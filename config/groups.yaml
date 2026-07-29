@@ -1,0 +1,23 @@
+groups:
+  # Публичная группа/канал — предпочтительно указывать username
+  - username: "VerhniyLars"
+    title: "Верхний Ларс"
+    enabled: true
+
+  - username: "krayzemlige"
+    title: "Край земли"
+    enabled: true
+
+  - username: "Sadahlo"
+    title: "Садахло"
+    enabled: true
+
+  - username: "sarpi_ge"
+    title: "Сарпи"
+    enabled: true
+
+  # Приватная группа — только по числовому id.
+  # Аккаунт, под которым запущен Reader, должен уже состоять в этой группе.
+#  - id: -1001234567890
+#    title: "Пример приватной группы"
+#    enabled: true

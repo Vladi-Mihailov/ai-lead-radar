@@ -1,0 +1,15 @@
+telegram:
+  # Два независимых Telethon-сессии одного и того же аккаунта — намеренно
+  # не общий файл: main.py работает круглосуточно и слушает live-апдейты,
+  # sync_users.py делает точечные запросы (участники + история). Общий
+  # .session-файл у Telethon хранится без WAL и оба процесса писали бы в
+  # него параллельно (в т.ч. состояние апдейтов pts/qts) — риск конфликтов.
+  session_name_live: reader_live    # main.py
+  session_name_sync: reader_sync    # sync_users.py
+
+app:
+  log_level: INFO
+  groups_file: config/groups.yaml
+  scenarios_file: config/scenarios.yaml
+  leads_output_file: data/output/leads.jsonl
+  users_db_file: data/users.db

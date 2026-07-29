@@ -1,0 +1,29 @@
+scenarios:
+  - name: insurance
+    enabled: true
+    keywords:
+      - "осаго"
+      - "каско"
+      - "страхов"
+      - "зеленая карта"
+      - "green card"
+      - "полис"
+      - "страховка"
+      - "страховку"
+      - "оформить"
+      - "авто"
+      - "онлайн"
+      
+
+#  - name: hotels
+#    enabled: true
+#    keywords:
+#      - "гостиниц"
+#      - "отель"
+#      - "нужен номер"
+
+#  - name: towing
+#    enabled: true
+#    keywords:
+#      - "эвакуатор"
+#      - "буксировк"
