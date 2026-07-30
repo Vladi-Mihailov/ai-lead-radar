@@ -27,6 +27,11 @@ async def run() -> None:
     settings = load_settings(CONFIG_PATH)
     setup_logging(settings.app.log_level)
     logger.info("Конфигурация загружена из %s", CONFIG_PATH)
+    logger.info(
+        "Using Telegram session: %s (%s)",
+        settings.telegram.session_path_live.name,
+        settings.telegram.session_path_live,
+    )
 
     groups = load_groups(settings.app.groups_file)
     scenarios = load_scenarios(settings.app.scenarios_file)
