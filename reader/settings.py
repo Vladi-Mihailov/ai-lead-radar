@@ -11,6 +11,7 @@ class ConfigError(Exception):
 
 
 _LEGACY_SESSION_NAME = "reader_session"
+_DEFAULT_SESSION_NAME_LIVE = "reader_live"
 
 
 def _session_file(session_path: Path) -> Path:
@@ -72,6 +73,7 @@ class AppSettings(BaseModel):
     leads_output_file: Path
     users_db_file: Path
     lead_forward_to: list[int | str] = Field(default_factory=list)
+    debug_telegram_events: bool = False
 
 
 class Settings(BaseModel):
@@ -117,12 +119,23 @@ def load_settings(config_path: Path) -> Settings:
     telegram_raw = raw.get("telegram", {})
     app_raw = raw.get("app", {})
 
+    # Имя live-сессии: TELEGRAM_SESSION_NAME (.env) имеет приоритет над
+    # session_name_live (config.yaml), а если ничего не задано — reader_live.
+    # Так на VPS и локально можно использовать один и тот же config.yaml,
+    # различаясь только .env (например, TELEGRAM_SESSION_NAME=reader_dev).
+    # session_name_sync — не затронуто, как и раньше, обязательный ключ.
+    session_name_live = (
+        os.getenv("TELEGRAM_SESSION_NAME")
+        or telegram_raw.get("session_name_live")
+        or _DEFAULT_SESSION_NAME_LIVE
+    )
+
     # ---------- Диагностика ----------
     session_path_live = (
         project_root
         / "data"
         / "sessions"
-        / telegram_raw["session_name_live"]
+        / session_name_live
     )
     session_path_sync = (
         project_root
@@ -133,6 +146,7 @@ def load_settings(config_path: Path) -> Settings:
 
     print("=" * 80)
     print("PROJECT ROOT      :", project_root)
+    print("SESSION NAME LIVE :", session_name_live)
     print("SESSION PATH LIVE :", session_path_live)
     print("SESSION PATH SYNC :", session_path_sync)
     print("PARENT EXISTS     :", session_path_live.parent.exists())
@@ -163,12 +177,19 @@ def load_settings(config_path: Path) -> Settings:
                 lead_forward_to=_parse_forward_targets(
                     os.getenv("LEAD_FORWARD_TO", "")
                 ),
+                debug_telegram_events=_parse_bool_env(
+                    os.getenv("DEBUG_TELEGRAM_EVENTS")
+                ),
             ),
         )
     except (KeyError, ValueError) as exc:
         raise ConfigError(
             f"Некорректная структура config.yaml: {exc}"
         ) from exc
+
+
+def _parse_bool_env(value: str | None) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _parse_forward_targets(raw: str) -> list[int | str]:

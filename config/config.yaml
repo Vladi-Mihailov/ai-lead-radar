@@ -4,8 +4,13 @@ telegram:
   # sync_users.py делает точечные запросы (участники + история). Общий
   # .session-файл у Telethon хранится без WAL и оба процесса писали бы в
   # него параллельно (в т.ч. состояние апдейтов pts/qts) — риск конфликтов.
+  #
+  # session_name_live необязателен: если не задан здесь и не задан
+  # TELEGRAM_SESSION_NAME в .env — используется reader_live по умолчанию.
+  # Значение ниже соответствует умолчанию и оставлено для наглядности —
+  # его можно удалить без изменения поведения.
   session_name_live: reader_live    # main.py
-  session_name_sync: reader_sync    # sync_users.py
+  session_name_sync: reader_sync    # sync_users.py (обязателен, не меняется через .env)
 
 app:
   log_level: INFO

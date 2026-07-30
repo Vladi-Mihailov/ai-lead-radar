@@ -36,7 +36,12 @@ async def run() -> None:
     engine = MatchEngine(matcher)
 
     user_repository = UserRepository(settings.app.users_db_file)
-    source = TelegramSource(settings.telegram, groups, user_repository)
+    source = TelegramSource(
+        settings.telegram,
+        groups,
+        user_repository,
+        debug_events=settings.app.debug_telegram_events,
+    )
     sinks = [
         ConsoleSink(),
         FileSink(settings.app.leads_output_file),

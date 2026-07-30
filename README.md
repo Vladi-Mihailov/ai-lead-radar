@@ -76,6 +76,33 @@ python reader/main.py
 старую сессию небезопасно: это означало бы, что `main.py` и `sync_users.py`
 работают под одной и той же Telegram-сессией вместо двух независимых.
 
+**Разные окружения (например, VPS и локальная разработка) не должны делить
+один и тот же live-`.session`-файл** — Telegram видит одновременное
+использование одной сессии с разных IP как подозрительное и инвалидирует
+ключ авторизации (`AuthKeyDuplicatedError`). Имя live-сессии настраивается,
+без изменения кода:
+
+1. `TELEGRAM_SESSION_NAME` в `.env` (наивысший приоритет);
+2. иначе `telegram.session_name_live` в `config.yaml`;
+3. иначе `reader_live` по умолчанию.
+
+Пример для VPS (`.env`) — можно просто не задавать переменную, сработает
+умолчание `reader_live`:
+```
+# TELEGRAM_SESSION_NAME=       # не задано — используется reader_live
+```
+
+Пример для локальной разработки (`.env`) — тот же `config.yaml`, что и на
+VPS, отдельная сессия только через `.env`:
+```
+TELEGRAM_SESSION_NAME=reader_dev
+```
+
+`session_name_sync` (сессия `sync_users.py`) через `.env` не переопределяется
+и остаётся обязательным ключом в `config.yaml` — она предназначена для
+разового/фонового запуска, а не для круглосуточной параллельной работы с
+нескольких машин.
+
 Ожидаемый вывод в консоли при успешном старте:
 
 ```
@@ -152,7 +179,7 @@ ai-lead-radar/
 
 ```yaml
 telegram:
-  session_name_live: reader_live   # main.py — постоянный мониторинг сообщений
+  session_name_live: reader_live   # main.py; необязателен — см. TELEGRAM_SESSION_NAME выше
   session_name_sync: reader_sync   # sync_users.py — участники + история
 
 app:

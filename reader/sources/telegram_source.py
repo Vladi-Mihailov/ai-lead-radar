@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 
 from reader.core.models import Message
 from reader.groups import Group
@@ -28,10 +28,15 @@ class TelegramSource(BaseSource):
         telegram_settings: TelegramSettings,
         groups: list[Group],
         user_repository: UserRepository,
+        *,
+        debug_events: bool = False,
     ):
         self._settings = telegram_settings
         self._groups = groups
         self._user_repository = user_repository
+        # Временная диагностика доставки сообщений (TRACKED GROUPS/RAW EVENT/
+        # FILTERED EVENT/QUEUE PUT) — включается DEBUG_TELEGRAM_EVENTS в .env.
+        self._debug_events = debug_events
         self._client = TelegramClient(
             str(telegram_settings.session_path_live),
             telegram_settings.api_id,
@@ -54,12 +59,63 @@ class TelegramSource(BaseSource):
         await self._client.get_dialogs()
         await self._resolve_groups()
 
+        if self._debug_events:
+            # ---- ВРЕМЕННАЯ ДИАГНОСТИКА: список того, что реально попало в self._resolved ----
+            for chat_id, resolved_group in self._resolved.items():
+                logger.warning(
+                    "TRACKED GROUPS\nchat_id=%s\ntitle=%s",
+                    chat_id,
+                    resolved_group.title,
+                )
+            # -------------------------------------------------------------------------------
+
+            # ---- ВРЕМЕННАЯ ДИАГНОСТИКА: события приходят только из первой группы ----
+            # Обработчик без chats= — ловит вообще все чаты, куда есть доступ у
+            # аккаунта, минуя наш фильтр. Если тут для группы нет RAW EVENT —
+            # проблема на стороне Telegram/членства, а не в нашем коде/фильтре.
+            self._client.add_event_handler(
+                self._log_raw_event,
+                events.NewMessage(),
+            )
+            # ---------------------------------------------------------------------
+
+            # Те же ключи, что и в self._resolved (см. TRACKED GROUPS выше) —
+            # именно они пойдут в chats= ниже.
+            filter_chat_ids = list(self._resolved.keys())
+
+            # ---- ВРЕМЕННАЯ ДИАГНОСТИКА: что именно передаём в chats= ----
+            logger.warning(
+                "Registering NewMessage handler for %d chats\n%s",
+                len(filter_chat_ids),
+                "\n".join(f"chat_id={cid}" for cid in filter_chat_ids),
+            )
+            # ---------------------------------------------------------------
+
         self._client.add_event_handler(
             self.handle_new_message,
             events.NewMessage(chats=[g.entity for g in self._resolved.values()]),
         )
 
         logger.info("Отслеживается групп: %d", len(self._resolved))
+
+    # ---- ВРЕМЕННАЯ ДИАГНОСТИКА ----
+    async def _log_raw_event(self, event: events.NewMessage.Event) -> None:
+        """Только логирует, ничего больше не делает — не часть бизнес-логики."""
+        chat_id = event.chat_id
+        title = getattr(event.chat, "title", None) or getattr(event.chat, "username", None)
+        tracked = chat_id in self._resolved
+        text = (event.raw_text or "")[:100]
+
+        logger.warning(
+            "RAW EVENT\nevent_id=%s\nchat_id=%s\ntitle=%s\ntracked=%s\ndate=%s\ntext=%r",
+            event.id,
+            chat_id,
+            title,
+            "YES" if tracked else "NO",
+            event.date,
+            text,
+        )
+    # --------------------------------
 
     async def _resolve_groups(self) -> None:
         for group in self._groups:
@@ -80,7 +136,7 @@ class TelegramSource(BaseSource):
                 or str(entity.id)
             )
 
-            self._resolved[entity.id] = _ResolvedGroup(
+            self._resolved[utils.get_peer_id(entity)] = _ResolvedGroup(
                 entity=entity,
                 title=title,
             )
@@ -152,6 +208,20 @@ class TelegramSource(BaseSource):
 
     async def handle_new_message(self, event: events.NewMessage.Event) -> None:
         """Точка входа для новых сообщений — регистрируется как обработчик у Telethon."""
+        if self._debug_events:
+            # ---- ВРЕМЕННАЯ ДИАГНОСТИКА ----
+            # Если для события есть RAW EVENT, но нет FILTERED EVENT — проблема
+            # в фильтре chats=. Лог до любого раннего return, чтобы не пропустить
+            # события с пустым текстом.
+            resolved_diag = self._resolved.get(event.chat_id)
+            logger.warning(
+                "FILTERED EVENT\nevent_id=%s\nchat_id=%s\ntitle=%s",
+                event.id,
+                event.chat_id,
+                resolved_diag.title if resolved_diag else None,
+            )
+            # --------------------------------
+
         text = event.raw_text
 
         if not text:
@@ -172,6 +242,16 @@ class TelegramSource(BaseSource):
             date=event.date,
             link=self._build_link(event.chat_id, event.id, resolved),
         )
+
+        if self._debug_events:
+            # ---- ВРЕМЕННАЯ ДИАГНОСТИКА ----
+            logger.warning(
+                "QUEUE PUT\nevent_id=%s\nchat_id=%s\ntitle=%s",
+                message.id,
+                message.chat_id,
+                message.chat_title,
+            )
+            # --------------------------------
 
         await self._queue.put(message)
 
