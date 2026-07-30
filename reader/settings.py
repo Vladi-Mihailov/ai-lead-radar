@@ -19,11 +19,17 @@ def _session_file(session_path: Path) -> Path:
     return session_path.parent / f"{session_path.name}.session"
 
 
-def _migrate_legacy_session(session_path_live: Path) -> None:
+def _migrate_legacy_session(session_name_live: str, session_path_live: Path) -> None:
     """Одноразовая миграция: до разделения на live/sync была одна сессия
     reader_session.session. Если reader_live.session ещё не существует, а
     старая сессия есть — переименовываем её, чтобы не заставлять
     пользователя заново авторизовывать main.py.
+
+    Срабатывает только для имени сессии по умолчанию (reader_live).
+    Если TELEGRAM_SESSION_NAME задаёт кастомное имя (например, reader_dev на
+    локальной машине) — миграция не выполняется: старая prod-сессия не
+    должна молча переименовываться в произвольное имя, случайно оказавшееся
+    рядом на диске (например, при копировании data/ из бэкапа).
 
     Для reader_sync ничего не переносим: клонирование того же auth_key в
     два файла означало бы, что оба процесса работают под ОДНОЙ и той же
@@ -31,6 +37,9 @@ def _migrate_legacy_session(session_path_live: Path) -> None:
     ради чего их разделили. sync_users.py один раз пройдёт авторизацию
     самостоятельно.
     """
+    if session_name_live != _DEFAULT_SESSION_NAME_LIVE:
+        return
+
     live_file = _session_file(session_path_live)
     if live_file.exists():
         return  # уже мигрировали, либо это не первый запуск после обновления
@@ -157,7 +166,7 @@ def load_settings(config_path: Path) -> Settings:
     session_path_sync.parent.mkdir(parents=True, exist_ok=True)
     # -------------------------------
 
-    _migrate_legacy_session(session_path_live)
+    _migrate_legacy_session(session_name_live, session_path_live)
 
     try:
         return Settings(
