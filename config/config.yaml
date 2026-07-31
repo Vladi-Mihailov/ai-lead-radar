@@ -20,7 +20,7 @@ telegram:
     - KrayZemli_Bot
 
 app:
-  log_level: DEBUG
+  log_level: INFO
   groups_file: config/groups.yaml
   scenarios_file: config/scenarios.yaml
   leads_output_file: data/output/leads.jsonl

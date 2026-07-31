@@ -150,44 +150,51 @@ class TelegramSource(BaseSource):
 
             logger.info("✔ Подключена группа %s", title)
 
-    async def _fetch_sender_info(
+    async def _resolve_entity_info(
         self,
-        event: events.NewMessage.Event,
+        entity_id: int | None,
+        get_sender: Any,
     ) -> TelegramUserInfo | None:
-        sender_id = event.sender_id
-        if not sender_id:
+        """Общая логика резолва User по id с фолбэками через UserEmpty.
+
+        Используется как для прямого отправителя события (event.get_sender),
+        так и для оригинального автора пересылки (event.forward.get_sender) —
+        у обоих один и тот же класс проблемы: Telegram может вернуть
+        UserEmpty, если у читающего аккаунта нет access_hash для этого id
+        (см. _fetch_sender_info для истории/деталей этого сценария).
+        """
+        if not entity_id:
             return None
 
         sender = None
         try:
-            sender = await event.get_sender()
+            sender = await get_sender()
         except Exception:
-            logger.debug("Не удалось получить отправителя %s из события", sender_id)
+            logger.debug("Не удалось получить отправителя %s из события", entity_id)
 
-        # UserEmpty — Telegram знает только sender_id, профиля нет вообще
+        # UserEmpty — Telegram знает только id, профиля нет вообще
         # (ни username, ни bot). Для наших целей это равнозначно отсутствию
         # sender, поэтому пробуем дорезолвить через get_entity() — но только
         # в этом случае, не при каждом сообщении.
         if sender is None or isinstance(sender, UserEmpty):
             try:
-                resolved = await self._client.get_entity(sender_id)
+                resolved = await self._client.get_entity(entity_id)
                 if not isinstance(resolved, UserEmpty):
                     sender = resolved
             except Exception:
-                logger.debug("Не удалось получить отправителя %s через get_entity", sender_id)
+                logger.debug("Не удалось получить отправителя %s через get_entity", entity_id)
 
+        cached = None
         if sender is None or isinstance(sender, UserEmpty):
-            # Резолв по id не дал ничего. Если для этого sender_id уже
-            # известен username (из локального кэша) — пробуем резолвнуть по
-            # нему: это отдельный, более надёжный путь (ResolveUsername), не
-            # зависящий от access_hash/контактов, которым упирается резолв по
-            # голому id. Выполняется только в этой ветке, не на каждое
-            # сообщение.
-            cached = None
+            # Резолв по id не дал ничего. Если для этого id уже известен
+            # username (из локального кэша) — пробуем резолвнуть по нему: это
+            # отдельный, более надёжный путь (ResolveUsername), не зависящий
+            # от access_hash/контактов, которым упирается резолв по голому
+            # id. Выполняется только в этой ветке, не на каждое сообщение.
             try:
-                cached = self._user_repository.get(sender_id)
+                cached = self._user_repository.get(entity_id)
             except Exception:
-                logger.warning("Не удалось прочитать локальный кэш пользователя %s", sender_id)
+                logger.warning("Не удалось прочитать локальный кэш пользователя %s", entity_id)
 
             if cached and cached.username:
                 try:
@@ -197,18 +204,18 @@ class TelegramSource(BaseSource):
                 except Exception:
                     logger.debug(
                         "Не удалось получить отправителя %s через username %s",
-                        sender_id,
+                        entity_id,
                         cached.username,
                     )
 
         if sender is None or isinstance(sender, UserEmpty):
             # Последний фолбэк: и username-резолв не помог (или username в
-            # кэше не было) — если этот sender_id уже встречался раньше,
-            # доверяем тому, что о нём знаем, вместо того чтобы по умолчанию
-            # считать его не ботом.
+            # кэше не было) — если этот id уже встречался раньше, доверяем
+            # тому, что о нём знаем, вместо того чтобы по умолчанию считать
+            # его не ботом.
             if cached is not None:
                 return TelegramUserInfo(
-                    user_id=sender_id,
+                    user_id=entity_id,
                     username=cached.username,
                     first_name=cached.first_name,
                     last_name=cached.last_name,
@@ -219,12 +226,74 @@ class TelegramSource(BaseSource):
             return None
 
         return TelegramUserInfo(
-            user_id=sender_id,
+            user_id=entity_id,
             username=getattr(sender, "username", None),
             first_name=getattr(sender, "first_name", None),
             last_name=getattr(sender, "last_name", None),
             is_bot=bool(getattr(sender, "bot", False)),
         )
+
+    async def _fetch_sender_info(
+        self,
+        event: events.NewMessage.Event,
+    ) -> TelegramUserInfo | None:
+        return await self._resolve_entity_info(event.sender_id, event.get_sender)
+
+    async def _fetch_forward_origin_info(
+        self,
+        event: events.NewMessage.Event,
+    ) -> TelegramUserInfo | None:
+        """Автор ОРИГИНАЛА пересланного сообщения (не тот, кто переслал).
+
+        Telegram/Telethon хранит это отдельно от sender: MessageFwdHeader
+        (event.message.fwd_from), обёрнутый Telethon в event.forward
+        (custom.forward.Forward). event.sender_id/get_sender() всегда
+        относятся к человеку, который нажал "Переслать", поэтому бот,
+        репост которого переслал живой человек, не ловился существующим
+        is_bot-фильтром — только этой проверкой.
+
+        getattr(..., None) — на случай другой версии Telethon, где forward
+        мог бы называться иначе или отсутствовать: тогда просто считаем, что
+        сообщение не переслано, вместо падения с AttributeError.
+        """
+        forward = getattr(event, "forward", None)
+        if forward is None:
+            return None
+
+        forward_sender_id = getattr(forward, "sender_id", None)
+        if not forward_sender_id:
+            # Автор пересылки скрыт настройками приватности — Telegram отдаёт
+            # только свободный текст (fwd_from.from_name, например "Бот Край
+            # Земли"), без from_id и username. Полноценно резолвнуть тут
+            # нечего (см. класс-докстрока) — единственный последний фолбэк:
+            # если from_name сам содержит "бот"/"bot", считаем это ботом.
+            # Это заведомо неточный сигнал (совпадение по подстроке в
+            # свободном тексте), поэтому применяется только здесь, в самом
+            # конце цепочки, когда никакой другой идентификатор недоступен.
+            fwd_from = getattr(event.message, "fwd_from", None)
+            from_name = getattr(fwd_from, "from_name", None) if fwd_from else None
+            if from_name:
+                lowered = from_name.lower()
+                if "бот" in lowered or "bot" in lowered:
+                    logger.debug(
+                        'Skipping forwarded message from hidden bot name: "%s"',
+                        from_name,
+                    )
+                    return TelegramUserInfo(
+                        user_id=0,
+                        username=None,
+                        first_name=None,
+                        last_name=None,
+                        is_bot=True,
+                    )
+
+                logger.debug(
+                    "Forward origin without sender_id\nfrom_name=%r",
+                    from_name,
+                )
+            return None
+
+        return await self._resolve_entity_info(forward_sender_id, forward.get_sender)
 
     async def _resolve_sender(
         self,
@@ -232,13 +301,29 @@ class TelegramSource(BaseSource):
     ) -> tuple[int | None, str | None, str | None, bool]:
         sender_id = event.sender_id
         info = await self._fetch_sender_info(event)
+        forward_info = await self._fetch_forward_origin_info(event)
 
         # Бот определяется по данным этого же сообщения (info), а не по
         # кэшу/фолбэку ниже — именно так, как его увидел Telegram сейчас.
-        is_bot = bool(
+        # Учитываем ОБА источника: прямого отправителя (кто прислал именно
+        # это сообщение) и автора оригинала, если сообщение переслано (кто
+        # написал пересланный текст) — бот в любой из этих ролей должен
+        # блокироваться одинаково.
+        direct_is_bot = bool(
             info is not None
             and (info.is_bot or "bot" in (info.username or "").lower())
         )
+        forward_is_bot = bool(
+            forward_info is not None
+            and (forward_info.is_bot or "bot" in (forward_info.username or "").lower())
+        )
+        is_bot = direct_is_bot or forward_is_bot
+
+        if forward_is_bot and not direct_is_bot:
+            logger.debug(
+                "Пересланное сообщение: оригинал от бота username=%s",
+                forward_info.username,
+            )
 
         # Даже если пользователь уже был в базе — обновляем свежими данными.
         # Сбой локального кэша не должен приводить к потере сообщения.
