@@ -13,7 +13,7 @@ telegram:
   session_name_sync: reader_sync    # sync_users.py (обязателен, не меняется через .env)
 
 app:
-  log_level: INFO
+  log_level: DEBUG
   groups_file: config/groups.yaml
   scenarios_file: config/scenarios.yaml
   leads_output_file: data/output/leads.jsonl
