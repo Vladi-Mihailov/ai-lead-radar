@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -24,6 +25,12 @@ class _ResolvedGroup:
 
 
 class TelegramSource(BaseSource):
+    # Telethon иногда доставляет одно и то же обновление повторно (реконнект,
+    # gap-recovery и т.п.) — защита от повторной обработки по (chat_id,
+    # message_id). Только in-memory, без БД: хранится не более последних
+    # _SEEN_MESSAGES_MAXSIZE пар, старые вытесняются по LRU.
+    _SEEN_MESSAGES_MAXSIZE = 5000
+
     def __init__(
         self,
         telegram_settings: TelegramSettings,
@@ -52,6 +59,7 @@ class TelegramSource(BaseSource):
 
         self._queue: asyncio.Queue[Message] = asyncio.Queue()
         self._resolved: dict[int, _ResolvedGroup] = {}
+        self._seen_messages: OrderedDict[tuple[int, int], None] = OrderedDict()
 
     @property
     def client(self) -> TelegramClient:
@@ -350,8 +358,39 @@ class TelegramSource(BaseSource):
 
         return sender_id, username, display_name, is_bot
 
+    def _is_duplicate_message(self, chat_id: int, message_id: int) -> bool:
+        """LRU-проверка (chat_id, message_id) — без БД, только в памяти.
+
+        Telethon иногда доставляет одно и то же обновление повторно
+        (реконнект/gap-recovery) — само по себе это не ошибка бизнес-логики,
+        поэтому дедуп сделан отдельным, не пересекающимся с остальными
+        фильтрами шагом.
+        """
+        key = (chat_id, message_id)
+
+        if key in self._seen_messages:
+            self._seen_messages.move_to_end(key)
+            return True
+
+        self._seen_messages[key] = None
+        if len(self._seen_messages) > self._SEEN_MESSAGES_MAXSIZE:
+            self._seen_messages.popitem(last=False)
+
+        return False
+
     async def handle_new_message(self, event: events.NewMessage.Event) -> None:
         """Точка входа для новых сообщений — регистрируется как обработчик у Telethon."""
+        # Защита от повторной доставки — самая первая проверка, ещё дешевле
+        # ignored_sender_ids: если это дубль, остальная обработка (включая
+        # диагностику ниже) вообще не нужна.
+        if self._is_duplicate_message(event.chat_id, event.id):
+            logger.debug(
+                "Skipping duplicate message\nchat_id=%s\nmessage_id=%s",
+                event.chat_id,
+                event.id,
+            )
+            return
+
         # Явные исключения (config.yaml: ignored_sender_ids) — самая дешёвая
         # проверка, без единого резолва/обращения к сети, раньше всего
         # остального.

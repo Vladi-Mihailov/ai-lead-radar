@@ -44,7 +44,7 @@ class TelegramSink(BaseSink):
         message = event.message
         for target in self._resolved:
             try:
-                await self._client.forward_messages(
+                forwarded = await self._client.forward_messages(
                     target.entity,
                     messages=message.id,
                     from_peer=message.chat_id,
@@ -55,12 +55,19 @@ class TelegramSink(BaseSink):
                     target.label,
                 )
             else:
+                # forward_messages(messages=<int>) — единичный id, не список,
+                # поэтому Telethon возвращает один Message (не список) для
+                # только что созданного пересланного сообщения в target-чате.
+                # reply_to к нему — чтобы контекст был явной веткой-ответом
+                # под пересланным оригиналом, а не отдельным сообщением.
+                reply_to = getattr(forwarded, "id", None)
                 try:
                     await self._client.send_message(
                         target.entity,
-                        self._format_context(message),
+                        self._format_context(event),
                         parse_mode="md",
                         link_preview=False,
+                        reply_to=reply_to,
                     )
                 except Exception:
                     logger.warning(
@@ -96,13 +103,22 @@ class TelegramSink(BaseSink):
         return f"@{target}" if isinstance(target, str) else str(target)
 
     @staticmethod
-    def _format_context(message) -> str:
-        lines = [f"📍 {message.chat_title}"]
+    def _format_context(event: LeadEvent) -> str:
+        message = event.message
+        lines = [f"📍 **{message.chat_title}**"]
 
         if message.sender_username:
             lines.append(f"👤 @{message.sender_username}")
         elif message.sender_name:
             lines.append(f"👤 {message.sender_name}")
+
+        # dict.fromkeys — убирает дубликаты, сохраняя порядок первого
+        # появления; затем ограничиваем пятью, как и требуется.
+        keywords = list(
+            dict.fromkeys(kw for m in event.matches for kw in m.matched_keywords)
+        )[:5]
+        if keywords:
+            lines.append(f"🎯 Совпадения: {', '.join(keywords)}")
 
         if message.link:
             lines.append(f"🔗 [Открыть оригинал]({message.link})")
