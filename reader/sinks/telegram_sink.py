@@ -49,6 +49,24 @@ class TelegramSink(BaseSink):
                     messages=message.id,
                     from_peer=message.chat_id,
                 )
+            except Exception:
+                logger.warning(
+                    "Не удалось переслать оригинал сообщения в %s, отправляю текстовую копию",
+                    target.label,
+                )
+            else:
+                try:
+                    await self._client.send_message(
+                        target.entity,
+                        self._format_context(message),
+                        parse_mode="md",
+                        link_preview=False,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Не удалось отправить контекст (группа/автор/ссылка) в %s",
+                        target.label,
+                    )
 
                 # ---- ВРЕМЕННАЯ ДИАГНОСТИКА ----
                 logger.debug(
@@ -59,11 +77,6 @@ class TelegramSink(BaseSink):
                 # --------------------------------
 
                 continue
-            except Exception:
-                logger.warning(
-                    "Не удалось переслать оригинал сообщения в %s, отправляю текстовую копию",
-                    target.label,
-                )
 
             try:
                 await self._client.send_message(target.entity, self._format(event), link_preview=False)
@@ -81,6 +94,20 @@ class TelegramSink(BaseSink):
     @staticmethod
     def _label(target: int | str) -> str:
         return f"@{target}" if isinstance(target, str) else str(target)
+
+    @staticmethod
+    def _format_context(message) -> str:
+        lines = [f"📍 {message.chat_title}"]
+
+        if message.sender_username:
+            lines.append(f"👤 @{message.sender_username}")
+        elif message.sender_name:
+            lines.append(f"👤 {message.sender_name}")
+
+        if message.link:
+            lines.append(f"🔗 [Открыть оригинал]({message.link})")
+
+        return "\n".join(lines)
 
     @staticmethod
     def _format(event: LeadEvent) -> str:
