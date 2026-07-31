@@ -177,9 +177,16 @@ class TelegramSource(BaseSource):
     async def _resolve_sender(
         self,
         event: events.NewMessage.Event,
-    ) -> tuple[int | None, str | None, str | None]:
+    ) -> tuple[int | None, str | None, str | None, bool]:
         sender_id = event.sender_id
         info = await self._fetch_sender_info(event)
+
+        # Бот определяется по данным этого же сообщения (info), а не по
+        # кэшу/фолбэку ниже — именно так, как его увидел Telegram сейчас.
+        is_bot = bool(
+            info is not None
+            and (info.is_bot or "bot" in (info.username or "").lower())
+        )
 
         # Даже если пользователь уже был в базе — обновляем свежими данными.
         # Сбой локального кэша не должен приводить к потере сообщения.
@@ -204,7 +211,7 @@ class TelegramSource(BaseSource):
                 username = username or cached.username
                 display_name = display_name or cached.full_name
 
-        return sender_id, username, display_name
+        return sender_id, username, display_name, is_bot
 
     async def handle_new_message(self, event: events.NewMessage.Event) -> None:
         """Точка входа для новых сообщений — регистрируется как обработчик у Telethon."""
@@ -229,7 +236,11 @@ class TelegramSource(BaseSource):
 
         resolved = self._resolved.get(event.chat_id)
 
-        sender_id, username, display_name = await self._resolve_sender(event)
+        sender_id, username, display_name, is_bot = await self._resolve_sender(event)
+
+        if is_bot:
+            logger.debug("Skipping Telegram bot account | username=%s", username)
+            return
 
         message = Message(
             id=event.id,
