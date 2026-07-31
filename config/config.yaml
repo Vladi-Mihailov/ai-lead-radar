@@ -12,6 +12,13 @@ telegram:
   session_name_live: reader_live    # main.py
   session_name_sync: reader_sync    # sync_users.py (обязателен, не меняется через .env)
 
+  # Явные исключения — проверяются раньше автоматического определения бота
+  # (is_bot) и раньше очереди/сохранения сообщения. Оба списка необязательны,
+  # по умолчанию пустые.
+  ignored_sender_ids: []      # например: [123456789]
+  ignored_usernames:          # регистр и "@" не важны
+    - KrayZemli_Bot
+
 app:
   log_level: DEBUG
   groups_file: config/groups.yaml

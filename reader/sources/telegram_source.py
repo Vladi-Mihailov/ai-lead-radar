@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from telethon import TelegramClient, events, utils
+from telethon.tl.types import UserEmpty
 
 from reader.core.models import Message
 from reader.groups import Group
@@ -34,6 +35,12 @@ class TelegramSource(BaseSource):
         self._settings = telegram_settings
         self._groups = groups
         self._user_repository = user_repository
+        # Явные исключения из config.yaml (telegram.ignored_sender_ids/
+        # ignored_usernames) — проверяются раньше is_bot и раньше очереди.
+        self._ignored_sender_ids = set(telegram_settings.ignored_sender_ids)
+        self._ignored_usernames = {
+            u.lower().lstrip("@") for u in telegram_settings.ignored_usernames
+        }
         # Временная диагностика доставки сообщений (TRACKED GROUPS/RAW EVENT/
         # FILTERED EVENT/QUEUE PUT) — включается DEBUG_TELEGRAM_EVENTS в .env.
         self._debug_events = debug_events
@@ -157,13 +164,58 @@ class TelegramSource(BaseSource):
         except Exception:
             logger.debug("Не удалось получить отправителя %s из события", sender_id)
 
-        if sender is None:
+        # UserEmpty — Telegram знает только sender_id, профиля нет вообще
+        # (ни username, ни bot). Для наших целей это равнозначно отсутствию
+        # sender, поэтому пробуем дорезолвить через get_entity() — но только
+        # в этом случае, не при каждом сообщении.
+        if sender is None or isinstance(sender, UserEmpty):
             try:
-                sender = await self._client.get_entity(sender_id)
+                resolved = await self._client.get_entity(sender_id)
+                if not isinstance(resolved, UserEmpty):
+                    sender = resolved
             except Exception:
                 logger.debug("Не удалось получить отправителя %s через get_entity", sender_id)
 
-        if sender is None:
+        if sender is None or isinstance(sender, UserEmpty):
+            # Резолв по id не дал ничего. Если для этого sender_id уже
+            # известен username (из локального кэша) — пробуем резолвнуть по
+            # нему: это отдельный, более надёжный путь (ResolveUsername), не
+            # зависящий от access_hash/контактов, которым упирается резолв по
+            # голому id. Выполняется только в этой ветке, не на каждое
+            # сообщение.
+            cached = None
+            try:
+                cached = self._user_repository.get(sender_id)
+            except Exception:
+                logger.warning("Не удалось прочитать локальный кэш пользователя %s", sender_id)
+
+            if cached and cached.username:
+                try:
+                    resolved = await self._client.get_entity(cached.username)
+                    if not isinstance(resolved, UserEmpty):
+                        sender = resolved
+                except Exception:
+                    logger.debug(
+                        "Не удалось получить отправителя %s через username %s",
+                        sender_id,
+                        cached.username,
+                    )
+
+        if sender is None or isinstance(sender, UserEmpty):
+            # Последний фолбэк: и username-резолв не помог (или username в
+            # кэше не было) — если этот sender_id уже встречался раньше,
+            # доверяем тому, что о нём знаем, вместо того чтобы по умолчанию
+            # считать его не ботом.
+            if cached is not None:
+                return TelegramUserInfo(
+                    user_id=sender_id,
+                    username=cached.username,
+                    first_name=cached.first_name,
+                    last_name=cached.last_name,
+                    is_bot=bool(
+                        cached.is_bot or "bot" in (cached.username or "").lower()
+                    ),
+                )
             return None
 
         return TelegramUserInfo(
@@ -215,6 +267,13 @@ class TelegramSource(BaseSource):
 
     async def handle_new_message(self, event: events.NewMessage.Event) -> None:
         """Точка входа для новых сообщений — регистрируется как обработчик у Telethon."""
+        # Явные исключения (config.yaml: ignored_sender_ids) — самая дешёвая
+        # проверка, без единого резолва/обращения к сети, раньше всего
+        # остального.
+        if event.sender_id in self._ignored_sender_ids:
+            logger.debug("Skipped ignored sender_id=%s", event.sender_id)
+            return
+
         if self._debug_events:
             # ---- ВРЕМЕННАЯ ДИАГНОСТИКА ----
             # Если для события есть RAW EVENT, но нет FILTERED EVENT — проблема
@@ -237,6 +296,10 @@ class TelegramSource(BaseSource):
         resolved = self._resolved.get(event.chat_id)
 
         sender_id, username, display_name, is_bot = await self._resolve_sender(event)
+
+        if username and username.lower().lstrip("@") in self._ignored_usernames:
+            logger.debug("Skipped ignored username=%s", username)
+            return
 
         if is_bot:
             logger.debug("Skipping Telegram bot account | username=%s", username)
