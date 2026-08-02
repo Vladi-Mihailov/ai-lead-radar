@@ -312,28 +312,6 @@ class TelegramSource(BaseSource):
         info = await self._fetch_sender_info(event)
         forward_info = await self._fetch_forward_origin_info(event)
 
-        # Бот определяется по данным этого же сообщения (info), а не по
-        # кэшу/фолбэку ниже — именно так, как его увидел Telegram сейчас.
-        # Учитываем ОБА источника: прямого отправителя (кто прислал именно
-        # это сообщение) и автора оригинала, если сообщение переслано (кто
-        # написал пересланный текст) — бот в любой из этих ролей должен
-        # блокироваться одинаково.
-        direct_is_bot = bool(
-            info is not None
-            and (info.is_bot or "bot" in (info.username or "").lower())
-        )
-        forward_is_bot = bool(
-            forward_info is not None
-            and (forward_info.is_bot or "bot" in (forward_info.username or "").lower())
-        )
-        is_bot = direct_is_bot or forward_is_bot
-
-        if forward_is_bot and not direct_is_bot:
-            logger.debug(
-                "Пересланное сообщение: оригинал от бота username=%s",
-                forward_info.username,
-            )
-
         # Даже если пользователь уже был в базе — обновляем свежими данными.
         # Сбой локального кэша не должен приводить к потере сообщения.
         if info is not None:
@@ -342,10 +320,18 @@ class TelegramSource(BaseSource):
             except Exception:
                 logger.warning("Не удалось обновить локальный кэш пользователя %s", sender_id)
 
+        # Сначала — окончательные username/display_name (Telegram +, если
+        # чего-то не хватает, локальный кэш). is_bot считаем только ПОСЛЕ
+        # этого, по итоговому username, а не по промежуточному info.username.
+        # Причина: Telegram может отдать sender как "min"-объект — не None и
+        # не UserEmpty, а частично заполненный User, где first_name есть, а
+        # username — нет (см. комментарий в telethon/tl/custom/sendergetter.py
+        # про sender.min). Если считать is_bot по такому неполному info.username,
+        # эвристика "bot" in username не увидит username, который donабирается
+        # из кэша только несколькими строками ниже.
         username = info.username if info else None
         display_name = info.full_name if info else None
 
-        # Telegram не отдал username — пробуем локальный кэш по sender_id
         if not username and sender_id:
             try:
                 cached = self._user_repository.get(sender_id)
@@ -356,6 +342,46 @@ class TelegramSource(BaseSource):
             if cached:
                 username = username or cached.username
                 display_name = display_name or cached.full_name
+
+        forward_username = forward_info.username if forward_info else None
+
+        if forward_info is not None and not forward_username and forward_info.user_id:
+            try:
+                forward_cached = self._user_repository.get(forward_info.user_id)
+            except Exception:
+                logger.warning(
+                    "Не удалось прочитать локальный кэш пользователя %s", forward_info.user_id
+                )
+                forward_cached = None
+
+            if forward_cached:
+                forward_username = forward_cached.username
+
+        # IMPORTANT:
+        # username/display_name must already be finalized (including UserRepository
+        # fallback) before bot detection. Telegram may return min entities without
+        # username, so evaluating is_bot earlier causes bot accounts to bypass
+        # filtering.
+        #
+        # Учитываем ОБА источника: прямого отправителя (кто прислал именно это
+        # сообщение) и автора оригинала, если сообщение переслано (кто написал
+        # пересланный текст) — бот в любой из этих ролей должен блокироваться
+        # одинаково.
+        direct_is_bot = bool(
+            info is not None
+            and (info.is_bot or "bot" in (username or "").lower())
+        )
+        forward_is_bot = bool(
+            forward_info is not None
+            and (forward_info.is_bot or "bot" in (forward_username or "").lower())
+        )
+        is_bot = direct_is_bot or forward_is_bot
+
+        if forward_is_bot and not direct_is_bot:
+            logger.debug(
+                "Пересланное сообщение: оригинал от бота username=%s",
+                forward_username,
+            )
 
         return sender_id, username, display_name, is_bot
 
