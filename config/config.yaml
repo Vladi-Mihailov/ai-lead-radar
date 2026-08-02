@@ -18,6 +18,10 @@ telegram:
   ignored_sender_ids: []      # например: [123456789]
   ignored_usernames:          # регистр и "@" не важны
     - KrayZemli_Bot
+    - Livinginsrb
+
+  ignored_display_names:      # точное совпадение отображаемого имени
+    - "Аркадий"
 
 app:
   log_level: INFO

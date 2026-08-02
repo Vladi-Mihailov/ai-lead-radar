@@ -75,6 +75,7 @@ class TelegramSettings(BaseModel):
     phone: str
     ignored_sender_ids: list[int] = Field(default_factory=list)
     ignored_usernames: list[str] = Field(default_factory=list)
+    ignored_display_names: list[str] = Field(default_factory=list)
 
 
 class AppSettings(BaseModel):
@@ -180,6 +181,7 @@ def load_settings(config_path: Path) -> Settings:
                 phone=phone,
                 ignored_sender_ids=telegram_raw.get("ignored_sender_ids", []),
                 ignored_usernames=telegram_raw.get("ignored_usernames", []),
+                ignored_display_names=telegram_raw.get("ignored_display_names", []),
             ),
             app=AppSettings(
                 log_level=app_raw.get("log_level", "INFO"),

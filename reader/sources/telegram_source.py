@@ -48,6 +48,7 @@ class TelegramSource(BaseSource):
         self._ignored_usernames = {
             u.lower().lstrip("@") for u in telegram_settings.ignored_usernames
         }
+        self._ignored_display_names = set(telegram_settings.ignored_display_names)
         # Временная диагностика доставки сообщений (TRACKED GROUPS/RAW EVENT/
         # FILTERED EVENT/QUEUE PUT) — включается DEBUG_TELEGRAM_EVENTS в .env.
         self._debug_events = debug_events
@@ -423,6 +424,10 @@ class TelegramSource(BaseSource):
 
         if username and username.lower().lstrip("@") in self._ignored_usernames:
             logger.debug("Skipped ignored username=%s", username)
+            return
+
+        if display_name and display_name in self._ignored_display_names:
+            logger.debug('Skipping ignored display name: "%s"', display_name)
             return
 
         if is_bot:
