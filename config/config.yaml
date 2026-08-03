@@ -19,7 +19,7 @@ telegram:
   ignored_usernames:          # регистр и "@" не важны
     - KrayZemli_Bot
     - Livinginsrb
-
+    - Sladkov_A_L
   ignored_display_names:      # точное совпадение отображаемого имени
     - "Аркадий"
 
@@ -29,3 +29,27 @@ app:
   scenarios_file: config/scenarios.yaml
   leads_output_file: data/output/leads.jsonl
   users_db_file: data/users.db
+
+# Мониторинг штрафов police.ge (см. reader/jobs/fine_job.py). Работает в
+# том же процессе и на том же Telegram-клиенте, что и основной Reader —
+# отдельного подключения к Telegram не создаёт.
+fine_monitor:
+  enabled: true
+  timezone: Asia/Tbilisi
+  check_times:
+    - "09:00"
+    - "15:00"
+    - "21:00"
+  source_url: https://police.ge/protocol/index.php?lang=en
+  request_timeout: 30
+
+  # Чаты для уведомлений о новых штрафах. Если пусто — используется
+  # app.lead_forward_to (LEAD_FORWARD_TO из .env), тот же чат, куда уже
+  # идут лиды.
+  notification_chat_ids: []
+
+  # Кому разрешены служебные команды (fine add/list/stop/check/status).
+  # ОБЯЗАТЕЛЬНО заполнить своим Telegram user_id при enabled: true —
+  # с пустым списком приложение откажется запускаться (fail-fast, чтобы не
+  # поднять команды, доступные любому в чате). Например: [123456789]
+  allowed_user_ids: []

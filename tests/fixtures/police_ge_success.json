@@ -1,0 +1,37 @@
+{
+  "success": true,
+  "message": null,
+  "data": {
+    "count": 2,
+    "results": [
+      {
+        "protocolAuto": "B957MA09",
+        "protocolNo": "AB123456",
+        "protocolDate": "2026-08-06",
+        "violationDate": "2026-08-05",
+        "activeDate": "2026-08-10",
+        "lastDate": "2026-08-20",
+        "protocolAmount": 100,
+        "protocolPlace": "Test place",
+        "protocolLaw": "125-1-0",
+        "protocolLawDescription": "Test violation",
+        "publishDate": "2026-08-06",
+        "remainingDays": 5
+      },
+      {
+        "protocolAuto": "B957MA09",
+        "protocolNo": "AB999999",
+        "protocolDate": "2026-07-01",
+        "violationDate": "2026-06-30",
+        "activeDate": null,
+        "lastDate": "2026-07-20",
+        "protocolAmount": 50,
+        "protocolPlace": "Another place",
+        "protocolLaw": "125-6-0",
+        "protocolLawDescription": "Another violation",
+        "publishDate": "2026-07-01",
+        "remainingDays": 0
+      }
+    ]
+  }
+}

@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 _MAX_TEXT_LENGTH = 3000
 
 
-@dataclass
+@dataclass(frozen=True)
 class _ResolvedTarget:
     entity: Any
     label: str
@@ -37,10 +37,6 @@ class TelegramSink(BaseSink):
             logger.info("✔ Получатель %s найден", label)
 
     async def handle(self, event: LeadEvent) -> None:
-        # ---- ВРЕМЕННАЯ ДИАГНОСТИКА ----
-        logger.debug("TelegramSink entered | message_id=%s", event.message.id)
-        # --------------------------------
-
         message = event.message
         for target in self._resolved:
             try:
@@ -75,26 +71,10 @@ class TelegramSink(BaseSink):
                         target.label,
                     )
 
-                # ---- ВРЕМЕННАЯ ДИАГНОСТИКА ----
-                logger.debug(
-                    "TelegramSink finished | message_id=%s target=%s (forwarded)",
-                    message.id,
-                    target.label,
-                )
-                # --------------------------------
-
                 continue
 
             try:
                 await self._client.send_message(target.entity, self._format(event), link_preview=False)
-
-                # ---- ВРЕМЕННАЯ ДИАГНОСТИКА ----
-                logger.debug(
-                    "TelegramSink finished | message_id=%s target=%s (text copy)",
-                    message.id,
-                    target.label,
-                )
-                # --------------------------------
             except Exception:
                 logger.exception("Не удалось отправить лид в чат %s", target.label)
 

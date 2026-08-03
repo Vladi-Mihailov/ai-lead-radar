@@ -1,4 +1,5 @@
 import os
+from datetime import time
 from pathlib import Path
 
 import yaml
@@ -88,9 +89,20 @@ class AppSettings(BaseModel):
     debug_telegram_events: bool = False
 
 
+class FineMonitorSettings(BaseModel):
+    enabled: bool = False
+    timezone: str = "Asia/Tbilisi"
+    check_times: list[time] = Field(default_factory=lambda: [time(9, 0), time(15, 0), time(21, 0)])
+    source_url: str = "https://police.ge/protocol/index.php?lang=en"
+    request_timeout: float = 30.0
+    notification_chat_ids: list[int | str] = Field(default_factory=list)
+    allowed_user_ids: list[int] = Field(default_factory=list)
+
+
 class Settings(BaseModel):
     telegram: TelegramSettings
     app: AppSettings
+    fine_monitor: FineMonitorSettings
 
 
 def load_settings(config_path: Path) -> Settings:
@@ -130,6 +142,7 @@ def load_settings(config_path: Path) -> Settings:
 
     telegram_raw = raw.get("telegram", {})
     app_raw = raw.get("app", {})
+    fine_monitor_raw = raw.get("fine_monitor", {})
 
     # Имя live-сессии: TELEGRAM_SESSION_NAME (.env) имеет приоритет над
     # session_name_live (config.yaml), а если ничего не задано — reader_live.
@@ -196,6 +209,25 @@ def load_settings(config_path: Path) -> Settings:
                     os.getenv("DEBUG_TELEGRAM_EVENTS")
                 ),
             ),
+            fine_monitor=FineMonitorSettings(
+                enabled=bool(fine_monitor_raw.get("enabled", False)),
+                timezone=fine_monitor_raw.get("timezone", "Asia/Tbilisi"),
+                check_times=[
+                    _parse_check_time(value)
+                    for value in fine_monitor_raw.get(
+                        "check_times", ["09:00", "15:00", "21:00"]
+                    )
+                ],
+                source_url=fine_monitor_raw.get(
+                    "source_url", "https://police.ge/protocol/index.php?lang=en"
+                ),
+                request_timeout=float(fine_monitor_raw.get("request_timeout", 30)),
+                notification_chat_ids=[
+                    _normalize_chat_id(value)
+                    for value in fine_monitor_raw.get("notification_chat_ids", [])
+                ],
+                allowed_user_ids=list(fine_monitor_raw.get("allowed_user_ids", [])),
+            ),
         )
     except (KeyError, ValueError) as exc:
         raise ConfigError(
@@ -222,3 +254,19 @@ def _parse_forward_targets(raw: str) -> list[int | str]:
             targets.append(token)
 
     return targets
+
+
+def _parse_check_time(value: str) -> time:
+    hour_str, _, minute_str = str(value).partition(":")
+    return time(int(hour_str), int(minute_str))
+
+
+def _normalize_chat_id(value: int | str) -> int | str:
+    if isinstance(value, str):
+        token = value.strip().lstrip("@")
+        try:
+            return int(token)
+        except ValueError:
+            return token
+
+    return value

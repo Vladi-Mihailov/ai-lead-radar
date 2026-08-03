@@ -1,12 +1,12 @@
 import asyncio
 import logging
 from collections import OrderedDict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
 from telethon import TelegramClient, events, utils
-from telethon.tl.types import UserEmpty
+from telethon.tl.types import User, UserEmpty
 
 from reader.core.models import Message
 from reader.groups import Group
@@ -18,7 +18,7 @@ from reader.users.repository import UserRepository
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(frozen=True)
 class _ResolvedGroup:
     entity: Any
     title: str
@@ -49,8 +49,10 @@ class TelegramSource(BaseSource):
             u.lower().lstrip("@") for u in telegram_settings.ignored_usernames
         }
         self._ignored_display_names = set(telegram_settings.ignored_display_names)
-        # Временная диагностика доставки сообщений (TRACKED GROUPS/RAW EVENT/
-        # FILTERED EVENT/QUEUE PUT) — включается DEBUG_TELEGRAM_EVENTS в .env.
+        # Диагностика доставки сообщений (TRACKED GROUPS/RAW EVENT/FILTERED
+        # EVENT/QUEUE PUT) — постоянная, но выключенная по умолчанию
+        # функция; включается DEBUG_TELEGRAM_EVENTS в .env при разборе
+        # проблем с доставкой апдейтов.
         self._debug_events = debug_events
         self._client = TelegramClient(
             str(telegram_settings.session_path_live),
@@ -76,16 +78,14 @@ class TelegramSource(BaseSource):
         await self._resolve_groups()
 
         if self._debug_events:
-            # ---- ВРЕМЕННАЯ ДИАГНОСТИКА: список того, что реально попало в self._resolved ----
+            # Список того, что реально попало в self._resolved.
             for chat_id, resolved_group in self._resolved.items():
                 logger.warning(
                     "TRACKED GROUPS\nchat_id=%s\ntitle=%s",
                     chat_id,
                     resolved_group.title,
                 )
-            # -------------------------------------------------------------------------------
 
-            # ---- ВРЕМЕННАЯ ДИАГНОСТИКА: события приходят только из первой группы ----
             # Обработчик без chats= — ловит вообще все чаты, куда есть доступ у
             # аккаунта, минуя наш фильтр. Если тут для группы нет RAW EVENT —
             # проблема на стороне Telegram/членства, а не в нашем коде/фильтре.
@@ -93,19 +93,16 @@ class TelegramSource(BaseSource):
                 self._log_raw_event,
                 events.NewMessage(),
             )
-            # ---------------------------------------------------------------------
 
             # Те же ключи, что и в self._resolved (см. TRACKED GROUPS выше) —
             # именно они пойдут в chats= ниже.
             filter_chat_ids = list(self._resolved.keys())
 
-            # ---- ВРЕМЕННАЯ ДИАГНОСТИКА: что именно передаём в chats= ----
             logger.warning(
                 "Registering NewMessage handler for %d chats\n%s",
                 len(filter_chat_ids),
                 "\n".join(f"chat_id={cid}" for cid in filter_chat_ids),
             )
-            # ---------------------------------------------------------------
 
         self._client.add_event_handler(
             self.handle_new_message,
@@ -114,9 +111,9 @@ class TelegramSource(BaseSource):
 
         logger.info("Отслеживается групп: %d", len(self._resolved))
 
-    # ---- ВРЕМЕННАЯ ДИАГНОСТИКА ----
     async def _log_raw_event(self, event: events.NewMessage.Event) -> None:
-        """Только логирует, ничего больше не делает — не часть бизнес-логики."""
+        """Диагностический handler (см. debug_events) — только логирует,
+        ничего больше не делает, не часть бизнес-логики."""
         chat_id = event.chat_id
         title = getattr(event.chat, "title", None) or getattr(event.chat, "username", None)
         tracked = chat_id in self._resolved
@@ -131,7 +128,6 @@ class TelegramSource(BaseSource):
             event.date,
             text,
         )
-    # --------------------------------
 
     async def _resolve_groups(self) -> None:
         for group in self._groups:
@@ -162,7 +158,7 @@ class TelegramSource(BaseSource):
     async def _resolve_entity_info(
         self,
         entity_id: int | None,
-        get_sender: Any,
+        get_sender: Callable[[], Awaitable[User | UserEmpty | None]],
     ) -> TelegramUserInfo | None:
         """Общая логика резолва User по id с фолбэками через UserEmpty.
 
@@ -426,7 +422,6 @@ class TelegramSource(BaseSource):
             return
 
         if self._debug_events:
-            # ---- ВРЕМЕННАЯ ДИАГНОСТИКА ----
             # Если для события есть RAW EVENT, но нет FILTERED EVENT — проблема
             # в фильтре chats=. Лог до любого раннего return, чтобы не пропустить
             # события с пустым текстом.
@@ -437,7 +432,6 @@ class TelegramSource(BaseSource):
                 event.chat_id,
                 resolved_diag.title if resolved_diag else None,
             )
-            # --------------------------------
 
         text = event.raw_text
 
@@ -473,14 +467,12 @@ class TelegramSource(BaseSource):
         )
 
         if self._debug_events:
-            # ---- ВРЕМЕННАЯ ДИАГНОСТИКА ----
             logger.warning(
                 "QUEUE PUT\nevent_id=%s\nchat_id=%s\ntitle=%s",
                 message.id,
                 message.chat_id,
                 message.chat_title,
             )
-            # --------------------------------
 
         await self._queue.put(message)
 
@@ -498,10 +490,7 @@ class TelegramSource(BaseSource):
         if username:
             return f"https://t.me/{username}/{message_id}"
 
-        internal_id = str(chat_id)
-
-        if internal_id.startswith("-100"):
-            internal_id = internal_id[4:]
+        internal_id = str(chat_id).removeprefix("-100")
 
         return f"https://t.me/c/{internal_id}/{message_id}"
 
