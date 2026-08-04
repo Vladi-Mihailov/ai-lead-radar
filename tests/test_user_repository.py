@@ -1,7 +1,8 @@
 """
-Тесты UserRepository — локальный кэш пользователей Telegram, в частности
-новое поле keywords (add_keywords/get_keywords) и автоматическая миграция
-для баз, созданных до его появления.
+Тесты UserRepository — локальный кэш пользователей Telegram: keywords
+(add_keywords/get_keywords), access_hash/peer_type/peer_updated_at (для
+восстановления InputPeerUser без @username) и автоматическая миграция для
+баз, созданных до появления этих полей.
 """
 
 import sqlite3
@@ -119,5 +120,144 @@ def test_migration_adds_keywords_column_to_legacy_database(tmp_path):
 
         repository.add_keywords(777, ["осаго"])
         assert repository.get_keywords(777) == ["осаго"]
+    finally:
+        repository.close()
+
+
+def test_migration_adds_peer_columns_to_legacy_database(tmp_path):
+    db_path = tmp_path / "users.db"
+
+    # База в формате до появления access_hash/peer_type/peer_updated_at
+    # (но уже с keywords — промежуточная версия схемы).
+    legacy_conn = sqlite3.connect(db_path)
+    legacy_conn.execute(
+        """
+        CREATE TABLE users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            is_bot INTEGER,
+            keywords TEXT,
+            last_seen_at TIMESTAMP,
+            updated_at TIMESTAMP
+        )
+        """
+    )
+    legacy_conn.execute(
+        "INSERT INTO users (user_id, username, is_bot) VALUES (888, 'legacy_user2', 0)"
+    )
+    legacy_conn.commit()
+    legacy_conn.close()
+
+    repository = UserRepository(db_path)
+    try:
+        columns = {
+            row[1] for row in repository._conn.execute("PRAGMA table_info(users)")
+        }
+        assert {"access_hash", "peer_type", "peer_updated_at"} <= columns
+
+        existing_user = repository.get(888)
+        assert existing_user is not None
+        assert existing_user.access_hash is None
+        assert existing_user.peer_type is None
+        assert repository.get_peer_updated_at(888) is None
+
+        repository.upsert(
+            TelegramUserInfo(
+                user_id=888, username="legacy_user2", first_name=None, last_name=None,
+                access_hash=123456789, peer_type="User",
+            )
+        )
+        updated_user = repository.get(888)
+        assert updated_user.access_hash == 123456789
+        assert updated_user.peer_type == "User"
+        assert repository.get_peer_updated_at(888) is not None
+    finally:
+        repository.close()
+
+
+# ---- access_hash / peer_type ----
+
+
+def test_upsert_saves_access_hash_and_peer_type(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.upsert(
+            TelegramUserInfo(
+                user_id=901, username="ivan", first_name="Ivan", last_name=None,
+                access_hash=111222333, peer_type="User",
+            )
+        )
+
+        user = repository.get(901)
+        assert user.access_hash == 111222333
+        assert user.peer_type == "User"
+        assert repository.get_peer_updated_at(901) is not None
+    finally:
+        repository.close()
+
+
+def test_upsert_without_access_hash_does_not_overwrite_existing_one(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.upsert(
+            TelegramUserInfo(
+                user_id=902, username="ivan", first_name=None, last_name=None,
+                access_hash=111222333, peer_type="User",
+            )
+        )
+        first_peer_updated_at = repository.get_peer_updated_at(902)
+
+        # Обычный upsert без access_hash (как делает большинство существующих
+        # вызовов) — не должен затирать уже сохранённый хэш.
+        repository.upsert(
+            TelegramUserInfo(user_id=902, username="ivan_new", first_name=None, last_name=None)
+        )
+
+        user = repository.get(902)
+        assert user.username == "ivan_new"
+        assert user.access_hash == 111222333
+        assert user.peer_type == "User"
+        assert repository.get_peer_updated_at(902) == first_peer_updated_at
+    finally:
+        repository.close()
+
+
+def test_upsert_updates_access_hash_when_it_changes(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.upsert(
+            TelegramUserInfo(
+                user_id=903, username="ivan", first_name=None, last_name=None,
+                access_hash=111, peer_type="User",
+            )
+        )
+
+        # access_hash может смениться (например, после смены сессии) — новый
+        # upsert с новым значением должен его обновить, а не игнорировать.
+        repository.upsert(
+            TelegramUserInfo(
+                user_id=903, username="ivan", first_name=None, last_name=None,
+                access_hash=999, peer_type="User",
+            )
+        )
+
+        assert repository.get(903).access_hash == 999
+    finally:
+        repository.close()
+
+
+def test_get_returns_none_access_hash_and_peer_type_when_never_set(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.upsert(
+            TelegramUserInfo(user_id=904, username="ivan", first_name=None, last_name=None)
+        )
+
+        user = repository.get(904)
+        assert user.access_hash is None
+        assert user.peer_type is None
+        assert repository.get_peer_updated_at(904) is None
     finally:
         repository.close()

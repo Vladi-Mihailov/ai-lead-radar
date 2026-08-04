@@ -252,6 +252,11 @@ class TelegramSource(BaseSource):
             first_name=getattr(sender, "first_name", None),
             last_name=getattr(sender, "last_name", None),
             is_bot=bool(getattr(sender, "bot", False)),
+            # sender здесь — настоящий объект от Telethon (не None, не
+            # UserEmpty) — сохраняем access_hash для восстановления
+            # InputPeerUser без @username (см. UserRepository.upsert()).
+            access_hash=getattr(sender, "access_hash", None),
+            peer_type=type(sender).__name__,
         )
 
     async def _fetch_sender_info(

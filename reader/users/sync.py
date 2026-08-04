@@ -39,6 +39,11 @@ async def sync_all_users(
                         first_name=participant.first_name,
                         last_name=participant.last_name,
                         is_bot=bool(getattr(participant, "bot", False)),
+                        # participant — полноценный объект Telethon User —
+                        # сохраняем access_hash для восстановления
+                        # InputPeerUser без @username.
+                        access_hash=getattr(participant, "access_hash", None),
+                        peer_type=type(participant).__name__,
                     )
                 )
                 synced += 1

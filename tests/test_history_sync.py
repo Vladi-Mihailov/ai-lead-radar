@@ -36,12 +36,16 @@ _EMPTY_MATCHER = KeywordMatcher([])
 
 
 class _FakeSender:
-    def __init__(self, user_id, username=None, first_name=None, last_name=None, bot=False):
+    def __init__(
+        self, user_id, username=None, first_name=None, last_name=None, bot=False,
+        access_hash=None,
+    ):
         self.id = user_id
         self.username = username
         self.first_name = first_name
         self.last_name = last_name
         self.bot = bot
+        self.access_hash = access_hash
 
 
 class _FakeMessage:
@@ -360,6 +364,66 @@ async def test_keywords_from_different_messages_accumulate(tmp_path):
         await sync_users_from_history(client, [group], repository, state_repository, _KEYWORD_MATCHER)
 
         assert sorted(repository.get_keywords(805)) == ["осаго", "страховка"]
+    finally:
+        repository.close()
+        state_repository.close()
+
+
+# ---- access_hash / peer_type (InputPeerUser prep) ----
+
+
+async def test_history_sync_saves_access_hash_and_peer_type_for_new_sender(tmp_path):
+    get_sender_calls = []
+    sender = _FakeSender(901, username="new_user", access_hash=555666777)
+    messages = [_FakeMessage(1, 901, sender, get_sender_calls)]
+    entity = _FakeEntity(-100901, "Test group")
+    group = Group(id=-100901, username=None, title="Test group")
+
+    repository = UserRepository(tmp_path / "users.db")
+    state_repository = HistorySyncStateRepository(tmp_path / "users.db")
+    try:
+        client = _FakeClient(entity, messages, get_sender_calls)
+        await sync_users_from_history(client, [group], repository, state_repository, _EMPTY_MATCHER)
+
+        user = repository.get(901)
+        assert user.access_hash == 555666777
+        # peer_type берётся из реального класса объекта Telethon, а не
+        # захардкожен — здесь это фейковый класс сендера теста.
+        assert user.peer_type == "_FakeSender"
+        assert repository.get_peer_updated_at(901) is not None
+    finally:
+        repository.close()
+        state_repository.close()
+
+
+async def test_history_sync_updates_access_hash_when_it_changes(tmp_path):
+    get_sender_calls = []
+    entity = _FakeEntity(-100902, "Test group")
+    group = Group(id=-100902, username=None, title="Test group")
+
+    repository = UserRepository(tmp_path / "users.db")
+    state_repository = HistorySyncStateRepository(tmp_path / "users.db")
+    try:
+        # Пользователь уже известен локально с одним access_hash.
+        repository.upsert(
+            TelegramUserInfo(
+                user_id=902, username="ivan", first_name=None, last_name=None,
+                access_hash=111, peer_type="User",
+            )
+        )
+
+        # Раз пользователь уже в кэше, get_sender() не вызывается (см. тест
+        # про пропуск сети выше) — обновления access_hash через историю не
+        # происходит для уже известных, но и не ломает существующий кэш.
+        sender = _FakeSender(902, username="ivan", access_hash=999)
+        messages = [_FakeMessage(1, 902, sender, get_sender_calls)]
+        client = _FakeClient(entity, messages, get_sender_calls)
+        await sync_users_from_history(client, [group], repository, state_repository, _EMPTY_MATCHER)
+
+        # Обновление access_hash уже известного пользователя в этой задаче
+        # не требовалось (только сохранение для новых) — старое значение
+        # должно остаться нетронутым, а не быть заменено на None/битым.
+        assert repository.get(902).access_hash == 111
     finally:
         repository.close()
         state_repository.close()

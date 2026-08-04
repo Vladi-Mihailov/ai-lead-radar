@@ -188,6 +188,12 @@ async def _sync_group_history(
                                         first_name=getattr(sender, "first_name", None),
                                         last_name=getattr(sender, "last_name", None),
                                         is_bot=bool(getattr(sender, "bot", False)),
+                                        # sender — полноценный объект Telethon
+                                        # User — сохраняем access_hash для
+                                        # восстановления InputPeerUser без
+                                        # @username.
+                                        access_hash=getattr(sender, "access_hash", None),
+                                        peer_type=type(sender).__name__,
                                     )
                                 )
                             except Exception:

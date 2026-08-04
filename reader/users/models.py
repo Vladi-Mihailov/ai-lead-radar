@@ -8,6 +8,11 @@ class TelegramUserInfo:
     first_name: str | None
     last_name: str | None
     is_bot: bool = False
+    # Для восстановления InputPeerUser(user_id, access_hash) без @username —
+    # см. UserRepository.upsert(). None означает "неизвестно/не передано" (а
+    # не "нет"), поэтому уже сохранённое значение не затирается.
+    access_hash: int | None = None
+    peer_type: str | None = None
 
     @property
     def full_name(self) -> str | None:

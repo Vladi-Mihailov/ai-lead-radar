@@ -28,12 +28,16 @@ from reader.users.repository import UserRepository  # noqa: E402
 class _FakeSender:
     """То, что вернул бы Telegram: известен id, но не username."""
 
-    def __init__(self, id, username=None, first_name=None, last_name=None, bot=False):
+    def __init__(
+        self, id, username=None, first_name=None, last_name=None, bot=False,
+        access_hash=None,
+    ):
         self.id = id
         self.username = username
         self.first_name = first_name
         self.last_name = last_name
         self.bot = bot
+        self.access_hash = access_hash
 
 
 class _FakeEvent:
@@ -90,5 +94,42 @@ async def test_message_uses_cached_username_when_telegram_omits_it(tmp_path):
         assert message.sender_id == 123
         assert message.sender_username == "ivan"
         assert message.sender_username != "123"
+    finally:
+        repository.close()
+
+
+async def test_new_sender_message_saves_access_hash_and_peer_type(tmp_path):
+    """reader.main (через TelegramSource, тот же путь, что и Pipeline):
+    когда Telethon передал полноценный объект User с access_hash — он
+    должен сохраниться в локальном кэше для восстановления InputPeerUser
+    без @username."""
+    repository = UserRepository(tmp_path / "users.db")
+
+    telegram_settings = TelegramSettings(
+        session_path_live=tmp_path / "session_live",
+        session_path_sync=tmp_path / "session_sync",
+        api_id=1,
+        api_hash="dummy",
+        phone="+70000000000",
+    )
+    source = TelegramSource(telegram_settings, groups=[], user_repository=repository)
+
+    try:
+        event = _FakeEvent(
+            message_id=1,
+            chat_id=-100987654321,
+            sender_id=456,
+            text="Нужна страховка",
+            date=datetime.now(timezone.utc),
+            sender=_FakeSender(id=456, username="new_user", access_hash=987654321),
+        )
+
+        await source.handle_new_message(event)
+
+        user = repository.get(456)
+        assert user is not None
+        assert user.access_hash == 987654321
+        assert user.peer_type == "_FakeSender"
+        assert repository.get_peer_updated_at(456) is not None
     finally:
         repository.close()
