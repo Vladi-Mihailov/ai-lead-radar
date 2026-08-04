@@ -11,7 +11,6 @@ Telethon ничего не подключает в конструкторе, с�
 
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -227,50 +226,28 @@ def test_validate_fine_monitor_config_fails_without_notification_chat(tmp_path, 
         validate_fine_monitor_config(settings, resolve_notification_chat_ids(settings))
 
 
-def test_validate_fine_monitor_config_passes_with_empty_allowed_user_ids(tmp_path, monkeypatch):
-    # Пустой allowed_user_ids — штатный случай (см. resolve_allowed_user_ids),
-    # а не ошибка конфигурации: не должен приводить к fail-fast.
+def test_validate_fine_monitor_config_fails_with_empty_allowed_user_ids(tmp_path, monkeypatch):
     _set_required_env(monkeypatch)
     config_path = _write_config(tmp_path, _CONFIG_YAML_NO_ALLOWED_USERS)
     settings = load_settings(config_path)
 
-    validate_fine_monitor_config(settings, resolve_notification_chat_ids(settings))
+    with pytest.raises(ConfigError, match="allowed_user_ids"):
+        validate_fine_monitor_config(settings, resolve_notification_chat_ids(settings))
 
 
-class _FakeClientWithMe:
-    def __init__(self, me_id: int):
-        self._me_id = me_id
-        self.get_me_called = False
-
-    async def get_me(self):
-        self.get_me_called = True
-        return SimpleNamespace(id=self._me_id)
-
-
-async def test_resolve_allowed_user_ids_prefers_explicit_config(tmp_path, monkeypatch):
+def test_resolve_allowed_user_ids_returns_configured_list(tmp_path, monkeypatch):
     _set_required_env(monkeypatch)
     config_path = _write_config(tmp_path, _CONFIG_YAML)
     settings = load_settings(config_path)
 
-    client = _FakeClientWithMe(me_id=999)
-
-    result = await resolve_allowed_user_ids(settings, client)
-
-    assert result == [111]
-    # Явно настроенный список — client.get_me() вообще не должен вызываться.
-    assert client.get_me_called is False
+    assert resolve_allowed_user_ids(settings) == [111]
 
 
-async def test_resolve_allowed_user_ids_falls_back_to_current_account(tmp_path, monkeypatch, caplog):
+def test_resolve_allowed_user_ids_returns_empty_list_without_fallback(tmp_path, monkeypatch):
+    # Автофоллбэк на client.get_me().id убран — пустой список остаётся
+    # пустым, никакого обращения к Telegram-клиенту здесь больше нет.
     _set_required_env(monkeypatch)
     config_path = _write_config(tmp_path, _CONFIG_YAML_NO_ALLOWED_USERS)
     settings = load_settings(config_path)
 
-    client = _FakeClientWithMe(me_id=999)
-
-    with caplog.at_level("INFO"):
-        result = await resolve_allowed_user_ids(settings, client)
-
-    assert result == [999]
-    assert client.get_me_called is True
-    assert "Fine commands allowed for current account: 999" in caplog.text
+    assert resolve_allowed_user_ids(settings) == []

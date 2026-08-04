@@ -57,8 +57,10 @@ class CommandDispatcher:
         # Фильтр chats= в start() уже гарантирует нужный чат; здесь отсекаем
         # по отправителю внутри этого чата (например, если это группа).
         if event.sender_id not in self._allowed_user_ids:
-            logger.debug(
-                "Команда проигнорирована: user_id=%s не разрешён", event.sender_id
+            logger.info(
+                "Команда fine проигнорирована:\nsender_id=%s,\nallowed_user_ids=%s",
+                event.sender_id,
+                sorted(self._allowed_user_ids),
             )
             return
 

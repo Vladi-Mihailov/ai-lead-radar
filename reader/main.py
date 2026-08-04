@@ -51,17 +51,11 @@ def resolve_notification_chat_ids(settings: Settings) -> list[int | str]:
     return settings.fine_monitor.notification_chat_ids or settings.app.lead_forward_to
 
 
-async def resolve_allowed_user_ids(settings: Settings, client) -> list[int]:
-    """fine_monitor.allowed_user_ids, а если пусто — id уже авторизованного
-    аккаунта (сейчас в проекте используется один Telegram-аккаунт, поэтому
-    он и есть разумный получатель по умолчанию). client.get_me() — тот же
-    уже подключённый клиент, второе подключение не создаётся."""
-    if settings.fine_monitor.allowed_user_ids:
-        return settings.fine_monitor.allowed_user_ids
-
-    me = await client.get_me()
-    logger.info("Fine commands allowed for current account: %s", me.id)
-    return [me.id]
+def resolve_allowed_user_ids(settings: Settings) -> list[int]:
+    """fine_monitor.allowed_user_ids как есть, без автофоллбэка: пустой
+    список — штатное значение этой функции, отклонять его — забота
+    validate_fine_monitor_config(), а не этой функции (см. её докстрок)."""
+    return settings.fine_monitor.allowed_user_ids
 
 
 def build_fine_monitor_components(
@@ -124,16 +118,18 @@ def build_fine_monitor_components(
 def validate_fine_monitor_config(settings: Settings, notification_chat_ids: list[int | str]) -> None:
     """Fail-fast проверки перед запуском мониторинга штрафов — вынесены в
     отдельную синхронную функцию, чтобы их можно было проверить тестом без
-    реального Telegram-клиента (см. test_main_wiring.py).
-
-    fine_monitor.allowed_user_ids здесь не проверяется: пустой список —
-    штатный случай (см. resolve_allowed_user_ids), а не ошибка конфигурации.
-    """
+    реального Telegram-клиента (см. test_main_wiring.py)."""
     if not notification_chat_ids:
         raise ConfigError(
             "fine_monitor.enabled=true, но не задан ни fine_monitor.notification_chat_ids, "
             "ни app.lead_forward_to (LEAD_FORWARD_TO) — некуда отправлять уведомления и "
             "не в каком чате слушать команды"
+        )
+
+    if not settings.fine_monitor.allowed_user_ids:
+        raise ConfigError(
+            "fine_monitor.allowed_user_ids не настроен.\n"
+            "Добавьте Telegram User ID операторов, которым разрешено выполнять команды fine."
         )
 
 
@@ -152,7 +148,7 @@ async def _run_fine_monitor(
 
     await source.wait_until_ready()
 
-    allowed_user_ids = await resolve_allowed_user_ids(settings, source.client)
+    allowed_user_ids = resolve_allowed_user_ids(settings)
 
     http_client = httpx.AsyncClient(
         base_url="https://police.ge/protocol/",
