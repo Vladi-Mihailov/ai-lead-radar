@@ -225,6 +225,118 @@ async def test_completed_group_is_skipped_without_reading_history_again(tmp_path
         state_repository.close()
 
 
+# ---- force=True (--reindex): переиндексация игнорирует checkpoint ----
+
+
+async def test_force_rereads_history_of_already_completed_group(tmp_path):
+    get_sender_calls = []
+    messages = _make_messages(50, get_sender_calls)
+    entity = _FakeEntity(-101001, "Test group")
+    group = Group(id=-101001, username=None, title="Test group")
+
+    repository = UserRepository(tmp_path / "users.db")
+    state_repository = HistorySyncStateRepository(tmp_path / "users.db")
+    try:
+        client = _FakeClient(entity, messages, get_sender_calls)
+        await sync_users_from_history(client, [group], repository, state_repository, _EMPTY_MATCHER)
+        assert client.iter_messages_calls == 1
+
+        # Без force повторный запуск не читает историю (как и раньше).
+        skip_client = _FakeClient(entity, messages, get_sender_calls)
+        await sync_users_from_history(skip_client, [group], repository, state_repository, _EMPTY_MATCHER)
+        assert skip_client.iter_messages_calls == 0
+
+        # force=True — история читается заново, несмотря на завершённый checkpoint.
+        force_client = _FakeClient(entity, messages, get_sender_calls)
+        await sync_users_from_history(
+            force_client, [group], repository, state_repository, _EMPTY_MATCHER, force=True
+        )
+        assert force_client.iter_messages_calls >= 1
+
+        checkpoint = state_repository.get(-101001)
+        assert checkpoint.history_completed is True
+        assert checkpoint.processed_messages == 50
+    finally:
+        repository.close()
+        state_repository.close()
+
+
+async def test_force_refreshes_access_hash_for_already_known_sender(tmp_path):
+    """Сценарий из отчёта о баге: группа была полностью проиндексирована до
+    появления access_hash — обычный запуск её пропускает и никогда не
+    досчитает access_hash для уже известных пользователей; --reindex должен
+    это исправить."""
+    get_sender_calls = []
+    entity = _FakeEntity(-101002, "Test group")
+    group = Group(id=-101002, username=None, title="Test group")
+
+    repository = UserRepository(tmp_path / "users.db")
+    state_repository = HistorySyncStateRepository(tmp_path / "users.db")
+    try:
+        # Пользователь и checkpoint — как будто из "старого" прогона, до
+        # появления access_hash: пользователь известен, но без access_hash,
+        # группа уже отмечена полностью проиндексированной.
+        repository.upsert(
+            TelegramUserInfo(user_id=444, username="ivan", first_name=None, last_name=None)
+        )
+        state_repository.save_progress(
+            chat_id=-101002, chat_name="Test group", oldest_processed_message_id=1,
+            oldest_processed_date=None, processed_messages=10, saved_users=1,
+            history_completed=True,
+        )
+        assert repository.get(444).access_hash is None
+
+        sender_with_hash = _FakeSender(444, username="ivan", access_hash=123123123)
+        messages = [_FakeMessage(1, 444, sender_with_hash, get_sender_calls)]
+
+        # Без force ничего не меняется — группа считается завершённой.
+        client = _FakeClient(entity, messages, get_sender_calls)
+        await sync_users_from_history(client, [group], repository, state_repository, _EMPTY_MATCHER)
+        assert repository.get(444).access_hash is None
+        assert get_sender_calls == []
+
+        # С force=True — история перечитывается, и для уже известного
+        # пользователя всё равно запрашивается свежий объект User.
+        force_client = _FakeClient(entity, messages, get_sender_calls)
+        await sync_users_from_history(
+            force_client, [group], repository, state_repository, _EMPTY_MATCHER, force=True
+        )
+        assert get_sender_calls == [444]
+        assert repository.get(444).access_hash == 123123123
+
+        # Пользователь уже был известен — переиндексация не должна считать
+        # его "новым" в статистике checkpoint.
+        checkpoint = state_repository.get(-101002)
+        assert checkpoint.saved_users == 0
+    finally:
+        repository.close()
+        state_repository.close()
+
+
+async def test_force_still_counts_genuinely_new_users(tmp_path):
+    get_sender_calls = []
+    entity = _FakeEntity(-101003, "Test group")
+    group = Group(id=-101003, username=None, title="Test group")
+
+    repository = UserRepository(tmp_path / "users.db")
+    state_repository = HistorySyncStateRepository(tmp_path / "users.db")
+    try:
+        sender = _FakeSender(555, username="new_user", access_hash=999)
+        messages = [_FakeMessage(1, 555, sender, get_sender_calls)]
+
+        client = _FakeClient(entity, messages, get_sender_calls)
+        await sync_users_from_history(
+            client, [group], repository, state_repository, _EMPTY_MATCHER, force=True
+        )
+
+        checkpoint = state_repository.get(-101003)
+        assert checkpoint.saved_users == 1
+        assert repository.get(555).access_hash == 999
+    finally:
+        repository.close()
+        state_repository.close()
+
+
 async def test_known_sender_skips_get_sender_and_duplicate_upsert(tmp_path):
     get_sender_calls = []
     known_sender = _FakeSender(777, username="ivan")

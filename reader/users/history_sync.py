@@ -38,6 +38,8 @@ async def sync_users_from_history(
     repository: UserRepository,
     state_repository: HistorySyncStateRepository,
     matcher: KeywordMatcher,
+    *,
+    force: bool = False,
 ) -> None:
     """Инкрементально проходит историю сообщений групп и сохраняет авторов.
 
@@ -56,9 +58,15 @@ async def sync_users_from_history(
     сообщение прогоняется через него, и найденные keywords сохраняются в
     UserRepository (см. _sync_group_history) — независимо от того, штатный
     ли это отправитель или уже известный локально.
+
+    force=True (см. sync_users.py --reindex) — полностью игнорирует
+    checkpoint: не пропускает уже "завершённые" группы и заново запрашивает
+    полную информацию об отправителе (а не только для новых) для каждой
+    группы, чтобы досчитать поля, добавленные после того, как группа была
+    полностью проиндексирована в прошлый раз (например, keywords/access_hash).
     """
 
-    logger.info("Синхронизация истории начата")
+    logger.info("Синхронизация истории начата%s", " (принудительная переиндексация)" if force else "")
 
     for group in groups:
         try:
@@ -72,7 +80,9 @@ async def sync_users_from_history(
             continue
 
         title = group.title or getattr(entity, "title", None) or str(group.identifier)
-        await _sync_group_history(client, entity, title, repository, state_repository, matcher)
+        await _sync_group_history(
+            client, entity, title, repository, state_repository, matcher, force=force
+        )
 
 
 async def _sync_group_history(
@@ -82,24 +92,41 @@ async def _sync_group_history(
     repository: UserRepository,
     state_repository: HistorySyncStateRepository,
     matcher: KeywordMatcher,
+    *,
+    force: bool = False,
 ) -> None:
     chat_id = entity.id
     checkpoint = state_repository.get(chat_id)
 
-    if checkpoint and checkpoint.history_completed:
+    if checkpoint and checkpoint.history_completed and not force:
         logger.info(
             "Группа: %s — история уже полностью проиндексирована, пропускаю", title
         )
         return
 
+    if force and checkpoint:
+        logger.info(
+            "Группа: %s — принудительная переиндексация, игнорирую checkpoint "
+            "(был: message_id=%s, завершён=%s)",
+            title,
+            checkpoint.oldest_processed_message_id,
+            checkpoint.history_completed,
+        )
+
     logger.info("Группа: %s", title)
 
     flood_wait_retries = 0
+    # Игнорируем сохранённый checkpoint только для самого первого прохода
+    # цикла этой группы — если после него потребуется повтор (FloodWait),
+    # дальше резюмируемся уже от прогресса, который сохранил сам этот же
+    # прогон переиндексации, а не от старого checkpoint.
+    ignore_checkpoint = force
 
     while True:
         # Перечитываем checkpoint на каждой попытке — при повторе после
         # FloodWait он уже мог продвинуться благодаря периодическим save.
-        checkpoint = state_repository.get(chat_id)
+        checkpoint = None if ignore_checkpoint else state_repository.get(chat_id)
+        ignore_checkpoint = False
         offset_id = checkpoint.oldest_processed_message_id if checkpoint else 0
         processed_messages = checkpoint.processed_messages if checkpoint else 0
         saved_users_total = checkpoint.saved_users if checkpoint else 0
@@ -167,13 +194,18 @@ async def _sync_group_history(
                         existing = None
                         lookup_failed = True
 
-                    if not lookup_failed and existing is None:
-                        # Пользователя ещё нет в кэше — только в этом случае есть
-                        # смысл спрашивать Telegram: get_sender() может уйти в
-                        # сеть (GetUsersRequest), если отправитель пришёл в
-                        # составе страницы истории как "min"-сущность — а для
-                        # уже известных пользователей это лишний сетевой запрос
-                        # на каждое сообщение без всякой пользы.
+                    # Пользователя ещё нет в кэше — только в этом случае есть
+                    # смысл спрашивать Telegram: get_sender() может уйти в
+                    # сеть (GetUsersRequest), если отправитель пришёл в
+                    # составе страницы истории как "min"-сущность — а для
+                    # уже известных пользователей это лишний сетевой запрос
+                    # на каждое сообщение без всякой пользы.
+                    #
+                    # force=True (переиндексация) — исключение: запрашиваем
+                    # свежий объект User даже для уже известных отправителей,
+                    # чтобы досчитать поля вроде access_hash, которых не было
+                    # при первом проходе (см. sync_users.py --reindex).
+                    if not lookup_failed and (existing is None or force):
                         try:
                             sender = await message.get_sender()
                         except Exception:
@@ -202,10 +234,16 @@ async def _sync_group_history(
                                     sender_id,
                                 )
                             else:
-                                saved_users_total += 1
-                                new_users_in_batch += 1
-                    # existing уже в кэше (или чтение не удалось) — ни сети,
-                    # ни записи для этого сообщения не требуется.
+                                # saved_users_total/new_users_in_batch — счётчик
+                                # именно НОВЫХ пользователей: при force=True
+                                # existing может быть не None (мы всё равно
+                                # обновили его данные выше), это не "новый".
+                                if existing is None:
+                                    saved_users_total += 1
+                                    new_users_in_batch += 1
+                    # existing уже в кэше и не идёт переиндексация (или чтение
+                    # не удалось) — ни сети, ни записи для этого сообщения не
+                    # требуется.
 
                 if since_checkpoint >= _CHECKPOINT_INTERVAL:
                     save_checkpoint(history_completed=False)
