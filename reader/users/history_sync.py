@@ -55,19 +55,103 @@ def _upsert_sender(repository: UserRepository, sender_id: int, sender) -> bool:
     return True
 
 
+async def _resolve_one_by_one(
+    client: TelegramClient, user_ids: list[int]
+) -> tuple[dict[int, object], list[int]]:
+    """Поштучный fallback — только для ошибок, НЕ являющихся FloodWaitError
+    (та означает общую временную блокировку API, а не проблему конкретной
+    сущности, см. _resolve_entity_batch). Если FloodWaitError всё же
+    случится на отдельном id — цикл прерывается немедленно, без попыток на
+    оставшихся: иначе каждый из них тоже почти сразу получил бы тот же
+    FloodWaitError, порождая лавину одинаковых ошибок.
+
+    Возвращает (entities_by_id, failed_ids) — failed_ids это только те id,
+    для которых попытка была РЕАЛЬНО совершена и завершилась НЕ-FloodWait
+    ошибкой. Id, до которых не дошли из-за прерывания по FloodWaitError, в
+    failed_ids не попадают — они не считаются "проблемной сущностью" и
+    просто останутся неразрешёнными до следующего чекпоинта/прогона.
+    """
+    entities_by_id: dict[int, object] = {}
+    failed_ids: list[int] = []
+    for index, user_id in enumerate(user_ids):
+        try:
+            entities_by_id[user_id] = await client.get_entity(user_id)
+        except FloodWaitError as exc:
+            logger.warning(
+                "FloodWaitError при поштучном резолве (%d сек.) — прекращаю, "
+                "%d пользователей останутся неразрешёнными до следующего "
+                "чекпоинта",
+                exc.seconds, len(user_ids) - index,
+            )
+            break
+        except Exception:
+            failed_ids.append(user_id)
+    return entities_by_id, failed_ids
+
+
+async def _resolve_entity_batch(
+    client: TelegramClient, user_ids: list[int]
+) -> tuple[dict[int, object], list[int]]:
+    """Резолвит user_ids ОДНИМ пакетным client.get_entity() вместо отдельного
+    RPC на каждого — Telethon сам разбивает большие списки на запросы по 200
+    (лимит GetUsersRequest).
+
+    FloodWaitError — общая временная блокировка Telegram API (не ошибка
+    конкретного пакета или пользователя): при ней ждём exc.seconds и
+    повторяем ТОТ ЖЕ пакетный запрос один раз, без перехода на поштучный
+    fallback (который раньше на FloodWaitError немедленно давал каждому
+    пользователю в наборе тот же FloodWaitError заново — лавина ошибок).
+    Если блокировка не сошла и после повтора — оставляем весь набор
+    неразрешённым до следующего чекпоинта/прогона, тоже без единого
+    поштучного запроса.
+
+    Поштучный fallback (_resolve_one_by_one) применяется только если ошибка
+    НЕ FloodWaitError — то есть свидетельствует о проблеме с конкретными
+    сущностями внутри пакета, а не с API в целом.
+
+    Возвращает (entities_by_id, failed_ids) — см. _resolve_one_by_one.
+    """
+    try:
+        entities = await client.get_entity(user_ids)
+        return dict(zip(user_ids, entities)), []
+    except FloodWaitError as exc:
+        logger.warning(
+            "Пакетный резолв %d пользователей получил FloodWaitError (%d сек.) — "
+            "жду и повторяю пакетный запрос один раз, без поштучного fallback",
+            len(user_ids), exc.seconds,
+        )
+        await asyncio.sleep(exc.seconds)
+        try:
+            entities = await client.get_entity(user_ids)
+            return dict(zip(user_ids, entities)), []
+        except FloodWaitError as exc2:
+            logger.warning(
+                "FloodWaitError повторился (%d сек.) после повтора пакета — "
+                "%d пользователей останутся неразрешёнными до следующего "
+                "чекпоинта, поштучный fallback не выполняется",
+                exc2.seconds, len(user_ids),
+            )
+            return {}, []
+        except Exception:
+            return await _resolve_one_by_one(client, user_ids)
+    except Exception:
+        # Не FloodWaitError — например, битый id, который get_input_entity()
+        # выше не отфильтровал. Именно такие ошибки — про конкретную
+        # сущность, поэтому здесь fallback оправдан.
+        return await _resolve_one_by_one(client, user_ids)
+
+
 async def _resolve_and_upsert_pending(
     client: TelegramClient,
     repository: UserRepository,
     pending: dict[int, bool],
     failed_identity_refresh: set[int],
 ) -> tuple[int, int]:
-    """Резолвит все накопленные user_id ОДНИМ пакетным client.get_entity()
-    вместо отдельного RPC на каждого — Telethon сам разбивает большие списки
-    на запросы по 200 (лимит GetUsersRequest), так что даже сотни
-    пользователей обходятся считанными запросами. Именно вызов get_sender()
-    (или get_entity()) один раз НА КАЖДОЕ СООБЩЕНИЕ активного автора вместо
-    одного раза на пользователя и был причиной практически непрерывного
-    FloodWait при --reindex.
+    """Резолвит все накопленные user_id одним пакетным запросом (см.
+    _resolve_entity_batch) вместо отдельного RPC на каждого — именно вызов
+    get_sender()/get_entity() один раз НА КАЖДОЕ СООБЩЕНИЕ активного автора
+    вместо одного раза на пользователя был причиной практически
+    непрерывного FloodWait при --reindex.
 
     pending — {user_id: is_new}, is_new только для статистики (не считать
     уже известных пользователей "новыми" при переиндексации). Очищается
@@ -78,93 +162,47 @@ async def _resolve_and_upsert_pending(
     голого положительного int, см. докстрок get_input_entity()). Только
     закэшированные id идут в пакетный get_entity(); те, что не резолвятся
     даже так, изолируются заранее — иначе один такой id рушит get_entity()
-    целиком (см. диагностику и объяснение в history_sync.py issue про
-    "Пакетное получение ... не удалось").
+    целиком.
 
-    Любой user_id, для которого резолв так и не удался (ни пакетно, ни по
-    одному), добавляется в failed_identity_refresh — до конца текущего
-    вызова sync_users_from_history() к нему больше не будет попытки RPC
-    (см. needs_refresh в _sync_group_history). В следующем запуске программы
-    множество создаётся заново, так что попытка повторится.
+    user_id считается окончательно неразрешимым (и попадает в
+    failed_identity_refresh — до конца текущего вызова sync_users_from_history()
+    к нему больше не будет попытки, см. needs_refresh в _sync_group_history)
+    только если он не в локальном кэше ВООБЩЕ, либо был реально
+    ЗАПРОШЕН и получил не-FloodWait ошибку. Id, отложенные из-за
+    FloodWaitError, туда не попадают — они не "проблемная сущность", а
+    жертва общего ограничения API, и должны получить новую попытку на
+    следующем чекпоинте/прогоне.
     """
     if not pending:
         return 0, 0
 
     user_ids = list(pending.keys())
 
-    # ВРЕМЕННАЯ ДИАГНОСТИКА — убрать после того, как причина падения
-    # пакетного get_entity() будет подтверждена в проде. Печатает, какие
-    # именно id не проходят даже локальный (безсетевой) lookup, и почему.
-    for user_id in user_ids:
-        if user_id is None:
-            logger.warning("[DIAG] None среди id, ожидающих резолва — пропускаю")
-            continue
-        if not isinstance(user_id, int) or user_id <= 0:
-            logger.warning(
-                "[DIAG] Подозрительный id среди ожидающих резолва: %r (тип %s)",
-                user_id, type(user_id).__name__,
-            )
-
     resolvable_ids = []
-    unresolvable_ids = []
+    not_in_cache_ids = []
     for user_id in user_ids:
         try:
-            input_entity = await client.get_input_entity(user_id)
-        except Exception as exc:
-            unresolvable_ids.append(user_id)
-            logger.warning(
-                "[DIAG] user_id=%s не резолвится даже в input_entity "
-                "(нет в локальном кэше Telethon, без сети): %s: %s",
-                user_id, type(exc).__name__, exc,
-            )
+            await client.get_input_entity(user_id)
+        except Exception:
+            not_in_cache_ids.append(user_id)
         else:
             resolvable_ids.append(user_id)
-            logger.warning(
-                "[DIAG] user_id=%s -> %s", user_id, type(input_entity).__name__
-            )
-
-    if unresolvable_ids:
-        logger.warning(
-            "[DIAG] Исключено из пакетного резолва %d из %d id (не в локальном "
-            "кэше Telethon): %s",
-            len(unresolvable_ids), len(user_ids), unresolvable_ids,
-        )
 
     entities_by_id: dict[int, object] = {}
+    failed_ids: list[int] = []
     if resolvable_ids:
-        try:
-            entities = await client.get_entity(resolvable_ids)
-            entities_by_id = dict(zip(resolvable_ids, entities))
-        except Exception as exc:
-            # Пакетный запрос всё равно может упасть целиком (например,
-            # get_input_entity() выше был не единственным местом, где
-            # возможна ошибка) — дорезолвливаем по одному, чтобы не терять
-            # остальных валидных из этого набора.
-            logger.warning(
-                "[DIAG] Пакетное получение %d пользователей не удалось: %s: %s "
-                "— дорезолвливаю по одному",
-                len(resolvable_ids), type(exc).__name__, exc,
-            )
-            for user_id in resolvable_ids:
-                try:
-                    entities_by_id[user_id] = await client.get_entity(user_id)
-                except Exception as exc2:
-                    logger.warning(
-                        "[DIAG] user_id=%s не резолвился и по одному: %s: %s",
-                        user_id, type(exc2).__name__, exc2,
-                    )
-                    entities_by_id[user_id] = None
-    # --- конец временной диагностики ---
+        entities_by_id, failed_ids = await _resolve_entity_batch(client, resolvable_ids)
+
+    for user_id in not_in_cache_ids:
+        failed_identity_refresh.add(user_id)
+    for user_id in failed_ids:
+        failed_identity_refresh.add(user_id)
 
     upserted = 0
     new_count = 0
     for user_id in user_ids:
         sender = entities_by_id.get(user_id)
         if sender is None:
-            # Резолв не удался ни пакетно, ни по одному (см. unresolvable_ids
-            # выше и entities_by_id[user_id] = None в фоллбэке) — не пытаемся
-            # снова до конца этого запуска sync_users.py.
-            failed_identity_refresh.add(user_id)
             continue
         if _upsert_sender(repository, user_id, sender):
             upserted += 1
@@ -174,6 +212,13 @@ async def _resolve_and_upsert_pending(
         # сущность РЕЗОЛВИЛАСЬ успешно, поэтому в failed_identity_refresh не
         # попадает: следующее сообщение того же автора получит ещё одну
         # попытку записи (см. existing is None), а не будет пропущено вовсе.
+
+    deferred = len(user_ids) - upserted - len(not_in_cache_ids) - len(failed_ids)
+    logger.info(
+        "Резолв пользователей за чекпоинт: успешно %d, не в локальном кэше %d, "
+        "не удалось %d, отложено (FloodWait) %d — всего %d",
+        upserted, len(not_in_cache_ids), len(failed_ids), deferred, len(user_ids),
+    )
 
     pending.clear()
     return upserted, new_count

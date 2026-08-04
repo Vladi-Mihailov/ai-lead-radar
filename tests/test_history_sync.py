@@ -101,11 +101,21 @@ class _FakeClient:
         # (client.get_entity([id, id, ...])) — то, что заменило один RPC на
         # пользователя (см. _resolve_and_upsert_pending в history_sync.py).
         self.get_entity_batch_calls: list[list] = []
+        # Каждый ОДИНОЧНЫЙ (не-списочный) вызов get_entity(ident) — включает
+        # и резолв самой группы (client.get_entity(group.identifier)), и
+        # поштучный fallback (_resolve_one_by_one). Тест на FloodWaitError
+        # проверяет, что кроме резолва группы здесь ничего не появляется.
+        self.get_entity_single_arg_calls: list = []
         self._users_by_id = users_by_id or {}
         # Каждый вызов get_input_entity(user_id) — именно то, что ограничено
         # failed_identity_refresh для систематически нерезолвящихся id (см.
         # тест на регрессию про "не пытаться повторно резолвить").
         self.get_input_entity_calls: list[int] = []
+        # Сколько раз пакетный get_entity([...]) должен бросить
+        # FloodWaitError, прежде чем начать отвечать нормально (см. тест на
+        # то, что FloodWaitError не переходит в поштучный fallback).
+        self.batch_flood_wait_times = 0
+        self.batch_flood_wait_seconds = 1
 
     async def get_input_entity(self, user_id):
         # Настоящий Telethon для голого положительного int смотрит ТОЛЬКО в
@@ -119,8 +129,14 @@ class _FakeClient:
     async def get_entity(self, ident):
         self.get_entity_calls += 1
         if isinstance(ident, list):
+            if self.batch_flood_wait_times > 0:
+                self.batch_flood_wait_times -= 1
+                raise FloodWaitError(
+                    request=GetHistoryRequest, capture=self.batch_flood_wait_seconds
+                )
             self.get_entity_batch_calls.append(list(ident))
             return [self._users_by_id.get(user_id) for user_id in ident]
+        self.get_entity_single_arg_calls.append(ident)
         return self.entity
 
     def iter_messages(self, entity, offset_id=0, limit=None):
@@ -561,6 +577,94 @@ async def test_failed_resolution_does_not_prevent_other_users_in_next_checkpoint
 
         assert repository.get(909) is None
         assert repository.get(910).access_hash == 10
+    finally:
+        repository.close()
+        state_repository.close()
+
+
+# ---- FloodWaitError на пакетном резолве — не переходит в поштучный fallback ----
+
+
+async def test_batch_flood_wait_retries_batch_once_without_single_fallback(tmp_path, monkeypatch):
+    """Ключевой регрессионный тест: FloodWaitError на пакетном get_entity()
+    — это общая временная блокировка API, а не ошибка конкретного
+    пользователя. Код должен подождать exc.seconds и повторить ТОТ ЖЕ
+    пакетный запрос один раз — и ни разу не дёрнуть одиночный get_entity()
+    ни для одного из пользователей набора."""
+    sleep_calls = await _sleep_recorder(monkeypatch)
+
+    get_sender_calls = []
+    entity = _FakeEntity(-101010, "Test group")
+    group = Group(id=-101010, username=None, title="Test group")
+
+    repository = UserRepository(tmp_path / "users.db")
+    state_repository = HistorySyncStateRepository(tmp_path / "users.db")
+    try:
+        messages = [
+            _FakeMessage(3, 921, sender=None, get_sender_calls=get_sender_calls),
+            _FakeMessage(2, 922, sender=None, get_sender_calls=get_sender_calls),
+            _FakeMessage(1, 923, sender=None, get_sender_calls=get_sender_calls),
+        ]
+        users_by_id = {
+            921: _FakeSender(921, username="u921", access_hash=1),
+            922: _FakeSender(922, username="u922", access_hash=2),
+            923: _FakeSender(923, username="u923", access_hash=3),
+        }
+        client = _FakeClient(entity, messages, get_sender_calls, users_by_id=users_by_id)
+        # Первый пакетный get_entity([...]) бросает FloodWaitError; второй
+        # (повтор после ожидания) должен пройти нормально.
+        client.batch_flood_wait_times = 1
+        client.batch_flood_wait_seconds = 7
+
+        await sync_users_from_history(client, [group], repository, state_repository, _EMPTY_MATCHER)
+
+        # Ждали ровно exc.seconds один раз — и повторили пакетный запрос,
+        # а не перешли на поштучный fallback.
+        assert sleep_calls == [7]
+        assert client.get_entity_batch_calls == [[921, 922, 923]]
+        # Единственный одиночный get_entity() за весь прогон — резолв самой
+        # группы, ни одного пользователя поштучно не запрашивали.
+        assert client.get_entity_single_arg_calls == [group.identifier]
+
+        assert repository.get(921).access_hash == 1
+        assert repository.get(922).access_hash == 2
+        assert repository.get(923).access_hash == 3
+    finally:
+        repository.close()
+        state_repository.close()
+
+
+async def test_batch_flood_wait_persisting_after_retry_defers_without_fallback(tmp_path, monkeypatch):
+    """Если FloodWaitError не сходит и после единственного повтора — набор
+    остаётся неразрешённым до следующего чекпоинта/прогона, без единого
+    поштучного запроса и без блокировки в failed_identity_refresh (это не
+    "проблемная сущность", а временное ограничение API)."""
+    sleep_calls = await _sleep_recorder(monkeypatch)
+
+    get_sender_calls = []
+    entity = _FakeEntity(-101011, "Test group")
+    group = Group(id=-101011, username=None, title="Test group")
+
+    repository = UserRepository(tmp_path / "users.db")
+    state_repository = HistorySyncStateRepository(tmp_path / "users.db")
+    try:
+        messages = [_FakeMessage(1, 931, sender=None, get_sender_calls=get_sender_calls)]
+        users_by_id = {931: _FakeSender(931, username="u931", access_hash=99)}
+        client = _FakeClient(entity, messages, get_sender_calls, users_by_id=users_by_id)
+        # И первая, и повторная попытка пакетного резолва — FloodWaitError.
+        client.batch_flood_wait_times = 2
+        client.batch_flood_wait_seconds = 3
+
+        await sync_users_from_history(client, [group], repository, state_repository, _EMPTY_MATCHER)
+
+        assert sleep_calls == [3]
+        assert client.get_entity_batch_calls == []
+        assert client.get_entity_single_arg_calls == [group.identifier]
+        # Пользователь не резолвился в этом прогоне вообще — но и не
+        # заблокирован навсегда: existing всё ещё None, следующий прогон
+        # (или следующий чекпоинт, если бы сообщений было больше) повторит
+        # попытку.
+        assert repository.get(931) is None
     finally:
         repository.close()
         state_repository.close()
