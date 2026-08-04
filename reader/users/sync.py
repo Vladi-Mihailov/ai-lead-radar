@@ -20,7 +20,14 @@ async def sync_all_users(
     for group in groups:
         try:
             entity = await client.get_entity(group.identifier)
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc, FloodWaitError):
+                # ВРЕМЕННАЯ ДИАГНОСТИКА — убрать после локализации источника
+                # FloodWait. Именно этот RPC — резолв самой группы.
+                logger.warning(
+                    "[DIAG] FloodWait (%ds) while resolving group entity ('%s')",
+                    exc.seconds, group.identifier,
+                )
             logger.warning(
                 "✖ Группа '%s' не найдена, синхронизация участников пропущена",
                 group.identifier,
@@ -48,6 +55,12 @@ async def sync_all_users(
                 )
                 synced += 1
         except FloodWaitError as exc:
+            # ВРЕМЕННАЯ ДИАГНОСТИКА — убрать после локализации источника
+            # FloodWait. Именно этот RPC — client.iter_participants().
+            logger.warning(
+                "[DIAG] FloodWait (%ds) while loading participants (группа '%s')",
+                exc.seconds, title,
+            )
             logger.warning(
                 "Telegram ограничил запросы при синхронизации группы '%s' "
                 "(нужно подождать %d сек.) — сохранено участников: %d, "

@@ -16,6 +16,14 @@ logger = logging.getLogger(__name__)
 _BATCH_SIZE = 10_000
 _CHECKPOINT_INTERVAL = 500
 _MAX_FLOOD_WAIT_RETRIES = 3
+# GetUsersRequest (внутри client.get_entity()) сам режет список на чанки по
+# 200 — значит, число RPC за один флуш pending_identity_refresh не может
+# стать меньше ceil(len(pending) / 200), сколько бы сообщений мы ни ждали.
+# Флуш по достижении порога, близкого к 200 (а не по количеству сообщений,
+# как раньше единственный флуш на _CHECKPOINT_INTERVAL), не увеличивает
+# общее число RPC, но не даёт pending разрастись сильно за 200 в активных
+# группах и не откладывает получение access_hash дольше необходимого.
+_PENDING_RESOLVE_THRESHOLD = 190
 
 _SEPARATOR = "─" * 40
 
@@ -77,6 +85,14 @@ async def _resolve_one_by_one(
         try:
             entities_by_id[user_id] = await client.get_entity(user_id)
         except FloodWaitError as exc:
+            # ВРЕМЕННАЯ ДИАГНОСТИКА — убрать после локализации источника
+            # FloodWait. Именно этот RPC — одиночный get_entity() в
+            # поштучном fallback (не пакетный).
+            logger.warning(
+                "[DIAG] FloodWait (%ds) while resolving users "
+                "(single get_entity fallback)",
+                exc.seconds,
+            )
             logger.warning(
                 "FloodWaitError при поштучном резолве (%d сек.) — прекращаю, "
                 "%d пользователей останутся неразрешёнными до следующего "
@@ -115,6 +131,12 @@ async def _resolve_entity_batch(
         entities = await client.get_entity(user_ids)
         return dict(zip(user_ids, entities)), []
     except FloodWaitError as exc:
+        # ВРЕМЕННАЯ ДИАГНОСТИКА — убрать после локализации источника
+        # FloodWait. Именно этот RPC — пакетный client.get_entity([...]).
+        logger.warning(
+            "[DIAG] FloodWait (%ds) while resolving users (batch get_entity)",
+            exc.seconds,
+        )
         logger.warning(
             "Пакетный резолв %d пользователей получил FloodWaitError (%d сек.) — "
             "жду и повторяю пакетный запрос один раз, без поштучного fallback",
@@ -125,6 +147,12 @@ async def _resolve_entity_batch(
             entities = await client.get_entity(user_ids)
             return dict(zip(user_ids, entities)), []
         except FloodWaitError as exc2:
+            # ВРЕМЕННАЯ ДИАГНОСТИКА — тот же RPC, но уже повтор.
+            logger.warning(
+                "[DIAG] FloodWait (%ds) while resolving users "
+                "(batch get_entity, retry)",
+                exc2.seconds,
+            )
             logger.warning(
                 "FloodWaitError повторился (%d сек.) после повтора пакета — "
                 "%d пользователей останутся неразрешёнными до следующего "
@@ -261,8 +289,10 @@ async def sync_users_from_history(
     группе, см. refreshed_user_ids в _sync_group_history), и по возможности
     вообще без RPC — сначала используется message.sender (уже пришедший
     вместе со страницей истории), а если его не хватает — резолв идёт одним
-    пакетным запросом на чекпоинт, а не по одному (см.
-    _resolve_and_upsert_pending).
+    пакетным запросом, а не по одному (см. _resolve_and_upsert_pending).
+    Флуш пакета происходит по чекпоинту ИЛИ раньше, если накопилось близко к
+    _PENDING_RESOLVE_THRESHOLD уникальных пользователей — то, что наступит
+    раньше (см. _PENDING_RESOLVE_THRESHOLD и _sync_group_history).
 
     Отдельно: если для пользователя (обычно совсем нового, ранее не
     встречавшегося) резолв так и не удался — ни пакетно, ни по одному — до
@@ -293,7 +323,14 @@ async def sync_users_from_history(
     for group in groups:
         try:
             entity = await client.get_entity(group.identifier)
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc, FloodWaitError):
+                # ВРЕМЕННАЯ ДИАГНОСТИКА — убрать после локализации источника
+                # FloodWait. Именно этот RPC — резолв самой группы.
+                logger.warning(
+                    "[DIAG] FloodWait (%ds) while resolving group entity ('%s')",
+                    exc.seconds, group.identifier,
+                )
             logger.warning(
                 "✖ Группа '%s' не найдена, синхронизация истории пропущена",
                 group.identifier,
@@ -372,7 +409,8 @@ async def _sync_group_history(
         batch_number = processed_messages // _BATCH_SIZE + 1
         # Отправители, которых нужно обновить, но для которых сообщение НЕ
         # принесло готовый объект User (см. ниже) — резолвятся одним пакетным
-        # запросом на чекпоинте, а не по одному сразу же. Сбрасывается на
+        # запросом (на чекпоинте или раньше, при достижении
+        # _PENDING_RESOLVE_THRESHOLD), а не по одному сразу же. Сбрасывается на
         # каждой новой попытке цикла (после FloodWait/сбоя) — неотправленные
         # записи всё равно попадут в него снова при переобработке тех же
         # сообщений после возобновления с последнего сохранённого checkpoint.
@@ -468,9 +506,10 @@ async def _sync_group_history(
                                 new_users_in_batch += 1
                         elif sender_id not in failed_identity_refresh:
                             # Не хватает данных в самом сообщении — резолвим
-                            # позже одним пакетным запросом на чекпоинте
-                            # (см. _resolve_and_upsert_pending), а не отдельным
-                            # RPC прямо здесь.
+                            # позже одним пакетным запросом (на чекпоинте
+                            # или раньше, если накопится _PENDING_RESOLVE_
+                            # THRESHOLD — см. ниже), а не отдельным RPC
+                            # прямо здесь.
                             pending_identity_refresh[sender_id] = existing is None
                         # else: RPC-резолв этого пользователя уже пробовали и
                         # не смогли в этом же прогоне (failed_identity_refresh)
@@ -482,7 +521,24 @@ async def _sync_group_history(
                     # не удалось) — ни сети, ни записи для этого сообщения не
                     # требуется.
 
+                # Флуш раньше чекпоинта, если накопилось близко к лимиту
+                # одного RPC (см. _PENDING_RESOLVE_THRESHOLD выше) — не
+                # увеличивает общее число запросов (GetUsersRequest всё
+                # равно режет по 200), но не даёт pending разрастись
+                # намного больше 200 в активных группах.
+                if len(pending_identity_refresh) >= _PENDING_RESOLVE_THRESHOLD:
+                    _, new_count = await _resolve_and_upsert_pending(
+                        client, repository, pending_identity_refresh, failed_identity_refresh,
+                    )
+                    saved_users_total += new_count
+                    new_users_in_batch += new_count
+
                 if since_checkpoint >= _CHECKPOINT_INTERVAL:
+                    # pending_identity_refresh почти всегда уже пуст здесь
+                    # (см. флуш по порогу выше) — но если чекпоинт наступил
+                    # раньше, чем накопился порог, дорезолвливаем остаток
+                    # перед сохранением checkpoint (_resolve_and_upsert_pending
+                    # ничего не делает и возвращает (0, 0), если pending пуст).
                     _, new_count = await _resolve_and_upsert_pending(
                         client, repository, pending_identity_refresh, failed_identity_refresh,
                     )
@@ -521,6 +577,13 @@ async def _sync_group_history(
                     unique_sender_ids_in_batch = set()
                     since_batch = 0
         except FloodWaitError as exc:
+            # ВРЕМЕННАЯ ДИАГНОСТИКА — убрать после локализации источника
+            # FloodWait. Именно этот RPC — client.iter_messages() (чтение
+            # истории), а не резолв пользователей/участников.
+            logger.warning(
+                "[DIAG] FloodWait (%ds) while reading history (группа '%s')",
+                exc.seconds, title,
+            )
             flood_wait_retries += 1
             if flood_wait_retries > _MAX_FLOOD_WAIT_RETRIES:
                 logger.warning(

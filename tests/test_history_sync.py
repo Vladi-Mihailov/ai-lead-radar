@@ -25,7 +25,11 @@ from telethon.tl.functions.messages import GetHistoryRequest  # noqa: E402
 from reader.groups import Group  # noqa: E402
 from reader.scenarios import KeywordMatcher, Scenario  # noqa: E402
 from reader.users.history_state_repository import HistorySyncStateRepository  # noqa: E402
-from reader.users.history_sync import _CHECKPOINT_INTERVAL, sync_users_from_history  # noqa: E402
+from reader.users.history_sync import (  # noqa: E402
+    _CHECKPOINT_INTERVAL,
+    _PENDING_RESOLVE_THRESHOLD,
+    sync_users_from_history,
+)
 from reader.users.models import TelegramUserInfo  # noqa: E402
 from reader.users.repository import UserRepository  # noqa: E402
 
@@ -665,6 +669,60 @@ async def test_batch_flood_wait_persisting_after_retry_defers_without_fallback(t
         # (или следующий чекпоинт, если бы сообщений было больше) повторит
         # попытку.
         assert repository.get(931) is None
+    finally:
+        repository.close()
+        state_repository.close()
+
+
+# ---- гибридный флуш pending_identity_refresh (порог vs чекпоинт) ----
+
+
+async def test_pending_flushes_early_at_threshold_before_checkpoint(tmp_path):
+    """Как только накопилось _PENDING_RESOLVE_THRESHOLD уникальных
+    пользователей, ожидающих резолва, флуш должен произойти сразу — не
+    дожидаясь _CHECKPOINT_INTERVAL (500), который намного больше порога."""
+    get_sender_calls = []
+    entity = _FakeEntity(-101012, "Test group")
+    group = Group(id=-101012, username=None, title="Test group")
+
+    repository = UserRepository(tmp_path / "users.db")
+    state_repository = HistorySyncStateRepository(tmp_path / "users.db")
+    try:
+        # Ровно порог новых уникальных отправителей, каждый без
+        # message.sender — все должны попасть в один пакетный флуш ДО
+        # достижения _CHECKPOINT_INTERVAL (500 >> 190).
+        threshold_ids = list(range(1001, 1001 + _PENDING_RESOLVE_THRESHOLD))
+        tail_ids = list(range(2001, 2011))  # ещё 10 — после порога
+        all_sender_ids = threshold_ids + tail_ids
+
+        # id сообщений по убыванию, как реальная история — первым
+        # обрабатывается message с наибольшим id (threshold_ids[0]).
+        messages = [
+            _FakeMessage(len(all_sender_ids) - index, sender_id, None, get_sender_calls)
+            for index, sender_id in enumerate(all_sender_ids)
+        ]
+
+        users_by_id = {
+            sender_id: _FakeSender(sender_id, username=f"u{sender_id}", access_hash=sender_id)
+            for sender_id in all_sender_ids
+        }
+        client = _FakeClient(entity, messages, get_sender_calls, users_by_id=users_by_id)
+
+        await sync_users_from_history(client, [group], repository, state_repository, _EMPTY_MATCHER)
+
+        # Два пакетных вызова: первый — ровно порог (флуш по threshold, не
+        # дожидаясь checkpoint), второй — остаток (флуш "хвоста" группы при
+        # завершении истории, существующий механизм).
+        assert len(client.get_entity_batch_calls) == 2
+        assert client.get_entity_batch_calls[0] == threshold_ids
+        assert sorted(client.get_entity_batch_calls[1]) == tail_ids
+
+        for sender_id in threshold_ids + tail_ids:
+            assert repository.get(sender_id).access_hash == sender_id
+
+        checkpoint = state_repository.get(-101012)
+        assert checkpoint.history_completed is True
+        assert checkpoint.processed_messages == len(threshold_ids) + len(tail_ids)
     finally:
         repository.close()
         state_repository.close()
