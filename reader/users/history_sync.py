@@ -32,6 +32,81 @@ def _safe_users_count(repository: UserRepository) -> object:
         return "н/д"
 
 
+def _upsert_sender(repository: UserRepository, sender_id: int, sender) -> bool:
+    """Строит TelegramUserInfo из настоящего объекта Telethon User/Channel и
+    сохраняет его. Возвращает True при успехе."""
+    try:
+        repository.upsert(
+            TelegramUserInfo(
+                user_id=sender_id,
+                username=getattr(sender, "username", None),
+                first_name=getattr(sender, "first_name", None),
+                last_name=getattr(sender, "last_name", None),
+                is_bot=bool(getattr(sender, "bot", False)),
+                # sender — полноценный объект Telethon User — сохраняем
+                # access_hash для восстановления InputPeerUser без @username.
+                access_hash=getattr(sender, "access_hash", None),
+                peer_type=type(sender).__name__,
+            )
+        )
+    except Exception:
+        logger.warning("Не удалось сохранить пользователя %s в локальный кэш", sender_id)
+        return False
+    return True
+
+
+async def _resolve_and_upsert_pending(
+    client: TelegramClient,
+    repository: UserRepository,
+    pending: dict[int, bool],
+) -> tuple[int, int]:
+    """Резолвит все накопленные user_id ОДНИМ пакетным client.get_entity()
+    вместо отдельного RPC на каждого — Telethon сам разбивает большие списки
+    на запросы по 200 (лимит GetUsersRequest), так что даже сотни
+    пользователей обходятся считанными запросами. Именно вызов get_sender()
+    (или get_entity()) один раз НА КАЖДОЕ СООБЩЕНИЕ активного автора вместо
+    одного раза на пользователя и был причиной практически непрерывного
+    FloodWait при --reindex.
+
+    pending — {user_id: is_new}, is_new только для статистики (не считать
+    уже известных пользователей "новыми" при переиндексации). Очищается
+    после вызова независимо от результата.
+    """
+    if not pending:
+        return 0, 0
+
+    user_ids = list(pending.keys())
+    try:
+        entities = await client.get_entity(user_ids)
+    except Exception:
+        # Пакетный запрос падает целиком из-за одного проблемного id
+        # (get_entity() не изолирует ошибки внутри списка) — дорезолвливаем
+        # по одному, чтобы не терять остальных валидных из этого набора.
+        logger.warning(
+            "Пакетное получение %d пользователей не удалось, дорезолвливаю по одному",
+            len(user_ids),
+        )
+        entities = []
+        for user_id in user_ids:
+            try:
+                entities.append(await client.get_entity(user_id))
+            except Exception:
+                entities.append(None)
+
+    upserted = 0
+    new_count = 0
+    for user_id, sender in zip(user_ids, entities):
+        if sender is None:
+            continue
+        if _upsert_sender(repository, user_id, sender):
+            upserted += 1
+            if pending[user_id]:
+                new_count += 1
+
+    pending.clear()
+    return upserted, new_count
+
+
 async def sync_users_from_history(
     client: TelegramClient,
     groups: list[Group],
@@ -64,9 +139,23 @@ async def sync_users_from_history(
     полную информацию об отправителе (а не только для новых) для каждой
     группы, чтобы досчитать поля, добавленные после того, как группа была
     полностью проиндексирована в прошлый раз (например, keywords/access_hash).
+    Информация запрашивается не более одного раза на пользователя за весь
+    этот вызов (не на каждое его сообщение и не повторно в каждой следующей
+    группе, см. refreshed_user_ids в _sync_group_history), и по возможности
+    вообще без RPC — сначала используется message.sender (уже пришедший
+    вместе со страницей истории), а если его не хватает — резолв идёт одним
+    пакетным запросом на чекпоинт, а не по одному (см.
+    _resolve_and_upsert_pending).
     """
 
     logger.info("Синхронизация истории начата%s", " (принудительная переиндексация)" if force else "")
+
+    # Пользователи, для которых access_hash/username уже переспрошены в
+    # этом прогоне --reindex — общий для всех групп набор, чтобы активный
+    # автор, написавший тысячи сообщений (в одной группе или в нескольких),
+    # не резолвился повторно на каждое из них: раньше это приводило к
+    # практически непрерывному FloodWait вместо пакетов по 10000 сообщений.
+    refreshed_user_ids: set[int] = set()
 
     for group in groups:
         try:
@@ -81,7 +170,8 @@ async def sync_users_from_history(
 
         title = group.title or getattr(entity, "title", None) or str(group.identifier)
         await _sync_group_history(
-            client, entity, title, repository, state_repository, matcher, force=force
+            client, entity, title, repository, state_repository, matcher,
+            force=force, refreshed_user_ids=refreshed_user_ids,
         )
 
 
@@ -94,6 +184,7 @@ async def _sync_group_history(
     matcher: KeywordMatcher,
     *,
     force: bool = False,
+    refreshed_user_ids: set[int],
 ) -> None:
     chat_id = entity.id
     checkpoint = state_repository.get(chat_id)
@@ -144,6 +235,13 @@ async def _sync_group_history(
         new_users_in_batch = 0
         unique_sender_ids_in_batch: set[int] = set()
         batch_number = processed_messages // _BATCH_SIZE + 1
+        # Отправители, которых нужно обновить, но для которых сообщение НЕ
+        # принесло готовый объект User (см. ниже) — резолвятся одним пакетным
+        # запросом на чекпоинте, а не по одному сразу же. Сбрасывается на
+        # каждой новой попытке цикла (после FloodWait/сбоя) — неотправленные
+        # записи всё равно попадут в него снова при переобработке тех же
+        # сообщений после возобновления с последнего сохранённого checkpoint.
+        pending_identity_refresh: dict[int, bool] = {}
 
         def save_checkpoint(history_completed: bool) -> None:
             state_repository.save_progress(
@@ -195,57 +293,60 @@ async def _sync_group_history(
                         lookup_failed = True
 
                     # Пользователя ещё нет в кэше — только в этом случае есть
-                    # смысл спрашивать Telegram: get_sender() может уйти в
-                    # сеть (GetUsersRequest), если отправитель пришёл в
-                    # составе страницы истории как "min"-сущность — а для
-                    # уже известных пользователей это лишний сетевой запрос
-                    # на каждое сообщение без всякой пользы.
+                    # смысл спрашивать Telegram: резолв может уйти в сеть, если
+                    # отправитель пришёл в составе страницы истории как
+                    # "min"-сущность — а для уже известных пользователей это
+                    # лишний сетевой запрос на каждое сообщение без всякой
+                    # пользы.
                     #
-                    # force=True (переиндексация) — исключение: запрашиваем
-                    # свежий объект User даже для уже известных отправителей,
-                    # чтобы досчитать поля вроде access_hash, которых не было
-                    # при первом проходе (см. sync_users.py --reindex).
-                    if not lookup_failed and (existing is None or force):
-                        try:
-                            sender = await message.get_sender()
-                        except Exception:
-                            sender = None
+                    # force=True (переиндексация) — исключение: обновляем
+                    # даже уже известных отправителей, чтобы досчитать поля
+                    # вроде access_hash, которых не было при первом проходе
+                    # (см. sync_users.py --reindex). НО только один раз на
+                    # пользователя за весь этот вызов sync_users_from_history()
+                    # (refreshed_user_ids), а не на каждое его сообщение.
+                    needs_refresh = existing is None or (
+                        force and sender_id not in refreshed_user_ids
+                    )
+                    if not lookup_failed and needs_refresh:
+                        if force:
+                            # Не более одной попытки на пользователя за
+                            # прогон — независимо от того, как именно она
+                            # будет разрешена (сразу или пакетно ниже).
+                            refreshed_user_ids.add(sender_id)
 
-                        if sender is not None:
-                            try:
-                                repository.upsert(
-                                    TelegramUserInfo(
-                                        user_id=sender_id,
-                                        username=getattr(sender, "username", None),
-                                        first_name=getattr(sender, "first_name", None),
-                                        last_name=getattr(sender, "last_name", None),
-                                        is_bot=bool(getattr(sender, "bot", False)),
-                                        # sender — полноценный объект Telethon
-                                        # User — сохраняем access_hash для
-                                        # восстановления InputPeerUser без
-                                        # @username.
-                                        access_hash=getattr(sender, "access_hash", None),
-                                        peer_type=type(sender).__name__,
-                                    )
-                                )
-                            except Exception:
-                                logger.warning(
-                                    "Не удалось сохранить пользователя %s в локальный кэш",
-                                    sender_id,
-                                )
-                            else:
-                                # saved_users_total/new_users_in_batch — счётчик
-                                # именно НОВЫХ пользователей: при force=True
-                                # existing может быть не None (мы всё равно
-                                # обновили его данные выше), это не "новый".
-                                if existing is None:
-                                    saved_users_total += 1
-                                    new_users_in_batch += 1
+                        # message.sender — то, что Telegram уже прислал
+                        # вместе с этой же страницей истории (без единого
+                        # RPC): для iter_messages() это обычно полноценный
+                        # объект, а не "min"-заглушка, потому что автор
+                        # сообщения в этом же чате был отправлен вместе с
+                        # ответом. Раньше здесь всегда вызывался
+                        # message.get_sender(), который для КАЖДОГО такого
+                        # сообщения повторно уходил в сеть — это и было
+                        # причиной практически непрерывного FloodWait при
+                        # --reindex (RPC на каждое сообщение активного автора,
+                        # а не один раз на автора).
+                        sender = message.sender
+                        if sender is not None and not getattr(sender, "min", False):
+                            if _upsert_sender(repository, sender_id, sender) and existing is None:
+                                saved_users_total += 1
+                                new_users_in_batch += 1
+                        else:
+                            # Не хватает данных в самом сообщении — резолвим
+                            # позже одним пакетным запросом на чекпоинте
+                            # (см. _resolve_and_upsert_pending), а не отдельным
+                            # RPC прямо здесь.
+                            pending_identity_refresh[sender_id] = existing is None
                     # existing уже в кэше и не идёт переиндексация (или чтение
                     # не удалось) — ни сети, ни записи для этого сообщения не
                     # требуется.
 
                 if since_checkpoint >= _CHECKPOINT_INTERVAL:
+                    _, new_count = await _resolve_and_upsert_pending(
+                        client, repository, pending_identity_refresh
+                    )
+                    saved_users_total += new_count
+                    new_users_in_batch += new_count
                     save_checkpoint(history_completed=False)
                     since_checkpoint = 0
 
@@ -320,6 +421,15 @@ async def _sync_group_history(
                 exc_info=True,
             )
             return
+
+        # Дорезолвливаем всё, что накопилось после последнего checkpoint —
+        # иначе "хвост" группы (< _CHECKPOINT_INTERVAL сообщений) остался бы
+        # без access_hash/данных до следующего запуска.
+        _, new_count = await _resolve_and_upsert_pending(
+            client, repository, pending_identity_refresh
+        )
+        saved_users_total += new_count
+        new_users_in_batch += new_count
 
         save_checkpoint(history_completed=True)
         logger.info(

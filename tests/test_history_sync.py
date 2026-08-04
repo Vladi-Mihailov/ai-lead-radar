@@ -87,6 +87,7 @@ class _FakeClient:
         fail_after_in_call=None,
         flood_wait_on_calls=(),
         flood_wait_seconds=5,
+        users_by_id=None,
     ):
         self.entity = entity
         self.messages = messages
@@ -96,9 +97,17 @@ class _FakeClient:
         self.flood_wait_seconds = flood_wait_seconds
         self.iter_messages_calls = 0
         self.get_entity_calls = 0
+        # Отдельно от get_entity_calls: именно пакетные вызовы
+        # (client.get_entity([id, id, ...])) — то, что заменило один RPC на
+        # пользователя (см. _resolve_and_upsert_pending в history_sync.py).
+        self.get_entity_batch_calls: list[list] = []
+        self._users_by_id = users_by_id or {}
 
     async def get_entity(self, ident):
         self.get_entity_calls += 1
+        if isinstance(ident, list):
+            self.get_entity_batch_calls.append(list(ident))
+            return [self._users_by_id.get(user_id) for user_id in ident]
         return self.entity
 
     def iter_messages(self, entity, offset_id=0, limit=None):
@@ -265,7 +274,8 @@ async def test_force_refreshes_access_hash_for_already_known_sender(tmp_path):
     """Сценарий из отчёта о баге: группа была полностью проиндексирована до
     появления access_hash — обычный запуск её пропускает и никогда не
     досчитает access_hash для уже известных пользователей; --reindex должен
-    это исправить."""
+    это исправить. message.sender уже несёт нужные данные — ни get_sender(),
+    ни client.get_entity() не нужны."""
     get_sender_calls = []
     entity = _FakeEntity(-101002, "Test group")
     group = Group(id=-101002, username=None, title="Test group")
@@ -296,12 +306,15 @@ async def test_force_refreshes_access_hash_for_already_known_sender(tmp_path):
         assert get_sender_calls == []
 
         # С force=True — история перечитывается, и для уже известного
-        # пользователя всё равно запрашивается свежий объект User.
+        # пользователя данные всё равно обновляются — но напрямую из
+        # message.sender (см. фейк), без единого RPC ни старым (get_sender),
+        # ни новым (get_entity) способом.
         force_client = _FakeClient(entity, messages, get_sender_calls)
         await sync_users_from_history(
             force_client, [group], repository, state_repository, _EMPTY_MATCHER, force=True
         )
-        assert get_sender_calls == [444]
+        assert get_sender_calls == []
+        assert force_client.get_entity_batch_calls == []
         assert repository.get(444).access_hash == 123123123
 
         # Пользователь уже был известен — переиндексация не должна считать
@@ -332,6 +345,105 @@ async def test_force_still_counts_genuinely_new_users(tmp_path):
         checkpoint = state_repository.get(-101003)
         assert checkpoint.saved_users == 1
         assert repository.get(555).access_hash == 999
+    finally:
+        repository.close()
+        state_repository.close()
+
+
+async def test_missing_message_sender_falls_back_to_batched_get_entity(tmp_path):
+    """message.sender может быть None (Telegram не прислал его вместе со
+    страницей истории) — тогда резолв идёт через client.get_entity() пакетно,
+    а не через message.get_sender() и не по одному RPC на пользователя."""
+    get_sender_calls = []
+    entity = _FakeEntity(-101004, "Test group")
+    group = Group(id=-101004, username=None, title="Test group")
+
+    repository = UserRepository(tmp_path / "users.db")
+    state_repository = HistorySyncStateRepository(tmp_path / "users.db")
+    try:
+        messages = [_FakeMessage(1, 666, sender=None, get_sender_calls=get_sender_calls)]
+        resolved_sender = _FakeSender(666, username="resolved_user", access_hash=42)
+        client = _FakeClient(
+            entity, messages, get_sender_calls, users_by_id={666: resolved_sender}
+        )
+
+        await sync_users_from_history(client, [group], repository, state_repository, _EMPTY_MATCHER)
+
+        assert get_sender_calls == []
+        assert client.get_entity_batch_calls == [[666]]
+        user = repository.get(666)
+        assert user is not None
+        assert user.username == "resolved_user"
+        assert user.access_hash == 42
+    finally:
+        repository.close()
+        state_repository.close()
+
+
+async def test_multiple_new_senders_are_resolved_in_a_single_batch_call(tmp_path):
+    """Ровно то, из-за чего возникал почти непрерывный FloodWait: несколько
+    новых отправителей без message.sender в одном чекпоинт-окне должны
+    резолвиться ОДНИМ вызовом client.get_entity([...]), а не по одному RPC
+    на каждого."""
+    get_sender_calls = []
+    entity = _FakeEntity(-101005, "Test group")
+    group = Group(id=-101005, username=None, title="Test group")
+
+    repository = UserRepository(tmp_path / "users.db")
+    state_repository = HistorySyncStateRepository(tmp_path / "users.db")
+    try:
+        messages = [
+            _FakeMessage(3, 701, sender=None, get_sender_calls=get_sender_calls),
+            _FakeMessage(2, 702, sender=None, get_sender_calls=get_sender_calls),
+            _FakeMessage(1, 703, sender=None, get_sender_calls=get_sender_calls),
+        ]
+        users_by_id = {
+            701: _FakeSender(701, username="u701", access_hash=1),
+            702: _FakeSender(702, username="u702", access_hash=2),
+            703: _FakeSender(703, username="u703", access_hash=3),
+        }
+        client = _FakeClient(entity, messages, get_sender_calls, users_by_id=users_by_id)
+
+        await sync_users_from_history(client, [group], repository, state_repository, _EMPTY_MATCHER)
+
+        # Все три — в одном пакетном вызове (внутри одного чекпоинт-окна:
+        # 3 сообщения << _CHECKPOINT_INTERVAL), а не в трёх отдельных.
+        assert client.get_entity_batch_calls == [[701, 702, 703]]
+        assert get_sender_calls == []
+        assert repository.get(701).access_hash == 1
+        assert repository.get(702).access_hash == 2
+        assert repository.get(703).access_hash == 3
+
+        checkpoint = state_repository.get(-101005)
+        assert checkpoint.saved_users == 3
+    finally:
+        repository.close()
+        state_repository.close()
+
+
+async def test_repeated_sender_without_message_sender_resolved_only_once_per_run(tmp_path):
+    """Активный автор без message.sender, написавший много сообщений: даже
+    без --reindex он один раз попадает в пакетный запрос, а не по разу на
+    каждое сообщение (существующая защита existing is None срабатывает уже
+    после первого резолва)."""
+    get_sender_calls = []
+    entity = _FakeEntity(-101006, "Test group")
+    group = Group(id=-101006, username=None, title="Test group")
+
+    repository = UserRepository(tmp_path / "users.db")
+    state_repository = HistorySyncStateRepository(tmp_path / "users.db")
+    try:
+        messages = [
+            _FakeMessage(mid, 808, sender=None, get_sender_calls=get_sender_calls)
+            for mid in range(20, 0, -1)
+        ]
+        users_by_id = {808: _FakeSender(808, username="active_user", access_hash=99)}
+        client = _FakeClient(entity, messages, get_sender_calls, users_by_id=users_by_id)
+
+        await sync_users_from_history(client, [group], repository, state_repository, _EMPTY_MATCHER)
+
+        assert client.get_entity_batch_calls == [[808]]
+        assert repository.get(808).access_hash == 99
     finally:
         repository.close()
         state_repository.close()
