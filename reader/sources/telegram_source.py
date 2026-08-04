@@ -59,6 +59,13 @@ class TelegramSource(BaseSource):
             telegram_settings.api_id,
             telegram_settings.api_hash,
         )
+        # Устанавливается в start() сразу после client.start() — то есть
+        # клиент уже подключён и авторизован, можно слать RPC (get_me(),
+        # send_message() и т.п.), даже если резолв групп ниже в start() ещё
+        # не завершён. Позволяет другим потребителям client (см.
+        # wait_until_ready) дождаться этого момента через Event вместо
+        # опроса is_user_authorized().
+        self._ready = asyncio.Event()
 
         self._queue: asyncio.Queue[Message] = asyncio.Queue()
         self._resolved: dict[int, _ResolvedGroup] = {}
@@ -68,11 +75,20 @@ class TelegramSource(BaseSource):
     def client(self) -> TelegramClient:
         return self._client
 
+    async def wait_until_ready(self) -> None:
+        """Дожидается момента сразу после успешного client.start() внутри
+        start() — клиент подключён и авторизован, готов к RPC. Не ждёт
+        остального start() (get_dialogs/_resolve_groups), это не нужно
+        потребителям, которым важен только authenticated client (например,
+        мониторингу штрафов, см. reader/main.py: _run_fine_monitor)."""
+        await self._ready.wait()
+
     async def start(self) -> None:
         self._settings.session_path_live.parent.mkdir(parents=True, exist_ok=True)
 
         await self._client.start(phone=self._settings.phone)
         logger.info("Авторизация в Telegram выполнена")
+        self._ready.set()
 
         await self._client.get_dialogs()
         await self._resolve_groups()

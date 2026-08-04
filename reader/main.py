@@ -38,7 +38,6 @@ CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 
 logger = logging.getLogger(__name__)
 
-_CLIENT_READY_POLL_SECONDS = 0.5
 _SCHEDULER_POLL_INTERVAL_SECONDS = 30.0
 _POLICE_GE_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -46,18 +45,23 @@ _POLICE_GE_USER_AGENT = (
 )
 
 
-async def _wait_until_client_ready(client) -> None:
-    """TelegramSource.start() (внутри Pipeline.run()) авторизует клиент —
-    ждём этого моста без единого изменения в TelegramSource/Pipeline, просто
-    опросом уже существующего Telethon-метода."""
-    while not await client.is_user_authorized():
-        await asyncio.sleep(_CLIENT_READY_POLL_SECONDS)
-
-
 def resolve_notification_chat_ids(settings: Settings) -> list[int | str]:
     """fine_monitor.notification_chat_ids, а если пусто — тот же чат(ы), куда
     уже уходят лиды (app.lead_forward_to / LEAD_FORWARD_TO)."""
     return settings.fine_monitor.notification_chat_ids or settings.app.lead_forward_to
+
+
+async def resolve_allowed_user_ids(settings: Settings, client) -> list[int]:
+    """fine_monitor.allowed_user_ids, а если пусто — id уже авторизованного
+    аккаунта (сейчас в проекте используется один Telegram-аккаунт, поэтому
+    он и есть разумный получатель по умолчанию). client.get_me() — тот же
+    уже подключённый клиент, второе подключение не создаётся."""
+    if settings.fine_monitor.allowed_user_ids:
+        return settings.fine_monitor.allowed_user_ids
+
+    me = await client.get_me()
+    logger.info("Fine commands allowed for current account: %s", me.id)
+    return [me.id]
 
 
 def build_fine_monitor_components(
@@ -67,6 +71,7 @@ def build_fine_monitor_components(
     detected_fine_repository: DetectedFineRepository,
     http_client: httpx.AsyncClient,
     notification_chat_ids: list[int | str],
+    allowed_user_ids: list[int],
 ) -> tuple[FineJob, Scheduler, TelegramNotificationService, CommandDispatcher, FineCommand]:
     """Чистая сборка зависимостей мониторинга штрафов — без единого await,
     без обращения к сети/Telegram (конструкторы ничего не подключают, только
@@ -101,7 +106,7 @@ def build_fine_monitor_components(
     scheduler = Scheduler([fine_job], poll_interval_seconds=_SCHEDULER_POLL_INTERVAL_SECONDS)
 
     command_dispatcher = CommandDispatcher(
-        source.client, notification_chat_ids[0], fine_monitor.allowed_user_ids
+        source.client, notification_chat_ids[0], allowed_user_ids
     )
     fine_command = FineCommand(
         task_repository=task_repository,
@@ -119,18 +124,16 @@ def build_fine_monitor_components(
 def validate_fine_monitor_config(settings: Settings, notification_chat_ids: list[int | str]) -> None:
     """Fail-fast проверки перед запуском мониторинга штрафов — вынесены в
     отдельную синхронную функцию, чтобы их можно было проверить тестом без
-    реального Telegram-клиента (см. test_main_wiring.py)."""
+    реального Telegram-клиента (см. test_main_wiring.py).
+
+    fine_monitor.allowed_user_ids здесь не проверяется: пустой список —
+    штатный случай (см. resolve_allowed_user_ids), а не ошибка конфигурации.
+    """
     if not notification_chat_ids:
         raise ConfigError(
             "fine_monitor.enabled=true, но не задан ни fine_monitor.notification_chat_ids, "
             "ни app.lead_forward_to (LEAD_FORWARD_TO) — некуда отправлять уведомления и "
             "не в каком чате слушать команды"
-        )
-
-    if not settings.fine_monitor.allowed_user_ids:
-        raise ConfigError(
-            "fine_monitor.enabled=true, но fine_monitor.allowed_user_ids пуст — команды "
-            "fine ... были бы доступны любому пользователю в чате, отказываюсь запускаться"
         )
 
 
@@ -147,7 +150,9 @@ async def _run_fine_monitor(
     notification_chat_ids = resolve_notification_chat_ids(settings)
     validate_fine_monitor_config(settings, notification_chat_ids)
 
-    await _wait_until_client_ready(source.client)
+    await source.wait_until_ready()
+
+    allowed_user_ids = await resolve_allowed_user_ids(settings, source.client)
 
     http_client = httpx.AsyncClient(
         base_url="https://police.ge/protocol/",
@@ -157,7 +162,7 @@ async def _run_fine_monitor(
         _fine_job, scheduler, notification_service, command_dispatcher, fine_command = (
             build_fine_monitor_components(
                 settings, source, task_repository, detected_fine_repository,
-                http_client, notification_chat_ids,
+                http_client, notification_chat_ids, allowed_user_ids,
             )
         )
 
@@ -182,6 +187,27 @@ async def _run_fine_monitor(
         await scheduler.run_forever()
     finally:
         await http_client.aclose()
+
+
+async def _run_concurrently(coroutines: list) -> None:
+    """Как asyncio.gather, но при ошибке в одной корутине отменяет
+    остальные, а не оставляет их работать дальше (или висеть навсегда:
+    например, если Pipeline.run() падает до TelegramSource.start() успевает
+    выставить готовность, _run_fine_monitor() иначе завис бы на
+    source.wait_until_ready() бесконечно)."""
+    tasks = [asyncio.create_task(coro) for coro in coroutines]
+    try:
+        done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    for task in done:
+        exc = task.exception()
+        if exc is not None:
+            raise exc
 
 
 async def run() -> None:
@@ -235,7 +261,7 @@ async def run() -> None:
         logger.info("Fine monitor disabled (fine_monitor.enabled=false)")
 
     try:
-        await asyncio.gather(*background)
+        await _run_concurrently(background)
     finally:
         user_repository.close()
         if fine_task_repository is not None:
