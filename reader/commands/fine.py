@@ -34,12 +34,12 @@ _ADD_USAGE_ERROR = (
     "или\n"
     "fine add B957MA09 03.08.2026 13.08.2026"
 )
-_STOP_USAGE_ERROR = "❌ Неверный формат команды\n\nИспользуйте:\nfine stop <TASK_ID>"
-_CHECK_USAGE_ERROR = "❌ Неверный формат команды\n\nИспользуйте:\nfine check <TASK_ID>"
+_STOP_USAGE_ERROR = "❌ Неверный формат команды\n\nИспользуйте:\nfine stop <НОМЕР_АВТОМОБИЛЯ>"
+_CHECK_USAGE_ERROR = "❌ Неверный формат команды\n\nИспользуйте:\nfine check <НОМЕР_АВТОМОБИЛЯ>"
 _UNKNOWN_SUBCOMMAND_ERROR = (
     "❌ Неверный формат команды\n\n"
     "Используйте:\n"
-    "fine add | fine list | fine stop <TASK_ID> | fine check <TASK_ID> | "
+    "fine add | fine list | fine stop <НОМЕР_АВТОМОБИЛЯ> | fine check <НОМЕР_АВТОМОБИЛЯ> | "
     "fine status | fine stats"
 )
 
@@ -57,13 +57,6 @@ def _format_check_times(run_times: list[dt_time]) -> str:
     if len(formatted) <= 1:
         return ", ".join(formatted)
     return ", ".join(formatted[:-1]) + f" и {formatted[-1]}"
-
-
-def _parse_task_id(raw: str) -> int:
-    try:
-        return int(raw)
-    except ValueError:
-        raise CommandError(f'❌ ID задачи должен быть числом, получено: "{raw}"') from None
 
 
 class FineCommand(Command):
@@ -140,7 +133,6 @@ class FineCommand(Command):
         return CommandResult(
             text=(
                 "✅ Мониторинг штрафов добавлен\n\n"
-                f"ID: {task.id}\n"
                 f"Автомобиль: {task.car_number}\n"
                 f"Период: {_fmt_date(start_date)}–{_fmt_date(end_date)}\n"
                 f"Проверка: {_format_check_times(self._run_times)} по Тбилиси"
@@ -157,7 +149,7 @@ class FineCommand(Command):
 
     @staticmethod
     def _format_task_line(task: FineMonitoringTask) -> str:
-        lines = [f"ID {task.id}: {task.car_number}" + (f" ({task.label})" if task.label else "")]
+        lines = [task.car_number + (f" ({task.label})" if task.label else "")]
         lines.append(f"Период: {_fmt_date(task.start_date)}–{_fmt_date(task.end_date)}")
 
         if task.last_checked_at is not None:
@@ -174,36 +166,46 @@ class FineCommand(Command):
         if len(args) != 1:
             raise CommandError(_STOP_USAGE_ERROR)
 
-        task_id = _parse_task_id(args[0])
-        task = self._task_repository.get(task_id)
-        if task is None:
-            raise CommandError(f"❌ Задача с ID {task_id} не найдена")
-        if task.status != "active":
-            raise CommandError(
-                f"❌ Задача с ID {task_id} уже не активна (статус: {task.status})"
-            )
+        car_number = normalize_car_number(args[0])
+        tasks = self._task_repository.get_active_by_car_number(car_number)
+        if not tasks:
+            raise CommandError(f"❌ Активная задача мониторинга для {car_number} не найдена")
 
-        self._task_repository.set_status(task_id, "stopped")
+        # validate_no_overlap (fine add) не даёт завести вторую активную
+        # задачу с пересекающимся периодом для того же номера, но не
+        # исключает две непересекающиеся по времени активные задачи —
+        # останавливаем все, а не только первую попавшуюся.
+        for task in tasks:
+            self._task_repository.set_status(task.id, "stopped")
 
-        return CommandResult(
-            text=f"✅ Мониторинг для {task.car_number} (ID {task_id}) остановлен"
-        )
+        return CommandResult(text=f"✅ Мониторинг для {car_number} остановлен")
 
     async def _handle_check(self, args: list[str]) -> CommandResult:
         if len(args) != 1:
             raise CommandError(_CHECK_USAGE_ERROR)
 
-        task_id = _parse_task_id(args[0])
-        task = self._task_repository.get(task_id)
-        if task is None:
-            raise CommandError(f"❌ Задача с ID {task_id} не найдена")
+        car_number = normalize_car_number(args[0])
+        tasks = self._task_repository.get_active_by_car_number(car_number)
+        if not tasks:
+            raise CommandError(f"❌ Активная задача мониторинга для {car_number} не найдена")
 
-        # Тот же FineCheckService, что использует и FineJob по расписанию —
-        # никакой отдельной логики проверки здесь нет.
-        result = await self._check_service.check_task(task)
+        total_fines_found = 0
+        total_new_fines = 0
+        total_duration_ms = 0
 
-        if result.status == "error":
-            raise CommandError(f"❌ Ошибка проверки: {result.error_message}")
+        for task in tasks:
+            # Тот же FineCheckService, что использует и FineJob по расписанию —
+            # никакой отдельной логики проверки здесь нет. Обычно у номера
+            # ровно одна активная задача (см. комментарий в _handle_stop) —
+            # цикл на случай, если их всё-таки несколько.
+            result = await self._check_service.check_task(task)
+
+            if result.status == "error":
+                raise CommandError(f"❌ Ошибка проверки: {result.error_message}")
+
+            total_fines_found += result.total_fines_found
+            total_new_fines += len(result.new_fines)
+            total_duration_ms += result.duration_ms
 
         # Тот же механизм доставки, что и у FineJob — тем же самым объектом
         # координатора, а не копией логики.
@@ -212,10 +214,10 @@ class FineCommand(Command):
         return CommandResult(
             text=(
                 "✅ Проверка завершена\n\n"
-                f"Автомобиль: {task.car_number}\n"
-                f"Найдено штрафов: {result.total_fines_found}\n"
-                f"Новых: {len(result.new_fines)}\n"
-                f"Время: {result.duration_ms} мс"
+                f"Автомобиль: {car_number}\n"
+                f"Найдено штрафов: {total_fines_found}\n"
+                f"Новых: {total_new_fines}\n"
+                f"Время: {total_duration_ms} мс"
             )
         )
 

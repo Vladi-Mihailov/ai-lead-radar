@@ -140,6 +140,8 @@ async def test_fine_add_with_explicit_dates(fx):
     assert "Автомобиль: B957MA09" in result.text
     assert "Период: 03.08.2026–13.08.2026" in result.text
     assert "09:00, 15:00 и 21:00" in result.text
+    # Внутренний ID задачи — деталь реализации БД, оператору не нужен.
+    assert "ID" not in result.text
 
     [task] = fx.task_repository.list_active()
     assert task.car_number == "B957MA09"
@@ -209,6 +211,8 @@ async def test_fine_list_with_tasks(fx):
     assert "AA001AA" in result.text
     assert "BB002BB" in result.text
     assert "01.08.2026–31.08.2026" in result.text
+    # Внутренний ID задачи — деталь реализации БД, оператору не нужен.
+    assert "ID" not in result.text
 
 
 async def test_fine_list_with_no_tasks(fx):
@@ -220,46 +224,81 @@ async def test_fine_list_with_no_tasks(fx):
 # ---- fine stop ----
 
 
-async def test_fine_stop_active_task(fx):
+async def test_fine_stop_by_car_number(fx):
     await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
     task_id = fx.task_repository.list_active()[0].id
 
-    result = await fx.command.handle(_ctx(["stop", str(task_id)]))
+    result = await fx.command.handle(_ctx(["stop", "AA001AA"]))
 
-    assert "✅" in result.text
-    assert "остановлен" in result.text
+    assert result.text == "✅ Мониторинг для AA001AA остановлен"
     assert fx.task_repository.get(task_id).status == "stopped"
     assert fx.task_repository.list_active() == []
 
 
-async def test_fine_stop_unknown_task_returns_command_error(fx):
+async def test_fine_stop_normalizes_car_number(fx):
+    await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
+
+    result = await fx.command.handle(_ctx(["stop", "aa001aa"]))
+
+    assert result.text == "✅ Мониторинг для AA001AA остановлен"
+    assert fx.task_repository.list_active() == []
+
+
+async def test_fine_stop_unknown_car_number_returns_command_error(fx):
     with pytest.raises(CommandError) as exc_info:
-        await fx.command.handle(_ctx(["stop", "999999"]))
+        await fx.command.handle(_ctx(["stop", "ZZ999ZZ"]))
 
     assert "не найдена" in exc_info.value.message
 
 
-async def test_fine_stop_already_inactive_task_returns_command_error(fx):
+async def test_fine_stop_already_stopped_car_returns_command_error(fx):
     await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
-    task_id = fx.task_repository.list_active()[0].id
-    fx.task_repository.set_status(task_id, "stopped")
+    await fx.command.handle(_ctx(["stop", "AA001AA"]))
 
     with pytest.raises(CommandError) as exc_info:
-        await fx.command.handle(_ctx(["stop", str(task_id)]))
+        await fx.command.handle(_ctx(["stop", "AA001AA"]))
 
-    assert "не активна" in exc_info.value.message
+    assert "не найдена" in exc_info.value.message
+
+
+async def test_fine_stop_stops_all_active_tasks_for_car_number(fx):
+    # validate_no_overlap не запрещает две непересекающиеся по датам
+    # активные задачи для одного номера — fine stop должен остановить обе.
+    await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "10.08.2026"]))
+    await fx.command.handle(_ctx(["add", "AA001AA", "15.08.2026", "20.08.2026"]))
+    task_ids = [task.id for task in fx.task_repository.list_active()]
+    assert len(task_ids) == 2
+
+    result = await fx.command.handle(_ctx(["stop", "AA001AA"]))
+
+    assert result.text == "✅ Мониторинг для AA001AA остановлен"
+    assert fx.task_repository.list_active() == []
+    assert all(fx.task_repository.get(task_id).status == "stopped" for task_id in task_ids)
+
+
+async def test_fine_stop_rejects_invalid_car_number(fx):
+    with pytest.raises(CommandError) as exc_info:
+        await fx.command.handle(_ctx(["stop", "AA-001-AA"]))
+
+    assert "❌" in exc_info.value.message
+
+
+async def test_fine_stop_rejects_wrong_argument_count(fx):
+    with pytest.raises(CommandError) as exc_info:
+        await fx.command.handle(_ctx(["stop"]))
+
+    assert "Неверный формат команды" in exc_info.value.message
 
 
 # ---- fine check ----
 
 
-async def test_fine_check_successful(tmp_path):
+async def test_fine_check_by_car_number(tmp_path):
     fx = _Fixture(tmp_path, records_by_car={"AA001AA": [_record(car_number="AA001AA")]})
     try:
         await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
-        task_id = fx.task_repository.list_active()[0].id
 
-        result = await fx.command.handle(_ctx(["check", str(task_id)]))
+        result = await fx.command.handle(_ctx(["check", "AA001AA"]))
 
         assert "✅ Проверка завершена" in result.text
         assert "Автомобиль: AA001AA" in result.text
@@ -270,21 +309,46 @@ async def test_fine_check_successful(tmp_path):
         fx.close()
 
 
-async def test_fine_check_unknown_task_returns_command_error(fx):
+async def test_fine_check_normalizes_car_number(tmp_path):
+    fx = _Fixture(tmp_path, records_by_car={"AA001AA": [_record(car_number="AA001AA")]})
+    try:
+        await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
+
+        result = await fx.command.handle(_ctx(["check", "aa001aa"]))
+
+        assert "Автомобиль: AA001AA" in result.text
+    finally:
+        fx.close()
+
+
+async def test_fine_check_unknown_car_number_returns_command_error(fx):
     with pytest.raises(CommandError) as exc_info:
-        await fx.command.handle(_ctx(["check", "999999"]))
+        await fx.command.handle(_ctx(["check", "ZZ999ZZ"]))
 
     assert "не найдена" in exc_info.value.message
+
+
+async def test_fine_check_rejects_invalid_car_number(fx):
+    with pytest.raises(CommandError) as exc_info:
+        await fx.command.handle(_ctx(["check", "AA-001-AA"]))
+
+    assert "❌" in exc_info.value.message
+
+
+async def test_fine_check_rejects_wrong_argument_count(fx):
+    with pytest.raises(CommandError) as exc_info:
+        await fx.command.handle(_ctx(["check"]))
+
+    assert "Неверный формат команды" in exc_info.value.message
 
 
 async def test_fine_check_with_provider_error_returns_clean_message(tmp_path):
     fx = _Fixture(tmp_path, provider_error=FineProviderError("police.ge недоступен"))
     try:
         await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
-        task_id = fx.task_repository.list_active()[0].id
 
         with pytest.raises(CommandError) as exc_info:
-            await fx.command.handle(_ctx(["check", str(task_id)]))
+            await fx.command.handle(_ctx(["check", "AA001AA"]))
 
         assert "police.ge недоступен" in exc_info.value.message
         # Никакого трейсбека оператору — только чистое сообщение.
@@ -299,7 +363,7 @@ async def test_fine_check_uses_shared_pending_notification_mechanism(tmp_path):
         await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
         task_id = fx.task_repository.list_active()[0].id
 
-        await fx.command.handle(_ctx(["check", str(task_id)]))
+        await fx.command.handle(_ctx(["check", "AA001AA"]))
 
         # То же самое, что делает FineJob после check_task(): flush_pending()
         # доставил штраф через тот же NotificationService и отметил
@@ -315,14 +379,41 @@ async def test_fine_check_does_not_duplicate_already_notified_fine_on_repeat(tmp
     fx = _Fixture(tmp_path, records_by_car={"AA001AA": [_record(car_number="AA001AA", fingerprint="fp-1")]})
     try:
         await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
-        task_id = fx.task_repository.list_active()[0].id
 
-        await fx.command.handle(_ctx(["check", str(task_id)]))
-        result = await fx.command.handle(_ctx(["check", str(task_id)]))
+        await fx.command.handle(_ctx(["check", "AA001AA"]))
+        result = await fx.command.handle(_ctx(["check", "AA001AA"]))
 
         assert "Новых: 0" in result.text
         # flush_pending() второй раз не находит ничего для отправки.
         assert len(fx.notification_service.notify_calls) == 1
+    finally:
+        fx.close()
+
+
+async def test_fine_check_checks_all_active_tasks_for_car_number(tmp_path):
+    # Две непересекающиеся по датам активные задачи для одного номера —
+    # fine check должен проверить обе и просуммировать результат.
+    fx = _Fixture(
+        tmp_path,
+        records_by_car={
+            "AA001AA": [
+                _record(car_number="AA001AA", fingerprint="fp-1"),
+                _record(car_number="AA001AA", fingerprint="fp-2"),
+            ]
+        },
+    )
+    try:
+        await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "10.08.2026"]))
+        await fx.command.handle(_ctx(["add", "AA001AA", "15.08.2026", "20.08.2026"]))
+        assert len(fx.task_repository.list_active()) == 2
+
+        result = await fx.command.handle(_ctx(["check", "AA001AA"]))
+
+        # Провайдер возвращает те же 2 записи для обеих задач — 4 найдено,
+        # но каждая уникальна только в рамках своей задачи (fingerprint
+        # общий, а monitoring_task_id разный), поэтому все 4 новые.
+        assert "Найдено штрафов: 4" in result.text
+        assert "Новых: 4" in result.text
     finally:
         fx.close()
 
@@ -371,8 +462,7 @@ async def test_fine_stats_groups_by_car_and_sorts_by_count_desc(tmp_path):
     try:
         for car_number in records_by_car:
             await fx.command.handle(_ctx(["add", car_number, "01.08.2026", "31.08.2026"]))
-        for task in fx.task_repository.list_active():
-            await fx.command.handle(_ctx(["check", str(task.id)]))
+            await fx.command.handle(_ctx(["check", car_number]))
 
         result = await fx.command.handle(_ctx(["stats"]))
 
