@@ -5,7 +5,9 @@ from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 
 from reader.groups import Group
+from reader.scenarios import KeywordMatcher
 from reader.users.history_state_repository import HistorySyncStateRepository
+from reader.users.keyword_matches import unique_keywords
 from reader.users.models import TelegramUserInfo
 from reader.users.repository import UserRepository
 
@@ -35,6 +37,7 @@ async def sync_users_from_history(
     groups: list[Group],
     repository: UserRepository,
     state_repository: HistorySyncStateRepository,
+    matcher: KeywordMatcher,
 ) -> None:
     """Инкрементально проходит историю сообщений групп и сохраняет авторов.
 
@@ -47,6 +50,12 @@ async def sync_users_from_history(
     message_id (checkpoint), поэтому история никогда не перечитывается
     заново — при повторном запуске обход продолжается с места остановки, а
     группы с полностью пройденной историей пропускаются мгновенно.
+
+    matcher — тот же KeywordMatcher, что использует reader/main.py (Pipeline)
+    для новых сообщений: для каждого сообщения с известным отправителем
+    сообщение прогоняется через него, и найденные keywords сохраняются в
+    UserRepository (см. _sync_group_history) — независимо от того, штатный
+    ли это отправитель или уже известный локально.
     """
 
     logger.info("Синхронизация истории начата")
@@ -63,7 +72,7 @@ async def sync_users_from_history(
             continue
 
         title = group.title or getattr(entity, "title", None) or str(group.identifier)
-        await _sync_group_history(client, entity, title, repository, state_repository)
+        await _sync_group_history(client, entity, title, repository, state_repository, matcher)
 
 
 async def _sync_group_history(
@@ -72,6 +81,7 @@ async def _sync_group_history(
     title: str,
     repository: UserRepository,
     state_repository: HistorySyncStateRepository,
+    matcher: KeywordMatcher,
 ) -> None:
     chat_id = entity.id
     checkpoint = state_repository.get(chat_id)
@@ -130,6 +140,21 @@ async def _sync_group_history(
                 sender_id = message.sender_id
                 if sender_id:
                     unique_sender_ids_in_batch.add(sender_id)
+
+                    # Ключевые слова ищем независимо от того, известен ли
+                    # уже отправитель локально — тем же KeywordMatcher, что
+                    # использует reader/main.py (Pipeline) для новых
+                    # сообщений. Никакого сетевого запроса не требует, текст
+                    # уже пришёл вместе с сообщением истории.
+                    matches = matcher.match(message.raw_text or "")
+                    if matches:
+                        try:
+                            repository.add_keywords(sender_id, unique_keywords(matches))
+                        except Exception:
+                            logger.warning(
+                                "Не удалось обновить keywords пользователя %s",
+                                sender_id,
+                            )
 
                     try:
                         existing = repository.get(sender_id)

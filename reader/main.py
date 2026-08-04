@@ -239,7 +239,7 @@ async def run() -> None:
         sinks.append(TelegramSink(source.client, settings.app.lead_forward_to))
         logger.info("Пересылка лидов включена, чатов: %d", len(settings.app.lead_forward_to))
 
-    pipeline = Pipeline(source, engine, sinks)
+    pipeline = Pipeline(source, engine, sinks, user_repository)
 
     # Reader (Pipeline.run() — авторизует и подключает единственный
     # TelegramClient) и мониторинг штрафов работают в одном event loop'е,

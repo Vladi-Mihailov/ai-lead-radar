@@ -9,6 +9,7 @@ from telethon import TelegramClient  # noqa: E402
 
 from reader.groups import GroupLoadError, load_groups  # noqa: E402
 from reader.logging_setup import setup_logging  # noqa: E402
+from reader.scenarios import KeywordMatcher, ScenarioLoadError, load_scenarios  # noqa: E402
 from reader.settings import ConfigError, load_settings  # noqa: E402
 from reader.users.history_state_repository import HistorySyncStateRepository  # noqa: E402
 from reader.users.history_sync import sync_users_from_history  # noqa: E402
@@ -23,6 +24,8 @@ async def run() -> None:
     setup_logging(settings.app.log_level)
 
     groups = load_groups(settings.app.groups_file)
+    scenarios = load_scenarios(settings.app.scenarios_file)
+    matcher = KeywordMatcher(scenarios)
 
     client = TelegramClient(
         str(settings.telegram.session_path_sync),
@@ -39,7 +42,7 @@ async def run() -> None:
     state_repository = HistorySyncStateRepository(settings.app.users_db_file)
     try:
         await sync_all_users(client, groups, repository)
-        await sync_users_from_history(client, groups, repository, state_repository)
+        await sync_users_from_history(client, groups, repository, state_repository, matcher)
     finally:
         state_repository.close()
         repository.close()
@@ -49,7 +52,7 @@ async def run() -> None:
 def main() -> None:
     try:
         asyncio.run(run())
-    except (ConfigError, GroupLoadError) as exc:
+    except (ConfigError, GroupLoadError, ScenarioLoadError) as exc:
         print(f"Ошибка запуска: {exc}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
