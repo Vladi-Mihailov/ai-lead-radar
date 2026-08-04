@@ -12,7 +12,8 @@ from zoneinfo import ZoneInfo
 
 from reader.commands.base import Command, CommandContext, CommandError, CommandResult
 from reader.fines.check_service import FineCheckService
-from reader.fines.models import FineMonitoringTask
+from reader.fines.detected_fine_repository import DetectedFineRepository
+from reader.fines.models import CarFineStats, FineMonitoringTask
 from reader.fines.notification_coordinator import FineNotificationCoordinator
 from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.fines.validation import (
@@ -38,7 +39,8 @@ _CHECK_USAGE_ERROR = "❌ Неверный формат команды\n\nИсп
 _UNKNOWN_SUBCOMMAND_ERROR = (
     "❌ Неверный формат команды\n\n"
     "Используйте:\n"
-    "fine add | fine list | fine stop <TASK_ID> | fine check <TASK_ID> | fine status"
+    "fine add | fine list | fine stop <TASK_ID> | fine check <TASK_ID> | "
+    "fine status | fine stats"
 )
 
 
@@ -74,6 +76,7 @@ class FineCommand(Command):
         notification_coordinator: FineNotificationCoordinator,
         scheduler: Scheduler,
         fine_job: FineJob,
+        detected_fine_repository: DetectedFineRepository,
         *,
         run_times: list[dt_time],
         tz: ZoneInfo,
@@ -83,6 +86,7 @@ class FineCommand(Command):
         self._notification_coordinator = notification_coordinator
         self._scheduler = scheduler
         self._fine_job = fine_job
+        self._detected_fine_repository = detected_fine_repository
         self._run_times = run_times
         self._tz = tz
 
@@ -104,6 +108,8 @@ class FineCommand(Command):
                 return await self._handle_check(rest)
             if subcommand == "status":
                 return self._handle_status()
+            if subcommand == "stats":
+                return self._handle_stats()
         except FineValidationError as exc:
             raise CommandError(f"❌ {exc.message}") from exc
 
@@ -241,3 +247,48 @@ class FineCommand(Command):
                 f"Последняя ошибка: {last_error}"
             )
         )
+
+    def _handle_stats(self) -> CommandResult:
+        stats = self._detected_fine_repository.get_stats_by_car()
+
+        if not stats:
+            return CommandResult(
+                text="📊 Статистика штрафов\n\nПока не найдено ни одного штрафа."
+            )
+
+        table = self._format_stats_table(stats)
+        total_cars = len(stats)
+        total_fines = sum(row.fine_count for row in stats)
+
+        return CommandResult(
+            text=(
+                "📊 Статистика штрафов\n\n"
+                f"{table}\n\n"
+                f"Всего автомобилей: {total_cars}\n"
+                f"Всего опубликованных штрафов: {total_fines}"
+            )
+        )
+
+    _STATS_CAR_HEADER = "Автомобиль"
+    _STATS_COUNT_HEADER = "Штрафов"
+    _STATS_COLUMN_GAP = "  "
+
+    @classmethod
+    def _format_stats_table(cls, stats: list[CarFineStats]) -> str:
+        car_width = max(len(cls._STATS_CAR_HEADER), *(len(row.car_number) for row in stats))
+        count_width = max(
+            len(cls._STATS_COUNT_HEADER), *(len(str(row.fine_count)) for row in stats)
+        )
+
+        header = (
+            f"{cls._STATS_CAR_HEADER.ljust(car_width)}{cls._STATS_COLUMN_GAP}"
+            f"{cls._STATS_COUNT_HEADER}"
+        )
+        separator = f"{'-' * car_width}{cls._STATS_COLUMN_GAP}{'-' * count_width}"
+        rows = [
+            f"{row.car_number.ljust(car_width)}{cls._STATS_COLUMN_GAP}"
+            f"{str(row.fine_count).rjust(count_width)}"
+            for row in stats
+        ]
+
+        return "\n".join([header, separator, *rows])

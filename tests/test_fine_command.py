@@ -20,7 +20,7 @@ from reader.commands.base import CommandContext, CommandError  # noqa: E402
 from reader.commands.fine import FineCommand  # noqa: E402
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
-from reader.fines.models import ParsedFineRecord  # noqa: E402
+from reader.fines.models import CarFineStats, ParsedFineRecord  # noqa: E402
 from reader.fines.notification_coordinator import FineNotificationCoordinator  # noqa: E402
 from reader.fines.provider import FineProvider, FineProviderError  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
@@ -113,6 +113,7 @@ class _Fixture:
             notification_coordinator=self.coordinator,
             scheduler=self.scheduler,
             fine_job=self.fine_job,
+            detected_fine_repository=self.detected_fine_repository,
             run_times=_RUN_TIMES,
             tz=_TBILISI,
         )
@@ -349,6 +350,86 @@ async def test_fine_status_reflects_scheduler_running_state(fx):
     result = await fx.command.handle(_ctx(["status"]))
 
     assert "Scheduler: работает" in result.text
+
+
+# ---- fine stats ----
+
+
+async def test_fine_stats_with_no_fines(fx):
+    result = await fx.command.handle(_ctx(["stats"]))
+
+    assert result.text == "📊 Статистика штрафов\n\nПока не найдено ни одного штрафа."
+
+
+async def test_fine_stats_groups_by_car_and_sorts_by_count_desc(tmp_path):
+    records_by_car = {
+        "B957MA09": [_record(car_number="B957MA09", fingerprint=f"b-{i}") for i in range(7)],
+        "P701XY126": [_record(car_number="P701XY126", fingerprint=f"p-{i}") for i in range(3)],
+        "AA123BC77": [_record(car_number="AA123BC77", fingerprint="a-1")],
+    }
+    fx = _Fixture(tmp_path, records_by_car=records_by_car)
+    try:
+        for car_number in records_by_car:
+            await fx.command.handle(_ctx(["add", car_number, "01.08.2026", "31.08.2026"]))
+        for task in fx.task_repository.list_active():
+            await fx.command.handle(_ctx(["check", str(task.id)]))
+
+        result = await fx.command.handle(_ctx(["stats"]))
+
+        assert "📊 Статистика штрафов" in result.text
+
+        lines = result.text.split("\n")
+        assert lines[2] == "Автомобиль  Штрафов"
+        assert lines[3] == "----------  -------"
+        # Порядок строк должен отражать ORDER BY COUNT(*) DESC, счётчик
+        # выровнен по правому краю.
+        assert lines[4] == "B957MA09          7"
+        assert lines[5] == "P701XY126         3"
+        assert lines[6] == "AA123BC77         1"
+
+        assert "Всего автомобилей: 3" in result.text
+        assert "Всего опубликованных штрафов: 11" in result.text
+    finally:
+        fx.close()
+
+
+def test_format_stats_table_aligns_columns_with_separator():
+    stats = [
+        CarFineStats(car_number="B957MA09", fine_count=7),
+        CarFineStats(car_number="P701XY126", fine_count=3),
+        CarFineStats(car_number="AA123BC77", fine_count=1),
+    ]
+
+    lines = FineCommand._format_stats_table(stats).split("\n")
+
+    assert lines[0] == "Автомобиль  Штрафов"
+    assert lines[1] == "----------  -------"
+    assert lines[2] == "B957MA09          7"
+    assert lines[3] == "P701XY126         3"
+    assert lines[4] == "AA123BC77         1"
+
+    # Все строки таблицы одной и той же длины — столбцы выровнены.
+    assert len({len(line) for line in lines}) == 1
+
+
+def test_format_stats_table_column_widths_are_computed_from_data_not_hardcoded():
+    # Автомобиль длиннее заголовка "Автомобиль", а счётчик — длиннее
+    # заголовка "Штрафов": оба столбца должны расшириться под данные, а не
+    # остаться равными длине заголовков.
+    stats = [
+        CarFineStats(car_number="VERYLONGPLATE123", fine_count=12345678),
+        CarFineStats(car_number="AA1", fine_count=1),
+    ]
+
+    car_width = len("VERYLONGPLATE123")
+    count_width = len("12345678")
+
+    lines = FineCommand._format_stats_table(stats).split("\n")
+
+    assert lines[0] == "Автомобиль".ljust(car_width) + "  " + "Штрафов"
+    assert lines[1] == "-" * car_width + "  " + "-" * count_width
+    assert lines[2] == "VERYLONGPLATE123  12345678"
+    assert lines[3] == "AA1".ljust(car_width) + "  " + "1".rjust(count_width)
 
 
 # ---- общие ошибки формата ----

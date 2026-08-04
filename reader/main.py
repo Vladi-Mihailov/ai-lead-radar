@@ -108,6 +108,7 @@ def build_fine_monitor_components(
         notification_coordinator=notification_coordinator,
         scheduler=scheduler,
         fine_job=fine_job,
+        detected_fine_repository=detected_fine_repository,
         run_times=fine_monitor.check_times,
         tz=tz,
     )

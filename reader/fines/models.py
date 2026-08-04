@@ -39,6 +39,16 @@ class DetectedFine:
 
 
 @dataclass(frozen=True)
+class CarFineStats:
+    """Одна строка статистики fine stats — сколько штрафов опубликовано
+    по конкретному автомобилю (detected_fines, сгруппированные по
+    car_number)."""
+
+    car_number: str
+    fine_count: int
+
+
+@dataclass(frozen=True)
 class ParsedFineRecord:
     """Одна запись из ответа police.ge (или другого будущего FineProvider),
     уже приведённая к доменному виду — независимо от того, как именно

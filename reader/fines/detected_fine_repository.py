@@ -2,7 +2,7 @@ import sqlite3
 from datetime import date, datetime
 from pathlib import Path
 
-from reader.fines.models import DetectedFine
+from reader.fines.models import CarFineStats, DetectedFine
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS detected_fines (
@@ -51,6 +51,13 @@ _SELECT_BY_FINGERPRINT = f"""
 
 _SELECT_PENDING_NOTIFICATIONS = f"""
     SELECT {_SELECT_FIELDS} FROM detected_fines WHERE notification_sent_at IS NULL
+"""
+
+_SELECT_STATS_BY_CAR = """
+    SELECT car_number, COUNT(*) AS fine_count
+    FROM detected_fines
+    GROUP BY car_number
+    ORDER BY fine_count DESC
 """
 
 _MARK_SEEN = "UPDATE detected_fines SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?"
@@ -132,6 +139,13 @@ class DetectedFineRepository:
         без разделения на "новые" и "повтор": это один и тот же признак."""
         rows = self._conn.execute(_SELECT_PENDING_NOTIFICATIONS).fetchall()
         return [_row_to_fine(row) for row in rows]
+
+    def get_stats_by_car(self) -> list[CarFineStats]:
+        """Количество опубликованных штрафов по каждому автомобилю (fine
+        stats) — сгруппировано и отсортировано по убыванию средствами
+        SQLite, а не в Python."""
+        rows = self._conn.execute(_SELECT_STATS_BY_CAR).fetchall()
+        return [CarFineStats(car_number=row[0], fine_count=row[1]) for row in rows]
 
     def create(
         self,

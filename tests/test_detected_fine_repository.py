@@ -14,6 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import pytest  # noqa: E402
 
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
+from reader.fines.models import CarFineStats  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
 
 _CHAT_ID = -100999
@@ -257,6 +258,72 @@ def test_mark_notification_sent_updates_notification_sent_at(tmp_path):
 
         updated = repo.get_by_fingerprint(task_id, "fp")
         assert updated.notification_sent_at is not None
+    finally:
+        repo.close()
+
+
+def test_get_stats_by_car_groups_and_sorts_by_count_desc(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    try:
+        task_a = task_repo.create(
+            car_number="B957MA09",
+            label=None,
+            start_date=date(2026, 8, 1),
+            end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID,
+            created_by_user_id=_USER_ID,
+        )
+        task_b = task_repo.create(
+            car_number="AA001AA",
+            label=None,
+            start_date=date(2026, 8, 1),
+            end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID,
+            created_by_user_id=_USER_ID,
+        )
+    finally:
+        task_repo.close()
+
+    repo = DetectedFineRepository(db_path)
+    try:
+        for i in range(2):
+            repo.create(
+                monitoring_task_id=task_a.id,
+                car_number="B957MA09",
+                external_fine_id=f"A{i}",
+                fingerprint=f"fp-a-{i}",
+                penalty_date=None,
+                due_date=None,
+                delivered_status=None,
+                raw_data="{}",
+            )
+        repo.create(
+            monitoring_task_id=task_b.id,
+            car_number="AA001AA",
+            external_fine_id="X1",
+            fingerprint="fp-b-1",
+            penalty_date=None,
+            due_date=None,
+            delivered_status=None,
+            raw_data="{}",
+        )
+
+        assert repo.get_stats_by_car() == [
+            CarFineStats(car_number="B957MA09", fine_count=2),
+            CarFineStats(car_number="AA001AA", fine_count=1),
+        ]
+    finally:
+        repo.close()
+
+
+def test_get_stats_by_car_returns_empty_list_when_no_fines(tmp_path):
+    db_path = tmp_path / "users.db"
+    FineMonitoringTaskRepository(db_path).close()
+
+    repo = DetectedFineRepository(db_path)
+    try:
+        assert repo.get_stats_by_car() == []
     finally:
         repo.close()
 
