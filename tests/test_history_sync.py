@@ -102,6 +102,19 @@ class _FakeClient:
         # пользователя (см. _resolve_and_upsert_pending в history_sync.py).
         self.get_entity_batch_calls: list[list] = []
         self._users_by_id = users_by_id or {}
+        # Каждый вызов get_input_entity(user_id) — именно то, что ограничено
+        # failed_identity_refresh для систематически нерезолвящихся id (см.
+        # тест на регрессию про "не пытаться повторно резолвить").
+        self.get_input_entity_calls: list[int] = []
+
+    async def get_input_entity(self, user_id):
+        # Настоящий Telethon для голого положительного int смотрит ТОЛЬКО в
+        # локальный кэш, без единого RPC — здесь кэш эмулируется тем же
+        # users_by_id, что и для пакетного get_entity().
+        self.get_input_entity_calls.append(user_id)
+        if user_id not in self._users_by_id:
+            raise ValueError(f"Cannot find any entity corresponding to {user_id!r}")
+        return object()
 
     async def get_entity(self, ident):
         self.get_entity_calls += 1
@@ -444,6 +457,110 @@ async def test_repeated_sender_without_message_sender_resolved_only_once_per_run
 
         assert client.get_entity_batch_calls == [[808]]
         assert repository.get(808).access_hash == 99
+    finally:
+        repository.close()
+        state_repository.close()
+
+
+async def test_one_unresolvable_id_does_not_block_the_rest_of_the_batch(tmp_path):
+    """Воспроизведение отчёта о баге: один id без записи в локальном кэше
+    Telethon не должен ронять весь пакетный резолв — остальные обязаны
+    получить свой access_hash как обычно."""
+    get_sender_calls = []
+    entity = _FakeEntity(-101007, "Test group")
+    group = Group(id=-101007, username=None, title="Test group")
+
+    repository = UserRepository(tmp_path / "users.db")
+    state_repository = HistorySyncStateRepository(tmp_path / "users.db")
+    try:
+        messages = [
+            _FakeMessage(3, 901, sender=None, get_sender_calls=get_sender_calls),
+            # 902 намеренно отсутствует в users_by_id — недорезолвливаемый id.
+            _FakeMessage(2, 902, sender=None, get_sender_calls=get_sender_calls),
+            _FakeMessage(1, 903, sender=None, get_sender_calls=get_sender_calls),
+        ]
+        users_by_id = {
+            901: _FakeSender(901, username="u901", access_hash=1),
+            903: _FakeSender(903, username="u903", access_hash=3),
+        }
+        client = _FakeClient(entity, messages, get_sender_calls, users_by_id=users_by_id)
+
+        await sync_users_from_history(client, [group], repository, state_repository, _EMPTY_MATCHER)
+
+        # Пакетный get_entity() вызван только для резолвимых id — 902
+        # исключён заранее, а не отправлен в запрос, который упал бы целиком.
+        assert client.get_entity_batch_calls == [[901, 903]]
+        assert repository.get(901).access_hash == 1
+        assert repository.get(903).access_hash == 3
+        assert repository.get(902) is None
+    finally:
+        repository.close()
+        state_repository.close()
+
+
+async def test_persistently_unresolvable_new_user_is_not_retried_across_checkpoints(tmp_path):
+    """Регрессия на обнаруженный пробел: совсем новый пользователь (никогда
+    не было записи в БД), который систематически не резолвится (не в
+    локальном кэше Telethon), не должен пытаться резолвиться заново на
+    каждом чекпоинт-окне — RPC-попытка должна быть только одна за весь этот
+    вызов sync_users_from_history(), даже если он продолжает встречаться в
+    истории (сообщений больше, чем _CHECKPOINT_INTERVAL)."""
+    get_sender_calls = []
+    entity = _FakeEntity(-101008, "Test group")
+    group = Group(id=-101008, username=None, title="Test group")
+
+    repository = UserRepository(tmp_path / "users.db")
+    state_repository = HistorySyncStateRepository(tmp_path / "users.db")
+    try:
+        total_messages = _CHECKPOINT_INTERVAL * 2 + 10
+        # 909 намеренно отсутствует в users_by_id на протяжении ВСЕХ
+        # сообщений — систематически нерезолвящийся id, пишущий через
+        # границы нескольких чекпоинт-окон.
+        messages = [
+            _FakeMessage(mid, 909, sender=None, get_sender_calls=get_sender_calls)
+            for mid in range(total_messages, 0, -1)
+        ]
+        client = _FakeClient(entity, messages, get_sender_calls, users_by_id={})
+
+        await sync_users_from_history(client, [group], repository, state_repository, _EMPTY_MATCHER)
+
+        # Несмотря на то, что сообщений намного больше одного чекпоинт-окна,
+        # попытка резолва (даже неудачная) была ровно одна за весь прогон.
+        assert client.get_input_entity_calls == [909]
+        assert repository.get(909) is None
+
+        checkpoint = state_repository.get(-101008)
+        assert checkpoint.history_completed is True
+        assert checkpoint.processed_messages == total_messages
+        assert checkpoint.saved_users == 0
+    finally:
+        repository.close()
+        state_repository.close()
+
+
+async def test_failed_resolution_does_not_prevent_other_users_in_next_checkpoint(tmp_path):
+    """failed_identity_refresh не должен мешать нормально резолвиться другим,
+    последующим пользователям в следующих чекпоинт-окнах."""
+    get_sender_calls = []
+    entity = _FakeEntity(-101009, "Test group")
+    group = Group(id=-101009, username=None, title="Test group")
+
+    repository = UserRepository(tmp_path / "users.db")
+    state_repository = HistorySyncStateRepository(tmp_path / "users.db")
+    try:
+        total_messages = _CHECKPOINT_INTERVAL + 10
+        messages = [
+            _FakeMessage(mid, 909, sender=None, get_sender_calls=get_sender_calls)
+            for mid in range(total_messages, 1, -1)
+        ] + [_FakeMessage(1, 910, sender=None, get_sender_calls=get_sender_calls)]
+        # 909 — нерезолвящийся; 910 — резолвится нормально, в следующем окне.
+        users_by_id = {910: _FakeSender(910, username="u910", access_hash=10)}
+        client = _FakeClient(entity, messages, get_sender_calls, users_by_id=users_by_id)
+
+        await sync_users_from_history(client, [group], repository, state_repository, _EMPTY_MATCHER)
+
+        assert repository.get(909) is None
+        assert repository.get(910).access_hash == 10
     finally:
         repository.close()
         state_repository.close()

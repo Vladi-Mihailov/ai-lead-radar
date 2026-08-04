@@ -59,6 +59,7 @@ async def _resolve_and_upsert_pending(
     client: TelegramClient,
     repository: UserRepository,
     pending: dict[int, bool],
+    failed_identity_refresh: set[int],
 ) -> tuple[int, int]:
     """Резолвит все накопленные user_id ОДНИМ пакетным client.get_entity()
     вместо отдельного RPC на каждого — Telethon сам разбивает большие списки
@@ -71,37 +72,108 @@ async def _resolve_and_upsert_pending(
     pending — {user_id: is_new}, is_new только для статистики (не считать
     уже известных пользователей "новыми" при переиндексации). Очищается
     после вызова независимо от результата.
+
+    Сначала для каждого id проверяется, есть ли он в локальном кэше сущностей
+    Telethon (client.get_input_entity() — чистый lookup, без единого RPC для
+    голого положительного int, см. докстрок get_input_entity()). Только
+    закэшированные id идут в пакетный get_entity(); те, что не резолвятся
+    даже так, изолируются заранее — иначе один такой id рушит get_entity()
+    целиком (см. диагностику и объяснение в history_sync.py issue про
+    "Пакетное получение ... не удалось").
+
+    Любой user_id, для которого резолв так и не удался (ни пакетно, ни по
+    одному), добавляется в failed_identity_refresh — до конца текущего
+    вызова sync_users_from_history() к нему больше не будет попытки RPC
+    (см. needs_refresh в _sync_group_history). В следующем запуске программы
+    множество создаётся заново, так что попытка повторится.
     """
     if not pending:
         return 0, 0
 
     user_ids = list(pending.keys())
-    try:
-        entities = await client.get_entity(user_ids)
-    except Exception:
-        # Пакетный запрос падает целиком из-за одного проблемного id
-        # (get_entity() не изолирует ошибки внутри списка) — дорезолвливаем
-        # по одному, чтобы не терять остальных валидных из этого набора.
+
+    # ВРЕМЕННАЯ ДИАГНОСТИКА — убрать после того, как причина падения
+    # пакетного get_entity() будет подтверждена в проде. Печатает, какие
+    # именно id не проходят даже локальный (безсетевой) lookup, и почему.
+    for user_id in user_ids:
+        if user_id is None:
+            logger.warning("[DIAG] None среди id, ожидающих резолва — пропускаю")
+            continue
+        if not isinstance(user_id, int) or user_id <= 0:
+            logger.warning(
+                "[DIAG] Подозрительный id среди ожидающих резолва: %r (тип %s)",
+                user_id, type(user_id).__name__,
+            )
+
+    resolvable_ids = []
+    unresolvable_ids = []
+    for user_id in user_ids:
+        try:
+            input_entity = await client.get_input_entity(user_id)
+        except Exception as exc:
+            unresolvable_ids.append(user_id)
+            logger.warning(
+                "[DIAG] user_id=%s не резолвится даже в input_entity "
+                "(нет в локальном кэше Telethon, без сети): %s: %s",
+                user_id, type(exc).__name__, exc,
+            )
+        else:
+            resolvable_ids.append(user_id)
+            logger.warning(
+                "[DIAG] user_id=%s -> %s", user_id, type(input_entity).__name__
+            )
+
+    if unresolvable_ids:
         logger.warning(
-            "Пакетное получение %d пользователей не удалось, дорезолвливаю по одному",
-            len(user_ids),
+            "[DIAG] Исключено из пакетного резолва %d из %d id (не в локальном "
+            "кэше Telethon): %s",
+            len(unresolvable_ids), len(user_ids), unresolvable_ids,
         )
-        entities = []
-        for user_id in user_ids:
-            try:
-                entities.append(await client.get_entity(user_id))
-            except Exception:
-                entities.append(None)
+
+    entities_by_id: dict[int, object] = {}
+    if resolvable_ids:
+        try:
+            entities = await client.get_entity(resolvable_ids)
+            entities_by_id = dict(zip(resolvable_ids, entities))
+        except Exception as exc:
+            # Пакетный запрос всё равно может упасть целиком (например,
+            # get_input_entity() выше был не единственным местом, где
+            # возможна ошибка) — дорезолвливаем по одному, чтобы не терять
+            # остальных валидных из этого набора.
+            logger.warning(
+                "[DIAG] Пакетное получение %d пользователей не удалось: %s: %s "
+                "— дорезолвливаю по одному",
+                len(resolvable_ids), type(exc).__name__, exc,
+            )
+            for user_id in resolvable_ids:
+                try:
+                    entities_by_id[user_id] = await client.get_entity(user_id)
+                except Exception as exc2:
+                    logger.warning(
+                        "[DIAG] user_id=%s не резолвился и по одному: %s: %s",
+                        user_id, type(exc2).__name__, exc2,
+                    )
+                    entities_by_id[user_id] = None
+    # --- конец временной диагностики ---
 
     upserted = 0
     new_count = 0
-    for user_id, sender in zip(user_ids, entities):
+    for user_id in user_ids:
+        sender = entities_by_id.get(user_id)
         if sender is None:
+            # Резолв не удался ни пакетно, ни по одному (см. unresolvable_ids
+            # выше и entities_by_id[user_id] = None в фоллбэке) — не пытаемся
+            # снова до конца этого запуска sync_users.py.
+            failed_identity_refresh.add(user_id)
             continue
         if _upsert_sender(repository, user_id, sender):
             upserted += 1
             if pending[user_id]:
                 new_count += 1
+        # _upsert_sender() сам залогировал сбой записи в локальный кэш —
+        # сущность РЕЗОЛВИЛАСЬ успешно, поэтому в failed_identity_refresh не
+        # попадает: следующее сообщение того же автора получит ещё одну
+        # попытку записи (см. existing is None), а не будет пропущено вовсе.
 
     pending.clear()
     return upserted, new_count
@@ -146,6 +218,12 @@ async def sync_users_from_history(
     вместе со страницей истории), а если его не хватает — резолв идёт одним
     пакетным запросом на чекпоинт, а не по одному (см.
     _resolve_and_upsert_pending).
+
+    Отдельно: если для пользователя (обычно совсем нового, ранее не
+    встречавшегося) резолв так и не удался — ни пакетно, ни по одному — до
+    конца ЭТОГО вызова к нему больше не будет попытки RPC (см.
+    failed_identity_refresh); в следующем запуске sync_users.py попытка
+    повторится, так как это множество создаётся заново при каждом вызове.
     """
 
     logger.info("Синхронизация истории начата%s", " (принудительная переиндексация)" if force else "")
@@ -156,6 +234,16 @@ async def sync_users_from_history(
     # не резолвился повторно на каждое из них: раньше это приводило к
     # практически непрерывному FloodWait вместо пакетов по 10000 сообщений.
     refreshed_user_ids: set[int] = set()
+
+    # Пользователи, для которых попытка полного резолва (пакетного и
+    # одиночного) уже провалилась в этом прогоне — например, id, которого
+    # Telethon принципиально не может найти без контекста сообщения. Без
+    # этого множества такой пользователь заново попадал бы в пакетный запрос
+    # на каждом следующем чекпоинт-окне (existing остаётся None навсегда, а
+    # значит needs_refresh остаётся истинным), пока продолжает встречаться
+    # в истории. Общий для всех групп по той же причине, что и
+    # refreshed_user_ids.
+    failed_identity_refresh: set[int] = set()
 
     for group in groups:
         try:
@@ -172,6 +260,7 @@ async def sync_users_from_history(
         await _sync_group_history(
             client, entity, title, repository, state_repository, matcher,
             force=force, refreshed_user_ids=refreshed_user_ids,
+            failed_identity_refresh=failed_identity_refresh,
         )
 
 
@@ -185,6 +274,7 @@ async def _sync_group_history(
     *,
     force: bool = False,
     refreshed_user_ids: set[int],
+    failed_identity_refresh: set[int],
 ) -> None:
     chat_id = entity.id
     checkpoint = state_repository.get(chat_id)
@@ -331,19 +421,25 @@ async def _sync_group_history(
                             if _upsert_sender(repository, sender_id, sender) and existing is None:
                                 saved_users_total += 1
                                 new_users_in_batch += 1
-                        else:
+                        elif sender_id not in failed_identity_refresh:
                             # Не хватает данных в самом сообщении — резолвим
                             # позже одним пакетным запросом на чекпоинте
                             # (см. _resolve_and_upsert_pending), а не отдельным
                             # RPC прямо здесь.
                             pending_identity_refresh[sender_id] = existing is None
+                        # else: RPC-резолв этого пользователя уже пробовали и
+                        # не смогли в этом же прогоне (failed_identity_refresh)
+                        # — не повторяем попытку до следующего запуска
+                        # sync_users.py. message.sender мы всё равно уже
+                        # проверили бесплатно чуть выше — если бы он оказался
+                        # заполнен, пользователь был бы обновлён в ветке if.
                     # existing уже в кэше и не идёт переиндексация (или чтение
                     # не удалось) — ни сети, ни записи для этого сообщения не
                     # требуется.
 
                 if since_checkpoint >= _CHECKPOINT_INTERVAL:
                     _, new_count = await _resolve_and_upsert_pending(
-                        client, repository, pending_identity_refresh
+                        client, repository, pending_identity_refresh, failed_identity_refresh,
                     )
                     saved_users_total += new_count
                     new_users_in_batch += new_count
@@ -426,7 +522,7 @@ async def _sync_group_history(
         # иначе "хвост" группы (< _CHECKPOINT_INTERVAL сообщений) остался бы
         # без access_hash/данных до следующего запуска.
         _, new_count = await _resolve_and_upsert_pending(
-            client, repository, pending_identity_refresh
+            client, repository, pending_identity_refresh, failed_identity_refresh,
         )
         saved_users_total += new_count
         new_users_in_batch += new_count
