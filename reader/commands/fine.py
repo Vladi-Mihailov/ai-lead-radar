@@ -19,6 +19,7 @@ from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.fines.validation import (
     FineValidationError,
     normalize_car_number,
+    parse_date,
     resolve_monitoring_period,
     validate_no_overlap,
 )
@@ -33,6 +34,19 @@ _ADD_USAGE_ERROR = (
     "fine add B957MA09\n"
     "или\n"
     "fine add B957MA09 03.08.2026 13.08.2026"
+)
+_BULK_MAX_CAR_NUMBERS = 100
+_BULK_USAGE_ERROR = (
+    "❌ Неверный формат команды\n\n"
+    "После первой строки укажите хотя бы один номер автомобиля, каждый —"
+    " на отдельной строке. Например:\n\n"
+    "fine add bulk\n"
+    "H663KH702\n"
+    "C072H0977\n\n"
+    "или с общим периодом для всех номеров:\n\n"
+    "fine add bulk 04.08.2026 04.09.2026\n"
+    "H663KH702\n"
+    "C072H0977"
 )
 _STOP_USAGE_ERROR = "❌ Неверный формат команды\n\nИспользуйте:\nfine stop <НОМЕР_АВТОМОБИЛЯ>"
 _CHECK_USAGE_ERROR = "❌ Неверный формат команды\n\nИспользуйте:\nfine check <НОМЕР_АВТОМОБИЛЯ>"
@@ -109,6 +123,9 @@ class FineCommand(Command):
         raise CommandError(_UNKNOWN_SUBCOMMAND_ERROR)
 
     async def _handle_add(self, ctx: CommandContext, args: list[str]) -> CommandResult:
+        if args and args[0].lower() == "bulk":
+            return await self._handle_add_bulk(ctx, args[1:])
+
         if len(args) not in (1, 3):
             raise CommandError(_ADD_USAGE_ERROR)
 
@@ -138,6 +155,92 @@ class FineCommand(Command):
                 f"Проверка: {_format_check_times(self._run_times)} по Тбилиси"
             )
         )
+
+    async def _handle_add_bulk(self, ctx: CommandContext, args: list[str]) -> CommandResult:
+        start_raw, end_raw, car_numbers_raw = self._split_bulk_args(args)
+
+        if not car_numbers_raw:
+            raise CommandError(_BULK_USAGE_ERROR)
+
+        if len(car_numbers_raw) > _BULK_MAX_CAR_NUMBERS:
+            raise CommandError(
+                f"❌ Слишком много номеров в одном сообщении: {len(car_numbers_raw)} "
+                f"(максимум {_BULK_MAX_CAR_NUMBERS} за одно сообщение)"
+            )
+
+        today = datetime.now(timezone.utc).astimezone(self._tz).date()
+        start_date, end_date = resolve_monitoring_period(start_raw, end_raw, today=today)
+
+        added = 0
+        already_tracked = 0
+        errors: list[tuple[str, str]] = []
+        seen_car_numbers: set[str] = set()
+
+        for raw_car_number in car_numbers_raw:
+            try:
+                car_number = normalize_car_number(raw_car_number)
+            except FineValidationError as exc:
+                errors.append((raw_car_number, exc.message))
+                continue
+
+            if car_number in seen_car_numbers:
+                # Дубль внутри этого же сообщения — тихо пропускаем, уже
+                # обработан (добавлен/учтён как ошибка) при первом появлении.
+                continue
+            seen_car_numbers.add(car_number)
+
+            existing = self._task_repository.get_active_by_car_number(car_number)
+            try:
+                validate_no_overlap(start_date, end_date, existing)
+            except FineValidationError:
+                already_tracked += 1
+                continue
+
+            self._task_repository.create(
+                car_number=car_number,
+                label=None,
+                start_date=start_date,
+                end_date=end_date,
+                telegram_chat_id=ctx.chat_id,
+                created_by_user_id=ctx.user_id,
+            )
+            added += 1
+
+        return CommandResult(text=self._format_bulk_result(added, already_tracked, errors))
+
+    @staticmethod
+    def _split_bulk_args(args: list[str]) -> tuple[str | None, str | None, list[str]]:
+        """Первая строка "fine add bulk ..." — это args здесь. Если первые
+        два токена — обе валидные даты, это общий период (START_DATE
+        END_DATE), а всё остальное — номера. Иначе период не задан
+        (используется значение по умолчанию), а все токены — номера."""
+        if len(args) >= 2:
+            try:
+                parse_date(args[0])
+                parse_date(args[1])
+            except FineValidationError:
+                pass
+            else:
+                return args[0], args[1], args[2:]
+
+        return None, None, args
+
+    @staticmethod
+    def _format_bulk_result(
+        added: int, already_tracked: int, errors: list[tuple[str, str]]
+    ) -> str:
+        lines = [
+            f"✅ Добавлено: {added}",
+            f"⚠️ Уже отслеживаются: {already_tracked}",
+            f"❌ Ошибок: {len(errors)}",
+        ]
+
+        if errors:
+            lines.append("")
+            lines.append("Ошибки:")
+            lines.extend(f"• {raw_car_number} — {message}" for raw_car_number, message in errors)
+
+        return "\n".join(lines)
 
     def _handle_list(self) -> CommandResult:
         tasks = self._task_repository.list_active()

@@ -199,6 +199,142 @@ async def test_fine_add_rejects_overlapping_active_task(fx):
     assert len(fx.task_repository.list_active()) == 1
 
 
+# ---- fine add bulk ----
+
+
+async def test_fine_add_bulk_with_explicit_dates(fx):
+    result = await fx.command.handle(
+        _ctx(
+            [
+                "add", "bulk", "04.08.2026", "04.09.2026",
+                "H663KH702", "C072H0977", "M012KT193", "P701XY126",
+            ]
+        )
+    )
+
+    assert result.text == "✅ Добавлено: 4\n⚠️ Уже отслеживаются: 0\n❌ Ошибок: 0"
+
+    tasks = {task.car_number: task for task in fx.task_repository.list_active()}
+    assert set(tasks) == {"H663KH702", "C072H0977", "M012KT193", "P701XY126"}
+    for task in tasks.values():
+        assert task.start_date == date(2026, 8, 4)
+        assert task.end_date == date(2026, 9, 4)
+        assert task.telegram_chat_id == _CHAT_ID
+        assert task.created_by_user_id == _USER_ID
+
+
+async def test_fine_add_bulk_without_dates_defaults_to_today_plus_30_days(fx):
+    result = await fx.command.handle(_ctx(["add", "bulk", "H663KH702", "C072H0977"]))
+
+    assert result.text == "✅ Добавлено: 2\n⚠️ Уже отслеживаются: 0\n❌ Ошибок: 0"
+
+    tasks = fx.task_repository.list_active()
+    assert len(tasks) == 2
+    for task in tasks:
+        assert (task.end_date - task.start_date) == timedelta(days=30)
+
+
+async def test_fine_add_bulk_normalizes_car_numbers(fx):
+    await fx.command.handle(_ctx(["add", "bulk", "h663kh702", " c072h0977 "]))
+
+    car_numbers = {task.car_number for task in fx.task_repository.list_active()}
+    assert car_numbers == {"H663KH702", "C072H0977"}
+
+
+async def test_fine_add_bulk_deduplicates_within_message_preserving_order(fx):
+    result = await fx.command.handle(
+        _ctx(["add", "bulk", "H663KH702", "C072H0977", "H663KH702", "h663kh702"])
+    )
+
+    assert result.text == "✅ Добавлено: 2\n⚠️ Уже отслеживаются: 0\n❌ Ошибок: 0"
+
+    car_numbers = sorted(task.car_number for task in fx.task_repository.list_active())
+    assert car_numbers == ["C072H0977", "H663KH702"]
+
+
+async def test_fine_add_bulk_reports_already_tracked_for_existing_active_task(fx):
+    await fx.command.handle(_ctx(["add", "H663KH702", "01.08.2026", "31.08.2026"]))
+
+    result = await fx.command.handle(
+        _ctx(["add", "bulk", "15.08.2026", "20.09.2026", "H663KH702", "C072H0977"])
+    )
+
+    assert result.text == "✅ Добавлено: 1\n⚠️ Уже отслеживаются: 1\n❌ Ошибок: 0"
+    assert len(fx.task_repository.list_active()) == 2
+
+
+async def test_fine_add_bulk_reports_invalid_car_number_among_valid_ones(fx):
+    result = await fx.command.handle(
+        _ctx(["add", "bulk", "H663KH702", "AA-001-AA", "C072H0977"])
+    )
+
+    assert "✅ Добавлено: 2" in result.text
+    assert "⚠️ Уже отслеживаются: 0" in result.text
+    assert "❌ Ошибок: 1" in result.text
+    assert "Ошибки:" in result.text
+    assert "• AA-001-AA — " in result.text
+
+    car_numbers = {task.car_number for task in fx.task_repository.list_active()}
+    assert car_numbers == {"H663KH702", "C072H0977"}
+
+
+async def test_fine_add_bulk_error_in_one_number_does_not_block_others(fx):
+    # Невалидный номер посередине списка — оба соседних валидных всё равно
+    # должны быть добавлены, ошибка одного не откатывает остальные.
+    result = await fx.command.handle(
+        _ctx(["add", "bulk", "H663KH702", "AA-001-AA", "C072H0977", "###", "M012KT193"])
+    )
+
+    assert "✅ Добавлено: 3" in result.text
+    assert "❌ Ошибок: 2" in result.text
+
+    car_numbers = {task.car_number for task in fx.task_repository.list_active()}
+    assert car_numbers == {"H663KH702", "C072H0977", "M012KT193"}
+
+
+async def test_fine_add_bulk_all_succeed_omits_errors_block(fx):
+    result = await fx.command.handle(_ctx(["add", "bulk", "H663KH702", "C072H0977"]))
+
+    assert "Ошибки:" not in result.text
+
+
+async def test_fine_add_bulk_with_no_car_numbers_shows_format_example(fx):
+    with pytest.raises(CommandError) as exc_info:
+        await fx.command.handle(_ctx(["add", "bulk"]))
+
+    assert "Неверный формат команды" in exc_info.value.message
+    assert "fine add bulk" in exc_info.value.message
+    assert fx.task_repository.list_active() == []
+
+
+async def test_fine_add_bulk_with_dates_but_no_car_numbers_shows_format_example(fx):
+    with pytest.raises(CommandError) as exc_info:
+        await fx.command.handle(_ctx(["add", "bulk", "04.08.2026", "04.09.2026"]))
+
+    assert "Неверный формат команды" in exc_info.value.message
+    assert fx.task_repository.list_active() == []
+
+
+async def test_fine_add_bulk_rejects_over_limit(fx):
+    car_numbers = [f"AA{i:03d}AA" for i in range(101)]
+
+    with pytest.raises(CommandError) as exc_info:
+        await fx.command.handle(_ctx(["add", "bulk", *car_numbers]))
+
+    assert "Слишком много номеров" in exc_info.value.message
+    # Превышение лимита проверяется до обработки — ни один номер не добавлен.
+    assert fx.task_repository.list_active() == []
+
+
+async def test_fine_add_bulk_accepts_exactly_the_limit(fx):
+    car_numbers = [f"AA{i:03d}AA" for i in range(100)]
+
+    result = await fx.command.handle(_ctx(["add", "bulk", *car_numbers]))
+
+    assert "✅ Добавлено: 100" in result.text
+    assert len(fx.task_repository.list_active()) == 100
+
+
 # ---- fine list ----
 
 
