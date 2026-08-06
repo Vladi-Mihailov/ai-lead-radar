@@ -95,8 +95,16 @@ def _parse_keywords_column(raw: str | None) -> list[str]:
 # count_candidates()/select_candidates() (с фильтром по username) и
 # count_found_candidates() (без него, см. ниже) — единый фрагмент, чтобы
 # оба запроса не могли разойтись между собой.
+#
+# is_bot IS NULL — не исключаем: старые строки, записанные до появления
+# этого признака (или без него вовсе), не должны молча выпадать из
+# кандидатов; исключаем только тех, для кого is_bot=1 ТОЧНО известен (см.
+# TelegramUserInfo.is_bot/UserRepository.upsert). Приглашение бота
+# (например @Vlars_Bot) заканчивается ChatAdminRequiredError — отсеиваем
+# заранее, на этапе выборки, а не после ошибки Telegram.
 _CANDIDATES_BASE_WHERE = """
     u.access_hash IS NOT NULL
+    AND (u.is_bot IS NULL OR u.is_bot = 0)
     AND (', ' || u.keywords || ', ') LIKE ('%, ' || c.keyword || ', %')
     AND NOT EXISTS (
         SELECT 1 FROM user_campaign_invites uci
@@ -452,9 +460,9 @@ class UserCampaignInviteRepository:
 
     def count_candidates(self, campaign_id: int) -> int:
         """Сколько пользователей подходят кампании campaign_id прямо сейчас
-        (access_hash есть, username есть и не пуст, keyword кампании — среди
-        их keywords, ещё не приглашены для этой кампании) — без учёта limit,
-        см. select_candidates()."""
+        (access_hash есть, username есть и не пуст, is_bot не равен 1,
+        keyword кампании — среди их keywords, ещё не приглашены для этой
+        кампании) — без учёта limit, см. select_candidates()."""
         row = self._conn.execute(_COUNT_CANDIDATES, {"campaign_id": campaign_id}).fetchone()
         return row[0]
 
@@ -473,11 +481,13 @@ class UserCampaignInviteRepository:
         содержит keyword кампании, access_hash задан и username задан и не
         пуст (иначе приглашающий аккаунт, которому candidate не известен,
         не сможет его резолвить вовсе — см. InviterService._resolve_input_peer
-        и требование задачи о фильтрации по username), ещё нет записи со
-        status='invited' для ЭТОЙ кампании — отсортированные по
-        last_seen_at DESC, не более limit штук. Только выборка — никаких
-        записей в user_campaign_invites не создаёт и не изменяет (см.
-        service.py)."""
+        и требование задачи о фильтрации по username), is_bot не равен 1
+        (Telegram-боты приглашаются с ChatAdminRequiredError — отсеиваем их
+        заранее, см. _CANDIDATES_BASE_WHERE; is_bot=NULL, для строк без
+        этого признака, не исключается), ещё нет записи со status='invited'
+        для ЭТОЙ кампании — отсортированные по last_seen_at DESC, не более
+        limit штук. Только выборка — никаких записей в user_campaign_invites
+        не создаёт и не изменяет (см. service.py)."""
         rows = self._conn.execute(
             _SELECT_CANDIDATES, {"campaign_id": campaign_id, "limit": limit}
         ).fetchall()

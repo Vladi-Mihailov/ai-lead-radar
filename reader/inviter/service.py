@@ -298,7 +298,12 @@ def _humanize_error(exc: Exception) -> str:
     if isinstance(exc, ChatAdminRequiredError):
         return "У аккаунта нет прав приглашать участников."
     if isinstance(exc, PeerFloodError):
-        return "Telegram временно ограничил аккаунт."
+        # exc.__init__ жёстко пишет "Too many requests" (см. Telethon —
+        # отдельного TooManyRequestsError не существует, это и есть
+        # PeerFloodError) — упоминаем исходную фразу, чтобы оператор мог
+        # сопоставить её с тем, что видит в логах/БД (см. ниже — там
+        # остаётся str(exc) без изменений).
+        return "Telegram временно ограничил приглашения (Too many requests)."
     return str(exc)
 
 

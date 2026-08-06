@@ -72,6 +72,7 @@ def _seed_user(
     keywords: list[str] | None = None,
     access_hash: int | None = None,
     last_seen_at: datetime | None = None,
+    is_bot: bool | None = None,
 ) -> None:
     """Пишет пользователя напрямую в users, минуя UserRepository.upsert()
     (который всегда ставит last_seen_at=CURRENT_TIMESTAMP) — тестам нужен
@@ -83,21 +84,27 @@ def _seed_user(
     существующих тестов сам username не важен, поэтому по умолчанию (когда
     он вообще не передан) подставляется "user<id>", а не None. Передайте
     username=None явно, если тест целенаправленно проверяет отсутствие
-    username."""
+    username.
+
+    is_bot=None (по умолчанию) — как у строк, записанных без этого
+    признака (см. _CANDIDATES_BASE_WHERE: NULL не исключается из
+    кандидатов, только is_bot=1); передайте True явно, чтобы смоделировать
+    Telegram-бота (см. test_select_candidates_excludes_bots)."""
     if username is _USERNAME_NOT_PASSED:
         username = f"user{user_id}"
 
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
-            "INSERT INTO users (user_id, username, keywords, access_hash, last_seen_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            "INSERT INTO users (user_id, username, keywords, access_hash, last_seen_at, is_bot, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
             (
                 user_id,
                 username,
                 ", ".join(keywords) if keywords else None,
                 access_hash,
                 last_seen_at.isoformat() if last_seen_at else None,
+                None if is_bot is None else int(is_bot),
             ),
         )
         conn.commit()
@@ -365,6 +372,49 @@ def test_select_candidates_excludes_users_without_username(tmp_path):
         candidates = invite_repository.select_candidates(campaign.id, limit=10)
         assert [c.user_id for c in candidates] == [4]
         assert invite_repository.count_candidates(campaign.id) == 1
+    finally:
+        campaign_repository.close()
+        invite_repository.close()
+
+
+def test_select_candidates_excludes_bots(tmp_path):
+    """Приглашение Telegram-бота (is_bot=1) заканчивается
+    ChatAdminRequiredError — исключаем таких кандидатов ещё на этапе
+    выборки (SQL), а не после ошибки Telegram. is_bot=NULL — как у строк,
+    записанных без этого признака вовсе — НЕ исключается (см.
+    test_select_candidates_includes_users_with_unknown_bot_flag)."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, username="vlars_bot", keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME, is_bot=True)
+    _seed_user(db_path, 2, username="ivan", keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME, is_bot=False)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+
+        candidates = invite_repository.select_candidates(campaign.id, limit=10)
+        assert [c.user_id for c in candidates] == [2]
+        assert invite_repository.count_candidates(campaign.id) == 1
+        assert invite_repository.count_found_candidates(campaign.id) == 1
+    finally:
+        campaign_repository.close()
+        invite_repository.close()
+
+
+def test_select_candidates_includes_users_with_unknown_bot_flag(tmp_path):
+    """Строки без известного признака is_bot (NULL — например, записанные
+    до появления этого поля) не должны молча выпадать из кандидатов:
+    исключаются только те, для кого is_bot=1 достоверно известен."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, username="ivan", keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME, is_bot=None)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+
+        candidates = invite_repository.select_candidates(campaign.id, limit=10)
+        assert [c.user_id for c in candidates] == [1]
     finally:
         campaign_repository.close()
         invite_repository.close()
@@ -1382,7 +1432,7 @@ def test_execute_peer_flood_during_resolution_stops_account(tmp_path):
 
     stop_notifications = [m for m in notifier.sent if m.startswith("⚠️")]
     assert len(stop_notifications) == 1
-    assert "Telegram временно ограничил аккаунт." in stop_notifications[0]
+    assert "Telegram временно ограничил приглашения (Too many requests)." in stop_notifications[0]
 
 
 def test_execute_creates_failed_record_on_rpc_error(tmp_path):
@@ -1841,7 +1891,7 @@ def test_format_duration_formats_seconds_as_hh_mm_ss(seconds, expected):
         ),
         (
             PeerFloodError(request=GetHistoryRequest),
-            "Telegram временно ограничил аккаунт.",
+            "Telegram временно ограничил приглашения (Too many requests).",
         ),
     ],
 )
@@ -2131,14 +2181,14 @@ def test_execute_peer_flood_stops_account_and_notifies_operator(tmp_path):
         # В БД — оригинальный текст исключения, а не человекочитаемый: он
         # предназначен для диагностики, а не для оператора.
         assert invites[0].error == str(PeerFloodError(request=GetHistoryRequest))
-        assert invites[0].error != "Telegram временно ограничил аккаунт."
+        assert invites[0].error != "Telegram временно ограничил приглашения (Too many requests)."
     finally:
         invite_repository.close()
 
     stop_notifications = [m for m in notifier.sent if m.startswith("⚠️")]
     assert len(stop_notifications) == 1
     assert "Аккаунт: account_2" in stop_notifications[0]
-    assert "Telegram временно ограничил аккаунт." in stop_notifications[0]
+    assert "Telegram временно ограничил приглашения (Too many requests)." in stop_notifications[0]
     assert "Работа аккаунта остановлена." in stop_notifications[0]
     assert "Переход к следующему аккаунту." in stop_notifications[0]
 
