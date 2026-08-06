@@ -1,0 +1,136 @@
+import argparse
+import asyncio
+import logging
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from telethon import TelegramClient  # noqa: E402
+
+from reader.inviter.models import TelegramAccount  # noqa: E402
+from reader.inviter.repository import (  # noqa: E402
+    InviteCampaignRepository,
+    TelegramAccountRepository,
+    UserCampaignInviteRepository,
+)
+from reader.inviter.service import InviterService  # noqa: E402
+from reader.logging_setup import setup_logging  # noqa: E402
+# resolve_notification_chat_ids — тот же "чат оператора", куда уже уходят
+# уведомления о штрафах (reader/main.py, _run_fine_monitor) — переиспользуем
+# готовую функцию, а не задаём chat_id заново, чтобы при смене chat_id в
+# конфиге (см. задачу) обоим потребителям не пришлось править код отдельно.
+from reader.main import resolve_notification_chat_ids  # noqa: E402
+from reader.notifications.operator_notifier import OperatorNotifier  # noqa: E402
+from reader.settings import ConfigError, Settings, load_settings  # noqa: E402
+
+CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
+
+logger = logging.getLogger(__name__)
+
+
+def _build_client_factory(settings: Settings):
+    """Каждый TelegramAccount — отдельная Telegram-сессия (session_path),
+    но одно и то же приложение (api_id/api_hash из settings.telegram) — тот
+    же принцип, что и у reader/sync_users.py. Клиент возвращается
+    неподключённым — connect()/disconnect() делает вызывающий (см.
+    InviterService._dry_run_account/_execute_account)."""
+
+    def factory(account: TelegramAccount) -> TelegramClient:
+        return TelegramClient(
+            account.session_path,
+            settings.telegram.api_id,
+            settings.telegram.api_hash,
+            receive_updates=False,
+        )
+
+    return factory
+
+
+def _build_operator_notifier(settings: Settings) -> OperatorNotifier:
+    """Отдельная сессия (session_path_notifier) — не делит .session-файл ни
+    с main.py (session_path_live), ни с sync_users.py (session_path_sync),
+    см. reader/settings.py. Получатели — те же, что уже настроены для
+    уведомлений приложения (fine_monitor.notification_chat_ids, а если
+    пусто — app.lead_forward_to), см. resolve_notification_chat_ids()."""
+    client = TelegramClient(
+        settings.telegram.session_path_notifier,
+        settings.telegram.api_id,
+        settings.telegram.api_hash,
+        receive_updates=False,
+    )
+    return OperatorNotifier(client, resolve_notification_chat_ids(settings))
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Инвайтер — отбор кандидатов и приглашение их в target_chat кампаний."
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Только подготовка и лог READY/FAILED, без единого изменения в "
+            "Telegram (по умолчанию, можно указать явно)."
+        ),
+    )
+    mode.add_argument(
+        "--execute",
+        action="store_true",
+        help="Выполнить реальные приглашения в Telegram (InviteToChannelRequest/AddChatUserRequest).",
+    )
+    return parser.parse_args(argv)
+
+
+async def run(*, execute: bool = False) -> None:
+    """Поднимает инфраструктуру инвайтера (репозитории + миграции БД) и
+    делегирует запуск InviterService — отбор кандидатов и, при execute=True,
+    реальные приглашения (см. service.py). execute=False (по умолчанию) —
+    только dry-run, без единого изменения в Telegram."""
+    settings = load_settings(CONFIG_PATH)
+    setup_logging(settings.app.log_level)
+    logger.info("Инвайтер запущен в режиме: %s", "EXECUTE" if execute else "DRY RUN")
+
+    account_repository = TelegramAccountRepository(settings.app.users_db_file)
+    campaign_repository = InviteCampaignRepository(settings.app.users_db_file)
+    invite_repository = UserCampaignInviteRepository(settings.app.users_db_file)
+    logger.info(
+        "Инфраструктура инвайтера готова: аккаунтов=%d, кампаний=%d, приглашений=%d",
+        len(account_repository.list()),
+        len(campaign_repository.list()),
+        len(invite_repository.list()),
+    )
+
+    notifier = _build_operator_notifier(settings)
+    await notifier.start()
+
+    try:
+        service = InviterService(
+            account_repository, campaign_repository, invite_repository,
+            client_factory=_build_client_factory(settings),
+            notifier=notifier,
+        )
+        await service.run(execute=execute)
+    finally:
+        await notifier.close()
+        account_repository.close()
+        campaign_repository.close()
+        invite_repository.close()
+
+
+def main() -> None:
+    args = _parse_args(sys.argv[1:])
+    try:
+        asyncio.run(run(execute=args.execute))
+    except ConfigError as exc:
+        print(f"Ошибка запуска: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nОстановлено пользователем.")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

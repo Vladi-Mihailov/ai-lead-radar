@@ -13,6 +13,7 @@ class ConfigError(Exception):
 
 _LEGACY_SESSION_NAME = "reader_session"
 _DEFAULT_SESSION_NAME_LIVE = "reader_live"
+_DEFAULT_SESSION_NAME_NOTIFIER = "reader_notifier"
 
 
 def _session_file(session_path: Path) -> Path:
@@ -71,6 +72,11 @@ def _migrate_legacy_session(session_name_live: str, session_path_live: Path) -> 
 class TelegramSettings(BaseModel):
     session_path_live: Path
     session_path_sync: Path
+    # Опционален (в отличие от live/sync) — используется только
+    # reader/inviter (уведомления оператору о ходе приглашений, см.
+    # OperatorNotifier); прямое построение TelegramSettings(...) в
+    # существующих тестах/коде не обязано его задавать.
+    session_path_notifier: Path | None = None
     api_id: int
     api_hash: str
     phone: str
@@ -168,6 +174,19 @@ def load_settings(config_path: Path) -> Settings:
         / "sessions"
         / telegram_raw["session_name_sync"]
     )
+    # Опционален в config.yaml (в отличие от session_name_sync) — только
+    # reader/inviter открывает эту сессию (уведомления оператору, см.
+    # OperatorNotifier); её отсутствие не должно ломать существующие
+    # config.yaml, у которых этого ключа никогда не было.
+    session_name_notifier = (
+        telegram_raw.get("session_name_notifier") or _DEFAULT_SESSION_NAME_NOTIFIER
+    )
+    session_path_notifier = (
+        project_root
+        / "data"
+        / "sessions"
+        / session_name_notifier
+    )
 
     print("=" * 80)
     print("PROJECT ROOT      :", project_root)
@@ -180,6 +199,7 @@ def load_settings(config_path: Path) -> Settings:
     # Создаем каталог автоматически
     session_path_live.parent.mkdir(parents=True, exist_ok=True)
     session_path_sync.parent.mkdir(parents=True, exist_ok=True)
+    session_path_notifier.parent.mkdir(parents=True, exist_ok=True)
     # -------------------------------
 
     _migrate_legacy_session(session_name_live, session_path_live)
@@ -189,6 +209,7 @@ def load_settings(config_path: Path) -> Settings:
             telegram=TelegramSettings(
                 session_path_live=session_path_live,
                 session_path_sync=session_path_sync,
+                session_path_notifier=session_path_notifier,
                 api_id=int(api_id),
                 api_hash=api_hash,
                 phone=phone,
