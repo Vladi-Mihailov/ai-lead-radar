@@ -4,6 +4,7 @@ import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable, Protocol
 
 from telethon.errors import FloodWaitError, PeerFloodError, RPCError, UserAlreadyParticipantError
@@ -222,6 +223,30 @@ def _format_account_stopped_notification(account: TelegramAccount, reason: str) 
     )
 
 
+def _session_file_path(account: TelegramAccount) -> Path:
+    """Telethon сам дописывает ".session" к переданному session_path —
+    ровно тот же файл, что будет открывать TelegramClient(account.session_path, ...)."""
+    return Path(f"{account.session_path}.session")
+
+
+def _default_session_checker(account: TelegramAccount) -> bool:
+    """Реальная проверка наличия .session-файла на диске — используется по
+    умолчанию (main.py ничего специально передавать не обязан). Тесты
+    подставляют свою функцию через InviterService(session_checker=...),
+    чтобы не зависеть от реальных файлов (см. _run_service в тестах)."""
+    return _session_file_path(account).exists()
+
+
+def _format_missing_session_message(account: TelegramAccount) -> str:
+    return (
+        "Session not found:\n\n"
+        f"Account: {account.name}\n\n"
+        "Expected session:\n"
+        f"{_session_file_path(account)}\n\n"
+        "Please authorize this account first."
+    )
+
+
 def _build_invite_request(target_entity, input_peer: InputPeerUser):
     """InviteToChannelRequest — для каналов/супергрупп (Channel), иначе
     (обычный small group chat) — AddChatUserRequest. Ровно один из двух, ни
@@ -268,6 +293,7 @@ class InviterService:
         invite_repository: UserCampaignInviteRepository,
         client_factory: TelegramClientFactory,
         notifier: OperatorNotifierLike | None = None,
+        session_checker: Callable[[TelegramAccount], bool] = _default_session_checker,
     ):
         self._account_repository = account_repository
         self._campaign_repository = campaign_repository
@@ -277,6 +303,9 @@ class InviterService:
         # если main.py не смог поднять OperatorNotifier); это не должно
         # мешать самим приглашениям, см. _safe_notify().
         self._notifier = notifier
+        # По умолчанию — реальная проверка файла на диске (см.
+        # _default_session_checker); подставляется явно только в тестах.
+        self._session_checker = session_checker
 
     async def run(self, *, execute: bool = False) -> None:
         """execute=False (по умолчанию) — только dry-run, без единого
@@ -338,6 +367,10 @@ class InviterService:
         обработку остальных аккаунтов (см. InviterService.run()), поэтому
         любая ошибка здесь только логируется."""
         if not candidates:
+            return
+
+        if not self._session_checker(account):
+            logger.warning(_format_missing_session_message(account))
             return
 
         client = self._client_factory(account)
@@ -404,8 +437,18 @@ class InviterService:
         накопленную InviteStats; уведомление оператору (см.
         _notify_account_result) отправляется ровно один раз в конце — и при
         обрыве connect()/резолва target_chat тоже (со стартовыми, скорее
-        всего нулевыми, счётчиками), и при обычном завершении."""
+        всего нулевыми, счётчиками), и при обычном завершении.
+
+        Если для account ещё нет .session-файла (см. _default_session_checker)
+        — тоже None, без единой попытки подключения/приглашения и без
+        stack trace: только понятный лог с ожидаемым путём к сессии (см.
+        _format_missing_session_message) — до первой авторизации через
+        reader/inviter/authorize.py."""
         if not candidates:
+            return None
+
+        if not self._session_checker(account):
+            logger.warning(_format_missing_session_message(account))
             return None
 
         started_at = time.monotonic()

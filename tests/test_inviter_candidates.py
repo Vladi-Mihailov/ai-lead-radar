@@ -30,6 +30,7 @@ from reader.inviter.repository import (  # noqa: E402
     UserCampaignInviteRepository,
 )
 from reader.inviter.service import InviterService, _format_duration  # noqa: E402
+from reader.users.models import TelegramUserInfo  # noqa: E402
 from reader.users.repository import UserRepository  # noqa: E402
 
 _BASE_TIME = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -178,6 +179,7 @@ class _FakeOperatorNotifier:
 
 async def _run_service(
     db_path: Path, client_factory=None, execute: bool = False, notifier=None,
+    session_checker=None,
 ) -> None:
     account_repository = TelegramAccountRepository(db_path)
     campaign_repository = InviteCampaignRepository(db_path)
@@ -187,6 +189,12 @@ async def _run_service(
             account_repository, campaign_repository, invite_repository,
             client_factory=client_factory or _make_client_factory(),
             notifier=notifier,
+            # По умолчанию — "сессия всегда есть": тестовые аккаунты
+            # используют фиктивные session_path (например "acc1.session"),
+            # реального файла на диске для них нет и не должно требоваться,
+            # кроме тестов, которые ЯВНО проверяют поведение при её
+            # отсутствии (см. test_missing_session_*).
+            session_checker=session_checker or (lambda account: True),
         )
         await service.run(execute=execute)
     finally:
@@ -319,6 +327,89 @@ def test_select_candidates_respects_limit(tmp_path):
         assert invite_repository.count_candidates(campaign.id) == 5
     finally:
         campaign_repository.close()
+        invite_repository.close()
+
+
+# ---- миграция users (access_hash/keywords) при первом же открытии инвайтера ----
+
+
+def test_user_campaign_invite_repository_migrates_legacy_users_table_without_access_hash(tmp_path):
+    """Реальный баг: users создана СТАРОЙ версией схемы (до keywords/
+    access_hash), а UserRepository (владелец её схемы/миграций) в этом
+    окружении ещё не открывался ни sync_users.py, ни main.py —
+    UserCampaignInviteRepository.select_candidates()/count_candidates()
+    падали с sqlite3.OperationalError: no such column: u.access_hash.
+    Открытие UserCampaignInviteRepository теперь мигрирует users само,
+    без ручных правок SQLite — как и для остальных таблиц проекта."""
+    db_path = tmp_path / "users.db"
+
+    # Схема users до появления keywords/access_hash — как в самом первом
+    # легаси-фикстуре test_user_repository.py
+    # (test_migration_adds_keywords_column_to_legacy_database).
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            is_bot INTEGER,
+            last_seen_at TIMESTAMP,
+            updated_at TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO users (user_id, username, last_seen_at) VALUES "
+        "(555, 'ivan', '2026-01-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    try:
+        campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+    finally:
+        campaign_repository.close()
+
+    # Открываем UserCampaignInviteRepository НАПРЯМУЮ, минуя UserRepository —
+    # именно так это происходит в реальном сервисе (см.
+    # reader/inviter/service.py), и именно это раньше приводило к
+    # "no such column: u.access_hash".
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        # Не падает — миграция уже выполнена при открытии репозитория.
+        assert invite_repository.count_candidates(campaign.id) == 0
+        assert invite_repository.select_candidates(campaign.id, limit=10) == []
+
+        conn = sqlite3.connect(db_path)
+        try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+        finally:
+            conn.close()
+        # Как минимум эти две колонки нужны select_candidates() — обе
+        # добавляются той же миграцией (_migrate_missing_columns), что и
+        # peer_type/peer_updated_at, поэтому отдельно их не проверяем.
+        assert {"access_hash", "keywords"} <= columns
+
+        # Сквозная проверка: после миграции обычный путь (UserRepository)
+        # тоже видит ту же таблицу и реальная выборка отрабатывает целиком.
+        user_repository = UserRepository(db_path)
+        try:
+            user_repository.upsert(
+                TelegramUserInfo(
+                    user_id=555, username="ivan", first_name=None, last_name=None,
+                    access_hash=42,
+                )
+            )
+            user_repository.add_keywords(555, ["осаго"])
+        finally:
+            user_repository.close()
+
+        candidates = invite_repository.select_candidates(campaign.id, limit=10)
+        assert [c.user_id for c in candidates] == [555]
+    finally:
         invite_repository.close()
 
 
@@ -1564,3 +1655,180 @@ def test_execute_flood_wait_below_threshold_waits_and_continues_account(tmp_path
     # Никакого уведомления об остановке — аккаунт не останавливался.
     stop_notifications = [m for m in notifier.sent if m.startswith("⚠️")]
     assert stop_notifications == []
+
+
+# ---- отсутствие .session-файла — понятный лог, без исключений, без попыток ----
+
+
+def test_default_session_checker_reflects_real_file_presence(tmp_path):
+    db_path = _setup_db(tmp_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        account = account_repository.create(
+            name="@vladimihailov", phone="+995500000001", session_name="vladimihailov",
+            session_path=str(tmp_path / "vladimihailov"), daily_limit=1,
+        )
+    finally:
+        account_repository.close()
+
+    import reader.inviter.service as service_module
+
+    assert service_module._default_session_checker(account) is False
+
+    (tmp_path / "vladimihailov.session").write_text("")
+
+    assert service_module._default_session_checker(account) is True
+
+
+def test_format_missing_session_message_includes_account_and_expected_path(tmp_path):
+    db_path = _setup_db(tmp_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        account = account_repository.create(
+            name="@vladimihailov", phone="+995500000001", session_name="vladimihailov",
+            session_path="data/sessions/vladimihailov", daily_limit=1,
+        )
+    finally:
+        account_repository.close()
+
+    import reader.inviter.service as service_module
+
+    message = service_module._format_missing_session_message(account)
+    expected_path = service_module._session_file_path(account)
+
+    assert message == (
+        "Session not found:\n\n"
+        "Account: @vladimihailov\n\n"
+        "Expected session:\n"
+        f"{expected_path}\n\n"
+        "Please authorize this account first."
+    )
+
+
+def test_execute_missing_session_logs_message_and_skips_account_without_error(tmp_path, caplog):
+    """Нет .session-файла — понятный лог, ноль попыток подключения/
+    приглашения, никакого необработанного исключения, корректное
+    завершение обработки этого аккаунта."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="@vladimihailov", phone="+995500000001", session_name="vladimihailov",
+            session_path="data/sessions/vladimihailov", daily_limit=1,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(created=created_clients)
+
+    with caplog.at_level("WARNING", logger="reader.inviter.service"):
+        asyncio.run(
+            _run_service(
+                db_path, client_factory=client_factory, execute=True,
+                session_checker=lambda account: False,
+            )
+        )
+
+    # Ни одного клиента не создано — ни единой попытки подключения.
+    assert created_clients == []
+
+    log_text = caplog.text
+    assert "Session not found:" in log_text
+    assert "Account: @vladimihailov" in log_text
+    assert "Expected session:" in log_text
+    assert "vladimihailov.session" in log_text
+    assert "Please authorize this account first." in log_text
+
+    # Ни одной записи о приглашении — до этого аккаунта дело не дошло.
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        assert invite_repository.list() == []
+    finally:
+        invite_repository.close()
+
+
+def test_dry_run_missing_session_logs_message_and_skips_account_without_error(tmp_path, caplog):
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="@vladimihailov", phone="+995500000001", session_name="vladimihailov",
+            session_path="data/sessions/vladimihailov", daily_limit=1,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(created=created_clients)
+
+    with caplog.at_level("WARNING", logger="reader.inviter.service"):
+        asyncio.run(
+            _run_service(
+                db_path, client_factory=client_factory, execute=False,
+                session_checker=lambda account: False,
+            )
+        )
+
+    assert created_clients == []
+
+    log_text = caplog.text
+    assert "Session not found:" in log_text
+    assert "Account: @vladimihailov" in log_text
+    assert "Please authorize this account first." in log_text
+
+
+def test_missing_session_only_skips_the_affected_account(tmp_path):
+    """Один аккаунт без сессии не должен мешать остальным — как и при
+    любом другом сбое конкретного аккаунта (см. run())."""
+    db_path = _setup_db(tmp_path)
+    for user_id in range(1, 3):
+        _seed_user(
+            db_path, user_id, keywords=["осаго"], access_hash=user_id,
+            last_seen_at=_BASE_TIME + timedelta(days=user_id),
+        )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="Без сессии", phone="+995500000001", session_name="no-session",
+            session_path="data/sessions/no-session", daily_limit=1,
+        )
+        account_repository.create(
+            name="С сессией", phone="+995500000002", session_name="has-session",
+            session_path="data/sessions/has-session", daily_limit=1,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(created=created_clients)
+
+    asyncio.run(
+        _run_service(
+            db_path, client_factory=client_factory, execute=True,
+            session_checker=lambda account: account.name == "С сессией",
+        )
+    )
+
+    # Только "С сессией" реально подключался и пригласил своего кандидата.
+    assert len(created_clients) == 1
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == 1
+    finally:
+        invite_repository.close()

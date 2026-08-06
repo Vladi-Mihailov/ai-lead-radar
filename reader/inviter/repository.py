@@ -8,6 +8,7 @@ from reader.inviter.models import (
     TelegramAccount,
     UserCampaignInvite,
 )
+from reader.users.repository import UserRepository
 
 _TELEGRAM_ACCOUNTS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS telegram_accounts (
@@ -325,11 +326,22 @@ def _row_to_campaign(row) -> InviteCampaign:
 class UserCampaignInviteRepository:
     """CRUD поверх user_campaign_invites (SQLite) — без бизнес-логики: набор
     допустимых значений status и переходы между ними здесь не определяются
-    (см. service.py, когда появится сама логика приглашений)."""
+    (см. service.py, когда появится сама логика приглашений).
+
+    select_candidates()/count_candidates() читают таблицу users, которой
+    владеет и мигрирует UserRepository (reader/users/repository.py) — эта
+    БД могла быть создана до появления keywords/access_hash там, а
+    sync_users.py/main.py (единственные, кто раньше открывал UserRepository
+    и тем самым мигрировал users) на момент первого запуска инвайтера могли
+    ещё не запускаться в этом окружении. Поэтому здесь эта же миграция
+    выполняется явно (создание временного UserRepository, без дублирования
+    её схемы/ALTER-логики) — как и остальные таблицы проекта, users
+    подхватывает актуальную схему автоматически, без ручных правок SQLite."""
 
     _UPDATABLE_COLUMNS = ("account_id", "status", "error", "invited_at")
 
     def __init__(self, db_path: Path):
+        UserRepository(db_path).close()
         self._conn = _connect(db_path)
         self._conn.execute(_USER_CAMPAIGN_INVITES_SCHEMA)
         for statement in _USER_CAMPAIGN_INVITES_INDEXES:
