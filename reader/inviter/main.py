@@ -24,6 +24,7 @@ from reader.logging_setup import setup_logging  # noqa: E402
 from reader.main import resolve_notification_chat_ids  # noqa: E402
 from reader.notifications.operator_notifier import OperatorNotifier  # noqa: E402
 from reader.settings import ConfigError, Settings, load_settings  # noqa: E402
+from reader.users.repository import UserRepository  # noqa: E402
 
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 
@@ -96,6 +97,11 @@ async def run(*, execute: bool = False) -> None:
     account_repository = TelegramAccountRepository(settings.app.users_db_file)
     campaign_repository = InviteCampaignRepository(settings.app.users_db_file)
     invite_repository = UserCampaignInviteRepository(settings.app.users_db_file)
+    # Инвайтер резолвит некоторых кандидатов лично своим же аккаунтом (см.
+    # InviterService._resolve_input_peer) — свежий access_hash из этого
+    # резолва сохраняется через UserRepository, ту же таблицу users, что
+    # ведут sync_users.py/main.py.
+    user_repository = UserRepository(settings.app.users_db_file)
     logger.info(
         "Инфраструктура инвайтера готова: аккаунтов=%d, кампаний=%d, приглашений=%d",
         len(account_repository.list()),
@@ -111,6 +117,7 @@ async def run(*, execute: bool = False) -> None:
             account_repository, campaign_repository, invite_repository,
             client_factory=_build_client_factory(settings),
             notifier=notifier,
+            user_repository=user_repository,
         )
         await service.run(execute=execute)
     finally:
@@ -118,6 +125,7 @@ async def run(*, execute: bool = False) -> None:
         account_repository.close()
         campaign_repository.close()
         invite_repository.close()
+        user_repository.close()
 
 
 def main() -> None:

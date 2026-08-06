@@ -261,3 +261,147 @@ def test_get_returns_none_access_hash_and_peer_type_when_never_set(tmp_path):
         assert repository.get_peer_updated_at(904) is None
     finally:
         repository.close()
+
+
+# ---- update_access_hash() — резолв кандидата ЛИЧНО инвайтящим аккаунтом
+# (reader/inviter/service.py: InviterService._resolve_input_peer) ----
+
+
+def test_update_access_hash_updates_when_value_changed(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.upsert(
+            TelegramUserInfo(user_id=905, username="ivan", first_name=None, last_name=None, access_hash=111)
+        )
+
+        updated = repository.update_access_hash(905, 999)
+
+        assert updated is True
+        assert repository.get(905).access_hash == 999
+    finally:
+        repository.close()
+
+
+def test_update_access_hash_updates_username_when_it_changed(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.upsert(
+            TelegramUserInfo(user_id=906, username="old_name", first_name=None, last_name=None, access_hash=111)
+        )
+
+        updated = repository.update_access_hash(906, 111, username="new_name")
+
+        assert updated is True
+        assert repository.get(906).username == "new_name"
+    finally:
+        repository.close()
+
+
+def test_update_access_hash_ignores_empty_or_unchanged_username(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.upsert(
+            TelegramUserInfo(user_id=907, username="ivan", first_name=None, last_name=None, access_hash=111)
+        )
+
+        # Тот же username — не считается изменением.
+        repository.update_access_hash(907, 222, username="ivan")
+        assert repository.get(907).username == "ivan"
+        assert repository.get(907).access_hash == 222
+
+        # Пустая строка — как "username не передан", не затирает текущий.
+        repository.update_access_hash(907, 333, username="")
+        assert repository.get(907).username == "ivan"
+        assert repository.get(907).access_hash == 333
+    finally:
+        repository.close()
+
+
+def test_update_access_hash_skips_write_when_nothing_changed(tmp_path):
+    """Если access_hash совпадает, а username пуст либо совпадает — лишнего
+    UPDATE быть не должно. updated_at (секундная точность CURRENT_TIMESTAMP)
+    ненадёжен для этой проверки в рамках одного теста — вместо этого следим
+    за sqlite3.Connection.total_changes (счётчик реально изменённых строк)."""
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.upsert(
+            TelegramUserInfo(user_id=908, username="ivan", first_name=None, last_name=None, access_hash=111)
+        )
+
+        changes_before = repository._conn.total_changes
+        updated = repository.update_access_hash(908, 111, username="ivan")
+
+        assert updated is False
+        assert repository._conn.total_changes == changes_before
+    finally:
+        repository.close()
+
+
+def test_update_access_hash_returns_false_for_unknown_user(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        assert repository.update_access_hash(999999, 111) is False
+    finally:
+        repository.close()
+
+
+def test_update_access_hash_does_not_touch_other_fields(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.upsert(
+            TelegramUserInfo(
+                user_id=909, username="ivan", first_name="Ivan", last_name="Petrov",
+                access_hash=111, is_bot=False,
+            )
+        )
+        repository.add_keywords(909, ["осаго"])
+
+        repository.update_access_hash(909, 222)
+
+        user = repository.get(909)
+        assert user.first_name == "Ivan"
+        assert user.last_name == "Petrov"
+        assert repository.get_keywords(909) == ["осаго"]
+    finally:
+        repository.close()
+
+
+def test_update_access_hash_advances_peer_updated_at_when_it_actually_updates(tmp_path):
+    """access_hash реально меняется (в т.ч. с "никогда не было" на
+    заданное) -> peer_updated_at должен обновиться — время получения
+    Telegram peer-данных, то же поле, что ставит upsert()."""
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.upsert(
+            TelegramUserInfo(user_id=910, username="ivan", first_name=None, last_name=None)
+        )
+        assert repository.get_peer_updated_at(910) is None
+
+        updated = repository.update_access_hash(910, 111)
+
+        assert updated is True
+        assert repository.get_peer_updated_at(910) is not None
+    finally:
+        repository.close()
+
+
+def test_update_access_hash_leaves_peer_updated_at_untouched_when_skipped(tmp_path):
+    """Ничего не изменилось (access_hash совпадает, username пуст/совпадает)
+    -> update_access_hash() возвращает False и НЕ трогает peer_updated_at,
+    как и остальные поля."""
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.upsert(
+            TelegramUserInfo(
+                user_id=911, username="ivan", first_name=None, last_name=None, access_hash=111,
+            )
+        )
+        before = repository.get_peer_updated_at(911)
+        assert before is not None
+
+        updated = repository.update_access_hash(911, 111, username="ivan")
+
+        assert updated is False
+        assert repository.get_peer_updated_at(911) == before
+    finally:
+        repository.close()

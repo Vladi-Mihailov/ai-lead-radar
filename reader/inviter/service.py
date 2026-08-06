@@ -10,7 +10,7 @@ from typing import Callable, Protocol
 from telethon.errors import FloodWaitError, PeerFloodError, RPCError, UserAlreadyParticipantError
 from telethon.tl.functions.channels import InviteToChannelRequest
 from telethon.tl.functions.messages import AddChatUserRequest
-from telethon.tl.types import Channel, InputPeerUser
+from telethon.tl.types import Channel, ChannelForbidden, InputPeerUser, User
 
 from reader.inviter.models import InviteCampaign, InviteCandidate, TelegramAccount
 from reader.inviter.repository import (
@@ -64,6 +64,18 @@ class OperatorNotifierLike(Protocol):
     async def notify_text(self, text: str) -> bool: ...
 
 
+class UserAccessHashUpdaterLike(Protocol):
+    """Ровно то, что нужно InviterService от UserRepository
+    (reader/users/repository.py) — не импортируем сам класс, чтобы не
+    тянуть всю таблицу users в тесты, которым нужен только фейк. Вся
+    работа с SQL остаётся в самом UserRepository (см.
+    UserRepository.update_access_hash)."""
+
+    def update_access_hash(
+        self, user_id: int, access_hash: int, username: str | None = None,
+    ) -> bool: ...
+
+
 @dataclass
 class InviteStats:
     """Единая структура счётчиков — используется и для отчёта по аккаунту
@@ -96,14 +108,18 @@ class InviteStats:
 
 class DryRunTelegramClient(Protocol):
     """Подмножество TelegramClient, которое использует InviterService —
-    connect()/get_entity()/disconnect() (dry-run и execute) и __call__()
-    (только execute — фактическая отправка запроса Telethon). Ни
-    ImportChatInviteRequest, ни какой-либо другой мутирующий метод сверх
-    ровно одного приглашения на кандидата здесь не вызывается."""
+    connect()/get_entity()/get_input_entity()/disconnect() (dry-run и
+    execute) и __call__() (только execute — фактическая отправка запроса
+    Telethon). get_input_entity() используется только в execute (см.
+    _resolve_input_peer) — dry-run её не трогает. Ни ImportChatInviteRequest,
+    ни какой-либо другой мутирующий метод сверх ровно одного приглашения на
+    кандидата здесь не вызывается."""
 
     async def connect(self) -> None: ...
 
     async def get_entity(self, entity): ...
+
+    async def get_input_entity(self, entity): ...
 
     async def __call__(self, request): ...
 
@@ -111,6 +127,12 @@ class DryRunTelegramClient(Protocol):
 
 
 TelegramClientFactory = Callable[[TelegramAccount], DryRunTelegramClient]
+
+
+class _CandidateUnresolvableError(Exception):
+    """candidate не известен текущему аккаунту и не может быть резолвлен
+    (см. InviterService._resolve_input_peer) — не Telethon-ошибка, поэтому
+    отдельный класс, не пересекающийся с их иерархией (RPCError и т.п.)."""
 
 
 def _format_username(username: str | None) -> str:
@@ -249,9 +271,19 @@ def _format_missing_session_message(account: TelegramAccount) -> str:
 
 def _build_invite_request(target_entity, input_peer: InputPeerUser):
     """InviteToChannelRequest — для каналов/супергрупп (Channel), иначе
-    (обычный small group chat) — AddChatUserRequest. Ровно один из двух, ни
-    один другой Telegram-мутирующий метод не вызывается."""
-    if isinstance(target_entity, Channel):
+    (обычный small group chat, Chat) — AddChatUserRequest. Ровно один из
+    двух, ни один другой Telegram-мутирующий метод не вызывается.
+
+    ChannelForbidden — тоже Channel-семейство (то же TL-объединение "Chat",
+    что и Channel/Chat), а не Chat: get_entity() может вернуть его для
+    канала/супергруппы без полного доступа у этого аккаунта. AddChatUserRequest
+    для него ломается точно так же, как для обычного Channel (Telegram
+    трактует chat_id как id обычной группы, а не канала/супергруппы — см.
+    ChatIdInvalidError: "...if the request is designed for chats (not
+    channels/megagroups)... An example working with a megagroup and
+    AddChatUserRequest, it will fail because megagroups are channels. Use
+    InviteToChannelRequest instead")."""
+    if isinstance(target_entity, (Channel, ChannelForbidden)):
         return InviteToChannelRequest(channel=target_entity, users=[input_peer])
     return AddChatUserRequest(chat_id=target_entity.id, user_id=input_peer, fwd_limit=0)
 
@@ -294,6 +326,7 @@ class InviterService:
         client_factory: TelegramClientFactory,
         notifier: OperatorNotifierLike | None = None,
         session_checker: Callable[[TelegramAccount], bool] = _default_session_checker,
+        user_repository: UserAccessHashUpdaterLike | None = None,
     ):
         self._account_repository = account_repository
         self._campaign_repository = campaign_repository
@@ -306,6 +339,10 @@ class InviterService:
         # По умолчанию — реальная проверка файла на диске (см.
         # _default_session_checker); подставляется явно только в тестах.
         self._session_checker = session_checker
+        # None — свежий access_hash (см. _resolve_input_peer) просто не
+        # сохраняется в users.db; сам резолв и приглашение это не должно
+        # останавливать (см. _update_user_access_hash).
+        self._user_repository = user_repository
 
     async def run(self, *, execute: bool = False) -> None:
         """execute=False (по умолчанию) — только dry-run, без единого
@@ -475,6 +512,22 @@ class InviterService:
                         f"FAILED\nНе удалось найти target_chat: {exc}"
                     )
                 else:
+                    # ВРЕМЕННАЯ ДИАГНОСТИКА — какой именно тип вернул
+                    # get_entity() (Channel/Chat/ChannelForbidden/другое) и
+                    # выбрал ли _build_invite_request() из-за этого
+                    # AddChatUserRequest вместо InviteToChannelRequest для
+                    # каналов/супергрупп. Убрать после подтверждения на
+                    # реальном прогоне.
+                    logger.info(
+                        f"[EXECUTE]\nAccount: {account.name}\nTarget: {campaign.target_chat}\n"
+                        f"Resolved entity type: {type(target_entity).__module__}."
+                        f"{type(target_entity).__name__}\n"
+                        f"id={getattr(target_entity, 'id', None)}, "
+                        f"megagroup={getattr(target_entity, 'megagroup', None)}, "
+                        f"broadcast={getattr(target_entity, 'broadcast', None)}, "
+                        f"gigagroup={getattr(target_entity, 'gigagroup', None)}, "
+                        f"access_hash={getattr(target_entity, 'access_hash', None)}"
+                    )
                     for candidate in candidates:
                         should_stop = await self._invite_candidate(
                             client, campaign, account, target_entity, candidate, stats,
@@ -512,12 +565,19 @@ class InviterService:
         стеку, здесь же он не встречается. Во всех остальных случаях —
         False, и после случайной паузы (_MIN_INVITE_PAUSE_SECONDS..
         _MAX_INVITE_PAUSE_SECONDS) обработка продолжается со следующего
-        кандидата."""
+        кандидата.
+
+        Перед отправкой резолвит candidate ИМЕННО этим аккаунтом (см.
+        _resolve_input_peer) — access_hash из users.db получен читающим
+        аккаунтом (sync_users.py/main.py), а не текущим инвайтящим, и часто
+        невалиден для него. Неразрешимый candidate (_CandidateUnresolvableError)
+        обрабатывается тем же generic-веткой ниже, что и любая другая
+        ошибка — record failed + переход к следующему кандидату."""
         user_label = f"{candidate.user_id} {_format_username(candidate.username)}"
-        input_peer = InputPeerUser(user_id=candidate.user_id, access_hash=candidate.access_hash)
-        request = _build_invite_request(target_entity, input_peer)
 
         try:
+            input_peer = await self._resolve_input_peer(client, candidate)
+            request = _build_invite_request(target_entity, input_peer)
             await client(request)
         except UserAlreadyParticipantError:
             # Кандидат уже состоит в target_chat — цель кампании для него уже
@@ -601,6 +661,89 @@ class InviterService:
             stats.invited += 1
             await self._pause_between_invites()
             return False
+
+    async def _resolve_input_peer(
+        self, client: DryRunTelegramClient, candidate: InviteCandidate,
+    ) -> InputPeerUser:
+        """access_hash в users.db получен ЧИТАЮЩИМ аккаунтом (sync_users.py/
+        main.py), а не текущим инвайтящим — Telegram привязывает access_hash
+        к паре (аккаунт, пользователь), поэтому чужой access_hash часто
+        отклоняется как "Invalid object ID for a user" (см. отчёт об
+        ошибке). Перед приглашением проверяем, известен ли candidate ИМЕННО
+        этому аккаунту:
+
+        1. client.get_input_entity(candidate.user_id) — резолв через кэш
+           этого аккаунта (см. её собственную документацию — для некоторых
+           отношений, например контактов, может дорезолвить и без явного
+           общего чата; в остальном чистый локальный lookup).
+        2. Если не известен и есть username — резолвим этим же аккаунтом
+           через client.get_entity(username): единственный надёжный способ
+           получить access_hash, валидный именно для этого аккаунта, без
+           общего чата с candidate. Успешный результат п.2 сразу же
+           сохраняется в users.db (см. _update_user_access_hash) — чтобы
+           select_candidates() в следующий раз отдавал уже актуальный
+           access_hash, а не устаревший от читающего аккаунта.
+
+        Отдельного хранилища access_hash "на аккаунт" не требуется —
+        Telethon сам кэширует результат в .session-файле ЭТОГО аккаунта
+        (account.session_path), поэтому следующий прогон того же аккаунта
+        для того же пользователя снова попадёт в п.1, без единого RPC.
+
+        FloodWaitError/PeerFloodError, полученные при резолве, не
+        перехватываются здесь — поднимаются в _invite_candidate и
+        обрабатываются там точно так же, как если бы случились при самой
+        отправке приглашения. Кандидат, которого не удалось резолвить
+        никак — _CandidateUnresolvableError, обрабатывается в
+        _invite_candidate как обычная ошибка (record failed, следующий
+        кандидат)."""
+        try:
+            input_peer = await client.get_input_entity(candidate.user_id)
+        except (FloodWaitError, PeerFloodError):
+            raise
+        except Exception:
+            input_peer = None
+
+        if input_peer is not None:
+            return input_peer
+
+        if not candidate.username:
+            raise _CandidateUnresolvableError(
+                f"пользователь {candidate.user_id} не известен этому аккаунту "
+                f"и не имеет username для резолва"
+            )
+
+        try:
+            entity = await client.get_entity(f"@{candidate.username}")
+        except (FloodWaitError, PeerFloodError):
+            raise
+        except Exception as exc:
+            raise _CandidateUnresolvableError(
+                f"не удалось резолвить @{candidate.username} этим аккаунтом: {exc}"
+            ) from exc
+
+        if isinstance(entity, User):
+            self._update_user_access_hash(entity)
+
+        return InputPeerUser(user_id=entity.id, access_hash=entity.access_hash)
+
+    def _update_user_access_hash(self, entity: User) -> None:
+        """Сохраняет свежий access_hash (и username, если реально изменился)
+        в users.db сразу после успешного get_entity() этим аккаунтом (см.
+        _resolve_input_peer) — только эти два поля, никакие другие. Сбой
+        записи не должен мешать самому приглашению — только предупреждение
+        в лог (тот же access_hash будет заново получен в следующий раз,
+        просто без сохранения в кэш)."""
+        if self._user_repository is None:
+            return
+        try:
+            self._user_repository.update_access_hash(
+                entity.id, entity.access_hash, getattr(entity, "username", None),
+            )
+        except Exception:
+            logger.warning(
+                f"Не удалось обновить access_hash пользователя {entity.id} в users.db",
+                exc_info=True,
+            )
 
     async def _warm_up_account(self) -> None:
         """Один раз сразу после connect() — до резолва target_chat и до

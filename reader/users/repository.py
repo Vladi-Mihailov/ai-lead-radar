@@ -71,6 +71,17 @@ ON CONFLICT(user_id) DO UPDATE SET
     updated_at=CURRENT_TIMESTAMP
 """
 
+_SELECT_ACCESS_HASH_AND_USERNAME = "SELECT access_hash, username FROM users WHERE user_id = ?"
+
+_UPDATE_ACCESS_HASH = """
+UPDATE users
+SET access_hash = :access_hash,
+    username = COALESCE(:username, username),
+    updated_at = CURRENT_TIMESTAMP,
+    peer_updated_at = CURRENT_TIMESTAMP
+WHERE user_id = :user_id
+"""
+
 
 def _parse_keywords(raw: str | None) -> list[str]:
     if not raw:
@@ -175,6 +186,43 @@ class UserRepository:
     def get_keywords(self, user_id: int) -> list[str]:
         row = self._conn.execute(_SELECT_KEYWORDS, (user_id,)).fetchone()
         return _parse_keywords(row[0] if row else None)
+
+    def update_access_hash(
+        self, user_id: int, access_hash: int, username: str | None = None,
+    ) -> bool:
+        """Обновляет ТОЛЬКО access_hash (и, если он реально отличается,
+        username), заодно продвигая peer_updated_at — время получения
+        Telegram peer-данных (access_hash/username), то же поле, что и
+        upsert() ставит при появлении access_hash — уже существующего
+        пользователя. Например, когда reader/inviter/service.py резолвит
+        candidate лично СВОИМ аккаунтом через client.get_entity("@username"),
+        потому что access_hash, сохранённый читающим аккаунтом
+        (sync_users.py/main.py), не годится для другого (инвайтящего)
+        аккаунта. В отличие от upsert() ничего не создаёт — если user_id
+        ещё не в таблице, ничего не делает и возвращает False. Никакие
+        другие поля (first_name/last_name/is_bot/keywords/peer_type/...) не
+        трогает.
+
+        Возвращает False без единого UPDATE (в т.ч. без сдвига
+        peer_updated_at), если реально ничего не меняется — access_hash
+        совпадает, а username пуст либо совпадает с уже сохранённым —
+        чтобы не писать в БД на каждое приглашение."""
+        row = self._conn.execute(_SELECT_ACCESS_HASH_AND_USERNAME, (user_id,)).fetchone()
+        if row is None:
+            return False
+
+        current_access_hash, current_username = row
+        new_username = username if (username and username != current_username) else None
+
+        if access_hash == current_access_hash and new_username is None:
+            return False
+
+        self._conn.execute(
+            _UPDATE_ACCESS_HASH,
+            {"access_hash": access_hash, "username": new_username, "user_id": user_id},
+        )
+        self._conn.commit()
+        return True
 
     def count(self) -> int:
         """Общее количество пользователей в локальном кэше (SELECT COUNT(*))."""
