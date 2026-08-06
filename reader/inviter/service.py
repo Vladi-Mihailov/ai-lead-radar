@@ -7,7 +7,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Protocol
 
-from telethon.errors import FloodWaitError, PeerFloodError, RPCError, UserAlreadyParticipantError
+from telethon.errors import (
+    ChatAdminRequiredError,
+    FloodWaitError,
+    PeerFloodError,
+    RPCError,
+    UserAlreadyParticipantError,
+    UserChannelsTooMuchError,
+    UserPrivacyRestrictedError,
+)
 from telethon.tl.functions.channels import InviteToChannelRequest
 from telethon.tl.functions.messages import AddChatUserRequest
 from telethon.tl.types import Channel, ChannelForbidden, InputPeerUser, User
@@ -43,6 +51,14 @@ _LONG_PAUSE_PROBABILITY = 0.2
 # exc.seconds >= это значение — FloodWait считается слишком большим, чтобы
 # просто подождать и продолжить тем же аккаунтом (см. _invite_candidate).
 _MAX_TOLERABLE_FLOOD_WAIT_SECONDS = 300
+
+# --test (main.py) — тестовый прогон: как только текущий вызов run()
+# выполнит это количество успешных приглашений (status='invited', см.
+# InviteStats.invited) — остановить ВЕСЬ запуск (текущий аккаунт
+# заканчивается штатно, без прерывания уже выполняющегося приглашения,
+# остальные аккаунты и кампании больше не трогаются, см. run()/
+# _invite_candidate). already_participant/errors в счёт не идут.
+TEST_MODE_MAX_SUCCESSFUL_INVITES = 30
 
 
 def _choose_invite_pause_seconds() -> float:
@@ -260,6 +276,32 @@ def _format_account_stopped_notification(account: TelegramAccount, reason: str) 
     )
 
 
+def _humanize_error(exc: Exception) -> str:
+    """Понятное для оператора описание распространённых Telegram RPC-ошибок
+    — используется ТОЛЬКО там, где текст ошибки уже показывается оператору
+    (см. _format_account_stopped_notification). В логах (_format_execute_block)
+    и в user_campaign_invites.error (см. _record_invite_result) продолжает
+    храниться str(exc) — оригинальное имя/текст исключения, для диагностики.
+
+    Порядок проверок не важен — все перечисленные классы независимы (ни
+    один не является подклассом другого), кроме FloodWaitError, которому
+    нужен exc.seconds. Ошибки, для которых понятного описания ещё нет,
+    возвращаются как есть (str(exc)), а не теряются."""
+    if isinstance(exc, FloodWaitError):
+        return f"Telegram требует подождать {exc.seconds} секунд."
+    if isinstance(exc, UserChannelsTooMuchError):
+        return "Пользователь состоит в слишком большом количестве групп."
+    if isinstance(exc, UserPrivacyRestrictedError):
+        return "Пользователь запретил приглашения."
+    if isinstance(exc, UserAlreadyParticipantError):
+        return "Уже состоит в группе."
+    if isinstance(exc, ChatAdminRequiredError):
+        return "У аккаунта нет прав приглашать участников."
+    if isinstance(exc, PeerFloodError):
+        return "Telegram временно ограничил аккаунт."
+    return str(exc)
+
+
 def _session_file_path(account: TelegramAccount) -> Path:
     """Telethon сам дописывает ".session" к переданному session_path —
     ровно тот же файл, что будет открывать TelegramClient(account.session_path, ...)."""
@@ -342,6 +384,7 @@ class InviterService:
         notifier: OperatorNotifierLike | None = None,
         session_checker: Callable[[TelegramAccount], bool] = _default_session_checker,
         user_repository: UserAccessHashUpdaterLike | None = None,
+        max_successful_invites: int | None = None,
     ):
         self._account_repository = account_repository
         self._campaign_repository = campaign_repository
@@ -358,6 +401,12 @@ class InviterService:
         # сохраняется в users.db; сам резолв и приглашение это не должно
         # останавливать (см. _update_user_access_hash).
         self._user_repository = user_repository
+        # None (по умолчанию) — без ограничения, обычный режим. Иначе —
+        # тестовый режим (--test в main.py, см. TEST_MODE_MAX_SUCCESSFUL_INVITES):
+        # run() останавливается, как только наберёт столько успешных
+        # приглашений, см. _successful_invites_count.
+        self._max_successful_invites = max_successful_invites
+        self._successful_invites_count = 0
 
     async def run(self, *, execute: bool = False) -> None:
         """execute=False (по умолчанию) — только dry-run, без единого
@@ -379,7 +428,16 @@ class InviterService:
         # (Account1 — [0:d1], Account2 — [d1:d1+d2], и т.д.).
         total_limit = sum(account.daily_limit for account in accounts)
 
+        # Счётчик успешных приглашений (status='invited') именно этого
+        # вызова run() — сбрасывается на каждый запуск, см.
+        # TEST_MODE_MAX_SUCCESSFUL_INVITES/_invite_candidate.
+        self._successful_invites_count = 0
+        limit_reached = False
+
         for campaign in campaigns:
+            if limit_reached:
+                break
+
             campaign_started_at = time.monotonic()
             found = self._invite_repository.count_candidates(campaign.id)
             # "Всего найдено" для операторского отчёта (см.
@@ -401,6 +459,20 @@ class InviterService:
                     if account_stats is not None:
                         campaign_stats = campaign_stats + account_stats
                         accounts_processed += 1
+                    if (
+                        self._max_successful_invites is not None
+                        and self._successful_invites_count >= self._max_successful_invites
+                    ):
+                        # "Мягкая" остановка: текущий аккаунт уже завершён
+                        # штатно (см. _execute_account/_invite_candidate) —
+                        # просто не переходим к следующему аккаунту/кампании.
+                        logger.info(
+                            f"Тестовый режим: достигнут лимит "
+                            f"{self._max_successful_invites} успешных приглашений — "
+                            f"дальнейшая обработка остановлена."
+                        )
+                        limit_reached = True
+                        break
                 else:
                     await self._dry_run_account(campaign, account, account_candidates)
 
@@ -553,9 +625,10 @@ class InviterService:
                             client, campaign, account, target_entity, candidate, stats,
                         )
                         if should_stop:
-                            # PeerFlood или FloodWait >= _MAX_TOLERABLE_FLOOD_WAIT_SECONDS
-                            # (см. _invite_candidate) — остальные кандидаты этого
-                            # аккаунта не трогаем, переходим к следующему аккаунту.
+                            # PeerFlood, FloodWait >= _MAX_TOLERABLE_FLOOD_WAIT_SECONDS,
+                            # либо достигнут лимит успешных приглашений
+                            # тестового режима (см. _invite_candidate) —
+                            # остальные кандидаты этого аккаунта не трогаем.
                             break
         finally:
             await client.disconnect()
@@ -628,7 +701,7 @@ class InviterService:
             self._record_invite_result(campaign, account, candidate, status="failed", error=str(exc))
             stats.errors += 1
             await self._safe_notify(
-                _format_account_stopped_notification(account, "Получен PeerFlood.")
+                _format_account_stopped_notification(account, _humanize_error(exc))
             )
             return True
         except FloodWaitError as exc:
@@ -646,9 +719,7 @@ class InviterService:
             # не отказ конкретному пользователю (см. InviteStats).
             if exc.seconds >= _MAX_TOLERABLE_FLOOD_WAIT_SECONDS:
                 await self._safe_notify(
-                    _format_account_stopped_notification(
-                        account, f"FloodWait: {exc.seconds} сек.",
-                    )
+                    _format_account_stopped_notification(account, _humanize_error(exc))
                 )
                 return True
             await asyncio.sleep(exc.seconds)
@@ -679,7 +750,17 @@ class InviterService:
             )
             self._record_invite_result(campaign, account, candidate, status="invited")
             stats.invited += 1
+            self._successful_invites_count += 1
             await self._pause_between_invites()
+            if (
+                self._max_successful_invites is not None
+                and self._successful_invites_count >= self._max_successful_invites
+            ):
+                # Лимит тестового режима достигнут — сигнализируем
+                # _execute_account остановить ЭТОТ аккаунт (как при
+                # PeerFlood/большом FloodWait); переход к следующему
+                # аккаунту/кампании останавливает уже run() (см. выше).
+                return True
             return False
 
     async def _resolve_input_peer(

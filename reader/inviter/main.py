@@ -15,7 +15,7 @@ from reader.inviter.repository import (  # noqa: E402
     TelegramAccountRepository,
     UserCampaignInviteRepository,
 )
-from reader.inviter.service import InviterService  # noqa: E402
+from reader.inviter.service import InviterService, TEST_MODE_MAX_SUCCESSFUL_INVITES  # noqa: E402
 from reader.logging_setup import setup_logging  # noqa: E402
 # resolve_notification_chat_ids — тот же "чат оператора", куда уже уходят
 # уведомления о штрафах (reader/main.py, _run_fine_monitor) — переиспользуем
@@ -82,17 +82,33 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Выполнить реальные приглашения в Telegram (InviteToChannelRequest/AddChatUserRequest).",
     )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help=(
+            "Тестовый прогон: остановить весь запуск, как только он выполнит "
+            "30 успешных приглашений (status='invited'). Имеет смысл только "
+            "вместе с --execute."
+        ),
+    )
     return parser.parse_args(argv)
 
 
-async def run(*, execute: bool = False) -> None:
+async def run(*, execute: bool = False, test: bool = False) -> None:
     """Поднимает инфраструктуру инвайтера (репозитории + миграции БД) и
     делегирует запуск InviterService — отбор кандидатов и, при execute=True,
     реальные приглашения (см. service.py). execute=False (по умолчанию) —
-    только dry-run, без единого изменения в Telegram."""
+    только dry-run, без единого изменения в Telegram. test=True (--test) —
+    имеет смысл только вместе с execute=True: останавливает весь запуск
+    после TEST_MODE_MAX_SUCCESSFUL_INVITES успешных приглашений (см.
+    InviterService(max_successful_invites=...))."""
     settings = load_settings(CONFIG_PATH)
     setup_logging(settings.app.log_level)
-    logger.info("Инвайтер запущен в режиме: %s", "EXECUTE" if execute else "DRY RUN")
+    logger.info(
+        "Инвайтер запущен в режиме: %s%s",
+        "EXECUTE" if execute else "DRY RUN",
+        " (TEST)" if test else "",
+    )
 
     account_repository = TelegramAccountRepository(settings.app.users_db_file)
     campaign_repository = InviteCampaignRepository(settings.app.users_db_file)
@@ -118,6 +134,7 @@ async def run(*, execute: bool = False) -> None:
             client_factory=_build_client_factory(settings),
             notifier=notifier,
             user_repository=user_repository,
+            max_successful_invites=TEST_MODE_MAX_SUCCESSFUL_INVITES if test else None,
         )
         await service.run(execute=execute)
     finally:
@@ -131,7 +148,7 @@ async def run(*, execute: bool = False) -> None:
 def main() -> None:
     args = _parse_args(sys.argv[1:])
     try:
-        asyncio.run(run(execute=args.execute))
+        asyncio.run(run(execute=args.execute, test=args.test))
     except ConfigError as exc:
         print(f"Ошибка запуска: {exc}", file=sys.stderr)
         sys.exit(1)

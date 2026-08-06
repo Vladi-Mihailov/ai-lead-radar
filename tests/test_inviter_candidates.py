@@ -21,6 +21,8 @@ from telethon.errors import (  # noqa: E402
     FloodWaitError,
     PeerFloodError,
     UserAlreadyParticipantError,
+    UserChannelsTooMuchError,
+    UserPrivacyRestrictedError,
 )
 from telethon.tl.functions.channels import InviteToChannelRequest  # noqa: E402
 from telethon.tl.functions.messages import AddChatUserRequest, GetHistoryRequest  # noqa: E402
@@ -32,7 +34,12 @@ from reader.inviter.repository import (  # noqa: E402
     UserCampaignInviteRepository,
 )
 from reader.inviter.models import InviteCandidate  # noqa: E402
-from reader.inviter.service import InviterService, _format_duration  # noqa: E402
+from reader.inviter.service import (  # noqa: E402
+    TEST_MODE_MAX_SUCCESSFUL_INVITES,
+    InviterService,
+    _format_duration,
+    _humanize_error,
+)
 from reader.users.models import TelegramUserInfo  # noqa: E402
 from reader.users.repository import UserRepository  # noqa: E402
 
@@ -252,7 +259,7 @@ class _FakeUserRepository:
 
 async def _run_service(
     db_path: Path, client_factory=None, execute: bool = False, notifier=None,
-    session_checker=None, user_repository=None,
+    session_checker=None, user_repository=None, max_successful_invites=None,
 ) -> None:
     account_repository = TelegramAccountRepository(db_path)
     campaign_repository = InviteCampaignRepository(db_path)
@@ -269,6 +276,10 @@ async def _run_service(
             # отсутствии (см. test_missing_session_*).
             session_checker=session_checker or (lambda account: True),
             user_repository=user_repository,
+            # None (по умолчанию) — обычный режим без ограничения; тестовый
+            # режим (--test в main.py) передаёт сюда конкретное число, см.
+            # test_execute_test_mode_*.
+            max_successful_invites=max_successful_invites,
         )
         await service.run(execute=execute)
     finally:
@@ -1371,7 +1382,7 @@ def test_execute_peer_flood_during_resolution_stops_account(tmp_path):
 
     stop_notifications = [m for m in notifier.sent if m.startswith("⚠️")]
     assert len(stop_notifications) == 1
-    assert "Получен PeerFlood." in stop_notifications[0]
+    assert "Telegram временно ограничил аккаунт." in stop_notifications[0]
 
 
 def test_execute_creates_failed_record_on_rpc_error(tmp_path):
@@ -1805,6 +1816,44 @@ def test_format_duration_formats_seconds_as_hh_mm_ss(seconds, expected):
     assert _format_duration(seconds) == expected
 
 
+@pytest.mark.parametrize(
+    "exc,expected",
+    [
+        (
+            FloodWaitError(request=GetHistoryRequest, capture=624),
+            "Telegram требует подождать 624 секунд.",
+        ),
+        (
+            UserChannelsTooMuchError(request=GetHistoryRequest),
+            "Пользователь состоит в слишком большом количестве групп.",
+        ),
+        (
+            UserPrivacyRestrictedError(request=GetHistoryRequest),
+            "Пользователь запретил приглашения.",
+        ),
+        (
+            UserAlreadyParticipantError(request=GetHistoryRequest),
+            "Уже состоит в группе.",
+        ),
+        (
+            ChatAdminRequiredError(request=GetHistoryRequest),
+            "У аккаунта нет прав приглашать участников.",
+        ),
+        (
+            PeerFloodError(request=GetHistoryRequest),
+            "Telegram временно ограничил аккаунт.",
+        ),
+    ],
+)
+def test_humanize_error_maps_known_rpc_errors_to_readable_text(exc, expected):
+    assert _humanize_error(exc) == expected
+
+
+def test_humanize_error_falls_back_to_str_for_unmapped_exception():
+    exc = ValueError("что-то неожиданное")
+    assert _humanize_error(exc) == str(exc)
+
+
 def test_notifications_include_elapsed_time_without_changing_other_lines(tmp_path, monkeypatch):
     """Время выполнения — ДОБАВЛЕННАЯ строка: остальные строки отчёта по
     аккаунту и по кампании должны остаться такими же, как до этой задачи."""
@@ -2079,13 +2128,17 @@ def test_execute_peer_flood_stops_account_and_notifies_operator(tmp_path):
         assert len(invites) == 1
         assert invites[0].user_id == 2
         assert invites[0].status == "failed"
+        # В БД — оригинальный текст исключения, а не человекочитаемый: он
+        # предназначен для диагностики, а не для оператора.
+        assert invites[0].error == str(PeerFloodError(request=GetHistoryRequest))
+        assert invites[0].error != "Telegram временно ограничил аккаунт."
     finally:
         invite_repository.close()
 
     stop_notifications = [m for m in notifier.sent if m.startswith("⚠️")]
     assert len(stop_notifications) == 1
     assert "Аккаунт: account_2" in stop_notifications[0]
-    assert "Получен PeerFlood." in stop_notifications[0]
+    assert "Telegram временно ограничил аккаунт." in stop_notifications[0]
     assert "Работа аккаунта остановлена." in stop_notifications[0]
     assert "Переход к следующему аккаунту." in stop_notifications[0]
 
@@ -2144,14 +2197,18 @@ def test_execute_flood_wait_at_or_above_threshold_stops_account_and_notifies_ope
 
     invite_repository = UserCampaignInviteRepository(db_path)
     try:
-        assert len(invite_repository.list()) == 1
+        invites = invite_repository.list()
+        assert len(invites) == 1
+        # В БД — оригинальный (технический) текст, а не человекочитаемый.
+        assert invites[0].error == "FloodWaitError: 624 сек."
+        assert invites[0].error != "Telegram требует подождать 624 секунд."
     finally:
         invite_repository.close()
 
     stop_notifications = [m for m in notifier.sent if m.startswith("⚠️")]
     assert len(stop_notifications) == 1
     assert "Аккаунт: account_2" in stop_notifications[0]
-    assert "FloodWait: 624 сек." in stop_notifications[0]
+    assert "Telegram требует подождать 624 секунд." in stop_notifications[0]
     assert "Работа аккаунта остановлена." in stop_notifications[0]
 
 
@@ -2218,6 +2275,214 @@ def test_execute_flood_wait_below_threshold_waits_and_continues_account(tmp_path
     # Никакого уведомления об остановке — аккаунт не останавливался.
     stop_notifications = [m for m in notifier.sent if m.startswith("⚠️")]
     assert stop_notifications == []
+
+
+# ---- тестовый режим (--test/main.py) — лимит успешных приглашений на весь run() ----
+
+
+def test_execute_test_mode_stops_after_exactly_n_successful_invites(tmp_path):
+    """max_successful_invites (--test в main.py, TEST_MODE_MAX_SUCCESSFUL_INVITES=30) —
+    как только текущий вызов run() наберёт ровно это количество успешных
+    приглашений (status='invited', реальный InviteStats.invited), дальнейшая
+    обработка останавливается: текущий аккаунт заканчивается штатно (не
+    прерывая уже выполняющееся приглашение), следующие аккаунты и кампании
+    больше не трогаются."""
+    db_path = _setup_db(tmp_path)
+    total_users = 40
+    for user_id in range(1, total_users + 1):
+        _seed_user(
+            db_path, user_id, keywords=["осаго"], access_hash=user_id,
+            last_seen_at=_BASE_TIME + timedelta(days=user_id),
+        )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=20,
+        )
+        account_repository.create(
+            name="account_2", phone="+995500000002", session_name="acc2",
+            session_path="acc2.session", daily_limit=20,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    # Без call_errors — все приглашения успешны.
+    client_factory = _make_client_factory(created=created_clients)
+
+    asyncio.run(
+        _run_service(
+            db_path, client_factory=client_factory, execute=True,
+            max_successful_invites=TEST_MODE_MAX_SUCCESSFUL_INVITES,
+        )
+    )
+
+    assert TEST_MODE_MAX_SUCCESSFUL_INVITES == 30
+
+    client_1, client_2 = created_clients
+    # account_1 (daily_limit=20) отработал полностью — 20 успехов < 30, не
+    # останавливается.
+    assert len(client_1.call_requests) == 20
+    # account_2 останавливается ровно после 10-го своего успеха: 20 + 10 = 30.
+    assert len(client_2.call_requests) == 10
+    assert client_1.disconnected is True
+    assert client_2.disconnected is True
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == 30
+        assert all(invite.status == "invited" for invite in invites)
+    finally:
+        invite_repository.close()
+
+
+def test_execute_test_mode_errors_and_already_participant_do_not_count_toward_limit(tmp_path):
+    """UserAlreadyParticipantError и любые ошибки (включая
+    UserChannelsTooMuchError/UserPrivacyRestrictedError) не увеличивают
+    счётчик тестового режима — лимит реагирует только на реальные успешные
+    приглашения."""
+    db_path = _setup_db(tmp_path)
+    total_users = 6
+    for user_id in range(1, total_users + 1):
+        _seed_user(
+            db_path, user_id, keywords=["осаго"], access_hash=user_id,
+            last_seen_at=_BASE_TIME + timedelta(days=user_id),
+        )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=6,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(
+        call_errors={
+            "account_1": [
+                UserAlreadyParticipantError(request=GetHistoryRequest),
+                UserChannelsTooMuchError(request=GetHistoryRequest),
+                UserPrivacyRestrictedError(request=GetHistoryRequest),
+                None,
+                None,
+                None,
+            ]
+        },
+        created=created_clients,
+    )
+
+    asyncio.run(
+        _run_service(
+            db_path, client_factory=client_factory, execute=True,
+            max_successful_invites=2,
+        )
+    )
+
+    client = created_clients[0]
+    # 3 "не-успеха" (не в счёт лимита) + ровно 2 успеха до остановки = 5
+    # обработанных кандидатов, 6-й не тронут вовсе.
+    assert len(client.call_requests) == 5
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == 5
+        # candidate1 (already_participant) записывается со статусом
+        # 'invited' (см. _invite_candidate), + 2 реальных успеха = 3.
+        assert sum(1 for i in invites if i.status == "invited") == 3
+        assert sum(1 for i in invites if i.status == "failed") == 2
+    finally:
+        invite_repository.close()
+
+
+def test_execute_test_mode_stop_still_sends_correct_final_stats_notifications(tmp_path):
+    """После срабатывания лимита тестового режима отчёты оператору (по
+    аккаунту и по кампании) формируются как обычно, с корректными
+    счётчиками того, что реально произошло до остановки — без отдельного
+    уведомления о самой остановке (в отличие от PeerFlood/большого
+    FloodWait, см. test_execute_peer_flood_stops_account_and_notifies_operator)."""
+    db_path = _setup_db(tmp_path)
+    total_users = 10
+    for user_id in range(1, total_users + 1):
+        _seed_user(
+            db_path, user_id, keywords=["осаго"], access_hash=user_id,
+            last_seen_at=_BASE_TIME + timedelta(days=user_id),
+        )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=10,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(
+        call_errors={
+            "account_1": [
+                None,
+                UserAlreadyParticipantError(request=GetHistoryRequest),
+                UserChannelsTooMuchError(request=GetHistoryRequest),
+                None,
+                None,
+            ]
+        },
+        created=created_clients,
+    )
+    notifier = _FakeOperatorNotifier()
+
+    asyncio.run(
+        _run_service(
+            db_path, client_factory=client_factory, execute=True, notifier=notifier,
+            max_successful_invites=3,
+        )
+    )
+
+    client = created_clients[0]
+    assert len(client.call_requests) == 5  # candidates 6..10 не тронуты
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        assert len(invite_repository.list()) == 5
+    finally:
+        invite_repository.close()
+
+    # Никакого уведомления об остановке — это не PeerFlood/FloodWait.
+    stop_notifications = [m for m in notifier.sent if m.startswith("⚠️")]
+    assert stop_notifications == []
+
+    account_notifications = [m for m in notifier.sent if m.startswith("📨")]
+    assert len(account_notifications) == 1
+    assert "✅ Приглашено: 3" in account_notifications[0]
+    assert "☑️ Уже состояли в группе: 1" in account_notifications[0]
+    assert "🚫 Недоступны (invalid): 0" in account_notifications[0]
+    assert "❌ Ошибок: 1" in account_notifications[0]
+    assert "Осталось кандидатов: 6" in account_notifications[0]
+
+    campaign_notifications = [m for m in notifier.sent if "Итоги кампании" in m]
+    assert len(campaign_notifications) == 1
+    assert "✅ Приглашено: 3" in campaign_notifications[0]
+    assert "☑️ Уже состояли: 1" in campaign_notifications[0]
+    assert "❌ Ошибок: 1" in campaign_notifications[0]
+    # 10 подходящих кандидатов всего - 4 со статусом 'invited' в БД
+    # (3 реальных успеха + 1 already_participant) = 6 осталось.
+    assert "Осталось кандидатов: 6" in campaign_notifications[0]
 
 
 # ---- отсутствие .session-файла — понятный лог, без исключений, без попыток ----
