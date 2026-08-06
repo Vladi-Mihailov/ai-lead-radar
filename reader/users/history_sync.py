@@ -279,12 +279,16 @@ async def sync_users_from_history(
     UserRepository (см. _sync_group_history) — независимо от того, штатный
     ли это отправитель или уже известный локально.
 
-    force=True (см. sync_users.py --reindex) — полностью игнорирует
-    checkpoint: не пропускает уже "завершённые" группы и заново запрашивает
-    полную информацию об отправителе (а не только для новых) для каждой
-    группы, чтобы досчитать поля, добавленные после того, как группа была
-    полностью проиндексирована в прошлый раз (например, keywords/access_hash).
-    Информация запрашивается не более одного раза на пользователя за весь
+    force=True (см. sync_users.py --reindex) — ведёт свой ОТДЕЛЬНЫЙ checkpoint
+    (mode="reindex" в HistorySyncStateRepository), независимый от обычного
+    инкрементального: первый запуск --reindex по группе начинает историю с
+    самого начала (не глядя на инкрементальный checkpoint), а прерванный
+    прогон --reindex (SSH/reboot/Ctrl+C) при следующем запуске продолжается
+    именно с места остановки, не начиная заново. Заново запрашивает полную
+    информацию об отправителе (а не только для новых), чтобы досчитать поля,
+    добавленные после того, как группа была полностью проиндексирована в
+    прошлый раз (например, keywords/access_hash). Информация запрашивается не
+    более одного раза на пользователя за весь
     этот вызов (не на каждое его сообщение и не повторно в каждой следующей
     группе, см. refreshed_user_ids в _sync_group_history), и по возможности
     вообще без RPC — сначала используется message.sender (уже пришедший
@@ -359,45 +363,38 @@ async def _sync_group_history(
     failed_identity_refresh: set[int],
 ) -> None:
     chat_id = entity.id
-    checkpoint = state_repository.get(chat_id)
+    # Инкрементальный режим и --reindex ведут независимый прогресс по одной и
+    # той же группе (см. HistorySyncStateRepository) — обычный checkpoint не
+    # трогается и не читается в режиме reindex, и наоборот, поэтому прогон
+    # --reindex, прерванный (SSH/reboot/Ctrl+C), продолжается со своего же
+    # места, а не с начала истории заново.
+    mode = "reindex" if force else "incremental"
+    checkpoint = state_repository.get(chat_id, mode=mode)
 
-    if checkpoint and checkpoint.history_completed and not force:
+    if checkpoint and checkpoint.history_completed:
         logger.info(
-            "Группа: %s — история уже полностью проиндексирована, пропускаю", title
+            "Группа: %s — история уже полностью проиндексирована (%s), пропускаю",
+            title, mode,
         )
         return
-
-    if force and checkpoint:
-        logger.info(
-            "Группа: %s — принудительная переиндексация, игнорирую checkpoint "
-            "(был: message_id=%s, завершён=%s)",
-            title,
-            checkpoint.oldest_processed_message_id,
-            checkpoint.history_completed,
-        )
 
     logger.info("Группа: %s", title)
 
     flood_wait_retries = 0
-    # Игнорируем сохранённый checkpoint только для самого первого прохода
-    # цикла этой группы — если после него потребуется повтор (FloodWait),
-    # дальше резюмируемся уже от прогресса, который сохранил сам этот же
-    # прогон переиндексации, а не от старого checkpoint.
-    ignore_checkpoint = force
 
     while True:
         # Перечитываем checkpoint на каждой попытке — при повторе после
-        # FloodWait он уже мог продвинуться благодаря периодическим save.
-        checkpoint = None if ignore_checkpoint else state_repository.get(chat_id)
-        ignore_checkpoint = False
+        # FloodWait (или при возобновлении прерванного прогона в новом
+        # процессе) он уже мог продвинуться благодаря периодическим save.
+        checkpoint = state_repository.get(chat_id, mode=mode)
         offset_id = checkpoint.oldest_processed_message_id if checkpoint else 0
         processed_messages = checkpoint.processed_messages if checkpoint else 0
         saved_users_total = checkpoint.saved_users if checkpoint else 0
 
         if checkpoint:
-            logger.info("Checkpoint: message_id=%d", offset_id)
+            logger.info("Checkpoint (%s): message_id=%d", mode, offset_id)
         else:
-            logger.info("Checkpoint: отсутствует, начинаю с самого начала истории")
+            logger.info("Checkpoint (%s): отсутствует, начинаю с самого начала истории", mode)
 
         last_message_id = offset_id
         last_message_date = checkpoint.oldest_processed_date if checkpoint else None
@@ -425,6 +422,7 @@ async def _sync_group_history(
                 processed_messages=processed_messages,
                 saved_users=saved_users_total,
                 history_completed=history_completed,
+                mode=mode,
             )
 
         try:

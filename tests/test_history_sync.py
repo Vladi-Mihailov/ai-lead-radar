@@ -295,9 +295,15 @@ async def test_force_rereads_history_of_already_completed_group(tmp_path):
         )
         assert force_client.iter_messages_calls >= 1
 
+        # --reindex ведёт свой собственный checkpoint — обычный (mode по
+        # умолчанию) остаётся таким же, каким его оставил самый первый прогон.
         checkpoint = state_repository.get(-101001)
         assert checkpoint.history_completed is True
         assert checkpoint.processed_messages == 50
+
+        reindex_checkpoint = state_repository.get(-101001, mode="reindex")
+        assert reindex_checkpoint.history_completed is True
+        assert reindex_checkpoint.processed_messages == 50
     finally:
         repository.close()
         state_repository.close()
@@ -351,8 +357,10 @@ async def test_force_refreshes_access_hash_for_already_known_sender(tmp_path):
         assert repository.get(444).access_hash == 123123123
 
         # Пользователь уже был известен — переиндексация не должна считать
-        # его "новым" в статистике checkpoint.
-        checkpoint = state_repository.get(-101002)
+        # его "новым" в статистике checkpoint. Проверяем именно
+        # reindex-checkpoint — обычный (mode по умолчанию) отдельный и не
+        # трогается прогоном --reindex.
+        checkpoint = state_repository.get(-101002, mode="reindex")
         assert checkpoint.saved_users == 0
     finally:
         repository.close()
@@ -375,9 +383,184 @@ async def test_force_still_counts_genuinely_new_users(tmp_path):
             client, [group], repository, state_repository, _EMPTY_MATCHER, force=True
         )
 
-        checkpoint = state_repository.get(-101003)
+        # force=True пишет в свой отдельный reindex-checkpoint, а не в
+        # обычный (mode по умолчанию).
+        checkpoint = state_repository.get(-101003, mode="reindex")
         assert checkpoint.saved_users == 1
         assert repository.get(555).access_hash == 999
+    finally:
+        repository.close()
+        state_repository.close()
+
+
+# ---- независимый checkpoint для --reindex (mode="reindex") ----
+
+
+async def test_reindex_first_run_starts_from_beginning(tmp_path):
+    """Первый запуск --reindex для группы должен начать историю с самого
+    начала — независимо от того, что показывает обычный (инкрементальный)
+    checkpoint этой же группы."""
+    get_sender_calls = []
+    messages = _make_messages(50, get_sender_calls)
+    entity = _FakeEntity(-102001, "Test group")
+    group = Group(id=-102001, username=None, title="Test group")
+
+    repository = UserRepository(tmp_path / "users.db")
+    state_repository = HistorySyncStateRepository(tmp_path / "users.db")
+    try:
+        # Обычный checkpoint уже продвинут почти до конца истории — если бы
+        # --reindex ошибочно использовал его, был бы прочитан только "хвост".
+        state_repository.save_progress(
+            chat_id=-102001, chat_name="Test group",
+            oldest_processed_message_id=5, oldest_processed_date=None,
+            processed_messages=45, saved_users=45, history_completed=False,
+        )
+
+        client = _FakeClient(entity, messages, get_sender_calls)
+        await sync_users_from_history(
+            client, [group], repository, state_repository, _EMPTY_MATCHER, force=True
+        )
+
+        # Прочитана вся история (offset_id=0), а не только "хвост" от чужого
+        # (инкрементального) checkpoint.
+        reindex_checkpoint = state_repository.get(-102001, mode="reindex")
+        assert reindex_checkpoint.history_completed is True
+        assert reindex_checkpoint.processed_messages == 50
+        assert reindex_checkpoint.oldest_processed_message_id == 1
+
+        # Обычный checkpoint остался нетронутым.
+        incremental_checkpoint = state_repository.get(-102001)
+        assert incremental_checkpoint.processed_messages == 45
+        assert incremental_checkpoint.history_completed is False
+    finally:
+        repository.close()
+        state_repository.close()
+
+
+async def test_reindex_resumes_from_its_own_checkpoint_after_interruption(tmp_path):
+    """--reindex, прерванный посреди истории (SSH/reboot/Ctrl+C — здесь
+    смоделировано обрывом сети в новом процессе), должен при следующем
+    запуске продолжить именно с сохранённого reindex-checkpoint, а не
+    начинать всю историю заново."""
+    get_sender_calls = []
+    messages = _make_messages(1300, get_sender_calls)
+    entity = _FakeEntity(-102002, "Test group")
+    group = Group(id=-102002, username=None, title="Test group")
+
+    repository = UserRepository(tmp_path / "users.db")
+    state_repository = HistorySyncStateRepository(tmp_path / "users.db")
+    try:
+        crashing_client = _FakeClient(entity, messages, get_sender_calls, fail_after_in_call=1250)
+        await sync_users_from_history(
+            crashing_client, [group], repository, state_repository, _EMPTY_MATCHER, force=True
+        )
+
+        expected_saved = (1250 // _CHECKPOINT_INTERVAL) * _CHECKPOINT_INTERVAL
+        checkpoint = state_repository.get(-102002, mode="reindex")
+        assert checkpoint.history_completed is False
+        assert checkpoint.processed_messages == expected_saved
+        assert checkpoint.oldest_processed_message_id == 1300 - expected_saved + 1
+
+        # Новый процесс, снова --reindex — должен продолжить именно с этого
+        # места, а не перечитать всю историю заново.
+        resuming_client = _FakeClient(entity, messages, get_sender_calls)
+        await sync_users_from_history(
+            resuming_client, [group], repository, state_repository, _EMPTY_MATCHER, force=True
+        )
+
+        final_checkpoint = state_repository.get(-102002, mode="reindex")
+        assert final_checkpoint.history_completed is True
+        assert final_checkpoint.processed_messages == 1300
+        assert final_checkpoint.oldest_processed_message_id == 1
+    finally:
+        repository.close()
+        state_repository.close()
+
+
+async def test_incremental_and_reindex_progress_are_independent(tmp_path):
+    """Инкрементальный прогон, завершивший всю историю группы, и
+    прерванный --reindex по той же группе должны иметь совершенно разный,
+    никак не влияющий друг на друга прогресс."""
+    get_sender_calls = []
+    messages = _make_messages(1300, get_sender_calls)
+    entity = _FakeEntity(-102003, "Test group")
+    group = Group(id=-102003, username=None, title="Test group")
+
+    repository = UserRepository(tmp_path / "users.db")
+    state_repository = HistorySyncStateRepository(tmp_path / "users.db")
+    try:
+        incremental_client = _FakeClient(entity, messages, get_sender_calls)
+        await sync_users_from_history(
+            incremental_client, [group], repository, state_repository, _EMPTY_MATCHER
+        )
+        incremental_checkpoint = state_repository.get(-102003)
+        assert incremental_checkpoint.history_completed is True
+        assert incremental_checkpoint.processed_messages == 1300
+
+        # --reindex по той же группе, прерванный на середине.
+        reindex_client = _FakeClient(entity, messages, get_sender_calls, fail_after_in_call=600)
+        await sync_users_from_history(
+            reindex_client, [group], repository, state_repository, _EMPTY_MATCHER, force=True
+        )
+
+        expected_reindex_saved = (600 // _CHECKPOINT_INTERVAL) * _CHECKPOINT_INTERVAL
+        reindex_checkpoint = state_repository.get(-102003, mode="reindex")
+        assert reindex_checkpoint.history_completed is False
+        assert reindex_checkpoint.processed_messages == expected_reindex_saved
+
+        # Обычный (инкрементальный) checkpoint не изменился ни на бит.
+        incremental_checkpoint_after = state_repository.get(-102003)
+        assert incremental_checkpoint_after == incremental_checkpoint
+    finally:
+        repository.close()
+        state_repository.close()
+
+
+async def test_completed_flag_is_independent_per_mode(tmp_path):
+    """Флаг completed для инкрементального и reindex-режима хранится и
+    проверяется отдельно: завершение одного режима не помечает (и не
+    пропускает) группу для другого."""
+    get_sender_calls = []
+    messages = _make_messages(40, get_sender_calls)
+    entity = _FakeEntity(-102004, "Test group")
+    group = Group(id=-102004, username=None, title="Test group")
+
+    repository = UserRepository(tmp_path / "users.db")
+    state_repository = HistorySyncStateRepository(tmp_path / "users.db")
+    try:
+        # --reindex завершает группу первым.
+        reindex_client = _FakeClient(entity, messages, get_sender_calls)
+        await sync_users_from_history(
+            reindex_client, [group], repository, state_repository, _EMPTY_MATCHER, force=True
+        )
+        assert state_repository.get(-102004, mode="reindex").history_completed is True
+        # Обычный checkpoint ещё вовсе не существует — reindex его не создал.
+        assert state_repository.get(-102004) is None
+
+        # Обычный (инкрементальный) прогон по той же группе — обычный
+        # checkpoint отсутствует, поэтому история читается заново, несмотря
+        # на то, что reindex уже пометил свою копию завершённой.
+        incremental_client = _FakeClient(entity, messages, get_sender_calls)
+        await sync_users_from_history(
+            incremental_client, [group], repository, state_repository, _EMPTY_MATCHER
+        )
+        assert incremental_client.iter_messages_calls == 1
+        assert state_repository.get(-102004).history_completed is True
+
+        # Повторный --reindex теперь пропускается — его собственный
+        # checkpoint уже завершён, независимо от инкрементального.
+        second_reindex_client = _FakeClient(entity, messages, get_sender_calls)
+        await sync_users_from_history(
+            second_reindex_client, [group], repository, state_repository, _EMPTY_MATCHER, force=True
+        )
+        assert second_reindex_client.iter_messages_calls == 0
+
+        # И наоборот: повторный инкрементальный запуск тоже пропускается.
+        second_incremental_client = _FakeClient(entity, messages, get_sender_calls)
+        await sync_users_from_history(
+            second_incremental_client, [group], repository, state_repository, _EMPTY_MATCHER
+        )
+        assert second_incremental_client.iter_messages_calls == 0
     finally:
         repository.close()
         state_repository.close()
