@@ -16,7 +16,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import pytest  # noqa: E402
-from telethon.errors import FloodWaitError, PeerFloodError, UserAlreadyParticipantError  # noqa: E402
+from telethon.errors import (  # noqa: E402
+    ChatAdminRequiredError,
+    FloodWaitError,
+    PeerFloodError,
+    UserAlreadyParticipantError,
+)
 from telethon.tl.functions.messages import AddChatUserRequest, GetHistoryRequest  # noqa: E402
 
 from reader.inviter.repository import (  # noqa: E402
@@ -28,6 +33,21 @@ from reader.inviter.service import InviterService, _format_duration  # noqa: E40
 from reader.users.repository import UserRepository  # noqa: E402
 
 _BASE_TIME = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sleep(monkeypatch):
+    """_pause_between_invites() реально ждёт 20-60 сек. после КАЖДОГО
+    приглашения — без этой подмены большинство тестов execute=True стали бы
+    занимать минуты. Тесты, которым нужно проверить сам факт/длительность
+    сна (FloodWait, случайная пауза), переопределяют asyncio.sleep у себя в
+    теле — это просто перекрывает подмену этого фикстура на время теста."""
+    import reader.inviter.service as service_module
+
+    async def instant_sleep(seconds):
+        pass
+
+    monkeypatch.setattr(service_module.asyncio, "sleep", instant_sleep)
 
 
 def _seed_user(
@@ -746,8 +766,11 @@ def test_execute_creates_failed_record_on_rpc_error(tmp_path):
     db_path = _setup_db(tmp_path)
     campaign, account = _setup_single_candidate_campaign(db_path)
 
+    # ChatAdminRequiredError — просто пример "любой другой RPCError";
+    # PeerFloodError теперь ведёт себя иначе (останавливает аккаунт, см.
+    # test_execute_peer_flood_stops_account_and_notifies_operator).
     client_factory = _make_client_factory(
-        call_errors={"Основной": [PeerFloodError(request=GetHistoryRequest)]},
+        call_errors={"Основной": [ChatAdminRequiredError(request=GetHistoryRequest)]},
     )
 
     asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
@@ -762,7 +785,7 @@ def test_execute_creates_failed_record_on_rpc_error(tmp_path):
         assert invite.account_id == account.id
         assert invite.status == "failed"
         assert invite.error  # непустая причина
-        assert "Too many requests" in invite.error
+        assert "admin" in invite.error.lower()
         assert invite.invited_at is None
     finally:
         invite_repository.close()
@@ -793,6 +816,8 @@ def test_execute_flood_wait_records_failed_sleeps_and_continues(tmp_path, monkey
 
     import reader.inviter.service as service_module
 
+    monkeypatch.setattr(service_module.random, "random", lambda: 0.9)  # форсируем короткую паузу
+
     sleep_calls: list = []
 
     async def fake_sleep(seconds):
@@ -802,7 +827,14 @@ def test_execute_flood_wait_records_failed_sleeps_and_continues(tmp_path, monkey
 
     asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
 
-    assert sleep_calls == [7]
+    # sleep_calls[0] — "разогрев" аккаунта сразу после connect() (см.
+    # test_warm_up_account_...), [1] — ожидание самого FloodWait (7 сек., как
+    # и раньше), [2] — случайная пауза после ВТОРОГО (успешного) кандидата
+    # (см. _pause_between_invites) — в диапазоне [20, 60).
+    assert len(sleep_calls) == 3
+    assert 5 <= sleep_calls[0] < 15
+    assert sleep_calls[1] == 7
+    assert 20 <= sleep_calls[2] < 60
 
     invite_repository = UserCampaignInviteRepository(db_path)
     try:
@@ -898,9 +930,11 @@ def test_execute_sends_account_and_campaign_notifications_with_correct_counts(tm
         campaign_repository.close()
         account_repository.close()
 
-    # По last_seen_at DESC: 1 (успех), 2 (уже участник), 3 (ошибка).
+    # По last_seen_at DESC: 1 (успех), 2 (уже участник), 3 (обычная ошибка —
+    # не PeerFlood/FloodWait, у которых теперь особое поведение остановки
+    # аккаунта, см. test_execute_peer_flood_stops_account_and_notifies_operator).
     client_factory = _make_client_factory(
-        call_errors={"account_1": [None, UserAlreadyParticipantError(request=GetHistoryRequest), PeerFloodError(request=GetHistoryRequest)]},
+        call_errors={"account_1": [None, UserAlreadyParticipantError(request=GetHistoryRequest), ChatAdminRequiredError(request=GetHistoryRequest)]},
     )
     notifier = _FakeOperatorNotifier()
 
@@ -999,7 +1033,7 @@ def test_execute_aggregates_stats_across_multiple_accounts_in_campaign_summary(t
     client_factory = _make_client_factory(
         call_errors={
             "account_1": [None, None],
-            "account_2": [PeerFloodError(request=GetHistoryRequest), None],
+            "account_2": [ChatAdminRequiredError(request=GetHistoryRequest), None],
         },
     )
     notifier = _FakeOperatorNotifier()
@@ -1185,3 +1219,348 @@ def test_elapsed_time_uses_monotonic_not_wall_clock(tmp_path, monkeypatch):
 
     account_message = notifier.sent[0]
     assert "Время выполнения: 01:15:00" in account_message
+
+
+# ---- случайная пауза + остановка аккаунта на PeerFlood/большом FloodWait ----
+
+
+def test_pause_between_invites_happens_after_each_outcome_regardless_of_result(tmp_path, monkeypatch):
+    """Пауза (см. _choose_invite_pause_seconds) выполняется после КАЖДОГО
+    кандидата — успеха, "уже участник" и обычной ошибки — не пропускается ни
+    для одного из этих трёх исходов. Само значение задержки замокано через
+    _choose_invite_pause_seconds — его стратегия 80/20 проверяется отдельно
+    (см. test_choose_invite_pause_seconds_*), здесь же интересует только факт
+    и число вызовов паузы."""
+    db_path = _setup_db(tmp_path)
+    for user_id in range(1, 4):
+        _seed_user(
+            db_path, user_id, keywords=["осаго"], access_hash=user_id,
+            last_seen_at=_BASE_TIME + timedelta(days=user_id),
+        )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="Основной", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    # По last_seen_at DESC: 3 (успех), 2 (уже участник), 1 (обычная ошибка).
+    client_factory = _make_client_factory(
+        call_errors={
+            "Основной": [
+                None,
+                UserAlreadyParticipantError(request=GetHistoryRequest),
+                ChatAdminRequiredError(request=GetHistoryRequest),
+            ],
+        },
+    )
+
+    import reader.inviter.service as service_module
+
+    monkeypatch.setattr(service_module, "_choose_invite_pause_seconds", lambda: 55.5)
+    # "Разогрев" пользуется random.uniform() напрямую (не через
+    # _choose_invite_pause_seconds) — задаём ему отдельное фиксированное
+    # значение, чтобы отличать его от пауз между кандидатами.
+    monkeypatch.setattr(service_module.random, "uniform", lambda a, b: 7.0)
+
+    sleep_calls: list = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(service_module.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    # sleep_calls[0] — разогрев (7.0), остальные три — по одной паузе на
+    # каждого из трёх кандидатов, независимо от исхода.
+    assert sleep_calls[0] == 7.0
+    assert sleep_calls[1:] == [55.5, 55.5, 55.5]
+
+
+def test_warm_up_account_pauses_once_after_connect_not_per_candidate(tmp_path, monkeypatch):
+    """connect() -> случайная пауза 5-15 сек (см. _warm_up_account) -> резолв
+    target_chat -> приглашения. Ровно один раз на аккаунт, независимо от
+    числа обработанных кандидатов — не перед каждым пользователем."""
+    db_path = _setup_db(tmp_path)
+    for user_id in range(1, 3):
+        _seed_user(
+            db_path, user_id, keywords=["осаго"], access_hash=user_id,
+            last_seen_at=_BASE_TIME + timedelta(days=user_id),
+        )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="Основной", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    client_factory = _make_client_factory(call_errors={"Основной": [None, None]})
+
+    import reader.inviter.service as service_module
+
+    uniform_calls: list[tuple] = []
+
+    def fake_uniform(a, b):
+        uniform_calls.append((a, b))
+        return 10.0 if (a, b) == (5, 15) else 30.0
+
+    monkeypatch.setattr(service_module.random, "uniform", fake_uniform)
+    monkeypatch.setattr(service_module.random, "random", lambda: 0.9)  # форсируем короткую паузу
+
+    sleep_calls: list = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(service_module.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    # Ровно один вызов "разогрева" random.uniform(5, 15), несмотря на два
+    # обработанных кандидата — не перед каждым из них.
+    warmup_calls = [call for call in uniform_calls if call == (5, 15)]
+    assert len(warmup_calls) == 1
+
+    # Разогрев — самый первый сон, до какой-либо обработки кандидатов;
+    # дальше — по одной паузе на каждого из двух кандидатов.
+    assert sleep_calls[0] == 10.0
+    assert sleep_calls[1:] == [30.0, 30.0]
+
+
+def test_choose_invite_pause_seconds_returns_short_pause_when_above_probability(monkeypatch):
+    """random.random() >= _LONG_PAUSE_PROBABILITY (0.2) -> короткая пауза
+    random.uniform(20, 60), не длинная."""
+    import reader.inviter.service as service_module
+
+    monkeypatch.setattr(service_module.random, "random", lambda: 0.2)  # ровно на границе — НЕ длинная
+
+    uniform_calls: list[tuple] = []
+
+    def fake_uniform(a, b):
+        uniform_calls.append((a, b))
+        return 42.0
+
+    monkeypatch.setattr(service_module.random, "uniform", fake_uniform)
+
+    result = service_module._choose_invite_pause_seconds()
+
+    assert uniform_calls == [(20, 60)]
+    assert result == 42.0
+
+
+def test_choose_invite_pause_seconds_returns_long_pause_when_below_probability(monkeypatch):
+    """random.random() < _LONG_PAUSE_PROBABILITY (0.2) -> длинная пауза
+    random.uniform(90, 180), не короткая — примерно в 20% случаев."""
+    import reader.inviter.service as service_module
+
+    monkeypatch.setattr(service_module.random, "random", lambda: 0.199999)
+
+    uniform_calls: list[tuple] = []
+
+    def fake_uniform(a, b):
+        uniform_calls.append((a, b))
+        return 123.0
+
+    monkeypatch.setattr(service_module.random, "uniform", fake_uniform)
+
+    result = service_module._choose_invite_pause_seconds()
+
+    assert uniform_calls == [(90, 180)]
+    assert result == 123.0
+
+
+def test_execute_peer_flood_stops_account_and_notifies_operator(tmp_path):
+    """PeerFloodError на любом кандидате — записать его результат, уведомить
+    оператора, немедленно прекратить обработку ОСТАЛЬНЫХ кандидатов этим
+    аккаунтом, корректно disconnect() и перейти к следующему аккаунту."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_2", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    # По last_seen_at DESC — первый (и единственно тронутый) кандидат: 2.
+    client_factory = _make_client_factory(
+        call_errors={"account_2": [PeerFloodError(request=GetHistoryRequest)]},
+        created=created_clients,
+    )
+    notifier = _FakeOperatorNotifier()
+
+    asyncio.run(
+        _run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier)
+    )
+
+    client = created_clients[0]
+    # Второй кандидат (1) не тронут вовсе — ни одного запроса на него.
+    assert len(client.call_requests) == 1
+    assert client.disconnected is True
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == 1
+        assert invites[0].user_id == 2
+        assert invites[0].status == "failed"
+    finally:
+        invite_repository.close()
+
+    stop_notifications = [m for m in notifier.sent if m.startswith("⚠️")]
+    assert len(stop_notifications) == 1
+    assert "Аккаунт: account_2" in stop_notifications[0]
+    assert "Получен PeerFlood." in stop_notifications[0]
+    assert "Работа аккаунта остановлена." in stop_notifications[0]
+    assert "Переход к следующему аккаунту." in stop_notifications[0]
+
+
+def test_execute_flood_wait_at_or_above_threshold_stops_account_and_notifies_operator(
+    tmp_path, monkeypatch,
+):
+    """FloodWaitError с exc.seconds >= 300 — не пережидать, а остановить
+    аккаунт (как PeerFlood) и уведомить оператора с указанием времени
+    ожидания."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_2", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(
+        call_errors={"account_2": [FloodWaitError(request=GetHistoryRequest, capture=624)]},
+        created=created_clients,
+    )
+    notifier = _FakeOperatorNotifier()
+
+    import reader.inviter.service as service_module
+
+    sleep_calls: list = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(service_module.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(
+        _run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier)
+    )
+
+    # Большой FloodWait не пережидается — единственный sleep() — это
+    # "разогрев" аккаунта сразу после connect() (см.
+    # test_warm_up_account_...), а не ожидание FloodWait.
+    assert len(sleep_calls) == 1
+    assert 5 <= sleep_calls[0] < 15
+
+    client = created_clients[0]
+    assert len(client.call_requests) == 1  # второй кандидат не тронут
+    assert client.disconnected is True
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        assert len(invite_repository.list()) == 1
+    finally:
+        invite_repository.close()
+
+    stop_notifications = [m for m in notifier.sent if m.startswith("⚠️")]
+    assert len(stop_notifications) == 1
+    assert "Аккаунт: account_2" in stop_notifications[0]
+    assert "FloodWait: 624 сек." in stop_notifications[0]
+    assert "Работа аккаунта остановлена." in stop_notifications[0]
+
+
+def test_execute_flood_wait_below_threshold_waits_and_continues_account(tmp_path, monkeypatch):
+    """FloodWaitError с exc.seconds < 300 — поведение как раньше: подождать
+    exc.seconds и продолжить ЭТИМ ЖЕ аккаунтом остальных кандидатов, без
+    уведомления об остановке."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(
+        call_errors={"account_1": [FloodWaitError(request=GetHistoryRequest, capture=299), None]},
+        created=created_clients,
+    )
+    notifier = _FakeOperatorNotifier()
+
+    import reader.inviter.service as service_module
+
+    monkeypatch.setattr(service_module.random, "random", lambda: 0.9)  # форсируем короткую паузу
+
+    sleep_calls: list = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(service_module.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(
+        _run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier)
+    )
+
+    # 299 < 300 — дождались и продолжили ОБА кандидата этим же аккаунтом.
+    # sleep_calls[0] — "разогрев" сразу после connect(); [1] — ожидание
+    # FloodWait; [2] — случайная пауза после ВТОРОГО (успешного) кандидата
+    # (см. _pause_between_invites).
+    assert len(sleep_calls) == 3
+    assert 5 <= sleep_calls[0] < 15
+    assert sleep_calls[1] == 299
+    assert 20 <= sleep_calls[2] < 60
+
+    client = created_clients[0]
+    assert len(client.call_requests) == 2
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        assert len(invite_repository.list()) == 2
+    finally:
+        invite_repository.close()
+
+    # Никакого уведомления об остановке — аккаунт не останавливался.
+    stop_notifications = [m for m in notifier.sent if m.startswith("⚠️")]
+    assert stop_notifications == []

@@ -1,11 +1,12 @@
 import asyncio
 import logging
+import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Protocol
 
-from telethon.errors import FloodWaitError, RPCError, UserAlreadyParticipantError
+from telethon.errors import FloodWaitError, PeerFloodError, RPCError, UserAlreadyParticipantError
 from telethon.tl.functions.channels import InviteToChannelRequest
 from telethon.tl.functions.messages import AddChatUserRequest
 from telethon.tl.types import Channel, InputPeerUser
@@ -18,6 +19,40 @@ from reader.inviter.repository import (
 )
 
 logger = logging.getLogger(__name__)
+
+# "Разогрев" — один раз после connect(), перед резолвом target_chat и до
+# первого приглашения (см. _execute_account) — только что подключившийся
+# аккаунт, который сразу начинает рассылать приглашения, выглядит подозрительно.
+_WARMUP_MIN_SECONDS = 5
+_WARMUP_MAX_SECONDS = 15
+
+# Пауза после каждого приглашения (независимо от результата —
+# invited/already_participant/failed/invalid), чтобы аккаунт не рассылал
+# приглашения через равные интервалы — это и есть один из самых заметных
+# признаков автоматизации для Telegram. Большинство пауз короткие, но
+# примерно 20% — длинные (см. _choose_invite_pause_seconds), как у живого
+# человека, который иногда отвлекается. FloodWait/PeerFlood — отдельная
+# пауза/остановка (см. _invite_candidate), эта не добавляется поверх них.
+_SHORT_PAUSE_MIN_SECONDS = 20
+_SHORT_PAUSE_MAX_SECONDS = 60
+_LONG_PAUSE_MIN_SECONDS = 90
+_LONG_PAUSE_MAX_SECONDS = 180
+_LONG_PAUSE_PROBABILITY = 0.2
+
+# exc.seconds >= это значение — FloodWait считается слишком большим, чтобы
+# просто подождать и продолжить тем же аккаунтом (см. _invite_candidate).
+_MAX_TOLERABLE_FLOOD_WAIT_SECONDS = 300
+
+
+def _choose_invite_pause_seconds() -> float:
+    """~_LONG_PAUSE_PROBABILITY (по умолчанию 20%) случаев — длинная пауза
+    (_LONG_PAUSE_MIN_SECONDS.._LONG_PAUSE_MAX_SECONDS), иначе — короткая
+    (_SHORT_PAUSE_MIN_SECONDS.._SHORT_PAUSE_MAX_SECONDS). Отдельная функция —
+    чтобы её можно было проверить в тестах моком random.random()/
+    random.uniform(), не полагаясь на статистику по множеству прогонов."""
+    if random.random() < _LONG_PAUSE_PROBABILITY:
+        return random.uniform(_LONG_PAUSE_MIN_SECONDS, _LONG_PAUSE_MAX_SECONDS)
+    return random.uniform(_SHORT_PAUSE_MIN_SECONDS, _SHORT_PAUSE_MAX_SECONDS)
 
 
 class OperatorNotifierLike(Protocol):
@@ -178,6 +213,15 @@ def _format_campaign_summary_notification(
     )
 
 
+def _format_account_stopped_notification(account: TelegramAccount, reason: str) -> str:
+    return (
+        f"⚠️ Аккаунт: {account.name}\n\n"
+        f"{reason}\n\n"
+        f"Работа аккаунта остановлена.\n\n"
+        f"Переход к следующему аккаунту."
+    )
+
+
 def _build_invite_request(target_entity, input_peer: InputPeerUser):
     """InviteToChannelRequest — для каналов/супергрупп (Channel), иначе
     (обычный small group chat) — AddChatUserRequest. Ровно один из двух, ни
@@ -201,9 +245,13 @@ class InviterService:
     InviteToChannelRequest/AddChatUserRequest на кандидата (см.
     _build_invite_request), с немедленной записью результата
     (status='invited'/'failed') сразу после каждого кандидата — не
-    дожидаясь конца партии. FloodWaitError ждётся (exc.seconds) и не
-    прерывает ни аккаунт, ни весь сервис; сбой одного аккаунта (например,
-    обрыв connect()) не мешает остальным.
+    дожидаясь конца партии, и случайной паузой после каждого (см.
+    _pause_between_invites). FloodWaitError < _MAX_TOLERABLE_FLOOD_WAIT_SECONDS
+    ждётся (exc.seconds) и не прерывает ни аккаунт, ни весь сервис;
+    FloodWaitError >= _MAX_TOLERABLE_FLOOD_WAIT_SECONDS и PeerFloodError
+    останавливают текущий аккаунт (с уведомлением оператора, см.
+    _format_account_stopped_notification) и переходят к следующему; сбой
+    самого аккаунта (например, обрыв connect()) не мешает остальным.
 
     В режиме execute=True после каждого обработанного аккаунта и после
     каждой кампании оператору отправляется краткая статистика (см.
@@ -371,6 +419,11 @@ class InviterService:
                     f"[EXECUTE]\nAccount: {account.name}\nFAILED\nНе удалось подключиться: {exc}"
                 )
             else:
+                # "Разогрев" — один раз сразу после подключения, до резолва
+                # target_chat и до первого приглашения (НЕ перед каждым
+                # кандидатом, см. _warm_up_account).
+                await self._warm_up_account()
+
                 try:
                     target_entity = await client.get_entity(campaign.target_chat)
                 except Exception as exc:
@@ -380,9 +433,14 @@ class InviterService:
                     )
                 else:
                     for candidate in candidates:
-                        await self._invite_candidate(
+                        should_stop = await self._invite_candidate(
                             client, campaign, account, target_entity, candidate, stats,
                         )
+                        if should_stop:
+                            # PeerFlood или FloodWait >= _MAX_TOLERABLE_FLOOD_WAIT_SECONDS
+                            # (см. _invite_candidate) — остальные кандидаты этого
+                            # аккаунта не трогаем, переходим к следующему аккаунту.
+                            break
         finally:
             await client.disconnect()
 
@@ -397,14 +455,21 @@ class InviterService:
         target_entity,
         candidate: InviteCandidate,
         stats: InviteStats,
-    ) -> None:
+    ) -> bool:
         """Ровно один запрос Telethon на кандидата (InviteToChannelRequest
         или AddChatUserRequest, см. _build_invite_request) — результат
         сохраняется в user_campaign_invites немедленно, независимо от
         успеха/неудачи, чтобы обрыв ПОСЛЕ этого кандидата не потерял уже
-        готовый результат. FloodWaitError — общее временное ограничение API
-        (см. reader/users/history_sync.py): ждём exc.seconds и переходим к
-        следующему кандидату, не прерывая весь сервис."""
+        готовый результат.
+
+        Возвращает True, если этот аккаунт должен немедленно прекратить
+        обработку ОСТАЛЬНЫХ кандидатов (PeerFloodError или FloodWaitError
+        >= _MAX_TOLERABLE_FLOOD_WAIT_SECONDS — см. run()/_execute_account) —
+        обрыв connect() отдельно этого аккаунта уже обрабатывается выше по
+        стеку, здесь же он не встречается. Во всех остальных случаях —
+        False, и после случайной паузы (_MIN_INVITE_PAUSE_SECONDS..
+        _MAX_INVITE_PAUSE_SECONDS) обработка продолжается со следующего
+        кандидата."""
         user_label = f"{candidate.user_id} {_format_username(candidate.username)}"
         input_peer = InputPeerUser(user_id=candidate.user_id, access_hash=candidate.access_hash)
         request = _build_invite_request(target_entity, input_peer)
@@ -424,6 +489,25 @@ class InviterService:
             )
             self._record_invite_result(campaign, account, candidate, status="invited")
             stats.already_participant += 1
+            await self._pause_between_invites()
+            return False
+        except PeerFloodError as exc:
+            # Telegram считает поведение аккаунта похожим на спам —
+            # продолжать приглашать этим же аккаунтом дальше только усугубит
+            # ситуацию (риск бана). Останавливаем именно этот аккаунт, без
+            # паузы (смысла ждать нет — переходим к следующему аккаунту), и
+            # уведомляем оператора отдельно от обычной статистики.
+            logger.warning(
+                _format_execute_block(
+                    account, user_label, campaign.target_chat, status="failed", reason=str(exc),
+                )
+            )
+            self._record_invite_result(campaign, account, candidate, status="failed", error=str(exc))
+            stats.errors += 1
+            await self._safe_notify(
+                _format_account_stopped_notification(account, "Получен PeerFlood.")
+            )
+            return True
         except FloodWaitError as exc:
             logger.warning(
                 _format_execute_block(
@@ -437,7 +521,15 @@ class InviterService:
             )
             # Не увеличиваем errors — это общее временное ограничение API, а
             # не отказ конкретному пользователю (см. InviteStats).
+            if exc.seconds >= _MAX_TOLERABLE_FLOOD_WAIT_SECONDS:
+                await self._safe_notify(
+                    _format_account_stopped_notification(
+                        account, f"FloodWait: {exc.seconds} сек.",
+                    )
+                )
+                return True
             await asyncio.sleep(exc.seconds)
+            return False
         except RPCError as exc:
             logger.warning(
                 _format_execute_block(
@@ -446,6 +538,8 @@ class InviterService:
             )
             self._record_invite_result(campaign, account, candidate, status="failed", error=str(exc))
             stats.errors += 1
+            await self._pause_between_invites()
+            return False
         except Exception as exc:
             logger.warning(
                 _format_execute_block(
@@ -454,12 +548,30 @@ class InviterService:
             )
             self._record_invite_result(campaign, account, candidate, status="failed", error=str(exc))
             stats.errors += 1
+            await self._pause_between_invites()
+            return False
         else:
             logger.info(
                 _format_execute_block(account, user_label, campaign.target_chat, status="invited")
             )
             self._record_invite_result(campaign, account, candidate, status="invited")
             stats.invited += 1
+            await self._pause_between_invites()
+            return False
+
+    async def _warm_up_account(self) -> None:
+        """Один раз сразу после connect() — до резолва target_chat и до
+        первого приглашения (см. _execute_account), НЕ перед каждым
+        кандидатом: только что подключившийся аккаунт, который сразу
+        начинает рассылать приглашения, выглядит подозрительно."""
+        await asyncio.sleep(random.uniform(_WARMUP_MIN_SECONDS, _WARMUP_MAX_SECONDS))
+
+    async def _pause_between_invites(self) -> None:
+        """Случайная пауза между приглашениями (см.
+        _choose_invite_pause_seconds) — вещественная, не фиксированная
+        задержка, чтобы интервалы между сообщениями аккаунта не выглядели
+        равномерными/автоматическими."""
+        await asyncio.sleep(_choose_invite_pause_seconds())
 
     def _record_invite_result(
         self,
