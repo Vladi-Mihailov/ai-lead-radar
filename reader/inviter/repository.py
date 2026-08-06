@@ -91,8 +91,11 @@ def _parse_keywords_column(raw: str | None) -> list[str]:
 # Кандидат подходит кампании, если keyword кампании — один из
 # запятая-разделённых токенов users.keywords. Оборачиваем обе стороны в
 # ", " перед LIKE, чтобы искать ТОЧНЫЙ токен, а не произвольную подстроку
-# (иначе keyword "ко" ложно совпал бы внутри "каско").
-_CANDIDATES_WHERE = """
+# (иначе keyword "ко" ложно совпал бы внутри "каско"). Общая часть для
+# count_candidates()/select_candidates() (с фильтром по username) и
+# count_found_candidates() (без него, см. ниже) — единый фрагмент, чтобы
+# оба запроса не могли разойтись между собой.
+_CANDIDATES_BASE_WHERE = """
     u.access_hash IS NOT NULL
     AND (', ' || u.keywords || ', ') LIKE ('%, ' || c.keyword || ', %')
     AND NOT EXISTS (
@@ -103,11 +106,36 @@ _CANDIDATES_WHERE = """
     )
 """
 
+# username IS NOT NULL/не пуст — обязателен: если candidate не известен
+# приглашающему аккаунту (InviterService._resolve_input_peer:
+# client.get_input_entity() не нашёл его в кэше ЭТОГО аккаунта — а
+# access_hash в users.db получен ДРУГИМ, читающим, аккаунтом и для
+# приглашающего часто невалиден), единственный способ его всё же
+# резолвить — client.get_entity("@username"). Без username такой
+# candidate физически не подготовить ни для одного нового аккаунта
+# ("... не известен этому аккаунту и не имеет username для резолва") —
+# поэтому не выбираем его вовсе, а не проваливаем каждую попытку.
+_USERNAME_FILTER = "u.username IS NOT NULL AND TRIM(u.username) <> ''"
+
+_CANDIDATES_WHERE = f"{_CANDIDATES_BASE_WHERE} AND {_USERNAME_FILTER}"
+
 _COUNT_CANDIDATES = f"""
 SELECT COUNT(*)
 FROM users u
 JOIN invite_campaigns c ON c.id = :campaign_id
 WHERE {_CANDIDATES_WHERE}
+"""
+
+# "Всего найдено" для операторского отчёта (см.
+# InviterService._notify_campaign_result) — те же условия, что и
+# count_candidates(), но БЕЗ фильтра по username, чтобы можно было
+# показать, сколько кандидатов отсеялось именно из-за его отсутствия
+# (found_total - count_candidates()).
+_COUNT_FOUND_CANDIDATES = f"""
+SELECT COUNT(*)
+FROM users u
+JOIN invite_campaigns c ON c.id = :campaign_id
+WHERE {_CANDIDATES_BASE_WHERE}
 """
 
 _SELECT_CANDIDATES = f"""
@@ -424,16 +452,28 @@ class UserCampaignInviteRepository:
 
     def count_candidates(self, campaign_id: int) -> int:
         """Сколько пользователей подходят кампании campaign_id прямо сейчас
-        (access_hash есть, keyword кампании — среди их keywords, ещё не
-        приглашены для этой кампании) — без учёта limit, см.
-        select_candidates()."""
+        (access_hash есть, username есть и не пуст, keyword кампании — среди
+        их keywords, ещё не приглашены для этой кампании) — без учёта limit,
+        см. select_candidates()."""
         row = self._conn.execute(_COUNT_CANDIDATES, {"campaign_id": campaign_id}).fetchone()
+        return row[0]
+
+    def count_found_candidates(self, campaign_id: int) -> int:
+        """То же самое, что count_candidates(), но БЕЗ фильтра по
+        username — "всего найдено" для операторского отчёта (см.
+        InviterService._notify_campaign_result). Разница
+        count_found_candidates() - count_candidates() — сколько
+        подходящих по остальным условиям пользователей физически нельзя
+        подготовить к приглашению из-за отсутствия username."""
+        row = self._conn.execute(_COUNT_FOUND_CANDIDATES, {"campaign_id": campaign_id}).fetchone()
         return row[0]
 
     def select_candidates(self, campaign_id: int, *, limit: int) -> list[InviteCandidate]:
         """Кандидаты на приглашение в кампанию campaign_id: keywords
-        содержит keyword кампании, access_hash задан (иначе Telethon не
-        сможет пригласить пользователя без @username), ещё нет записи со
+        содержит keyword кампании, access_hash задан и username задан и не
+        пуст (иначе приглашающий аккаунт, которому candidate не известен,
+        не сможет его резолвить вовсе — см. InviterService._resolve_input_peer
+        и требование задачи о фильтрации по username), ещё нет записи со
         status='invited' для ЭТОЙ кампании — отсортированные по
         last_seen_at DESC, не более limit штук. Только выборка — никаких
         записей в user_campaign_invites не создаёт и не изменяет (см.

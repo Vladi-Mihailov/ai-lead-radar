@@ -31,6 +31,7 @@ from reader.inviter.repository import (  # noqa: E402
     TelegramAccountRepository,
     UserCampaignInviteRepository,
 )
+from reader.inviter.models import InviteCandidate  # noqa: E402
 from reader.inviter.service import InviterService, _format_duration  # noqa: E402
 from reader.users.models import TelegramUserInfo  # noqa: E402
 from reader.users.repository import UserRepository  # noqa: E402
@@ -53,11 +54,14 @@ def _no_real_sleep(monkeypatch):
     monkeypatch.setattr(service_module.asyncio, "sleep", instant_sleep)
 
 
+_USERNAME_NOT_PASSED = object()
+
+
 def _seed_user(
     db_path: Path,
     user_id: int,
     *,
-    username: str | None = None,
+    username=_USERNAME_NOT_PASSED,
     keywords: list[str] | None = None,
     access_hash: int | None = None,
     last_seen_at: datetime | None = None,
@@ -65,7 +69,17 @@ def _seed_user(
     """Пишет пользователя напрямую в users, минуя UserRepository.upsert()
     (который всегда ставит last_seen_at=CURRENT_TIMESTAMP) — тестам нужен
     полный контроль над last_seen_at, чтобы детерминированно проверить
-    сортировку."""
+    сортировку.
+
+    select_candidates() теперь требует непустой username (см. задачу про
+    фильтр "username IS NOT NULL AND TRIM(username) <> ''") — большинству
+    существующих тестов сам username не важен, поэтому по умолчанию (когда
+    он вообще не передан) подставляется "user<id>", а не None. Передайте
+    username=None явно, если тест целенаправленно проверяет отсутствие
+    username."""
+    if username is _USERNAME_NOT_PASSED:
+        username = f"user{user_id}"
+
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
@@ -316,6 +330,98 @@ def test_select_candidates_excludes_users_without_access_hash(tmp_path):
 
         candidates = invite_repository.select_candidates(campaign.id, limit=10)
         assert [c.user_id for c in candidates] == [2]
+    finally:
+        campaign_repository.close()
+        invite_repository.close()
+
+
+def test_select_candidates_excludes_users_without_username(tmp_path):
+    """Без username приглашающий аккаунт физически не может резолвить
+    кандидата, если он ему не известен (см. InviterService._resolve_input_peer
+    и client.get_entity("@username")) — такой candidate не должен попадать
+    в выборку вовсе, а не проваливать каждую попытку приглашения."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, username=None, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, username="", keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 3, username="  ", keywords=["осаго"], access_hash=3, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 4, username="ivan", keywords=["осаго"], access_hash=4, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+
+        candidates = invite_repository.select_candidates(campaign.id, limit=10)
+        assert [c.user_id for c in candidates] == [4]
+        assert invite_repository.count_candidates(campaign.id) == 1
+    finally:
+        campaign_repository.close()
+        invite_repository.close()
+
+
+def test_select_candidates_includes_users_with_username(tmp_path):
+    """Симметричная проверка: пользователь с обычным (непустым) username
+    продолжает попадать в выборку — фильтр не отсекает лишнего."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, username="ivan", keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+
+        candidates = invite_repository.select_candidates(campaign.id, limit=10)
+        assert [c.user_id for c in candidates] == [1]
+        assert candidates[0].username == "ivan"
+    finally:
+        campaign_repository.close()
+        invite_repository.close()
+
+
+def test_count_found_candidates_ignores_username_filter(tmp_path):
+    """count_found_candidates() — те же условия, что и count_candidates()
+    (keyword/access_hash/ещё-не-приглашён), но БЕЗ фильтра по username —
+    "всего найдено" для операторского отчёта (см.
+    InviterService._notify_campaign_result)."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, username=None, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, username="", keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 3, username="ivan", keywords=["осаго"], access_hash=3, last_seen_at=_BASE_TIME)
+    # Не подходит ни под один из счётчиков — нет access_hash вовсе.
+    _seed_user(db_path, 4, username="petr", keywords=["осаго"], access_hash=None, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+
+        # 1, 2, 3 подходят по keyword/access_hash (4 — без access_hash, не
+        # подходит вообще ни при каких условиях).
+        assert invite_repository.count_found_candidates(campaign.id) == 3
+        # Из них только 3 — с username.
+        assert invite_repository.count_candidates(campaign.id) == 1
+    finally:
+        campaign_repository.close()
+        invite_repository.close()
+
+
+def test_count_found_candidates_respects_keyword_and_already_invited_filters(tmp_path):
+    """count_found_candidates() — не просто "все пользователи с
+    access_hash", а те же keyword/ещё-не-приглашён условия, что и у
+    count_candidates()/select_candidates()."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, username=None, keywords=["каско"], access_hash=1, last_seen_at=_BASE_TIME)  # другой keyword
+    _seed_user(db_path, 2, username=None, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+
+        assert invite_repository.count_found_candidates(campaign.id) == 1  # только user 2
+
+        invite_repository.create(user_id=2, campaign_id=campaign.id, status="invited")
+        assert invite_repository.count_found_candidates(campaign.id) == 0  # уже приглашён
     finally:
         campaign_repository.close()
         invite_repository.close()
@@ -1149,47 +1255,38 @@ def test_execute_does_not_update_access_hash_for_non_user_entity(tmp_path):
     assert user_repository.calls == []
 
 
-def test_execute_unresolvable_candidate_without_username_recorded_as_failed(tmp_path):
-    """Кандидат не известен этому аккаунту и не имеет username — резолвить
-    нечем: записать failed, НЕ отправлять ни одного Telegram-запроса,
-    продолжить со следующим кандидатом (без необработанного исключения)."""
-    db_path = _setup_db(tmp_path)
-    _seed_user(db_path, 1, username=None, keywords=["осаго"], access_hash=11, last_seen_at=_BASE_TIME)
-    _seed_user(db_path, 2, username="petr", keywords=["осаго"], access_hash=22, last_seen_at=_BASE_TIME + timedelta(days=1))
-
-    campaign_repository = InviteCampaignRepository(db_path)
-    account_repository = TelegramAccountRepository(db_path)
+async def test_resolve_input_peer_raises_for_candidate_without_username(tmp_path):
+    """select_candidates() теперь никогда не отдаёт кандидата без username
+    (см. тесты test_select_candidates_excludes_users_without_username в
+    tests/test_inviter_repository.py), поэтому эта ветка _resolve_input_peer
+    недостижима через обычный run() — но остаётся защитой на случай, если
+    InviteCandidate придёт сюда как-то иначе. Проверяем её напрямую, минуя
+    выборку."""
+    account_repository = TelegramAccountRepository(tmp_path / "users.db")
+    campaign_repository = InviteCampaignRepository(tmp_path / "users.db")
+    invite_repository = UserCampaignInviteRepository(tmp_path / "users.db")
     try:
-        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
-        account_repository.create(
-            name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+        service = InviterService(
+            account_repository, campaign_repository, invite_repository,
+            client_factory=_make_client_factory(),
         )
+        client = _FakeTelegramClient(
+            SimpleNamespace(name="Основной"),
+            get_input_entity_error=ValueError("не известен этому аккаунту"),
+        )
+        candidate = InviteCandidate(
+            user_id=1, username=None, keywords=["осаго"], access_hash=11, last_seen_at=None,
+        )
+
+        import reader.inviter.service as service_module
+
+        with pytest.raises(service_module._CandidateUnresolvableError):
+            await service._resolve_input_peer(client, candidate)
+
+        assert client.call_requests == []
     finally:
-        campaign_repository.close()
         account_repository.close()
-
-    created_clients: list = []
-    client_factory = _make_client_factory(
-        get_input_entity_errors={"Основной": ValueError("не известен этому аккаунту")},
-        entity_responses={"Основной": {"@petr": SimpleNamespace(id=2, access_hash=222)}},
-        created=created_clients,
-    )
-
-    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
-
-    client = created_clients[0]
-    # По last_seen_at DESC: 2 (petr, есть username — успешно резолвится
-    # через get_entity), 1 (без username — не резолвится вовсе).
-    assert len(client.call_requests) == 1  # только за petr
-
-    invite_repository = UserCampaignInviteRepository(db_path)
-    try:
-        invites = {i.user_id: i for i in invite_repository.list()}
-        assert invites[1].status == "failed"
-        assert invites[1].error  # непустая причина
-        assert invites[2].status == "invited"
-    finally:
+        campaign_repository.close()
         invite_repository.close()
 
 
@@ -1476,6 +1573,48 @@ def test_execute_sends_account_and_campaign_notifications_with_correct_counts(tm
     assert "🚫 Недоступны: 0" in campaign_message
     assert "❌ Ошибок: 1" in campaign_message
     assert "Осталось кандидатов: 1" in campaign_message
+
+
+def test_execute_campaign_notification_includes_found_vs_processable_summary(tmp_path):
+    """Итоговое уведомление по кампании должно показывать "Всего найдено"
+    (без фильтра по username), "Будет обработано" (с ним, как раньше
+    count_candidates()) и "без username" — разницу между ними."""
+    db_path = _setup_db(tmp_path)
+    # 2 без username (не подходят для приглашения вовсе), 1 с username.
+    _seed_user(db_path, 1, username=None, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, username="", keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+    _seed_user(db_path, 3, username="ivan", keywords=["осаго"], access_hash=3, last_seen_at=_BASE_TIME + timedelta(days=2))
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    notifier = _FakeOperatorNotifier()
+    client_factory = _make_client_factory()
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier))
+
+    assert len(notifier.sent) == 2
+    _account_message, campaign_message = notifier.sent
+
+    assert "📋 Кампания: ОСАГО" in campaign_message
+    # 3 подходят по keyword/access_hash, но только 1 (ivan) — с username.
+    assert "👥 Всего найдено: 3" in campaign_message
+    assert "✅ Будет обработано: 1" in campaign_message
+    assert "🚫 Пропущено:" in campaign_message
+    assert "• без username: 2" in campaign_message
+
+    # Существующие поля отчёта остаются на месте, не заменены новыми.
+    assert '📊 Итоги кампании "ОСАГО"' in campaign_message
+    assert "✅ Приглашено: 1" in campaign_message
 
 
 def test_execute_flood_wait_excluded_from_error_count_in_notification(tmp_path, monkeypatch):

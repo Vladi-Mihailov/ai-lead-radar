@@ -219,11 +219,26 @@ def _format_account_notification(
 
 def _format_campaign_summary_notification(
     campaign: InviteCampaign, accounts_processed: int, stats: InviteStats, remaining: int,
-    elapsed_seconds: float,
+    elapsed_seconds: float, found_total: int, found_processable: int,
 ) -> str:
+    """found_total — сколько подошло по keyword/access_hash/ещё-не-приглашён,
+    БЕЗ фильтра по username (UserCampaignInviteRepository.
+    count_found_candidates()); found_processable — то же самое, но С этим
+    фильтром (count_candidates(), как и раньше). Разница между ними — те,
+    кого нашли, но подготовить к приглашению физически нельзя (нет
+    username для резолва этим аккаунтом, см.
+    InviterService._resolve_input_peer) — считается прямо здесь, простым
+    вычитанием двух уже посчитанных в SQL чисел, а не перебором
+    пользователей в Python."""
+    skipped_without_username = found_total - found_processable
     separator = "=" * 32
     return (
         f"{separator}\n\n"
+        f"📋 Кампания: {campaign.name}\n\n"
+        f"👥 Всего найдено: {found_total}\n"
+        f"✅ Будет обработано: {found_processable}\n\n"
+        f"🚫 Пропущено:\n"
+        f"• без username: {skipped_without_username}\n\n"
         f'📊 Итоги кампании "{campaign.name}"\n\n'
         f"Время выполнения: {_format_duration(elapsed_seconds)}\n\n"
         f"Аккаунтов обработано: {accounts_processed}\n\n"
@@ -367,6 +382,10 @@ class InviterService:
         for campaign in campaigns:
             campaign_started_at = time.monotonic()
             found = self._invite_repository.count_candidates(campaign.id)
+            # "Всего найдено" для операторского отчёта (см.
+            # _notify_campaign_result) — то же самое, но без фильтра по
+            # username, чтобы показать, сколько отсеялось именно из-за него.
+            found_total = self._invite_repository.count_found_candidates(campaign.id)
             candidates = self._invite_repository.select_candidates(campaign.id, limit=total_limit)
 
             campaign_stats = InviteStats()
@@ -390,6 +409,7 @@ class InviterService:
                 await self._notify_campaign_result(
                     campaign, accounts_processed, campaign_stats, remaining,
                     time.monotonic() - campaign_started_at,
+                    found_total, found,
                 )
 
     async def _dry_run_account(
@@ -788,11 +808,12 @@ class InviterService:
 
     async def _notify_campaign_result(
         self, campaign: InviteCampaign, accounts_processed: int, stats: InviteStats, remaining: int,
-        elapsed_seconds: float,
+        elapsed_seconds: float, found_total: int, found_processable: int,
     ) -> None:
         await self._safe_notify(
             _format_campaign_summary_notification(
                 campaign, accounts_processed, stats, remaining, elapsed_seconds,
+                found_total, found_processable,
             )
         )
 
