@@ -147,7 +147,7 @@ WHERE {_CANDIDATES_BASE_WHERE}
 """
 
 _SELECT_CANDIDATES = f"""
-SELECT u.user_id, u.username, u.keywords, u.access_hash, u.last_seen_at
+SELECT u.user_id, u.username, u.keywords, u.access_hash, u.last_seen_at, u.is_bot
 FROM users u
 JOIN invite_campaigns c ON c.id = :campaign_id
 WHERE {_CANDIDATES_WHERE}
@@ -157,13 +157,14 @@ LIMIT :limit
 
 
 def _row_to_candidate(row) -> InviteCandidate:
-    user_id, username, keywords, access_hash, last_seen_at = row
+    user_id, username, keywords, access_hash, last_seen_at, is_bot = row
     return InviteCandidate(
         user_id=user_id,
         username=username,
         keywords=_parse_keywords_column(keywords),
         access_hash=access_hash,
         last_seen_at=_parse_datetime(last_seen_at),
+        is_bot=None if is_bot is None else bool(is_bot),
     )
 
 

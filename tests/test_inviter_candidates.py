@@ -18,10 +18,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import pytest  # noqa: E402
 from telethon.errors import (  # noqa: E402
     ChatAdminRequiredError,
+    ChatWriteForbiddenError,
     FloodWaitError,
     PeerFloodError,
+    RPCError,
     UserAlreadyParticipantError,
+    UserBotError,
     UserChannelsTooMuchError,
+    UserKickedError,
     UserPrivacyRestrictedError,
 )
 from telethon.tl.functions.channels import InviteToChannelRequest  # noqa: E402
@@ -36,7 +40,11 @@ from reader.inviter.repository import (  # noqa: E402
 from reader.inviter.models import InviteCandidate  # noqa: E402
 from reader.inviter.service import (  # noqa: E402
     TEST_MODE_MAX_SUCCESSFUL_INVITES,
+    InviteErrorAction,
     InviterService,
+    _CandidateIsBotError,
+    _CandidateUnresolvableError,
+    _classify_invite_error,
     _format_duration,
     _humanize_error,
 )
@@ -162,13 +170,23 @@ class _FakeTelegramClient:
 
     async def get_entity(self, entity):
         self.get_entity_calls.append(entity)
-        if entity in self._entity_responses:
-            response = self._entity_responses[entity]
+        # Проверка is_bot (см. InviterService._resolve_input_peer) вызывает
+        # get_entity(input_peer) — InputPeerUser, а не строка/id, поэтому
+        # ключом в entity_responses для такого вызова служит сам user_id.
+        lookup_key = entity.user_id if isinstance(entity, InputPeerUser) else entity
+        if lookup_key in self._entity_responses:
+            response = self._entity_responses[lookup_key]
             if isinstance(response, Exception):
                 raise response
             return response
         if self._get_entity_error is not None:
             raise self._get_entity_error
+        if isinstance(entity, InputPeerUser):
+            # По умолчанию — обычный (не бот) пользователь, если тест не
+            # переопределил ответ выше: большинство тестов не про статус
+            # бота конкретно (см. test_execute_test_mode_* и соседние про
+            # is_bot — они настраивают это явно).
+            return User(id=entity.user_id, access_hash=entity.access_hash, bot=False, first_name="Test")
         return self._target_entity
 
     async def get_input_entity(self, user_id):
@@ -248,17 +266,24 @@ class _FakeOperatorNotifier:
 
 class _FakeUserRepository:
     """Ровно то, что нужно InviterService от UserRepository —
-    update_access_hash(user_id, access_hash, username=None) -> bool (см.
-    reader/users/repository.py). raise_error, если задан, имитирует сбой
-    записи (сервис не должен из-за этого падать, см.
-    test_execute_update_access_hash_failure_does_not_stop_invite)."""
+    update_access_hash(user_id, access_hash, username=None, is_bot=None)
+    и mark_as_bot(user_id) -> bool (см. reader/users/repository.py).
+    raise_error, если задан, имитирует сбой записи (сервис не должен из-за
+    этого падать, см. test_execute_update_access_hash_failure_does_not_stop_invite)."""
 
     def __init__(self, *, raise_error=None):
         self.calls: list[tuple] = []
+        self.mark_as_bot_calls: list[int] = []
         self._raise_error = raise_error
 
-    def update_access_hash(self, user_id, access_hash, username=None) -> bool:
-        self.calls.append((user_id, access_hash, username))
+    def update_access_hash(self, user_id, access_hash, username=None, is_bot=None) -> bool:
+        self.calls.append((user_id, access_hash, username, is_bot))
+        if self._raise_error is not None:
+            raise self._raise_error
+        return True
+
+    def mark_as_bot(self, user_id) -> bool:
+        self.mark_as_bot_calls.append(user_id)
         if self._raise_error is not None:
             raise self._raise_error
         return True
@@ -1030,8 +1055,11 @@ def test_dry_run_continues_with_other_accounts_when_one_fails_to_connect(tmp_pat
 # ---- execute=True — реальные приглашения ----
 
 
-def _setup_single_candidate_campaign(db_path, *, daily_limit=5):
-    _seed_user(db_path, 1, username="ivan", keywords=["осаго"], access_hash=11, last_seen_at=_BASE_TIME)
+def _setup_single_candidate_campaign(db_path, *, daily_limit=5, is_bot=None):
+    _seed_user(
+        db_path, 1, username="ivan", keywords=["осаго"], access_hash=11,
+        last_seen_at=_BASE_TIME, is_bot=is_bot,
+    )
 
     campaign_repository = InviteCampaignRepository(db_path)
     account_repository = TelegramAccountRepository(db_path)
@@ -1159,11 +1187,13 @@ def test_execute_basic_group_chat_uses_add_chat_user_request(tmp_path):
 
 
 def test_execute_skips_username_resolution_when_candidate_already_known(tmp_path):
-    """get_input_entity() успешна (кандидат уже известен этому аккаунту) —
-    get_entity(username) для НЕГО вызываться не должен вовсе, только для
-    campaign.target_chat."""
+    """get_input_entity() успешна (кандидат уже известен этому аккаунту) и
+    is_bot=False уже подтверждён при последней синхронизации (см.
+    users.is_bot) — ни get_entity(username), ни дополнительная проверка
+    is_bot (get_entity(input_peer), см. test_execute_verifies_bot_status_*)
+    для НЕГО вызываться не должны, только get_entity для campaign.target_chat."""
     db_path = _setup_db(tmp_path)
-    campaign, account = _setup_single_candidate_campaign(db_path)  # access_hash=11, username="ivan"
+    campaign, account = _setup_single_candidate_campaign(db_path, is_bot=False)  # access_hash=11, username="ivan"
 
     created_clients: list = []
     client_factory = _make_client_factory(created=created_clients)  # get_input_entity успешна по умолчанию
@@ -1172,7 +1202,8 @@ def test_execute_skips_username_resolution_when_candidate_already_known(tmp_path
 
     client = created_clients[0]
     assert client.get_input_entity_calls == [1]
-    # get_entity вызывался только для target_chat, не для "@ivan".
+    # get_entity вызывался только для target_chat, не для "@ivan" и не для
+    # проверки is_bot (InputPeerUser).
     assert client.get_entity_calls == ["@target_chat"]
     assert len(client.call_requests) == 1
 
@@ -1241,7 +1272,7 @@ def test_execute_resolving_unknown_candidate_updates_users_db_access_hash(tmp_pa
         )
     )
 
-    assert user_repository.calls == [(1, 999999, "ivan")]
+    assert user_repository.calls == [(1, 999999, "ivan", False)]
 
 
 def test_execute_update_access_hash_failure_does_not_stop_invite(tmp_path, caplog):
@@ -1275,11 +1306,12 @@ def test_execute_update_access_hash_failure_does_not_stop_invite(tmp_path, caplo
 
 
 def test_execute_does_not_update_access_hash_when_candidate_already_known(tmp_path):
-    """Кандидат уже известен этому аккаунту (get_input_entity успешна) —
-    get_entity(username) не вызывается вовсе, а значит и update_access_hash
-    не должен вызываться (свежей сущности просто нет)."""
+    """Кандидат уже известен этому аккаунту (get_input_entity успешна) и
+    is_bot=False уже подтверждён (см. users.is_bot) — ни get_entity(username),
+    ни проверка is_bot не вызываются вовсе, а значит и update_access_hash не
+    должен вызываться (свежей сущности просто нет)."""
     db_path = _setup_db(tmp_path)
-    campaign, account = _setup_single_candidate_campaign(db_path)
+    campaign, account = _setup_single_candidate_campaign(db_path, is_bot=False)
 
     user_repository = _FakeUserRepository()
 
@@ -1351,6 +1383,206 @@ async def test_resolve_input_peer_raises_for_candidate_without_username(tmp_path
         invite_repository.close()
 
 
+# ---- защита от приглашения Telegram-ботов (см. задачу об инциденте с ----
+# ---- приглашением @Vlars_Bot и 3-дневным ограничением аккаунта) --------
+
+
+async def _resolve_with_fake_service(candidate, client, user_repository=None):
+    """Вызывает InviterService._resolve_input_peer() напрямую, минуя
+    выборку кандидатов и полноценный run() — для точечной проверки самой
+    проверки is_bot, без лишней инфраструктуры БД кампаний/аккаунтов."""
+    import reader.inviter.service as service_module
+
+    service = service_module.InviterService(
+        account_repository=None, campaign_repository=None, invite_repository=None,
+        client_factory=_make_client_factory(), user_repository=user_repository,
+    )
+    return await service._resolve_input_peer(client, candidate)
+
+
+def test_resolve_input_peer_raises_immediately_for_known_bot_without_any_rpc(tmp_path):
+    """candidate.is_bot=True (не ожидается — уже отсекается на этапе SQL,
+    см. _CANDIDATES_BASE_WHERE — но на случай гонки/устаревшей выборки) —
+    приглашение отменяется без единого RPC-вызова вовсе."""
+    client = _FakeTelegramClient(SimpleNamespace(name="Основной"))
+    candidate = InviteCandidate(
+        user_id=1, username="ivan", keywords=["осаго"], access_hash=11,
+        last_seen_at=None, is_bot=True,
+    )
+
+    with pytest.raises(_CandidateIsBotError):
+        asyncio.run(_resolve_with_fake_service(candidate, client))
+
+    assert client.get_input_entity_calls == []
+    assert client.get_entity_calls == []
+
+
+def test_resolve_input_peer_skips_bot_check_when_already_confirmed_not_bot(tmp_path):
+    """candidate.is_bot=False (уже подтверждён Telethon при последней
+    синхронизации) — дополнительный get_entity(input_peer) не нужен."""
+    client = _FakeTelegramClient(SimpleNamespace(name="Основной"))
+    candidate = InviteCandidate(
+        user_id=1, username="ivan", keywords=["осаго"], access_hash=11,
+        last_seen_at=None, is_bot=False,
+    )
+
+    input_peer = asyncio.run(_resolve_with_fake_service(candidate, client))
+
+    assert input_peer.user_id == 1
+    assert client.get_entity_calls == []
+
+
+def test_resolve_input_peer_verifies_unknown_status_and_raises_for_confirmed_bot(tmp_path):
+    """candidate.is_bot=None (статус неизвестен) и get_input_entity успешна
+    (кандидат известен этому аккаунту локально) — обязательная живая
+    проверка get_entity(input_peer) должна произойти, и, если она
+    подтверждает User.bot=True, приглашение отменяется ДО единого
+    InviteToChannelRequest/AddChatUserRequest, а is_bot=1 сохраняется в
+    users.db (через update_access_hash, у которого уже есть access_hash)."""
+    client = _FakeTelegramClient(
+        SimpleNamespace(name="Основной"),
+        entity_responses={1: User(id=1, access_hash=11, username="vlars_bot", bot=True)},
+    )
+    candidate = InviteCandidate(
+        user_id=1, username="vlars_bot", keywords=["осаго"], access_hash=11,
+        last_seen_at=None, is_bot=None,
+    )
+    user_repository = _FakeUserRepository()
+
+    with pytest.raises(_CandidateIsBotError):
+        asyncio.run(_resolve_with_fake_service(candidate, client, user_repository=user_repository))
+
+    assert client.get_input_entity_calls == [1]
+    assert len(client.get_entity_calls) == 1  # проверка бота, не username-резолв
+    assert user_repository.calls == [(1, 11, "vlars_bot", True)]
+
+
+def test_resolve_input_peer_persists_confirmed_non_bot_status(tmp_path):
+    """candidate.is_bot=None — после подтверждения User.bot=False
+    приглашение продолжается как обычно, а свежий статус (False, а не
+    только True) сохраняется в users.db, чтобы со временем NULL исчезали и
+    повторная проверка больше не требовалась (см. test_resolve_input_peer_
+    skips_bot_check_when_already_confirmed_not_bot)."""
+    client = _FakeTelegramClient(
+        SimpleNamespace(name="Основной"),
+        entity_responses={1: User(id=1, access_hash=11, username="ivan", bot=False)},
+    )
+    candidate = InviteCandidate(
+        user_id=1, username="ivan", keywords=["осаго"], access_hash=11,
+        last_seen_at=None, is_bot=None,
+    )
+    user_repository = _FakeUserRepository()
+
+    input_peer = asyncio.run(
+        _resolve_with_fake_service(candidate, client, user_repository=user_repository)
+    )
+
+    assert input_peer.user_id == 1
+    assert user_repository.calls == [(1, 11, "ivan", False)]
+
+
+def test_execute_skips_confirmed_bot_before_sending_invite_request(tmp_path):
+    """Кандидат с is_bot=NULL в users.db, который Telegram подтверждает
+    ботом при живой проверке (см. _resolve_input_peer) — НИ ОДНОГО
+    InviteToChannelRequest/AddChatUserRequest не отправляется вовсе,
+    записывается status='invalid', is_bot=1 сохраняется в users.db, и
+    аккаунт продолжает обработку ОСТАЛЬНЫХ кандидатов (это не PeerFlood/
+    ChatAdminRequired — риска для аккаунта здесь нет)."""
+    db_path = _setup_db(tmp_path)
+    # По last_seen_at DESC: 2 (бот, is_bot=NULL), 1 (обычный, is_bot=False
+    # — уже подтверждён, чтобы не отвлекать проверку лишним вызовом).
+    _seed_user(db_path, 2, username="vlars_bot", keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+    _seed_user(db_path, 1, username="ivan", keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME, is_bot=False)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="Основной", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(
+        entity_responses={"Основной": {2: User(id=2, access_hash=2, username="vlars_bot", bot=True)}},
+        created=created_clients,
+    )
+    user_repository = _FakeUserRepository()
+
+    asyncio.run(
+        _run_service(
+            db_path, client_factory=client_factory, execute=True, user_repository=user_repository,
+        )
+    )
+
+    client = created_clients[0]
+    # Ровно один InviteToChannelRequest/AddChatUserRequest — для кандидата
+    # 1, не для бота 2.
+    assert len(client.call_requests) == 1
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = {i.user_id: i for i in invite_repository.list()}
+        assert invites[2].status == "invalid"
+        assert invites[1].status == "invited"
+    finally:
+        invite_repository.close()
+
+    assert user_repository.calls == [(2, 2, "vlars_bot", True)]
+
+
+def test_execute_marks_bot_via_rpc_error_as_defense_in_depth(tmp_path):
+    """Даже если проактивная проверка почему-то не сработала (кандидат уже
+    известен ЭТОМУ аккаунту и is_bot=False был неверно подтверждён раньше
+    — здесь смоделировано напрямую через RPC-ошибку при самой отправке) —
+    Telegram-специфичная RPC-ошибка (UserBotError) при самой отправке
+    приглашения тоже должна сохранить is_bot=1 в users.db (через
+    mark_as_bot — полноценного entity здесь уже нет) и не останавливать
+    аккаунт (это SKIP_USER, а не STOP_ACCOUNT)."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 2, username="vlars_bot", keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1), is_bot=False)
+    _seed_user(db_path, 1, username="ivan", keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME, is_bot=False)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="Основной", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    client_factory = _make_client_factory(
+        call_errors={"Основной": [UserBotError(request=GetHistoryRequest), None]},
+    )
+    user_repository = _FakeUserRepository()
+
+    asyncio.run(
+        _run_service(
+            db_path, client_factory=client_factory, execute=True, user_repository=user_repository,
+        )
+    )
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = {i.user_id: i for i in invite_repository.list()}
+        assert invites[2].status == "invalid"
+        # Аккаунт НЕ остановился — второй кандидат тоже обработан.
+        assert invites[1].status == "invited"
+    finally:
+        invite_repository.close()
+
+    assert user_repository.mark_as_bot_calls == [2]
+
+
+
 def test_execute_flood_wait_during_resolution_handled_like_during_send(tmp_path, monkeypatch):
     """FloodWaitError, полученный при резолве кандидата (get_entity(username)),
     обрабатывается точно так же, как при самой отправке приглашения:
@@ -1380,7 +1612,7 @@ def test_execute_flood_wait_during_resolution_handled_like_during_send(tmp_path,
     try:
         invite = invite_repository.list()[0]
         assert invite.status == "failed"
-        assert "FloodWaitError" in invite.error
+        assert invite.error == str(FloodWaitError(request=GetHistoryRequest, capture=42))
     finally:
         invite_repository.close()
 
@@ -1439,11 +1671,13 @@ def test_execute_creates_failed_record_on_rpc_error(tmp_path):
     db_path = _setup_db(tmp_path)
     campaign, account = _setup_single_candidate_campaign(db_path)
 
-    # ChatAdminRequiredError — просто пример "любой другой RPCError";
-    # PeerFloodError теперь ведёт себя иначе (останавливает аккаунт, см.
-    # test_execute_peer_flood_stops_account_and_notifies_operator).
+    # UserPrivacyRestrictedError — пример SKIP_USER-ошибки, касающейся
+    # только этого кандидата (см. _classify_invite_error). PeerFloodError/
+    # ChatAdminRequiredError и т.п. останавливают аккаунт — см.
+    # test_execute_peer_flood_stops_account_and_notifies_operator/
+    # test_execute_chat_admin_required_stops_account_and_notifies_operator.
     client_factory = _make_client_factory(
-        call_errors={"Основной": [ChatAdminRequiredError(request=GetHistoryRequest)]},
+        call_errors={"Основной": [UserPrivacyRestrictedError(request=GetHistoryRequest)]},
     )
 
     asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
@@ -1458,7 +1692,7 @@ def test_execute_creates_failed_record_on_rpc_error(tmp_path):
         assert invite.account_id == account.id
         assert invite.status == "failed"
         assert invite.error  # непустая причина
-        assert "admin" in invite.error.lower()
+        assert invite.error == str(UserPrivacyRestrictedError(request=GetHistoryRequest))
         assert invite.invited_at is None
     finally:
         invite_repository.close()
@@ -1513,7 +1747,7 @@ def test_execute_flood_wait_records_failed_sleeps_and_continues(tmp_path, monkey
     try:
         invites = {i.user_id: i for i in invite_repository.list()}
         assert invites[2].status == "failed"
-        assert "FloodWaitError" in invites[2].error
+        assert invites[2].error == str(FloodWaitError(request=GetHistoryRequest, capture=7))
         assert invites[2].invited_at is None
 
         assert invites[1].status == "invited"
@@ -1603,11 +1837,13 @@ def test_execute_sends_account_and_campaign_notifications_with_correct_counts(tm
         campaign_repository.close()
         account_repository.close()
 
-    # По last_seen_at DESC: 1 (успех), 2 (уже участник), 3 (обычная ошибка —
-    # не PeerFlood/FloodWait, у которых теперь особое поведение остановки
-    # аккаунта, см. test_execute_peer_flood_stops_account_and_notifies_operator).
+    # По last_seen_at DESC: 1 (успех), 2 (уже участник), 3 (обычная ошибка,
+    # касающаяся только этого кандидата — SKIP_USER, см.
+    # _classify_invite_error — не PeerFlood/FloodWait/ChatAdminRequired и
+    # т.п., у которых теперь особое поведение остановки аккаунта, см.
+    # test_execute_peer_flood_stops_account_and_notifies_operator).
     client_factory = _make_client_factory(
-        call_errors={"account_1": [None, UserAlreadyParticipantError(request=GetHistoryRequest), ChatAdminRequiredError(request=GetHistoryRequest)]},
+        call_errors={"account_1": [None, UserAlreadyParticipantError(request=GetHistoryRequest), UserPrivacyRestrictedError(request=GetHistoryRequest)]},
     )
     notifier = _FakeOperatorNotifier()
 
@@ -1623,8 +1859,8 @@ def test_execute_sends_account_and_campaign_notifications_with_correct_counts(tm
     assert "☑️ Уже состояли в группе: 1" in account_message
     assert "🚫 Недоступны (invalid): 0" in account_message
     assert "❌ Ошибок: 1" in account_message
-    # 3-й кандидат получил RPCError (status='failed') — не исключается из
-    # будущей выборки, поэтому остаётся кандидатом.
+    # 3-й кандидат получил UserPrivacyRestrictedError (status='failed') —
+    # не исключается из будущей выборки, поэтому остаётся кандидатом.
     assert "Осталось кандидатов: 1" in account_message
 
     assert '📊 Итоги кампании "ОСАГО"' in campaign_message
@@ -1744,11 +1980,12 @@ def test_execute_aggregates_stats_across_multiple_accounts_in_campaign_summary(t
         account_repository.close()
 
     # account_1 (кандидаты 4,3 по last_seen_at DESC): оба успешны.
-    # account_2 (кандидаты 2,1): один RPCError, один успешен.
+    # account_2 (кандидаты 2,1): один SKIP_USER-ошибка (не про сам аккаунт,
+    # см. _classify_invite_error), один успешен.
     client_factory = _make_client_factory(
         call_errors={
             "account_1": [None, None],
-            "account_2": [ChatAdminRequiredError(request=GetHistoryRequest), None],
+            "account_2": [UserPrivacyRestrictedError(request=GetHistoryRequest), None],
         },
     )
     notifier = _FakeOperatorNotifier()
@@ -1763,8 +2000,9 @@ def test_execute_aggregates_stats_across_multiple_accounts_in_campaign_summary(t
     assert "✅ Приглашено: 3" in campaign_message  # 2 (account_1) + 1 (account_2)
     assert "☑️ Уже состояли: 0" in campaign_message
     assert "❌ Ошибок: 1" in campaign_message
-    # Кандидат с RPCError (status='failed') не исключается из будущей
-    # выборки — остаётся ровно один "оставшийся" кандидат.
+    # Кандидат с UserPrivacyRestrictedError (status='failed') не
+    # исключается из будущей выборки — остаётся ровно один "оставшийся"
+    # кандидат.
     assert "Осталось кандидатов: 1" in campaign_message
 
 
@@ -1904,6 +2142,106 @@ def test_humanize_error_falls_back_to_str_for_unmapped_exception():
     assert _humanize_error(exc) == str(exc)
 
 
+# ---- единый классификатор ошибок приглашения (_classify_invite_error) ----
+
+
+@pytest.mark.parametrize(
+    "exc,expected_action,expected_db_status,expected_stat_field",
+    [
+        (
+            UserAlreadyParticipantError(request=GetHistoryRequest),
+            InviteErrorAction.SKIP_USER, "invited", "already_participant",
+        ),
+        (
+            _CandidateIsBotError("42 — известный Telegram-бот"),
+            InviteErrorAction.SKIP_USER, "invalid", "invalid",
+        ),
+        (
+            _CandidateUnresolvableError("42 не известен и без username"),
+            InviteErrorAction.SKIP_USER, "failed", "errors",
+        ),
+        (
+            UserPrivacyRestrictedError(request=GetHistoryRequest),
+            InviteErrorAction.SKIP_USER, "failed", "errors",
+        ),
+        (
+            UserChannelsTooMuchError(request=GetHistoryRequest),
+            InviteErrorAction.SKIP_USER, "failed", "errors",
+        ),
+        (
+            UserKickedError(request=GetHistoryRequest),
+            InviteErrorAction.SKIP_USER, "failed", "errors",
+        ),
+        (
+            UserBotError(request=GetHistoryRequest),
+            InviteErrorAction.SKIP_USER, "invalid", "invalid",
+        ),
+        (
+            FloodWaitError(request=GetHistoryRequest, capture=7),
+            InviteErrorAction.RETRY_LATER, "failed", None,
+        ),
+        (
+            FloodWaitError(request=GetHistoryRequest, capture=624),
+            InviteErrorAction.STOP_ACCOUNT, "failed", None,
+        ),
+        (
+            PeerFloodError(request=GetHistoryRequest),
+            InviteErrorAction.STOP_ACCOUNT, "failed", "errors",
+        ),
+        (
+            ChatAdminRequiredError(request=GetHistoryRequest),
+            InviteErrorAction.STOP_ACCOUNT, "failed", "errors",
+        ),
+        (
+            ChatWriteForbiddenError(request=GetHistoryRequest),
+            InviteErrorAction.STOP_ACCOUNT, "failed", "errors",
+        ),
+        (
+            # Никогда явно не классифицированный RPCError — по умолчанию
+            # STOP_ACCOUNT ("если есть сомнения — лучше остановить").
+            RPCError(request=GetHistoryRequest, message="SOME_UNKNOWN_ERROR", code=400),
+            InviteErrorAction.STOP_ACCOUNT, "failed", "errors",
+        ),
+        (
+            ValueError("совсем не Telegram RPC-ошибка"),
+            InviteErrorAction.FATAL, "failed", "errors",
+        ),
+    ],
+)
+def test_classify_invite_error_returns_expected_action_and_bookkeeping(
+    exc, expected_action, expected_db_status, expected_stat_field,
+):
+    classification = _classify_invite_error(exc)
+    assert classification.action == expected_action
+    assert classification.db_status == expected_db_status
+    assert classification.stat_field == expected_stat_field
+
+
+def test_classify_invite_error_flood_wait_carries_wait_seconds():
+    classification = _classify_invite_error(FloodWaitError(request=GetHistoryRequest, capture=42))
+    assert classification.wait_seconds == 42
+
+
+def test_classify_invite_error_marks_bot_error_types_for_persisting():
+    """UserBotError (RPC, "живой" ответ Telegram уже ПОСЛЕ попытки
+    приглашения) должен запомнить is_bot=1 — в отличие от
+    _CandidateIsBotError, который срабатывает ДО отправки (см.
+    InviterService._resolve_input_peer) и статус уже сохранён там."""
+    assert _classify_invite_error(UserBotError(request=GetHistoryRequest)).mark_as_bot is True
+    assert _classify_invite_error(_CandidateIsBotError("бот")).mark_as_bot is False
+
+
+def test_classify_invite_error_stop_account_has_operator_message():
+    """STOP_ACCOUNT/FATAL — единственные случаи, где нужен человекочитаемый
+    operator_message (см. _format_account_stopped_notification); для
+    SKIP_USER/RETRY_LATER он не используется и остаётся пустым."""
+    stop = _classify_invite_error(PeerFloodError(request=GetHistoryRequest))
+    assert stop.operator_message == "Telegram временно ограничил приглашения (Too many requests)."
+
+    skip = _classify_invite_error(UserPrivacyRestrictedError(request=GetHistoryRequest))
+    assert skip.operator_message == ""
+
+
 def test_notifications_include_elapsed_time_without_changing_other_lines(tmp_path, monkeypatch):
     """Время выполнения — ДОБАВЛЕННАЯ строка: остальные строки отчёта по
     аккаунту и по кампании должны остаться такими же, как до этой задачи."""
@@ -2003,13 +2341,14 @@ def test_pause_between_invites_happens_after_each_outcome_regardless_of_result(t
         campaign_repository.close()
         account_repository.close()
 
-    # По last_seen_at DESC: 3 (успех), 2 (уже участник), 1 (обычная ошибка).
+    # По last_seen_at DESC: 3 (успех), 2 (уже участник), 1 (обычная
+    # SKIP_USER-ошибка, не про сам аккаунт — см. _classify_invite_error).
     client_factory = _make_client_factory(
         call_errors={
             "Основной": [
                 None,
                 UserAlreadyParticipantError(request=GetHistoryRequest),
-                ChatAdminRequiredError(request=GetHistoryRequest),
+                UserPrivacyRestrictedError(request=GetHistoryRequest),
             ],
         },
     )
@@ -2193,6 +2532,150 @@ def test_execute_peer_flood_stops_account_and_notifies_operator(tmp_path):
     assert "Переход к следующему аккаунту." in stop_notifications[0]
 
 
+def test_execute_chat_admin_required_stops_account_and_notifies_operator(tmp_path):
+    """ChatAdminRequiredError теперь останавливает аккаунт (как PeerFlood),
+    а не просто пропускает кандидата — именно эта ошибка на попытке
+    пригласить Telegram-бота предшествовала реальному 3-дневному
+    ограничению приглашений у аккаунта (см. задачу об инциденте с
+    @Vlars_Bot и единый классификатор _classify_invite_error)."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_2", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    # По last_seen_at DESC — первый (и единственно тронутый) кандидат: 2.
+    client_factory = _make_client_factory(
+        call_errors={"account_2": [ChatAdminRequiredError(request=GetHistoryRequest)]},
+        created=created_clients,
+    )
+    notifier = _FakeOperatorNotifier()
+
+    asyncio.run(
+        _run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier)
+    )
+
+    client = created_clients[0]
+    # Второй кандидат (1) не тронут вовсе — ни одного запроса на него.
+    assert len(client.call_requests) == 1
+    assert client.disconnected is True
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == 1
+        assert invites[0].user_id == 2
+        assert invites[0].status == "failed"
+        assert invites[0].error == str(ChatAdminRequiredError(request=GetHistoryRequest))
+    finally:
+        invite_repository.close()
+
+    stop_notifications = [m for m in notifier.sent if m.startswith("⚠️")]
+    assert len(stop_notifications) == 1
+    assert "Аккаунт: account_2" in stop_notifications[0]
+    assert "У аккаунта нет прав приглашать участников." in stop_notifications[0]
+    assert "Работа аккаунта остановлена." in stop_notifications[0]
+    assert "Переход к следующему аккаунту." in stop_notifications[0]
+
+
+def test_execute_unrecognized_rpc_error_stops_account_by_default(tmp_path):
+    """Ошибка Telethon (RPCError), которую _classify_invite_error не
+    распознал явно (не входит ни в один из известных типов) — по
+    умолчанию STOP_ACCOUNT, а не "пропустить и продолжить" — таково
+    условие задачи: если есть сомнения, лучше остановить аккаунт."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_2", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(
+        call_errors={
+            "account_2": [RPCError(request=GetHistoryRequest, message="SOME_UNKNOWN_ERROR", code=400)],
+        },
+        created=created_clients,
+    )
+    notifier = _FakeOperatorNotifier()
+
+    asyncio.run(
+        _run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier)
+    )
+
+    client = created_clients[0]
+    assert len(client.call_requests) == 1  # второй кандидат не тронут
+
+    stop_notifications = [m for m in notifier.sent if m.startswith("⚠️")]
+    assert len(stop_notifications) == 1
+    assert "Аккаунт: account_2" in stop_notifications[0]
+
+
+def test_execute_unexpected_non_rpc_exception_is_fatal_and_stops_account(tmp_path, caplog):
+    """Исключение, которое даже не RPCError (например, ошибка внутри самого
+    Telethon/сети, никак не относящаяся к известным Telegram-ошибкам) —
+    FATAL: тоже останавливает аккаунт (см. STOP_ACCOUNT), но логируется с
+    трассировкой (exc_info), чтобы отличать "непонятно что случилось" от
+    распознанного риска."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_2", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(
+        call_errors={"account_2": [RuntimeError("совсем не Telegram RPC-ошибка")]},
+        created=created_clients,
+    )
+    notifier = _FakeOperatorNotifier()
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(
+            _run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier)
+        )
+
+    client = created_clients[0]
+    assert len(client.call_requests) == 1  # второй кандидат не тронут
+
+    stop_notifications = [m for m in notifier.sent if m.startswith("⚠️")]
+    assert len(stop_notifications) == 1
+    assert "Аккаунт: account_2" in stop_notifications[0]
+
+    fatal_records = [r for r in caplog.records if r.exc_info is not None]
+    assert len(fatal_records) == 1
+
+
 def test_execute_flood_wait_at_or_above_threshold_stops_account_and_notifies_operator(
     tmp_path, monkeypatch,
 ):
@@ -2250,7 +2733,7 @@ def test_execute_flood_wait_at_or_above_threshold_stops_account_and_notifies_ope
         invites = invite_repository.list()
         assert len(invites) == 1
         # В БД — оригинальный (технический) текст, а не человекочитаемый.
-        assert invites[0].error == "FloodWaitError: 624 сек."
+        assert invites[0].error == str(FloodWaitError(request=GetHistoryRequest, capture=624))
         assert invites[0].error != "Telegram требует подождать 624 секунд."
     finally:
         invite_repository.close()

@@ -71,14 +71,22 @@ ON CONFLICT(user_id) DO UPDATE SET
     updated_at=CURRENT_TIMESTAMP
 """
 
-_SELECT_ACCESS_HASH_AND_USERNAME = "SELECT access_hash, username FROM users WHERE user_id = ?"
+_SELECT_ACCESS_HASH_AND_USERNAME = "SELECT access_hash, username, is_bot FROM users WHERE user_id = ?"
 
 _UPDATE_ACCESS_HASH = """
 UPDATE users
 SET access_hash = :access_hash,
     username = COALESCE(:username, username),
+    is_bot = COALESCE(:is_bot, is_bot),
     updated_at = CURRENT_TIMESTAMP,
     peer_updated_at = CURRENT_TIMESTAMP
+WHERE user_id = :user_id
+"""
+
+_MARK_AS_BOT = """
+UPDATE users
+SET is_bot = 1,
+    updated_at = CURRENT_TIMESTAMP
 WHERE user_id = :user_id
 """
 
@@ -189,40 +197,71 @@ class UserRepository:
 
     def update_access_hash(
         self, user_id: int, access_hash: int, username: str | None = None,
+        is_bot: bool | None = None,
     ) -> bool:
-        """Обновляет ТОЛЬКО access_hash (и, если он реально отличается,
-        username), заодно продвигая peer_updated_at — время получения
+        """Обновляет ТОЛЬКО access_hash (и, если они реально отличаются,
+        username/is_bot), заодно продвигая peer_updated_at — время получения
         Telegram peer-данных (access_hash/username), то же поле, что и
         upsert() ставит при появлении access_hash — уже существующего
         пользователя. Например, когда reader/inviter/service.py резолвит
-        candidate лично СВОИМ аккаунтом через client.get_entity("@username"),
+        candidate лично СВОИМ аккаунтом через client.get_entity(...),
         потому что access_hash, сохранённый читающим аккаунтом
         (sync_users.py/main.py), не годится для другого (инвайтящего)
-        аккаунта. В отличие от upsert() ничего не создаёт — если user_id
-        ещё не в таблице, ничего не делает и возвращает False. Никакие
-        другие поля (first_name/last_name/is_bot/keywords/peer_type/...) не
+        аккаунта — тем же вызовом сохраняется и свежий User.bot, если его
+        статус ранее был неизвестен (is_bot=NULL в БД), см. задачу про
+        безопасность инвайтера. В отличие от upsert() ничего не создаёт —
+        если user_id ещё не в таблице, ничего не делает и возвращает False.
+        Никакие другие поля (first_name/last_name/keywords/peer_type/...) не
         трогает.
+
+        is_bot=None (по умолчанию) означает "не передано/неизвестно" — как и
+        у access_hash/peer_type в TelegramUserInfo, а НЕ "не бот": уже
+        сохранённое значение не затирается. Передайте is_bot=True/False
+        явно, только когда статус реально подтверждён Telethon в этот момент
+        (см. InviterService._resolve_input_peer).
 
         Возвращает False без единого UPDATE (в т.ч. без сдвига
         peer_updated_at), если реально ничего не меняется — access_hash
-        совпадает, а username пуст либо совпадает с уже сохранённым —
-        чтобы не писать в БД на каждое приглашение."""
+        совпадает, username пуст либо совпадает с уже сохранённым, а is_bot
+        не передан либо совпадает с уже сохранённым — чтобы не писать в БД
+        на каждое приглашение."""
         row = self._conn.execute(_SELECT_ACCESS_HASH_AND_USERNAME, (user_id,)).fetchone()
         if row is None:
             return False
 
-        current_access_hash, current_username = row
+        current_access_hash, current_username, current_is_bot = row
         new_username = username if (username and username != current_username) else None
+        is_bot_changed = is_bot is not None and int(is_bot) != current_is_bot
 
-        if access_hash == current_access_hash and new_username is None:
+        if access_hash == current_access_hash and new_username is None and not is_bot_changed:
             return False
 
         self._conn.execute(
             _UPDATE_ACCESS_HASH,
-            {"access_hash": access_hash, "username": new_username, "user_id": user_id},
+            {
+                "access_hash": access_hash,
+                "username": new_username,
+                "is_bot": int(is_bot) if is_bot_changed else None,
+                "user_id": user_id,
+            },
         )
         self._conn.commit()
         return True
+
+    def mark_as_bot(self, user_id: int) -> bool:
+        """Помечает пользователя ботом (is_bot=1) — используется
+        InviterService, когда Telegram сам подтверждает это через RPC-ошибку
+        при попытке приглашения (см. _classify_invite_error), в момент,
+        когда полноценного entity (и его access_hash) уже нет под рукой —
+        в отличие от update_access_hash(). Чтобы такой бот больше никогда не
+        попадал в кандидаты ни для одной кампании (см. задачу об инциденте
+        с приглашением Telegram-бота и 3-дневным ограничением аккаунта).
+
+        Как и update_access_hash() — ничего не создаёт: если user_id ещё не
+        в таблице, ничего не делает и возвращает False."""
+        cursor = self._conn.execute(_MARK_AS_BOT, {"user_id": user_id})
+        self._conn.commit()
+        return cursor.rowcount > 0
 
     def count(self) -> int:
         """Общее количество пользователей в локальном кэше (SELECT COUNT(*))."""

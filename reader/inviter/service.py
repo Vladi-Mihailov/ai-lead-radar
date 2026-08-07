@@ -4,17 +4,36 @@ import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Protocol
 
 from telethon.errors import (
+    BotChannelsNaError,
+    BotGroupsBlockedError,
+    BotMissingError,
+    ChannelPrivateError,
     ChatAdminRequiredError,
+    ChatWriteForbiddenError,
     FloodWaitError,
+    InputUserDeactivatedError,
     PeerFloodError,
+    PeerIdInvalidError,
     RPCError,
     UserAlreadyParticipantError,
+    UserBlockedError,
+    UserBotError,
+    UserBotInvalidError,
+    UserBotRequiredError,
     UserChannelsTooMuchError,
+    UserDeactivatedBanError,
+    UserDeactivatedError,
+    UserIdInvalidError,
+    UserIsBotError,
+    UserKickedError,
+    UserNotMutualContactError,
     UserPrivacyRestrictedError,
+    UsersTooMuchError,
 )
 from telethon.tl.functions.channels import InviteToChannelRequest
 from telethon.tl.functions.messages import AddChatUserRequest
@@ -85,11 +104,14 @@ class UserAccessHashUpdaterLike(Protocol):
     (reader/users/repository.py) — не импортируем сам класс, чтобы не
     тянуть всю таблицу users в тесты, которым нужен только фейк. Вся
     работа с SQL остаётся в самом UserRepository (см.
-    UserRepository.update_access_hash)."""
+    UserRepository.update_access_hash/mark_as_bot)."""
 
     def update_access_hash(
         self, user_id: int, access_hash: int, username: str | None = None,
+        is_bot: bool | None = None,
     ) -> bool: ...
+
+    def mark_as_bot(self, user_id: int) -> bool: ...
 
 
 @dataclass
@@ -98,10 +120,10 @@ class InviteStats:
     (_notify_account_result), и для итогового отчёта по кампании
     (_notify_campaign_result), чтобы не дублировать подсчёт статистики.
 
-    invalid пока всегда 0 — отдельного статуса 'invalid' в
-    user_campaign_invites ещё нет (см. задачу); поле уже здесь, чтобы им
-    можно было начать пользоваться без изменения структуры счётчиков и
-    отчётов, когда такой статус появится.
+    invalid — кандидат, про которого достоверно известно, что приглашать
+    его нельзя ПРИНЦИПИАЛЬНО (сейчас — только подтверждённый Telegram-бот,
+    см. _classify_invite_error/_CandidateIsBotError) — status='invalid' в
+    user_campaign_invites, отдельно от обычных failed/errors.
 
     FloodWaitError сюда не попадает ни в одно поле (ни invited, ни errors):
     это не отказ конкретному пользователю, а общее временное ограничение
@@ -149,6 +171,13 @@ class _CandidateUnresolvableError(Exception):
     """candidate не известен текущему аккаунту и не может быть резолвлен
     (см. InviterService._resolve_input_peer) — не Telethon-ошибка, поэтому
     отдельный класс, не пересекающийся с их иерархией (RPCError и т.п.)."""
+
+
+class _CandidateIsBotError(Exception):
+    """candidate — подтверждённый (через живой запрос к Telegram, см.
+    InviterService._resolve_input_peer) Telegram-бот — приглашение
+    отменяется ДО отправки InviteToChannelRequest/AddChatUserRequest. Не
+    Telethon-ошибка (см. _CandidateUnresolvableError)."""
 
 
 def _format_username(username: str | None) -> str:
@@ -304,7 +333,169 @@ def _humanize_error(exc: Exception) -> str:
         # сопоставить её с тем, что видит в логах/БД (см. ниже — там
         # остаётся str(exc) без изменений).
         return "Telegram временно ограничил приглашения (Too many requests)."
+    if isinstance(exc, ChatWriteForbiddenError):
+        return "У аккаунта нет прав писать/приглашать в этот чат."
+    if isinstance(exc, ChannelPrivateError):
+        return "Канал/группа недоступны этому аккаунту (приватный канал или аккаунт исключён)."
+    if isinstance(exc, UsersTooMuchError):
+        return "В группе/канале достигнут лимит участников."
     return str(exc)
+
+
+class InviteErrorAction(Enum):
+    """Что делать после ошибки при попытке пригласить кандидата — единая
+    классификация вместо разбросанных except-веток (см.
+    _classify_invite_error/InviterService._handle_invite_error)."""
+
+    # Кандидат ни при чём — под сомнением сам аккаунт у Telegram (флуд,
+    # админ-права, доступ к чату и т.п., см. _STOP_ACCOUNT_ERROR_TYPES) —
+    # прекратить обработку ОСТАЛЬНЫХ кандидатов этим аккаунтом.
+    STOP_ACCOUNT = "stop_account"
+    # Проблема только в этом кандидате — риска для аккаунта нет, продолжаем
+    # со следующим кандидатом тем же аккаунтом.
+    SKIP_USER = "skip_user"
+    # Временное общее ограничение API (небольшой FloodWait) — подождать
+    # exc.seconds и продолжить тем же аккаунтом.
+    RETRY_LATER = "retry_later"
+    # Совсем не Telegram RPC-ошибка (не RPCError вовсе) — по определению
+    # ничего о ней не известно, поэтому обрабатывается так же осторожно,
+    # как STOP_ACCOUNT, но отдельно — для логирования с трассировкой.
+    FATAL = "fatal"
+
+
+@dataclass(frozen=True)
+class InviteErrorClassification:
+    """Результат _classify_invite_error(exc).
+
+    db_status/stat_field — что записать в user_campaign_invites и какое
+    поле InviteStats увеличить ("invited"/"already_participant"/"invalid"/
+    "errors"; None — не увеличивать ничего, см. FloodWaitError).
+    operator_message — человекочитаемый текст ТОЛЬКО для операторского
+    уведомления при STOP_ACCOUNT/FATAL (см. _format_account_stopped_notification);
+    в логах и в user_campaign_invites.error всегда остаётся str(exc) без
+    изменений (см. InviterService._handle_invite_error).
+    mark_as_bot — сохранить is_bot=1 в users.db (см.
+    InviterService._mark_user_as_bot), чтобы этот кандидат больше никогда
+    не попадал в выборку ни для одной кампании."""
+
+    action: InviteErrorAction
+    db_status: str
+    stat_field: str | None
+    operator_message: str = ""
+    wait_seconds: float | None = None
+    mark_as_bot: bool = False
+
+
+# Проблема только в конкретном кандидате (устарел/удалён/заблокировал этот
+# аккаунт/настройки приватности и т.п.) — риска для самого аккаунта нет.
+_SKIP_USER_ERROR_TYPES = (
+    UserPrivacyRestrictedError,
+    UserChannelsTooMuchError,
+    UserIdInvalidError,
+    PeerIdInvalidError,
+    UserDeactivatedError,
+    UserDeactivatedBanError,
+    InputUserDeactivatedError,
+    UserKickedError,
+    UserBlockedError,
+    UserNotMutualContactError,
+)
+
+# Telegram подтвердил RPC-ошибкой, что кандидат — бот (см. также
+# проактивную проверку в InviterService._resolve_input_peer, которая в
+# норме должна отсеивать эти случаи ДО отправки приглашения) — запоминаем
+# is_bot=1 в users.db, чтобы повторно этот бот уже никогда не попадал в
+# выборку кандидатов ни для одной кампании (см. задачу об инциденте с
+# приглашением Telegram-бота @Vlars_Bot и 3-дневным ограничением аккаунта).
+_BOT_ERROR_TYPES = (
+    UserBotError,
+    UserIsBotError,
+    UserBotInvalidError,
+    UserBotRequiredError,
+    BotGroupsBlockedError,
+    BotChannelsNaError,
+    BotMissingError,
+)
+
+# Ставят под сомнение сам статус аккаунта у Telegram или доступ к
+# target_chat — продолжать этим же аккаунтом рискованно (см. задачу:
+# именно ChatAdminRequiredError на попытке пригласить бота предшествовал
+# 3-дневному ограничению приглашений у аккаунта в реальном прогоне).
+_STOP_ACCOUNT_ERROR_TYPES = (
+    ChatAdminRequiredError,
+    ChatWriteForbiddenError,
+    ChannelPrivateError,
+    UsersTooMuchError,
+)
+
+
+def _classify_invite_error(exc: Exception) -> InviteErrorClassification:
+    """Единая точка классификации любой ошибки, возникшей при попытке
+    пригласить кандидата (резолв + сама отправка, см.
+    InviterService._invite_candidate) — вместо набора except-веток.
+
+    Порядок проверок важен только для FloodWaitError (двойной исход по
+    exc.seconds) и для UserAlreadyParticipantError/_CandidateIsBotError/
+    _CandidateUnresolvableError (не входят ни в один из трёх тюплов ниже) —
+    остальные классы между собой не пересекаются.
+
+    Если ошибка вообще не распознана (не входит ни в один из известных
+    типов) — по умолчанию STOP_ACCOUNT, а не "пропустить и продолжить": по
+    условию задачи ("если есть сомнения — лучше остановить аккаунт, чем
+    продолжать") любая нераспознанная RPC-ошибка считается потенциальным
+    риском для аккаунта. Единственное исключение — вообще не RPCError
+    (FATAL): такая ошибка не может быть проанализирована вовсе, поэтому
+    тоже останавливает аккаунт, но логируется отдельно, с трассировкой."""
+    if isinstance(exc, UserAlreadyParticipantError):
+        return InviteErrorClassification(
+            InviteErrorAction.SKIP_USER, db_status="invited", stat_field="already_participant",
+        )
+    if isinstance(exc, _CandidateIsBotError):
+        return InviteErrorClassification(
+            InviteErrorAction.SKIP_USER, db_status="invalid", stat_field="invalid",
+        )
+    if isinstance(exc, _CandidateUnresolvableError):
+        return InviteErrorClassification(
+            InviteErrorAction.SKIP_USER, db_status="failed", stat_field="errors",
+        )
+    if isinstance(exc, FloodWaitError):
+        if exc.seconds >= _MAX_TOLERABLE_FLOOD_WAIT_SECONDS:
+            return InviteErrorClassification(
+                InviteErrorAction.STOP_ACCOUNT, db_status="failed", stat_field=None,
+                operator_message=_humanize_error(exc), wait_seconds=exc.seconds,
+            )
+        return InviteErrorClassification(
+            InviteErrorAction.RETRY_LATER, db_status="failed", stat_field=None,
+            wait_seconds=exc.seconds,
+        )
+    if isinstance(exc, PeerFloodError):
+        return InviteErrorClassification(
+            InviteErrorAction.STOP_ACCOUNT, db_status="failed", stat_field="errors",
+            operator_message=_humanize_error(exc),
+        )
+    if isinstance(exc, _BOT_ERROR_TYPES):
+        return InviteErrorClassification(
+            InviteErrorAction.SKIP_USER, db_status="invalid", stat_field="invalid",
+            mark_as_bot=True,
+        )
+    if isinstance(exc, _SKIP_USER_ERROR_TYPES):
+        return InviteErrorClassification(
+            InviteErrorAction.SKIP_USER, db_status="failed", stat_field="errors",
+        )
+    if isinstance(exc, _STOP_ACCOUNT_ERROR_TYPES):
+        return InviteErrorClassification(
+            InviteErrorAction.STOP_ACCOUNT, db_status="failed", stat_field="errors",
+            operator_message=_humanize_error(exc),
+        )
+    if isinstance(exc, RPCError):
+        return InviteErrorClassification(
+            InviteErrorAction.STOP_ACCOUNT, db_status="failed", stat_field="errors",
+            operator_message=_humanize_error(exc),
+        )
+    return InviteErrorClassification(
+        InviteErrorAction.FATAL, db_status="failed", stat_field="errors",
+        operator_message=_humanize_error(exc),
+    )
 
 
 def _session_file_path(account: TelegramAccount) -> Path:
@@ -657,98 +848,31 @@ class InviterService:
         готовый результат.
 
         Возвращает True, если этот аккаунт должен немедленно прекратить
-        обработку ОСТАЛЬНЫХ кандидатов (PeerFloodError или FloodWaitError
-        >= _MAX_TOLERABLE_FLOOD_WAIT_SECONDS — см. run()/_execute_account) —
-        обрыв connect() отдельно этого аккаунта уже обрабатывается выше по
-        стеку, здесь же он не встречается. Во всех остальных случаях —
-        False, и после случайной паузы (_MIN_INVITE_PAUSE_SECONDS..
-        _MAX_INVITE_PAUSE_SECONDS) обработка продолжается со следующего
-        кандидата.
+        обработку ОСТАЛЬНЫХ кандидатов (см. _classify_invite_error —
+        InviteErrorAction.STOP_ACCOUNT/FATAL, либо достигнут лимит
+        успешных приглашений тестового режима) — обрыв connect() отдельно
+        этого аккаунта уже обрабатывается выше по стеку, здесь же он не
+        встречается. Во всех остальных случаях — False, и после случайной
+        паузы (см. _pause_between_invites) обработка продолжается со
+        следующего кандидата.
 
-        Перед отправкой резолвит candidate ИМЕННО этим аккаунтом (см.
-        _resolve_input_peer) — access_hash из users.db получен читающим
-        аккаунтом (sync_users.py/main.py), а не текущим инвайтящим, и часто
-        невалиден для него. Неразрешимый candidate (_CandidateUnresolvableError)
-        обрабатывается тем же generic-веткой ниже, что и любая другая
-        ошибка — record failed + переход к следующему кандидату."""
+        Перед отправкой резолвит candidate ИМЕННО этим аккаунтом и
+        проверяет его на статус Telegram-бота (см. _resolve_input_peer) —
+        access_hash из users.db получен читающим аккаунтом (sync_users.py/
+        main.py), а не текущим инвайтящим, и часто невалиден для него.
+        Любая ошибка резолва или самой отправки — через единый
+        классификатор (см. _classify_invite_error/_handle_invite_error), а
+        не разбросанные except-ветки."""
         user_label = f"{candidate.user_id} {_format_username(candidate.username)}"
 
         try:
             input_peer = await self._resolve_input_peer(client, candidate)
             request = _build_invite_request(target_entity, input_peer)
             await client(request)
-        except UserAlreadyParticipantError:
-            # Кандидат уже состоит в target_chat — цель кампании для него уже
-            # достигнута: status='invited', чтобы select_candidates() больше
-            # не выбирал его для этой кампании повторно (см. требование о
-            # UserAlreadyParticipantError в задаче).
-            logger.info(
-                _format_execute_block(
-                    account, user_label, campaign.target_chat,
-                    status="invited", reason="уже состоит в target_chat",
-                )
-            )
-            self._record_invite_result(campaign, account, candidate, status="invited")
-            stats.already_participant += 1
-            await self._pause_between_invites()
-            return False
-        except PeerFloodError as exc:
-            # Telegram считает поведение аккаунта похожим на спам —
-            # продолжать приглашать этим же аккаунтом дальше только усугубит
-            # ситуацию (риск бана). Останавливаем именно этот аккаунт, без
-            # паузы (смысла ждать нет — переходим к следующему аккаунту), и
-            # уведомляем оператора отдельно от обычной статистики.
-            logger.warning(
-                _format_execute_block(
-                    account, user_label, campaign.target_chat, status="failed", reason=str(exc),
-                )
-            )
-            self._record_invite_result(campaign, account, candidate, status="failed", error=str(exc))
-            stats.errors += 1
-            await self._safe_notify(
-                _format_account_stopped_notification(account, _humanize_error(exc))
-            )
-            return True
-        except FloodWaitError as exc:
-            logger.warning(
-                _format_execute_block(
-                    account, user_label, campaign.target_chat, status="failed",
-                    reason=f"FloodWaitError: жду {exc.seconds} сек.",
-                )
-            )
-            self._record_invite_result(
-                campaign, account, candidate, status="failed",
-                error=f"FloodWaitError: {exc.seconds} сек.",
-            )
-            # Не увеличиваем errors — это общее временное ограничение API, а
-            # не отказ конкретному пользователю (см. InviteStats).
-            if exc.seconds >= _MAX_TOLERABLE_FLOOD_WAIT_SECONDS:
-                await self._safe_notify(
-                    _format_account_stopped_notification(account, _humanize_error(exc))
-                )
-                return True
-            await asyncio.sleep(exc.seconds)
-            return False
-        except RPCError as exc:
-            logger.warning(
-                _format_execute_block(
-                    account, user_label, campaign.target_chat, status="failed", reason=str(exc),
-                )
-            )
-            self._record_invite_result(campaign, account, candidate, status="failed", error=str(exc))
-            stats.errors += 1
-            await self._pause_between_invites()
-            return False
         except Exception as exc:
-            logger.warning(
-                _format_execute_block(
-                    account, user_label, campaign.target_chat, status="failed", reason=str(exc),
-                )
+            return await self._handle_invite_error(
+                exc, campaign, account, candidate, stats, user_label,
             )
-            self._record_invite_result(campaign, account, candidate, status="failed", error=str(exc))
-            stats.errors += 1
-            await self._pause_between_invites()
-            return False
         else:
             logger.info(
                 _format_execute_block(account, user_label, campaign.target_chat, status="invited")
@@ -763,10 +887,66 @@ class InviterService:
             ):
                 # Лимит тестового режима достигнут — сигнализируем
                 # _execute_account остановить ЭТОТ аккаунт (как при
-                # PeerFlood/большом FloodWait); переход к следующему
-                # аккаунту/кампании останавливает уже run() (см. выше).
+                # STOP_ACCOUNT); переход к следующему аккаунту/кампании
+                # останавливает уже run() (см. выше).
                 return True
             return False
+
+    async def _handle_invite_error(
+        self,
+        exc: Exception,
+        campaign: InviteCampaign,
+        account: TelegramAccount,
+        candidate: InviteCandidate,
+        stats: InviteStats,
+        user_label: str,
+    ) -> bool:
+        """Единая обработка любой ошибки из _invite_candidate — классифицирует
+        (см. _classify_invite_error) и применяет ровно то, что решил
+        классификатор: запись в user_campaign_invites/InviteStats (raw
+        str(exc) — техническая причина, для диагностики), опциональное
+        is_bot=1 в users.db (см. _mark_user_as_bot), и одно из четырёх
+        действий (STOP_ACCOUNT/SKIP_USER/RETRY_LATER/FATAL).
+
+        Возвращает True, если аккаунт должен прекратить обработку
+        ОСТАЛЬНЫХ кандидатов (STOP_ACCOUNT и FATAL — оператору отправляется
+        _format_account_stopped_notification с человекочитаемой причиной,
+        см. classification.operator_message), иначе False."""
+        classification = _classify_invite_error(exc)
+        raw_text = str(exc)
+
+        if classification.mark_as_bot:
+            self._mark_user_as_bot(candidate.user_id)
+
+        log_fn = logger.info if classification.db_status in ("invited", "invalid") else logger.warning
+        log_fn(
+            _format_execute_block(
+                account, user_label, campaign.target_chat,
+                status=classification.db_status, reason=raw_text,
+            ),
+            exc_info=exc if classification.action == InviteErrorAction.FATAL else None,
+        )
+        self._record_invite_result(
+            campaign, account, candidate,
+            status=classification.db_status,
+            error=None if classification.db_status == "invited" else raw_text,
+        )
+        if classification.stat_field is not None:
+            setattr(stats, classification.stat_field, getattr(stats, classification.stat_field) + 1)
+
+        if classification.action == InviteErrorAction.RETRY_LATER:
+            await asyncio.sleep(classification.wait_seconds)
+            return False
+
+        if classification.action in (InviteErrorAction.STOP_ACCOUNT, InviteErrorAction.FATAL):
+            await self._safe_notify(
+                _format_account_stopped_notification(account, classification.operator_message)
+            )
+            return True
+
+        # SKIP_USER — этот кандидат обработан, продолжаем тем же аккаунтом.
+        await self._pause_between_invites()
+        return False
 
     async def _resolve_input_peer(
         self, client: DryRunTelegramClient, candidate: InviteCandidate,
@@ -785,23 +965,42 @@ class InviterService:
         2. Если не известен и есть username — резолвим этим же аккаунтом
            через client.get_entity(username): единственный надёжный способ
            получить access_hash, валидный именно для этого аккаунта, без
-           общего чата с candidate. Успешный результат п.2 сразу же
-           сохраняется в users.db (см. _update_user_access_hash) — чтобы
-           select_candidates() в следующий раз отдавал уже актуальный
-           access_hash, а не устаревший от читающего аккаунта.
+           общего чата с candidate.
 
         Отдельного хранилища access_hash "на аккаунт" не требуется —
         Telethon сам кэширует результат в .session-файле ЭТОГО аккаунта
         (account.session_path), поэтому следующий прогон того же аккаунта
         для того же пользователя снова попадёт в п.1, без единого RPC.
 
+        ОБЯЗАТЕЛЬНАЯ проверка is_bot ПЕРЕД возвратом (см. задачу об
+        инциденте: приглашение Telegram-бота @Vlars_Bot привело к
+        3-дневному ограничению приглашений у аккаунта):
+        - candidate.is_bot=True — не ожидается (см. _CANDIDATES_BASE_WHERE,
+          is_bot=1 уже отсекается на этапе SQL-выборки), но на случай
+          гонки/устаревшей выборки — отменяем без единого RPC.
+        - candidate.is_bot=False — статус уже подтверждён Telethon при
+          последней синхронизации (см. reader/users/sync.py,
+          reader/users/history_sync.py, reader/sources/telegram_source.py) —
+          повторная проверка не нужна, п.1 отдаёт input_peer как раньше.
+        - candidate.is_bot=None (статус неизвестен) — после успешного п.1
+          дополнительно убеждаемся ЖИВЫМ, безопасным (не мутирующим, не
+          связанным с антиспам-эвристиками самих инвайтов) запросом
+          client.get_entity(input_peer) — единственный способ узнать
+          User.bot, раз локальный кэш Telethon (get_input_entity) его не
+          хранит. Подтверждённый результат (True или False) сразу же
+          сохраняется в users.db (см. _update_user_access_hash), чтобы со
+          временем NULL исчезали и лишний запрос не повторялся.
+
         FloodWaitError/PeerFloodError, полученные при резолве, не
         перехватываются здесь — поднимаются в _invite_candidate и
         обрабатываются там точно так же, как если бы случились при самой
         отправке приглашения. Кандидат, которого не удалось резолвить
-        никак — _CandidateUnresolvableError, обрабатывается в
-        _invite_candidate как обычная ошибка (record failed, следующий
-        кандидат)."""
+        никак — _CandidateUnresolvableError; подтверждённый бот —
+        _CandidateIsBotError — оба обрабатываются в _invite_candidate через
+        единый классификатор (см. _classify_invite_error)."""
+        if candidate.is_bot:
+            raise _CandidateIsBotError(f"{candidate.user_id} — известный Telegram-бот")
+
         try:
             input_peer = await client.get_input_entity(candidate.user_id)
         except (FloodWaitError, PeerFloodError):
@@ -809,45 +1008,81 @@ class InviterService:
         except Exception:
             input_peer = None
 
-        if input_peer is not None:
+        if input_peer is not None and candidate.is_bot is False:
             return input_peer
 
-        if not candidate.username:
-            raise _CandidateUnresolvableError(
-                f"пользователь {candidate.user_id} не известен этому аккаунту "
-                f"и не имеет username для резолва"
-            )
-
-        try:
-            entity = await client.get_entity(f"@{candidate.username}")
-        except (FloodWaitError, PeerFloodError):
-            raise
-        except Exception as exc:
-            raise _CandidateUnresolvableError(
-                f"не удалось резолвить @{candidate.username} этим аккаунтом: {exc}"
-            ) from exc
+        if input_peer is None:
+            if not candidate.username:
+                raise _CandidateUnresolvableError(
+                    f"пользователь {candidate.user_id} не известен этому аккаунту "
+                    f"и не имеет username для резолва"
+                )
+            try:
+                entity = await client.get_entity(f"@{candidate.username}")
+            except (FloodWaitError, PeerFloodError):
+                raise
+            except Exception as exc:
+                raise _CandidateUnresolvableError(
+                    f"не удалось резолвить @{candidate.username} этим аккаунтом: {exc}"
+                ) from exc
+        else:
+            # candidate.is_bot is None — статус неизвестен, убеждаемся перед
+            # отправкой приглашения (см. докстрок выше).
+            try:
+                entity = await client.get_entity(input_peer)
+            except (FloodWaitError, PeerFloodError):
+                raise
+            except Exception as exc:
+                raise _CandidateUnresolvableError(
+                    f"не удалось проверить статус бота у {candidate.user_id}: {exc}"
+                ) from exc
 
         if isinstance(entity, User):
             self._update_user_access_hash(entity)
+            if entity.bot:
+                raise _CandidateIsBotError(
+                    f"{entity.id} — Telegram-бот (подтверждено при резолве), приглашение отменено"
+                )
 
         return InputPeerUser(user_id=entity.id, access_hash=entity.access_hash)
 
     def _update_user_access_hash(self, entity: User) -> None:
-        """Сохраняет свежий access_hash (и username, если реально изменился)
-        в users.db сразу после успешного get_entity() этим аккаунтом (см.
-        _resolve_input_peer) — только эти два поля, никакие другие. Сбой
-        записи не должен мешать самому приглашению — только предупреждение
-        в лог (тот же access_hash будет заново получен в следующий раз,
-        просто без сохранения в кэш)."""
+        """Сохраняет свежий access_hash (и username/is_bot, если реально
+        изменились) в users.db сразу после успешного get_entity() этим
+        аккаунтом (см. _resolve_input_peer). is_bot=bool(entity.bot) —
+        подтверждённый статус, сохраняется даже если он False (чтобы
+        неизвестные ранее (NULL) пользователи со временем перестали
+        требовать повторной проверки, см. _resolve_input_peer). Сбой записи
+        не должен мешать самому приглашению — только предупреждение в лог
+        (то же самое будет заново получено в следующий раз, просто без
+        сохранения в кэш)."""
         if self._user_repository is None:
             return
         try:
             self._user_repository.update_access_hash(
                 entity.id, entity.access_hash, getattr(entity, "username", None),
+                is_bot=bool(getattr(entity, "bot", False)),
             )
         except Exception:
             logger.warning(
                 f"Не удалось обновить access_hash пользователя {entity.id} в users.db",
+                exc_info=True,
+            )
+
+    def _mark_user_as_bot(self, user_id: int) -> None:
+        """Сохраняет is_bot=1 в users.db, когда Telegram подтверждает статус
+        бота уже ПОСЛЕ попытки приглашения (см. _classify_invite_error) —
+        без полноценного entity (в отличие от _update_user_access_hash).
+        Сбой записи не должен мешать пропуску этого кандидата — только
+        предупреждение в лог (при следующей выборке он попадёт в кандидаты
+        снова и будет пойман тем же механизмом повторно)."""
+        if self._user_repository is None:
+            return
+        try:
+            self._user_repository.mark_as_bot(user_id)
+        except Exception:
+            logger.warning(
+                f"Не удалось сохранить is_bot=1 для пользователя {user_id} в users.db",
                 exc_info=True,
             )
 

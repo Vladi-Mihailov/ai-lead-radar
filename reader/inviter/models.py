@@ -46,6 +46,12 @@ class InviteCandidate:
     keywords: list[str]
     access_hash: int
     last_seen_at: datetime | None
+    # users.is_bot на момент выборки — True уже не должно попадать сюда
+    # вовсе (см. _CANDIDATES_BASE_WHERE), False — статус подтверждён
+    # Telethon при последней синхронизации, None — неизвестен (см.
+    # InviterService._resolve_input_peer — только для None делается
+    # дополнительная проверка перед отправкой приглашения).
+    is_bot: bool | None = None
 
 
 @dataclass(frozen=True)
