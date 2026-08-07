@@ -551,7 +551,15 @@ class InviterService:
     и ни одной записи в user_campaign_invites (см.
     UserCampaignInviteRepository.select_candidates).
 
-    run(execute=True) — реальные приглашения: ровно один
+    run(execute=True) — реальные приглашения: кандидаты выбираются ТОЛЬКО
+    после того, как аккаунт подтвердил, что может приглашать (сессия
+    есть, остаток дневного лимита > 0, connect() и резолв target_chat
+    успешны, см. _execute_account) — неработающий аккаунт не тратит ни
+    одного SQL-запроса выборки. Остаток дневного лимита считается по
+    факту из БД (daily_limit минус уже выполненные СЕГОДНЯ успешные
+    приглашения этого аккаунта по всем кампаниям, см.
+    UserCampaignInviteRepository.count_today_successful) — без единого
+    счётчика в памяти. Дальше — ровно один
     InviteToChannelRequest/AddChatUserRequest на кандидата (см.
     _build_invite_request), с немедленной записью результата
     (status='invited'/'failed') сразу после каждого кандидата — не
@@ -608,21 +616,32 @@ class InviterService:
         """execute=False (по умолчанию) — только dry-run, без единого
         изменения в Telegram (см. _dry_run_account). execute=True — реальные
         приглашения (см. _execute_account); включается только явным
-        --execute в reader/inviter/main.py, никогда неявно."""
+        --execute в reader/inviter/main.py, никогда неявно.
+
+        execute=True и execute=False выбирают кандидатов ПРИНЦИПИАЛЬНО
+        по-разному (см. задачу о лишней выборке для неработающих
+        аккаунтов):
+        - dry-run ничего не пишет в user_campaign_invites (см.
+          _dry_run_account), поэтому единственный способ не раздать одних
+          и тех же кандидатов нескольким аккаунтам — выбрать их ОДИН раз
+          на кампанию (total_limit = SUM(daily_limit)) и поделить список
+          между аккаунтами по смещению (Account1 — [0:d1], Account2 —
+          [d1:d1+d2], и т.д., как и раньше).
+        - execute=True, наоборот, каждым успешным приглашением сразу
+          пишет status='invited' (см. _record_invite_result), поэтому
+          выборка кандидатов делается ОТДЕЛЬНО на каждый аккаунт, ПОСЛЕ
+          того, как аккаунт подтвердил, что может приглашать (см.
+          _execute_account) — и лимит для неё — остаток дневного лимита
+          ЭТОГО аккаунта, а не daily_limit целиком (см. задачу про
+          daily_limit). Пересечений между аккаунтами всё равно не
+          возникает: к моменту выборки для второго аккаунта первый уже
+          записал свои результаты, и NOT EXISTS в select_candidates() их
+          исключает."""
         campaigns = [c for c in self._campaign_repository.list() if c.enabled]
         accounts = [a for a in self._account_repository.list() if a.enabled]
 
         if not accounts:
             return
-
-        # Один вызов select_candidates() на кампанию, а не один на аккаунт —
-        # иначе каждый аккаунт независимо получал бы кандидатов 1..daily_limit
-        # с начала одного и того же отсортированного списка, и несколько
-        # аккаунтов раздавали бы приглашения одним и тем же пользователям.
-        # Вместо этого выбираем total_limit = SUM(daily_limit) кандидатов ОДИН
-        # раз и делим список между аккаунтами последовательно, без пересечений
-        # (Account1 — [0:d1], Account2 — [d1:d1+d2], и т.д.).
-        total_limit = sum(account.daily_limit for account in accounts)
 
         # Счётчик успешных приглашений (status='invited') именно этого
         # вызова run() — сбрасывается на каждый запуск, см.
@@ -640,18 +659,13 @@ class InviterService:
             # _notify_campaign_result) — то же самое, но без фильтра по
             # username, чтобы показать, сколько отсеялось именно из-за него.
             found_total = self._invite_repository.count_found_candidates(campaign.id)
-            candidates = self._invite_repository.select_candidates(campaign.id, limit=total_limit)
 
             campaign_stats = InviteStats()
             accounts_processed = 0
 
-            offset = 0
-            for account in accounts:
-                account_candidates = candidates[offset : offset + account.daily_limit]
-                offset += account.daily_limit
-                logger.info(_format_candidates_block(campaign, account, account_candidates, found))
-                if execute:
-                    account_stats = await self._execute_account(campaign, account, account_candidates)
+            if execute:
+                for account in accounts:
+                    account_stats = await self._execute_account(campaign, account, found)
                     if account_stats is not None:
                         campaign_stats = campaign_stats + account_stats
                         accounts_processed += 1
@@ -669,10 +683,7 @@ class InviterService:
                         )
                         limit_reached = True
                         break
-                else:
-                    await self._dry_run_account(campaign, account, account_candidates)
 
-            if execute:
                 # ВСЕГДА, а не только если accounts_processed > 0 — иначе
                 # итоговый отчёт по кампании молча пропадал бы целиком,
                 # например если ни у одного аккаунта не нашлось кандидатов
@@ -684,6 +695,18 @@ class InviterService:
                     time.monotonic() - campaign_started_at,
                     found_total, found,
                 )
+            else:
+                # Общая выборка на кампанию + деление по смещению — см.
+                # докстрок run() про то, почему dry-run не может выбирать
+                # кандидатов по аккаунту так же, как execute=True.
+                total_limit = sum(account.daily_limit for account in accounts)
+                candidates = self._invite_repository.select_candidates(campaign.id, limit=total_limit)
+                offset = 0
+                for account in accounts:
+                    account_candidates = candidates[offset : offset + account.daily_limit]
+                    offset += account.daily_limit
+                    logger.info(_format_candidates_block(campaign, account, account_candidates, found))
+                    await self._dry_run_account(campaign, account, account_candidates)
 
     async def _dry_run_account(
         self,
@@ -754,31 +777,51 @@ class InviterService:
         self,
         campaign: InviteCampaign,
         account: TelegramAccount,
-        candidates: list[InviteCandidate],
+        found: int,
     ) -> InviteStats | None:
-        """Как _dry_run_account (подключение, резолв target_chat, disconnect
-        в finally — обрыв одного аккаунта не должен мешать остальным), но
-        реально приглашает каждого кандидата (см. _invite_candidate) и
-        сохраняет результат в user_campaign_invites сразу после каждого —
-        не дожидаясь конца партии.
+        """Порядок специально такой (см. задачу про бесполезную выборку
+        кандидатов для неработающих аккаунтов и про daily_limit, не
+        учитывающий уже выполненные сегодня приглашения):
 
-        Возвращает None, если для этого аккаунта не было ни одного
-        кандидата (аккаунт не считается "обработанным" — см. run()), иначе
-        накопленную InviteStats; уведомление оператору (см.
-        _notify_account_result) отправляется ровно один раз в конце — и при
-        обрыве connect()/резолва target_chat тоже (со стартовыми, скорее
-        всего нулевыми, счётчиками), и при обычном завершении.
+        1. .session-файл (см. _default_session_checker) — самая дешёвая
+           проверка, без единого запроса вообще.
+        2. found == 0 — во всей кампании нет ни одного кандидата, ни один
+           аккаунт не должен даже подключаться (см. test_execute_does_not_
+           reinvite_user_on_next_run).
+        3. Остаток дневного лимита ЭТОГО аккаунта — daily_limit минус
+           фактически выполненные сегодня приглашения (см.
+           UserCampaignInviteRepository.count_today_successful, без
+           единого счётчика в памяти) — если <= 0, аккаунт полностью
+           пропущен, тоже без единого SQL-запроса выборки кандидатов.
+        4. Только после этого — connect(), резолв campaign.target_chat
+           (убедиться, что аккаунтом вообще можно приглашать в эту
+           группу/канал), и ТОЛЬКО если это удалось — select_candidates()
+           с limit=остаток. Если аккаунт не может приглашать (не
+           подключился, target_chat не резолвится) — кандидаты не
+           выбираются вовсе.
 
-        Если для account ещё нет .session-файла (см. _default_session_checker)
-        — тоже None, без единой попытки подключения/приглашения и без
-        stack trace: только понятный лог с ожидаемым путём к сессии (см.
-        _format_missing_session_message) — до первой авторизации через
-        reader/inviter/authorize.py."""
-        if not candidates:
-            return None
-
+        Возвращает None, если аккаунт был пропущен ПОЛНОСТЬЮ (сессии нет,
+        found == 0 или остаток лимита исчерпан — не считается
+        "обработанным", см. run()), иначе накопленную InviteStats —
+        уведомление оператору (см. _notify_account_result) отправляется
+        ровно один раз в конце — и при обрыве connect()/резолва
+        target_chat тоже (со стартовыми, скорее всего нулевыми,
+        счётчиками), и при обычном завершении."""
         if not self._session_checker(account):
             logger.warning(_format_missing_session_message(account))
+            return None
+
+        if found == 0:
+            return None
+
+        today_successful = self._invite_repository.count_today_successful(account.id)
+        remaining = account.daily_limit - today_successful
+        if remaining <= 0:
+            logger.info(
+                f"[EXECUTE]\nAccount: {account.name}\n"
+                f"Дневной лимит уже выполнен сегодня: {today_successful}/{account.daily_limit} "
+                f"успешных приглашений — аккаунт пропущен, выборка кандидатов не выполняется."
+            )
             return None
 
         started_at = time.monotonic()
@@ -821,6 +864,13 @@ class InviterService:
                         f"gigagroup={getattr(target_entity, 'gigagroup', None)}, "
                         f"access_hash={getattr(target_entity, 'access_hash', None)}"
                     )
+                    # Только теперь, когда подтверждено, что этим аккаунтом
+                    # можно приглашать — выборка кандидатов, с лимитом =
+                    # остаток дневного лимита (см. докстрок выше).
+                    candidates = self._invite_repository.select_candidates(
+                        campaign.id, limit=remaining,
+                    )
+                    logger.info(_format_candidates_block(campaign, account, candidates, found))
                     for candidate in candidates:
                         should_stop = await self._invite_candidate(
                             client, campaign, account, target_entity, candidate, stats,

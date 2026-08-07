@@ -1112,6 +1112,307 @@ def test_execute_creates_invited_record_on_success(tmp_path):
     assert isinstance(client.call_requests[0], AddChatUserRequest)
 
 
+# ---- проверка возможности приглашать ДО выборки кандидатов (execute=True) ----
+
+
+def test_execute_broken_connect_does_not_select_candidates_for_that_account(tmp_path, monkeypatch):
+    """Аккаунт, который не может подключиться, не должен выбирать
+    кандидатов вовсе (см. задачу про бесполезную выборку для
+    неработающих аккаунтов) — рабочий аккаунт получает ВСЕХ реальных
+    кандидатов, ни один не "зарезервирован" впустую за неработающим."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="broken", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+        account_repository.create(
+            name="works", phone="+995500000002", session_name="acc2",
+            session_path="acc2.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    client_factory = _make_client_factory(
+        connect_errors={"broken": ConnectionError("не удалось подключиться")},
+    )
+
+    import reader.inviter.service as service_module
+
+    all_logs: list[str] = []
+    monkeypatch.setattr(service_module.logger, "info", all_logs.append)
+    monkeypatch.setattr(service_module.logger, "warning", all_logs.append)
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    # Ни одного "Campaign: ..." блока (=вызова select_candidates(), см.
+    # _format_candidates_block) для неработающего аккаунта — только для
+    # того, который реально подключился.
+    campaign_blocks = [b for b in all_logs if b.startswith("Campaign:")]
+    assert len(campaign_blocks) == 1
+    assert "Account: works" in campaign_blocks[0]
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        # Оба кандидата ушли работающему аккаунту — ни один не пропал
+        # впустую из-за неработающего.
+        assert len(invites) == 2
+        assert all(i.account_id == 2 for i in invites)
+        assert all(i.status == "invited" for i in invites)
+    finally:
+        invite_repository.close()
+
+
+def test_execute_target_chat_not_found_does_not_select_candidates_for_that_account(tmp_path, monkeypatch):
+    """Аналогично test_execute_broken_connect_does_not_select_candidates_
+    for_that_account, но аккаунт подключается успешно, а резолв
+    target_chat падает — тоже без единого запроса выборки кандидатов."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="broken", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+        account_repository.create(
+            name="works", phone="+995500000002", session_name="acc2",
+            session_path="acc2.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    client_factory = _make_client_factory(
+        get_entity_errors={"broken": ValueError("target_chat не найден")},
+    )
+
+    import reader.inviter.service as service_module
+
+    all_logs: list[str] = []
+    monkeypatch.setattr(service_module.logger, "info", all_logs.append)
+    monkeypatch.setattr(service_module.logger, "warning", all_logs.append)
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    campaign_blocks = [b for b in all_logs if b.startswith("Campaign:")]
+    assert len(campaign_blocks) == 1
+    assert "Account: works" in campaign_blocks[0]
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == 2
+        assert all(i.account_id == 2 for i in invites)
+        assert all(i.status == "invited" for i in invites)
+    finally:
+        invite_repository.close()
+
+
+def test_execute_missing_session_does_not_select_candidates(tmp_path, monkeypatch):
+    """Симметрично: аккаунт вовсе без .session-файла тоже не должен
+    выбирать кандидатов — самая дешёвая из всех проверок, до единого RPC."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="no_session", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(created=created_clients)
+
+    import reader.inviter.service as service_module
+
+    all_logs: list[str] = []
+    monkeypatch.setattr(service_module.logger, "info", all_logs.append)
+    monkeypatch.setattr(service_module.logger, "warning", all_logs.append)
+
+    asyncio.run(
+        _run_service(
+            db_path, client_factory=client_factory, execute=True,
+            session_checker=lambda account: False,
+        )
+    )
+
+    assert created_clients == []
+    campaign_blocks = [b for b in all_logs if b.startswith("Campaign:")]
+    assert campaign_blocks == []
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        assert invite_repository.list() == []
+    finally:
+        invite_repository.close()
+
+
+# ---- daily_limit учитывает уже выполненные СЕГОДНЯ приглашения (execute=True) ----
+
+
+def test_execute_daily_limit_subtracts_already_successful_invites_today(tmp_path):
+    """daily_limit=5, но 3 успешных приглашения этим аккаунтом уже сделаны
+    СЕГОДНЯ (в user_campaign_invites, а не в памяти) — остаток 2, и именно
+    2 (а не 5) должно использоваться как LIMIT при выборе НОВЫХ
+    кандидатов (см. задачу про daily_limit-баг)."""
+    db_path = _setup_db(tmp_path)
+    # 5 свежих кандидатов, ещё не приглашённых.
+    for user_id in range(101, 106):
+        _seed_user(
+            db_path, user_id, keywords=["осаго"], access_hash=user_id,
+            last_seen_at=_BASE_TIME + timedelta(days=user_id),
+        )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account = account_repository.create(
+            name="Основной", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    # 3 "уже успешно приглашённых сегодня" этим же аккаунтом — как будто
+    # более ранний запуск --execute сегодня же. user_id этих записей не
+    # пересекается с 5 свежими кандидатами выше; user_campaign_invites не
+    # требует, чтобы такой user_id существовал в users (нет внешнего ключа).
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        now = datetime.now(timezone.utc)
+        for user_id in (901, 902, 903):
+            invite_repository.create(
+                user_id=user_id, campaign_id=campaign.id, account_id=account.id,
+                status="invited", invited_at=now,
+            )
+    finally:
+        invite_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(created=created_clients)
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    client = created_clients[0]
+    # Остаток лимита = 5 - 3 = 2, а не 5.
+    assert len(client.call_requests) == 2
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        # 3 старые записи + 2 новые.
+        assert len(invites) == 5
+        new_invites = [i for i in invites if i.user_id in range(101, 106)]
+        assert len(new_invites) == 2
+        assert all(i.status == "invited" for i in new_invites)
+    finally:
+        invite_repository.close()
+
+
+def test_execute_skips_account_entirely_when_daily_limit_already_reached(tmp_path):
+    """Остаток лимита <= 0 — аккаунт полностью пропускается: ни клиента,
+    ни единого запроса выборки кандидатов."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account = account_repository.create(
+            name="Основной", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=3,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        now = datetime.now(timezone.utc)
+        for user_id in (901, 902, 903):
+            invite_repository.create(
+                user_id=user_id, campaign_id=campaign.id, account_id=account.id,
+                status="invited", invited_at=now,
+            )
+    finally:
+        invite_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(created=created_clients)
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    assert created_clients == []
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        # Ровно 3 старые записи — ничего нового не добавилось.
+        assert len(invite_repository.list()) == 3
+    finally:
+        invite_repository.close()
+
+
+def test_execute_daily_limit_is_global_per_account_across_campaigns(tmp_path):
+    """daily_limit — свойство самого аккаунта, а не пары (аккаунт,
+    кампания): успешное приглашение ЭТИМ аккаунтом в одной кампании
+    должно уменьшать остаток лимита и для ДРУГОЙ кампании того же
+    аккаунта в рамках одного запуска run() (см. count_today_successful —
+    без фильтра по campaign_id)."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, username="u1", keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, username="u2", keywords=["каско"], access_hash=2, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        campaign_repository.create(name="Каско", keyword="каско", target_chat="@target_chat")
+        account_repository.create(
+            name="Основной", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=1,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    client_factory = _make_client_factory()
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        # daily_limit=1 на аккаунт ЦЕЛИКОМ — только ОДНО приглашение
+        # суммарно по обеим кампаниям, а не по одному на каждую.
+        assert len(invites) == 1
+        assert invites[0].status == "invited"
+        assert invites[0].user_id == 1  # кампания ОСАГО обработана первой
+    finally:
+        invite_repository.close()
+
+
 # ---- выбор InviteToChannelRequest/AddChatUserRequest по типу target_entity ----
 
 

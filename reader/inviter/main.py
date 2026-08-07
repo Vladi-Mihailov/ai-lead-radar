@@ -17,11 +17,6 @@ from reader.inviter.repository import (  # noqa: E402
 )
 from reader.inviter.service import InviterService, TEST_MODE_MAX_SUCCESSFUL_INVITES  # noqa: E402
 from reader.logging_setup import setup_logging  # noqa: E402
-# resolve_notification_chat_ids — тот же "чат оператора", куда уже уходят
-# уведомления о штрафах (reader/main.py, _run_fine_monitor) — переиспользуем
-# готовую функцию, а не задаём chat_id заново, чтобы при смене chat_id в
-# конфиге (см. задачу) обоим потребителям не пришлось править код отдельно.
-from reader.main import resolve_notification_chat_ids  # noqa: E402
 from reader.notifications.operator_notifier import OperatorNotifier  # noqa: E402
 from reader.settings import ConfigError, Settings, load_settings  # noqa: E402
 from reader.users.repository import UserRepository  # noqa: E402
@@ -52,16 +47,20 @@ def _build_client_factory(settings: Settings):
 def _build_operator_notifier(settings: Settings) -> OperatorNotifier:
     """Отдельная сессия (session_path_notifier) — не делит .session-файл ни
     с main.py (session_path_live), ни с sync_users.py (session_path_sync),
-    см. reader/settings.py. Получатели — те же, что уже настроены для
-    уведомлений приложения (fine_monitor.notification_chat_ids, а если
-    пусто — app.lead_forward_to), см. resolve_notification_chat_ids()."""
+    см. reader/settings.py. Получатели — ИМЕННО app.lead_forward_to, тот
+    же рабочий чат проекта, куда Reader уже пересылает найденные лиды (см.
+    reader/main.py, TelegramSink) — а не fine_monitor.notification_chat_ids
+    (отдельный, потенциально другой, чат для алертов об оштрафованных
+    авто): отчёты инвайтера — это статистика по проекту, а не персональное
+    уведомление оператору, поэтому им место там же, где лиды, независимо
+    от того, настроен ли отдельный чат для fine_monitor (см. задачу)."""
     client = TelegramClient(
         settings.telegram.session_path_notifier,
         settings.telegram.api_id,
         settings.telegram.api_hash,
         receive_updates=False,
     )
-    return OperatorNotifier(client, resolve_notification_chat_ids(settings))
+    return OperatorNotifier(client, settings.app.lead_forward_to)
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:

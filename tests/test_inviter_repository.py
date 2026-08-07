@@ -7,6 +7,7 @@ InviteCampaignRepository / UserCampaignInviteRepository.
 
 import sqlite3
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -215,5 +216,56 @@ def test_user_campaign_invite_update_rejects_unknown_field(tmp_path):
         invite = repository.create(user_id=111, campaign_id=1)
         with pytest.raises(ValueError):
             repository.update(invite.id, user_id=999)
+    finally:
+        repository.close()
+
+
+# ---- UserCampaignInviteRepository.count_today_successful() ----
+
+
+def test_count_today_successful_counts_only_todays_invited_for_this_account(tmp_path):
+    """Считаются только status='invited' с invited_at начиная с начала
+    текущих суток (UTC) И именно для этого account_id — другой аккаунт,
+    вчерашние приглашения и статус, отличный от 'invited' (например
+    'failed'), не должны попадать в счёт (см. задачу про daily_limit, не
+    учитывающий уже выполненные сегодня приглашения)."""
+    repository = UserCampaignInviteRepository(tmp_path / "inviter.db")
+    try:
+        now = datetime.now(timezone.utc)
+        yesterday = now - timedelta(days=1)
+
+        repository.create(user_id=1, campaign_id=1, account_id=7, status="invited", invited_at=now)
+        repository.create(user_id=2, campaign_id=1, account_id=7, status="invited", invited_at=now)
+        # Не должны попасть в счёт account_id=7:
+        repository.create(user_id=3, campaign_id=1, account_id=8, status="invited", invited_at=now)  # другой аккаунт
+        repository.create(user_id=4, campaign_id=1, account_id=7, status="invited", invited_at=yesterday)  # вчера
+        repository.create(user_id=5, campaign_id=1, account_id=7, status="failed", error="boom")  # не invited
+
+        assert repository.count_today_successful(7) == 2
+        assert repository.count_today_successful(8) == 1
+        assert repository.count_today_successful(999) == 0
+    finally:
+        repository.close()
+
+
+def test_count_today_successful_sums_across_campaigns_for_same_account(tmp_path):
+    """daily_limit — свойство самого TelegramAccount, а не пары
+    (account, campaign) — счётчик должен суммировать успешные приглашения
+    этого аккаунта по ВСЕМ кампаниям сразу, а не по одной."""
+    repository = UserCampaignInviteRepository(tmp_path / "inviter.db")
+    try:
+        now = datetime.now(timezone.utc)
+        repository.create(user_id=1, campaign_id=1, account_id=7, status="invited", invited_at=now)
+        repository.create(user_id=2, campaign_id=2, account_id=7, status="invited", invited_at=now)
+
+        assert repository.count_today_successful(7) == 2
+    finally:
+        repository.close()
+
+
+def test_count_today_successful_returns_zero_when_no_invites_at_all(tmp_path):
+    repository = UserCampaignInviteRepository(tmp_path / "inviter.db")
+    try:
+        assert repository.count_today_successful(1) == 0
     finally:
         repository.close()

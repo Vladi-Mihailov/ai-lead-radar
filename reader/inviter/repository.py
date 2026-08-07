@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from reader.inviter.models import (
@@ -153,6 +153,19 @@ JOIN invite_campaigns c ON c.id = :campaign_id
 WHERE {_CANDIDATES_WHERE}
 ORDER BY u.last_seen_at DESC
 LIMIT :limit
+"""
+
+# daily_limit — свойство САМОГО account (TelegramAccount.daily_limit), не
+# конкретной пары (account, campaign) — поэтому без campaign_id: аккаунт,
+# приглашающий сразу в нескольких кампаниях за один run(), должен
+# исчерпывать ОДИН общий дневной бюджет, а не отдельный на каждую
+# кампанию (см. InviterService._execute_account/count_today_successful).
+_COUNT_TODAY_SUCCESSFUL = """
+SELECT COUNT(*)
+FROM user_campaign_invites
+WHERE account_id = :account_id
+  AND status = 'invited'
+  AND invited_at >= :today_start
 """
 
 
@@ -475,6 +488,26 @@ class UserCampaignInviteRepository:
         подходящих по остальным условиям пользователей физически нельзя
         подготовить к приглашению из-за отсутствия username."""
         row = self._conn.execute(_COUNT_FOUND_CANDIDATES, {"campaign_id": campaign_id}).fetchone()
+        return row[0]
+
+    def count_today_successful(self, account_id: int) -> int:
+        """Сколько раз ЭТОТ account_id успешно пригласил кого-либо
+        (status='invited', invited_at задан) начиная с начала текущих
+        суток (UTC) — по ВСЕМ кампаниям сразу, а не только по одной (см.
+        _COUNT_TODAY_SUCCESSFUL). Используется InviterService._execute_account
+        для расчёта остатка дневного лимита (daily_limit - это значение)
+        ПЕРЕД тем, как решать, стоит ли вообще подключаться и выбирать
+        кандидатов — фактические данные из БД, без каких-либо счётчиков в
+        памяти, поэтому корректно учитывает уже выполненные сегодня
+        приглашения даже после перезапуска процесса или несколько
+        запусков --execute за один день."""
+        today_start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        )
+        row = self._conn.execute(
+            _COUNT_TODAY_SUCCESSFUL,
+            {"account_id": account_id, "today_start": today_start.isoformat()},
+        ).fetchone()
         return row[0]
 
     def select_candidates(self, campaign_id: int, *, limit: int) -> list[InviteCandidate]:
