@@ -251,17 +251,21 @@ class _FakeOperatorNotifier:
     """Ровно то, что нужно InviterService от OperatorNotifier —
     notify_text(text) -> bool. raise_error, если задан, имитирует сбой
     отправки (сервис не должен из-за этого падать, см.
-    test_notify_failure_does_not_stop_service)."""
+    test_notify_failure_does_not_stop_service). deliver=False (без
+    raise_error) — как настоящий OperatorNotifier.notify_text() без ни
+    одного получателя: не бросает исключение, просто возвращает False
+    (см. test_execute_campaign_summary_logged_when_no_recipients_found)."""
 
-    def __init__(self, *, raise_error=None):
+    def __init__(self, *, raise_error=None, deliver=True):
         self.sent: list[str] = []
         self._raise_error = raise_error
+        self._deliver = deliver
 
     async def notify_text(self, text: str) -> bool:
         self.sent.append(text)
         if self._raise_error is not None:
             raise self._raise_error
-        return True
+        return self._deliver
 
 
 class _FakeUserRepository:
@@ -2026,6 +2030,93 @@ def test_notify_failure_does_not_stop_service(tmp_path):
 
     # Уведомление было ПОПЫТАНО (иначе сбой было бы неоткуда взять).
     assert len(notifier.sent) >= 1
+
+
+# ---- баг: итоговая статистика по кампании пропадала целиком, если у -----
+# ---- OperatorNotifier не было получателей (или он вообще отсутствовал) --
+
+
+def test_execute_campaign_summary_logged_and_sent_when_notifier_succeeds(tmp_path, caplog):
+    """Уведомитель успешно отправляет — итоговый отчёт по кампании и
+    попадает в лог (logger.info), и реально уходит оператору, и это ровно
+    один и тот же текст (см. _safe_notify)."""
+    db_path = _setup_db(tmp_path)
+    _setup_single_candidate_campaign(db_path)
+
+    notifier = _FakeOperatorNotifier()
+
+    with caplog.at_level("INFO", logger="reader.inviter.service"):
+        asyncio.run(
+            _run_service(
+                db_path, client_factory=_make_client_factory(), execute=True, notifier=notifier,
+            )
+        )
+
+    campaign_notifications = [m for m in notifier.sent if "Итоги кампании" in m]
+    assert len(campaign_notifications) == 1
+    assert campaign_notifications[0] in caplog.text
+
+
+def test_execute_campaign_summary_logged_when_no_recipients_found(tmp_path, caplog):
+    """Уведомитель поднят, но получателей нет — OperatorNotifier.notify_text()
+    возвращает False (не бросает исключение), как настоящий "Нет ни
+    одного получателя уведомлений оператора" (см. задачу про баг) —
+    итоговый отчёт по кампании всё равно должен появиться в логе, а не
+    потеряться целиком."""
+    db_path = _setup_db(tmp_path)
+    _setup_single_candidate_campaign(db_path)
+
+    notifier = _FakeOperatorNotifier(deliver=False)
+
+    with caplog.at_level("INFO", logger="reader.inviter.service"):
+        asyncio.run(
+            _run_service(
+                db_path, client_factory=_make_client_factory(), execute=True, notifier=notifier,
+            )
+        )
+
+    # Отправка была ПОПЫТАНА (иначе не узнали бы, что доставки не было) —
+    # и по аккаунту, и по кампании.
+    assert len(notifier.sent) == 2
+    assert "Итоги кампании" in caplog.text
+    assert "не доставлено" in caplog.text
+
+
+def test_execute_campaign_summary_logged_when_notifier_absent(tmp_path, caplog):
+    """notifier=None (main.py не смог поднять OperatorNotifier) — итоговый
+    отчёт по кампании всё равно должен появиться в логе."""
+    db_path = _setup_db(tmp_path)
+    _setup_single_candidate_campaign(db_path)
+
+    with caplog.at_level("INFO", logger="reader.inviter.service"):
+        asyncio.run(_run_service(db_path, client_factory=_make_client_factory(), execute=True))
+
+    assert "Итоги кампании" in caplog.text
+
+
+def test_execute_campaign_summary_logged_when_notifier_raises(tmp_path, caplog):
+    """Уведомитель бросает исключение при отправке — процесс успешно
+    завершается (без падения и без потери уже созданных записей), а
+    итоговый отчёт по кампании всё равно остаётся в логе."""
+    db_path = _setup_db(tmp_path)
+    _setup_single_candidate_campaign(db_path)
+
+    notifier = _FakeOperatorNotifier(raise_error=RuntimeError("сеть недоступна"))
+
+    with caplog.at_level("INFO", logger="reader.inviter.service"):
+        asyncio.run(
+            _run_service(
+                db_path, client_factory=_make_client_factory(), execute=True, notifier=notifier,
+            )
+        )
+
+    assert "Итоги кампании" in caplog.text
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        assert len(invite_repository.list()) == 1
+    finally:
+        invite_repository.close()
 
 
 def test_execute_without_notifier_does_not_raise(tmp_path):

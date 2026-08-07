@@ -672,7 +672,12 @@ class InviterService:
                 else:
                     await self._dry_run_account(campaign, account, account_candidates)
 
-            if execute and accounts_processed:
+            if execute:
+                # ВСЕГДА, а не только если accounts_processed > 0 — иначе
+                # итоговый отчёт по кампании молча пропадал бы целиком,
+                # например если ни у одного аккаунта не нашлось кандидатов
+                # или не было .session-файла (см. задачу про баг с
+                # пропадающей статистикой).
                 remaining = self._invite_repository.count_candidates(campaign.id)
                 await self._notify_campaign_result(
                     campaign, accounts_processed, campaign_stats, remaining,
@@ -1139,11 +1144,33 @@ class InviterService:
         )
 
     async def _safe_notify(self, text: str) -> None:
-        """Сбой уведомления оператору (в т.ч. отсутствие notifier вовсе) не
-        должен останавливать сам сервис приглашений — только логируется."""
+        """Три отдельных шага, специально в этом порядке (см. задачу про
+        баг: итоговая статистика по кампании пропадала совсем, если у
+        OperatorNotifier не было ни одного получателя — text просто
+        никуда не логировался, только пытался отправиться):
+
+        1. logger.info(text) — ВСЕГДА, независимо от исхода следующих
+           шагов. Отчёт (см. _format_account_notification/
+           _format_campaign_summary_notification/
+           _format_account_stopped_notification) формируется вызывающим
+           кодом ОДИН раз и передаётся сюда уже готовым текстом — эта
+           функция не должна знать, как он выглядит, только гарантировать,
+           что он не потеряется.
+        2. Если notifier не поднят вовсе (main.py не смог создать
+           OperatorNotifier) — на этом всё, без исключения.
+        3. Попытка отправки оператору — сбой (исключение) или отсутствие
+           доставки (OperatorNotifier.notify_text() -> False, например
+           "нет ни одного получателя уведомлений") — только warning, само
+           содержимое отчёта уже в логе (см. шаг 1) и не теряется."""
+        logger.info(text)
         if self._notifier is None:
             return
         try:
-            await self._notifier.notify_text(text)
+            delivered = await self._notifier.notify_text(text)
         except Exception:
             logger.warning("Не удалось отправить уведомление оператору", exc_info=True)
+            return
+        if not delivered:
+            logger.warning(
+                "Уведомление оператору не доставлено (нет получателей или сбой отправки)"
+            )
