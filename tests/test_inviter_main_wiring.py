@@ -65,6 +65,11 @@ def test_operator_notifier_uses_lead_forward_to_not_fine_monitor_chat(tmp_path, 
     notifier = _build_operator_notifier(settings)
 
     assert notifier._chat_ids == ["lead_chat"]
+    # session_path передан явно — нужен OperatorNotifier.start() для
+    # понятного сообщения, если session_path_notifier не авторизован
+    # (см. reader/notifications/authorize_notifier.py и задачу про
+    # "Получатель уведомлений оператора ... не найден").
+    assert notifier._session_path == settings.telegram.session_path_notifier
 
 
 def test_operator_notifier_has_no_recipients_when_lead_forward_to_is_empty(tmp_path, monkeypatch):

@@ -60,7 +60,10 @@ def _build_operator_notifier(settings: Settings) -> OperatorNotifier:
         settings.telegram.api_hash,
         receive_updates=False,
     )
-    return OperatorNotifier(client, settings.app.lead_forward_to)
+    return OperatorNotifier(
+        client, settings.app.lead_forward_to,
+        session_path=settings.telegram.session_path_notifier,
+    )
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:

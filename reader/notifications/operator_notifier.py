@@ -12,11 +12,23 @@ NotificationService/TelegramNotificationService/TelegramSink не меняютс
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from telethon import TelegramClient
 
 logger = logging.getLogger(__name__)
+
+# Команда для одноразовой авторизации session_path_notifier (см.
+# reader/notifications/authorize_notifier.py) — упоминается в
+# предупреждении start(), когда сессия подключилась (connect() успешен),
+# но никогда не проходила логин (is_user_authorized() -> False). Раньше
+# в этом случае get_entity() падал с ошибкой авторизации, которая
+# неотличимо перехватывалась тем же except Exception, что и "получатель
+# не найден" — оператор видел неверный диагноз (см. задачу про
+# "Получатель уведомлений оператора ... не найден", хотя тот же получатель
+# получает лиды через отдельную, уже авторизованную сессию Reader).
+_AUTHORIZE_COMMAND = "python -m reader.notifications.authorize_notifier"
 
 
 @dataclass(frozen=True)
@@ -32,15 +44,28 @@ def _label(target: int | str) -> str:
 class OperatorNotifier:
     """client — отдельное (не live, не sync) Telegram-подключение, чтобы
     работать независимо от main.py/sync_users.py, не деля с ними один
-    .session-файл (см. reader/settings.py: session_path_notifier).
+    .session-файл (см. reader/settings.py: session_path_notifier). Эта
+    сессия не проходит через client.start()/интерактивный логин
+    автоматически — её нужно авторизовать ОДИН раз отдельно (см.
+    reader/notifications/authorize_notifier.py), прежде чем start() здесь
+    сможет что-либо резолвить.
 
     Любая ошибка — подключения, резолва получателя, отправки — только
     логируется. Сбой уведомления не должен останавливать вызывающий сервис
     (см. reader/inviter/service.py)."""
 
-    def __init__(self, client: TelegramClient, chat_ids: list[int | str]):
+    def __init__(
+        self,
+        client: TelegramClient,
+        chat_ids: list[int | str],
+        *,
+        session_path: str | Path | None = None,
+    ):
         self._client = client
         self._chat_ids = chat_ids
+        # Только для диагностического сообщения при неавторизованной
+        # сессии (см. start()) — сама доставка от него не зависит.
+        self._session_path = session_path
         self._resolved: list[_ResolvedTarget] = []
         self._connected = False
 
@@ -50,6 +75,18 @@ class OperatorNotifier:
             self._connected = True
         except Exception:
             logger.warning("✖ Не удалось подключить уведомления оператора", exc_info=True)
+            return
+
+        # connect() успешен не означает "авторизован" — это только
+        # MTProto-подключение. get_entity() ниже требует авторизованного
+        # пользователя; без этой явной проверки ошибка авторизации
+        # перехватывалась бы тем же except Exception, что и "получатель не
+        # найден", маскируя настоящую причину (см. задачу).
+        if not await self._client.is_user_authorized():
+            logger.warning(
+                "Сессия уведомлений не авторизована: %s. Сначала выполните %s.",
+                self._session_path, _AUTHORIZE_COMMAND,
+            )
             return
 
         for chat_id in self._chat_ids:
