@@ -279,6 +279,11 @@ async def sync_users_from_history(
     UserRepository (см. _sync_group_history) — независимо от того, штатный
     ли это отправитель или уже известный локально.
 
+    car_numbers сюда намеренно не входят — узкий отдельный backfill (см.
+    reader/users/backfill_car_numbers.py) не должен пересчитывать keywords
+    или заново резолвить access_hash/username, что делает --reindex, поэтому
+    их не стоит связывать одним и тем же проходом (см. задачу).
+
     force=True (см. sync_users.py --reindex) — ведёт свой ОТДЕЛЬНЫЙ checkpoint
     (mode="reindex" в HistorySyncStateRepository), независимый от обычного
     инкрементального: первый запуск --reindex по группе начинает историю с

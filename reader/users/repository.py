@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS users (
     peer_type TEXT,
     peer_updated_at TIMESTAMP,
     last_seen_at TIMESTAMP,
-    updated_at TIMESTAMP
+    updated_at TIMESTAMP,
+    car_numbers TEXT
 )
 """
 
@@ -28,6 +29,10 @@ _COLUMN_MIGRATIONS = {
     "access_hash": "ALTER TABLE users ADD COLUMN access_hash INTEGER",
     "peer_type": "ALTER TABLE users ADD COLUMN peer_type TEXT",
     "peer_updated_at": "ALTER TABLE users ADD COLUMN peer_updated_at TIMESTAMP",
+    # Госномера, упомянутые пользователем в сообщениях (см.
+    # reader/users/car_numbers.py) — nullable, как и keywords, чтобы не
+    # терять уже существующие строки users.db на сервере.
+    "car_numbers": "ALTER TABLE users ADD COLUMN car_numbers TEXT",
 }
 
 _UPSERT = """
@@ -71,6 +76,16 @@ ON CONFLICT(user_id) DO UPDATE SET
     updated_at=CURRENT_TIMESTAMP
 """
 
+_SELECT_CAR_NUMBERS = "SELECT car_numbers FROM users WHERE user_id = ?"
+
+_UPSERT_CAR_NUMBERS = """
+INSERT INTO users (user_id, car_numbers, last_seen_at, updated_at)
+VALUES (:user_id, :car_numbers, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+ON CONFLICT(user_id) DO UPDATE SET
+    car_numbers=:car_numbers,
+    updated_at=CURRENT_TIMESTAMP
+"""
+
 _SELECT_ACCESS_HASH_AND_USERNAME = "SELECT access_hash, username, is_bot FROM users WHERE user_id = ?"
 
 _UPDATE_ACCESS_HASH = """
@@ -99,6 +114,16 @@ def _parse_keywords(raw: str | None) -> list[str]:
 
 def _format_keywords(keywords: list[str]) -> str:
     return ", ".join(keywords)
+
+
+def _parse_car_numbers(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [number.strip() for number in raw.split(",") if number.strip()]
+
+
+def _format_car_numbers(car_numbers: list[str]) -> str:
+    return ", ".join(car_numbers)
 
 
 class UserRepository:
@@ -194,6 +219,36 @@ class UserRepository:
     def get_keywords(self, user_id: int) -> list[str]:
         row = self._conn.execute(_SELECT_KEYWORDS, (user_id,)).fetchone()
         return _parse_keywords(row[0] if row else None)
+
+    def add_car_numbers(self, user_id: int, car_numbers: list[str]) -> None:
+        """Объединяет новые car_numbers (уже нормализованные — см.
+        reader/users/car_numbers.py.extract_car_numbers) с уже
+        сохранёнными для user_id, без дублей. В отличие от add_keywords()
+        (порядок первого появления) хранит их СОРТИРОВАННЫМИ — для
+        car_numbers важнее детерминированный порядок хранения, а не
+        порядок появления в сообщениях (см. задачу). Создаёт запись
+        пользователя, если её ещё нет — как и add_keywords().
+
+        Общий метод для reader/core/pipeline.py (Pipeline, по новым
+        сообщениям) и reader/users/history_sync.py (sync_users.py, по
+        истории/backfill) — тот же архитектурный путь, что и add_keywords()."""
+        if not car_numbers:
+            return
+
+        row = self._conn.execute(_SELECT_CAR_NUMBERS, (user_id,)).fetchone()
+        existing = _parse_car_numbers(row[0] if row else None)
+
+        merged = sorted(set(existing) | set(car_numbers))
+
+        self._conn.execute(
+            _UPSERT_CAR_NUMBERS,
+            {"user_id": user_id, "car_numbers": _format_car_numbers(merged)},
+        )
+        self._conn.commit()
+
+    def get_car_numbers(self, user_id: int) -> list[str]:
+        row = self._conn.execute(_SELECT_CAR_NUMBERS, (user_id,)).fetchone()
+        return _parse_car_numbers(row[0] if row else None)
 
     def update_access_hash(
         self, user_id: int, access_hash: int, username: str | None = None,

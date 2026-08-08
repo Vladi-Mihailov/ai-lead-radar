@@ -4,6 +4,7 @@ from reader.core.engine import MatchEngine
 from reader.core.models import LeadEvent, Message
 from reader.sinks.base import BaseSink
 from reader.sources.base import BaseSource
+from reader.users.car_numbers import extract_car_numbers
 from reader.users.keyword_matches import unique_keywords
 from reader.users.repository import UserRepository
 
@@ -49,6 +50,19 @@ class Pipeline:
                 logger.exception(
                     "Не удалось обновить keywords пользователя %s", message.sender_id
                 )
+
+        if message.sender_id is not None:
+            # В отличие от keywords — независимо от того, совпал ли
+            # сценарий (см. задачу: госномер ищется в ЛЮБОМ сообщении
+            # пользователя, а не только в тех, что дали ScenarioMatch).
+            car_numbers = extract_car_numbers(message.text)
+            if car_numbers:
+                try:
+                    self._user_repository.add_car_numbers(message.sender_id, car_numbers)
+                except Exception:
+                    logger.exception(
+                        "Не удалось обновить car_numbers пользователя %s", message.sender_id
+                    )
 
         if not matches:
             return

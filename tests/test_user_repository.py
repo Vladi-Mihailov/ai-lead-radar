@@ -1,8 +1,9 @@
 """
 Тесты UserRepository — локальный кэш пользователей Telegram: keywords
-(add_keywords/get_keywords), access_hash/peer_type/peer_updated_at (для
-восстановления InputPeerUser без @username) и автоматическая миграция для
-баз, созданных до появления этих полей.
+(add_keywords/get_keywords), car_numbers (add_car_numbers/get_car_numbers),
+access_hash/peer_type/peer_updated_at (для восстановления InputPeerUser без
+@username) и автоматическая миграция для баз, созданных до появления этих
+полей.
 """
 
 import sqlite3
@@ -173,6 +174,145 @@ def test_migration_adds_peer_columns_to_legacy_database(tmp_path):
         assert updated_user.access_hash == 123456789
         assert updated_user.peer_type == "User"
         assert repository.get_peer_updated_at(888) is not None
+    finally:
+        repository.close()
+
+
+# ---- car_numbers (add_car_numbers/get_car_numbers) ----
+
+
+def test_add_car_numbers_creates_user_when_absent(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.add_car_numbers(111, ["A111AA77", "X777XX197"])
+
+        assert repository.get(111) is not None
+        assert repository.get_car_numbers(111) == ["A111AA77", "X777XX197"]
+    finally:
+        repository.close()
+
+
+def test_add_car_numbers_on_existing_user_preserves_identity_fields(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.upsert(
+            TelegramUserInfo(user_id=222, username="ivan", first_name="Ivan", last_name=None)
+        )
+
+        repository.add_car_numbers(222, ["A111AA77"])
+
+        user = repository.get(222)
+        assert user.username == "ivan"
+        assert user.first_name == "Ivan"
+        assert repository.get_car_numbers(222) == ["A111AA77"]
+    finally:
+        repository.close()
+
+
+def test_add_car_numbers_merges_without_duplicates_sorted(tmp_path):
+    """В отличие от add_keywords() (порядок первого появления) — car_numbers
+    хранятся сортированными, детерминированно, независимо от порядка
+    добавления (см. задачу)."""
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.add_car_numbers(333, ["X777XX197"])
+        repository.add_car_numbers(333, ["A111AA77", "X777XX197"])
+
+        assert repository.get_car_numbers(333) == ["A111AA77", "X777XX197"]
+    finally:
+        repository.close()
+
+
+def test_add_car_numbers_repeated_call_with_same_numbers_is_noop(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.add_car_numbers(444, ["A111AA77"])
+        repository.add_car_numbers(444, ["A111AA77"])
+
+        assert repository.get_car_numbers(444) == ["A111AA77"]
+    finally:
+        repository.close()
+
+
+def test_add_car_numbers_with_empty_list_is_noop(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.add_car_numbers(555, [])
+
+        assert repository.get(555) is None
+        assert repository.get_car_numbers(555) == []
+    finally:
+        repository.close()
+
+
+def test_get_car_numbers_returns_empty_list_for_unknown_user(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        assert repository.get_car_numbers(999999) == []
+    finally:
+        repository.close()
+
+
+def test_car_numbers_do_not_affect_keywords_and_vice_versa(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.add_keywords(666, ["осаго"])
+        repository.add_car_numbers(666, ["A111AA77"])
+
+        assert repository.get_keywords(666) == ["осаго"]
+        assert repository.get_car_numbers(666) == ["A111AA77"]
+    finally:
+        repository.close()
+
+
+def test_migration_adds_car_numbers_column_to_legacy_database(tmp_path):
+    db_path = tmp_path / "users.db"
+
+    # База в формате до появления car_numbers (но уже с keywords/access_hash
+    # и т.п. — промежуточная версия схемы, как на реальном сервере).
+    legacy_conn = sqlite3.connect(db_path)
+    legacy_conn.execute(
+        """
+        CREATE TABLE users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            is_bot INTEGER,
+            keywords TEXT,
+            access_hash INTEGER,
+            peer_type TEXT,
+            peer_updated_at TIMESTAMP,
+            last_seen_at TIMESTAMP,
+            updated_at TIMESTAMP
+        )
+        """
+    )
+    legacy_conn.execute(
+        "INSERT INTO users (user_id, username, is_bot, keywords) "
+        "VALUES (999, 'legacy_user3', 0, 'осаго')"
+    )
+    legacy_conn.commit()
+    legacy_conn.close()
+
+    # UserRepository должен открыть эту базу без удаления/пересоздания и
+    # добавить недостающую колонку car_numbers автоматически, без потери
+    # уже существующих данных (keywords/username и т.п.).
+    repository = UserRepository(db_path)
+    try:
+        columns = {row[1] for row in repository._conn.execute("PRAGMA table_info(users)")}
+        assert "car_numbers" in columns
+
+        existing_user = repository.get(999)
+        assert existing_user is not None
+        assert existing_user.username == "legacy_user3"
+        assert repository.get_keywords(999) == ["осаго"]
+        assert repository.get_car_numbers(999) == []
+
+        repository.add_car_numbers(999, ["A111AA77"])
+        assert repository.get_car_numbers(999) == ["A111AA77"]
+        # keywords не затронуты добавлением car_numbers.
+        assert repository.get_keywords(999) == ["осаго"]
     finally:
         repository.close()
 
