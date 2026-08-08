@@ -61,7 +61,28 @@ class UserCampaignInvite:
     account_id — какой TelegramAccount выполнил (или должен выполнить)
     приглашение; None, пока аккаунт не выбран. status/error — сырые
     значения, задаваемые вызывающим кодом; набор допустимых статусов и
-    переходы между ними здесь не определяются (без бизнес-логики)."""
+    переходы между ними здесь не определяются (без бизнес-логики).
+
+    invited_at — момент, когда InviteToChannelRequest/AddChatUserRequest
+    был принят Telegram (см. InviterService._record_invite_result) —
+    ставится сразу для status='pending'/'joined', независимо от того,
+    подтверждено ли участие. verified_at — момент, когда проверка pending
+    (см. InviterService._verify_pending_invites) дала ДОСТОВЕРНЫЙ ответ:
+    либо участие подтверждено (status='joined' — тоже сразу же, без
+    отдельной проверки, для UserAlreadyParticipantError, см.
+    _classify_invite_error), либо Telegram явно сказал, что участия нет
+    (status='not_joined', UserNotParticipantError). None, пока status
+    остаётся 'pending' — сбой самой проверки (не UserNotParticipantError)
+    не считается достоверным ответом и НЕ переводит запись в 'not_joined'.
+
+    daily_limit считается не по invited_at, а по joined_today +
+    pending_today (см. InviterService._remaining_daily_budget) — pending
+    временно резервирует место в лимите, пока не станет joined (место
+    остаётся занятым) или not_joined (место освобождается — см. задачу
+    про перелив лимита). status='invited'/'pending'/'joined' исключают
+    запись из будущей выборки (см. _CANDIDATES_BASE_WHERE); 'not_joined',
+    как и 'failed', НЕ исключает — остаётся кандидатом для следующего
+    прогона."""
 
     id: int
     user_id: int
@@ -70,5 +91,6 @@ class UserCampaignInvite:
     status: str
     error: str | None
     invited_at: datetime | None
+    verified_at: datetime | None
     created_at: datetime
     updated_at: datetime

@@ -49,6 +49,15 @@ CREATE TABLE IF NOT EXISTS user_campaign_invites (
 )
 """
 
+# CREATE TABLE IF NOT EXISTS не добавляет колонки в уже существующую
+# таблицу — для БД, созданных до появления verified_at (подтверждённое
+# участие в группе, см. InviterService._verify_pending_invites), добавляем
+# её явно при открытии, без удаления/пересоздания БД (см. reader/users/
+# repository.py — тот же приём для users.is_bot/access_hash/...).
+_USER_CAMPAIGN_INVITES_COLUMN_MIGRATIONS = {
+    "verified_at": "ALTER TABLE user_campaign_invites ADD COLUMN verified_at TIMESTAMP",
+}
+
 _USER_CAMPAIGN_INVITES_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_user_campaign_invites_user_id "
     "ON user_campaign_invites (user_id)",
@@ -102,6 +111,14 @@ def _parse_keywords_column(raw: str | None) -> list[str]:
 # TelegramUserInfo.is_bot/UserRepository.upsert). Приглашение бота
 # (например @Vlars_Bot) заканчивается ChatAdminRequiredError — отсеиваем
 # заранее, на этапе выборки, а не после ошибки Telegram.
+#
+# status IN ('invited', 'pending', 'joined') — кандидата, для которого уже
+# отправлено приглашение (pending — ждёт подтверждения вступления) или
+# участие уже подтверждено (joined), повторно приглашать не нужно; status
+# 'failed'/'invalid' НЕ исключается — такой кандидат остаётся кандидатом
+# для следующего прогона. 'invited' сохранён для обратной совместимости
+# со строками, записанными до перехода на жизненный цикл pending -> joined
+# (см. задачу про подтверждение реального вступления, а не успешного RPC).
 _CANDIDATES_BASE_WHERE = """
     u.access_hash IS NOT NULL
     AND (u.is_bot IS NULL OR u.is_bot = 0)
@@ -110,7 +127,7 @@ _CANDIDATES_BASE_WHERE = """
         SELECT 1 FROM user_campaign_invites uci
         WHERE uci.user_id = u.user_id
           AND uci.campaign_id = :campaign_id
-          AND uci.status = 'invited'
+          AND uci.status IN ('invited', 'pending', 'joined')
     )
 """
 
@@ -159,13 +176,45 @@ LIMIT :limit
 # конкретной пары (account, campaign) — поэтому без campaign_id: аккаунт,
 # приглашающий сразу в нескольких кампаниях за один run(), должен
 # исчерпывать ОДИН общий дневной бюджет, а не отдельный на каждую
-# кампанию (см. InviterService._execute_account/count_today_successful).
-_COUNT_TODAY_SUCCESSFUL = """
+# кампанию (см. InviterService._execute_account/count_today_joined).
+#
+# status='joined' И verified_at >= начала суток — считаем по ДЕЙСТВИТЕЛЬНО
+# подтверждённому вступлению (см. задачу: бизнесу важны реально вступившие
+# участники, а не успешные InviteToChannelRequest/AddChatUserRequest),
+# а не по invited_at/status='pending' (тот момент — только отправка).
+_COUNT_TODAY_JOINED = """
 SELECT COUNT(*)
 FROM user_campaign_invites
 WHERE account_id = :account_id
-  AND status = 'invited'
+  AND status = 'joined'
+  AND verified_at >= :today_start
+"""
+
+# pending — уже ОТПРАВЛЕННОЕ сегодня приглашение, которое пока не
+# подтверждено (joined) и не опровергнуто (not_joined) — временно
+# резервирует место в дневном лимите, иначе волна добора могла бы отправить
+# новые приглашения сверх daily_limit, пока эти pending ещё могут стать
+# joined (см. задачу про перелив лимита: remaining = daily_limit -
+# joined_today - pending_today, а не только - joined_today).
+_COUNT_TODAY_PENDING = """
+SELECT COUNT(*)
+FROM user_campaign_invites
+WHERE account_id = :account_id
+  AND status = 'pending'
   AND invited_at >= :today_start
+"""
+
+# Все приглашения ЭТОГО аккаунта в рамках ЭТОЙ кампании, которые ждут
+# подтверждения вступления (см. InviterService._verify_pending_invites) —
+# независимо от того, когда именно они были отправлены (в том числе из
+# прошлых запусков — самовосстанавливается, если процесс прервался между
+# отправкой и проверкой).
+_SELECT_PENDING = """
+SELECT id, user_id, campaign_id, account_id, status, error,
+       invited_at, verified_at, created_at, updated_at
+FROM user_campaign_invites
+WHERE account_id = :account_id AND campaign_id = :campaign_id AND status = 'pending'
+ORDER BY id
 """
 
 
@@ -388,15 +437,27 @@ class UserCampaignInviteRepository:
     её схемы/ALTER-логики) — как и остальные таблицы проекта, users
     подхватывает актуальную схему автоматически, без ручных правок SQLite."""
 
-    _UPDATABLE_COLUMNS = ("account_id", "status", "error", "invited_at")
+    _UPDATABLE_COLUMNS = ("account_id", "status", "error", "invited_at", "verified_at")
 
     def __init__(self, db_path: Path):
         UserRepository(db_path).close()
         self._conn = _connect(db_path)
         self._conn.execute(_USER_CAMPAIGN_INVITES_SCHEMA)
+        self._migrate_missing_columns()
         for statement in _USER_CAMPAIGN_INVITES_INDEXES:
             self._conn.execute(statement)
         self._conn.commit()
+
+    def _migrate_missing_columns(self) -> None:
+        """CREATE TABLE IF NOT EXISTS не добавляет колонки в уже
+        существующую таблицу — для БД, созданных до появления verified_at,
+        добавляем её явно, без удаления/пересоздания БД."""
+        existing_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(user_campaign_invites)")
+        }
+        for column, statement in _USER_CAMPAIGN_INVITES_COLUMN_MIGRATIONS.items():
+            if column not in existing_columns:
+                self._conn.execute(statement)
 
     def create(
         self,
@@ -407,12 +468,15 @@ class UserCampaignInviteRepository:
         status: str = "pending",
         error: str | None = None,
         invited_at: datetime | None = None,
+        verified_at: datetime | None = None,
     ) -> UserCampaignInvite:
         cursor = self._conn.execute(
             """
             INSERT INTO user_campaign_invites (
-                user_id, campaign_id, account_id, status, error, invited_at
-            ) VALUES (:user_id, :campaign_id, :account_id, :status, :error, :invited_at)
+                user_id, campaign_id, account_id, status, error, invited_at, verified_at
+            ) VALUES (
+                :user_id, :campaign_id, :account_id, :status, :error, :invited_at, :verified_at
+            )
             """,
             {
                 "user_id": user_id,
@@ -421,6 +485,7 @@ class UserCampaignInviteRepository:
                 "status": status,
                 "error": error,
                 "invited_at": _isoformat(invited_at),
+                "verified_at": _isoformat(verified_at),
             },
         )
         self._conn.commit()
@@ -438,6 +503,8 @@ class UserCampaignInviteRepository:
         if fields:
             if "invited_at" in fields:
                 fields["invited_at"] = _isoformat(fields["invited_at"])
+            if "verified_at" in fields:
+                fields["verified_at"] = _isoformat(fields["verified_at"])
             assignments = ", ".join(f"{column} = :{column}" for column in fields)
             self._conn.execute(
                 f"UPDATE user_campaign_invites "
@@ -455,7 +522,7 @@ class UserCampaignInviteRepository:
         row = self._conn.execute(
             """
             SELECT id, user_id, campaign_id, account_id, status, error,
-                   invited_at, created_at, updated_at
+                   invited_at, verified_at, created_at, updated_at
             FROM user_campaign_invites WHERE id = ?
             """,
             (invite_id,),
@@ -466,9 +533,20 @@ class UserCampaignInviteRepository:
         rows = self._conn.execute(
             """
             SELECT id, user_id, campaign_id, account_id, status, error,
-                   invited_at, created_at, updated_at
+                   invited_at, verified_at, created_at, updated_at
             FROM user_campaign_invites ORDER BY id
             """
+        ).fetchall()
+        return [_row_to_invite(row) for row in rows]
+
+    def list_pending(self, account_id: int, campaign_id: int) -> list[UserCampaignInvite]:
+        """Все приглашения ЭТОГО аккаунта в рамках ЭТОЙ кампании со
+        status='pending' — используется InviterService._verify_pending_invites
+        после основной волны приглашений, чтобы проверить, кто из них
+        реально вступил в группу/канал (см. задачу про подтверждение
+        вступления, а не успешного RPC)."""
+        rows = self._conn.execute(
+            _SELECT_PENDING, {"account_id": account_id, "campaign_id": campaign_id},
         ).fetchall()
         return [_row_to_invite(row) for row in rows]
 
@@ -490,22 +568,46 @@ class UserCampaignInviteRepository:
         row = self._conn.execute(_COUNT_FOUND_CANDIDATES, {"campaign_id": campaign_id}).fetchone()
         return row[0]
 
-    def count_today_successful(self, account_id: int) -> int:
-        """Сколько раз ЭТОТ account_id успешно пригласил кого-либо
-        (status='invited', invited_at задан) начиная с начала текущих
-        суток (UTC) — по ВСЕМ кампаниям сразу, а не только по одной (см.
-        _COUNT_TODAY_SUCCESSFUL). Используется InviterService._execute_account
-        для расчёта остатка дневного лимита (daily_limit - это значение)
-        ПЕРЕД тем, как решать, стоит ли вообще подключаться и выбирать
-        кандидатов — фактические данные из БД, без каких-либо счётчиков в
-        памяти, поэтому корректно учитывает уже выполненные сегодня
-        приглашения даже после перезапуска процесса или несколько
-        запусков --execute за один день."""
+    def count_today_joined(self, account_id: int) -> int:
+        """Сколько раз ЭТОТ account_id получил ДЕЙСТВИТЕЛЬНО подтверждённое
+        вступление в группу/канал (status='joined', verified_at задан)
+        начиная с начала текущих суток (UTC) — по ВСЕМ кампаниям сразу, а
+        не только по одной (см. _COUNT_TODAY_JOINED). Только ОДНА часть
+        формулы остатка дневного лимита — см. count_today_pending() и
+        InviterService._execute_account: remaining = daily_limit -
+        count_today_joined() - count_today_pending(), а не только -
+        count_today_joined() (иначе лимит можно превысить, см. задачу про
+        перелив). Фактические данные из БД, без каких-либо счётчиков в
+        памяти, поэтому корректно учитывает уже подтверждённые сегодня
+        вступления даже после перезапуска процесса или несколько запусков
+        --execute за один день."""
         today_start = datetime.now(timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0,
         )
         row = self._conn.execute(
-            _COUNT_TODAY_SUCCESSFUL,
+            _COUNT_TODAY_JOINED,
+            {"account_id": account_id, "today_start": today_start.isoformat()},
+        ).fetchone()
+        return row[0]
+
+    def count_today_pending(self, account_id: int) -> int:
+        """Сколько отправленных СЕГОДНЯ приглашений этого account_id (по
+        ВСЕМ кампаниям сразу, как и count_today_joined) до сих пор
+        status='pending' — то есть ни подтверждены (joined), ни
+        опровергнуты (not_joined, см. InviterService._verify_pending_invites).
+
+        Это ВРЕМЕННЫЙ резерв места в дневном лимите: пока неизвестно, чем
+        закончится приглашение, место нельзя отдать под НОВОГО кандидата —
+        иначе суммарно joined + pending может превысить daily_limit (см.
+        задачу про перелив лимита). Освобождается, только когда pending
+        превращается в joined (место остаётся занятым — просто по другой
+        причине, см. count_today_joined) или в not_joined (место
+        освобождается по-настоящему, см. _verify_pending_invites)."""
+        today_start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        )
+        row = self._conn.execute(
+            _COUNT_TODAY_PENDING,
             {"account_id": account_id, "today_start": today_start.isoformat()},
         ).fetchone()
         return row[0]
@@ -518,10 +620,13 @@ class UserCampaignInviteRepository:
         и требование задачи о фильтрации по username), is_bot не равен 1
         (Telegram-боты приглашаются с ChatAdminRequiredError — отсеиваем их
         заранее, см. _CANDIDATES_BASE_WHERE; is_bot=NULL, для строк без
-        этого признака, не исключается), ещё нет записи со status='invited'
-        для ЭТОЙ кампании — отсортированные по last_seen_at DESC, не более
-        limit штук. Только выборка — никаких записей в user_campaign_invites
-        не создаёт и не изменяет (см. service.py)."""
+        этого признака, не исключается), ещё нет записи со status IN
+        ('invited', 'pending', 'joined') для ЭТОЙ кампании (уже приглашён
+        и ждёт подтверждения либо уже подтверждён — см. задачу про
+        жизненный цикл pending -> joined) — отсортированные по
+        last_seen_at DESC, не более limit штук. Только выборка — никаких
+        записей в user_campaign_invites не создаёт и не изменяет (см.
+        service.py)."""
         rows = self._conn.execute(
             _SELECT_CANDIDATES, {"campaign_id": campaign_id, "limit": limit}
         ).fetchall()
@@ -534,7 +639,7 @@ class UserCampaignInviteRepository:
 def _row_to_invite(row) -> UserCampaignInvite:
     (
         id_, user_id, campaign_id, account_id, status, error,
-        invited_at, created_at, updated_at,
+        invited_at, verified_at, created_at, updated_at,
     ) = row
     return UserCampaignInvite(
         id=id_,
@@ -544,6 +649,7 @@ def _row_to_invite(row) -> UserCampaignInvite:
         status=status,
         error=error,
         invited_at=_parse_datetime(invited_at),
+        verified_at=_parse_datetime(verified_at),
         created_at=_parse_datetime(created_at),
         updated_at=_parse_datetime(updated_at),
     )

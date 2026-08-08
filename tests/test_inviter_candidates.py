@@ -26,6 +26,7 @@ from telethon.errors import (  # noqa: E402
     UserBotError,
     UserChannelsTooMuchError,
     UserKickedError,
+    UserNotParticipantError,
     UserPrivacyRestrictedError,
 )
 from telethon.tl.functions.channels import InviteToChannelRequest  # noqa: E402
@@ -138,6 +139,7 @@ class _FakeTelegramClient:
         self, account, *, connect_error=None, get_entity_error=None,
         target_entity=None, call_errors=None,
         get_input_entity_error=None, entity_responses=None,
+        participant_check_errors=None,
     ):
         self.account = account
         self._connect_error = connect_error
@@ -157,10 +159,16 @@ class _FakeTelegramClient:
         # используется обычное поведение get_entity_error/target_entity
         # (резолв campaign.target_chat — как и раньше).
         self._entity_responses = entity_responses or {}
+        # {user_id: исключение} — get_permissions(target_entity, user) для
+        # этого user_id бросает исключение (например UserNotParticipantError,
+        # см. InviterService._verify_pending_invites), вместо обычного
+        # "успешно подтверждён" по умолчанию.
+        self._participant_check_errors = participant_check_errors or {}
         self.connected = False
         self.disconnected = False
         self.get_entity_calls: list = []
         self.get_input_entity_calls: list = []
+        self.get_permissions_calls: list = []
         self.call_requests: list = []
 
     async def connect(self) -> None:
@@ -195,6 +203,14 @@ class _FakeTelegramClient:
             raise self._get_input_entity_error
         return InputPeerUser(user_id=user_id, access_hash=user_id)
 
+    async def get_permissions(self, entity, user):
+        self.get_permissions_calls.append((entity, user))
+        user_id = getattr(user, "user_id", user)
+        error = self._participant_check_errors.get(user_id)
+        if error is not None:
+            raise error
+        return object()
+
     async def __call__(self, request):
         self.call_requests.append(request)
         error = self._call_errors.pop(0) if self._call_errors else None
@@ -209,6 +225,7 @@ class _FakeTelegramClient:
 def _make_client_factory(
     *, connect_errors=None, get_entity_errors=None, call_errors=None,
     target_entities=None, get_input_entity_errors=None, entity_responses=None,
+    participant_check_errors=None,
     created=None,
 ):
     """connect_errors/get_entity_errors/call_errors/get_input_entity_errors —
@@ -220,6 +237,10 @@ def _make_client_factory(
     _FakeTelegramClient). entity_responses — {account.name: {value:
     entity_или_exception}} для get_entity(candidate.username) — резолв
     конкретного кандидата этим аккаунтом (см. _resolve_input_peer).
+    participant_check_errors — {account.name: {user_id: exception}} —
+    get_permissions() для этого user_id при проверке pending (см.
+    _verify_pending_invites) бросает exception вместо обычного успеха
+    (по умолчанию — все pending подтверждаются как joined).
     created — список, в который складываются все созданные фейковые клиенты
     (по одному на аккаунт), чтобы тест мог проверить connected/disconnected
     после run()."""
@@ -229,6 +250,7 @@ def _make_client_factory(
     target_entities = target_entities or {}
     get_input_entity_errors = get_input_entity_errors or {}
     entity_responses = entity_responses or {}
+    participant_check_errors = participant_check_errors or {}
 
     def factory(account):
         client = _FakeTelegramClient(
@@ -239,6 +261,7 @@ def _make_client_factory(
             target_entity=target_entities.get(account.name),
             get_input_entity_error=get_input_entity_errors.get(account.name),
             entity_responses=entity_responses.get(account.name),
+            participant_check_errors=participant_check_errors.get(account.name),
         )
         if created is not None:
             created.append(client)
@@ -1096,9 +1119,12 @@ def test_execute_creates_invited_record_on_success(tmp_path):
         assert invite.user_id == 1
         assert invite.campaign_id == campaign.id
         assert invite.account_id == account.id
-        assert invite.status == "invited"
+        # pending -> joined: отправлено, подтверждено при проверке (см.
+        # _verify_pending_invites, get_permissions успешна по умолчанию).
+        assert invite.status == "joined"
         assert invite.error is None
         assert invite.invited_at is not None
+        assert invite.verified_at is not None
     finally:
         invite_repository.close()
 
@@ -1154,10 +1180,12 @@ def test_execute_broken_connect_does_not_select_candidates_for_that_account(tmp_
 
     # Ни одного "Campaign: ..." блока (=вызова select_candidates(), см.
     # _format_candidates_block) для неработающего аккаунта — только для
-    # того, который реально подключился.
+    # того, который реально подключился (волна №1 и волна добора, см.
+    # _execute_account — обе выбирают кандидатов у одного и того же
+    # рабочего аккаунта, "broken" среди них нет вовсе).
     campaign_blocks = [b for b in all_logs if b.startswith("Campaign:")]
-    assert len(campaign_blocks) == 1
-    assert "Account: works" in campaign_blocks[0]
+    assert campaign_blocks
+    assert all("Account: works" in block for block in campaign_blocks)
 
     invite_repository = UserCampaignInviteRepository(db_path)
     try:
@@ -1166,7 +1194,7 @@ def test_execute_broken_connect_does_not_select_candidates_for_that_account(tmp_
         # впустую из-за неработающего.
         assert len(invites) == 2
         assert all(i.account_id == 2 for i in invites)
-        assert all(i.status == "invited" for i in invites)
+        assert all(i.status == "joined" for i in invites)
     finally:
         invite_repository.close()
 
@@ -1208,15 +1236,15 @@ def test_execute_target_chat_not_found_does_not_select_candidates_for_that_accou
     asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
 
     campaign_blocks = [b for b in all_logs if b.startswith("Campaign:")]
-    assert len(campaign_blocks) == 1
-    assert "Account: works" in campaign_blocks[0]
+    assert campaign_blocks
+    assert all("Account: works" in block for block in campaign_blocks)
 
     invite_repository = UserCampaignInviteRepository(db_path)
     try:
         invites = invite_repository.list()
         assert len(invites) == 2
         assert all(i.account_id == 2 for i in invites)
-        assert all(i.status == "invited" for i in invites)
+        assert all(i.status == "joined" for i in invites)
     finally:
         invite_repository.close()
 
@@ -1270,9 +1298,9 @@ def test_execute_missing_session_does_not_select_candidates(tmp_path, monkeypatc
 
 
 def test_execute_daily_limit_subtracts_already_successful_invites_today(tmp_path):
-    """daily_limit=5, но 3 успешных приглашения этим аккаунтом уже сделаны
-    СЕГОДНЯ (в user_campaign_invites, а не в памяти) — остаток 2, и именно
-    2 (а не 5) должно использоваться как LIMIT при выборе НОВЫХ
+    """daily_limit=5, но 3 подтверждённых участника этим аккаунтом уже
+    получены СЕГОДНЯ (в user_campaign_invites, а не в памяти) — остаток 2,
+    и именно 2 (а не 5) должно использоваться как LIMIT при выборе НОВЫХ
     кандидатов (см. задачу про daily_limit-баг)."""
     db_path = _setup_db(tmp_path)
     # 5 свежих кандидатов, ещё не приглашённых.
@@ -1294,17 +1322,18 @@ def test_execute_daily_limit_subtracts_already_successful_invites_today(tmp_path
         campaign_repository.close()
         account_repository.close()
 
-    # 3 "уже успешно приглашённых сегодня" этим же аккаунтом — как будто
-    # более ранний запуск --execute сегодня же. user_id этих записей не
-    # пересекается с 5 свежими кандидатами выше; user_campaign_invites не
-    # требует, чтобы такой user_id существовал в users (нет внешнего ключа).
+    # 3 "уже подтверждённых сегодня участника" этим же аккаунтом — как
+    # будто более ранний запуск --execute сегодня же. user_id этих записей
+    # не пересекается с 5 свежими кандидатами выше; user_campaign_invites
+    # не требует, чтобы такой user_id существовал в users (нет внешнего
+    # ключа).
     invite_repository = UserCampaignInviteRepository(db_path)
     try:
         now = datetime.now(timezone.utc)
         for user_id in (901, 902, 903):
             invite_repository.create(
                 user_id=user_id, campaign_id=campaign.id, account_id=account.id,
-                status="invited", invited_at=now,
+                status="joined", invited_at=now, verified_at=now,
             )
     finally:
         invite_repository.close()
@@ -1315,7 +1344,9 @@ def test_execute_daily_limit_subtracts_already_successful_invites_today(tmp_path
     asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
 
     client = created_clients[0]
-    # Остаток лимита = 5 - 3 = 2, а не 5.
+    # Остаток лимита = 5 - 3 = 2, а не 5 — и после того, как обе новые
+    # заявки подтвердятся (get_permissions успешна по умолчанию), остаток
+    # становится 0, поэтому волны добора не происходит.
     assert len(client.call_requests) == 2
 
     invite_repository = UserCampaignInviteRepository(db_path)
@@ -1325,7 +1356,7 @@ def test_execute_daily_limit_subtracts_already_successful_invites_today(tmp_path
         assert len(invites) == 5
         new_invites = [i for i in invites if i.user_id in range(101, 106)]
         assert len(new_invites) == 2
-        assert all(i.status == "invited" for i in new_invites)
+        assert all(i.status == "joined" for i in new_invites)
     finally:
         invite_repository.close()
 
@@ -1354,7 +1385,7 @@ def test_execute_skips_account_entirely_when_daily_limit_already_reached(tmp_pat
         for user_id in (901, 902, 903):
             invite_repository.create(
                 user_id=user_id, campaign_id=campaign.id, account_id=account.id,
-                status="invited", invited_at=now,
+                status="joined", invited_at=now, verified_at=now,
             )
     finally:
         invite_repository.close()
@@ -1378,7 +1409,7 @@ def test_execute_daily_limit_is_global_per_account_across_campaigns(tmp_path):
     """daily_limit — свойство самого аккаунта, а не пары (аккаунт,
     кампания): успешное приглашение ЭТИМ аккаунтом в одной кампании
     должно уменьшать остаток лимита и для ДРУГОЙ кампании того же
-    аккаунта в рамках одного запуска run() (см. count_today_successful —
+    аккаунта в рамках одного запуска run() (см. count_today_joined —
     без фильтра по campaign_id)."""
     db_path = _setup_db(tmp_path)
     _seed_user(db_path, 1, username="u1", keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
@@ -1407,8 +1438,438 @@ def test_execute_daily_limit_is_global_per_account_across_campaigns(tmp_path):
         # daily_limit=1 на аккаунт ЦЕЛИКОМ — только ОДНО приглашение
         # суммарно по обеим кампаниям, а не по одному на каждую.
         assert len(invites) == 1
-        assert invites[0].status == "invited"
+        assert invites[0].status == "joined"
         assert invites[0].user_id == 1  # кампания ОСАГО обработана первой
+    finally:
+        invite_repository.close()
+
+
+# ---- подтверждение вступления: pending -> joined, ожидание, волна добора ----
+
+
+# campaign_id, которого не существует в invite_campaigns — user_campaign_invites
+# не требует внешнего ключа (см. схему), поэтому можно смоделировать "уже
+# сегодня отправленные/подтверждённые где-то" записи без создания отдельной
+# настоящей кампании (иначе run() пытался бы обработать и её тоже).
+_UNRELATED_CAMPAIGN_ID = 999999
+
+
+@pytest.mark.parametrize(
+    "joined_today,pending_today,daily_limit,expected_new",
+    [
+        (10, 14, 24, 0),
+        (19, 0, 24, 5),
+        (19, 3, 24, 2),
+        (24, 0, 24, 0),
+        (0, 24, 24, 0),
+    ],
+)
+def test_execute_remaining_budget_accounts_for_pending_reservations(
+    tmp_path, joined_today, pending_today, daily_limit, expected_new,
+):
+    """remaining = daily_limit - joined_today - pending_today, а НЕ
+    только daily_limit - joined_today (см. задачу про перелив лимита) —
+    pending временно резервирует место, пока не подтверждён (joined) или
+    не опровергнут (not_joined)."""
+    db_path = _setup_db(tmp_path)
+    # Кандидатов для НОВОЙ волны с запасом — больше, чем может понадобиться
+    # в любом из сценариев.
+    for user_id in range(1, 31):
+        _seed_user(
+            db_path, user_id, keywords=["осаго"], access_hash=user_id,
+            last_seen_at=_BASE_TIME + timedelta(days=user_id),
+        )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account = account_repository.create(
+            name="account_1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=daily_limit,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    # "Уже сегодня" joined/pending — синтетические записи в НЕсвязанной
+    # кампании (см. _UNRELATED_CAMPAIGN_ID), чтобы count_today_joined()/
+    # count_today_pending() (глобальные по аккаунту, без campaign_id) их
+    # учли, а _verify_pending_invites() (per-campaign) — не тронул.
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        now = datetime.now(timezone.utc)
+        for i in range(joined_today):
+            invite_repository.create(
+                user_id=900 + i, campaign_id=_UNRELATED_CAMPAIGN_ID, account_id=account.id,
+                status="joined", invited_at=now, verified_at=now,
+            )
+        for i in range(pending_today):
+            invite_repository.create(
+                user_id=800 + i, campaign_id=_UNRELATED_CAMPAIGN_ID, account_id=account.id,
+                status="pending", invited_at=now,
+            )
+    finally:
+        invite_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(created=created_clients)
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    if expected_new == 0:
+        # remaining <= 0 сразу — аккаунт пропущен полностью, ни один
+        # клиент не создаётся (см. _execute_account).
+        assert created_clients == []
+    else:
+        client = created_clients[0]
+        assert len(client.call_requests) == expected_new
+
+
+def test_execute_top_up_remaining_also_accounts_for_pending_after_verification(tmp_path):
+    """Важный сценарий: отправили 24 pending -> верификация -> 19 joined,
+    5 НЕ подтвердились, но проверка САМА не смогла определить их статус
+    (не UserNotParticipantError — например сбой сети) -> они остаются
+    'pending', а не 'not_joined' -> их резерв в лимите НЕ освобождается ->
+    волна добора не должна отправлять новые 5, иначе daily_limit был бы
+    превышен (19 joined + 5 старых pending + 5 новых pending = 29 > 24)."""
+    db_path = _setup_db(tmp_path)
+    total_users = 29
+    for user_id in range(1, total_users + 1):
+        _seed_user(
+            db_path, user_id, keywords=["осаго"], access_hash=user_id,
+            last_seen_at=_BASE_TIME + timedelta(days=user_id),
+        )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=24,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    # По last_seen_at DESC волна №1 (limit=24) выбирает user_id 29..6. Для
+    # 5 из них (10..14) сама проверка не может определить статус (сбой,
+    # не UserNotParticipantError) — они остаются 'pending'.
+    unresolvable = {10, 11, 12, 13, 14}
+    client_factory = _make_client_factory(
+        participant_check_errors={
+            "account_1": {
+                user_id: ConnectionError("сеть моргнула") for user_id in unresolvable
+            },
+        },
+    )
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        # Волны добора НЕ было вовсе — 24 (волна №1) и ни одной новой
+        # записи сверху: 19 joined + 5 pending = 24, лимит уже исчерпан
+        # (0 свободных мест), кандидаты 1..5 не тронуты.
+        assert len(invites) == 24
+        joined_ids = {i.user_id for i in invites if i.status == "joined"}
+        pending_ids = {i.user_id for i in invites if i.status == "pending"}
+        assert len(joined_ids) == 19
+        assert pending_ids == unresolvable
+    finally:
+        invite_repository.close()
+
+
+def test_execute_verify_pending_confirms_joined_when_participant(tmp_path):
+    """get_permissions() успешна для pending-кандидата (см.
+    _verify_pending_invites) — status='joined', verified_at задан."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path)
+
+    client_factory = _make_client_factory()
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invite = invite_repository.list()[0]
+        assert invite.status == "joined"
+        assert invite.verified_at is not None
+        assert invite.verified_at >= invite.invited_at
+    finally:
+        invite_repository.close()
+
+
+def test_execute_verify_pending_marks_not_joined_when_confirmed_not_participant(tmp_path):
+    """get_permissions() бросает UserNotParticipantError — Telegram явно
+    говорит "не участник", это ДОСТОВЕРНЫЙ ответ: status='not_joined' (не
+    'pending' — иначе занятое место в дневном лимите никогда бы не
+    освободилось, см. задачу про перелив лимита), verified_at задан, и
+    это не считается ошибкой (см. _verify_pending_invites)."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path)
+
+    client_factory = _make_client_factory(
+        participant_check_errors={
+            "Основной": {1: UserNotParticipantError(request=GetHistoryRequest)},
+        },
+    )
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invite = invite_repository.list()[0]
+        assert invite.status == "not_joined"
+        assert invite.verified_at is not None
+    finally:
+        invite_repository.close()
+
+
+def test_execute_verify_pending_leaves_pending_on_unexpected_check_error(tmp_path, caplog):
+    """Любая другая ошибка при самой проверке (не UserNotParticipantError)
+    — тоже остаётся 'pending' (не считаем это подтверждением ИЛИ провалом
+    кандидата — просто не удалось проверить сейчас), с предупреждением в
+    лог."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path)
+
+    client_factory = _make_client_factory(
+        participant_check_errors={"Основной": {1: ConnectionError("сеть моргнула")}},
+    )
+
+    with caplog.at_level("WARNING", logger="reader.inviter.service"):
+        asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    assert "Не удалось проверить участие в группе" in caplog.text
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invite = invite_repository.list()[0]
+        assert invite.status == "pending"
+        assert invite.verified_at is None
+    finally:
+        invite_repository.close()
+
+
+def test_execute_waits_short_interval_before_verifying_when_sent_below_threshold(tmp_path, monkeypatch):
+    """Отправлено < 20 приглашений этой волной — ждать 60 сек. перед
+    проверкой pending (см. _wait_before_verifying_pending/
+    _PENDING_CHECK_BATCH_THRESHOLD)."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path, daily_limit=1)
+
+    import reader.inviter.service as service_module
+
+    sleep_calls: list = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(service_module.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(_run_service(db_path, client_factory=_make_client_factory(), execute=True))
+
+    # [0] — разогрев, [1] — пауза после кандидата, [2] — ожидание перед
+    # проверкой pending: ровно 1 отправлен (< 20) -> короткое, 60 сек.
+    assert sleep_calls[2] == 60
+
+
+def test_execute_waits_long_interval_before_verifying_when_sent_at_threshold(tmp_path, monkeypatch):
+    """Отправлено >= 20 приглашений этой волной — ждать 5 минут перед
+    проверкой pending: Telegram может обрабатывать большие пачки не
+    мгновенно (см. задачу)."""
+    db_path = _setup_db(tmp_path)
+    total_users = 20
+    for user_id in range(1, total_users + 1):
+        _seed_user(
+            db_path, user_id, keywords=["осаго"], access_hash=user_id,
+            last_seen_at=_BASE_TIME + timedelta(days=user_id),
+        )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=20,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    import reader.inviter.service as service_module
+
+    sleep_calls: list = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(service_module.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(_run_service(db_path, client_factory=_make_client_factory(), execute=True))
+
+    # [0] — разогрев, [1..20] — по паузе на каждого из 20 кандидатов,
+    # [21] — ожидание перед проверкой pending: отправлено ровно 20 (>= 20)
+    # -> длинное, 300 сек.
+    assert sleep_calls[21] == 300
+
+
+def test_execute_top_up_wave_matches_daily_limit_example_from_task(tmp_path):
+    """Пример из задачи: daily_limit=24, из первой волны подтверждается 19
+    (5 кандидатов "не успевают" вступить к моменту проверки), остаток 5
+    добирается ОДНОЙ дополнительной волной — и только ею, без повторной
+    проверки после неё."""
+    db_path = _setup_db(tmp_path)
+    total_users = 29
+    for user_id in range(1, total_users + 1):
+        _seed_user(
+            db_path, user_id, keywords=["осаго"], access_hash=user_id,
+            last_seen_at=_BASE_TIME + timedelta(days=user_id),
+        )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=24,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    # По last_seen_at DESC волна №1 (limit=24) выбирает user_id 29..6 (24
+    # штук). 5 из них "не успевают" вступить к моменту проверки.
+    not_yet_joined = {10, 11, 12, 13, 14}
+    client_factory = _make_client_factory(
+        participant_check_errors={
+            "account_1": {
+                user_id: UserNotParticipantError(request=GetHistoryRequest)
+                for user_id in not_yet_joined
+            },
+        },
+    )
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        # 24 (волна №1) + 5 (волна добора — единственные оставшиеся
+        # кандидаты, user_id 5..1, раз not_yet_joined уже "заняты" этим
+        # прогоном через attempted_user_ids) = 29.
+        assert len(invites) == 29
+        joined_ids = {i.user_id for i in invites if i.status == "joined"}
+        not_joined_ids = {i.user_id for i in invites if i.status == "not_joined"}
+        pending_ids = {i.user_id for i in invites if i.status == "pending"}
+        assert len(joined_ids) == 19
+        # not_yet_joined — ДОСТОВЕРНО не вступили (UserNotParticipantError,
+        # см. _verify_pending_invites) — их резерв в лимите освободился,
+        # это и позволило волне добора отправить именно 5 новых (1..5).
+        assert not_joined_ids == not_yet_joined
+        # Волна добора (5 штук, user_id 1..5) остаётся неподтверждённой —
+        # после неё проверка НЕ выполняется (см. задачу).
+        assert pending_ids == {1, 2, 3, 4, 5}
+        assert joined_ids == (set(range(6, 30)) - not_yet_joined)
+    finally:
+        invite_repository.close()
+
+
+def test_execute_top_up_wave_does_not_repeat_if_still_short_after_it(tmp_path):
+    """Даже если и после волны добора остаток лимита всё ещё > 0 (мало
+    кандидатов) — вторая волна добора НЕ выполняется: максимум две волны
+    приглашений за запуск (см. задачу)."""
+    db_path = _setup_db(tmp_path)
+    # Всего 2 кандидата, daily_limit=10 — после волны №1 (оба сразу
+    # выбираются, поскольку это всё, что есть) и волны добора (которая не
+    # найдёт вообще никого, раз кандидаты закончились) лимит всё ещё не
+    # исчерпан, но третьей волны быть не должно.
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=10,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(created=created_clients)
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    client = created_clients[0]
+    # Волна №1 отправила оба существующих кандидата; волна добора не нашла
+    # никого (пул пуст) — ровно 2 запроса всего, не больше.
+    assert len(client.call_requests) == 2
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == 2
+        assert all(i.status == "joined" for i in invites)
+    finally:
+        invite_repository.close()
+
+
+def test_execute_peer_flood_during_main_wave_skips_verification_and_top_up(tmp_path, monkeypatch):
+    """STOP_ACCOUNT (например PeerFlood) во время основной волны — ни
+    ожидания, ни проверки pending, ни волны добора: аккаунт сразу
+    завершается (см. _execute_account: stopped=True)."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=10,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    client_factory = _make_client_factory(
+        call_errors={"account_1": [PeerFloodError(request=GetHistoryRequest)]},
+    )
+
+    import reader.inviter.service as service_module
+
+    sleep_calls: list = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(service_module.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    # Только "разогрев" — никакого ожидания перед проверкой pending
+    # (60/300 сек.) не было вовсе.
+    assert sleep_calls == [sleep_calls[0]]
+    assert sleep_calls[0] not in (60, 300)
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        # Только первый (провалившийся) кандидат — второй не тронут
+        # (обычная остановка аккаунта), волны добора не было.
+        assert len(invites) == 1
+        assert invites[0].status == "failed"
     finally:
         invite_repository.close()
 
@@ -1506,7 +1967,9 @@ def test_execute_skips_username_resolution_when_candidate_already_known(tmp_path
     asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
 
     client = created_clients[0]
-    assert client.get_input_entity_calls == [1]
+    # Второй [1] — это get_input_entity() из проверки pending (см.
+    # _verify_pending_invites), не из резолва перед отправкой.
+    assert client.get_input_entity_calls == [1, 1]
     # get_entity вызывался только для target_chat, не для "@ivan" и не для
     # проверки is_bot (InputPeerUser).
     assert client.get_entity_calls == ["@target_chat"]
@@ -1514,7 +1977,9 @@ def test_execute_skips_username_resolution_when_candidate_already_known(tmp_path
 
     invite_repository = UserCampaignInviteRepository(db_path)
     try:
-        assert invite_repository.list()[0].status == "invited"
+        # pending -> joined: get_permissions() успешна по умолчанию (см.
+        # _verify_pending_invites).
+        assert invite_repository.list()[0].status == "joined"
     finally:
         invite_repository.close()
 
@@ -1539,7 +2004,12 @@ def test_execute_resolves_unknown_candidate_via_username_with_fresh_access_hash(
     asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
 
     client = created_clients[0]
-    assert client.get_input_entity_calls == [1]
+    # Второй вызов — из проверки pending (см. _verify_pending_invites),
+    # и падает по той же смоделированной причине (get_input_entity_errors
+    # действует на КАЖДЫЙ вызов в этом фейке) — кандидат остаётся 'pending',
+    # что не противоречит цели теста (он про СВЕЖИЙ access_hash в самом
+    # запросе приглашения, а не про подтверждение вступления).
+    assert client.get_input_entity_calls == [1, 1]
     assert "@ivan" in client.get_entity_calls  # резолвился именно по username
 
     assert len(client.call_requests) == 1
@@ -1551,7 +2021,7 @@ def test_execute_resolves_unknown_candidate_via_username_with_fresh_access_hash(
 
     invite_repository = UserCampaignInviteRepository(db_path)
     try:
-        assert invite_repository.list()[0].status == "invited"
+        assert invite_repository.list()[0].status == "pending"
     finally:
         invite_repository.close()
 
@@ -1604,8 +2074,11 @@ def test_execute_update_access_hash_failure_does_not_stop_invite(tmp_path, caplo
 
     invite_repository = UserCampaignInviteRepository(db_path)
     try:
-        # Приглашение всё равно прошло, несмотря на сбой записи access_hash.
-        assert invite_repository.list()[0].status == "invited"
+        # Приглашение всё равно прошло, несмотря на сбой записи access_hash
+        # (get_input_entity всегда падает в этом фейке, поэтому проверка
+        # pending тоже не резолвит кандидата — статус остаётся 'pending',
+        # что не противоречит цели теста: она про сам факт отправки).
+        assert invite_repository.list()[0].status == "pending"
     finally:
         invite_repository.close()
 
@@ -1792,7 +2265,11 @@ def test_execute_skips_confirmed_bot_before_sending_invite_request(tmp_path):
     InviteToChannelRequest/AddChatUserRequest не отправляется вовсе,
     записывается status='invalid', is_bot=1 сохраняется в users.db, и
     аккаунт продолжает обработку ОСТАЛЬНЫХ кандидатов (это не PeerFlood/
-    ChatAdminRequired — риска для аккаунта здесь нет)."""
+    ChatAdminRequired — риска для аккаунта здесь нет). Настоящий
+    UserRepository (не фейк) — чтобы is_bot=1 реально попал в users.db и
+    не дал волне добора (см. _execute_account) повторно выбрать того же
+    "бота", раз status='invalid' сам по себе не исключается из будущей
+    выборки."""
     db_path = _setup_db(tmp_path)
     # По last_seen_at DESC: 2 (бот, is_bot=NULL), 1 (обычный, is_bot=False
     # — уже подтверждён, чтобы не отвлекать проверку лишним вызовом).
@@ -1816,28 +2293,32 @@ def test_execute_skips_confirmed_bot_before_sending_invite_request(tmp_path):
         entity_responses={"Основной": {2: User(id=2, access_hash=2, username="vlars_bot", bot=True)}},
         created=created_clients,
     )
-    user_repository = _FakeUserRepository()
+    user_repository = UserRepository(db_path)
 
-    asyncio.run(
-        _run_service(
-            db_path, client_factory=client_factory, execute=True, user_repository=user_repository,
-        )
-    )
-
-    client = created_clients[0]
-    # Ровно один InviteToChannelRequest/AddChatUserRequest — для кандидата
-    # 1, не для бота 2.
-    assert len(client.call_requests) == 1
-
-    invite_repository = UserCampaignInviteRepository(db_path)
     try:
-        invites = {i.user_id: i for i in invite_repository.list()}
-        assert invites[2].status == "invalid"
-        assert invites[1].status == "invited"
-    finally:
-        invite_repository.close()
+        asyncio.run(
+            _run_service(
+                db_path, client_factory=client_factory, execute=True, user_repository=user_repository,
+            )
+        )
 
-    assert user_repository.calls == [(2, 2, "vlars_bot", True)]
+        client = created_clients[0]
+        # Ровно один InviteToChannelRequest/AddChatUserRequest — для
+        # кандидата 1, не для бота 2 (и волна добора не переигрывает его,
+        # раз is_bot=1 реально сохранён).
+        assert len(client.call_requests) == 1
+
+        invite_repository = UserCampaignInviteRepository(db_path)
+        try:
+            invites = {i.user_id: i for i in invite_repository.list()}
+            assert invites[2].status == "invalid"
+            assert invites[1].status == "joined"
+        finally:
+            invite_repository.close()
+
+        assert user_repository.get(2).is_bot is True
+    finally:
+        user_repository.close()
 
 
 def test_execute_marks_bot_via_rpc_error_as_defense_in_depth(tmp_path):
@@ -1847,7 +2328,10 @@ def test_execute_marks_bot_via_rpc_error_as_defense_in_depth(tmp_path):
     Telegram-специфичная RPC-ошибка (UserBotError) при самой отправке
     приглашения тоже должна сохранить is_bot=1 в users.db (через
     mark_as_bot — полноценного entity здесь уже нет) и не останавливать
-    аккаунт (это SKIP_USER, а не STOP_ACCOUNT)."""
+    аккаунт (это SKIP_USER, а не STOP_ACCOUNT). Настоящий UserRepository
+    (не фейк) — чтобы is_bot=1 реально попал в users.db и не дал волне
+    добора (см. _execute_account) повторно выбрать того же "бота", раз
+    status='invalid' сам по себе не исключается из будущей выборки."""
     db_path = _setup_db(tmp_path)
     _seed_user(db_path, 2, username="vlars_bot", keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1), is_bot=False)
     _seed_user(db_path, 1, username="ivan", keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME, is_bot=False)
@@ -1867,24 +2351,28 @@ def test_execute_marks_bot_via_rpc_error_as_defense_in_depth(tmp_path):
     client_factory = _make_client_factory(
         call_errors={"Основной": [UserBotError(request=GetHistoryRequest), None]},
     )
-    user_repository = _FakeUserRepository()
+    user_repository = UserRepository(db_path)
 
-    asyncio.run(
-        _run_service(
-            db_path, client_factory=client_factory, execute=True, user_repository=user_repository,
-        )
-    )
-
-    invite_repository = UserCampaignInviteRepository(db_path)
     try:
-        invites = {i.user_id: i for i in invite_repository.list()}
-        assert invites[2].status == "invalid"
-        # Аккаунт НЕ остановился — второй кандидат тоже обработан.
-        assert invites[1].status == "invited"
-    finally:
-        invite_repository.close()
+        asyncio.run(
+            _run_service(
+                db_path, client_factory=client_factory, execute=True, user_repository=user_repository,
+            )
+        )
 
-    assert user_repository.mark_as_bot_calls == [2]
+        invite_repository = UserCampaignInviteRepository(db_path)
+        try:
+            invites = {i.user_id: i for i in invite_repository.list()}
+            assert invites[2].status == "invalid"
+            # Аккаунт НЕ остановился — второй кандидат тоже обработан и
+            # подтверждён (get_permissions успешна по умолчанию).
+            assert invites[1].status == "joined"
+        finally:
+            invite_repository.close()
+
+        assert user_repository.get(2).is_bot is True
+    finally:
+        user_repository.close()
 
 
 
@@ -2042,11 +2530,16 @@ def test_execute_flood_wait_records_failed_sleeps_and_continues(tmp_path, monkey
     # sleep_calls[0] — "разогрев" аккаунта сразу после connect() (см.
     # test_warm_up_account_...), [1] — ожидание самого FloodWait (7 сек., как
     # и раньше), [2] — случайная пауза после ВТОРОГО (успешного) кандидата
-    # (см. _pause_between_invites) — в диапазоне [20, 60).
-    assert len(sleep_calls) == 3
+    # (см. _pause_between_invites) — в диапазоне [20, 60), [3] — ожидание
+    # перед проверкой pending (см. _wait_before_verifying_pending) — 60
+    # сек., отправлен всего 1 (< 20). Волна добора после проверки не находит
+    # новых кандидатов (user 2 уже обработан этим прогоном, user 1 —
+    # подтверждён), поэтому дополнительных sleep() нет.
+    assert len(sleep_calls) == 4
     assert 5 <= sleep_calls[0] < 15
     assert sleep_calls[1] == 7
     assert 20 <= sleep_calls[2] < 60
+    assert sleep_calls[3] == 60
 
     invite_repository = UserCampaignInviteRepository(db_path)
     try:
@@ -2055,7 +2548,7 @@ def test_execute_flood_wait_records_failed_sleeps_and_continues(tmp_path, monkey
         assert invites[2].error == str(FloodWaitError(request=GetHistoryRequest, capture=7))
         assert invites[2].invited_at is None
 
-        assert invites[1].status == "invited"
+        assert invites[1].status == "joined"
         assert invites[1].invited_at is not None
     finally:
         invite_repository.close()
@@ -2076,8 +2569,10 @@ def test_execute_user_already_participant_marks_invited(tmp_path):
         invites = invite_repository.list()
         assert len(invites) == 1
         # UserAlreadyParticipantError — цель кампании для пользователя уже
-        # достигнута: status='invited', а не 'failed' (см. требование задачи).
-        assert invites[0].status == "invited"
+        # достигнута: status='joined' (подтверждённый участник — Telegram
+        # сказал это прямо, см. _classify_invite_error), а не 'failed'/'pending'.
+        assert invites[0].status == "joined"
+        assert invites[0].verified_at is not None
         assert invites[0].user_id == 1
         assert invites[0].campaign_id == campaign.id
     finally:
@@ -2158,10 +2653,15 @@ def test_execute_sends_account_and_campaign_notifications_with_correct_counts(tm
     assert len(notifier.sent) == 2
     account_message, campaign_message = notifier.sent
 
+    # user 1 отправлен и подтверждён (get_permissions успешна по
+    # умолчанию), user 2 подтверждён немедленно (UserAlreadyParticipantError),
+    # итого "Подтверждено" = 2, "Отправлено" = 1 (только реальная отправка,
+    # UserAlreadyParticipantError в неё не считается).
     assert "📨 Кампания: ОСАГО" in account_message
     assert "👤 Аккаунт: account_1" in account_message
-    assert "✅ Приглашено: 1" in account_message
-    assert "☑️ Уже состояли в группе: 1" in account_message
+    assert "📤 Отправлено приглашений: 1" in account_message
+    assert "✅ Подтверждено участников: 2" in account_message
+    assert "⏳ Ожидают подтверждения: 0" in account_message
     assert "🚫 Недоступны (invalid): 0" in account_message
     assert "❌ Ошибок: 1" in account_message
     # 3-й кандидат получил UserPrivacyRestrictedError (status='failed') —
@@ -2170,8 +2670,9 @@ def test_execute_sends_account_and_campaign_notifications_with_correct_counts(tm
 
     assert '📊 Итоги кампании "ОСАГО"' in campaign_message
     assert "Аккаунтов обработано: 1" in campaign_message
-    assert "✅ Приглашено: 1" in campaign_message
-    assert "☑️ Уже состояли: 1" in campaign_message
+    assert "📤 Отправлено приглашений: 1" in campaign_message
+    assert "✅ Подтверждено участников: 2" in campaign_message
+    assert "⏳ Ожидают подтверждения: 0" in campaign_message
     assert "🚫 Недоступны: 0" in campaign_message
     assert "❌ Ошибок: 1" in campaign_message
     assert "Осталось кандидатов: 1" in campaign_message
@@ -2216,7 +2717,7 @@ def test_execute_campaign_notification_includes_found_vs_processable_summary(tmp
 
     # Существующие поля отчёта остаются на месте, не заменены новыми.
     assert '📊 Итоги кампании "ОСАГО"' in campaign_message
-    assert "✅ Приглашено: 1" in campaign_message
+    assert "✅ Подтверждено участников: 1" in campaign_message
 
 
 def test_execute_flood_wait_excluded_from_error_count_in_notification(tmp_path, monkeypatch):
@@ -2254,7 +2755,7 @@ def test_execute_flood_wait_excluded_from_error_count_in_notification(tmp_path, 
     asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier))
 
     account_message = notifier.sent[0]
-    assert "✅ Приглашено: 1" in account_message
+    assert "✅ Подтверждено участников: 1" in account_message
     assert "❌ Ошибок: 0" in account_message  # FloodWait не считается ошибкой
 
 
@@ -2302,8 +2803,9 @@ def test_execute_aggregates_stats_across_multiple_accounts_in_campaign_summary(t
     campaign_message = notifier.sent[-1]
 
     assert "Аккаунтов обработано: 2" in campaign_message
-    assert "✅ Приглашено: 3" in campaign_message  # 2 (account_1) + 1 (account_2)
-    assert "☑️ Уже состояли: 0" in campaign_message
+    assert "📤 Отправлено приглашений: 3" in campaign_message  # 2 (account_1) + 1 (account_2)
+    assert "✅ Подтверждено участников: 3" in campaign_message
+    assert "⏳ Ожидают подтверждения: 0" in campaign_message
     assert "❌ Ошибок: 1" in campaign_message
     # Кандидат с UserPrivacyRestrictedError (status='failed') не
     # исключается из будущей выборки — остаётся ровно один "оставшийся"
@@ -2325,7 +2827,7 @@ def test_notify_failure_does_not_stop_service(tmp_path):
     try:
         invites = invite_repository.list()
         assert len(invites) == 1
-        assert invites[0].status == "invited"
+        assert invites[0].status == "joined"
     finally:
         invite_repository.close()
 
@@ -2542,7 +3044,7 @@ def test_humanize_error_falls_back_to_str_for_unmapped_exception():
     [
         (
             UserAlreadyParticipantError(request=GetHistoryRequest),
-            InviteErrorAction.SKIP_USER, "invited", "already_participant",
+            InviteErrorAction.SKIP_USER, "joined", "joined",
         ),
         (
             _CandidateIsBotError("42 — известный Telegram-бот"),
@@ -2664,16 +3166,18 @@ def test_notifications_include_elapsed_time_without_changing_other_lines(tmp_pat
     # сдвинуть/удалить) — тот же набор, что и в тестах без time.monotonic().
     assert "📨 Кампания: ОСАГО" in account_message
     assert "👤 Аккаунт: Основной" in account_message
-    assert "✅ Приглашено: 1" in account_message
-    assert "☑️ Уже состояли в группе: 0" in account_message
+    assert "📤 Отправлено приглашений: 1" in account_message
+    assert "✅ Подтверждено участников: 1" in account_message
+    assert "⏳ Ожидают подтверждения: 0" in account_message
     assert "🚫 Недоступны (invalid): 0" in account_message
     assert "❌ Ошибок: 0" in account_message
     assert "Осталось кандидатов: 0" in account_message
 
     assert '📊 Итоги кампании "ОСАГО"' in campaign_message
     assert "Аккаунтов обработано: 1" in campaign_message
-    assert "✅ Приглашено: 1" in campaign_message
-    assert "☑️ Уже состояли: 0" in campaign_message
+    assert "📤 Отправлено приглашений: 1" in campaign_message
+    assert "✅ Подтверждено участников: 1" in campaign_message
+    assert "⏳ Ожидают подтверждения: 0" in campaign_message
     assert "🚫 Недоступны: 0" in campaign_message
     assert "❌ Ошибок: 0" in campaign_message
     assert "Осталось кандидатов: 0" in campaign_message
@@ -2762,10 +3266,14 @@ def test_pause_between_invites_happens_after_each_outcome_regardless_of_result(t
 
     asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
 
-    # sleep_calls[0] — разогрев (7.0), остальные три — по одной паузе на
-    # каждого из трёх кандидатов, независимо от исхода.
+    # sleep_calls[0] — разогрев (7.0), следующие три — по одной паузе на
+    # каждого из трёх кандидатов, независимо от исхода, [4] — ожидание
+    # перед проверкой pending (см. _wait_before_verifying_pending) — 60
+    # сек., отправлен всего 1 (< 20).
     assert sleep_calls[0] == 7.0
-    assert sleep_calls[1:] == [55.5, 55.5, 55.5]
+    assert sleep_calls[1:4] == [55.5, 55.5, 55.5]
+    assert sleep_calls[4] == 60
+    assert len(sleep_calls) == 5
 
 
 def test_warm_up_account_pauses_once_after_connect_not_per_candidate(tmp_path, monkeypatch):
@@ -2819,9 +3327,13 @@ def test_warm_up_account_pauses_once_after_connect_not_per_candidate(tmp_path, m
     assert len(warmup_calls) == 1
 
     # Разогрев — самый первый сон, до какой-либо обработки кандидатов;
-    # дальше — по одной паузе на каждого из двух кандидатов.
+    # дальше — по одной паузе на каждого из двух кандидатов, и в конце —
+    # ожидание перед проверкой pending (см. _wait_before_verifying_pending) —
+    # 60 сек., отправлено 2 (< 20).
     assert sleep_calls[0] == 10.0
-    assert sleep_calls[1:] == [30.0, 30.0]
+    assert sleep_calls[1:3] == [30.0, 30.0]
+    assert sleep_calls[3] == 60
+    assert len(sleep_calls) == 4
 
 
 def test_choose_invite_pause_seconds_returns_short_pause_when_above_probability(monkeypatch):
@@ -3182,11 +3694,14 @@ def test_execute_flood_wait_below_threshold_waits_and_continues_account(tmp_path
     # 299 < 300 — дождались и продолжили ОБА кандидата этим же аккаунтом.
     # sleep_calls[0] — "разогрев" сразу после connect(); [1] — ожидание
     # FloodWait; [2] — случайная пауза после ВТОРОГО (успешного) кандидата
-    # (см. _pause_between_invites).
-    assert len(sleep_calls) == 3
+    # (см. _pause_between_invites); [3] — ожидание перед проверкой pending
+    # (см. _wait_before_verifying_pending) — 60 сек., отправлен всего 1
+    # (< 20).
+    assert len(sleep_calls) == 4
     assert 5 <= sleep_calls[0] < 15
     assert sleep_calls[1] == 299
     assert 20 <= sleep_calls[2] < 60
+    assert sleep_calls[3] == 60
 
     client = created_clients[0]
     assert len(client.call_requests) == 2
@@ -3207,10 +3722,12 @@ def test_execute_flood_wait_below_threshold_waits_and_continues_account(tmp_path
 
 def test_execute_test_mode_stops_after_exactly_n_successful_invites(tmp_path):
     """max_successful_invites (--test в main.py, TEST_MODE_MAX_SUCCESSFUL_INVITES=30) —
-    как только текущий вызов run() наберёт ровно это количество успешных
-    приглашений (status='invited', реальный InviteStats.invited), дальнейшая
-    обработка останавливается: текущий аккаунт заканчивается штатно (не
-    прерывая уже выполняющееся приглашение), следующие аккаунты и кампании
+    как только текущий вызов run() наберёт ровно это количество успешно
+    ОТПРАВЛЕННЫХ приглашений (status='pending', реальный InviteStats.sent —
+    RPC-успех, не подтверждённое вступление), дальнейшая обработка
+    останавливается: текущий аккаунт заканчивается штатно (не прерывая уже
+    выполняющееся приглашение, но и не выполняя проверку pending/волну
+    добора для него — см. _execute_account), следующие аккаунты и кампании
     больше не трогаются."""
     db_path = _setup_db(tmp_path)
     total_users = 40
@@ -3262,7 +3779,14 @@ def test_execute_test_mode_stops_after_exactly_n_successful_invites(tmp_path):
     try:
         invites = invite_repository.list()
         assert len(invites) == 30
-        assert all(invite.status == "invited" for invite in invites)
+        # account_1 отработал полностью, включая проверку pending (лимит
+        # тестового режима не сработал у него) — все 20 подтверждены.
+        # account_2 остановился ИЗ-ЗА лимита ровно на 10-м успехе — это
+        # "мягкая" остановка (см. _execute_account: stopped=True пропускает
+        # и проверку pending, и волну добора), поэтому его 10 остаются
+        # неподтверждёнными.
+        assert sum(1 for i in invites if i.status == "joined") == 20
+        assert sum(1 for i in invites if i.status == "pending") == 10
     finally:
         invite_repository.close()
 
@@ -3323,9 +3847,13 @@ def test_execute_test_mode_errors_and_already_participant_do_not_count_toward_li
     try:
         invites = invite_repository.list()
         assert len(invites) == 5
-        # candidate1 (already_participant) записывается со статусом
-        # 'invited' (см. _invite_candidate), + 2 реальных успеха = 3.
-        assert sum(1 for i in invites if i.status == "invited") == 3
+        # UserAlreadyParticipantError — подтверждённый участник немедленно
+        # (status='joined', см. _classify_invite_error). Лимит сработал
+        # ровно на 2-м реальном успехе — "мягкая" остановка пропускает
+        # проверку pending для этого аккаунта (см. _execute_account), т.е.
+        # эти 2 успешные отправки остаются 'pending', а не 'joined'.
+        assert sum(1 for i in invites if i.status == "joined") == 1
+        assert sum(1 for i in invites if i.status == "pending") == 2
         assert sum(1 for i in invites if i.status == "failed") == 2
     finally:
         invite_repository.close()
@@ -3392,21 +3920,27 @@ def test_execute_test_mode_stop_still_sends_correct_final_stats_notifications(tm
     stop_notifications = [m for m in notifier.sent if m.startswith("⚠️")]
     assert stop_notifications == []
 
+    # "Мягкая" остановка (лимит тестового режима) пропускает проверку
+    # pending для этого аккаунта (см. _execute_account) — 3 успешные
+    # отправки (candidates 10,7,6) остаются 'pending', 1 подтверждён
+    # немедленно (candidate 9, UserAlreadyParticipantError).
     account_notifications = [m for m in notifier.sent if m.startswith("📨")]
     assert len(account_notifications) == 1
-    assert "✅ Приглашено: 3" in account_notifications[0]
-    assert "☑️ Уже состояли в группе: 1" in account_notifications[0]
+    assert "📤 Отправлено приглашений: 3" in account_notifications[0]
+    assert "✅ Подтверждено участников: 1" in account_notifications[0]
+    assert "⏳ Ожидают подтверждения: 3" in account_notifications[0]
     assert "🚫 Недоступны (invalid): 0" in account_notifications[0]
     assert "❌ Ошибок: 1" in account_notifications[0]
     assert "Осталось кандидатов: 6" in account_notifications[0]
 
     campaign_notifications = [m for m in notifier.sent if "Итоги кампании" in m]
     assert len(campaign_notifications) == 1
-    assert "✅ Приглашено: 3" in campaign_notifications[0]
-    assert "☑️ Уже состояли: 1" in campaign_notifications[0]
+    assert "📤 Отправлено приглашений: 3" in campaign_notifications[0]
+    assert "✅ Подтверждено участников: 1" in campaign_notifications[0]
+    assert "⏳ Ожидают подтверждения: 3" in campaign_notifications[0]
     assert "❌ Ошибок: 1" in campaign_notifications[0]
-    # 10 подходящих кандидатов всего - 4 со статусом 'invited' в БД
-    # (3 реальных успеха + 1 already_participant) = 6 осталось.
+    # 10 подходящих кандидатов всего - 4 со статусом 'pending'/'joined' в БД
+    # (3 pending + 1 joined) = 6 осталось.
     assert "Осталось кандидатов: 6" in campaign_notifications[0]
 
 

@@ -32,6 +32,7 @@ from telethon.errors import (
     UserIsBotError,
     UserKickedError,
     UserNotMutualContactError,
+    UserNotParticipantError,
     UserPrivacyRestrictedError,
     UsersTooMuchError,
 )
@@ -55,7 +56,7 @@ _WARMUP_MIN_SECONDS = 5
 _WARMUP_MAX_SECONDS = 15
 
 # Пауза после каждого приглашения (независимо от результата —
-# invited/already_participant/failed/invalid), чтобы аккаунт не рассылал
+# pending/joined/failed/invalid), чтобы аккаунт не рассылал
 # приглашения через равные интервалы — это и есть один из самых заметных
 # признаков автоматизации для Telegram. Большинство пауз короткие, но
 # примерно 20% — длинные (см. _choose_invite_pause_seconds), как у живого
@@ -71,12 +72,22 @@ _LONG_PAUSE_PROBABILITY = 0.2
 # просто подождать и продолжить тем же аккаунтом (см. _invite_candidate).
 _MAX_TOLERABLE_FLOOD_WAIT_SECONDS = 300
 
+# После основной волны приглашений (см. _execute_account) ждём этот
+# интервал ПЕРЕД проверкой pending (см. _verify_pending_invites) — Telegram
+# может обрабатывать вступление не мгновенно, особенно для больших пачек.
+# Порог — по количеству реально ОТПРАВЛЕННЫХ (успешных) приглашений этой
+# волны, не по числу кандидатов вообще (см. задачу).
+_PENDING_CHECK_BATCH_THRESHOLD = 20
+_PENDING_CHECK_SHORT_WAIT_SECONDS = 60
+_PENDING_CHECK_LONG_WAIT_SECONDS = 300
+
 # --test (main.py) — тестовый прогон: как только текущий вызов run()
-# выполнит это количество успешных приглашений (status='invited', см.
-# InviteStats.invited) — остановить ВЕСЬ запуск (текущий аккаунт
-# заканчивается штатно, без прерывания уже выполняющегося приглашения,
-# остальные аккаунты и кампании больше не трогаются, см. run()/
-# _invite_candidate). already_participant/errors в счёт не идут.
+# выполнит это количество успешно ОТПРАВЛЕННЫХ приглашений (status='pending',
+# см. InviteStats.sent — RPC-успех, не подтверждённое вступление) —
+# остановить ВЕСЬ запуск (текущий аккаунт заканчивается штатно, без
+# прерывания уже выполняющегося приглашения, остальные аккаунты и кампании
+# больше не трогаются, см. run()/_invite_candidate). already_participant/
+# errors в счёт не идут.
 TEST_MODE_MAX_SUCCESSFUL_INVITES = 30
 
 
@@ -120,25 +131,42 @@ class InviteStats:
     (_notify_account_result), и для итогового отчёта по кампании
     (_notify_campaign_result), чтобы не дублировать подсчёт статистики.
 
+    Бизнесу важны реально вступившие пользователи, а не успешные RPC (см.
+    задачу про подтверждение приглашений) — поэтому "успех" разделён на
+    два счётчика вместо одного:
+
+    sent — успешный InviteToChannelRequest/AddChatUserRequest, статус
+    'pending' (Telegram принял приглашение, но участие ещё не проверено).
+    joined — участие ДЕЙСТВИТЕЛЬНО подтверждено: либо через проверку
+    pending (см. _verify_pending_invites), либо сразу же по
+    UserAlreadyParticipantError (кандидат уже состоял в группе — тоже
+    подтверждённый участник, см. _classify_invite_error).
+    pending — из отправленных этой сессией (sent) осталось неподтверждённых
+    на момент завершения _execute_account (после проверки основной волны
+    и/или вся вторая волна, которую мы уже не проверяем, см. задачу: "после
+    дополнительной волны повторных циклов проверки не делать").
+
     invalid — кандидат, про которого достоверно известно, что приглашать
     его нельзя ПРИНЦИПИАЛЬНО (сейчас — только подтверждённый Telegram-бот,
     см. _classify_invite_error/_CandidateIsBotError) — status='invalid' в
     user_campaign_invites, отдельно от обычных failed/errors.
 
-    FloodWaitError сюда не попадает ни в одно поле (ни invited, ни errors):
+    FloodWaitError сюда не попадает ни в одно поле (ни sent, ни errors):
     это не отказ конкретному пользователю, а общее временное ограничение
     API (см. _invite_candidate) — кандидат остаётся кандидатом для
     следующего прогона, а не считается ни успехом, ни ошибкой."""
 
-    invited: int = 0
-    already_participant: int = 0
+    sent: int = 0
+    joined: int = 0
+    pending: int = 0
     invalid: int = 0
     errors: int = 0
 
     def __add__(self, other: "InviteStats") -> "InviteStats":
         return InviteStats(
-            invited=self.invited + other.invited,
-            already_participant=self.already_participant + other.already_participant,
+            sent=self.sent + other.sent,
+            joined=self.joined + other.joined,
+            pending=self.pending + other.pending,
             invalid=self.invalid + other.invalid,
             errors=self.errors + other.errors,
         )
@@ -149,15 +177,19 @@ class DryRunTelegramClient(Protocol):
     connect()/get_entity()/get_input_entity()/disconnect() (dry-run и
     execute) и __call__() (только execute — фактическая отправка запроса
     Telethon). get_input_entity() используется только в execute (см.
-    _resolve_input_peer) — dry-run её не трогает. Ни ImportChatInviteRequest,
-    ни какой-либо другой мутирующий метод сверх ровно одного приглашения на
-    кандидата здесь не вызывается."""
+    _resolve_input_peer) — dry-run её не трогает. get_permissions() —
+    только для проверки pending (см. _verify_pending_invites), тоже не
+    мутирующий вызов. Ни ImportChatInviteRequest, ни какой-либо другой
+    мутирующий метод сверх ровно одного приглашения на кандидата здесь не
+    вызывается."""
 
     async def connect(self) -> None: ...
 
     async def get_entity(self, entity): ...
 
     async def get_input_entity(self, entity): ...
+
+    async def get_permissions(self, entity, user): ...
 
     async def __call__(self, request): ...
 
@@ -254,8 +286,9 @@ def _format_account_notification(
         f"📨 Кампания: {campaign.name}\n\n"
         f"👤 Аккаунт: {account.name}\n\n"
         f"Время выполнения: {_format_duration(elapsed_seconds)}\n\n"
-        f"✅ Приглашено: {stats.invited}\n"
-        f"☑️ Уже состояли в группе: {stats.already_participant}\n"
+        f"📤 Отправлено приглашений: {stats.sent}\n"
+        f"✅ Подтверждено участников: {stats.joined}\n"
+        f"⏳ Ожидают подтверждения: {stats.pending}\n"
         f"🚫 Недоступны (invalid): {stats.invalid}\n"
         f"❌ Ошибок: {stats.errors}\n\n"
         f"Осталось кандидатов: {remaining}"
@@ -287,8 +320,9 @@ def _format_campaign_summary_notification(
         f'📊 Итоги кампании "{campaign.name}"\n\n'
         f"Время выполнения: {_format_duration(elapsed_seconds)}\n\n"
         f"Аккаунтов обработано: {accounts_processed}\n\n"
-        f"✅ Приглашено: {stats.invited}\n"
-        f"☑️ Уже состояли: {stats.already_participant}\n"
+        f"📤 Отправлено приглашений: {stats.sent}\n"
+        f"✅ Подтверждено участников: {stats.joined}\n"
+        f"⏳ Ожидают подтверждения: {stats.pending}\n"
         f"🚫 Недоступны: {stats.invalid}\n"
         f"❌ Ошибок: {stats.errors}\n\n"
         f"Осталось кандидатов: {remaining}\n\n"
@@ -368,7 +402,7 @@ class InviteErrorClassification:
     """Результат _classify_invite_error(exc).
 
     db_status/stat_field — что записать в user_campaign_invites и какое
-    поле InviteStats увеличить ("invited"/"already_participant"/"invalid"/
+    поле InviteStats увеличить ("sent"/"joined"/"pending"/"invalid"/
     "errors"; None — не увеличивать ничего, см. FloodWaitError).
     operator_message — человекочитаемый текст ТОЛЬКО для операторского
     уведомления при STOP_ACCOUNT/FATAL (см. _format_account_stopped_notification);
@@ -376,7 +410,11 @@ class InviteErrorClassification:
     изменений (см. InviterService._handle_invite_error).
     mark_as_bot — сохранить is_bot=1 в users.db (см.
     InviterService._mark_user_as_bot), чтобы этот кандидат больше никогда
-    не попадал в выборку ни для одной кампании."""
+    не попадал в выборку ни для одной кампании.
+    mark_verified_now — db_status="joined" получает verified_at=now сразу
+    же (см. UserAlreadyParticipantError — кандидат уже состоял в группе,
+    подтверждать через GetParticipantRequest/get_permissions нечего, это
+    уже само по себе подтверждение)."""
 
     action: InviteErrorAction
     db_status: str
@@ -384,6 +422,7 @@ class InviteErrorClassification:
     operator_message: str = ""
     wait_seconds: float | None = None
     mark_as_bot: bool = False
+    mark_verified_now: bool = False
 
 
 # Проблема только в конкретном кандидате (устарел/удалён/заблокировал этот
@@ -447,8 +486,12 @@ def _classify_invite_error(exc: Exception) -> InviteErrorClassification:
     (FATAL): такая ошибка не может быть проанализирована вовсе, поэтому
     тоже останавливает аккаунт, но логируется отдельно, с трассировкой."""
     if isinstance(exc, UserAlreadyParticipantError):
+        # Уже состоит в группе — это ТОЖЕ подтверждённый участник, просто
+        # без отдельной проверки через GetParticipantRequest/get_permissions
+        # (Telegram уже сказал прямо) — joined сразу же, а не pending.
         return InviteErrorClassification(
-            InviteErrorAction.SKIP_USER, db_status="invited", stat_field="already_participant",
+            InviteErrorAction.SKIP_USER, db_status="joined", stat_field="joined",
+            mark_verified_now=True,
         )
     if isinstance(exc, _CandidateIsBotError):
         return InviteErrorClassification(
@@ -556,20 +599,31 @@ class InviterService:
     есть, остаток дневного лимита > 0, connect() и резолв target_chat
     успешны, см. _execute_account) — неработающий аккаунт не тратит ни
     одного SQL-запроса выборки. Остаток дневного лимита считается по
-    факту из БД (daily_limit минус уже выполненные СЕГОДНЯ успешные
-    приглашения этого аккаунта по всем кампаниям, см.
-    UserCampaignInviteRepository.count_today_successful) — без единого
-    счётчика в памяти. Дальше — ровно один
-    InviteToChannelRequest/AddChatUserRequest на кандидата (см.
-    _build_invite_request), с немедленной записью результата
-    (status='invited'/'failed') сразу после каждого кандидата — не
-    дожидаясь конца партии, и случайной паузой после каждого (см.
-    _pause_between_invites). FloodWaitError < _MAX_TOLERABLE_FLOOD_WAIT_SECONDS
-    ждётся (exc.seconds) и не прерывает ни аккаунт, ни весь сервис;
-    FloodWaitError >= _MAX_TOLERABLE_FLOOD_WAIT_SECONDS и PeerFloodError
-    останавливают текущий аккаунт (с уведомлением оператора, см.
-    _format_account_stopped_notification) и переходят к следующему; сбой
-    самого аккаунта (например, обрыв connect()) не мешает остальным.
+    факту из БД (daily_limit минус уже ПОДТВЕРЖДЁННЫЕ сегодня участники
+    этого аккаунта по всем кампаниям, см.
+    UserCampaignInviteRepository.count_today_joined) — без единого
+    счётчика в памяти: бизнесу важны реально вступившие, а не успешные
+    RPC (см. задачу).
+
+    Каждое приглашение — ровно один InviteToChannelRequest/AddChatUserRequest
+    на кандидата (см. _build_invite_request), с немедленной записью
+    status='pending' (не 'invited' — участие ещё не подтверждено) сразу
+    после каждого кандидата, и случайной паузой после каждого (см.
+    _pause_between_invites). После основной волны — пауза (60 сек. если
+    отправлено < 20, иначе 5 мин., см. _wait_before_verifying_pending) и
+    проверка всех pending (см. _verify_pending_invites): подтверждённые
+    становятся 'joined'. Если после этого остаётся резерв дневного
+    лимита — ровно одна дополнительная волна добора, без повторной
+    проверки (см. _execute_account, максимум две волны за запуск).
+
+    FloodWaitError < _MAX_TOLERABLE_FLOOD_WAIT_SECONDS ждётся (exc.seconds)
+    и не прерывает ни аккаунт, ни весь сервис; FloodWaitError >=
+    _MAX_TOLERABLE_FLOOD_WAIT_SECONDS и PeerFloodError останавливают
+    текущий аккаунт (с уведомлением оператора, см.
+    _format_account_stopped_notification) и переходят к следующему — в
+    этом случае волна добора и проверка pending для этого аккаунта в этот
+    раз не выполняются; сбой самого аккаунта (например, обрыв connect())
+    не мешает остальным.
 
     В режиме execute=True после каждого обработанного аккаунта и после
     каждой кампании оператору отправляется краткая статистика (см.
@@ -628,7 +682,7 @@ class InviterService:
           между аккаунтами по смещению (Account1 — [0:d1], Account2 —
           [d1:d1+d2], и т.д., как и раньше).
         - execute=True, наоборот, каждым успешным приглашением сразу
-          пишет status='invited' (см. _record_invite_result), поэтому
+          пишет status='pending' (см. _record_invite_result), поэтому
           выборка кандидатов делается ОТДЕЛЬНО на каждый аккаунт, ПОСЛЕ
           того, как аккаунт подтвердил, что может приглашать (см.
           _execute_account) — и лимит для неё — остаток дневного лимита
@@ -643,9 +697,9 @@ class InviterService:
         if not accounts:
             return
 
-        # Счётчик успешных приглашений (status='invited') именно этого
-        # вызова run() — сбрасывается на каждый запуск, см.
-        # TEST_MODE_MAX_SUCCESSFUL_INVITES/_invite_candidate.
+        # Счётчик успешно ОТПРАВЛЕННЫХ приглашений (status='pending', RPC-
+        # успех) именно этого вызова run() — сбрасывается на каждый запуск,
+        # см. TEST_MODE_MAX_SUCCESSFUL_INVITES/_invite_candidate.
         self._successful_invites_count = 0
         limit_reached = False
 
@@ -773,6 +827,26 @@ class InviterService:
 
         return _format_dry_run_block(account, user_label, campaign.target_chat, ready=True)
 
+    def _remaining_daily_budget(self, account: TelegramAccount) -> int:
+        """daily_limit минус joined_today минус pending_today — а НЕ
+        только минус joined_today (см. задачу про перелив лимита).
+
+        pending — уже отправленное сегодня приглашение, которое пока не
+        подтверждено (joined) и не опровергнуто (not_joined, см.
+        _verify_pending_invites) — оно ВРЕМЕННО резервирует место в
+        дневном лимите: пока неизвестно, чем закончится приглашение, это
+        место нельзя отдать под нового кандидата, иначе суммарно
+        joined + pending может превысить daily_limit. Место освобождается
+        только когда pending становится joined (место остаётся занятым —
+        просто по другой причине) или not_joined (место освобождается
+        по-настоящему — Telegram достоверно подтвердил, что участия не
+        произошло). Используется и для расчёта ПЕРЕД основной волной, и
+        для расчёта ПЕРЕД единственной волной добора (см.
+        _execute_account) — одна и та же формула в обоих местах."""
+        joined = self._invite_repository.count_today_joined(account.id)
+        pending = self._invite_repository.count_today_pending(account.id)
+        return account.daily_limit - joined - pending
+
     async def _execute_account(
         self,
         campaign: InviteCampaign,
@@ -780,25 +854,32 @@ class InviterService:
         found: int,
     ) -> InviteStats | None:
         """Порядок специально такой (см. задачу про бесполезную выборку
-        кандидатов для неработающих аккаунтов и про daily_limit, не
-        учитывающий уже выполненные сегодня приглашения):
+        кандидатов для неработающих аккаунтов и про daily_limit, который
+        должен считаться по подтверждённым участникам, а не по успешным RPC):
 
         1. .session-файл (см. _default_session_checker) — самая дешёвая
            проверка, без единого запроса вообще.
         2. found == 0 — во всей кампании нет ни одного кандидата, ни один
            аккаунт не должен даже подключаться (см. test_execute_does_not_
            reinvite_user_on_next_run).
-        3. Остаток дневного лимита ЭТОГО аккаунта — daily_limit минус
-           фактически выполненные сегодня приглашения (см.
-           UserCampaignInviteRepository.count_today_successful, без
+        3. Остаток дневного лимита ЭТОГО аккаунта (см. _remaining_daily_budget
+           — daily_limit минус joined_today минус pending_today, без
            единого счётчика в памяти) — если <= 0, аккаунт полностью
            пропущен, тоже без единого SQL-запроса выборки кандидатов.
-        4. Только после этого — connect(), резолв campaign.target_chat
-           (убедиться, что аккаунтом вообще можно приглашать в эту
-           группу/канал), и ТОЛЬКО если это удалось — select_candidates()
-           с limit=остаток. Если аккаунт не может приглашать (не
-           подключился, target_chat не резолвится) — кандидаты не
-           выбираются вовсе.
+        4. connect(), резолв campaign.target_chat (убедиться, что аккаунтом
+           вообще можно приглашать в эту группу/канал) — если аккаунт не
+           может приглашать, кандидаты не выбираются вовсе.
+        5. Основная волна (см. _run_invite_wave) — до remaining кандидатов.
+        6. Если волна не была прервана (STOP_ACCOUNT/FATAL/лимит тестового
+           режима) — подождать (см. _wait_before_verifying_pending, по
+           числу реально отправленных) и проверить всех pending этого
+           аккаунта в этой кампании (см. _verify_pending_invites), включая
+           оставшихся с прошлых прогонов.
+        7. Пересчитать остаток лимита ПОСЛЕ проверки (см.
+           _remaining_daily_budget — уже с учётом того, что часть pending
+           стала joined/not_joined) и, если он > 0, выполнить РОВНО ОДНУ
+           дополнительную волну добора (см. задачу: максимум две волны за
+           запуск, без повторной проверки после второй).
 
         Возвращает None, если аккаунт был пропущен ПОЛНОСТЬЮ (сессии нет,
         found == 0 или остаток лимита исчерпан — не считается
@@ -806,7 +887,10 @@ class InviterService:
         уведомление оператору (см. _notify_account_result) отправляется
         ровно один раз в конце — и при обрыве connect()/резолва
         target_chat тоже (со стартовыми, скорее всего нулевыми,
-        счётчиками), и при обычном завершении."""
+        счётчиками), и при обычном завершении. stats.pending в конце —
+        ВСЕГДА текущее фактическое число pending в БД для этого аккаунта и
+        кампании (а не накопленный счётчик), независимо от того, как
+        далеко продвинулось выполнение в этот раз."""
         if not self._session_checker(account):
             logger.warning(_format_missing_session_message(account))
             return None
@@ -814,13 +898,13 @@ class InviterService:
         if found == 0:
             return None
 
-        today_successful = self._invite_repository.count_today_successful(account.id)
-        remaining = account.daily_limit - today_successful
+        remaining = self._remaining_daily_budget(account)
         if remaining <= 0:
             logger.info(
                 f"[EXECUTE]\nAccount: {account.name}\n"
-                f"Дневной лимит уже выполнен сегодня: {today_successful}/{account.daily_limit} "
-                f"успешных приглашений — аккаунт пропущен, выборка кандидатов не выполняется."
+                f"Дневной лимит уже выполнен сегодня (с учётом joined и "
+                f"ещё не подтверждённых pending) — аккаунт пропущен, "
+                f"выборка кандидатов не выполняется."
             )
             return None
 
@@ -864,28 +948,180 @@ class InviterService:
                         f"gigagroup={getattr(target_entity, 'gigagroup', None)}, "
                         f"access_hash={getattr(target_entity, 'access_hash', None)}"
                     )
-                    # Только теперь, когда подтверждено, что этим аккаунтом
-                    # можно приглашать — выборка кандидатов, с лимитом =
-                    # остаток дневного лимита (см. докстрок выше).
-                    candidates = self._invite_repository.select_candidates(
-                        campaign.id, limit=remaining,
+
+                    # Кандидаты, уже обработанные ЭТИМ вызовом
+                    # _execute_account (см. _run_invite_wave) — волна
+                    # добора не должна тут же повторно пытаться того же
+                    # кандидата, который только что провалился/оказался
+                    # ботом (status='failed'/'invalid' сами по себе не
+                    # исключаются из select_candidates() — это специально,
+                    # чтобы они остались кандидатами для СЛЕДУЮЩЕГО прогона).
+                    attempted_user_ids: set[int] = set()
+
+                    # Волна №1 (основная) — лимит = остаток дневного лимита
+                    # на момент старта (см. докстрок выше).
+                    stopped = await self._run_invite_wave(
+                        client, campaign, account, target_entity, remaining, found, stats,
+                        attempted_user_ids,
                     )
-                    logger.info(_format_candidates_block(campaign, account, candidates, found))
-                    for candidate in candidates:
-                        should_stop = await self._invite_candidate(
-                            client, campaign, account, target_entity, candidate, stats,
+
+                    if not stopped:
+                        await self._wait_before_verifying_pending(stats.sent)
+                        await self._verify_pending_invites(
+                            client, campaign, account, target_entity, stats,
                         )
-                        if should_stop:
-                            # PeerFlood, FloodWait >= _MAX_TOLERABLE_FLOOD_WAIT_SECONDS,
-                            # либо достигнут лимит успешных приглашений
-                            # тестового режима (см. _invite_candidate) —
-                            # остальные кандидаты этого аккаунта не трогаем.
-                            break
+
+                        top_up_remaining = self._remaining_daily_budget(account)
+                        if top_up_remaining > 0:
+                            # Волна №2 (добор) — РОВНО одна, без повторной
+                            # проверки/ожидания после неё (см. докстрок).
+                            await self._run_invite_wave(
+                                client, campaign, account, target_entity,
+                                top_up_remaining, found, stats, attempted_user_ids,
+                            )
+
+                    # Фактическое число pending прямо сейчас — включает и
+                    # неподтверждённые из волны №1, и всю волну №2 (её мы
+                    # не проверяем в этом запуске, см. докстрок).
+                    stats.pending = len(
+                        self._invite_repository.list_pending(account.id, campaign.id)
+                    )
         finally:
             await client.disconnect()
 
         await self._notify_account_result(campaign, account, stats, time.monotonic() - started_at)
         return stats
+
+    async def _run_invite_wave(
+        self,
+        client: DryRunTelegramClient,
+        campaign: InviteCampaign,
+        account: TelegramAccount,
+        target_entity,
+        limit: int,
+        found: int,
+        stats: InviteStats,
+        attempted_user_ids: set[int],
+    ) -> bool:
+        """Одна волна: выбрать до limit кандидатов (см.
+        UserCampaignInviteRepository.select_candidates) и пригласить
+        каждого (см. _invite_candidate) — используется и для основной
+        волны, и для волны добора (см. _execute_account).
+
+        attempted_user_ids — user_id, уже обработанные ЭТИМ вызовом
+        _execute_account (в т.ч. предыдущей волной) — исключаются из ЭТОЙ
+        волны в Python, а не в SQL: select_candidates() не исключает
+        status='failed'/'invalid'/'not_joined' (это специально — они
+        остаются кандидатами для СЛЕДУЮЩЕГО прогона, см. задачу), но волна
+        добора не должна тут же, в рамках одного запуска, повторно
+        пытаться того же кандидата, который только что провалился,
+        оказался ботом или не подтвердил участие при проверке.
+        Пополняется прямо здесь.
+
+        limit + len(attempted_user_ids) запрашивается у select_candidates()
+        (а не просто limit) — иначе, если самые "свежие" (last_seen_at
+        DESC) записи в БД совпадут с уже обработанными в этом запуске (см.
+        выше — они не исключены на уровне SQL), волна добора могла бы
+        получить меньше limit НОВЫХ кандидатов, хотя более старые (но
+        ещё не тронутые) в пуле есть. Запас размером len(attempted_user_ids)
+        гарантирует, что после фильтрации в Python останется как минимум
+        limit кандидатов, если они вообще существуют.
+
+        Возвращает True, если аккаунт должен немедленно прекратить
+        обработку ОСТАЛЬНЫХ кандидатов ЭТОЙ волны (см.
+        _classify_invite_error — STOP_ACCOUNT/FATAL, либо достигнут лимит
+        успешных отправок тестового режима, см. _invite_candidate) —
+        вызывающий код (_execute_account) тогда не выполняет ни проверку
+        pending, ни волну добора."""
+        raw_candidates = self._invite_repository.select_candidates(
+            campaign.id, limit=limit + len(attempted_user_ids),
+        )
+        candidates = [c for c in raw_candidates if c.user_id not in attempted_user_ids][:limit]
+        logger.info(_format_candidates_block(campaign, account, candidates, found))
+        for candidate in candidates:
+            attempted_user_ids.add(candidate.user_id)
+            should_stop = await self._invite_candidate(
+                client, campaign, account, target_entity, candidate, stats,
+            )
+            if should_stop:
+                return True
+        return False
+
+    async def _wait_before_verifying_pending(self, sent_count: int) -> None:
+        """После волны приглашений (см. _execute_account) — ждём, чтобы
+        Telegram успел обработать вступление, прежде чем проверять pending
+        (см. _verify_pending_invites): большие пачки Telegram может
+        обрабатывать не мгновенно (см. задачу), поэтому им — больше
+        времени. sent_count — сколько реально ОТПРАВЛЕНО (успешных
+        InviteToChannelRequest/AddChatUserRequest) именно этой волной, а
+        не число кандидатов вообще."""
+        wait_seconds = (
+            _PENDING_CHECK_LONG_WAIT_SECONDS
+            if sent_count >= _PENDING_CHECK_BATCH_THRESHOLD
+            else _PENDING_CHECK_SHORT_WAIT_SECONDS
+        )
+        await asyncio.sleep(wait_seconds)
+
+    async def _verify_pending_invites(
+        self,
+        client: DryRunTelegramClient,
+        campaign: InviteCampaign,
+        account: TelegramAccount,
+        target_entity,
+        stats: InviteStats,
+    ) -> None:
+        """Для каждого status='pending' этого аккаунта в этой кампании (см.
+        UserCampaignInviteRepository.list_pending — включая оставшихся с
+        прошлых прогонов, если процесс прерывался между отправкой и
+        проверкой) — проверяет, стал ли кандидат подтверждённым участником
+        через client.get_permissions(target_entity, user): тот же метод,
+        которым сам Telethon реализует и GetParticipantRequest (для
+        каналов/супергрупп), и проверку через GetFullChatRequest (для
+        обычных group chat) — единый API, не завязанный на тип
+        target_entity (см. задачу: "GetParticipantRequest или наиболее
+        подходящий Telethon API").
+
+        Три исхода — и только UserNotParticipantError освобождает
+        зарезервированное этим pending место в дневном лимите (см.
+        _remaining_daily_budget/count_today_pending и задачу про перелив
+        лимита: место освобождается ТОЛЬКО когда мы ДОСТОВЕРНО знаем, что
+        участия не произошло, а не при любом сбое проверки):
+
+        - Подтверждён (get_permissions успешна) — status='joined',
+          verified_at=сейчас, stats.joined. Место в лимите остаётся
+          занятым — просто теперь учитывается count_today_joined, а не
+          count_today_pending.
+        - UserNotParticipantError — Telegram ЯВНО говорит "не участник":
+          status='not_joined', verified_at=сейчас — единственный случай,
+          когда занятое место по-настоящему освобождается (not_joined не
+          считается ни в count_today_joined, ни в count_today_pending).
+          Как и 'failed', не исключается из будущей выборки — кандидат
+          может быть приглашён повторно в СЛЕДУЮЩЕМ прогоне.
+        - Любой другой сбой самой проверки (сеть, таймаут и т.п.) — мы
+          НЕ уверены, остаётся 'pending' без изменений, место остаётся
+          зарезервированным; итоговое stats.pending считает
+          _execute_account по факту из БД, а не здесь."""
+        pending = self._invite_repository.list_pending(account.id, campaign.id)
+        for invite in pending:
+            try:
+                user_ref = await client.get_input_entity(invite.user_id)
+                await client.get_permissions(target_entity, user_ref)
+            except UserNotParticipantError:
+                self._invite_repository.update(
+                    invite.id, status="not_joined", verified_at=datetime.now(timezone.utc),
+                )
+                continue
+            except Exception as exc:
+                logger.warning(
+                    f"[EXECUTE]\nAccount: {account.name}\nUser: {invite.user_id}\n"
+                    f"Не удалось проверить участие в группе: {exc}"
+                )
+                continue
+
+            self._invite_repository.update(
+                invite.id, status="joined", verified_at=datetime.now(timezone.utc),
+            )
+            stats.joined += 1
 
     async def _invite_candidate(
         self,
@@ -929,11 +1165,14 @@ class InviterService:
                 exc, campaign, account, candidate, stats, user_label,
             )
         else:
+            # Telegram принял приглашение — это ещё не подтверждённое
+            # участие (см. задачу): status='pending', пока
+            # _verify_pending_invites не подтвердит вступление.
             logger.info(
-                _format_execute_block(account, user_label, campaign.target_chat, status="invited")
+                _format_execute_block(account, user_label, campaign.target_chat, status="pending")
             )
-            self._record_invite_result(campaign, account, candidate, status="invited")
-            stats.invited += 1
+            self._record_invite_result(campaign, account, candidate, status="pending")
+            stats.sent += 1
             self._successful_invites_count += 1
             await self._pause_between_invites()
             if (
@@ -973,7 +1212,7 @@ class InviterService:
         if classification.mark_as_bot:
             self._mark_user_as_bot(candidate.user_id)
 
-        log_fn = logger.info if classification.db_status in ("invited", "invalid") else logger.warning
+        log_fn = logger.info if classification.db_status in ("joined", "invalid") else logger.warning
         log_fn(
             _format_execute_block(
                 account, user_label, campaign.target_chat,
@@ -984,7 +1223,8 @@ class InviterService:
         self._record_invite_result(
             campaign, account, candidate,
             status=classification.db_status,
-            error=None if classification.db_status == "invited" else raw_text,
+            error=None if classification.db_status == "joined" else raw_text,
+            verified_at=datetime.now(timezone.utc) if classification.mark_verified_now else None,
         )
         if classification.stat_field is not None:
             setattr(stats, classification.stat_field, getattr(stats, classification.stat_field) + 1)
@@ -1163,14 +1403,21 @@ class InviterService:
         *,
         status: str,
         error: str | None = None,
+        verified_at: datetime | None = None,
     ) -> None:
+        """invited_at — момент, когда InviteToChannelRequest/AddChatUserRequest
+        был принят Telegram (status='pending'/'joined' — оба начинаются
+        отправкой); verified_at — момент ДЕЙСТВИТЕЛЬНОГО подтверждения
+        участия (только для status='joined', см. _classify_invite_error/
+        _verify_pending_invites)."""
         self._invite_repository.create(
             user_id=candidate.user_id,
             campaign_id=campaign.id,
             account_id=account.id,
             status=status,
             error=error,
-            invited_at=datetime.now(timezone.utc) if status == "invited" else None,
+            invited_at=datetime.now(timezone.utc) if status in ("pending", "joined") else None,
+            verified_at=verified_at,
         )
 
     async def _notify_account_result(

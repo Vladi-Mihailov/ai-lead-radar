@@ -95,6 +95,56 @@ def test_reopening_database_does_not_fail_and_preserves_data(tmp_path):
         second_repository.close()
 
 
+def test_user_campaign_invites_migrates_legacy_table_without_verified_at(tmp_path):
+    """БД, созданная до появления verified_at (подтверждённое вступление,
+    см. задачу про pending -> joined), должна получить эту колонку при
+    открытии — без пересоздания таблицы и без потери уже существующих
+    записей."""
+    db_path = tmp_path / "inviter.db"
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE user_campaign_invites (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      INTEGER NOT NULL,
+                campaign_id  INTEGER NOT NULL,
+                account_id   INTEGER,
+                status       TEXT NOT NULL DEFAULT 'pending',
+                error        TEXT,
+                invited_at   TIMESTAMP,
+                created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO user_campaign_invites (user_id, campaign_id, status) "
+            "VALUES (111, 1, 'invited')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    repository = UserCampaignInviteRepository(db_path)
+    try:
+        columns = {row[1] for row in repository._conn.execute(
+            "PRAGMA table_info(user_campaign_invites)"
+        )}
+        assert "verified_at" in columns
+
+        invites = repository.list()
+        assert len(invites) == 1
+        assert invites[0].user_id == 111
+        assert invites[0].verified_at is None
+
+        updated = repository.update(invites[0].id, status="joined", verified_at=datetime.now(timezone.utc))
+        assert updated.verified_at is not None
+    finally:
+        repository.close()
+
+
 # ---- TelegramAccountRepository: create/get/update/list ----
 
 
@@ -220,52 +270,153 @@ def test_user_campaign_invite_update_rejects_unknown_field(tmp_path):
         repository.close()
 
 
-# ---- UserCampaignInviteRepository.count_today_successful() ----
+# ---- UserCampaignInviteRepository.count_today_joined() ----
 
 
-def test_count_today_successful_counts_only_todays_invited_for_this_account(tmp_path):
-    """Считаются только status='invited' с invited_at начиная с начала
+def test_count_today_joined_counts_only_todays_joined_for_this_account(tmp_path):
+    """Считаются только status='joined' с verified_at начиная с начала
     текущих суток (UTC) И именно для этого account_id — другой аккаунт,
-    вчерашние приглашения и статус, отличный от 'invited' (например
-    'failed'), не должны попадать в счёт (см. задачу про daily_limit, не
-    учитывающий уже выполненные сегодня приглашения)."""
+    вчерашнее подтверждение и статус, отличный от 'joined' (например
+    'pending'/'failed'), не должны попадать в счёт (см. задачу про
+    daily_limit, который должен считаться по фактически подтверждённым
+    участникам, а не по успешным RPC/invited_at)."""
     repository = UserCampaignInviteRepository(tmp_path / "inviter.db")
     try:
         now = datetime.now(timezone.utc)
         yesterday = now - timedelta(days=1)
 
-        repository.create(user_id=1, campaign_id=1, account_id=7, status="invited", invited_at=now)
-        repository.create(user_id=2, campaign_id=1, account_id=7, status="invited", invited_at=now)
+        repository.create(user_id=1, campaign_id=1, account_id=7, status="joined", invited_at=now, verified_at=now)
+        repository.create(user_id=2, campaign_id=1, account_id=7, status="joined", invited_at=now, verified_at=now)
         # Не должны попасть в счёт account_id=7:
-        repository.create(user_id=3, campaign_id=1, account_id=8, status="invited", invited_at=now)  # другой аккаунт
-        repository.create(user_id=4, campaign_id=1, account_id=7, status="invited", invited_at=yesterday)  # вчера
-        repository.create(user_id=5, campaign_id=1, account_id=7, status="failed", error="boom")  # не invited
+        repository.create(user_id=3, campaign_id=1, account_id=8, status="joined", invited_at=now, verified_at=now)  # другой аккаунт
+        repository.create(user_id=4, campaign_id=1, account_id=7, status="joined", invited_at=yesterday, verified_at=yesterday)  # вчера
+        repository.create(user_id=5, campaign_id=1, account_id=7, status="pending", invited_at=now)  # ещё не подтверждён
+        repository.create(user_id=6, campaign_id=1, account_id=7, status="failed", error="boom")  # не joined
 
-        assert repository.count_today_successful(7) == 2
-        assert repository.count_today_successful(8) == 1
-        assert repository.count_today_successful(999) == 0
+        assert repository.count_today_joined(7) == 2
+        assert repository.count_today_joined(8) == 1
+        assert repository.count_today_joined(999) == 0
     finally:
         repository.close()
 
 
-def test_count_today_successful_sums_across_campaigns_for_same_account(tmp_path):
+def test_count_today_joined_sums_across_campaigns_for_same_account(tmp_path):
     """daily_limit — свойство самого TelegramAccount, а не пары
-    (account, campaign) — счётчик должен суммировать успешные приглашения
-    этого аккаунта по ВСЕМ кампаниям сразу, а не по одной."""
+    (account, campaign) — счётчик должен суммировать подтверждённые
+    вступления этого аккаунта по ВСЕМ кампаниям сразу, а не по одной."""
     repository = UserCampaignInviteRepository(tmp_path / "inviter.db")
     try:
         now = datetime.now(timezone.utc)
-        repository.create(user_id=1, campaign_id=1, account_id=7, status="invited", invited_at=now)
-        repository.create(user_id=2, campaign_id=2, account_id=7, status="invited", invited_at=now)
+        repository.create(user_id=1, campaign_id=1, account_id=7, status="joined", invited_at=now, verified_at=now)
+        repository.create(user_id=2, campaign_id=2, account_id=7, status="joined", invited_at=now, verified_at=now)
 
-        assert repository.count_today_successful(7) == 2
+        assert repository.count_today_joined(7) == 2
     finally:
         repository.close()
 
 
-def test_count_today_successful_returns_zero_when_no_invites_at_all(tmp_path):
+def test_count_today_joined_returns_zero_when_no_invites_at_all(tmp_path):
     repository = UserCampaignInviteRepository(tmp_path / "inviter.db")
     try:
-        assert repository.count_today_successful(1) == 0
+        assert repository.count_today_joined(1) == 0
+    finally:
+        repository.close()
+
+
+def test_count_today_joined_ignores_pending_even_if_invited_at_is_today(tmp_path):
+    """Приглашение, которое ещё ждёт подтверждения (status='pending',
+    verified_at не задан) — не должно попадать в count_today_joined(),
+    даже если invited_at (момент отправки) — сегодня. Это и есть суть
+    исправления: считаем реально вступивших, а не отправленные приглашения."""
+    repository = UserCampaignInviteRepository(tmp_path / "inviter.db")
+    try:
+        now = datetime.now(timezone.utc)
+        repository.create(user_id=1, campaign_id=1, account_id=7, status="pending", invited_at=now)
+
+        assert repository.count_today_joined(7) == 0
+    finally:
+        repository.close()
+
+
+# ---- UserCampaignInviteRepository.count_today_pending() ----
+
+
+def test_count_today_pending_counts_only_todays_pending_for_this_account(tmp_path):
+    """Считаются только status='pending' с invited_at начиная с начала
+    текущих суток (UTC) И именно для этого account_id — другой аккаунт,
+    вчерашние отправки и статус, отличный от 'pending' (joined/not_joined/
+    failed), не должны попадать в счёт (см. задачу про перелив лимита:
+    pending временно резервирует место, пока не разрешится)."""
+    repository = UserCampaignInviteRepository(tmp_path / "inviter.db")
+    try:
+        now = datetime.now(timezone.utc)
+        yesterday = now - timedelta(days=1)
+
+        repository.create(user_id=1, campaign_id=1, account_id=7, status="pending", invited_at=now)
+        repository.create(user_id=2, campaign_id=1, account_id=7, status="pending", invited_at=now)
+        # Не должны попасть в счёт account_id=7:
+        repository.create(user_id=3, campaign_id=1, account_id=8, status="pending", invited_at=now)  # другой аккаунт
+        repository.create(user_id=4, campaign_id=1, account_id=7, status="pending", invited_at=yesterday)  # вчера
+        repository.create(user_id=5, campaign_id=1, account_id=7, status="joined", invited_at=now, verified_at=now)  # уже разрешён
+        repository.create(user_id=6, campaign_id=1, account_id=7, status="not_joined", invited_at=now, verified_at=now)  # уже разрешён
+        repository.create(user_id=7, campaign_id=1, account_id=7, status="failed", error="boom")  # не pending
+
+        assert repository.count_today_pending(7) == 2
+        assert repository.count_today_pending(8) == 1
+        assert repository.count_today_pending(999) == 0
+    finally:
+        repository.close()
+
+
+def test_count_today_pending_sums_across_campaigns_for_same_account(tmp_path):
+    """daily_limit — свойство самого TelegramAccount, а не пары (account,
+    campaign) — счётчик должен суммировать pending этого аккаунта по ВСЕМ
+    кампаниям сразу, а не по одной (как и count_today_joined)."""
+    repository = UserCampaignInviteRepository(tmp_path / "inviter.db")
+    try:
+        now = datetime.now(timezone.utc)
+        repository.create(user_id=1, campaign_id=1, account_id=7, status="pending", invited_at=now)
+        repository.create(user_id=2, campaign_id=2, account_id=7, status="pending", invited_at=now)
+
+        assert repository.count_today_pending(7) == 2
+    finally:
+        repository.close()
+
+
+def test_count_today_pending_returns_zero_when_no_invites_at_all(tmp_path):
+    repository = UserCampaignInviteRepository(tmp_path / "inviter.db")
+    try:
+        assert repository.count_today_pending(1) == 0
+    finally:
+        repository.close()
+
+
+# ---- UserCampaignInviteRepository.list_pending() ----
+
+
+def test_list_pending_returns_only_pending_for_this_account_and_campaign(tmp_path):
+    repository = UserCampaignInviteRepository(tmp_path / "inviter.db")
+    try:
+        now = datetime.now(timezone.utc)
+        pending = repository.create(
+            user_id=1, campaign_id=1, account_id=7, status="pending", invited_at=now,
+        )
+        repository.create(user_id=2, campaign_id=1, account_id=7, status="joined", invited_at=now, verified_at=now)
+        repository.create(user_id=3, campaign_id=2, account_id=7, status="pending", invited_at=now)  # другая кампания
+        repository.create(user_id=4, campaign_id=1, account_id=8, status="pending", invited_at=now)  # другой аккаунт
+
+        result = repository.list_pending(7, 1)
+
+        assert [i.id for i in result] == [pending.id]
+        assert result[0].user_id == 1
+        assert result[0].status == "pending"
+    finally:
+        repository.close()
+
+
+def test_list_pending_returns_empty_when_none_pending(tmp_path):
+    repository = UserCampaignInviteRepository(tmp_path / "inviter.db")
+    try:
+        assert repository.list_pending(7, 1) == []
     finally:
         repository.close()
