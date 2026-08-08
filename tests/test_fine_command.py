@@ -47,6 +47,23 @@ class _FakeProvider(FineProvider):
         return self._records_by_car.get(plate, [])
 
 
+class _SelectiveFailingProvider(FineProvider):
+    """Как _FakeProvider, но падает только для номеров из fail_for — нужен,
+    чтобы проверить, что ошибка проверки ОДНОГО автомобиля в fine
+    update-all не останавливает проверку остальных."""
+
+    def __init__(self, records_by_car=None, fail_for=()):
+        self._records_by_car = records_by_car or {}
+        self._fail_for = set(fail_for)
+        self.requested_plates: list[str] = []
+
+    async def search_by_plate(self, plate: str) -> list[ParsedFineRecord]:
+        self.requested_plates.append(plate)
+        if plate in self._fail_for:
+            raise FineProviderError(f"police.ge недоступен для {plate}")
+        return self._records_by_car.get(plate, [])
+
+
 class _FakeNotificationService(NotificationService):
     def __init__(self):
         self.notify_calls: list[list] = []
@@ -77,21 +94,41 @@ def _record(
     )
 
 
-def _ctx(args: list[str], *, chat_id=_CHAT_ID, user_id=_USER_ID) -> CommandContext:
+def _ctx(args: list[str], *, chat_id=_CHAT_ID, user_id=_USER_ID, event=None) -> CommandContext:
     return CommandContext(
-        chat_id=chat_id, user_id=user_id, args=args, raw_text="fine " + " ".join(args), event=None
+        chat_id=chat_id, user_id=user_id, args=args, raw_text="fine " + " ".join(args), event=event
     )
+
+
+class _FakeEvent:
+    """Достаточно Telethon event.respond() для fine update-all — минимум,
+    нужный только чтобы проверить, что стартовое сообщение реально
+    отправляется через event, а не просто печатается в лог."""
+
+    def __init__(self):
+        self.responses: list[str] = []
+
+    async def respond(self, text: str) -> None:
+        self.responses.append(text)
+
+
+def _split_into_args(multiline_text: str) -> list[str]:
+    """Имитирует ТОЧНО то же разбиение, что делает CommandDispatcher —
+    text.strip().split() (см. reader/commands/dispatcher.py) — на реальном
+    многострочном Telegram-сообщении, а не на уже готовом списке токенов:
+    перевод строки для str.split() ничем не отличается от пробела."""
+    return multiline_text.strip().split()
 
 
 class _Fixture:
     """Полный набор реальных зависимостей (кроме FineProvider/NotificationService)
     — тот же граф объектов, что собирает reader/main.py."""
 
-    def __init__(self, tmp_path, records_by_car=None, provider_error=None):
+    def __init__(self, tmp_path, records_by_car=None, provider_error=None, provider=None):
         db_path = tmp_path / "users.db"
         self.task_repository = FineMonitoringTaskRepository(db_path)
         self.detected_fine_repository = DetectedFineRepository(db_path)
-        self.provider = _FakeProvider(records_by_car, error=provider_error)
+        self.provider = provider if provider is not None else _FakeProvider(records_by_car, error=provider_error)
         self.check_service = FineCheckService(
             self.provider, self.task_repository, self.detected_fine_repository
         )
@@ -335,6 +372,147 @@ async def test_fine_add_bulk_accepts_exactly_the_limit(fx):
     assert len(fx.task_repository.list_active()) == 100
 
 
+# ---- fine add-bulk (многострочное Telegram-сообщение) ----
+
+
+async def test_fine_add_bulk_command_from_real_multiline_telegram_message(fx):
+    # Именно так текст выглядел бы в реальном Telegram-сообщении — одна
+    # команда "fine add-bulk", затем каждый номер на отдельной строке.
+    raw_text = "fine add-bulk\nA111AA111\nB222BB222\nC333CC333"
+    args = _split_into_args(raw_text)[1:]  # диспетчер отдаёт "fine" отдельно
+
+    result = await fx.command.handle(_ctx(args))
+
+    assert "Добавлено: 3" in result.text
+    assert "Уже в мониторинге: 0" in result.text
+    assert "Некорректных: 0" in result.text
+    assert "Ошибок: 0" in result.text
+
+    car_numbers = {task.car_number for task in fx.task_repository.list_active()}
+    assert car_numbers == {"A111AA111", "B222BB222", "C333CC333"}
+
+
+async def test_fine_add_bulk_command_produces_identical_task_to_sequential_fine_add(fx):
+    # "fine add-bulk" в одном сообщении должно давать ИДЕНТИЧНЫЙ результат
+    # последовательным fine add NUMBER — сравниваем реально созданные
+    # задачи (все поля, кроме car_number/id/created_at), а не только счётчики.
+    await fx.command.handle(_ctx(["add", "A111AA111"]))
+    [via_single_add] = fx.task_repository.list_active()
+
+    await fx.command.handle(_ctx(["add-bulk", "B222BB222"]))
+    tasks = {t.car_number: t for t in fx.task_repository.list_active()}
+    via_bulk = tasks["B222BB222"]
+
+    assert via_bulk.start_date == via_single_add.start_date
+    assert via_bulk.end_date == via_single_add.end_date
+    assert via_bulk.status == via_single_add.status == "active"
+    assert via_bulk.telegram_chat_id == via_single_add.telegram_chat_id == _CHAT_ID
+    assert via_bulk.created_by_user_id == via_single_add.created_by_user_id == _USER_ID
+    assert via_bulk.label == via_single_add.label is None
+
+
+async def test_fine_add_bulk_command_accepts_comma_separated_numbers(fx):
+    result = await fx.command.handle(_ctx(["add-bulk", "H663KH702,C072H0977", "M012KT193"]))
+
+    assert "Добавлено: 3" in result.text
+    car_numbers = {task.car_number for task in fx.task_repository.list_active()}
+    assert car_numbers == {"H663KH702", "C072H0977", "M012KT193"}
+
+
+async def test_fine_add_bulk_command_accepts_space_separated_numbers(fx):
+    result = await fx.command.handle(_ctx(["add-bulk", "H663KH702", "C072H0977"]))
+
+    assert "Добавлено: 2" in result.text
+    car_numbers = {task.car_number for task in fx.task_repository.list_active()}
+    assert car_numbers == {"H663KH702", "C072H0977"}
+
+
+async def test_fine_add_bulk_command_reports_already_in_monitoring(fx):
+    await fx.command.handle(_ctx(["add", "H663KH702"]))
+
+    result = await fx.command.handle(_ctx(["add-bulk", "H663KH702", "C072H0977"]))
+
+    assert "Добавлено: 1" in result.text
+    assert "Уже в мониторинге: 1" in result.text
+    assert len(fx.task_repository.list_active()) == 2
+
+
+async def test_fine_add_bulk_command_deduplicates_within_message(fx):
+    # Дубль внутри самого сообщения — второе появление того же номера
+    # обрабатывается тем же путём, что и "уже в мониторинге" (см.
+    # _handle_add_bulk_command): validate_no_overlap() внутри _handle_add()
+    # уже видит задачу, созданную первым появлением этого же номера.
+    result = await fx.command.handle(
+        _ctx(["add-bulk", "H663KH702", "h663kh702", "C072H0977"])
+    )
+
+    assert "Добавлено: 2" in result.text
+    assert "Уже в мониторинге: 1" in result.text
+    car_numbers = sorted(task.car_number for task in fx.task_repository.list_active())
+    assert car_numbers == ["C072H0977", "H663KH702"]
+
+
+async def test_fine_add_bulk_command_reports_invalid_number_among_valid_ones(fx):
+    result = await fx.command.handle(
+        _ctx(["add-bulk", "H663KH702", "AA-001-AA", "C072H0977"])
+    )
+
+    assert "Добавлено: 2" in result.text
+    assert "Некорректных: 1" in result.text
+    assert "Некорректные номера:" in result.text
+    assert "• AA-001-AA — " in result.text
+
+    car_numbers = {task.car_number for task in fx.task_repository.list_active()}
+    assert car_numbers == {"H663KH702", "C072H0977"}
+
+
+async def test_fine_add_bulk_command_error_on_one_number_does_not_block_others(fx, monkeypatch):
+    original_create = fx.task_repository.create
+
+    def failing_create(*, car_number, **kwargs):
+        if car_number == "C072H0977":
+            raise RuntimeError("simulated db failure")
+        return original_create(car_number=car_number, **kwargs)
+
+    monkeypatch.setattr(fx.task_repository, "create", failing_create)
+
+    result = await fx.command.handle(
+        _ctx(["add-bulk", "H663KH702", "C072H0977", "M012KT193"])
+    )
+
+    assert "Добавлено: 2" in result.text
+    assert "Ошибок: 1" in result.text
+    assert "Ошибки:" in result.text
+    assert "• C072H0977 — simulated db failure" in result.text
+
+    car_numbers = {task.car_number for task in fx.task_repository.list_active()}
+    assert car_numbers == {"H663KH702", "M012KT193"}
+
+
+async def test_fine_add_bulk_command_with_no_car_numbers_shows_format_example(fx):
+    with pytest.raises(CommandError) as exc_info:
+        await fx.command.handle(_ctx(["add-bulk"]))
+
+    assert "Неверный формат команды" in exc_info.value.message
+    assert "fine add-bulk" in exc_info.value.message
+    assert fx.task_repository.list_active() == []
+
+
+async def test_fine_add_bulk_command_uses_default_period_like_single_add(fx):
+    await fx.command.handle(_ctx(["add-bulk", "H663KH702"]))
+
+    [task] = fx.task_repository.list_active()
+    assert (task.end_date - task.start_date) == timedelta(days=30)
+
+
+async def test_fine_add_bulk_command_does_not_affect_existing_add_bulk_command(fx):
+    # fine add bulk (пробелом) — старая, отдельная от add-bulk команда,
+    # должна продолжать работать буквально без изменений.
+    result = await fx.command.handle(_ctx(["add", "bulk", "H663KH702", "C072H0977"]))
+
+    assert result.text == "✅ Добавлено: 2\n⚠️ Уже отслеживаются: 0\n❌ Ошибок: 0"
+
+
 # ---- fine list ----
 
 
@@ -552,6 +730,136 @@ async def test_fine_check_checks_all_active_tasks_for_car_number(tmp_path):
         assert "Новых: 4" in result.text
     finally:
         fx.close()
+
+
+# ---- fine update-all ----
+
+
+async def test_fine_update_all_checks_all_active_car_numbers(tmp_path):
+    fx = _Fixture(
+        tmp_path,
+        records_by_car={
+            "AA001AA": [_record(car_number="AA001AA", fingerprint="fp-1")],
+            "BB002BB": [],
+        },
+    )
+    try:
+        await fx.command.handle(_ctx(["add", "AA001AA"]))
+        await fx.command.handle(_ctx(["add", "BB002BB"]))
+
+        result = await fx.command.handle(_ctx(["update-all"]))
+
+        assert sorted(fx.provider.requested_plates) == ["AA001AA", "BB002BB"]
+        assert "✅ Массовая проверка завершена" in result.text
+        assert "Всего: 2" in result.text
+        assert "Проверено: 2" in result.text
+        assert "Новые штрафы: 1" in result.text
+        assert "Ошибок: 0" in result.text
+    finally:
+        fx.close()
+
+
+async def test_fine_update_all_sends_start_message_via_event_then_final_summary(tmp_path):
+    fx = _Fixture(tmp_path, records_by_car={"AA001AA": [_record(car_number="AA001AA")]})
+    try:
+        await fx.command.handle(_ctx(["add", "AA001AA"]))
+        await fx.command.handle(_ctx(["add", "BB002BB"]))
+
+        event = _FakeEvent()
+        result = await fx.command.handle(_ctx(["update-all"], event=event))
+
+        # Ровно одно промежуточное сообщение (старт) — не по одному на
+        # каждый из активных автомобилей.
+        assert event.responses == ["🔄 Запущена проверка 2 автомобилей"]
+        assert "✅ Массовая проверка завершена" in result.text
+    finally:
+        fx.close()
+
+
+async def test_fine_update_all_without_event_does_not_crash(fx):
+    # ctx.event is None (как во всех остальных тестах этого файла) — команда
+    # должна просто пропустить стартовое сообщение, а не упасть.
+    await fx.command.handle(_ctx(["add", "AA001AA"]))
+
+    result = await fx.command.handle(_ctx(["update-all"]))
+
+    assert "✅ Массовая проверка завершена" in result.text
+
+
+async def test_fine_update_all_skips_inactive_car_numbers(fx):
+    await fx.command.handle(_ctx(["add", "AA001AA"]))
+    await fx.command.handle(_ctx(["add", "BB002BB"]))
+    await fx.command.handle(_ctx(["stop", "BB002BB"]))
+
+    result = await fx.command.handle(_ctx(["update-all"]))
+
+    assert fx.provider.requested_plates == ["AA001AA"]
+    assert "Всего: 1" in result.text
+
+
+async def test_fine_update_all_error_on_one_car_does_not_stop_others(tmp_path):
+    provider = _SelectiveFailingProvider(
+        records_by_car={"BB002BB": [_record(car_number="BB002BB")]},
+        fail_for={"AA001AA"},
+    )
+    fx = _Fixture(tmp_path, provider=provider)
+    try:
+        await fx.command.handle(_ctx(["add", "AA001AA"]))
+        await fx.command.handle(_ctx(["add", "BB002BB"]))
+
+        result = await fx.command.handle(_ctx(["update-all"]))
+
+        assert sorted(provider.requested_plates) == ["AA001AA", "BB002BB"]
+        assert "Всего: 2" in result.text
+        assert "Проверено: 1" in result.text
+        assert "Новые штрафы: 1" in result.text
+        assert "Ошибок: 1" in result.text
+        assert "• AA001AA — police.ge недоступен для AA001AA" in result.text
+    finally:
+        fx.close()
+
+
+async def test_fine_update_all_uses_same_check_task_mechanism_and_notifies(tmp_path):
+    fx = _Fixture(
+        tmp_path, records_by_car={"AA001AA": [_record(car_number="AA001AA", fingerprint="fp-1")]},
+    )
+    try:
+        await fx.command.handle(_ctx(["add", "AA001AA"]))
+
+        await fx.command.handle(_ctx(["update-all"]))
+
+        # То же самое, что делает FineCheckService.check_task() + flush_pending()
+        # для fine check/FineJob — не отдельная логика доставки.
+        assert len(fx.notification_service.notify_calls) == 1
+        task_id = fx.task_repository.list_active()[0].id
+        fine = fx.detected_fine_repository.get_by_fingerprint(task_id, "fp-1")
+        assert fine.notification_sent_at is not None
+
+        # Повторный update-all не находит новых штрафов и не шлёт повторно.
+        result = await fx.command.handle(_ctx(["update-all"]))
+        assert "Новые штрафы: 0" in result.text
+        assert len(fx.notification_service.notify_calls) == 1
+    finally:
+        fx.close()
+
+
+async def test_fine_update_all_with_no_active_tasks(fx):
+    result = await fx.command.handle(_ctx(["update-all"]))
+
+    assert "Всего: 0" in result.text
+    assert "Проверено: 0" in result.text
+    assert "Ошибок: 0" in result.text
+
+
+async def test_fine_update_all_does_not_touch_history_or_scheduled_job_state(fx):
+    # update-all не должен трогать FineJob (расписание/статус) — это ручной,
+    # отдельный вызов того же check_service, а не альтернативный планировщик.
+    await fx.command.handle(_ctx(["add", "AA001AA"]))
+
+    await fx.command.handle(_ctx(["update-all"]))
+
+    assert fx.fine_job.status.last_run_at is None
+    assert fx.fine_job.status.last_success_at is None
 
 
 # ---- fine status ----

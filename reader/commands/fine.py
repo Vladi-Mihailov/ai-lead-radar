@@ -6,6 +6,7 @@ FineJob), доставка уведомлений — в FineNotificationCoordin
 с FineJob). Эта команда — только парсинг ввода/форматирование ответа.
 """
 
+import logging
 from datetime import date, datetime, timezone
 from datetime import time as dt_time
 from zoneinfo import ZoneInfo
@@ -25,6 +26,8 @@ from reader.fines.validation import (
 )
 from reader.jobs.fine_job import FineJob
 from reader.jobs.scheduler import Scheduler
+
+logger = logging.getLogger(__name__)
 
 _DATE_FORMAT = "%d.%m.%Y"
 
@@ -50,12 +53,38 @@ _BULK_USAGE_ERROR = (
 )
 _STOP_USAGE_ERROR = "❌ Неверный формат команды\n\nИспользуйте:\nfine stop <НОМЕР_АВТОМОБИЛЯ>"
 _CHECK_USAGE_ERROR = "❌ Неверный формат команды\n\nИспользуйте:\nfine check <НОМЕР_АВТОМОБИЛЯ>"
+_ADD_BULK_COMMAND_USAGE_ERROR = (
+    "❌ Неверный формат команды\n\n"
+    "Укажите хотя бы один номер автомобиля после fine add-bulk, каждый — "
+    "на отдельной строке (также допускаются пробелы/запятые в качестве "
+    "разделителя). Например:\n\n"
+    "fine add-bulk\n"
+    "A111AA111\n"
+    "B222BB222\n"
+    "C333CC333"
+)
 _UNKNOWN_SUBCOMMAND_ERROR = (
     "❌ Неверный формат команды\n\n"
     "Используйте:\n"
-    "fine add | fine list | fine stop <НОМЕР_АВТОМОБИЛЯ> | fine check <НОМЕР_АВТОМОБИЛЯ> | "
-    "fine status | fine stats"
+    "fine add | fine add-bulk | fine list | fine stop <НОМЕР_АВТОМОБИЛЯ> | "
+    "fine check <НОМЕР_АВТОМОБИЛЯ> | fine update-all | fine status | fine stats"
 )
+
+
+def _split_bulk_numbers(args: list[str]) -> list[str]:
+    """args — уже разбитые диспетчером по ЛЮБЫМ пробельным символам токены
+    (см. reader/commands/dispatcher.py: text.strip().split()) — то есть
+    номера, каждый на отдельной строке многострочного Telegram-сообщения,
+    сюда уже приходят отдельными элементами списка, точно так же, как если
+    бы они были разделены пробелами. Дополнительно разбиваем каждый токен
+    ещё и по запятым — на случай "A111AA111,B222BB222" в одной строке."""
+    numbers: list[str] = []
+    for token in args:
+        for piece in token.split(","):
+            piece = piece.strip()
+            if piece:
+                numbers.append(piece)
+    return numbers
 
 
 def _fmt_date(value: date) -> str:
@@ -107,12 +136,16 @@ class FineCommand(Command):
         try:
             if subcommand == "add":
                 return await self._handle_add(ctx, rest)
+            if subcommand == "add-bulk":
+                return await self._handle_add_bulk_command(ctx, rest)
             if subcommand == "list":
                 return self._handle_list()
             if subcommand == "stop":
                 return self._handle_stop(rest)
             if subcommand == "check":
                 return await self._handle_check(rest)
+            if subcommand == "update-all":
+                return await self._handle_update_all(ctx)
             if subcommand == "status":
                 return self._handle_status()
             if subcommand == "stats":
@@ -242,6 +275,86 @@ class FineCommand(Command):
 
         return "\n".join(lines)
 
+    async def _handle_add_bulk_command(self, ctx: CommandContext, args: list[str]) -> CommandResult:
+        """fine add-bulk — один номер на строку (см. _split_bulk_numbers для
+        точного разбора многострочного/через-запятую сообщения).
+
+        Для каждого номера буквально вызывает self._handle_add(ctx,
+        [raw_car_number]) — тот же самый метод, что обрабатывает одиночный
+        "fine add NUMBER", без изменений и без параллельной реализации
+        валидации/создания задачи. normalize_car_number() вызывается здесь
+        ЕЩЁ РАЗ отдельно (это чистая, уже существующая функция из
+        reader/fines/validation.py, а не копия логики _handle_add) только
+        чтобы отличить "номер некорректен" от "у _handle_add() нет иной
+        причины для FineValidationError, кроме пересечения с уже активной
+        задачей" — иначе эти два случая неразличимы по одному только типу
+        исключения."""
+        car_numbers = _split_bulk_numbers(args)
+        if not car_numbers:
+            raise CommandError(_ADD_BULK_COMMAND_USAGE_ERROR)
+
+        added = 0
+        already_tracked = 0
+        invalid: list[tuple[str, str]] = []
+        errors: list[tuple[str, str]] = []
+
+        for raw_car_number in car_numbers:
+            try:
+                normalize_car_number(raw_car_number)
+            except FineValidationError as exc:
+                invalid.append((raw_car_number, exc.message))
+                continue
+
+            try:
+                await self._handle_add(ctx, [raw_car_number])
+            except FineValidationError:
+                # normalize_car_number() для этого номера уже прошла выше —
+                # единственная причина, по которой _handle_add() всё же
+                # бросает FineValidationError для уже нормализуемого
+                # номера, это validate_no_overlap() (номер уже в
+                # мониторинге с пересекающимся периодом).
+                already_tracked += 1
+                continue
+            except Exception as exc:
+                # Один плохой номер (например, сбой БД именно на этой
+                # записи) не должен прерывать остальные — импорт
+                # продолжается независимо для каждого номера.
+                errors.append((raw_car_number, str(exc)))
+                logger.exception("fine add-bulk: не удалось добавить номер %s", raw_car_number)
+                continue
+
+            added += 1
+
+        return CommandResult(
+            text=self._format_add_bulk_command_result(added, already_tracked, invalid, errors)
+        )
+
+    @staticmethod
+    def _format_add_bulk_command_result(
+        added: int,
+        already_tracked: int,
+        invalid: list[tuple[str, str]],
+        errors: list[tuple[str, str]],
+    ) -> str:
+        lines = [
+            f"Добавлено: {added}",
+            f"Уже в мониторинге: {already_tracked}",
+            f"Некорректных: {len(invalid)}",
+            f"Ошибок: {len(errors)}",
+        ]
+
+        if invalid:
+            lines.append("")
+            lines.append("Некорректные номера:")
+            lines.extend(f"• {raw} — {message}" for raw, message in invalid)
+
+        if errors:
+            lines.append("")
+            lines.append("Ошибки:")
+            lines.extend(f"• {raw} — {message}" for raw, message in errors)
+
+        return "\n".join(lines)
+
     def _handle_list(self) -> CommandResult:
         tasks = self._task_repository.list_active()
         if not tasks:
@@ -323,6 +436,66 @@ class FineCommand(Command):
                 f"Время: {total_duration_ms} мс"
             )
         )
+
+    async def _handle_update_all(self, ctx: CommandContext) -> CommandResult:
+        """fine update-all — берёт все активные задачи мониторинга и
+        последовательно (без параллелизма, как и FineJob) прогоняет каждую
+        через self._check_service.check_task() — тот же самый метод,
+        которым для одного автомобиля пользуется _handle_check() и по
+        расписанию FineJob.run(); никакой отдельной бизнес-логики проверки
+        здесь нет. Ошибка одной задачи не останавливает обработку
+        остальных."""
+        tasks = self._task_repository.list_active()
+
+        if ctx.event is not None:
+            # Единственное промежуточное сообщение — старт. Прогресс по
+            # каждому отдельному автомобилю в чат не шлём: на сотни
+            # активных задач это были бы сотни сообщений подряд.
+            await ctx.event.respond(f"🔄 Запущена проверка {len(tasks)} автомобилей")
+
+        checked = 0
+        new_fines_total = 0
+        errors: list[tuple[str, str]] = []
+
+        for task in tasks:
+            try:
+                result = await self._check_service.check_task(task)
+            except Exception as exc:
+                errors.append((task.car_number, str(exc)))
+                logger.exception(
+                    "fine update-all: проверка задачи id=%s (%s) завершилась с ошибкой",
+                    task.id, task.car_number,
+                )
+                continue
+
+            if result.status == "error":
+                errors.append((task.car_number, result.error_message or "неизвестная ошибка"))
+                continue
+
+            checked += 1
+            new_fines_total += len(result.new_fines)
+
+        try:
+            # Тот же механизм доставки, что и у fine check/FineJob — тем же
+            # самым объектом координатора, один раз в конце всего прохода.
+            await self._notification_coordinator.flush_pending()
+        except Exception as exc:
+            errors.append(("(уведомления)", str(exc)))
+            logger.exception("fine update-all: отправка накопленных уведомлений завершилась с ошибкой")
+
+        lines = [
+            "✅ Массовая проверка завершена",
+            f"Всего: {len(tasks)}",
+            f"Проверено: {checked}",
+            f"Новые штрафы: {new_fines_total}",
+            f"Ошибок: {len(errors)}",
+        ]
+        if errors:
+            lines.append("")
+            lines.append("Ошибки:")
+            lines.extend(f"• {car_number} — {message}" for car_number, message in errors)
+
+        return CommandResult(text="\n".join(lines))
 
     def _handle_status(self) -> CommandResult:
         active_count = self._task_repository.count_active()
