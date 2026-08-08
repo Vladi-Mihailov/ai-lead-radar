@@ -3,7 +3,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Protocol
@@ -297,7 +297,7 @@ def _format_account_notification(
 
 def _format_campaign_summary_notification(
     campaign: InviteCampaign, accounts_processed: int, stats: InviteStats, remaining: int,
-    elapsed_seconds: float, found_total: int, found_processable: int,
+    elapsed_seconds: float, found_total: int, found_processable: int, accounts_blocked: int = 0,
 ) -> str:
     """found_total — сколько подошло по keyword/access_hash/ещё-не-приглашён,
     БЕЗ фильтра по username (UserCampaignInviteRepository.
@@ -307,9 +307,18 @@ def _format_campaign_summary_notification(
     username для резолва этим аккаунтом, см.
     InviterService._resolve_input_peer) — считается прямо здесь, простым
     вычитанием двух уже посчитанных в SQL чисел, а не перебором
-    пользователей в Python."""
+    пользователей в Python.
+
+    accounts_blocked — сколько enabled-аккаунтов этой кампании были
+    полностью пропущены из-за активного account.blocked_until (см.
+    _is_blocked_by_flood_wait/InviterService.run()) — не входят в
+    accounts_processed (см. _execute_account: такой аккаунт возвращает
+    None, как и при отсутствии сессии/лимита)."""
     skipped_without_username = found_total - found_processable
     separator = "=" * 32
+    blocked_line = (
+        f"⏸ Пропущено из-за FloodWait: {accounts_blocked}\n\n" if accounts_blocked else ""
+    )
     return (
         f"{separator}\n\n"
         f"📋 Кампания: {campaign.name}\n\n"
@@ -320,6 +329,7 @@ def _format_campaign_summary_notification(
         f'📊 Итоги кампании "{campaign.name}"\n\n'
         f"Время выполнения: {_format_duration(elapsed_seconds)}\n\n"
         f"Аккаунтов обработано: {accounts_processed}\n\n"
+        f"{blocked_line}"
         f"📤 Отправлено приглашений: {stats.sent}\n"
         f"✅ Подтверждено участников: {stats.joined}\n"
         f"⏳ Ожидают подтверждения: {stats.pending}\n"
@@ -336,6 +346,27 @@ def _format_account_stopped_notification(account: TelegramAccount, reason: str) 
         f"{reason}\n\n"
         f"Работа аккаунта остановлена.\n\n"
         f"Переход к следующему аккаунту."
+    )
+
+
+def _is_blocked_by_flood_wait(account: TelegramAccount, now: datetime) -> bool:
+    """enabled=False (аккаунт отключён оператором) и blocked_until
+    (временное ограничение самого Telegram, см. _persist_flood_wait_block)
+    — независимые условия (см. TelegramAccount) — эта проверка касается
+    только blocked_until. Просроченный blocked_until (<= now) считается
+    снятым автоматически — никакого ручного enabled=True не требуется, и
+    саму запись очищать необязательно (см. задачу)."""
+    return account.blocked_until is not None and account.blocked_until > now
+
+
+def _format_blocked_account_message(account: TelegramAccount, now: datetime) -> str:
+    assert account.blocked_until is not None
+    remaining_seconds = max((account.blocked_until - now).total_seconds(), 0.0)
+    return (
+        f"Account {account.name} пропущен:\n"
+        f"Telegram FloodWait действует до "
+        f"{account.blocked_until.strftime('%Y-%m-%d %H:%M')} UTC\n"
+        f"Осталось: {_format_duration(remaining_seconds)}"
     )
 
 
@@ -414,7 +445,17 @@ class InviteErrorClassification:
     mark_verified_now — db_status="joined" получает verified_at=now сразу
     же (см. UserAlreadyParticipantError — кандидат уже состоял в группе,
     подтверждать через GetParticipantRequest/get_permissions нечего, это
-    уже само по себе подтверждение)."""
+    уже само по себе подтверждение).
+    wait_seconds — задаётся ТОЛЬКО для FloodWaitError (exc.seconds, в обоих
+    исходах — RETRY_LATER и STOP_ACCOUNT), и используется двояко (см.
+    InviterService._handle_invite_error): как длительность
+    asyncio.sleep() при RETRY_LATER, и — независимо от action — как основа
+    для account.blocked_until = now + wait_seconds (см.
+    _persist_flood_wait_block), чтобы следующий запуск не повторил попытку
+    этим аккаунтом раньше времени. Ни для одной другой ошибки (в т.ч.
+    PeerFloodError — Telegram не сообщает точное время окончания
+    ограничения) не задаётся — специально, чтобы не изобретать
+    blocked_until там, где Telegram не дал на это оснований (см. задачу)."""
 
     action: InviteErrorAction
     db_status: str
@@ -625,6 +666,22 @@ class InviterService:
     раз не выполняются; сбой самого аккаунта (например, обрыв connect())
     не мешает остальным.
 
+    ЛЮБОЙ FloodWaitError (независимо от того, ждём мы его или он
+    останавливает аккаунт) сохраняет account.blocked_until = now +
+    exc.seconds в БД (см. _persist_flood_wait_block) — перед обработкой
+    КАЖДОГО аккаунта (execute и dry-run) _is_blocked_by_flood_wait
+    проверяет это поле ДО connect()/резолва target_chat/выборки
+    кандидатов и, если блокировка ещё активна, полностью пропускает
+    аккаунт (см. _execute_account/_dry_run_account) — именно это не даёт
+    уже заблокированному Telegram аккаунту повторно попытаться пригласить
+    в СЛЕДУЮЩЕМ запуске (см. задачу про повторный FloodWait у
+    @Mihailov_vm). enabled=False (отключён оператором) и blocked_until
+    (временное ограничение самого Telegram) — независимые условия;
+    просроченный blocked_until снимается автоматически, без участия
+    оператора. PeerFloodError не даёт Telegram точного времени окончания
+    ограничения — blocked_until для него не изобретается (см.
+    _classify_invite_error/InviteErrorClassification.wait_seconds).
+
     В режиме execute=True после каждого обработанного аккаунта и после
     каждой кампании оператору отправляется краткая статистика (см.
     InviteStats/_notify_account_result/_notify_campaign_result) через
@@ -716,9 +773,12 @@ class InviterService:
 
             campaign_stats = InviteStats()
             accounts_processed = 0
+            accounts_blocked = 0
 
             if execute:
                 for account in accounts:
+                    if _is_blocked_by_flood_wait(account, datetime.now(timezone.utc)):
+                        accounts_blocked += 1
                     account_stats = await self._execute_account(campaign, account, found)
                     if account_stats is not None:
                         campaign_stats = campaign_stats + account_stats
@@ -747,7 +807,7 @@ class InviterService:
                 await self._notify_campaign_result(
                     campaign, accounts_processed, campaign_stats, remaining,
                     time.monotonic() - campaign_started_at,
-                    found_total, found,
+                    found_total, found, accounts_blocked,
                 )
             else:
                 # Общая выборка на кампанию + деление по смещению — см.
@@ -774,6 +834,11 @@ class InviterService:
         обработку остальных аккаунтов (см. InviterService.run()), поэтому
         любая ошибка здесь только логируется."""
         if not candidates:
+            return
+
+        now = datetime.now(timezone.utc)
+        if _is_blocked_by_flood_wait(account, now):
+            logger.info(_format_blocked_account_message(account, now))
             return
 
         if not self._session_checker(account):
@@ -857,8 +922,17 @@ class InviterService:
         кандидатов для неработающих аккаунтов и про daily_limit, который
         должен считаться по подтверждённым участникам, а не по успешным RPC):
 
-        1. .session-файл (см. _default_session_checker) — самая дешёвая
-           проверка, без единого запроса вообще.
+        0. account.blocked_until (см. _is_blocked_by_flood_wait) — активный
+           FloodWait самого Telegram (см. _persist_flood_wait_block) — САМАЯ
+           первая проверка, даже перед .session-файлом: пока блокировка не
+           истекла, аккаунт не должен ни подключаться, ни резолвить
+           target_chat, ни выбирать кандидатов вообще (см. задачу про
+           повторный FloodWait у @Mihailov_vm). Не путать с enabled=False
+           (отключён оператором вручную) — это отдельное, самостоятельное
+           условие (см. TelegramAccount), снимается автоматически по
+           истечении blocked_until, без участия оператора.
+        1. .session-файл (см. _default_session_checker) — самая дешёвая из
+           оставшихся проверок, без единого запроса вообще.
         2. found == 0 — во всей кампании нет ни одного кандидата, ни один
            аккаунт не должен даже подключаться (см. test_execute_does_not_
            reinvite_user_on_next_run).
@@ -891,6 +965,11 @@ class InviterService:
         ВСЕГДА текущее фактическое число pending в БД для этого аккаунта и
         кампании (а не накопленный счётчик), независимо от того, как
         далеко продвинулось выполнение в этот раз."""
+        now = datetime.now(timezone.utc)
+        if _is_blocked_by_flood_wait(account, now):
+            logger.info(_format_blocked_account_message(account, now))
+            return None
+
         if not self._session_checker(account):
             logger.warning(_format_missing_session_message(account))
             return None
@@ -1212,6 +1291,13 @@ class InviterService:
         if classification.mark_as_bot:
             self._mark_user_as_bot(candidate.user_id)
 
+        if classification.wait_seconds is not None:
+            # Только FloodWaitError задаёт wait_seconds (см.
+            # InviteErrorClassification.wait_seconds) — сохраняем
+            # blocked_until ДО записи результата и уведомления, чтобы обе
+            # ссылались на уже обновлённый account (см. ниже).
+            account = self._persist_flood_wait_block(account, classification.wait_seconds)
+
         log_fn = logger.info if classification.db_status in ("joined", "invalid") else logger.warning
         log_fn(
             _format_execute_block(
@@ -1234,8 +1320,15 @@ class InviterService:
             return False
 
         if classification.action in (InviteErrorAction.STOP_ACCOUNT, InviteErrorAction.FATAL):
+            operator_message = classification.operator_message
+            if account.blocked_until is not None:
+                operator_message = (
+                    f"{operator_message}\n\n"
+                    f"Аккаунт заблокирован до "
+                    f"{account.blocked_until.strftime('%Y-%m-%d %H:%M')} UTC."
+                )
             await self._safe_notify(
-                _format_account_stopped_notification(account, classification.operator_message)
+                _format_account_stopped_notification(account, operator_message)
             )
             return True
 
@@ -1364,6 +1457,29 @@ class InviterService:
                 exc_info=True,
             )
 
+    def _persist_flood_wait_block(
+        self, account: TelegramAccount, wait_seconds: float,
+    ) -> TelegramAccount:
+        """FloodWaitError — единственная ошибка, для которой Telegram
+        сообщает точное время окончания ограничения (exc.seconds, см.
+        InviteErrorClassification.wait_seconds) — только для неё
+        сохраняем account.blocked_until, чтобы ни следующий запуск, ни
+        следующий аккаунт в ЭТОМ же запуске (см. _execute_account/
+        _dry_run_account) не пытались снова подключиться этим аккаунтом
+        раньше времени (см. задачу про повторный FloodWait). Сбой записи
+        не должен прерывать обработку ошибки — только предупреждение в
+        лог, с исходным (не обновлённым) account."""
+        blocked_until = datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
+        try:
+            return self._account_repository.update(
+                account.id, blocked_until=blocked_until, blocked_reason="flood_wait",
+            )
+        except Exception:
+            logger.warning(
+                f"Не удалось сохранить blocked_until для аккаунта {account.name}", exc_info=True,
+            )
+            return account
+
     def _mark_user_as_bot(self, user_id: int) -> None:
         """Сохраняет is_bot=1 в users.db, когда Telegram подтверждает статус
         бота уже ПОСЛЕ попытки приглашения (см. _classify_invite_error) —
@@ -1431,12 +1547,12 @@ class InviterService:
 
     async def _notify_campaign_result(
         self, campaign: InviteCampaign, accounts_processed: int, stats: InviteStats, remaining: int,
-        elapsed_seconds: float, found_total: int, found_processable: int,
+        elapsed_seconds: float, found_total: int, found_processable: int, accounts_blocked: int = 0,
     ) -> None:
         await self._safe_notify(
             _format_campaign_summary_notification(
                 campaign, accounts_processed, stats, remaining, elapsed_seconds,
-                found_total, found_processable,
+                found_total, found_processable, accounts_blocked,
             )
         )
 

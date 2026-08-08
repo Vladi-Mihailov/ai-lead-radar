@@ -145,6 +145,64 @@ def test_user_campaign_invites_migrates_legacy_table_without_verified_at(tmp_pat
         repository.close()
 
 
+def test_telegram_accounts_migrates_legacy_table_without_blocked_columns(tmp_path):
+    """БД, созданная до появления blocked_until/blocked_reason (временная
+    блокировка аккаунта самим Telegram, см. задачу про повторный FloodWait
+    у @Mihailov_vm), должна получить обе колонки при открытии — без
+    пересоздания таблицы и без потери уже существующих записей. Именно
+    этот сценарий обеспечивает безопасное применение к существующему
+    data/users.db на сервере."""
+    db_path = tmp_path / "inviter.db"
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE telegram_accounts (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                name            TEXT NOT NULL,
+                phone           TEXT NOT NULL,
+                session_name    TEXT NOT NULL,
+                session_path    TEXT NOT NULL,
+                daily_limit     INTEGER NOT NULL DEFAULT 30,
+                enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at    TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO telegram_accounts (name, phone, session_name, session_path) "
+            "VALUES ('Основной', '+995500000001', 'acc1', 'data/sessions/acc1.session')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    repository = TelegramAccountRepository(db_path)
+    try:
+        columns = {row[1] for row in repository._conn.execute(
+            "PRAGMA table_info(telegram_accounts)"
+        )}
+        assert "blocked_until" in columns
+        assert "blocked_reason" in columns
+
+        accounts = repository.list()
+        assert len(accounts) == 1
+        assert accounts[0].name == "Основной"
+        assert accounts[0].blocked_until is None
+        assert accounts[0].blocked_reason is None
+
+        blocked_until = datetime.now(timezone.utc) + timedelta(hours=5)
+        updated = repository.update(
+            accounts[0].id, blocked_until=blocked_until, blocked_reason="flood_wait",
+        )
+        assert updated.blocked_until == blocked_until
+        assert updated.blocked_reason == "flood_wait"
+    finally:
+        repository.close()
+
+
 # ---- TelegramAccountRepository: create/get/update/list ----
 
 

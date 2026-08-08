@@ -7,7 +7,17 @@ class TelegramAccount:
     """Telegram-аккаунт, которым инвайтер может приглашать пользователей в
     target_chat кампаний (см. InviteCampaign). daily_limit/enabled —
     сырые данные конфигурации; сама логика лимитов/отбора аккаунта здесь
-    не реализована (см. service.py)."""
+    не реализована (см. service.py).
+
+    enabled и blocked_until — разные вещи, не путать: enabled=False —
+    аккаунт отключён оператором вручную, до явного enabled=True снова не
+    используется никогда; blocked_until — временное ограничение САМИМ
+    Telegram (сейчас — только FloodWaitError, см. service.py
+    _classify_invite_error/_persist_flood_wait_block), снимается
+    автоматически по истечении времени, никакого ручного enabled=True не
+    требует. blocked_reason — просто пояснение источника ограничения
+    ("flood_wait"), не влияет на саму проверку (см. service.py
+    _is_blocked_by_flood_wait)."""
 
     id: int
     name: str
@@ -18,6 +28,8 @@ class TelegramAccount:
     enabled: bool
     created_at: datetime
     last_used_at: datetime | None
+    blocked_until: datetime | None = None
+    blocked_reason: str | None = None
 
 
 @dataclass(frozen=True)

@@ -3717,6 +3717,340 @@ def test_execute_flood_wait_below_threshold_waits_and_continues_account(tmp_path
     assert stop_notifications == []
 
 
+# ---- blocked_until: активный FloodWait самого Telegram блокирует аккаунт ----
+
+
+def test_execute_flood_wait_persists_blocked_until_for_five_hours(tmp_path):
+    """FloodWaitError(seconds=5*3600) — account.blocked_until сохраняется
+    как now + 5 часов (см. задачу про повторный FloodWait у @Mihailov_vm),
+    blocked_reason='flood_wait'."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path)
+
+    five_hours = 5 * 3600
+    client_factory = _make_client_factory(
+        call_errors={account.name: [FloodWaitError(request=GetHistoryRequest, capture=five_hours)]},
+    )
+
+    before = datetime.now(timezone.utc)
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+    after = datetime.now(timezone.utc)
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        updated = account_repository.get(account.id)
+        assert updated.blocked_reason == "flood_wait"
+        assert updated.blocked_until is not None
+        assert before + timedelta(seconds=five_hours) <= updated.blocked_until
+        assert updated.blocked_until <= after + timedelta(seconds=five_hours)
+    finally:
+        account_repository.close()
+
+
+def test_execute_flood_wait_mid_wave_stops_account_and_persists_block(tmp_path):
+    """FloodWaitError, полученный ПРИ отправке приглашения (основная
+    волна) — останавливает текущий аккаунт немедленно (второй кандидат не
+    трогается) и сохраняет blocked_until, как и любой другой FloodWaitError."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account = account_repository.create(
+            name="account_flood", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(
+        call_errors={"account_flood": [FloodWaitError(request=GetHistoryRequest, capture=624)]},
+        created=created_clients,
+    )
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    client = created_clients[0]
+    assert len(client.call_requests) == 1  # второй кандидат не тронут
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        updated = account_repository.get(account.id)
+        assert updated.blocked_until is not None
+        assert updated.blocked_until > datetime.now(timezone.utc)
+    finally:
+        account_repository.close()
+
+
+def test_execute_flood_wait_stop_skips_verification_and_top_up_wave(tmp_path):
+    """FloodWaitError, полученный на ПЕРВОМ кандидате основной волны —
+    аккаунт останавливается ДО проверки pending и ДО волны добора (см.
+    _execute_account: _run_invite_wave вернул stopped=True) — ни одного
+    client.get_permissions(), ни одного дополнительного приглашения сверх
+    того, что уже успело отправиться до FloodWait."""
+    db_path = _setup_db(tmp_path)
+    for user_id in range(1, 6):
+        _seed_user(
+            db_path, user_id, keywords=["осаго"], access_hash=user_id,
+            last_seen_at=_BASE_TIME + timedelta(days=user_id),
+        )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_flood", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(
+        call_errors={"account_flood": [FloodWaitError(request=GetHistoryRequest, capture=600)]},
+        created=created_clients,
+    )
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    client = created_clients[0]
+    # Только первый (по last_seen_at DESC) кандидат тронут вообще — ни
+    # волны добора, ни повторной попытки основной волны для остальных.
+    assert len(client.call_requests) == 1
+    assert client.get_permissions_calls == []
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        assert len(invite_repository.list()) == 1
+    finally:
+        invite_repository.close()
+
+
+def test_execute_flood_wait_below_threshold_still_persists_blocked_until(tmp_path):
+    """Небольшой FloodWaitError (< 300 сек.) продолжает пережидаться и не
+    останавливает аккаунт (см.
+    test_execute_flood_wait_below_threshold_waits_and_continues_account),
+    но blocked_until всё равно сохраняется — "При получении
+    FloodWaitError(seconds=N) сохранить blocked_until" не зависит от
+    порога, только от самого факта FloodWaitError (см. задачу)."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account = account_repository.create(
+            name="account_1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    client_factory = _make_client_factory(
+        call_errors={"account_1": [FloodWaitError(request=GetHistoryRequest, capture=7), None]},
+    )
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        updated = account_repository.get(account.id)
+        assert updated.blocked_reason == "flood_wait"
+        assert updated.blocked_until is not None
+        # 7 секунд уже прошли (мок sleep не ждёт реально) — блокировка
+        # формально сохранена, но уже истекла к моменту проверки.
+        assert updated.blocked_until <= datetime.now(timezone.utc) + timedelta(seconds=7)
+    finally:
+        account_repository.close()
+
+
+def test_execute_skips_account_with_active_blocked_until(tmp_path, monkeypatch):
+    """Аккаунт с активным (ещё не истёкшим) blocked_until полностью
+    пропускается ДО connect()/резолва target_chat/выборки кандидатов — ни
+    одного вызова select_candidates() (см. _format_candidates_block/
+    "Campaign: ..." в логах), ни одной записи в user_campaign_invites."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path)
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        account_repository.update(
+            account.id,
+            blocked_until=datetime.now(timezone.utc) + timedelta(hours=5),
+            blocked_reason="flood_wait",
+        )
+    finally:
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(created=created_clients)
+
+    import reader.inviter.service as service_module
+
+    all_logs: list[str] = []
+    monkeypatch.setattr(service_module.logger, "info", all_logs.append)
+    monkeypatch.setattr(service_module.logger, "warning", all_logs.append)
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    campaign_blocks = [b for b in all_logs if b.startswith("Campaign:")]
+    assert campaign_blocks == []
+
+    skip_messages = [m for m in all_logs if m.startswith(f"Account {account.name} пропущен:")]
+    assert len(skip_messages) == 1
+    assert "Telegram FloodWait действует до" in skip_messages[0]
+    assert "Осталось:" in skip_messages[0]
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        assert invite_repository.list() == []
+    finally:
+        invite_repository.close()
+
+
+def test_execute_blocked_account_does_not_create_telegram_client(tmp_path):
+    """Симметрично: ни client_factory(), ни connect() не вызываются для
+    аккаунта с активным blocked_until — ноль взаимодействия с Telegram."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path)
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        account_repository.update(
+            account.id,
+            blocked_until=datetime.now(timezone.utc) + timedelta(hours=5),
+            blocked_reason="flood_wait",
+        )
+    finally:
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(created=created_clients)
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    assert created_clients == []
+
+
+def test_execute_processes_account_again_after_blocked_until_expires(tmp_path):
+    """blocked_until в прошлом — считается снятым автоматически, без
+    участия оператора (enabled=True изначально и остаётся неизменным) —
+    аккаунт обрабатывается как обычно."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path)
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        account_repository.update(
+            account.id,
+            blocked_until=datetime.now(timezone.utc) - timedelta(hours=1),
+            blocked_reason="flood_wait",
+        )
+    finally:
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(created=created_clients)
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    client = created_clients[0]
+    assert client.connected is True
+    assert len(client.call_requests) == 1
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        assert len(invite_repository.list()) == 1
+    finally:
+        invite_repository.close()
+
+
+def test_execute_disabled_account_ignored_regardless_of_blocked_until(tmp_path):
+    """enabled=False — отключён оператором вручную — не запускается вовсе,
+    независимо от blocked_until (даже если блокировка уже истекла/её
+    вообще нет): enabled и blocked_until — независимые условия (см.
+    TelegramAccount)."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path)
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        account_repository.update(account.id, enabled=False)
+    finally:
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(created=created_clients)
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    assert created_clients == []
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        assert invite_repository.list() == []
+    finally:
+        invite_repository.close()
+
+
+def test_execute_one_blocked_account_does_not_block_next_account(tmp_path):
+    """Заблокированный аккаунт не должен мешать обработке СЛЕДУЮЩЕГО —
+    каждый аккаунт проверяется независимо (см. _execute_account)."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        blocked_account = account_repository.create(
+            name="blocked", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+        account_repository.create(
+            name="works", phone="+995500000002", session_name="acc2",
+            session_path="acc2.session", daily_limit=5,
+        )
+        account_repository.update(
+            blocked_account.id,
+            blocked_until=datetime.now(timezone.utc) + timedelta(hours=5),
+            blocked_reason="flood_wait",
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(created=created_clients)
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    # Единственный созданный клиент — для "works" (заблокированный вообще
+    # не подключается, см. test_execute_blocked_account_does_not_create_
+    # telegram_client).
+    assert len(created_clients) == 1
+    assert created_clients[0].account.name == "works"
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        # Оба реальных кандидата ушли рабочему аккаунту.
+        assert len(invites) == 2
+        assert all(i.account_id == 2 for i in invites)
+    finally:
+        invite_repository.close()
+
+
 # ---- тестовый режим (--test/main.py) — лимит успешных приглашений на весь run() ----
 
 

@@ -20,9 +20,24 @@ CREATE TABLE IF NOT EXISTS telegram_accounts (
     daily_limit     INTEGER NOT NULL DEFAULT 30,
     enabled         BOOLEAN NOT NULL DEFAULT TRUE,
     created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    last_used_at    TIMESTAMP
+    last_used_at    TIMESTAMP,
+    blocked_until   TIMESTAMP,
+    blocked_reason  TEXT
 )
 """
+
+# CREATE TABLE IF NOT EXISTS не добавляет колонки в уже существующую
+# таблицу — для БД, созданных до появления blocked_until/blocked_reason
+# (временная блокировка аккаунта самим Telegram, см.
+# InviterService._persist_flood_wait_block), добавляем их явно при
+# открытии, без удаления/пересоздания БД (тот же приём, что и для
+# user_campaign_invites.verified_at ниже/users.is_bot и т.п. в
+# reader/users/repository.py) — безопасно применяется к существующему
+# data/users.db на сервере.
+_TELEGRAM_ACCOUNTS_COLUMN_MIGRATIONS = {
+    "blocked_until": "ALTER TABLE telegram_accounts ADD COLUMN blocked_until TIMESTAMP",
+    "blocked_reason": "ALTER TABLE telegram_accounts ADD COLUMN blocked_reason TEXT",
+}
 
 _INVITE_CAMPAIGNS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS invite_campaigns (
@@ -238,12 +253,26 @@ class TelegramAccountRepository:
     _UPDATABLE_COLUMNS = (
         "name", "phone", "session_name", "session_path",
         "daily_limit", "enabled", "last_used_at",
+        "blocked_until", "blocked_reason",
     )
 
     def __init__(self, db_path: Path):
         self._conn = _connect(db_path)
         self._conn.execute(_TELEGRAM_ACCOUNTS_SCHEMA)
+        self._migrate_missing_columns()
         self._conn.commit()
+
+    def _migrate_missing_columns(self) -> None:
+        """CREATE TABLE IF NOT EXISTS не добавляет колонки в уже
+        существующую таблицу — для БД, созданных до появления
+        blocked_until/blocked_reason, добавляем их явно, без
+        удаления/пересоздания БД (см. _TELEGRAM_ACCOUNTS_COLUMN_MIGRATIONS)."""
+        existing_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(telegram_accounts)")
+        }
+        for column, statement in _TELEGRAM_ACCOUNTS_COLUMN_MIGRATIONS.items():
+            if column not in existing_columns:
+                self._conn.execute(statement)
 
     def create(
         self,
@@ -285,6 +314,8 @@ class TelegramAccountRepository:
         if fields:
             if "last_used_at" in fields:
                 fields["last_used_at"] = _isoformat(fields["last_used_at"])
+            if "blocked_until" in fields:
+                fields["blocked_until"] = _isoformat(fields["blocked_until"])
             assignments = ", ".join(f"{column} = :{column}" for column in fields)
             self._conn.execute(
                 f"UPDATE telegram_accounts SET {assignments} WHERE id = :id",
@@ -301,7 +332,7 @@ class TelegramAccountRepository:
         row = self._conn.execute(
             """
             SELECT id, name, phone, session_name, session_path, daily_limit,
-                   enabled, created_at, last_used_at
+                   enabled, created_at, last_used_at, blocked_until, blocked_reason
             FROM telegram_accounts WHERE id = ?
             """,
             (account_id,),
@@ -312,7 +343,7 @@ class TelegramAccountRepository:
         rows = self._conn.execute(
             """
             SELECT id, name, phone, session_name, session_path, daily_limit,
-                   enabled, created_at, last_used_at
+                   enabled, created_at, last_used_at, blocked_until, blocked_reason
             FROM telegram_accounts ORDER BY id
             """
         ).fetchall()
@@ -325,7 +356,7 @@ class TelegramAccountRepository:
 def _row_to_account(row) -> TelegramAccount:
     (
         id_, name, phone, session_name, session_path, daily_limit,
-        enabled, created_at, last_used_at,
+        enabled, created_at, last_used_at, blocked_until, blocked_reason,
     ) = row
     return TelegramAccount(
         id=id_,
@@ -337,6 +368,8 @@ def _row_to_account(row) -> TelegramAccount:
         enabled=bool(enabled),
         created_at=_parse_datetime(created_at),
         last_used_at=_parse_datetime(last_used_at),
+        blocked_until=_parse_datetime(blocked_until),
+        blocked_reason=blocked_reason,
     )
 
 
