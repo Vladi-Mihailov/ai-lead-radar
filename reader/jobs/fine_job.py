@@ -11,10 +11,11 @@ FineMonitoringTaskRepository остаётся простым хранилище�
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from datetime import time as dt_time
 from zoneinfo import ZoneInfo
 
+from reader.fines.archive_scheduling import local_time_to_utc
 from reader.fines.check_service import FineCheckService
 from reader.fines.notification_coordinator import FineNotificationCoordinator
 from reader.fines.task_repository import FineMonitoringTaskRepository
@@ -46,12 +47,22 @@ class FineJob(Job):
         *,
         run_times: list[dt_time],
         tz: ZoneInfo,
+        archive_check_enabled: bool = False,
+        archive_check_hour: int = 4,
+        archive_interval_days: int = 30,
     ):
         self._task_repository = task_repository
         self._check_service = check_service
         self._notification_coordinator = notification_coordinator
         self._run_times = run_times
         self._tz = tz
+        # Архивный режим (см. reader/jobs/archive_fine_job.py) выключен по
+        # умолчанию — конструктор без этих аргументов (как во всех
+        # существующих вызовах/тестах) ведёт себя БИТ В БИТ как раньше:
+        # завершение задачи — это только set_status(..., "completed").
+        self._archive_check_enabled = archive_check_enabled
+        self._archive_check_hour = archive_check_hour
+        self._archive_interval_days = archive_interval_days
         self._last_run_slot: tuple[date, dt_time] | None = None
         self.status = FineJobStatus()
 
@@ -109,6 +120,17 @@ class FineJob(Job):
                     # Период закончился — завершаем задачу, к FineCheckService
                     # не обращаемся вовсе.
                     self._task_repository.set_status(task.id, "completed")
+                    if self._archive_check_enabled:
+                        # Задача только что завершилась ЕСТЕСТВЕННО, под
+                        # надзором самого FineJob — источник события
+                        # однозначен, поэтому (в отличие от уже существующих
+                        # исторических completed-задач, см.
+                        # reader/fines/archive_enrollment.py) можно безопасно
+                        # поставить первую архивную проверку автоматически,
+                        # без отдельного enrollment-шага.
+                        self._task_repository.schedule_first_archive_check(
+                            task.id, next_check_at=self._first_archive_check_at(run_at)
+                        )
                     continue
 
                 # start_date <= today <= end_date — границы включительно.
@@ -137,6 +159,16 @@ class FineJob(Job):
             return
 
         self.status.last_success_at = run_at
+
+    def _first_archive_check_at(self, run_at: datetime) -> datetime:
+        """~archive_interval_days от сегодня (по self._tz), время —
+        archive_check_hour:00 — тот же формат "день + фиксированный час",
+        что и у массового enrollment (см. build_archive_schedule), чтобы
+        обе точки постановки в архивный режим были согласованы."""
+        target_day = run_at.astimezone(self._tz).date() + timedelta(
+            days=self._archive_interval_days
+        )
+        return local_time_to_utc(target_day, self._archive_check_hour, self._tz)
 
     def _record_error(self, exc: Exception) -> None:
         self.status.error_count += 1

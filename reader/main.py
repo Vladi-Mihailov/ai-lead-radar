@@ -20,6 +20,7 @@ from reader.fines.police_ge_provider import PoliceGeProvider  # noqa: E402
 from reader.fines.police_ge_session import PoliceGeSession  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
 from reader.groups import GroupLoadError, load_groups  # noqa: E402
+from reader.jobs.archive_fine_job import ArchiveFineJob  # noqa: E402
 from reader.jobs.fine_job import FineJob  # noqa: E402
 from reader.jobs.scheduler import Scheduler  # noqa: E402
 from reader.logging_setup import setup_logging  # noqa: E402
@@ -96,8 +97,28 @@ def build_fine_monitor_components(
         notification_coordinator=notification_coordinator,
         run_times=fine_monitor.check_times,
         tz=tz,
+        archive_check_enabled=fine_monitor.archive_check_enabled,
+        archive_check_hour=fine_monitor.archive_check_hour,
+        archive_interval_days=fine_monitor.archive_interval_days,
     )
-    scheduler = Scheduler([fine_job], poll_interval_seconds=_SCHEDULER_POLL_INTERVAL_SECONDS)
+    # Второй, независимый job — архивные проверки (см. докстрок
+    # ArchiveFineJob) для задач, у которых обычный период уже закончился.
+    # Тот же task_repository/check_service/notification_coordinator, что и
+    # у fine_job — ни второго обращения к police.ge, ни второго notification
+    # flow не создаётся.
+    archive_fine_job = ArchiveFineJob(
+        task_repository=task_repository,
+        check_service=check_service,
+        notification_coordinator=notification_coordinator,
+        enabled=fine_monitor.archive_check_enabled,
+        hour=fine_monitor.archive_check_hour,
+        interval_days=fine_monitor.archive_interval_days,
+        daily_limit=fine_monitor.archive_daily_limit,
+        tz=tz,
+    )
+    scheduler = Scheduler(
+        [fine_job, archive_fine_job], poll_interval_seconds=_SCHEDULER_POLL_INTERVAL_SECONDS
+    )
 
     command_dispatcher = CommandDispatcher(
         source.client, notification_chat_ids[0], allowed_user_ids
@@ -179,6 +200,13 @@ async def _run_fine_monitor(
         logger.info(
             "Notification chats: %s",
             ", ".join(str(chat_id) for chat_id in notification_chat_ids),
+        )
+        logger.info(
+            "Archive check: %s (hour=%02d:00, interval=%d days, daily_limit=%d)",
+            "enabled" if fine_monitor.archive_check_enabled else "disabled",
+            fine_monitor.archive_check_hour,
+            fine_monitor.archive_interval_days,
+            fine_monitor.archive_daily_limit,
         )
 
         await scheduler.run_forever()

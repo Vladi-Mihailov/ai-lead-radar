@@ -20,6 +20,15 @@ class FineMonitoringTask:
     last_checked_at: datetime | None
     last_check_status: str | None
     last_error: str | None
+    # Архивный режим (см. reader/jobs/archive_fine_job.py) — независим от
+    # status: задача остаётся 'completed' (не попадает в list_active()/
+    # обычные 3 проверки в день), пока archive_check_enabled=1 не выставлен
+    # явно (FineJob при завершении периода — для новых задач, либо разовым
+    # enrollment — для существующих, см. reader/fines/archive_enrollment.py).
+    # Default'ы сохраняют старое поведение для существующих вызовов
+    # FineMonitoringTask(...) (см. tests/test_fine_validation.py) без правки.
+    archive_check_enabled: bool = False
+    next_archive_check_at: datetime | None = None
 
 
 @dataclass(frozen=True)

@@ -104,6 +104,23 @@ class FineMonitorSettings(BaseModel):
     notification_chat_ids: list[int | str] = Field(default_factory=list)
     allowed_user_ids: list[int] = Field(default_factory=list)
 
+    # Архивный режим (см. reader/jobs/archive_fine_job.py) — автомобили,
+    # у которых закончился обычный период (check_times, несколько раз в
+    # сутки), продолжают изредка проверяться, а не выпадают из мониторинга
+    # совсем. archive_check_enabled — независимый от `enabled` выключатель:
+    # можно держать обычный мониторинг включённым, а архивный — нет (и
+    # наоборот было бы бессмысленно, но проверка этого — забота
+    # validate_fine_monitor_config, а не самой модели настроек).
+    archive_check_enabled: bool = True
+    archive_check_hour: int = 4
+    archive_interval_days: int = 30
+    # Safety limit на один запуск ArchiveFineJob (см. её докстрок про
+    # downtime/backlog) — с запасом относительно текущего объёма (~1000
+    # машин/30 дней ≈ 34 проверки в день), чтобы после нескольких дней
+    # простоя backlog разбирался за разумное число запусков, а не за один
+    # неограниченный проход.
+    archive_daily_limit: int = 200
+
 
 class Settings(BaseModel):
     telegram: TelegramSettings
@@ -248,6 +265,10 @@ def load_settings(config_path: Path) -> Settings:
                     for value in fine_monitor_raw.get("notification_chat_ids", [])
                 ],
                 allowed_user_ids=list(fine_monitor_raw.get("allowed_user_ids", [])),
+                archive_check_enabled=bool(fine_monitor_raw.get("archive_check_enabled", True)),
+                archive_check_hour=int(fine_monitor_raw.get("archive_check_hour", 4)),
+                archive_interval_days=int(fine_monitor_raw.get("archive_interval_days", 30)),
+                archive_daily_limit=int(fine_monitor_raw.get("archive_daily_limit", 200)),
             ),
         )
     except (KeyError, ValueError) as exc:

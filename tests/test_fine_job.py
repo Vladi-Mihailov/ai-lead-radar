@@ -11,7 +11,7 @@ tmp_path), FineCheckService — тоже настоящий (как в test_fine
 """
 
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from datetime import time as dt_time
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -99,6 +99,28 @@ def _make_job(task_repo, fine_repo, provider, notification_service) -> FineJob:
         notification_coordinator=coordinator,
         run_times=_RUN_TIMES,
         tz=_TBILISI,
+    )
+
+
+def _make_job_with_archive(
+    task_repo, fine_repo, provider, notification_service,
+    *, archive_check_hour=4, archive_interval_days=30,
+) -> FineJob:
+    """Как _make_job(), но с включённым архивным режимом (см.
+    reader/jobs/archive_fine_job.py) — отдельный helper, а не изменение
+    _make_job()/его вызовов, чтобы все существующие тесты продолжали
+    проверять поведение FineJob БЕЗ архивного режима бит в бит как раньше."""
+    check_service = FineCheckService(provider, task_repo, fine_repo)
+    coordinator = FineNotificationCoordinator(fine_repo, task_repo, notification_service)
+    return FineJob(
+        task_repository=task_repo,
+        check_service=check_service,
+        notification_coordinator=coordinator,
+        run_times=_RUN_TIMES,
+        tz=_TBILISI,
+        archive_check_enabled=True,
+        archive_check_hour=archive_check_hour,
+        archive_interval_days=archive_interval_days,
     )
 
 
@@ -336,6 +358,103 @@ async def test_task_after_end_date_is_completed_and_not_checked(tmp_path):
 
         assert provider.requested_plates == []
         assert task_repo.get(task.id).status == "completed"
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+# ---- run(): архивный режим (см. reader/jobs/archive_fine_job.py) ----
+
+
+async def test_completion_does_not_enable_archive_mode_by_default(tmp_path):
+    """archive_check_enabled НЕ передан в FineJob(...) (как во всех тестах
+    выше и во всём остальном этом файле) — завершение задачи ведёт себя
+    БИТ В БИТ как раньше: только set_status(..., "completed"), архивные
+    поля не трогаются вообще."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    try:
+        task = task_repo.create(
+            car_number="AA001AA", label=None,
+            start_date=date(2026, 8, 10), end_date=date(2026, 8, 20),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+
+        provider = _FakeProvider()
+        job = _make_job(task_repo, fine_repo, provider, _FakeNotificationService())
+
+        await job.run(datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc))
+
+        updated = task_repo.get(task.id)
+        assert updated.status == "completed"
+        assert updated.archive_check_enabled is False
+        assert updated.next_archive_check_at is None
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_completion_schedules_first_archive_check_when_archive_enabled(tmp_path):
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    try:
+        task = task_repo.create(
+            car_number="AA001AA", label=None,
+            start_date=date(2026, 8, 10), end_date=date(2026, 8, 20),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+
+        provider = _FakeProvider()
+        job = _make_job_with_archive(
+            task_repo, fine_repo, provider, _FakeNotificationService(),
+            archive_check_hour=4, archive_interval_days=30,
+        )
+
+        after_end = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
+        await job.run(after_end)
+
+        updated = task_repo.get(task.id)
+        assert updated.status == "completed"
+        assert updated.archive_check_enabled is True
+        assert updated.next_archive_check_at is not None
+
+        # ~30 дней от даты завершения (2026-08-21 по Тбилиси), в 04:00 по
+        # Тбилиси (UTC+4 -> 00:00 UTC).
+        expected_day = date(2026, 8, 21) + timedelta(days=30)
+        assert updated.next_archive_check_at == datetime(
+            expected_day.year, expected_day.month, expected_day.day, 0, 0, tzinfo=timezone.utc
+        )
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_archive_enrollment_on_completion_does_not_affect_other_active_tasks(tmp_path):
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    try:
+        overdue_task = task_repo.create(
+            car_number="AA001AA", label=None,
+            start_date=date(2026, 7, 1), end_date=date(2026, 7, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+        active_task = task_repo.create(
+            car_number="BB002BB", label=None,
+            start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+
+        provider = _FakeProvider()
+        job = _make_job_with_archive(task_repo, fine_repo, provider, _FakeNotificationService())
+
+        await job.run(_MID_PERIOD)
+
+        assert task_repo.get(overdue_task.id).archive_check_enabled is True
+        # Всё ещё активная задача не должна получить архивные поля.
+        still_active = task_repo.get(active_task.id)
+        assert still_active.status == "active"
+        assert still_active.archive_check_enabled is False
+        assert still_active.next_archive_check_at is None
     finally:
         task_repo.close()
         fine_repo.close()

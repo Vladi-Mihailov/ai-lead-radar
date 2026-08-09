@@ -25,6 +25,7 @@ from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa
 from reader.fines.notification_coordinator import FineNotificationCoordinator  # noqa: E402
 from reader.fines.police_ge_provider import PoliceGeProvider  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
+from reader.jobs.archive_fine_job import ArchiveFineJob  # noqa: E402
 from reader.jobs.fine_job import FineJob  # noqa: E402
 from reader.jobs.scheduler import Scheduler  # noqa: E402
 from reader.main import (  # noqa: E402
@@ -113,6 +114,31 @@ def test_load_settings_parses_fine_monitor_section(tmp_path, monkeypatch):
     assert settings.fine_monitor.notification_chat_ids == ["operator_chat"]
     assert settings.fine_monitor.allowed_user_ids == [111]
 
+    # _CONFIG_YAML не задаёт архивные ключи — должны применяться defaults,
+    # без правки существующего конфига этого теста.
+    assert settings.fine_monitor.archive_check_enabled is True
+    assert settings.fine_monitor.archive_check_hour == 4
+    assert settings.fine_monitor.archive_interval_days == 30
+    assert settings.fine_monitor.archive_daily_limit == 200
+
+
+def test_load_settings_parses_explicit_archive_settings(tmp_path, monkeypatch):
+    _set_required_env(monkeypatch)
+    config_with_archive = _CONFIG_YAML + (
+        "  archive_check_enabled: false\n"
+        "  archive_check_hour: 5\n"
+        "  archive_interval_days: 14\n"
+        "  archive_daily_limit: 50\n"
+    )
+    config_path = _write_config(tmp_path, config_with_archive)
+
+    settings = load_settings(config_path)
+
+    assert settings.fine_monitor.archive_check_enabled is False
+    assert settings.fine_monitor.archive_check_hour == 5
+    assert settings.fine_monitor.archive_interval_days == 14
+    assert settings.fine_monitor.archive_daily_limit == 50
+
 
 def test_resolve_notification_chat_ids_prefers_explicit_config(tmp_path, monkeypatch):
     _set_required_env(monkeypatch)
@@ -185,12 +211,31 @@ async def test_build_fine_monitor_components_wires_dependencies_correctly(tmp_pa
         assert fine_command._check_service is fine_job._check_service
         assert fine_command._notification_coordinator is fine_job._notification_coordinator
 
-        # Scheduler получил ровно один job — FineJob.
-        assert scheduler._jobs == [fine_job]
+        # Scheduler получил оба job'а — FineJob и ArchiveFineJob, тот же
+        # task_repository/check_service/notification_coordinator у обоих
+        # (ни второго обращения к police.ge, ни второго notification flow).
+        assert len(scheduler._jobs) == 2
+        assert scheduler._jobs[0] is fine_job
+        archive_fine_job = scheduler._jobs[1]
+        assert isinstance(archive_fine_job, ArchiveFineJob)
+        assert archive_fine_job._task_repository is task_repository
+        assert archive_fine_job._check_service is fine_job._check_service
+        assert archive_fine_job._notification_coordinator is fine_job._notification_coordinator
 
         # Расписание/таймзона взяты из конфига, а не захардкожены.
         assert [t.strftime("%H:%M") for t in fine_job._run_times] == ["09:00", "15:00", "21:00"]
         assert str(fine_job._tz) == "Asia/Tbilisi"
+
+        # Настройки архивного режима — тоже из конфига (см. FineMonitorSettings
+        # defaults и _CONFIG_YAML выше, где эти ключи не заданы явно).
+        assert fine_job._archive_check_enabled is True
+        assert fine_job._archive_check_hour == 4
+        assert fine_job._archive_interval_days == 30
+        assert archive_fine_job._enabled is True
+        assert archive_fine_job._hour == 4
+        assert archive_fine_job._interval_days == 30
+        assert archive_fine_job._daily_limit == 200
+        assert str(archive_fine_job._tz) == "Asia/Tbilisi"
 
         # CommandDispatcher слушает первый из настроенных чатов уведомлений.
         assert command_dispatcher._chat_id == "operator_chat"

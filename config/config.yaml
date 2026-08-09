@@ -54,3 +54,16 @@ fine_monitor:
   # поднять команды, доступные любому в чате).
   allowed_user_ids:
     - 410811386
+
+  # Архивный режим (см. reader/jobs/archive_fine_job.py) — автомобили, у
+  # которых закончился обычный период (check_times, несколько раз в сутки),
+  # не выпадают из мониторинга совсем, а проверяются раз в
+  # archive_interval_days дней, в archive_check_hour:00 по timezone выше.
+  archive_check_enabled: true
+  archive_check_hour: 4
+  archive_interval_days: 30
+  # Safety limit на один запуск ArchiveFineJob — если после простоя backlog
+  # due-задач больше лимита, остаток остаётся due и уйдёт на следующие дни,
+  # ничего не теряя. 200 — с запасом относительно текущего объёма (~1000
+  # машин/30 дней ≈ 34 проверки в день).
+  archive_daily_limit: 200
