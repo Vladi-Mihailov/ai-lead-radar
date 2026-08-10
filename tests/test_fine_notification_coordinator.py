@@ -24,13 +24,16 @@ _USER_ID = 111
 
 class _FakeUserRepository:
     """Реализует ровно UserLookupLike (см. notification_coordinator.py) —
-    без единой строчки SQL, только то, что нужно координатору."""
+    без единой строчки SQL, только то, что нужно координатору.
+    users_by_car_number моделирует users.car_numbers: ключ — нормализованный
+    номер, значение — список пользователей (обычно один, но не всегда —
+    см. тест на неоднозначность)."""
 
-    def __init__(self, users_by_id: dict[int, TelegramUserInfo] | None = None):
-        self._users_by_id = users_by_id or {}
+    def __init__(self, users_by_car_number: dict[str, list[TelegramUserInfo]] | None = None):
+        self._users_by_car_number = users_by_car_number or {}
 
-    def get(self, user_id: int) -> TelegramUserInfo | None:
-        return self._users_by_id.get(user_id)
+    def find_by_car_number(self, car_number: str) -> list[TelegramUserInfo]:
+        return self._users_by_car_number.get(car_number, [])
 
 
 class _FakeNotificationService(NotificationService):
@@ -137,17 +140,19 @@ async def test_flush_pending_leaves_failed_fines_pending_for_next_call(tmp_path)
         fine_repo.close()
 
 
-# ---- created_by_display: fine_monitoring_tasks.created_by_user_id -> users ----
+# ---- car_owner_display: car_number -> users.car_numbers -> users ----
 
 
-def _create_task_and_fine(task_repo, fine_repo, *, created_by_user_id, fingerprint="fp-1"):
+def _create_task_and_fine(
+    task_repo, fine_repo, *, car_number="AA001AA", created_by_user_id, fingerprint="fp-1",
+):
     task = task_repo.create(
-        car_number="AA001AA", label=None,
+        car_number=car_number, label=None,
         start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
         telegram_chat_id=_CHAT_ID, created_by_user_id=created_by_user_id,
     )
     fine = fine_repo.create(
-        monitoring_task_id=task.id, car_number="AA001AA",
+        monitoring_task_id=task.id, car_number=car_number,
         external_fine_id="A1", fingerprint=fingerprint,
         penalty_date=None, due_date=None, delivered_status="Не вручено",
         raw_data="{}",
@@ -155,13 +160,28 @@ def _create_task_and_fine(task_repo, fine_repo, *, created_by_user_id, fingerpri
     return task, fine
 
 
-async def test_created_by_display_shows_username_when_available(tmp_path):
+async def test_car_owner_display_uses_car_number_not_created_by_user_id(tmp_path):
+    """Главный regression-тест против production-бага: car_number
+    принадлежит user A (владелец по users.car_numbers), а задачу
+    мониторинга создал (created_by_user_id) совсем другой user B —
+    показываться должен именно A, а не B."""
     task_repo, fine_repo = _make_repos(tmp_path)
     try:
-        _create_task_and_fine(task_repo, fine_repo, created_by_user_id=42)
+        USER_A_OWNER = 100
+        USER_B_CREATOR = 200
+        _create_task_and_fine(
+            task_repo, fine_repo, car_number="AA001AA", created_by_user_id=USER_B_CREATOR,
+        )
 
         user_repository = _FakeUserRepository(
-            {42: TelegramUserInfo(user_id=42, username="ivan_petrov", first_name=None, last_name=None)}
+            {
+                "AA001AA": [
+                    TelegramUserInfo(
+                        user_id=USER_A_OWNER, username="owner_ivan",
+                        first_name=None, last_name=None,
+                    )
+                ],
+            }
         )
         notification_service = _FakeNotificationService()
         coordinator = FineNotificationCoordinator(
@@ -171,20 +191,19 @@ async def test_created_by_display_shows_username_when_available(tmp_path):
         await coordinator.flush_pending()
 
         sent_event = notification_service.notify_calls[0][0]
-        assert sent_event.created_by_display == "@ivan_petrov"
+        assert sent_event.car_owner_display == "@owner_ivan"
     finally:
         task_repo.close()
         fine_repo.close()
 
 
-async def test_created_by_display_falls_back_to_user_id_when_username_missing(tmp_path):
+async def test_car_owner_display_shows_username_when_found_by_car_number(tmp_path):
     task_repo, fine_repo = _make_repos(tmp_path)
     try:
-        _create_task_and_fine(task_repo, fine_repo, created_by_user_id=123456789)
+        _create_task_and_fine(task_repo, fine_repo, car_number="AA001AA", created_by_user_id=42)
 
-        # UserRepository знает пользователя, но у него нет ни username, ни имени.
         user_repository = _FakeUserRepository(
-            {123456789: TelegramUserInfo(user_id=123456789, username=None, first_name=None, last_name=None)}
+            {"AA001AA": [TelegramUserInfo(user_id=42, username="ivan_petrov", first_name=None, last_name=None)]}
         )
         notification_service = _FakeNotificationService()
         coordinator = FineNotificationCoordinator(
@@ -194,18 +213,38 @@ async def test_created_by_display_falls_back_to_user_id_when_username_missing(tm
         await coordinator.flush_pending()
 
         sent_event = notification_service.notify_calls[0][0]
-        assert sent_event.created_by_display == "ID 123456789"
+        assert sent_event.car_owner_display == "@ivan_petrov"
     finally:
         task_repo.close()
         fine_repo.close()
 
 
-async def test_created_by_display_falls_back_to_user_id_when_user_repository_is_none(tmp_path):
-    """Без UserRepository вообще (например, старое подключение) — уведомление
-    остаётся полезным: показывает хотя бы created_by_user_id."""
+async def test_car_owner_display_shows_not_found_when_car_number_unknown(tmp_path):
     task_repo, fine_repo = _make_repos(tmp_path)
     try:
-        _create_task_and_fine(task_repo, fine_repo, created_by_user_id=999)
+        _create_task_and_fine(task_repo, fine_repo, car_number="AA001AA", created_by_user_id=42)
+
+        # UserRepository ничего не знает про AA001AA — created_by_user_id=42
+        # НЕ должен подставляться как владелец.
+        user_repository = _FakeUserRepository({})
+        notification_service = _FakeNotificationService()
+        coordinator = FineNotificationCoordinator(
+            fine_repo, task_repo, notification_service, user_repository,
+        )
+
+        await coordinator.flush_pending()
+
+        sent_event = notification_service.notify_calls[0][0]
+        assert sent_event.car_owner_display == "не найден"
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_car_owner_display_shows_not_found_when_user_repository_is_none(tmp_path):
+    task_repo, fine_repo = _make_repos(tmp_path)
+    try:
+        _create_task_and_fine(task_repo, fine_repo, car_number="AA001AA", created_by_user_id=999)
 
         notification_service = _FakeNotificationService()
         coordinator = FineNotificationCoordinator(fine_repo, task_repo, notification_service)
@@ -213,41 +252,21 @@ async def test_created_by_display_falls_back_to_user_id_when_user_repository_is_
         await coordinator.flush_pending()
 
         sent_event = notification_service.notify_calls[0][0]
-        assert sent_event.created_by_display == "ID 999"
+        assert sent_event.car_owner_display == "не найден"
     finally:
         task_repo.close()
         fine_repo.close()
 
 
-async def test_created_by_display_falls_back_to_user_id_when_user_not_found_in_repository(tmp_path):
+async def test_car_owner_display_combines_full_name_and_username(tmp_path):
     task_repo, fine_repo = _make_repos(tmp_path)
     try:
-        _create_task_and_fine(task_repo, fine_repo, created_by_user_id=555)
-
-        user_repository = _FakeUserRepository({})  # пользователь не найден
-        notification_service = _FakeNotificationService()
-        coordinator = FineNotificationCoordinator(
-            fine_repo, task_repo, notification_service, user_repository,
-        )
-
-        await coordinator.flush_pending()
-
-        sent_event = notification_service.notify_calls[0][0]
-        assert sent_event.created_by_display == "ID 555"
-    finally:
-        task_repo.close()
-        fine_repo.close()
-
-
-async def test_created_by_display_combines_full_name_and_username(tmp_path):
-    task_repo, fine_repo = _make_repos(tmp_path)
-    try:
-        _create_task_and_fine(task_repo, fine_repo, created_by_user_id=42)
+        _create_task_and_fine(task_repo, fine_repo, car_number="AA001AA", created_by_user_id=42)
 
         user_repository = _FakeUserRepository(
-            {42: TelegramUserInfo(
+            {"AA001AA": [TelegramUserInfo(
                 user_id=42, username="ivan_petrov", first_name="Иван", last_name="Петров",
-            )}
+            )]}
         )
         notification_service = _FakeNotificationService()
         coordinator = FineNotificationCoordinator(
@@ -257,19 +276,19 @@ async def test_created_by_display_combines_full_name_and_username(tmp_path):
         await coordinator.flush_pending()
 
         sent_event = notification_service.notify_calls[0][0]
-        assert sent_event.created_by_display == "Иван Петров (@ivan_petrov)"
+        assert sent_event.car_owner_display == "Иван Петров (@ivan_petrov)"
     finally:
         task_repo.close()
         fine_repo.close()
 
 
-async def test_created_by_display_shows_full_name_with_id_when_username_missing(tmp_path):
+async def test_car_owner_display_shows_full_name_with_id_when_username_missing(tmp_path):
     task_repo, fine_repo = _make_repos(tmp_path)
     try:
-        _create_task_and_fine(task_repo, fine_repo, created_by_user_id=42)
+        _create_task_and_fine(task_repo, fine_repo, car_number="AA001AA", created_by_user_id=42)
 
         user_repository = _FakeUserRepository(
-            {42: TelegramUserInfo(user_id=42, username=None, first_name="Иван", last_name="Петров")}
+            {"AA001AA": [TelegramUserInfo(user_id=42, username=None, first_name="Иван", last_name="Петров")]}
         )
         notification_service = _FakeNotificationService()
         coordinator = FineNotificationCoordinator(
@@ -279,18 +298,49 @@ async def test_created_by_display_shows_full_name_with_id_when_username_missing(
         await coordinator.flush_pending()
 
         sent_event = notification_service.notify_calls[0][0]
-        assert sent_event.created_by_display == "Иван Петров (ID 42)"
+        assert sent_event.car_owner_display == "Иван Петров (ID 42)"
     finally:
         task_repo.close()
         fine_repo.close()
 
 
-async def test_created_by_display_is_looked_up_once_per_task_for_multiple_fines_same_car(tmp_path):
+async def test_car_owner_display_reports_ambiguous_match(tmp_path, caplog):
+    """car_number найден одновременно у нескольких пользователей — нельзя
+    молча выбирать "победителя"."""
+    task_repo, fine_repo = _make_repos(tmp_path)
+    try:
+        _create_task_and_fine(task_repo, fine_repo, car_number="AA001AA", created_by_user_id=42)
+
+        user_repository = _FakeUserRepository(
+            {
+                "AA001AA": [
+                    TelegramUserInfo(user_id=1, username="user_one", first_name=None, last_name=None),
+                    TelegramUserInfo(user_id=2, username="user_two", first_name=None, last_name=None),
+                ],
+            }
+        )
+        notification_service = _FakeNotificationService()
+        coordinator = FineNotificationCoordinator(
+            fine_repo, task_repo, notification_service, user_repository,
+        )
+
+        with caplog.at_level("WARNING", logger="reader.fines.notification_coordinator"):
+            await coordinator.flush_pending()
+
+        sent_event = notification_service.notify_calls[0][0]
+        assert sent_event.car_owner_display == "найдено несколько пользователей"
+        assert any("AA001AA" in r.getMessage() and "[1, 2]" in r.getMessage() for r in caplog.records)
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_car_owner_display_is_looked_up_once_per_task_for_multiple_fines_same_car(tmp_path):
     """Несколько новых штрафов по одной и той же задаче мониторинга — у
-    всех событий должен быть одинаковый created_by_display (сам рендеринг
+    всех событий должен быть одинаковый car_owner_display (сам рендеринг
     "один раз на автомобиль" — забота TelegramNotificationService, но
     источник данных для этого — координатор, и он не должен путать
-    пользователей между разными штрафами одной задачи)."""
+    владельцев между разными штрафами одной задачи)."""
     task_repo, fine_repo = _make_repos(tmp_path)
     try:
         task = task_repo.create(
@@ -312,7 +362,7 @@ async def test_created_by_display_is_looked_up_once_per_task_for_multiple_fines_
         )
 
         user_repository = _FakeUserRepository(
-            {42: TelegramUserInfo(user_id=42, username="ivan_petrov", first_name=None, last_name=None)}
+            {"AA001AA": [TelegramUserInfo(user_id=100, username="ivan_petrov", first_name=None, last_name=None)]}
         )
         notification_service = _FakeNotificationService()
         coordinator = FineNotificationCoordinator(
@@ -323,21 +373,21 @@ async def test_created_by_display_is_looked_up_once_per_task_for_multiple_fines_
 
         sent_events = notification_service.notify_calls[0]
         assert len(sent_events) == 2
-        assert all(e.created_by_display == "@ivan_petrov" for e in sent_events)
+        assert all(e.car_owner_display == "@ivan_petrov" for e in sent_events)
     finally:
         task_repo.close()
         fine_repo.close()
 
 
-async def test_created_by_display_is_none_when_monitoring_task_not_found(tmp_path):
+async def test_car_owner_display_is_none_when_monitoring_task_not_found(tmp_path):
     """Задача мониторинга не найдена (не должно случаться в норме — есть
     FOREIGN KEY на fine_monitoring_tasks(id), но репозиторий уже терпим к
-    этому для label, см. _build_event) — created_by_display той же логике
+    этому для label, см. _build_event) — car_owner_display той же логике
     следует (None), а не падает с исключением."""
     task_repo, fine_repo = _make_repos(tmp_path)
     try:
         user_repository = _FakeUserRepository(
-            {42: TelegramUserInfo(user_id=42, username="ivan_petrov", first_name=None, last_name=None)}
+            {"AA001AA": [TelegramUserInfo(user_id=42, username="ivan_petrov", first_name=None, last_name=None)]}
         )
         coordinator = FineNotificationCoordinator(
             fine_repo, task_repo, _FakeNotificationService(), user_repository,
@@ -354,7 +404,7 @@ async def test_created_by_display_is_none_when_monitoring_task_not_found(tmp_pat
         event = coordinator._build_event(orphan_fine)
 
         assert event.label is None
-        assert event.created_by_display is None
+        assert event.car_owner_display is None
     finally:
         task_repo.close()
         fine_repo.close()

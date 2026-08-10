@@ -78,6 +78,11 @@ ON CONFLICT(user_id) DO UPDATE SET
 
 _SELECT_CAR_NUMBERS = "SELECT car_numbers FROM users WHERE user_id = ?"
 
+_SELECT_USERS_WITH_CAR_NUMBERS = (
+    "SELECT user_id, username, first_name, last_name, is_bot, access_hash, peer_type, car_numbers "
+    "FROM users WHERE car_numbers IS NOT NULL AND car_numbers != ''"
+)
+
 _UPSERT_CAR_NUMBERS = """
 INSERT INTO users (user_id, car_numbers, last_seen_at, updated_at)
 VALUES (:user_id, :car_numbers, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
@@ -249,6 +254,44 @@ class UserRepository:
     def get_car_numbers(self, user_id: int) -> list[str]:
         row = self._conn.execute(_SELECT_CAR_NUMBERS, (user_id,)).fetchone()
         return _parse_car_numbers(row[0] if row else None)
+
+    def find_by_car_number(self, car_number: str) -> list[TelegramUserInfo]:
+        """Пользователи, у которых car_numbers содержит РОВНО этот номер —
+        car_number должен быть уже нормализован вызывающим кодом (как
+        fine_monitoring_tasks.car_number, см.
+        reader/fines/validation.py.normalize_car_number(): один и тот же
+        алфавит/регистр [A-Z0-9], без пробелов/дефисов, что и у значений,
+        которые сюда кладёт reader/users/car_numbers.py.extract_car_numbers()).
+
+        Намеренно НЕ использует SQL LIKE по car_numbers (строка вида
+        "A111AA77, X777XX197") — подстрока могла бы случайно совпасть с
+        частью другого номера (например, "A111AA77" внутри "XA111AA779").
+        Вместо этого читает только строки с непустым car_numbers (обычно
+        меньшинство таблицы) и сверяет каждую как уже разобранный список
+        через _parse_car_numbers() — дёшево и однозначно корректно.
+
+        Список, а не Optional[TelegramUserInfo]: add_car_numbers() не
+        гарантирует уникальность car_number между разными user_id (два
+        разных Telegram-пользователя вполне могут упомянуть один и тот же
+        номер в истории чата) — вызывающий код обязан сам решить, что
+        делать при 0 или >1 совпадениях, а не молча брать первое."""
+        rows = self._conn.execute(_SELECT_USERS_WITH_CAR_NUMBERS).fetchall()
+
+        matches = []
+        for user_id, username, first_name, last_name, is_bot, access_hash, peer_type, car_numbers_raw in rows:
+            if car_number in _parse_car_numbers(car_numbers_raw):
+                matches.append(
+                    TelegramUserInfo(
+                        user_id=user_id,
+                        username=username,
+                        first_name=first_name,
+                        last_name=last_name,
+                        is_bot=bool(is_bot),
+                        access_hash=access_hash,
+                        peer_type=peer_type,
+                    )
+                )
+        return matches
 
     def update_access_hash(
         self, user_id: int, access_hash: int, username: str | None = None,

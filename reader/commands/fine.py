@@ -18,7 +18,7 @@ from reader.fines.models import CarFineStats, FineMonitoringTask
 from reader.fines.notification_coordinator import (
     FineNotificationCoordinator,
     UserLookupLike,
-    format_user_display,
+    format_car_owner_display,
 )
 from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.fines.validation import (
@@ -131,7 +131,7 @@ class FineCommand(Command):
         self._run_times = run_times
         self._tz = tz
         # None — как и у FineNotificationCoordinator (см. её докстрок) —
-        # "Telegram: ..." в результате fine check тогда покажет "ID N".
+        # "Telegram: ..." в результате fine check тогда покажет "не найден".
         self._user_repository = user_repository
 
     async def handle(self, ctx: CommandContext) -> CommandResult:
@@ -435,11 +435,13 @@ class FineCommand(Command):
         # координатора, а не копией логики.
         await self._notification_coordinator.flush_pending()
 
-        # fine_monitoring_tasks.created_by_user_id -> UserRepository.get() —
-        # та же связь и тот же формат (с fallback на ID), что и в
-        # уведомлении о новом штрафе (см. FineNotificationCoordinator);
-        # обычно у номера ровно одна активная задача, поэтому берём первую.
-        telegram_display = self._created_by_display(tasks[0].created_by_user_id)
+        # car_number -> users.car_numbers -> UserRepository.find_by_car_number() —
+        # Telegram-ВЛАДЕЛЕЦ автомобиля, а не тот, кто создал задачу
+        # мониторинга (fine_monitoring_tasks.created_by_user_id — другой
+        # человек, см. докстрок _car_owner_display и задачу про
+        # production-баг). Тот же формат/fallback, что и в уведомлении о
+        # новом штрафе (см. FineNotificationCoordinator).
+        telegram_display = self._car_owner_display(car_number)
 
         return CommandResult(
             text=(
@@ -452,9 +454,17 @@ class FineCommand(Command):
             )
         )
 
-    def _created_by_display(self, user_id: int) -> str:
-        user = self._user_repository.get(user_id) if self._user_repository is not None else None
-        return format_user_display(user, user_id)
+    def _car_owner_display(self, car_number: str) -> str:
+        if self._user_repository is None:
+            return format_car_owner_display([])
+
+        users = self._user_repository.find_by_car_number(car_number)
+        if len(users) > 1:
+            logger.warning(
+                "По номеру %s найдено несколько Telegram-пользователей: user_id=%s",
+                car_number, [user.user_id for user in users],
+            )
+        return format_car_owner_display(users)
 
     async def _handle_update_all(self, ctx: CommandContext) -> CommandResult:
         """fine update-all — берёт все активные задачи мониторинга и

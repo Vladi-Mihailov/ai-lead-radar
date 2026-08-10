@@ -4,6 +4,7 @@
 Ничего не знает про Telegram — только про NotificationService (интерфейс).
 """
 
+import logging
 from typing import Protocol
 
 from reader.fines.detected_fine_repository import DetectedFineRepository
@@ -12,39 +13,55 @@ from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.notifications.base import NotificationResult, NotificationService
 from reader.users.models import TelegramUserInfo
 
+logger = logging.getLogger(__name__)
+
 
 class UserLookupLike(Protocol):
     """Ровно то, что нужно FineNotificationCoordinator от UserRepository
     (reader/users/repository.py) — не импортируем сам класс, чтобы не тянуть
     его целиком (sqlite и т.п.) в тесты, которым нужен только фейк. Тот же
     приём, что и InviterService.UserAccessHashUpdaterLike
-    (reader/inviter/service.py)."""
+    (reader/inviter/service.py).
 
-    def get(self, user_id: int) -> TelegramUserInfo | None: ...
+    find_by_car_number(), а НЕ get(user_id) — Telegram-владелец автомобиля
+    определяется по car_number -> users.car_numbers, а не по
+    fine_monitoring_tasks.created_by_user_id (это другой человек — тот, кто
+    создал задачу мониторинга, см. докстрок _car_owner_display)."""
+
+    def find_by_car_number(self, car_number: str) -> list[TelegramUserInfo]: ...
 
 
-def format_user_display(user: TelegramUserInfo | None, user_id: int) -> str:
-    """"@username", "Имя Фамилия (@username)", "Имя Фамилия (ID N)" или,
-    если о пользователе ничего не известно (нет UserRepository, пользователь
-    не найден, ни username, ни имени нет), — "ID N". Уведомление остаётся
-    полезным в любом случае: id мониторинга гарантированно известен.
+def format_car_owner_display(users: list[TelegramUserInfo]) -> str:
+    """"@username", "Имя Фамилия (@username)", "Имя Фамилия (ID N)" или
+    "ID N" — ровно для ОДНОГО найденного владельца. Отдельно и явно
+    обрабатывает случаи, когда владелец неизвестен:
 
-    Публичная функция (не только для этого модуля) — тем же форматом
-    пользуется и reader/commands/fine.py (fine check), чтобы не заводить
-    вторую реализацию того же самого fallback."""
-    if user is None:
-        return f"ID {user_id}"
+    - users пуст (car_number не встречался ни у одного пользователя,
+      либо UserRepository вообще не передан) -> "не найден". Никогда не
+      подставляем сюда чей-либо user_id "на всякий случай" — это была бы
+      ложная информация о владельце (см. задачу про production-баг с
+      created_by_user_id);
+    - users содержит больше одного элемента (add_car_numbers() не
+      гарантирует, что один номер принадлежит ровно одному
+      Telegram-пользователю — см. UserRepository.find_by_car_number()) ->
+      "найдено несколько пользователей", вместо того чтобы молча выбрать
+      случайного "победителя"."""
+    if not users:
+        return "не найден"
+    if len(users) > 1:
+        return "найдено несколько пользователей"
 
+    user = users[0]
     full_name = user.full_name
     username = user.username
 
     if full_name and username:
         return f"{full_name} (@{username})"
     if full_name:
-        return f"{full_name} (ID {user_id})"
+        return f"{full_name} (ID {user.user_id})"
     if username:
         return f"@{username}"
-    return f"ID {user_id}"
+    return f"ID {user.user_id}"
 
 
 class FineNotificationCoordinator:
@@ -60,8 +77,8 @@ class FineNotificationCoordinator:
         self._notification_service = notification_service
         # None — как и everywhere в этом проекте (см. InviterService) —
         # означает "функциональность недоступна", а не ошибку: без
-        # UserRepository уведомление всё равно покажет "Telegram: ID N"
-        # (created_by_user_id всегда есть на самой задаче мониторинга).
+        # UserRepository уведомление покажет "Telegram: не найден", а не
+        # какой-либо (заведомо неверный) id.
         self._user_repository = user_repository
 
     async def flush_pending(self) -> NotificationResult:
@@ -89,13 +106,17 @@ class FineNotificationCoordinator:
         return NewFineEvent.from_detected_fine(
             fine,
             label=task.label if task is not None else None,
-            created_by_display=self._created_by_display(task) if task is not None else None,
+            car_owner_display=self._car_owner_display(task.car_number) if task is not None else None,
         )
 
-    def _created_by_display(self, task: FineMonitoringTask) -> str:
-        user = (
-            self._user_repository.get(task.created_by_user_id)
-            if self._user_repository is not None
-            else None
-        )
-        return format_user_display(user, task.created_by_user_id)
+    def _car_owner_display(self, car_number: str) -> str:
+        if self._user_repository is None:
+            return format_car_owner_display([])
+
+        users = self._user_repository.find_by_car_number(car_number)
+        if len(users) > 1:
+            logger.warning(
+                "По номеру %s найдено несколько Telegram-пользователей: user_id=%s",
+                car_number, [user.user_id for user in users],
+            )
+        return format_car_owner_display(users)

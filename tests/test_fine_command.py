@@ -66,13 +66,15 @@ class _SelectiveFailingProvider(FineProvider):
 
 
 class _FakeUserRepository:
-    """Реализует ровно UserLookupLike (см. reader/fines/notification_coordinator.py)."""
+    """Реализует ровно UserLookupLike (см. reader/fines/notification_coordinator.py) —
+    ключ словаря — car_number (users.car_numbers), а не user_id: владелец
+    определяется ПО НОМЕРУ АВТОМОБИЛЯ, не по created_by_user_id задачи."""
 
-    def __init__(self, users_by_id: dict[int, TelegramUserInfo] | None = None):
-        self._users_by_id = users_by_id or {}
+    def __init__(self, users_by_car_number: dict[str, list[TelegramUserInfo]] | None = None):
+        self._users_by_car_number = users_by_car_number or {}
 
-    def get(self, user_id: int) -> TelegramUserInfo | None:
-        return self._users_by_id.get(user_id)
+    def find_by_car_number(self, car_number: str) -> list[TelegramUserInfo]:
+        return self._users_by_car_number.get(car_number, [])
 
 
 class _FakeNotificationService(NotificationService):
@@ -639,20 +641,30 @@ async def test_fine_check_by_car_number(tmp_path):
         fx.close()
 
 
-async def test_fine_check_shows_telegram_username_of_task_creator(tmp_path):
+async def test_fine_check_shows_owner_by_car_number_not_task_creator(tmp_path):
+    """Главный regression-тест против production-бага: car_number
+    принадлежит владельцу A (users.car_numbers), а задачу создал (кто
+    вызвал fine add, т.е. created_by_user_id) другой пользователь B —
+    результат должен показывать именно A, а не B."""
+    OWNER_USER_ID = 100
+    CREATOR_USER_ID = 200
     fx = _Fixture(
         tmp_path,
         records_by_car={"AA001AA": [_record(car_number="AA001AA")]},
         user_repository=_FakeUserRepository(
-            {_USER_ID: TelegramUserInfo(user_id=_USER_ID, username="ivan_petrov", first_name=None, last_name=None)}
+            {"AA001AA": [TelegramUserInfo(
+                user_id=OWNER_USER_ID, username="owner_ivan", first_name=None, last_name=None,
+            )]}
         ),
     )
     try:
-        await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
+        await fx.command.handle(
+            _ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"], user_id=CREATOR_USER_ID)
+        )
 
         result = await fx.command.handle(_ctx(["check", "AA001AA"]))
 
-        assert "Telegram: @ivan_petrov" in result.text
+        assert "Telegram: @owner_ivan" in result.text
         # Остальное содержимое результата не потеряно.
         assert "✅ Проверка завершена" in result.text
         assert "Автомобиль: AA001AA" in result.text
@@ -663,12 +675,12 @@ async def test_fine_check_shows_telegram_username_of_task_creator(tmp_path):
         fx.close()
 
 
-async def test_fine_check_falls_back_to_user_id_without_username(tmp_path):
+async def test_fine_check_shows_username_of_owner_found_by_car_number(tmp_path):
     fx = _Fixture(
         tmp_path,
         records_by_car={"AA001AA": [_record(car_number="AA001AA")]},
         user_repository=_FakeUserRepository(
-            {_USER_ID: TelegramUserInfo(user_id=_USER_ID, username=None, first_name=None, last_name=None)}
+            {"AA001AA": [TelegramUserInfo(user_id=1, username="ivan_petrov", first_name=None, last_name=None)]}
         ),
     )
     try:
@@ -676,37 +688,37 @@ async def test_fine_check_falls_back_to_user_id_without_username(tmp_path):
 
         result = await fx.command.handle(_ctx(["check", "AA001AA"]))
 
-        assert f"Telegram: ID {_USER_ID}" in result.text
+        assert "Telegram: @ivan_petrov" in result.text
     finally:
         fx.close()
 
 
-async def test_fine_check_falls_back_to_user_id_without_user_repository(tmp_path):
-    # user_repository вообще не передан (как во всех остальных тестах этого
-    # файла до этой задачи) — результат всё равно полезен.
-    fx = _Fixture(tmp_path, records_by_car={"AA001AA": [_record(car_number="AA001AA")]})
-    try:
-        await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
-
-        result = await fx.command.handle(_ctx(["check", "AA001AA"]))
-
-        assert f"Telegram: ID {_USER_ID}" in result.text
-    finally:
-        fx.close()
-
-
-async def test_fine_check_falls_back_to_user_id_when_user_not_found(tmp_path):
+async def test_fine_check_shows_not_found_when_car_number_unknown_to_users(tmp_path):
     fx = _Fixture(
         tmp_path,
         records_by_car={"AA001AA": [_record(car_number="AA001AA")]},
-        user_repository=_FakeUserRepository({}),  # пользователь не найден
+        user_repository=_FakeUserRepository({}),  # AA001AA нет ни у кого в car_numbers
     )
     try:
         await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
 
         result = await fx.command.handle(_ctx(["check", "AA001AA"]))
 
-        assert f"Telegram: ID {_USER_ID}" in result.text
+        assert "Telegram: не найден" in result.text
+    finally:
+        fx.close()
+
+
+async def test_fine_check_shows_not_found_without_user_repository(tmp_path):
+    # user_repository вообще не передан — результат всё равно корректен, но
+    # НЕ подставляет created_by_user_id как владельца.
+    fx = _Fixture(tmp_path, records_by_car={"AA001AA": [_record(car_number="AA001AA")]})
+    try:
+        await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
+
+        result = await fx.command.handle(_ctx(["check", "AA001AA"]))
+
+        assert "Telegram: не найден" in result.text
     finally:
         fx.close()
 
@@ -716,9 +728,9 @@ async def test_fine_check_shows_full_name_with_username(tmp_path):
         tmp_path,
         records_by_car={"AA001AA": [_record(car_number="AA001AA")]},
         user_repository=_FakeUserRepository(
-            {_USER_ID: TelegramUserInfo(
-                user_id=_USER_ID, username="ivan_petrov", first_name="Иван", last_name="Петров",
-            )}
+            {"AA001AA": [TelegramUserInfo(
+                user_id=1, username="ivan_petrov", first_name="Иван", last_name="Петров",
+            )]}
         ),
     )
     try:
@@ -727,6 +739,29 @@ async def test_fine_check_shows_full_name_with_username(tmp_path):
         result = await fx.command.handle(_ctx(["check", "AA001AA"]))
 
         assert "Telegram: Иван Петров (@ivan_petrov)" in result.text
+    finally:
+        fx.close()
+
+
+async def test_fine_check_shows_ambiguous_owner_when_multiple_users_match(tmp_path):
+    fx = _Fixture(
+        tmp_path,
+        records_by_car={"AA001AA": [_record(car_number="AA001AA")]},
+        user_repository=_FakeUserRepository(
+            {
+                "AA001AA": [
+                    TelegramUserInfo(user_id=1, username="user_one", first_name=None, last_name=None),
+                    TelegramUserInfo(user_id=2, username="user_two", first_name=None, last_name=None),
+                ],
+            }
+        ),
+    )
+    try:
+        await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
+
+        result = await fx.command.handle(_ctx(["check", "AA001AA"]))
+
+        assert "Telegram: найдено несколько пользователей" in result.text
     finally:
         fx.close()
 

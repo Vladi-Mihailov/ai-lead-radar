@@ -50,16 +50,21 @@ def _format_fine_block(event: NewFineEvent) -> str:
 
 
 def _format_car_line(car_number: str, events: list[NewFineEvent]) -> str:
-    """"Автомобиль: X" + (если известно) "Telegram: ..." — ровно один раз на
-    группу (см. _group_by_car), а не на каждый штраф внутри неё. Берём
-    значение с первого события группы: все события в группе относятся к
-    одному car_number, а created_by_display в первую очередь несёт смысл
-    "кто добавил этот автомобиль в мониторинг", а не привязан к конкретному
-    штрафу."""
+    """"Автомобиль: X" + "Telegram: ..." — ровно один раз на группу (см.
+    _group_by_car), а не на каждый штраф внутри неё. Берём значение с
+    первого события группы: все события в группе относятся к одному
+    car_number, а car_owner_display определяется именно по car_number (см.
+    FineNotificationCoordinator), а не привязан к конкретному штрафу.
+
+    car_owner_display почти всегда непустая строка — "не найден"/"найдено
+    несколько пользователей", если владельца нельзя однозначно показать
+    (единый вариант вместо тихого пропуска строки, см. задачу). None
+    бывает, только если саму задачу мониторинга не удалось найти вообще —
+    тогда строку не показываем, показывать нечего даже "не найден"."""
     line = f"Автомобиль: {car_number}"
-    created_by_display = events[0].created_by_display
-    if created_by_display:
-        line += f"\nTelegram: {created_by_display}"
+    car_owner_display = events[0].car_owner_display
+    if car_owner_display:
+        line += f"\nTelegram: {car_owner_display}"
     return line
 
 

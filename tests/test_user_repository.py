@@ -265,6 +265,106 @@ def test_car_numbers_do_not_affect_keywords_and_vice_versa(tmp_path):
         repository.close()
 
 
+# ---- find_by_car_number() ----
+
+
+def test_find_by_car_number_returns_matching_user(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.add_car_numbers(111, ["A111AA77"])
+
+        found = repository.find_by_car_number("A111AA77")
+
+        assert [u.user_id for u in found] == [111]
+    finally:
+        repository.close()
+
+
+def test_find_by_car_number_returns_empty_list_when_not_found(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.add_car_numbers(111, ["A111AA77"])
+
+        assert repository.find_by_car_number("X999XX99") == []
+    finally:
+        repository.close()
+
+
+def test_find_by_car_number_returns_empty_list_when_no_users_have_car_numbers(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        assert repository.find_by_car_number("A111AA77") == []
+    finally:
+        repository.close()
+
+
+def test_find_by_car_number_does_not_match_substring_of_another_plate(tmp_path):
+    """Регрессия против наивного SQL LIKE по car_numbers: "A111AA77" не
+    должен считаться найденным только потому, что он является подстрокой
+    другого сохранённого номера."""
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.add_car_numbers(111, ["XA111AA779"])
+
+        assert repository.find_by_car_number("A111AA77") == []
+        assert [u.user_id for u in repository.find_by_car_number("XA111AA779")] == [111]
+    finally:
+        repository.close()
+
+
+def test_find_by_car_number_matches_regardless_of_position_in_stored_list(tmp_path):
+    """car_numbers хранится как "N1, N2, N3" (см. _format_car_numbers) —
+    номер должен находиться независимо от того, первый он, последний или
+    посередине списка конкретного пользователя."""
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.add_car_numbers(111, ["A111AA77", "B222BB77", "C333CC77"])
+
+        assert [u.user_id for u in repository.find_by_car_number("A111AA77")] == [111]
+        assert [u.user_id for u in repository.find_by_car_number("B222BB77")] == [111]
+        assert [u.user_id for u in repository.find_by_car_number("C333CC77")] == [111]
+    finally:
+        repository.close()
+
+
+def test_find_by_car_number_returns_all_users_when_ambiguous(tmp_path):
+    """add_car_numbers() не гарантирует уникальность car_number между
+    разными user_id — два разных Telegram-пользователя вполне могут
+    упомянуть один и тот же номер в истории чата (см. докстрок
+    find_by_car_number). Метод должен вернуть ОБОИХ, а не молча выбрать
+    одного."""
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.add_car_numbers(111, ["A111AA77"])
+        repository.add_car_numbers(222, ["A111AA77"])
+
+        found = repository.find_by_car_number("A111AA77")
+
+        assert sorted(u.user_id for u in found) == [111, 222]
+    finally:
+        repository.close()
+
+
+def test_find_by_car_number_returns_full_user_info(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.upsert(
+            TelegramUserInfo(
+                user_id=111, username="ivan_petrov", first_name="Иван", last_name="Петров",
+            )
+        )
+        repository.add_car_numbers(111, ["A111AA77"])
+
+        [found] = repository.find_by_car_number("A111AA77")
+
+        assert found.user_id == 111
+        assert found.username == "ivan_petrov"
+        assert found.first_name == "Иван"
+        assert found.last_name == "Петров"
+    finally:
+        repository.close()
+
+
 def test_migration_adds_car_numbers_column_to_legacy_database(tmp_path):
     db_path = tmp_path / "users.db"
 

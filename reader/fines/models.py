@@ -93,17 +93,20 @@ class NewFineEvent:
     due_date: date | None
     delivered_status: str | None
     # Готовая для показа строка вида "@ivan_petrov"/"Иван Петров (@ivan_petrov)"/
-    # "ID 123456789" — кто добавил машину в мониторинг (fine_monitoring_tasks.
-    # created_by_user_id -> users.user_id, см. FineNotificationCoordinator).
-    # None, только если задачу мониторинга вообще не удалось найти — в
-    # остальных случаях всегда есть хотя бы "ID <created_by_user_id>".
-    # Default сохраняет старое поведение для существующих вызовов (например,
-    # FineCheckService.check_task(), которому эта информация не нужна).
-    created_by_display: str | None = None
+    # "не найден"/"найдено несколько пользователей" — Telegram-ВЛАДЕЛЕЦ
+    # автомобиля, определяемый по car_number -> users.car_numbers ->
+    # UserRepository.find_by_car_number() (см. FineNotificationCoordinator).
+    # Это НЕ fine_monitoring_tasks.created_by_user_id (тот, кто создал
+    # задачу мониторинга) — раньше поле ошибочно показывало именно его,
+    # см. задачу про production-баг. None, только если задачу мониторинга
+    # вообще не удалось найти. Default сохраняет старое поведение для
+    # существующих вызовов (например, FineCheckService.check_task(),
+    # которому эта информация не нужна).
+    car_owner_display: str | None = None
 
     @classmethod
     def from_detected_fine(
-        cls, fine: DetectedFine, *, label: str | None, created_by_display: str | None = None,
+        cls, fine: DetectedFine, *, label: str | None, car_owner_display: str | None = None,
     ) -> "NewFineEvent":
         return cls(
             detected_fine_id=fine.id,
@@ -114,7 +117,7 @@ class NewFineEvent:
             penalty_date=fine.penalty_date,
             due_date=fine.due_date,
             delivered_status=fine.delivered_status,
-            created_by_display=created_by_display,
+            car_owner_display=car_owner_display,
         )
 
 
