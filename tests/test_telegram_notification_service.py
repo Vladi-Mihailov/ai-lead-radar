@@ -48,6 +48,7 @@ def _event(
     delivered_status="Не вручено",
     task_id=1,
     detected_fine_id=1,
+    created_by_display=None,
 ) -> NewFineEvent:
     return NewFineEvent(
         detected_fine_id=detected_fine_id,
@@ -58,6 +59,7 @@ def _event(
         penalty_date=penalty_date,
         due_date=due_date,
         delivered_status=delivered_status,
+        created_by_display=created_by_display,
     )
 
 
@@ -100,6 +102,36 @@ async def test_notify_omits_missing_optional_fields():
     assert "Дата штрафа: 06.08.2026" in text
 
 
+async def test_notify_includes_telegram_line_right_after_car_number():
+    client = _FakeClient()
+    service = await _started_service(client)
+
+    await service.notify([_event(created_by_display="@ivan_petrov")])
+
+    _, text, _ = client.sent_messages[0]
+    assert text == (
+        "🚨 Обнаружен новый опубликованный штраф\n"
+        "\n"
+        "Автомобиль: B957MA09\n"
+        "Telegram: @ivan_petrov\n"
+        "Дата штрафа: 06.08.2026\n"
+        "Срок оплаты: 20.08.2026\n"
+        "Статус вручения: Не вручено\n"
+        "\n"
+        f"🔗 [Открыть источник]({_SOURCE_URL})"
+    )
+
+
+async def test_notify_omits_telegram_line_when_created_by_display_is_none():
+    client = _FakeClient()
+    service = await _started_service(client)
+
+    await service.notify([_event(created_by_display=None)])
+
+    _, text, _ = client.sent_messages[0]
+    assert "Telegram:" not in text
+
+
 async def test_multiple_events_for_same_car_are_grouped_into_one_message():
     client = _FakeClient()
     service = await _started_service(client)
@@ -127,6 +159,32 @@ async def test_multiple_events_for_same_car_are_grouped_into_one_message():
     # Успешная доставка группового сообщения — оба входящих штрафа доставлены.
     assert sorted(result.delivered_event_ids) == [1, 2]
     assert result.failed_event_ids == []
+
+
+async def test_multiple_events_for_same_car_show_telegram_line_exactly_once():
+    client = _FakeClient()
+    service = await _started_service(client)
+
+    events = [
+        _event(
+            detected_fine_id=1, external_fine_id="A1",
+            penalty_date=date(2026, 8, 6), due_date=date(2026, 8, 20),
+            created_by_display="@ivan_petrov",
+        ),
+        _event(
+            detected_fine_id=2, external_fine_id="A2",
+            penalty_date=date(2026, 7, 1), due_date=date(2026, 7, 20),
+            created_by_display="@ivan_petrov",
+        ),
+    ]
+
+    await service.notify(events)
+
+    _, text, _ = client.sent_messages[0]
+    assert text.count("Telegram: @ivan_petrov") == 1
+    # Строка идёт сразу после "Автомобиль:", один раз на весь автомобиль, а
+    # не возле каждого штрафа.
+    assert "Автомобиль: B957MA09\nTelegram: @ivan_petrov" in text
 
 
 async def test_multiple_cars_produce_separate_messages():

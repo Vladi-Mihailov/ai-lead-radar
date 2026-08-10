@@ -67,12 +67,20 @@ def build_fine_monitor_components(
     http_client: httpx.AsyncClient,
     notification_chat_ids: list[int | str],
     allowed_user_ids: list[int],
+    user_repository: UserRepository | None = None,
 ) -> tuple[FineJob, Scheduler, TelegramNotificationService, CommandDispatcher, FineCommand]:
     """Чистая сборка зависимостей мониторинга штрафов — без единого await,
     без обращения к сети/Telegram (конструкторы ничего не подключают, только
     сохраняют переданное). Вынесено отдельно от _run_fine_monitor именно
     для того, чтобы это можно было проверить unit/integration-тестом без
-    реального HTTP и Telegram (см. test_main_wiring.py)."""
+    реального HTTP и Telegram (см. test_main_wiring.py).
+
+    user_repository — тот же самый UserRepository, что уже открыт в run()
+    для Pipeline/TelegramSource (settings.app.users_db_file) — второе
+    соединение с users.db не открывается. Нужен только для того, чтобы
+    уведомление о новом штрафе показывало Telegram-пользователя, добавившего
+    машину в мониторинг (см. FineNotificationCoordinator); None — тоже
+    рабочий вариант (уведомление тогда покажет "Telegram: ID N")."""
     fine_monitor = settings.fine_monitor
     tz = ZoneInfo(fine_monitor.timezone)
 
@@ -80,7 +88,7 @@ def build_fine_monitor_components(
         source.client, notification_chat_ids, fine_monitor.source_url
     )
     notification_coordinator = FineNotificationCoordinator(
-        detected_fine_repository, task_repository, notification_service
+        detected_fine_repository, task_repository, notification_service, user_repository
     )
 
     police_ge_session = PoliceGeSession(
@@ -160,6 +168,7 @@ async def _run_fine_monitor(
     source: TelegramSource,
     task_repository: FineMonitoringTaskRepository,
     detected_fine_repository: DetectedFineRepository,
+    user_repository: UserRepository | None = None,
 ) -> None:
     """Композиция мониторинга штрафов: PoliceGeSession/Provider →
     FineCheckService → FineJob → Scheduler, плюс TelegramNotificationService
@@ -181,6 +190,7 @@ async def _run_fine_monitor(
             build_fine_monitor_components(
                 settings, source, task_repository, detected_fine_repository,
                 http_client, notification_chat_ids, allowed_user_ids,
+                user_repository=user_repository,
             )
         )
 
@@ -280,7 +290,10 @@ async def run() -> None:
         fine_task_repository = FineMonitoringTaskRepository(settings.app.users_db_file)
         detected_fine_repository = DetectedFineRepository(settings.app.users_db_file)
         background.append(
-            _run_fine_monitor(settings, source, fine_task_repository, detected_fine_repository)
+            _run_fine_monitor(
+                settings, source, fine_task_repository, detected_fine_repository,
+                user_repository,
+            )
         )
     else:
         logger.info("Fine monitor disabled (fine_monitor.enabled=false)")

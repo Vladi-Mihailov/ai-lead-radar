@@ -183,6 +183,7 @@ async def test_build_fine_monitor_components_wires_dependencies_correctly(tmp_pa
             build_fine_monitor_components(
                 settings, source, task_repository, detected_fine_repository,
                 http_client, notification_chat_ids, settings.fine_monitor.allowed_user_ids,
+                user_repository=user_repository,
             )
         )
 
@@ -203,6 +204,10 @@ async def test_build_fine_monitor_components_wires_dependencies_correctly(tmp_pa
         assert isinstance(fine_job._notification_coordinator, FineNotificationCoordinator)
         assert fine_job._notification_coordinator._detected_fine_repository is detected_fine_repository
         assert fine_job._notification_coordinator._notification_service is notification_service
+        # UserRepository переиспользован (тот же, что у Pipeline/TelegramSource),
+        # второе соединение с users.db не открыто — нужен координатору только
+        # чтобы уведомление о новом штрафе показывало Telegram-пользователя.
+        assert fine_job._notification_coordinator._user_repository is user_repository
 
         # FineCheckService получил именно PoliceGeProvider, а не заглушку, и
         # это тот же самый объект, что использует и FineCommand.fine_check.

@@ -49,14 +49,30 @@ def _format_fine_block(event: NewFineEvent) -> str:
     return "\n".join(lines)
 
 
+def _format_car_line(car_number: str, events: list[NewFineEvent]) -> str:
+    """"Автомобиль: X" + (если известно) "Telegram: ..." — ровно один раз на
+    группу (см. _group_by_car), а не на каждый штраф внутри неё. Берём
+    значение с первого события группы: все события в группе относятся к
+    одному car_number, а created_by_display в первую очередь несёт смысл
+    "кто добавил этот автомобиль в мониторинг", а не привязан к конкретному
+    штрафу."""
+    line = f"Автомобиль: {car_number}"
+    created_by_display = events[0].created_by_display
+    if created_by_display:
+        line += f"\nTelegram: {created_by_display}"
+    return line
+
+
 def _format_message(car_number: str, events: list[NewFineEvent], source_url: str) -> str:
+    car_line = _format_car_line(car_number, events)
+
     if len(events) == 1:
         header = "🚨 Обнаружен новый опубликованный штраф"
-        body = f"Автомобиль: {car_number}\n" + _format_fine_block(events[0])
+        body = f"{car_line}\n" + _format_fine_block(events[0])
     else:
         header = f"🚨 Обнаружены новые опубликованные штрафы ({len(events)})"
         blocks = "\n\n".join(_format_fine_block(event) for event in events)
-        body = f"Автомобиль: {car_number}\n\n{blocks}"
+        body = f"{car_line}\n\n{blocks}"
 
     lines = [header, "", body, "", f"🔗 [Открыть источник]({source_url})"]
     return "\n".join(lines)
