@@ -27,6 +27,7 @@ from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E
 from reader.jobs.fine_job import FineJob  # noqa: E402
 from reader.jobs.scheduler import Scheduler  # noqa: E402
 from reader.notifications.base import NotificationResult, NotificationService  # noqa: E402
+from reader.users.models import TelegramUserInfo  # noqa: E402
 
 _CHAT_ID = -100999
 _USER_ID = 111
@@ -62,6 +63,16 @@ class _SelectiveFailingProvider(FineProvider):
         if plate in self._fail_for:
             raise FineProviderError(f"police.ge недоступен для {plate}")
         return self._records_by_car.get(plate, [])
+
+
+class _FakeUserRepository:
+    """Реализует ровно UserLookupLike (см. reader/fines/notification_coordinator.py)."""
+
+    def __init__(self, users_by_id: dict[int, TelegramUserInfo] | None = None):
+        self._users_by_id = users_by_id or {}
+
+    def get(self, user_id: int) -> TelegramUserInfo | None:
+        return self._users_by_id.get(user_id)
 
 
 class _FakeNotificationService(NotificationService):
@@ -124,10 +135,14 @@ class _Fixture:
     """Полный набор реальных зависимостей (кроме FineProvider/NotificationService)
     — тот же граф объектов, что собирает reader/main.py."""
 
-    def __init__(self, tmp_path, records_by_car=None, provider_error=None, provider=None):
+    def __init__(
+        self, tmp_path, records_by_car=None, provider_error=None, provider=None,
+        user_repository=None,
+    ):
         db_path = tmp_path / "users.db"
         self.task_repository = FineMonitoringTaskRepository(db_path)
         self.detected_fine_repository = DetectedFineRepository(db_path)
+        self.user_repository = user_repository
         self.provider = provider if provider is not None else _FakeProvider(records_by_car, error=provider_error)
         self.check_service = FineCheckService(
             self.provider, self.task_repository, self.detected_fine_repository
@@ -153,6 +168,7 @@ class _Fixture:
             detected_fine_repository=self.detected_fine_repository,
             run_times=_RUN_TIMES,
             tz=_TBILISI,
+            user_repository=self.user_repository,
         )
 
     def close(self):
@@ -619,6 +635,98 @@ async def test_fine_check_by_car_number(tmp_path):
         assert "Найдено штрафов: 1" in result.text
         assert "Новых: 1" in result.text
         assert "мс" in result.text
+    finally:
+        fx.close()
+
+
+async def test_fine_check_shows_telegram_username_of_task_creator(tmp_path):
+    fx = _Fixture(
+        tmp_path,
+        records_by_car={"AA001AA": [_record(car_number="AA001AA")]},
+        user_repository=_FakeUserRepository(
+            {_USER_ID: TelegramUserInfo(user_id=_USER_ID, username="ivan_petrov", first_name=None, last_name=None)}
+        ),
+    )
+    try:
+        await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
+
+        result = await fx.command.handle(_ctx(["check", "AA001AA"]))
+
+        assert "Telegram: @ivan_petrov" in result.text
+        # Остальное содержимое результата не потеряно.
+        assert "✅ Проверка завершена" in result.text
+        assert "Автомобиль: AA001AA" in result.text
+        assert "Найдено штрафов: 1" in result.text
+        assert "Новых: 1" in result.text
+        assert "мс" in result.text
+    finally:
+        fx.close()
+
+
+async def test_fine_check_falls_back_to_user_id_without_username(tmp_path):
+    fx = _Fixture(
+        tmp_path,
+        records_by_car={"AA001AA": [_record(car_number="AA001AA")]},
+        user_repository=_FakeUserRepository(
+            {_USER_ID: TelegramUserInfo(user_id=_USER_ID, username=None, first_name=None, last_name=None)}
+        ),
+    )
+    try:
+        await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
+
+        result = await fx.command.handle(_ctx(["check", "AA001AA"]))
+
+        assert f"Telegram: ID {_USER_ID}" in result.text
+    finally:
+        fx.close()
+
+
+async def test_fine_check_falls_back_to_user_id_without_user_repository(tmp_path):
+    # user_repository вообще не передан (как во всех остальных тестах этого
+    # файла до этой задачи) — результат всё равно полезен.
+    fx = _Fixture(tmp_path, records_by_car={"AA001AA": [_record(car_number="AA001AA")]})
+    try:
+        await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
+
+        result = await fx.command.handle(_ctx(["check", "AA001AA"]))
+
+        assert f"Telegram: ID {_USER_ID}" in result.text
+    finally:
+        fx.close()
+
+
+async def test_fine_check_falls_back_to_user_id_when_user_not_found(tmp_path):
+    fx = _Fixture(
+        tmp_path,
+        records_by_car={"AA001AA": [_record(car_number="AA001AA")]},
+        user_repository=_FakeUserRepository({}),  # пользователь не найден
+    )
+    try:
+        await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
+
+        result = await fx.command.handle(_ctx(["check", "AA001AA"]))
+
+        assert f"Telegram: ID {_USER_ID}" in result.text
+    finally:
+        fx.close()
+
+
+async def test_fine_check_shows_full_name_with_username(tmp_path):
+    fx = _Fixture(
+        tmp_path,
+        records_by_car={"AA001AA": [_record(car_number="AA001AA")]},
+        user_repository=_FakeUserRepository(
+            {_USER_ID: TelegramUserInfo(
+                user_id=_USER_ID, username="ivan_petrov", first_name="Иван", last_name="Петров",
+            )}
+        ),
+    )
+    try:
+        await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
+
+        result = await fx.command.handle(_ctx(["check", "AA001AA"]))
+
+        assert "Telegram: Иван Петров (@ivan_petrov)" in result.text
     finally:
         fx.close()
 

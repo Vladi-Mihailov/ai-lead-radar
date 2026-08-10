@@ -15,7 +15,11 @@ from reader.commands.base import Command, CommandContext, CommandError, CommandR
 from reader.fines.check_service import FineCheckService
 from reader.fines.detected_fine_repository import DetectedFineRepository
 from reader.fines.models import CarFineStats, FineMonitoringTask
-from reader.fines.notification_coordinator import FineNotificationCoordinator
+from reader.fines.notification_coordinator import (
+    FineNotificationCoordinator,
+    UserLookupLike,
+    format_user_display,
+)
 from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.fines.validation import (
     FineValidationError,
@@ -116,6 +120,7 @@ class FineCommand(Command):
         *,
         run_times: list[dt_time],
         tz: ZoneInfo,
+        user_repository: UserLookupLike | None = None,
     ):
         self._task_repository = task_repository
         self._check_service = check_service
@@ -125,6 +130,9 @@ class FineCommand(Command):
         self._detected_fine_repository = detected_fine_repository
         self._run_times = run_times
         self._tz = tz
+        # None — как и у FineNotificationCoordinator (см. её докстрок) —
+        # "Telegram: ..." в результате fine check тогда покажет "ID N".
+        self._user_repository = user_repository
 
     async def handle(self, ctx: CommandContext) -> CommandResult:
         if not ctx.args:
@@ -427,15 +435,26 @@ class FineCommand(Command):
         # координатора, а не копией логики.
         await self._notification_coordinator.flush_pending()
 
+        # fine_monitoring_tasks.created_by_user_id -> UserRepository.get() —
+        # та же связь и тот же формат (с fallback на ID), что и в
+        # уведомлении о новом штрафе (см. FineNotificationCoordinator);
+        # обычно у номера ровно одна активная задача, поэтому берём первую.
+        telegram_display = self._created_by_display(tasks[0].created_by_user_id)
+
         return CommandResult(
             text=(
                 "✅ Проверка завершена\n\n"
                 f"Автомобиль: {car_number}\n"
+                f"Telegram: {telegram_display}\n"
                 f"Найдено штрафов: {total_fines_found}\n"
                 f"Новых: {total_new_fines}\n"
                 f"Время: {total_duration_ms} мс"
             )
         )
+
+    def _created_by_display(self, user_id: int) -> str:
+        user = self._user_repository.get(user_id) if self._user_repository is not None else None
+        return format_user_display(user, user_id)
 
     async def _handle_update_all(self, ctx: CommandContext) -> CommandResult:
         """fine update-all — берёт все активные задачи мониторинга и

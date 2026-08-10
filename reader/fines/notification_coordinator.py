@@ -23,11 +23,15 @@ class UserLookupLike(Protocol):
     def get(self, user_id: int) -> TelegramUserInfo | None: ...
 
 
-def _format_user_display(user: TelegramUserInfo | None, user_id: int) -> str:
+def format_user_display(user: TelegramUserInfo | None, user_id: int) -> str:
     """"@username", "Имя Фамилия (@username)", "Имя Фамилия (ID N)" или,
     если о пользователе ничего не известно (нет UserRepository, пользователь
     не найден, ни username, ни имени нет), — "ID N". Уведомление остаётся
-    полезным в любом случае: id мониторинга гарантированно известен."""
+    полезным в любом случае: id мониторинга гарантированно известен.
+
+    Публичная функция (не только для этого модуля) — тем же форматом
+    пользуется и reader/commands/fine.py (fine check), чтобы не заводить
+    вторую реализацию того же самого fallback."""
     if user is None:
         return f"ID {user_id}"
 
@@ -94,4 +98,4 @@ class FineNotificationCoordinator:
             if self._user_repository is not None
             else None
         )
-        return _format_user_display(user, task.created_by_user_id)
+        return format_user_display(user, task.created_by_user_id)

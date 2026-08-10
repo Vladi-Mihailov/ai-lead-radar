@@ -215,6 +215,9 @@ async def test_build_fine_monitor_components_wires_dependencies_correctly(tmp_pa
         assert isinstance(fine_job._check_service._provider, PoliceGeProvider)
         assert fine_command._check_service is fine_job._check_service
         assert fine_command._notification_coordinator is fine_job._notification_coordinator
+        # Тот же UserRepository, что и у FineNotificationCoordinator — нужен
+        # "fine check" для строки "Telegram: ..." в результате.
+        assert fine_command._user_repository is user_repository
 
         # Scheduler получил оба job'а — FineJob и ArchiveFineJob, тот же
         # task_repository/check_service/notification_coordinator у обоих
