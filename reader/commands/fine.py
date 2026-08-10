@@ -9,6 +9,7 @@ FineJob), доставка уведомлений — в FineNotificationCoordin
 import logging
 from datetime import date, datetime, timezone
 from datetime import time as dt_time
+from typing import NamedTuple, Protocol
 from zoneinfo import ZoneInfo
 
 from reader.commands.base import Command, CommandContext, CommandError, CommandResult
@@ -17,7 +18,6 @@ from reader.fines.detected_fine_repository import DetectedFineRepository
 from reader.fines.models import CarFineStats, FineMonitoringTask
 from reader.fines.notification_coordinator import (
     FineNotificationCoordinator,
-    UserLookupLike,
     format_car_owner_display,
 )
 from reader.fines.task_repository import FineMonitoringTaskRepository
@@ -30,6 +30,7 @@ from reader.fines.validation import (
 )
 from reader.jobs.fine_job import FineJob
 from reader.jobs.scheduler import Scheduler
+from reader.users.models import TelegramUserInfo
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,9 @@ _ADD_USAGE_ERROR = (
     "Используйте:\n"
     "fine add B957MA09\n"
     "или\n"
-    "fine add B957MA09 03.08.2026 13.08.2026"
+    "fine add B957MA09 03.08.2026 13.08.2026\n"
+    "или, чтобы сразу указать Telegram-владельца автомобиля:\n"
+    "fine add B957MA09 @ivan_petrov"
 )
 _BULK_MAX_CAR_NUMBERS = 100
 _BULK_USAGE_ERROR = (
@@ -73,6 +76,35 @@ _UNKNOWN_SUBCOMMAND_ERROR = (
     "fine add | fine add-bulk | fine list | fine stop <НОМЕР_АВТОМОБИЛЯ> | "
     "fine check <НОМЕР_АВТОМОБИЛЯ> | fine update-all | fine status | fine stats"
 )
+
+
+class FineUserRepositoryLike(Protocol):
+    """Ровно то, что нужно FineCommand от UserRepository
+    (reader/users/repository.py) — не импортируем сам класс, тот же приём,
+    что и UserLookupLike (reader/fines/notification_coordinator.py), но
+    надмножество: fine add @username дополнительно должен резолвить
+    username -> пользователь и привязывать car_number этому пользователю,
+    чего fine check/fine add-bulk (только find_by_car_number) не требуют."""
+
+    def find_by_car_number(self, car_number: str) -> list[TelegramUserInfo]: ...
+    def find_by_username(self, username: str) -> TelegramUserInfo | None: ...
+    def add_car_numbers(self, user_id: int, car_numbers: list[str]) -> None: ...
+
+
+class _OwnerLinkResult(NamedTuple):
+    """Результат разбора необязательного "@username" в конце fine add —
+    только чтение (find_by_username/find_by_car_number), ничего не пишет
+    (см. _resolve_car_owner_for_add). Возвращается ТОЛЬКО в случае успеха
+    (уже привязан этому же пользователю или ещё ни у кого не записан) —
+    любой конфликт (username не найден, номер уже у другого/нескольких
+    пользователей) — это CommandError, брошенный ДО task_repository.
+    create(), а не часть этого результата: задача мониторинга не должна
+    создаваться, если владелец не удалось однозначно определить (см.
+    задачу)."""
+
+    telegram_line: str  # "Telegram: ..." в ответе об успешном добавлении
+    user_id_to_link: int | None  # кому вызвать add_car_numbers() — None,
+    # если car_number уже есть у этого же пользователя (дублировать не нужно)
 
 
 def _split_bulk_numbers(args: list[str]) -> list[str]:
@@ -120,7 +152,7 @@ class FineCommand(Command):
         *,
         run_times: list[dt_time],
         tz: ZoneInfo,
-        user_repository: UserLookupLike | None = None,
+        user_repository: FineUserRepositoryLike | None = None,
     ):
         self._task_repository = task_repository
         self._check_service = check_service
@@ -167,6 +199,18 @@ class FineCommand(Command):
         if args and args[0].lower() == "bulk":
             return await self._handle_add_bulk(ctx, args[1:])
 
+        # Необязательный последний аргумент — "@username" Telegram-владельца
+        # автомобиля (НЕ путать с created_by_user_id — тем, кто прислал эту
+        # команду, см. ctx.user_id ниже, который не меняется). Явный "@" —
+        # без него неоднозначность с датами, поэтому "без @" не принимается
+        # (см. задачу).
+        owner_username: str | None = None
+        if args and args[-1].startswith("@"):
+            owner_username = args[-1][1:]
+            args = args[:-1]
+            if not owner_username:
+                raise CommandError(_ADD_USAGE_ERROR)
+
         if len(args) not in (1, 3):
             raise CommandError(_ADD_USAGE_ERROR)
 
@@ -179,6 +223,13 @@ class FineCommand(Command):
         existing = self._task_repository.get_active_by_car_number(car_number)
         validate_no_overlap(start_date, end_date, existing)
 
+        # Lookup @username ДО создания задачи — если пользователь не
+        # найден, задача мониторинга вообще не создаётся (см. задачу: не
+        # должно получиться состояния "task создан, а владелец — нет").
+        owner_result: _OwnerLinkResult | None = None
+        if owner_username is not None:
+            owner_result = self._resolve_car_owner_for_add(car_number, owner_username)
+
         task = self._task_repository.create(
             car_number=car_number,
             label=None,
@@ -188,13 +239,67 @@ class FineCommand(Command):
             created_by_user_id=ctx.user_id,
         )
 
-        return CommandResult(
-            text=(
-                "✅ Мониторинг штрафов добавлен\n\n"
-                f"Автомобиль: {task.car_number}\n"
-                f"Период: {_fmt_date(start_date)}–{_fmt_date(end_date)}\n"
-                f"Проверка: {_format_check_times(self._run_times)} по Тбилиси"
+        if owner_result is not None and owner_result.user_id_to_link is not None:
+            # self._user_repository гарантированно не None здесь — иначе
+            # _resolve_car_owner_for_add() уже бросил бы CommandError выше.
+            self._user_repository.add_car_numbers(owner_result.user_id_to_link, [car_number])
+
+        lines = [
+            "✅ Мониторинг штрафов добавлен",
+            "",
+            f"Автомобиль: {task.car_number}",
+        ]
+        if owner_result is not None:
+            lines.append(f"Telegram: {owner_result.telegram_line}")
+        lines.append(f"Период: {_fmt_date(start_date)}–{_fmt_date(end_date)}")
+        lines.append(f"Проверка: {_format_check_times(self._run_times)} по Тбилиси")
+
+        return CommandResult(text="\n".join(lines))
+
+    def _resolve_car_owner_for_add(self, car_number: str, raw_username: str) -> _OwnerLinkResult:
+        """Только чтение (find_by_username/find_by_car_number) — ничего не
+        пишет, вызывается ДО task_repository.create() (см. _handle_add).
+
+        Бросает CommandError (и тогда задача мониторинга НЕ создаётся —
+        см. _handle_add) в ЛЮБОМ случае, когда владельца нельзя однозначно
+        определить: @username не найден, номер уже привязан к ДРУГОМУ
+        пользователю, или номер вообще неоднозначен (привязан к нескольким).
+        Единственные исходы, при которых задача создаётся — car_number
+        ещё ни у кого не записан, либо уже записан именно у запрошенного
+        @username (см. задачу: вся pre-validation владельца должна
+        произойти до создания task, без частичных состояний)."""
+        owner = self._user_repository.find_by_username(raw_username) if self._user_repository else None
+        if owner is None:
+            raise CommandError(
+                f"❌ Telegram-пользователь @{raw_username} не найден в базе.\n\n"
+                "Автомобиль не добавлен."
             )
+
+        existing_owners = self._user_repository.find_by_car_number(car_number)
+
+        if not existing_owners:
+            # Ещё ни у кого не записан — привязываем запрошенному пользователю.
+            return _OwnerLinkResult(format_car_owner_display([owner]), owner.user_id)
+
+        if len(existing_owners) == 1 and existing_owners[0].user_id == owner.user_id:
+            # Уже привязан именно ему — успех без дублей, повторно писать
+            # car_numbers не нужно (add_car_numbers и так идемпотентен, но
+            # тут даже вызывать незачем).
+            return _OwnerLinkResult(format_car_owner_display([owner]), None)
+
+        if len(existing_owners) == 1:
+            raise CommandError(
+                f"⚠️ Автомобиль {car_number} уже связан с другим Telegram-пользователем: "
+                f"{format_car_owner_display(existing_owners)}.\n\n"
+                "Автомобиль не добавлен."
+            )
+
+        # Несколько пользователей уже имеют этот номер в car_numbers —
+        # неоднозначно, молча выбирать "победителя" нельзя (см. задачу).
+        raise CommandError(
+            f"⚠️ Автомобиль {car_number} уже связан с несколькими Telegram-пользователями "
+            "— связь неоднозначна и требует ручной проверки.\n\n"
+            "Автомобиль не добавлен."
         )
 
     async def _handle_add_bulk(self, ctx: CommandContext, args: list[str]) -> CommandResult:

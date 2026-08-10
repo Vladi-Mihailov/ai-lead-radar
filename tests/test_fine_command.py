@@ -66,15 +66,51 @@ class _SelectiveFailingProvider(FineProvider):
 
 
 class _FakeUserRepository:
-    """Реализует ровно UserLookupLike (см. reader/fines/notification_coordinator.py) —
-    ключ словаря — car_number (users.car_numbers), а не user_id: владелец
-    определяется ПО НОМЕРУ АВТОМОБИЛЯ, не по created_by_user_id задачи."""
+    """Реализует ровно FineUserRepositoryLike (см. reader/commands/fine.py) —
+    надмножество UserLookupLike (find_by_car_number, для fine check),
+    дополнительно find_by_username/add_car_numbers для fine add @username.
 
-    def __init__(self, users_by_car_number: dict[str, list[TelegramUserInfo]] | None = None):
-        self._users_by_car_number = users_by_car_number or {}
+    Внутреннее состояние — car_numbers по user_id (как в настоящем
+    UserRepository), а не отдельно на car_number, поэтому add_car_numbers()
+    корректно отражается в последующих find_by_car_number() в рамках
+    одного теста.
+
+    users_by_car_number — старый формат конструктора (car_number ->
+    список пользователей), оставлен для существующих тестов "fine check".
+    users — список известных пользователей для find_by_username (и чтобы
+    add_car_numbers() могло найти, кому дописать номер)."""
+
+    def __init__(
+        self,
+        users_by_car_number: dict[str, list[TelegramUserInfo]] | None = None,
+        users: list[TelegramUserInfo] | None = None,
+    ):
+        self._users_by_id: dict[int, TelegramUserInfo] = {}
+        self._car_numbers_by_user_id: dict[int, set[str]] = {}
+
+        for user in users or []:
+            self._users_by_id[user.user_id] = user
+
+        for car_number, owners in (users_by_car_number or {}).items():
+            for owner in owners:
+                self._users_by_id[owner.user_id] = owner
+                self._car_numbers_by_user_id.setdefault(owner.user_id, set()).add(car_number)
 
     def find_by_car_number(self, car_number: str) -> list[TelegramUserInfo]:
-        return self._users_by_car_number.get(car_number, [])
+        return [
+            self._users_by_id[user_id]
+            for user_id, numbers in self._car_numbers_by_user_id.items()
+            if car_number in numbers
+        ]
+
+    def find_by_username(self, username: str) -> TelegramUserInfo | None:
+        for user in self._users_by_id.values():
+            if user.username is not None and user.username.lower() == username.lower():
+                return user
+        return None
+
+    def add_car_numbers(self, user_id: int, car_numbers: list[str]) -> None:
+        self._car_numbers_by_user_id.setdefault(user_id, set()).update(car_numbers)
 
 
 class _FakeNotificationService(NotificationService):
@@ -252,6 +288,225 @@ async def test_fine_add_rejects_overlapping_active_task(fx):
 
     assert "уже есть активная задача" in exc_info.value.message
     assert len(fx.task_repository.list_active()) == 1
+
+
+# ---- fine add NUMBER @username ----
+
+
+async def test_fine_add_with_username_links_owner_not_creator(tmp_path):
+    """Главный regression-тест: created_by_user_id остаётся ID того, кто
+    прислал команду, а @username привязывается к car_numbers СОВСЕМ
+    другого пользователя."""
+    OPERATOR_USER_ID = 111
+    OWNER_USER_ID = 222
+    owner = TelegramUserInfo(user_id=OWNER_USER_ID, username="owner", first_name=None, last_name=None)
+    fx = _Fixture(tmp_path, user_repository=_FakeUserRepository(users=[owner]))
+    try:
+        result = await fx.command.handle(
+            _ctx(["add", "A123AA777", "@owner"], user_id=OPERATOR_USER_ID)
+        )
+
+        [task] = fx.task_repository.list_active()
+        assert task.car_number == "A123AA777"
+        assert task.created_by_user_id == OPERATOR_USER_ID
+
+        found = fx.user_repository.find_by_car_number("A123AA777")
+        assert [u.user_id for u in found] == [OWNER_USER_ID]
+
+        assert "✅ Мониторинг штрафов добавлен" in result.text
+        assert "Telegram: @owner" in result.text
+    finally:
+        fx.close()
+
+
+async def test_fine_add_without_username_keeps_old_behavior(tmp_path):
+    """fine add NUMBER (без @username) — старое поведение не меняется:
+    номер НЕ присваивается автоматически автору команды."""
+    fx = _Fixture(tmp_path, user_repository=_FakeUserRepository())
+    try:
+        result = await fx.command.handle(_ctx(["add", "A123AA777"]))
+
+        assert "✅ Мониторинг штрафов добавлен" in result.text
+        assert "Telegram:" not in result.text
+        assert fx.user_repository.find_by_car_number("A123AA777") == []
+
+        [task] = fx.task_repository.list_active()
+        assert task.created_by_user_id == _USER_ID
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_unknown_username_fails_and_creates_nothing(tmp_path):
+    fx = _Fixture(tmp_path, user_repository=_FakeUserRepository())
+    try:
+        with pytest.raises(CommandError) as exc_info:
+            await fx.command.handle(_ctx(["add", "A123AA777", "@unknown"]))
+
+        assert "@unknown" in exc_info.value.message
+        assert "не найден" in exc_info.value.message
+        assert "Автомобиль не добавлен" in exc_info.value.message
+
+        # Задача мониторинга НЕ создана, car_numbers не тронуты.
+        assert fx.task_repository.list_active() == []
+        assert fx.user_repository.find_by_car_number("A123AA777") == []
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_fails_when_no_user_repository_wired(fx):
+    # user_repository вообще не передан (как у fx по умолчанию) — нельзя
+    # проверить username, значит по той же логике, что и "не найден".
+    with pytest.raises(CommandError) as exc_info:
+        await fx.command.handle(_ctx(["add", "A123AA777", "@owner"]))
+
+    assert "не найден" in exc_info.value.message
+    assert fx.task_repository.list_active() == []
+
+
+async def test_fine_add_with_username_already_owning_number_is_idempotent(tmp_path):
+    owner = TelegramUserInfo(user_id=222, username="owner", first_name=None, last_name=None)
+    fx = _Fixture(
+        tmp_path,
+        user_repository=_FakeUserRepository(users_by_car_number={"A123AA777": [owner]}, users=[owner]),
+    )
+    try:
+        result = await fx.command.handle(_ctx(["add", "A123AA777", "@owner"]))
+
+        assert "Telegram: @owner" in result.text
+        assert "⚠️" not in result.text
+
+        found = fx.user_repository.find_by_car_number("A123AA777")
+        assert [u.user_id for u in found] == [222]  # без дублей
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_conflicting_owner_creates_no_task(tmp_path):
+    """Вся pre-validation владельца — ДО task_repository.create(): конфликт
+    (номер уже у ДРУГОГО пользователя) должен целиком блокировать команду,
+    а не создавать задачу с последующим предупреждением."""
+    user1 = TelegramUserInfo(user_id=1, username="user1", first_name=None, last_name=None)
+    user2 = TelegramUserInfo(user_id=2, username="user2", first_name=None, last_name=None)
+    fx = _Fixture(
+        tmp_path,
+        user_repository=_FakeUserRepository(
+            users_by_car_number={"A123AA777": [user1]}, users=[user1, user2],
+        ),
+    )
+    try:
+        tasks_before = fx.task_repository.list_active()
+        assert tasks_before == []
+
+        with pytest.raises(CommandError) as exc_info:
+            await fx.command.handle(_ctx(["add", "A123AA777", "@user2"]))
+
+        assert "⚠️" in exc_info.value.message
+        assert "@user1" in exc_info.value.message
+        assert "Автомобиль не добавлен" in exc_info.value.message
+
+        # Regression: количество задач НЕ изменилось.
+        assert fx.task_repository.list_active() == tasks_before
+        assert len(fx.task_repository.list_active()) == 0
+
+        found = fx.user_repository.find_by_car_number("A123AA777")
+        assert [u.user_id for u in found] == [1]  # user2 НЕ добавлен
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_ambiguous_existing_owners_creates_no_task(tmp_path):
+    """Тот же принцип для неоднозначной привязки (несколько существующих
+    владельцев) — задача НЕ создаётся."""
+    user1 = TelegramUserInfo(user_id=1, username="user1", first_name=None, last_name=None)
+    user2 = TelegramUserInfo(user_id=2, username="user2", first_name=None, last_name=None)
+    user3 = TelegramUserInfo(user_id=3, username="user3", first_name=None, last_name=None)
+    fx = _Fixture(
+        tmp_path,
+        user_repository=_FakeUserRepository(
+            users_by_car_number={"A123AA777": [user1, user2]}, users=[user1, user2, user3],
+        ),
+    )
+    try:
+        tasks_before = fx.task_repository.list_active()
+        assert tasks_before == []
+
+        with pytest.raises(CommandError) as exc_info:
+            await fx.command.handle(_ctx(["add", "A123AA777", "@user3"]))
+
+        assert "⚠️" in exc_info.value.message
+        assert "неоднозначна" in exc_info.value.message
+        assert "Автомобиль не добавлен" in exc_info.value.message
+
+        # Regression: количество задач НЕ изменилось.
+        assert fx.task_repository.list_active() == tasks_before
+        assert len(fx.task_repository.list_active()) == 0
+
+        found = fx.user_repository.find_by_car_number("A123AA777")
+        assert sorted(u.user_id for u in found) == [1, 2]  # user3 не добавлен
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_conflict_does_not_change_task_count_alongside_other_tasks(tmp_path):
+    """Более сильная версия regression-теста: конфликт по ОДНОМУ номеру не
+    должен влиять на количество задач мониторинга вообще — даже когда в
+    базе уже есть другие, не связанные с этим конфликтом задачи."""
+    user1 = TelegramUserInfo(user_id=1, username="user1", first_name=None, last_name=None)
+    user2 = TelegramUserInfo(user_id=2, username="user2", first_name=None, last_name=None)
+    fx = _Fixture(
+        tmp_path,
+        user_repository=_FakeUserRepository(
+            users_by_car_number={"A123AA777": [user1]}, users=[user1, user2],
+        ),
+    )
+    try:
+        await fx.command.handle(_ctx(["add", "B999BB999"]))
+        count_before = len(fx.task_repository.list_active())
+        assert count_before == 1
+
+        with pytest.raises(CommandError):
+            await fx.command.handle(_ctx(["add", "A123AA777", "@user2"]))
+
+        assert len(fx.task_repository.list_active()) == count_before
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_normalizes_car_number(tmp_path):
+    owner = TelegramUserInfo(user_id=222, username="owner", first_name=None, last_name=None)
+    fx = _Fixture(tmp_path, user_repository=_FakeUserRepository(users=[owner]))
+    try:
+        await fx.command.handle(_ctx(["add", "a123aa777", "@owner"]))
+
+        [task] = fx.task_repository.list_active()
+        assert task.car_number == "A123AA777"
+
+        found = fx.user_repository.find_by_car_number("A123AA777")
+        assert [u.user_id for u in found] == [222]
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_explicit_dates_and_username(tmp_path):
+    owner = TelegramUserInfo(user_id=222, username="owner", first_name="Иван", last_name="Петров")
+    fx = _Fixture(tmp_path, user_repository=_FakeUserRepository(users=[owner]))
+    try:
+        result = await fx.command.handle(
+            _ctx(["add", "A123AA777", "01.08.2026", "31.08.2026", "@owner"])
+        )
+
+        assert "Период: 01.08.2026–31.08.2026" in result.text
+        assert "Telegram: Иван Петров (@owner)" in result.text
+    finally:
+        fx.close()
+
+
+async def test_fine_add_rejects_bare_at_symbol(fx):
+    with pytest.raises(CommandError) as exc_info:
+        await fx.command.handle(_ctx(["add", "A123AA777", "@"]))
+
+    assert "Неверный формат команды" in exc_info.value.message
+    assert fx.task_repository.list_active() == []
 
 
 # ---- fine add bulk ----

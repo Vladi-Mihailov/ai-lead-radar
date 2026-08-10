@@ -65,6 +65,10 @@ _SELECT = (
     "SELECT user_id, username, first_name, last_name, is_bot, access_hash, peer_type "
     "FROM users WHERE user_id = ?"
 )
+_SELECT_BY_USERNAME = (
+    "SELECT user_id, username, first_name, last_name, is_bot, access_hash, peer_type "
+    "FROM users WHERE LOWER(username) = LOWER(?)"
+)
 _SELECT_KEYWORDS = "SELECT keywords FROM users WHERE user_id = ?"
 _SELECT_PEER_UPDATED_AT = "SELECT peer_updated_at FROM users WHERE user_id = ?"
 
@@ -178,6 +182,28 @@ class UserRepository:
         return TelegramUserInfo(
             user_id=user_id,
             username=username,
+            first_name=first_name,
+            last_name=last_name,
+            is_bot=bool(is_bot),
+            access_hash=access_hash,
+            peer_type=peer_type,
+        )
+
+    def find_by_username(self, username: str) -> TelegramUserInfo | None:
+        """username без ведущего '@' (см. reader/commands/fine.py — там же
+        он убирается перед вызовом). Сравнение регистронезависимое
+        (LOWER() в SQL) — Telegram username и так регистронезависим на
+        уровне платформы, тот же принцип, что и у TelegramSource при
+        сопоставлении ignored_usernames. Никогда не создаёт пользователя,
+        если он не найден (в отличие от upsert()) — возвращает None."""
+        row = self._conn.execute(_SELECT_BY_USERNAME, (username,)).fetchone()
+        if row is None:
+            return None
+
+        user_id, username_db, first_name, last_name, is_bot, access_hash, peer_type = row
+        return TelegramUserInfo(
+            user_id=user_id,
+            username=username_db,
             first_name=first_name,
             last_name=last_name,
             is_bot=bool(is_bot),

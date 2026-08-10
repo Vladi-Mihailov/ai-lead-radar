@@ -365,6 +365,56 @@ def test_find_by_car_number_returns_full_user_info(tmp_path):
         repository.close()
 
 
+# ---- find_by_username() ----
+
+
+def test_find_by_username_returns_matching_user(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.upsert(TelegramUserInfo(user_id=111, username="ivan_petrov", first_name=None, last_name=None))
+
+        found = repository.find_by_username("ivan_petrov")
+
+        assert found is not None
+        assert found.user_id == 111
+    finally:
+        repository.close()
+
+
+def test_find_by_username_returns_none_when_not_found(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        assert repository.find_by_username("unknown") is None
+    finally:
+        repository.close()
+
+
+def test_find_by_username_is_case_insensitive(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.upsert(TelegramUserInfo(user_id=111, username="Ivan_Petrov", first_name=None, last_name=None))
+
+        assert repository.find_by_username("ivan_petrov").user_id == 111
+        assert repository.find_by_username("IVAN_PETROV").user_id == 111
+        assert repository.find_by_username("Ivan_Petrov").user_id == 111
+    finally:
+        repository.close()
+
+
+def test_find_by_username_does_not_strip_at_itself(tmp_path):
+    """find_by_username() ожидает username уже БЕЗ ведущего '@' (вызывающий
+    код, reader/commands/fine.py, сам его убирает) — с '@' совпадений не
+    найдёт, потому что в БД username хранится без него (см. upsert())."""
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.upsert(TelegramUserInfo(user_id=111, username="ivan_petrov", first_name=None, last_name=None))
+
+        assert repository.find_by_username("@ivan_petrov") is None
+        assert repository.find_by_username("ivan_petrov") is not None
+    finally:
+        repository.close()
+
+
 def test_migration_adds_car_numbers_column_to_legacy_database(tmp_path):
     db_path = tmp_path / "users.db"
 
