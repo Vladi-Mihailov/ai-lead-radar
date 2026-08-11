@@ -122,10 +122,36 @@ class FineMonitorSettings(BaseModel):
     archive_daily_limit: int = 200
 
 
+class InviterWorkerSettings(BaseModel):
+    """Постоянный фоновый режим инвайтера (см. reader/inviter/worker.py,
+    python -m reader.inviter.main --worker) — равномерно распределяет
+    приглашения во времени вместо разовой дневной пачки.
+
+    invitations_per_account_per_hour — ДОПОЛНИТЕЛЬНОЕ ограничение поверх
+    account.daily_limit (столбец telegram_accounts.daily_limit в БД, не
+    здесь), а не вместо него: обе проверки применяются независимо, самая
+    строгая побеждает (см. InviterService.run_one_worker_attempt).
+
+    poll_interval_seconds — как часто worker проверяет ОДИН очередной
+    аккаунт по кругу (round-robin, см. InviterWorker) — не интервал между
+    приглашениями одного аккаунта. Поскольку за один тик обрабатывается
+    не более одной пары (кампания, аккаунт), реальный интервал между
+    приглашениями РАЗНЫХ аккаунтов не может быть меньше этого значения —
+    так они не приглашают одновременно."""
+
+    invitations_per_account_per_hour: int = 2
+    poll_interval_seconds: int = 600
+
+
+class InviterSettings(BaseModel):
+    worker: InviterWorkerSettings = Field(default_factory=InviterWorkerSettings)
+
+
 class Settings(BaseModel):
     telegram: TelegramSettings
     app: AppSettings
     fine_monitor: FineMonitorSettings
+    inviter: InviterSettings = Field(default_factory=InviterSettings)
 
 
 def load_settings(config_path: Path) -> Settings:
@@ -166,6 +192,8 @@ def load_settings(config_path: Path) -> Settings:
     telegram_raw = raw.get("telegram", {})
     app_raw = raw.get("app", {})
     fine_monitor_raw = raw.get("fine_monitor", {})
+    inviter_raw = raw.get("inviter", {})
+    inviter_worker_raw = inviter_raw.get("worker", {})
 
     # Имя live-сессии: TELEGRAM_SESSION_NAME (.env) имеет приоритет над
     # session_name_live (config.yaml), а если ничего не задано — reader_live.
@@ -269,6 +297,16 @@ def load_settings(config_path: Path) -> Settings:
                 archive_check_hour=int(fine_monitor_raw.get("archive_check_hour", 4)),
                 archive_interval_days=int(fine_monitor_raw.get("archive_interval_days", 30)),
                 archive_daily_limit=int(fine_monitor_raw.get("archive_daily_limit", 200)),
+            ),
+            inviter=InviterSettings(
+                worker=InviterWorkerSettings(
+                    invitations_per_account_per_hour=int(
+                        inviter_worker_raw.get("invitations_per_account_per_hour", 2)
+                    ),
+                    poll_interval_seconds=int(
+                        inviter_worker_raw.get("poll_interval_seconds", 600)
+                    ),
+                ),
             ),
         )
     except (KeyError, ValueError) as exc:

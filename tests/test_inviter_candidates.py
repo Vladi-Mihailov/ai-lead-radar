@@ -4453,3 +4453,239 @@ def test_missing_session_only_skips_the_affected_account(tmp_path):
         assert len(invites) == 1
     finally:
         invite_repository.close()
+
+
+# ---- InviterService.run_one_worker_attempt() (см. reader/inviter/worker.py) ----
+
+
+def _build_service(db_path: Path, *, client_factory=None):
+    """Как _run_service(), но возвращает сам InviterService и репозитории
+    открытыми — тестам run_one_worker_attempt() нужно вызывать метод
+    сервиса напрямую (не через run()) и затем проверять состояние БД тем
+    же соединением, поэтому закрывать их приходится самому тесту."""
+    account_repository = TelegramAccountRepository(db_path)
+    campaign_repository = InviteCampaignRepository(db_path)
+    invite_repository = UserCampaignInviteRepository(db_path)
+    service = InviterService(
+        account_repository, campaign_repository, invite_repository,
+        client_factory=client_factory or _make_client_factory(),
+        session_checker=lambda account: True,
+    )
+    return service, account_repository, campaign_repository, invite_repository
+
+
+def test_worker_attempt_sends_at_most_one_invite_even_with_daily_headroom(tmp_path):
+    """daily_limit=24 (реальный прод-лимит аккаунтов, см. задачу) и 5
+    подходящих кандидатов — run_one_worker_attempt() должен отправить
+    РОВНО одно приглашение, а не всю волну добора вплоть до остатка
+    дневного лимита (см. _execute_account max_sent_this_call=1) — иначе
+    почасовое распределение не имело бы смысла."""
+    db_path = _setup_db(tmp_path)
+    for user_id in range(1, 6):
+        _seed_user(
+            db_path, user_id, keywords=["осаго"], access_hash=user_id,
+            last_seen_at=_BASE_TIME + timedelta(days=user_id),
+        )
+
+    service, account_repository, campaign_repository, invite_repository = _build_service(db_path)
+    try:
+        campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        account = account_repository.create(
+            name="acc1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=24,
+        )
+
+        stats = asyncio.run(service.run_one_worker_attempt(campaign, account, hourly_limit=2))
+
+        assert stats is not None
+        assert stats.sent == 1
+        assert len(invite_repository.list()) == 1
+    finally:
+        account_repository.close()
+        campaign_repository.close()
+        invite_repository.close()
+
+
+def test_worker_attempt_skips_account_when_hourly_limit_already_reached(tmp_path):
+    """Скользящий часовой лимит (см. UserCampaignInviteRepository.
+    count_recent_sent) уже исчерпан — аккаунт пропускается ЦЕЛИКОМ, ещё до
+    connect() (ни один TelegramClient не создаётся, см. созданный список
+    created_clients), а не просто без отправки."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    created_clients: list = []
+    service, account_repository, campaign_repository, invite_repository = _build_service(
+        db_path, client_factory=_make_client_factory(created=created_clients),
+    )
+    try:
+        campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        account = account_repository.create(
+            name="acc1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=24,
+        )
+        now = datetime.now(timezone.utc)
+        invite_repository.create(
+            user_id=901, campaign_id=campaign.id, account_id=account.id,
+            status="pending", invited_at=now,
+        )
+        invite_repository.create(
+            user_id=902, campaign_id=campaign.id, account_id=account.id,
+            status="joined", invited_at=now, verified_at=now,
+        )
+
+        stats = asyncio.run(service.run_one_worker_attempt(campaign, account, hourly_limit=2))
+
+        assert stats is None
+        assert created_clients == []
+        # Только два "исторических" приглашения — ничего нового не отправлено.
+        assert len(invite_repository.list()) == 2
+    finally:
+        account_repository.close()
+        campaign_repository.close()
+        invite_repository.close()
+
+
+def test_worker_attempt_second_call_within_hour_is_skipped(tmp_path):
+    """hourly_limit=1: первый вызов отправляет приглашение, второй (в тот
+    же скользящий час) — пропускается без единого нового подключения, а не
+    пытается "довыполнить" лимит другим кандидатом."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+
+    created_clients: list = []
+    service, account_repository, campaign_repository, invite_repository = _build_service(
+        db_path, client_factory=_make_client_factory(created=created_clients),
+    )
+    try:
+        campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        account = account_repository.create(
+            name="acc1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=24,
+        )
+
+        first = asyncio.run(service.run_one_worker_attempt(campaign, account, hourly_limit=1))
+        second = asyncio.run(service.run_one_worker_attempt(campaign, account, hourly_limit=1))
+
+        assert first is not None and first.sent == 1
+        assert second is None
+        assert len(created_clients) == 1
+        assert len(invite_repository.list()) == 1
+    finally:
+        account_repository.close()
+        campaign_repository.close()
+        invite_repository.close()
+
+
+def test_worker_attempt_hourly_limit_persists_across_new_service_instance(tmp_path):
+    """Симулирует restart процесса worker'а: часовой лимит вычисляется по
+    user_campaign_invites в БД (см. count_recent_sent), а не по счётчику в
+    памяти InviterService — совершенно новый экземпляр сервиса (та же БД,
+    ни один Python-объект не переиспользуется из "старого процесса")
+    должен по-прежнему видеть приглашение, отправленное ДО "перезапуска",
+    и пропустить аккаунт, а не начать отсчёт часового лимита заново."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+
+    service_before_restart, account_repository, campaign_repository, invite_repository = _build_service(db_path)
+    try:
+        campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        account = account_repository.create(
+            name="acc1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=24,
+        )
+
+        before = asyncio.run(
+            service_before_restart.run_one_worker_attempt(campaign, account, hourly_limit=1)
+        )
+        assert before is not None and before.sent == 1
+
+        # "Restart" — новый InviterService поверх ТЕХ ЖЕ репозиториев/БД
+        # (как и в реальности: новый процесс, тот же users.db на диске).
+        created_clients_after_restart: list = []
+        service_after_restart = InviterService(
+            account_repository, campaign_repository, invite_repository,
+            client_factory=_make_client_factory(created=created_clients_after_restart),
+            session_checker=lambda a: True,
+        )
+
+        after = asyncio.run(
+            service_after_restart.run_one_worker_attempt(campaign, account, hourly_limit=1)
+        )
+
+        assert after is None
+        assert created_clients_after_restart == []
+        assert len(invite_repository.list()) == 1
+    finally:
+        account_repository.close()
+        campaign_repository.close()
+        invite_repository.close()
+
+
+def test_worker_attempt_respects_blocked_until(tmp_path):
+    """FloodWait (blocked_until в будущем) должен останавливать worker-
+    попытку точно так же, как обычный run(execute=True) — логика не
+    дублируется, run_one_worker_attempt() делегирует в _execute_account,
+    которая уже это проверяет."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    created_clients: list = []
+    service, account_repository, campaign_repository, invite_repository = _build_service(
+        db_path, client_factory=_make_client_factory(created=created_clients),
+    )
+    try:
+        campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        account = account_repository.create(
+            name="acc1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=24,
+        )
+        account = account_repository.update(
+            account.id,
+            blocked_until=datetime.now(timezone.utc) + timedelta(minutes=30),
+            blocked_reason="flood_wait",
+        )
+
+        stats = asyncio.run(service.run_one_worker_attempt(campaign, account, hourly_limit=2))
+
+        assert stats is None
+        assert created_clients == []
+    finally:
+        account_repository.close()
+        campaign_repository.close()
+        invite_repository.close()
+
+
+def test_worker_attempt_respects_daily_limit_even_when_hourly_limit_allows(tmp_path):
+    """daily_limit уже полностью исчерпан сегодня — worker-попытка не
+    должна отправлять ничего, даже если часовой лимит формально ещё не
+    исчерпан (обе проверки независимы, самая строгая побеждает, см. задачу)."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    created_clients: list = []
+    service, account_repository, campaign_repository, invite_repository = _build_service(
+        db_path, client_factory=_make_client_factory(created=created_clients),
+    )
+    try:
+        campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        account = account_repository.create(
+            name="acc1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=1,
+        )
+        now = datetime.now(timezone.utc)
+        invite_repository.create(
+            user_id=901, campaign_id=campaign.id, account_id=account.id,
+            status="joined", invited_at=now, verified_at=now,
+        )
+
+        stats = asyncio.run(service.run_one_worker_attempt(campaign, account, hourly_limit=2))
+
+        assert stats is None
+        assert created_clients == []
+    finally:
+        account_repository.close()
+        campaign_repository.close()
+        invite_repository.close()

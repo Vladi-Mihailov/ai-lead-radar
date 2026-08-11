@@ -822,6 +822,46 @@ class InviterService:
                     logger.info(_format_candidates_block(campaign, account, account_candidates, found))
                     await self._dry_run_account(campaign, account, account_candidates)
 
+    async def run_one_worker_attempt(
+        self, campaign: InviteCampaign, account: TelegramAccount, *, hourly_limit: int,
+    ) -> InviteStats | None:
+        """Единственная точка входа для постоянного фонового режима (см.
+        reader/inviter/worker.py, InviterWorker) — используется ТОТ ЖЕ
+        путь отправки/учёта/FloodWait/daily_limit, что и обычный
+        run(execute=True) (см. _execute_account), просто на один
+        кандидат за раз вместо целой волны (max_sent_this_call=1, см. её
+        докстрок) — ни единой отдельной бизнес-логики приглашения здесь
+        не заводится.
+
+        hourly_limit — ДОПОЛНИТЕЛЬНОЕ ограничение поверх account.daily_limit
+        (не вместо него): скользящее часовое окно (см.
+        UserCampaignInviteRepository.count_recent_sent), а не отдельный
+        счётчик — если оно уже исчерпано, аккаунт пропускается целиком, ещё
+        ДО connect()/резолва target_chat/выборки кандидатов (как и
+        blocked_until/daily_limit внутри _execute_account). Если аккаунт
+        сейчас не может приглашать (blocked_until, нет .session,
+        daily_limit исчерпан) — вся эта логика уже есть в _execute_account,
+        здесь не дублируется.
+
+        Не делает НИКАКИХ попыток компенсировать пропущенные из-за
+        FloodWait/часового лимита приглашения — вызывающий (InviterWorker)
+        просто попробует этот же (campaign, account) снова в следующий
+        свой черёд по кругу (см. задачу: "никаких искусственных попыток
+        догнать пропущенную квоту")."""
+        hourly_sent = self._invite_repository.count_recent_sent(
+            account.id, datetime.now(timezone.utc) - timedelta(hours=1),
+        )
+        if hourly_sent >= hourly_limit:
+            logger.info(
+                f"[WORKER]\nAccount: {account.name}\n"
+                f"Часовой лимит ({hourly_limit}/час) уже выполнен — "
+                f"аккаунт пропущен до следующего цикла."
+            )
+            return None
+
+        found = self._invite_repository.count_candidates(campaign.id)
+        return await self._execute_account(campaign, account, found, max_sent_this_call=1)
+
     async def _dry_run_account(
         self,
         campaign: InviteCampaign,
@@ -917,8 +957,22 @@ class InviterService:
         campaign: InviteCampaign,
         account: TelegramAccount,
         found: int,
+        *,
+        max_sent_this_call: int | None = None,
     ) -> InviteStats | None:
-        """Порядок специально такой (см. задачу про бесполезную выборку
+        """max_sent_this_call — None (по умолчанию, все существующие
+        вызовы из run()) сохраняет прежнее поведение без изменений: обе
+        волны (основная и добор) ограничены только остатком дневного
+        лимита. Любое другое значение — верхняя граница на СУММАРНОЕ
+        stats.sent за весь этот вызов (основная волна + волна добора
+        вместе, а не каждая по отдельности) — используется ИСКЛЮЧИТЕЛЬНО
+        run_one_worker_attempt() (max_sent_this_call=1), чтобы постоянный
+        фоновый режим (см. reader/inviter/worker.py) отправлял не больше
+        одного приглашения за обращение к аккаунту, даже если остаток
+        дневного лимита позволяет намного больше — иначе волна добора
+        свела бы на нет весь смысл почасового распределения.
+
+        Порядок специально такой (см. задачу про бесполезную выборку
         кандидатов для неработающих аккаунтов и про daily_limit, который
         должен считаться по подтверждённым участникам, а не по успешным RPC):
 
@@ -987,6 +1041,11 @@ class InviterService:
             )
             return None
 
+        # См. докстрок max_sent_this_call — ограничивает только размер
+        # ЭТОЙ (основной) волны, не сам daily-лимит-остаток выше (та
+        # проверка/лог должны отражать реальный остаток, а не урезанный).
+        wave_limit = remaining if max_sent_this_call is None else min(remaining, max_sent_this_call)
+
         started_at = time.monotonic()
         stats = InviteStats()
         client = self._client_factory(account)
@@ -1038,9 +1097,10 @@ class InviterService:
                     attempted_user_ids: set[int] = set()
 
                     # Волна №1 (основная) — лимит = остаток дневного лимита
-                    # на момент старта (см. докстрок выше).
+                    # на момент старта, при необходимости урезанный
+                    # max_sent_this_call (см. докстрок выше).
                     stopped = await self._run_invite_wave(
-                        client, campaign, account, target_entity, remaining, found, stats,
+                        client, campaign, account, target_entity, wave_limit, found, stats,
                         attempted_user_ids,
                     )
 
@@ -1051,6 +1111,14 @@ class InviterService:
                         )
 
                         top_up_remaining = self._remaining_daily_budget(account)
+                        if max_sent_this_call is not None:
+                            # Волна добора тоже засчитывается в тот же
+                            # суммарный max_sent_this_call — иначе она свела
+                            # бы на нет весь смысл ограничения одной волны
+                            # (см. докстрок max_sent_this_call).
+                            top_up_remaining = min(
+                                top_up_remaining, max(0, max_sent_this_call - stats.sent)
+                            )
                         if top_up_remaining > 0:
                             # Волна №2 (добор) — РОВНО одна, без повторной
                             # проверки/ожидания после неё (см. докстрок).

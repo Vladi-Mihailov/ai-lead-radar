@@ -449,6 +449,73 @@ def test_count_today_pending_returns_zero_when_no_invites_at_all(tmp_path):
         repository.close()
 
 
+# ---- UserCampaignInviteRepository.count_recent_sent() ----
+
+
+def test_count_recent_sent_counts_pending_and_joined_since_cutoff(tmp_path):
+    """Скользящее окно (см. reader/inviter/worker.py) — считает и
+    status='pending', и status='joined' (оба означают успешно ОТПРАВЛЕННОЕ
+    приглашение, см. InviterService._record_invite_result: invited_at
+    заполняется для обоих), но не 'failed'/'invalid'/'not_joined' (RPC не
+    было успешным или было отменено ДО отправки) и не приглашения другого
+    аккаунта или отправленные раньше cutoff."""
+    repository = UserCampaignInviteRepository(tmp_path / "inviter.db")
+    try:
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=1)
+        before_cutoff = cutoff - timedelta(minutes=1)
+
+        repository.create(user_id=1, campaign_id=1, account_id=7, status="pending", invited_at=now)
+        repository.create(user_id=2, campaign_id=1, account_id=7, status="joined", invited_at=now, verified_at=now)
+        # Не должны попасть в счёт:
+        repository.create(user_id=3, campaign_id=1, account_id=8, status="pending", invited_at=now)  # другой аккаунт
+        repository.create(user_id=4, campaign_id=1, account_id=7, status="pending", invited_at=before_cutoff)  # раньше окна
+        repository.create(user_id=5, campaign_id=1, account_id=7, status="failed", error="boom")  # RPC не успешен
+        repository.create(user_id=6, campaign_id=1, account_id=7, status="invalid")  # отменено до отправки
+
+        assert repository.count_recent_sent(7, cutoff) == 2
+        assert repository.count_recent_sent(8, cutoff) == 1
+        assert repository.count_recent_sent(999, cutoff) == 0
+    finally:
+        repository.close()
+
+
+def test_count_recent_sent_sums_across_campaigns_for_same_account(tmp_path):
+    """Как и count_today_joined/count_today_pending — по ВСЕМ кампаниям
+    сразу, а не по одной (account.daily_limit и часовой лимит воркера —
+    свойства аккаунта, не пары (account, campaign))."""
+    repository = UserCampaignInviteRepository(tmp_path / "inviter.db")
+    try:
+        now = datetime.now(timezone.utc)
+        repository.create(user_id=1, campaign_id=1, account_id=7, status="pending", invited_at=now)
+        repository.create(user_id=2, campaign_id=2, account_id=7, status="joined", invited_at=now, verified_at=now)
+
+        assert repository.count_recent_sent(7, now - timedelta(hours=1)) == 2
+    finally:
+        repository.close()
+
+
+def test_count_recent_sent_returns_zero_when_no_invites_at_all(tmp_path):
+    repository = UserCampaignInviteRepository(tmp_path / "inviter.db")
+    try:
+        assert repository.count_recent_sent(1, datetime.now(timezone.utc) - timedelta(hours=1)) == 0
+    finally:
+        repository.close()
+
+
+def test_count_recent_sent_excludes_exactly_at_cutoff_boundary_inclusive(tmp_path):
+    """cutoff (:since) — включительно, как и today_start у count_today_*
+    (invited_at >= :since)."""
+    repository = UserCampaignInviteRepository(tmp_path / "inviter.db")
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+        repository.create(user_id=1, campaign_id=1, account_id=7, status="pending", invited_at=cutoff)
+
+        assert repository.count_recent_sent(7, cutoff) == 1
+    finally:
+        repository.close()
+
+
 # ---- UserCampaignInviteRepository.list_pending() ----
 
 

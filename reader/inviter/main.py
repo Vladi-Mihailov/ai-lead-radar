@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import signal
 import sys
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from reader.inviter.repository import (  # noqa: E402
     UserCampaignInviteRepository,
 )
 from reader.inviter.service import InviterService, TEST_MODE_MAX_SUCCESSFUL_INVITES  # noqa: E402
+from reader.inviter.worker import InviterWorker  # noqa: E402
 from reader.logging_setup import setup_logging  # noqa: E402
 from reader.notifications.operator_notifier import OperatorNotifier  # noqa: E402
 from reader.settings import ConfigError, Settings, load_settings  # noqa: E402
@@ -84,6 +86,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Выполнить реальные приглашения в Telegram (InviteToChannelRequest/AddChatUserRequest).",
     )
+    mode.add_argument(
+        "--worker",
+        action="store_true",
+        help=(
+            "Постоянный фоновый режим: вместо разовой дневной пачки равномерно "
+            "распределяет приглашения во времени (см. inviter.worker в "
+            "config.yaml) и работает до SIGTERM/Ctrl+C. Всегда выполняет "
+            "реальные приглашения, как --execute — несовместим с --dry-run/--execute."
+        ),
+    )
     parser.add_argument(
         "--test",
         action="store_true",
@@ -93,7 +105,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "вместе с --execute."
         ),
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.worker and args.test:
+        parser.error("--worker и --test нельзя использовать одновременно.")
+    return args
 
 
 async def run(*, execute: bool = False, test: bool = False) -> None:
@@ -147,10 +162,83 @@ async def run(*, execute: bool = False, test: bool = False) -> None:
         user_repository.close()
 
 
+def _install_shutdown_handlers(shutdown_event: asyncio.Event) -> None:
+    """SIGTERM (systemd stop/restart) и SIGINT (Ctrl+C) ставят
+    shutdown_event, а не поднимают исключение — InviterWorker.run_forever()
+    проверяет его МЕЖДУ тиками (см. reader/inviter/worker.py), поэтому уже
+    начатая попытка приглашения всегда успевает завершиться штатно,
+    включая disconnect() клиента, прежде чем процесс остановится (graceful
+    shutdown для systemd, см. задачу).
+
+    loop.add_signal_handler недоступен на Windows (NotImplementedError) —
+    тогда используется обычный signal.signal(); в проде (Linux/systemd)
+    всегда берётся asyncio-вариант."""
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, shutdown_event.set)
+        except NotImplementedError:
+            signal.signal(sig, lambda *_args: shutdown_event.set())
+
+
+async def run_worker() -> None:
+    """Постоянный фоновый режим (см. reader/inviter/worker.py) — та же
+    инфраструктура (репозитории/notifier/client_factory), что и run(), но
+    вместо одного прохода поднимает InviterWorker.run_forever() и работает
+    до SIGTERM/Ctrl+C (см. _install_shutdown_handlers). Lifecycle
+    TelegramClient остаётся ровно тем же, что и у run(execute=True): клиент
+    создаётся заново на каждую попытку приглашения внутри
+    InviterService._execute_account и закрывается сразу после (см. её
+    докстрок) — worker не держит ни одного клиента открытым между тиками."""
+    settings = load_settings(CONFIG_PATH)
+    setup_logging(settings.app.log_level)
+    logger.info(
+        "Инвайтер запущен в постоянном фоновом режиме (worker): "
+        "%d/час на аккаунт, тик каждые %d сек.",
+        settings.inviter.worker.invitations_per_account_per_hour,
+        settings.inviter.worker.poll_interval_seconds,
+    )
+
+    account_repository = TelegramAccountRepository(settings.app.users_db_file)
+    campaign_repository = InviteCampaignRepository(settings.app.users_db_file)
+    invite_repository = UserCampaignInviteRepository(settings.app.users_db_file)
+    user_repository = UserRepository(settings.app.users_db_file)
+
+    notifier = _build_operator_notifier(settings)
+    await notifier.start()
+
+    try:
+        service = InviterService(
+            account_repository, campaign_repository, invite_repository,
+            client_factory=_build_client_factory(settings),
+            notifier=notifier,
+            user_repository=user_repository,
+        )
+        shutdown_event = asyncio.Event()
+        _install_shutdown_handlers(shutdown_event)
+        worker = InviterWorker(
+            service, campaign_repository, account_repository,
+            invitations_per_account_per_hour=settings.inviter.worker.invitations_per_account_per_hour,
+            poll_interval_seconds=settings.inviter.worker.poll_interval_seconds,
+            shutdown_event=shutdown_event,
+        )
+        await worker.run_forever()
+        logger.info("Инвайтер (worker): получен сигнал остановки — завершение работы.")
+    finally:
+        await notifier.close()
+        account_repository.close()
+        campaign_repository.close()
+        invite_repository.close()
+        user_repository.close()
+
+
 def main() -> None:
     args = _parse_args(sys.argv[1:])
     try:
-        asyncio.run(run(execute=args.execute, test=args.test))
+        if args.worker:
+            asyncio.run(run_worker())
+        else:
+            asyncio.run(run(execute=args.execute, test=args.test))
     except ConfigError as exc:
         print(f"Ошибка запуска: {exc}", file=sys.stderr)
         sys.exit(1)

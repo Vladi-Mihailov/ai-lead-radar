@@ -219,6 +219,22 @@ WHERE account_id = :account_id
   AND invited_at >= :today_start
 """
 
+# Скользящее часовое окно (см. UserCampaignInviteRepository.count_recent_sent
+# и reader/inviter/worker.py) — в отличие от _COUNT_TODAY_JOINED/
+# _COUNT_TODAY_PENDING (календарные UTC-сутки, только для daily_limit), :since
+# передаётся вызывающим кодом (now - 1 час), а не вычисляется здесь.
+# status IN ('pending', 'joined') — те же статусы, что и invited_at IS NOT
+# NULL (см. InviterService._record_invite_result: invited_at заполняется
+# только для успешного RPC-приглашения) — "успешно отправлено", независимо
+# от того, подтверждено ли уже вступление.
+_COUNT_RECENT_SENT = """
+SELECT COUNT(*)
+FROM user_campaign_invites
+WHERE account_id = :account_id
+  AND status IN ('pending', 'joined')
+  AND invited_at >= :since
+"""
+
 # Все приглашения ЭТОГО аккаунта в рамках ЭТОЙ кампании, которые ждут
 # подтверждения вступления (см. InviterService._verify_pending_invites) —
 # независимо от того, когда именно они были отправлены (в том числе из
@@ -642,6 +658,21 @@ class UserCampaignInviteRepository:
         row = self._conn.execute(
             _COUNT_TODAY_PENDING,
             {"account_id": account_id, "today_start": today_start.isoformat()},
+        ).fetchone()
+        return row[0]
+
+    def count_recent_sent(self, account_id: int, since: datetime) -> int:
+        """Сколько раз ЭТОТ account_id успешно ОТПРАВИЛ приглашение (RPC-
+        успех — status IN ('pending', 'joined'), см. _COUNT_RECENT_SENT)
+        начиная с since (включительно), по ВСЕМ кампаниям сразу — как и
+        count_today_joined()/count_today_pending(), но со скользящим
+        произвольным окном вместо календарных суток: используется
+        InviterService.run_one_worker_attempt() для часового лимита
+        воркера (see reader/inviter/worker.py), передающего
+        since=now-timedelta(hours=1) — НЕ хранится отдельным счётчиком,
+        вычисляется по факту из уже существующей истории приглашений."""
+        row = self._conn.execute(
+            _COUNT_RECENT_SENT, {"account_id": account_id, "since": _isoformat(since)},
         ).fetchone()
         return row[0]
 
