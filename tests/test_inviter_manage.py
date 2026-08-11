@@ -50,6 +50,59 @@ def test_parse_args_add_account_explicit_values():
     assert args.enabled is False
 
 
+def test_parse_args_add_account_verify_membership_defaults_true():
+    args = manage._parse_args(
+        [
+            "add-account", "--name", "@vladimihailov",
+            "--session-name", "vladimihailov", "--session-path", "data/sessions/vladimihailov",
+        ]
+    )
+    assert args.verify_membership is True
+
+
+def test_parse_args_add_account_no_verify_membership():
+    args = manage._parse_args(
+        [
+            "add-account", "--name", "@car_ins_account",
+            "--session-name", "car_ins_account", "--session-path", "data/sessions/car_ins_account",
+            "--no-verify-membership",
+        ]
+    )
+    assert args.verify_membership is False
+
+
+def test_parse_args_add_account_verify_membership_explicit_true():
+    """--verify-membership не только "по умолчанию" — можно явно включить
+    обратно (см. задачу: "также должна быть возможность снова включить его")."""
+    args = manage._parse_args(
+        [
+            "add-account", "--name", "@car_ins_account",
+            "--session-name", "car_ins_account", "--session-path", "data/sessions/car_ins_account",
+            "--verify-membership",
+        ]
+    )
+    assert args.verify_membership is True
+
+
+def test_parse_args_verify_membership_independent_from_enabled():
+    """enabled и verify_membership — независимые флаги, не связанные друг
+    с другом (см. задачу)."""
+    args = manage._parse_args(
+        [
+            "add-account", "--name", "@car_ins_account",
+            "--session-name", "car_ins_account", "--session-path", "data/sessions/car_ins_account",
+            "--no-verify-membership",
+        ]
+    )
+    assert args.enabled is True
+    assert args.verify_membership is False
+
+
+def test_parse_args_list_accounts():
+    args = manage._parse_args(["list-accounts"])
+    assert args.command == "list-accounts"
+
+
 def test_parse_args_add_campaign_defaults():
     args = manage._parse_args(
         ["add-campaign", "--name", "Страхование", "--keyword", "страх", "--target-chat", "@tplgee"]
@@ -134,6 +187,66 @@ def test_ensure_account_defaults_phone_to_empty_string_when_omitted(tmp_path):
     )
 
     assert account.phone == ""
+
+
+def test_ensure_account_defaults_verify_membership_to_true(tmp_path):
+    db_path = tmp_path / "users.db"
+
+    account = manage.ensure_account(
+        db_path, name="@vladimihailov", phone="", session_name="vladimihailov",
+        session_path="data/sessions/vladimihailov", daily_limit=30, enabled=True,
+    )
+
+    assert account.verify_membership is True
+
+
+def test_ensure_account_can_disable_and_re_enable_verify_membership(tmp_path):
+    """python -m reader.inviter.manage add-account ... --no-verify-membership,
+    затем снова ... --verify-membership — обе стороны переключения
+    (см. задачу: "также должна быть возможность снова включить его")."""
+    db_path = tmp_path / "users.db"
+
+    disabled = manage.ensure_account(
+        db_path, name="@car_ins_account", phone="", session_name="car_ins_account",
+        session_path="data/sessions/car_ins_account", daily_limit=24, enabled=True,
+        verify_membership=False,
+    )
+    assert disabled.verify_membership is False
+    assert disabled.enabled is True  # enabled не затронут
+
+    re_enabled = manage.ensure_account(
+        db_path, name="@car_ins_account", phone="", session_name="car_ins_account",
+        session_path="data/sessions/car_ins_account", daily_limit=24, enabled=True,
+        verify_membership=True,
+    )
+    assert re_enabled.id == disabled.id  # тот же ряд, не новый
+    assert re_enabled.verify_membership is True
+
+
+# ---- list_accounts ----
+
+
+def test_list_accounts_returns_all_accounts_with_verify_membership(tmp_path):
+    db_path = tmp_path / "users.db"
+    manage.ensure_account(
+        db_path, name="@acc1", phone="", session_name="acc1", session_path="data/sessions/acc1",
+        daily_limit=24, enabled=True, verify_membership=True,
+    )
+    manage.ensure_account(
+        db_path, name="@acc2", phone="", session_name="acc2", session_path="data/sessions/acc2",
+        daily_limit=24, enabled=True, verify_membership=False,
+    )
+
+    accounts = manage.list_accounts(db_path)
+
+    assert {a.name: a.verify_membership for a in accounts} == {
+        "@acc1": True, "@acc2": False,
+    }
+
+
+def test_list_accounts_returns_empty_list_when_no_accounts(tmp_path):
+    db_path = tmp_path / "users.db"
+    assert manage.list_accounts(db_path) == []
 
 
 # ---- ensure_campaign ----

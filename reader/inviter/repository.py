@@ -12,31 +12,39 @@ from reader.users.repository import UserRepository
 
 _TELEGRAM_ACCOUNTS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS telegram_accounts (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    name            TEXT NOT NULL,
-    phone           TEXT NOT NULL,
-    session_name    TEXT NOT NULL,
-    session_path    TEXT NOT NULL,
-    daily_limit     INTEGER NOT NULL DEFAULT 30,
-    enabled         BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    last_used_at    TIMESTAMP,
-    blocked_until   TIMESTAMP,
-    blocked_reason  TEXT
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                TEXT NOT NULL,
+    phone               TEXT NOT NULL,
+    session_name        TEXT NOT NULL,
+    session_path        TEXT NOT NULL,
+    daily_limit         INTEGER NOT NULL DEFAULT 30,
+    enabled             BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_used_at        TIMESTAMP,
+    blocked_until       TIMESTAMP,
+    blocked_reason      TEXT,
+    verify_membership   INTEGER NOT NULL DEFAULT 1
 )
 """
 
 # CREATE TABLE IF NOT EXISTS не добавляет колонки в уже существующую
 # таблицу — для БД, созданных до появления blocked_until/blocked_reason
 # (временная блокировка аккаунта самим Telegram, см.
-# InviterService._persist_flood_wait_block), добавляем их явно при
-# открытии, без удаления/пересоздания БД (тот же приём, что и для
-# user_campaign_invites.verified_at ниже/users.is_bot и т.п. в
-# reader/users/repository.py) — безопасно применяется к существующему
-# data/users.db на сервере.
+# InviterService._persist_flood_wait_block) или verify_membership (см.
+# TelegramAccount.verify_membership/InviterService._execute_account),
+# добавляем их явно при открытии, без удаления/пересоздания БД (тот же
+# приём, что и для user_campaign_invites.verified_at ниже/users.is_bot и
+# т.п. в reader/users/repository.py) — безопасно применяется к
+# существующему data/users.db на сервере. DEFAULT 1 — обратная
+# совместимость: у уже существующих аккаунтов проверка pending продолжает
+# работать как раньше, пока оператор явно не выключит её конкретному
+# аккаунту (см. reader/inviter/manage.py).
 _TELEGRAM_ACCOUNTS_COLUMN_MIGRATIONS = {
     "blocked_until": "ALTER TABLE telegram_accounts ADD COLUMN blocked_until TIMESTAMP",
     "blocked_reason": "ALTER TABLE telegram_accounts ADD COLUMN blocked_reason TEXT",
+    "verify_membership": (
+        "ALTER TABLE telegram_accounts ADD COLUMN verify_membership INTEGER NOT NULL DEFAULT 1"
+    ),
 }
 
 _INVITE_CAMPAIGNS_SCHEMA = """
@@ -269,7 +277,7 @@ class TelegramAccountRepository:
     _UPDATABLE_COLUMNS = (
         "name", "phone", "session_name", "session_path",
         "daily_limit", "enabled", "last_used_at",
-        "blocked_until", "blocked_reason",
+        "blocked_until", "blocked_reason", "verify_membership",
     )
 
     def __init__(self, db_path: Path):
@@ -299,12 +307,17 @@ class TelegramAccountRepository:
         session_path: str,
         daily_limit: int = 30,
         enabled: bool = True,
+        verify_membership: bool = True,
     ) -> TelegramAccount:
         cursor = self._conn.execute(
             """
             INSERT INTO telegram_accounts (
-                name, phone, session_name, session_path, daily_limit, enabled
-            ) VALUES (:name, :phone, :session_name, :session_path, :daily_limit, :enabled)
+                name, phone, session_name, session_path, daily_limit, enabled,
+                verify_membership
+            ) VALUES (
+                :name, :phone, :session_name, :session_path, :daily_limit, :enabled,
+                :verify_membership
+            )
             """,
             {
                 "name": name,
@@ -313,6 +326,7 @@ class TelegramAccountRepository:
                 "session_path": session_path,
                 "daily_limit": daily_limit,
                 "enabled": enabled,
+                "verify_membership": verify_membership,
             },
         )
         self._conn.commit()
@@ -348,7 +362,8 @@ class TelegramAccountRepository:
         row = self._conn.execute(
             """
             SELECT id, name, phone, session_name, session_path, daily_limit,
-                   enabled, created_at, last_used_at, blocked_until, blocked_reason
+                   enabled, created_at, last_used_at, blocked_until, blocked_reason,
+                   verify_membership
             FROM telegram_accounts WHERE id = ?
             """,
             (account_id,),
@@ -359,7 +374,8 @@ class TelegramAccountRepository:
         rows = self._conn.execute(
             """
             SELECT id, name, phone, session_name, session_path, daily_limit,
-                   enabled, created_at, last_used_at, blocked_until, blocked_reason
+                   enabled, created_at, last_used_at, blocked_until, blocked_reason,
+                   verify_membership
             FROM telegram_accounts ORDER BY id
             """
         ).fetchall()
@@ -373,6 +389,7 @@ def _row_to_account(row) -> TelegramAccount:
     (
         id_, name, phone, session_name, session_path, daily_limit,
         enabled, created_at, last_used_at, blocked_until, blocked_reason,
+        verify_membership,
     ) = row
     return TelegramAccount(
         id=id_,
@@ -386,6 +403,7 @@ def _row_to_account(row) -> TelegramAccount:
         last_used_at=_parse_datetime(last_used_at),
         blocked_until=_parse_datetime(blocked_until),
         blocked_reason=blocked_reason,
+        verify_membership=bool(verify_membership),
     )
 
 

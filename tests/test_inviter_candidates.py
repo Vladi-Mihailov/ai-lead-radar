@@ -49,6 +49,7 @@ from reader.inviter.service import (  # noqa: E402
     _format_duration,
     _humanize_error,
 )
+from reader.inviter.worker import InviterWorker  # noqa: E402
 from reader.users.models import TelegramUserInfo  # noqa: E402
 from reader.users.repository import UserRepository  # noqa: E402
 
@@ -1082,7 +1083,7 @@ def test_dry_run_continues_with_other_accounts_when_one_fails_to_connect(tmp_pat
 # ---- execute=True — реальные приглашения ----
 
 
-def _setup_single_candidate_campaign(db_path, *, daily_limit=5, is_bot=None):
+def _setup_single_candidate_campaign(db_path, *, daily_limit=5, is_bot=None, verify_membership=True):
     _seed_user(
         db_path, 1, username="ivan", keywords=["осаго"], access_hash=11,
         last_seen_at=_BASE_TIME, is_bot=is_bot,
@@ -1095,6 +1096,7 @@ def _setup_single_candidate_campaign(db_path, *, daily_limit=5, is_bot=None):
         account = account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
             session_path="acc1.session", daily_limit=daily_limit,
+            verify_membership=verify_membership,
         )
         return campaign, account
     finally:
@@ -1651,6 +1653,213 @@ def test_execute_verify_pending_leaves_pending_on_unexpected_check_error(tmp_pat
         assert invite.status == "pending"
         assert invite.verified_at is None
     finally:
+        invite_repository.close()
+
+
+# ---- InviterService: account.verify_membership ----
+# Обычные (не admin) аккаунты инвайтера могут не иметь прав на
+# GetParticipantRequest в конкретном target_chat — раньше это означало
+# десятки заведомо неработающих запросов на каждый цикл ("Chat admin
+# privileges are required...", см. задачу). verify_membership=False
+# отключает именно эту проверку для конкретного аккаунта, не трогая
+# отправку приглашений/daily_limit/hourly worker limit.
+
+
+def test_execute_verifies_pending_when_verify_membership_true(tmp_path):
+    """Базовое поведение по умолчанию (verify_membership=True) — не
+    изменилось: get_permissions() вызывается, pending подтверждается."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path, verify_membership=True)
+
+    created_clients: list = []
+    client_factory = _make_client_factory(created=created_clients)
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    assert len(created_clients[0].get_permissions_calls) == 1
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        assert invite_repository.list()[0].status == "joined"
+    finally:
+        invite_repository.close()
+
+
+def test_execute_skips_verification_when_verify_membership_false(tmp_path):
+    """verify_membership=False — ни одного client.get_permissions()
+    (GetParticipantRequest) вообще, новый успешный InviteToChannelRequest/
+    AddChatUserRequest по-прежнему выполняется и остаётся status='pending'
+    (НЕ искусственно переводится в joined — нет данных Telegram, чтобы это
+    утверждать, см. задачу)."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path, verify_membership=False)
+
+    created_clients: list = []
+    client_factory = _make_client_factory(created=created_clients)
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    client = created_clients[0]
+    assert len(client.call_requests) == 1  # InviteToChannelRequest/AddChatUserRequest всё равно выполнен
+    assert client.get_permissions_calls == []  # но НИ ОДНОГО GetParticipantRequest
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invite = invite_repository.list()[0]
+        assert invite.status == "pending"
+        assert invite.verified_at is None
+    finally:
+        invite_repository.close()
+
+
+def test_execute_verify_membership_false_does_not_check_old_pending_from_previous_run(tmp_path):
+    """pending, оставшийся с ПРЕДЫДУЩЕГО прогона (до того, как оператор
+    выключил verify_membership) — тоже не проверяется ни при каких
+    обстоятельствах, а не только новые из этого запуска."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(
+        db_path, daily_limit=5, verify_membership=False,
+    )
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        old_pending = invite_repository.create(
+            user_id=999, campaign_id=campaign.id, account_id=account.id,
+            status="pending", invited_at=datetime.now(timezone.utc) - timedelta(days=1),
+        )
+    finally:
+        invite_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(created=created_clients)
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    assert created_clients[0].get_permissions_calls == []
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        untouched = invite_repository.get(old_pending.id)
+        assert untouched.status == "pending"
+        assert untouched.verified_at is None
+    finally:
+        invite_repository.close()
+
+
+def test_execute_verify_membership_false_avoids_admin_privileges_warning(tmp_path, caplog):
+    """Продакшен-сценарий из задачи: get_permissions() падал бы с
+    ChatAdminRequiredError ("Chat admin privileges are required...") на
+    каждом pending — verify_membership=False должен исключить это
+    полностью (никакого запроса — никакой ошибки и предупреждения в лог),
+    а не просто подавить сообщение об ошибке."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path, verify_membership=False)
+
+    client_factory = _make_client_factory(
+        participant_check_errors={"Основной": {1: ChatAdminRequiredError(request=GetHistoryRequest)}},
+    )
+
+    with caplog.at_level("WARNING", logger="reader.inviter.service"):
+        asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    assert "Не удалось проверить участие в группе" not in caplog.text
+    assert "Chat admin privileges" not in caplog.text
+
+
+def test_execute_verify_membership_false_still_reports_pending_in_summary(tmp_path):
+    """Summary/operator-уведомление по-прежнему показывает pending (см.
+    задачу: "В summary допустимо по-прежнему показывать pending") — просто
+    без попытки его подтвердить."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path, verify_membership=False)
+
+    notifier = _FakeOperatorNotifier()
+    asyncio.run(
+        _run_service(
+            db_path, client_factory=_make_client_factory(), execute=True, notifier=notifier,
+        )
+    )
+
+    account_report = next(t for t in notifier.sent if "Аккаунт:" in t)
+    assert "Ожидают подтверждения: 1" in account_report
+
+
+def test_execute_enabled_false_overrides_regardless_of_verify_membership(tmp_path):
+    """enabled=False по-прежнему полностью выключает аккаунт из инвайтера
+    — verify_membership (в любую сторону) не может это компенсировать
+    (см. задачу: это независимые флаги, но enabled остаётся главным)."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path, verify_membership=True)
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        account_repository.update(account.id, enabled=False)
+    finally:
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(created=created_clients)
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    assert created_clients == []  # аккаунт вообще не подключался
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        assert invite_repository.list() == []
+    finally:
+        invite_repository.close()
+
+
+def test_worker_picks_up_verify_membership_change_without_restart(tmp_path):
+    """reader/inviter/worker.py::InviterWorker перечитывает аккаунты из БД
+    на каждом тике (см. InviterWorker._enabled_pairs) — оператор,
+    выключивший verify_membership МЕЖДУ тиками (без перезапуска процесса,
+    тот же InviterWorker/InviterService), должен увидеть эффект уже на
+    следующем тике (см. задачу: "Worker должен автоматически подхватывать
+    изменение флага из БД без перезапуска")."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, username="ivan1", keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(
+        db_path, 2, username="ivan2", keywords=["осаго"], access_hash=2,
+        last_seen_at=_BASE_TIME + timedelta(days=1),
+    )
+
+    created_clients: list = []
+    service, account_repository, campaign_repository, invite_repository = _build_service(
+        db_path, client_factory=_make_client_factory(created=created_clients),
+    )
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        account = account_repository.create(
+            name="acc1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=24, verify_membership=True,
+        )
+
+        worker = InviterWorker(
+            service, campaign_repository, account_repository,
+            invitations_per_account_per_hour=2, poll_interval_seconds=600,
+            shutdown_event=asyncio.Event(),
+        )
+
+        asyncio.run(worker.run_one_tick())
+        assert len(created_clients) == 1
+        # verify_membership=True — проверка pending прошла как обычно.
+        assert len(created_clients[0].get_permissions_calls) == 1
+
+        # Оператор выключает verify_membership МЕЖДУ тиками — тот же
+        # процесс, тот же InviterWorker/InviterService, никакого
+        # перезапуска.
+        account_repository.update(account.id, verify_membership=False)
+
+        asyncio.run(worker.run_one_tick())
+
+        assert len(created_clients) == 2
+        # Второй тик отправил новое приглашение (второй кандидат), но НЕ
+        # проверил его — изменение флага подхватилось немедленно.
+        assert len(created_clients[1].call_requests) == 1
+        assert created_clients[1].get_permissions_calls == []
+    finally:
+        account_repository.close()
+        campaign_repository.close()
         invite_repository.close()
 
 

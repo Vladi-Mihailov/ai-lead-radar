@@ -999,10 +999,15 @@ class InviterService:
            может приглашать, кандидаты не выбираются вовсе.
         5. Основная волна (см. _run_invite_wave) — до remaining кандидатов.
         6. Если волна не была прервана (STOP_ACCOUNT/FATAL/лимит тестового
-           режима) — подождать (см. _wait_before_verifying_pending, по
-           числу реально отправленных) и проверить всех pending этого
-           аккаунта в этой кампании (см. _verify_pending_invites), включая
-           оставшихся с прошлых прогонов.
+           режима) И account.verify_membership — подождать (см.
+           _wait_before_verifying_pending, по числу реально отправленных)
+           и проверить всех pending этого аккаунта в этой кампании (см.
+           _verify_pending_invites), включая оставшихся с прошлых
+           прогонов. verify_membership=False (обычный, не admin, аккаунт
+           без прав на GetParticipantRequest в target_chat, см.
+           TelegramAccount.verify_membership) — оба шага полностью
+           пропускаются, pending остаётся pending без единого запроса
+           проверки.
         7. Пересчитать остаток лимита ПОСЛЕ проверки (см.
            _remaining_daily_budget — уже с учётом того, что часть pending
            стала joined/not_joined) и, если он > 0, выполнить РОВНО ОДНУ
@@ -1105,10 +1110,20 @@ class InviterService:
                     )
 
                     if not stopped:
-                        await self._wait_before_verifying_pending(stats.sent)
-                        await self._verify_pending_invites(
-                            client, campaign, account, target_entity, stats,
-                        )
+                        if account.verify_membership:
+                            await self._wait_before_verifying_pending(stats.sent)
+                            await self._verify_pending_invites(
+                                client, campaign, account, target_entity, stats,
+                            )
+                        # verify_membership=False (см. TelegramAccount) —
+                        # этот аккаунт не имеет прав на GetParticipantRequest
+                        # в target_chat (обычная, не admin, учётка) — ни
+                        # ожидания, ни самого запроса проверки не делаем
+                        # вовсе, ни для только что отправленных, ни для
+                        # оставшихся с прошлых прогонов pending (см. задачу
+                        # про лог "Chat admin privileges are required...").
+                        # invitation flow (волны/daily_limit/pending-запись)
+                        # не меняется — pending просто не проверяется.
 
                         top_up_remaining = self._remaining_daily_budget(account)
                         if max_sent_this_call is not None:

@@ -15,7 +15,31 @@
         --keyword страх --target-chat @tplgee
 
 Повторный запуск с теми же --name обновляет уже существующую запись, а не
-создаёт вторую.
+создаёт вторую. Это касается и всех остальных полей add-account, включая
+--verify-membership: при обновлении нужно передавать ПОЛНЫЙ набор значений
+(как и для --daily-limit/--enabled уже сегодня), не переданное явно поле
+вернётся к своему умолчанию, а не сохранит прежнее значение.
+
+Управление verify_membership (см. TelegramAccount.verify_membership) —
+отдельно от enabled, тем же способом (--enabled/--no-enabled), что и
+существующий флаг enabled: обычный (не admin) аккаунт может не иметь прав
+на GetParticipantRequest в конкретной target-группе — --no-verify-membership
+выключает именно проверку pending-приглашений
+(InviterService._verify_pending_invites) для этого аккаунта, сама отправка
+приглашений продолжает работать как обычно:
+
+    python -m reader.inviter.manage add-account --name @car_ins_account \
+        --session-name car_ins_account --session-path data/sessions/car_ins_account \
+        --daily-limit 24 --no-verify-membership
+
+    python -m reader.inviter.manage add-account --name @car_ins_account \
+        --session-name car_ins_account --session-path data/sessions/car_ins_account \
+        --daily-limit 24 --verify-membership
+
+Посмотреть текущее состояние всех аккаунтов (enabled/verify_membership/
+daily_limit/blocked_until):
+
+    python -m reader.inviter.manage list-accounts
 """
 
 import argparse
@@ -61,6 +85,23 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     add_account.add_argument("--daily-limit", type=int, default=30)
     add_account.add_argument("--enabled", action=argparse.BooleanOptionalAction, default=True)
+    add_account.add_argument(
+        "--verify-membership", action=argparse.BooleanOptionalAction, default=True,
+        help=(
+            "Разрешить проверку pending-приглашений этого аккаунта через "
+            "GetParticipantRequest (см. InviterService._verify_pending_invites). "
+            "Выключите (--no-verify-membership) для обычных (не admin) "
+            "аккаунтов, у которых эта проверка гарантированно проваливается "
+            "('Chat admin privileges are required...') — отправка приглашений "
+            "продолжит работать как обычно, только сам pending не проверяется. "
+            "НЕ то же самое, что --enabled. По умолчанию включено."
+        ),
+    )
+
+    subparsers.add_parser(
+        "list-accounts",
+        help="Показать все аккаунты инвайтера и их флаги (enabled, verify_membership, daily_limit, blocked_until).",
+    )
 
     add_campaign = subparsers.add_parser(
         "add-campaign",
@@ -83,6 +124,7 @@ def ensure_account(
     session_path: str,
     daily_limit: int,
     enabled: bool,
+    verify_membership: bool = True,
 ) -> TelegramAccount:
     """Идемпотентно: если аккаунт с таким name уже есть — обновляет его,
     иначе создаёт новый. Ни при каких повторных вызовах не плодит дубликаты."""
@@ -93,11 +135,22 @@ def ensure_account(
             return repository.create(
                 name=name, phone=phone, session_name=session_name,
                 session_path=session_path, daily_limit=daily_limit, enabled=enabled,
+                verify_membership=verify_membership,
             )
         return repository.update(
             existing.id, name=name, phone=phone, session_name=session_name,
             session_path=session_path, daily_limit=daily_limit, enabled=enabled,
+            verify_membership=verify_membership,
         )
+    finally:
+        repository.close()
+
+
+def list_accounts(db_path) -> list[TelegramAccount]:
+    """Только чтение — используется CLI-командой list-accounts (см. main())."""
+    repository = TelegramAccountRepository(db_path)
+    try:
+        return repository.list()
     finally:
         repository.close()
 
@@ -136,11 +189,27 @@ def main() -> None:
                 settings.app.users_db_file,
                 name=args.name, phone=args.phone, session_name=args.session_name,
                 session_path=args.session_path, daily_limit=args.daily_limit, enabled=args.enabled,
+                verify_membership=args.verify_membership,
             )
             print(
                 f"✔ Аккаунт готов: {account.name} (id={account.id}, "
-                f"daily_limit={account.daily_limit}, enabled={account.enabled})"
+                f"daily_limit={account.daily_limit}, enabled={account.enabled}, "
+                f"verify_membership={account.verify_membership})"
             )
+        elif args.command == "list-accounts":
+            accounts = list_accounts(settings.app.users_db_file)
+            if not accounts:
+                print("Аккаунтов нет.")
+            for account in accounts:
+                blocked = (
+                    f"до {account.blocked_until.strftime('%Y-%m-%d %H:%M')} UTC"
+                    if account.blocked_until else "нет"
+                )
+                print(
+                    f"id={account.id} {account.name}: enabled={account.enabled}, "
+                    f"verify_membership={account.verify_membership}, "
+                    f"daily_limit={account.daily_limit}, blocked_until={blocked}"
+                )
         elif args.command == "add-campaign":
             campaign = ensure_campaign(
                 settings.app.users_db_file,

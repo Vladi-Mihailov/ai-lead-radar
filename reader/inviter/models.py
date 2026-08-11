@@ -17,7 +17,21 @@ class TelegramAccount:
     автоматически по истечении времени, никакого ручного enabled=True не
     требует. blocked_reason — просто пояснение источника ограничения
     ("flood_wait"), не влияет на саму проверку (см. service.py
-    _is_blocked_by_flood_wait)."""
+    _is_blocked_by_flood_wait).
+
+    verify_membership — тоже НЕ то же самое, что enabled: enabled=False
+    убирает аккаунт из инвайтера целиком, а verify_membership=False
+    оставляет его приглашающим (InviteToChannelRequest/AddChatUserRequest
+    работают как обычно, новый успешный RPC по-прежнему пишется как
+    status='pending'), но запрещает именно
+    InviterService._verify_pending_invites() — обычные (не админ) аккаунты
+    Telegram может не давать права на GetParticipantRequest в конкретном
+    target_chat, из-за чего эта проверка гарантированно проваливается на
+    каждом pending (см. задачу про лог "Chat admin privileges are
+    required..."/InvokeWithoutUpdatesRequest(GetParticipantRequest)) —
+    без этого флага такие аккаунты бесполезно повторяли бы заведомо
+    неработающий запрос на каждый цикл. По умолчанию True — обратная
+    совместимость с уже существующими аккаунтами/поведением (см. задачу)."""
 
     id: int
     name: str
@@ -30,6 +44,7 @@ class TelegramAccount:
     last_used_at: datetime | None
     blocked_until: datetime | None = None
     blocked_reason: str | None = None
+    verify_membership: bool = True
 
 
 @dataclass(frozen=True)

@@ -148,10 +148,11 @@ def test_user_campaign_invites_migrates_legacy_table_without_verified_at(tmp_pat
 def test_telegram_accounts_migrates_legacy_table_without_blocked_columns(tmp_path):
     """БД, созданная до появления blocked_until/blocked_reason (временная
     блокировка аккаунта самим Telegram, см. задачу про повторный FloodWait
-    у @Mihailov_vm), должна получить обе колонки при открытии — без
-    пересоздания таблицы и без потери уже существующих записей. Именно
-    этот сценарий обеспечивает безопасное применение к существующему
-    data/users.db на сервере."""
+    у @Mihailov_vm) и verify_membership (см. TelegramAccount.verify_membership/
+    задачу про "Chat admin privileges are required..."), должна получить
+    все три колонки при открытии — без пересоздания таблицы и без потери
+    уже существующих записей. Именно этот сценарий обеспечивает безопасное
+    применение к существующему data/users.db на сервере."""
     db_path = tmp_path / "inviter.db"
 
     conn = sqlite3.connect(db_path)
@@ -186,12 +187,16 @@ def test_telegram_accounts_migrates_legacy_table_without_blocked_columns(tmp_pat
         )}
         assert "blocked_until" in columns
         assert "blocked_reason" in columns
+        assert "verify_membership" in columns
 
         accounts = repository.list()
         assert len(accounts) == 1
         assert accounts[0].name == "Основной"
         assert accounts[0].blocked_until is None
         assert accounts[0].blocked_reason is None
+        # DEFAULT 1 — обратная совместимость: у уже существующих аккаунтов
+        # проверка pending продолжает работать как раньше (см. задачу).
+        assert accounts[0].verify_membership is True
 
         blocked_until = datetime.now(timezone.utc) + timedelta(hours=5)
         updated = repository.update(
@@ -199,6 +204,59 @@ def test_telegram_accounts_migrates_legacy_table_without_blocked_columns(tmp_pat
         )
         assert updated.blocked_until == blocked_until
         assert updated.blocked_reason == "flood_wait"
+    finally:
+        repository.close()
+
+
+def test_telegram_accounts_migrates_existing_table_without_verify_membership(tmp_path):
+    """Сценарий, реально ожидаемый на продакшене: таблица УЖЕ содержит
+    blocked_until/blocked_reason (из предыдущей миграции), но ещё не имеет
+    verify_membership — открытие репозитория должно добавить только её,
+    без пересоздания таблицы и без потери существующих записей/значений."""
+    db_path = tmp_path / "inviter.db"
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE telegram_accounts (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                name            TEXT NOT NULL,
+                phone           TEXT NOT NULL,
+                session_name    TEXT NOT NULL,
+                session_path    TEXT NOT NULL,
+                daily_limit     INTEGER NOT NULL DEFAULT 30,
+                enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at    TIMESTAMP,
+                blocked_until   TIMESTAMP,
+                blocked_reason  TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO telegram_accounts (name, phone, session_name, session_path, daily_limit) "
+            "VALUES ('@car_ins_account', '+995500000001', 'acc1', 'data/sessions/acc1.session', 24)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    repository = TelegramAccountRepository(db_path)
+    try:
+        columns = {row[1] for row in repository._conn.execute(
+            "PRAGMA table_info(telegram_accounts)"
+        )}
+        assert "verify_membership" in columns
+
+        accounts = repository.list()
+        assert len(accounts) == 1
+        assert accounts[0].name == "@car_ins_account"
+        assert accounts[0].daily_limit == 24  # существующие значения не потеряны
+        assert accounts[0].verify_membership is True  # DEFAULT 1
+
+        updated = repository.update(accounts[0].id, verify_membership=False)
+        assert updated.verify_membership is False
     finally:
         repository.close()
 
@@ -217,6 +275,7 @@ def test_telegram_account_create_get_update_list(tmp_path):
         assert account.daily_limit == 30  # значение по умолчанию
         assert account.enabled is True
         assert account.last_used_at is None
+        assert account.verify_membership is True  # значение по умолчанию
 
         fetched = repository.get(account.id)
         assert fetched == account
@@ -226,14 +285,39 @@ def test_telegram_account_create_get_update_list(tmp_path):
         assert updated.enabled is False
         # Поля, не переданные в update(), не изменились.
         assert updated.phone == "+995500000001"
+        assert updated.verify_membership is True
 
         second_account = repository.create(
             name="Второй", phone="+995500000002",
             session_name="acc2", session_path="data/sessions/acc2.session",
-            daily_limit=10, enabled=False,
+            daily_limit=10, enabled=False, verify_membership=False,
         )
+        assert second_account.verify_membership is False
         listed = repository.list()
         assert [a.id for a in listed] == [account.id, second_account.id]
+    finally:
+        repository.close()
+
+
+def test_telegram_account_toggle_verify_membership_true_and_false(tmp_path):
+    """verify_membership независим от enabled — переключается отдельно, в
+    обе стороны (см. задачу: "также должна быть возможность снова
+    включить его")."""
+    repository = TelegramAccountRepository(tmp_path / "inviter.db")
+    try:
+        account = repository.create(
+            name="@car_ins_account", phone="+995500000001",
+            session_name="acc1", session_path="data/sessions/acc1.session",
+        )
+        assert account.enabled is True
+        assert account.verify_membership is True
+
+        disabled_verify = repository.update(account.id, verify_membership=False)
+        assert disabled_verify.verify_membership is False
+        assert disabled_verify.enabled is True  # enabled не затронут
+
+        re_enabled_verify = repository.update(account.id, verify_membership=True)
+        assert re_enabled_verify.verify_membership is True
     finally:
         repository.close()
 
