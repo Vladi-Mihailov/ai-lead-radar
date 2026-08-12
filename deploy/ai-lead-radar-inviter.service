@@ -1,16 +1,17 @@
 [Unit]
-Description=ai-lead-radar inviter (постоянный фоновый worker-режим)
-# Отдельный сервис от ai-lead-radar.service (reader.main) — работает
-# независимо, со своим набором TelegramAccount-сессий (data/sessions/*),
-# никак не разделяемых с reader.main/sync_users/notifier.
+Description=AI Lead Radar Inviter Worker
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
+# User/Group/WorkingDirectory/Environment — те же, что и у ai-lead-radar.service
+# (см. `systemctl cat ai-lead-radar.service` на сервере) — тот же venv/аккаунт,
+# отдельный процесс.
 User=leadradar
 Group=leadradar
 WorkingDirectory=/home/leadradar/ai-lead-radar
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/leadradar/.venv/bin/python -m reader.inviter.main --worker
 
 # SIGTERM -> InviterWorker.run_forever() дожидается завершения текущей
@@ -22,10 +23,14 @@ ExecStart=/home/leadradar/.venv/bin/python -m reader.inviter.main --worker
 KillSignal=SIGTERM
 TimeoutStopSec=300
 
-# Автоматический перезапуск только после НЕОЖИДАННОГО падения (ненулевой
-# exit code/сигнал) — не после штатного `systemctl stop`.
+# on-failure (не always, как у ai-lead-radar.service) — намеренно другая
+# политика: перезапуск только после НЕОЖИДАННОГО падения, не после
+# штатного `systemctl stop` (см. задачу про постоянный worker-режим).
+# RestartSec=10 — с небольшим запасом относительно ai-lead-radar.service
+# (5s): падение здесь обычно связано с Telegram/сетью, которым нужно
+# чуть больше времени на восстановление, прежде чем пробовать снова.
 Restart=on-failure
-RestartSec=15
+RestartSec=10
 
 StandardOutput=journal
 StandardError=journal
