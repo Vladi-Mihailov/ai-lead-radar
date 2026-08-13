@@ -72,6 +72,23 @@ _LONG_PAUSE_PROBABILITY = 0.2
 # просто подождать и продолжить тем же аккаунтом (см. _invite_candidate).
 _MAX_TOLERABLE_FLOOD_WAIT_SECONDS = 300
 
+# PeerFloodError ("Too many requests") — Telegram, в отличие от
+# FloodWaitError, не сообщает точное время окончания ограничения, поэтому
+# используется этот фиксированный fallback-кулдаун (см.
+# _classify_invite_error/_persist_flood_wait_block) — раньше для
+# PeerFloodError account.blocked_until вообще не обновлялся, из-за чего
+# аккаунт снова считался свободным уже на следующем тике/запуске и
+# получал повторный PeerFloodError (см. задачу про "Too many requests" и
+# "Аккаунт заблокирован до" со старой/чужой датой в логе). 24 часа —
+# консервативный дефолт: по опыту именно invite-flood ограничение
+# держится порядка суток и дольше, а Telegram не даёт оснований для более
+# короткого значения; преждевременные повторные попытки только продлевают
+# реальную блокировку. Не задаётся через config.yaml — как и соседние
+# safety-константы этого модуля (_MAX_TOLERABLE_FLOOD_WAIT_SECONDS,
+# _WARMUP_*, _*_PAUSE_*), это внутренний защитный механизм, а не бизнес-
+# параметр вроде daily_limit/invitations_per_account_per_hour.
+_PEER_FLOOD_COOLDOWN_SECONDS = 24 * 60 * 60
+
 # После основной волны приглашений (см. _execute_account) ждём этот
 # интервал ПЕРЕД проверкой pending (см. _verify_pending_invites) — Telegram
 # может обрабатывать вступление не мгновенно, особенно для больших пачек.
@@ -446,22 +463,33 @@ class InviteErrorClassification:
     же (см. UserAlreadyParticipantError — кандидат уже состоял в группе,
     подтверждать через GetParticipantRequest/get_permissions нечего, это
     уже само по себе подтверждение).
-    wait_seconds — задаётся ТОЛЬКО для FloodWaitError (exc.seconds, в обоих
-    исходах — RETRY_LATER и STOP_ACCOUNT), и используется двояко (см.
+    wait_seconds — задаётся для FloodWaitError (exc.seconds, в обоих
+    исходах — RETRY_LATER и STOP_ACCOUNT) и для PeerFloodError
+    (_PEER_FLOOD_COOLDOWN_SECONDS — см. ниже), и используется двояко (см.
     InviterService._handle_invite_error): как длительность
     asyncio.sleep() при RETRY_LATER, и — независимо от action — как основа
     для account.blocked_until = now + wait_seconds (см.
-    _persist_flood_wait_block), чтобы следующий запуск не повторил попытку
-    этим аккаунтом раньше времени. Ни для одной другой ошибки (в т.ч.
-    PeerFloodError — Telegram не сообщает точное время окончания
-    ограничения) не задаётся — специально, чтобы не изобретать
-    blocked_until там, где Telegram не дал на это оснований (см. задачу)."""
+    _persist_flood_wait_block), чтобы следующий тик/запуск не повторил
+    попытку этим аккаунтом раньше времени. Для остальных ошибок (в т.ч.
+    ChatAdminRequiredError и прочих из _STOP_ACCOUNT_ERROR_TYPES, а также
+    непойманного RPCError) не задаётся — они прекращают обработку ТОЛЬКО
+    оставшихся кандидатов ЭТОГО прогона, но не блокируют аккаунт от
+    следующего тика/запуска (за пределами этой задачи — см. её условия).
+
+    blocked_reason — что записать в account.blocked_reason при
+    wait_seconds is not None (см. _persist_flood_wait_block). "flood_wait"
+    для FloodWaitError (Telegram сообщил точное время) и "peer_flood" для
+    PeerFloodError (Telegram НЕ сообщил время — это заранее выбранный
+    консервативный fallback-кулдаун, а не Telegram-provided значение,
+    поэтому отдельная причина — чтобы отличать их в БД/логах, см. задачу
+    про "Too many requests")."""
 
     action: InviteErrorAction
     db_status: str
     stat_field: str | None
     operator_message: str = ""
     wait_seconds: float | None = None
+    blocked_reason: str = "flood_wait"
     mark_as_bot: bool = False
     mark_verified_now: bool = False
 
@@ -553,9 +581,16 @@ def _classify_invite_error(exc: Exception) -> InviteErrorClassification:
             wait_seconds=exc.seconds,
         )
     if isinstance(exc, PeerFloodError):
+        # См. _PEER_FLOOD_COOLDOWN_SECONDS — Telegram не даёт точное время,
+        # но account.blocked_until всё равно должен обновиться (иначе
+        # аккаунт снова считается свободным уже на следующем тике/запуске,
+        # см. задачу про "Too many requests"), поэтому wait_seconds задан,
+        # в отличие от прежнего поведения.
         return InviteErrorClassification(
             InviteErrorAction.STOP_ACCOUNT, db_status="failed", stat_field="errors",
             operator_message=_humanize_error(exc),
+            wait_seconds=_PEER_FLOOD_COOLDOWN_SECONDS,
+            blocked_reason="peer_flood",
         )
     if isinstance(exc, _BOT_ERROR_TYPES):
         return InviteErrorClassification(
@@ -667,20 +702,27 @@ class InviterService:
     не мешает остальным.
 
     ЛЮБОЙ FloodWaitError (независимо от того, ждём мы его или он
-    останавливает аккаунт) сохраняет account.blocked_until = now +
-    exc.seconds в БД (см. _persist_flood_wait_block) — перед обработкой
-    КАЖДОГО аккаунта (execute и dry-run) _is_blocked_by_flood_wait
-    проверяет это поле ДО connect()/резолва target_chat/выборки
-    кандидатов и, если блокировка ещё активна, полностью пропускает
-    аккаунт (см. _execute_account/_dry_run_account) — именно это не даёт
-    уже заблокированному Telegram аккаунту повторно попытаться пригласить
-    в СЛЕДУЮЩЕМ запуске (см. задачу про повторный FloodWait у
-    @Mihailov_vm). enabled=False (отключён оператором) и blocked_until
-    (временное ограничение самого Telegram) — независимые условия;
-    просроченный blocked_until снимается автоматически, без участия
-    оператора. PeerFloodError не даёт Telegram точного времени окончания
-    ограничения — blocked_until для него не изобретается (см.
-    _classify_invite_error/InviteErrorClassification.wait_seconds).
+    останавливает аккаунт) и ЛЮБОЙ PeerFloodError сохраняют
+    account.blocked_until в БД (см. _persist_flood_wait_block) —
+    now + exc.seconds для FloodWaitError (Telegram сообщил точное время),
+    now + _PEER_FLOOD_COOLDOWN_SECONDS для PeerFloodError (Telegram НЕ
+    сообщил время — фиксированный консервативный fallback, см. задачу про
+    "Too many requests": без него аккаунт снова считался бы свободным уже
+    на следующем тике/запуске и тут же получал повторный PeerFloodError).
+    Перед обработкой КАЖДОГО аккаунта (execute и dry-run)
+    _is_blocked_by_flood_wait проверяет это поле ДО connect()/резолва
+    target_chat/выборки кандидатов и, если блокировка ещё активна,
+    полностью пропускает аккаунт (см. _execute_account/_dry_run_account) —
+    именно это не даёт уже заблокированному Telegram аккаунту повторно
+    попытаться пригласить в СЛЕДУЮЩЕМ тике/запуске (см. задачу про
+    повторный FloodWait у @Mihailov_vm). enabled=False (отключён
+    оператором) и blocked_until (временное ограничение самого Telegram) —
+    независимые условия; просроченный blocked_until снимается
+    автоматически, без участия оператора. Остальные STOP_ACCOUNT-ошибки
+    (ChatAdminRequiredError и т.п. из _STOP_ACCOUNT_ERROR_TYPES, а также
+    непойманный RPCError) блокировку НЕ устанавливают — они прекращают
+    обработку только оставшихся кандидатов текущего прогона (за пределами
+    задачи про "Too many requests").
 
     В режиме execute=True после каждого обработанного аккаунта и после
     каждой кампании оператору отправляется краткая статистика (см.
@@ -1375,11 +1417,13 @@ class InviterService:
             self._mark_user_as_bot(candidate.user_id)
 
         if classification.wait_seconds is not None:
-            # Только FloodWaitError задаёт wait_seconds (см.
+            # FloodWaitError и PeerFloodError задают wait_seconds (см.
             # InviteErrorClassification.wait_seconds) — сохраняем
             # blocked_until ДО записи результата и уведомления, чтобы обе
             # ссылались на уже обновлённый account (см. ниже).
-            account = self._persist_flood_wait_block(account, classification.wait_seconds)
+            account = self._persist_flood_wait_block(
+                account, classification.wait_seconds, classification.blocked_reason,
+            )
 
         log_fn = logger.info if classification.db_status in ("joined", "invalid") else logger.warning
         log_fn(
@@ -1541,21 +1585,25 @@ class InviterService:
             )
 
     def _persist_flood_wait_block(
-        self, account: TelegramAccount, wait_seconds: float,
+        self, account: TelegramAccount, wait_seconds: float, blocked_reason: str,
     ) -> TelegramAccount:
-        """FloodWaitError — единственная ошибка, для которой Telegram
-        сообщает точное время окончания ограничения (exc.seconds, см.
-        InviteErrorClassification.wait_seconds) — только для неё
-        сохраняем account.blocked_until, чтобы ни следующий запуск, ни
-        следующий аккаунт в ЭТОМ же запуске (см. _execute_account/
-        _dry_run_account) не пытались снова подключиться этим аккаунтом
-        раньше времени (см. задачу про повторный FloodWait). Сбой записи
-        не должен прерывать обработку ошибки — только предупреждение в
-        лог, с исходным (не обновлённым) account."""
+        """Вызывается для любой ошибки, у которой InviteErrorClassification.
+        wait_seconds задан (FloodWaitError — Telegram-provided exc.seconds,
+        или PeerFloodError — фиксированный _PEER_FLOOD_COOLDOWN_SECONDS,
+        см. _classify_invite_error) — сохраняем account.blocked_until,
+        чтобы ни следующий тик/запуск, ни следующий аккаунт в ЭТОМ же
+        запуске (см. _execute_account/_dry_run_account) не пытались снова
+        подключиться этим аккаунтом раньше времени (см. задачу про
+        повторный FloodWait и про "Too many requests"). blocked_reason —
+        classification.blocked_reason ("flood_wait"/"peer_flood") —
+        отдельная причина для fallback-кулдауна без Telegram-provided
+        времени, чтобы отличать их в БД/логах. Сбой записи не должен
+        прерывать обработку ошибки — только предупреждение в лог, с
+        исходным (не обновлённым) account."""
         blocked_until = datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
         try:
             return self._account_repository.update(
-                account.id, blocked_until=blocked_until, blocked_reason="flood_wait",
+                account.id, blocked_until=blocked_until, blocked_reason=blocked_reason,
             )
         except Exception:
             logger.warning(

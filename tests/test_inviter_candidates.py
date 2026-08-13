@@ -3996,6 +3996,217 @@ def test_execute_flood_wait_mid_wave_stops_account_and_persists_block(tmp_path):
         account_repository.close()
 
 
+# ---- PeerFloodError ("Too many requests"): fallback-кулдаун (см. задачу
+# про account.blocked_until, оставшийся в прошлом после "Too many requests") ----
+
+
+def test_execute_peer_flood_sets_future_blocked_until_with_peer_flood_reason(tmp_path):
+    """До исправления PeerFloodError вообще не обновлял blocked_until
+    (wait_seconds было None) — аккаунт снова считался свободным уже на
+    следующем тике. Теперь — конкретное будущее время и отдельная причина
+    ('peer_flood', не 'flood_wait' — Telegram не сообщал длительность,
+    это fallback, см. _PEER_FLOOD_COOLDOWN_SECONDS), и это сохраняется
+    именно в БД (перечитано ОТДЕЛЬНЫМ репозиторием, не тот же объект)."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path)
+
+    client_factory = _make_client_factory(
+        call_errors={account.name: [PeerFloodError(request=GetHistoryRequest)]},
+    )
+
+    before = datetime.now(timezone.utc)
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        updated = account_repository.get(account.id)
+        assert updated.blocked_reason == "peer_flood"
+        assert updated.blocked_until is not None
+        assert updated.blocked_until > before  # строго в будущем, а не в прошлом
+    finally:
+        account_repository.close()
+
+
+def test_execute_peer_flood_replaces_stale_past_blocked_until(tmp_path):
+    """Воспроизводит production-сценарий буквально: у аккаунта УЖЕ есть
+    blocked_until в прошлом (оставшийся от давнего, давно истёкшего
+    FloodWait — именно так и получались "странные" прошлые даты в логе).
+    Новый PeerFloodError должен заменить это старое прошлое значение
+    новым будущим, а не оставить БД нетронутой."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path)
+
+    stale_blocked_until = datetime.now(timezone.utc) - timedelta(days=2)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        account_repository.update(
+            account.id, blocked_until=stale_blocked_until, blocked_reason="flood_wait",
+        )
+    finally:
+        account_repository.close()
+
+    client_factory = _make_client_factory(
+        call_errors={account.name: [PeerFloodError(request=GetHistoryRequest)]},
+    )
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        updated = account_repository.get(account.id)
+        assert updated.blocked_until > datetime.now(timezone.utc)
+        assert updated.blocked_until != stale_blocked_until
+        assert updated.blocked_reason == "peer_flood"
+    finally:
+        account_repository.close()
+
+
+def test_worker_skips_account_on_next_tick_after_peer_flood(tmp_path):
+    """reader/inviter/worker.py::InviterWorker — после PeerFloodError на
+    одном тике, следующий тик должен пропустить аккаунт целиком (см.
+    _is_blocked_by_flood_wait) — ни новой попытки connect(), ни нового
+    InviteToChannelRequest. hourly_limit/daily_limit не должны считать
+    неудачную попытку как "отправленную" (status='failed', invited_at не
+    задан — не попадает ни в count_recent_sent, ни в daily-бюджет)."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, username="ivan1", keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(
+        db_path, 2, username="ivan2", keywords=["осаго"], access_hash=2,
+        last_seen_at=_BASE_TIME + timedelta(days=1),
+    )
+
+    created_clients: list = []
+    service, account_repository, campaign_repository, invite_repository = _build_service(
+        db_path,
+        client_factory=_make_client_factory(
+            call_errors={"acc1": [PeerFloodError(request=GetHistoryRequest)]},
+            created=created_clients,
+        ),
+    )
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        account = account_repository.create(
+            name="acc1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=24,
+        )
+
+        worker = InviterWorker(
+            service, campaign_repository, account_repository,
+            invitations_per_account_per_hour=2, poll_interval_seconds=600,
+            shutdown_event=asyncio.Event(),
+        )
+
+        asyncio.run(worker.run_one_tick())
+        assert len(created_clients) == 1  # первая попытка — connect() был
+
+        asyncio.run(worker.run_one_tick())
+        # Второй тик: аккаунт заблокирован (см. _is_blocked_by_flood_wait) —
+        # НИ ОДНОГО нового клиента/подключения не создано.
+        assert len(created_clients) == 1
+
+        # Неудачная попытка не расходует hourly/daily лимит.
+        assert invite_repository.count_recent_sent(account.id, datetime.now(timezone.utc) - timedelta(hours=1)) == 0
+    finally:
+        account_repository.close()
+        campaign_repository.close()
+        invite_repository.close()
+
+
+def test_execute_flood_wait_reason_unaffected_by_peer_flood_fallback(tmp_path):
+    """Регрессия: настоящий FloodWaitError продолжает использовать
+    Telegram-provided длительность и blocked_reason='flood_wait' — новый
+    fallback для PeerFloodError не подменяет и не путает это поведение."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path)
+
+    client_factory = _make_client_factory(
+        call_errors={account.name: [FloodWaitError(request=GetHistoryRequest, capture=90)]},
+    )
+
+    before = datetime.now(timezone.utc)
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+    after = datetime.now(timezone.utc)
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        updated = account_repository.get(account.id)
+        assert updated.blocked_reason == "flood_wait"
+        assert before + timedelta(seconds=90) <= updated.blocked_until <= after + timedelta(seconds=90)
+    finally:
+        account_repository.close()
+
+
+def test_execute_peer_flood_on_one_account_does_not_stop_other_accounts(tmp_path):
+    """PeerFloodError у одного аккаунта не должен мешать обработке
+    следующего доступного аккаунта в том же прогоне (см. run())."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        account_repository.create(
+            name="account_flood", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+        account_repository.create(
+            name="account_ok", phone="+995500000002", session_name="acc2",
+            session_path="acc2.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    client_factory = _make_client_factory(
+        call_errors={"account_flood": [PeerFloodError(request=GetHistoryRequest)]},
+    )
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        statuses_by_account = {i.account_id: i.status for i in invites}
+    finally:
+        invite_repository.close()
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        flood_account = next(a for a in account_repository.list() if a.name == "account_flood")
+        ok_account = next(a for a in account_repository.list() if a.name == "account_ok")
+    finally:
+        account_repository.close()
+
+    assert statuses_by_account[flood_account.id] == "failed"
+    # Второй аккаунт всё равно обработал СВОЕГО кандидата, несмотря на
+    # PeerFloodError у первого.
+    assert statuses_by_account[ok_account.id] in ("pending", "joined")
+
+
+def test_execute_peer_flood_does_not_affect_verify_membership_false_account(tmp_path):
+    """verify_membership=False не связан с обработкой PeerFloodError —
+    STOP_ACCOUNT прерывает волну до шага верификации в любом случае,
+    blocked_until всё равно корректно устанавливается."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path, verify_membership=False)
+
+    client_factory = _make_client_factory(
+        call_errors={account.name: [PeerFloodError(request=GetHistoryRequest)]},
+    )
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        updated = account_repository.get(account.id)
+        assert updated.blocked_reason == "peer_flood"
+        assert updated.blocked_until > datetime.now(timezone.utc)
+    finally:
+        account_repository.close()
+
+
 def test_execute_flood_wait_stop_skips_verification_and_top_up_wave(tmp_path):
     """FloodWaitError, полученный на ПЕРВОМ кандидате основной волны —
     аккаунт останавливается ДО проверки pending и ДО волны добора (см.
