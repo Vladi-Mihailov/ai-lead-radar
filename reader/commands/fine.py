@@ -30,6 +30,7 @@ from reader.fines.validation import (
 )
 from reader.jobs.fine_job import FineJob
 from reader.jobs.scheduler import Scheduler
+from reader.time_display import to_tbilisi
 from reader.users.models import TelegramUserInfo
 
 logger = logging.getLogger(__name__)
@@ -128,7 +129,13 @@ def _fmt_date(value: date) -> str:
 
 
 def _fmt_datetime(value: datetime) -> str:
-    return value.strftime("%d.%m.%Y %H:%M")
+    """value — aware UTC datetime (см. FineJobStatus.last_run_at/
+    last_success_at/last_error_at, все — datetime.now(timezone.utc)), либо
+    naive-но-фактически-UTC (FineMonitoringTask.last_checked_at — читается
+    из SQLite CURRENT_TIMESTAMP без offset, см. to_tbilisi()) — в обоих
+    случаях конвертируется в Asia/Tbilisi перед показом оператору, формат
+    отображения (дд.мм.гггг чч:мм) не меняется."""
+    return to_tbilisi(value).strftime("%d.%m.%Y %H:%M")
 
 
 def _format_check_times(run_times: list[dt_time]) -> str:

@@ -46,6 +46,7 @@ from reader.inviter.repository import (
     TelegramAccountRepository,
     UserCampaignInviteRepository,
 )
+from reader.time_display import format_tbilisi
 
 logger = logging.getLogger(__name__)
 
@@ -255,7 +256,8 @@ def _format_candidates_block(
         lines.append(f"{candidate.user_id} {_format_username(candidate.username)}")
         lines.append(f"keywords: {', '.join(candidate.keywords)}")
         lines.append(
-            f"last_seen_at: {candidate.last_seen_at.isoformat() if candidate.last_seen_at else '—'}"
+            f"last_seen_at: "
+            f"{format_tbilisi(candidate.last_seen_at, fmt='%Y-%m-%d %H:%M') if candidate.last_seen_at else '—'}"
         )
         lines.append("")
     lines.append(f"найдено кандидатов: {found}")
@@ -382,7 +384,7 @@ def _format_blocked_account_message(account: TelegramAccount, now: datetime) -> 
     return (
         f"Account {account.name} пропущен:\n"
         f"Telegram FloodWait действует до "
-        f"{account.blocked_until.strftime('%Y-%m-%d %H:%M')} UTC\n"
+        f"{format_tbilisi(account.blocked_until)}\n"
         f"Осталось: {_format_duration(remaining_seconds)}"
     )
 
@@ -1452,7 +1454,7 @@ class InviterService:
                 operator_message = (
                     f"{operator_message}\n\n"
                     f"Аккаунт заблокирован до "
-                    f"{account.blocked_until.strftime('%Y-%m-%d %H:%M')} UTC."
+                    f"{format_tbilisi(account.blocked_until)}."
                 )
             await self._safe_notify(
                 _format_account_stopped_notification(account, operator_message)

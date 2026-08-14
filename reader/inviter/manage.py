@@ -55,6 +55,7 @@ from reader.inviter.repository import (  # noqa: E402
     TelegramAccountRepository,
 )
 from reader.settings import ConfigError, load_settings  # noqa: E402
+from reader.time_display import format_tbilisi  # noqa: E402
 
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 
@@ -155,6 +156,18 @@ def list_accounts(db_path) -> list[TelegramAccount]:
         repository.close()
 
 
+def _format_account_line(account: TelegramAccount) -> str:
+    """Одна строка вывода list-accounts. blocked_until хранится в БД в
+    UTC (не меняется) — здесь только показывается по Asia/Tbilisi (см.
+    reader/time_display.py и задачу про перевод отображения времени)."""
+    blocked = f"до {format_tbilisi(account.blocked_until)}" if account.blocked_until else "нет"
+    return (
+        f"id={account.id} {account.name}: enabled={account.enabled}, "
+        f"verify_membership={account.verify_membership}, "
+        f"daily_limit={account.daily_limit}, blocked_until={blocked}"
+    )
+
+
 def ensure_campaign(
     db_path,
     *,
@@ -201,15 +214,7 @@ def main() -> None:
             if not accounts:
                 print("Аккаунтов нет.")
             for account in accounts:
-                blocked = (
-                    f"до {account.blocked_until.strftime('%Y-%m-%d %H:%M')} UTC"
-                    if account.blocked_until else "нет"
-                )
-                print(
-                    f"id={account.id} {account.name}: enabled={account.enabled}, "
-                    f"verify_membership={account.verify_membership}, "
-                    f"daily_limit={account.daily_limit}, blocked_until={blocked}"
-                )
+                print(_format_account_line(account))
         elif args.command == "add-campaign":
             campaign = ensure_campaign(
                 settings.app.users_db_file,

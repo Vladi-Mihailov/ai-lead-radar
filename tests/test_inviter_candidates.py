@@ -3645,6 +3645,74 @@ def test_execute_peer_flood_stops_account_and_notifies_operator(tmp_path):
     assert "Переход к следующему аккаунту." in stop_notifications[0]
 
 
+def test_execute_peer_flood_stop_notification_shows_tbilisi_time_not_utc(tmp_path):
+    """"Аккаунт заблокирован до ..." в операторском уведомлении — время по
+    Asia/Tbilisi (UTC+4, см. задачу про перевод отображения времени), а не
+    сырой UTC и без литерала "UTC" — при этом сам blocked_until в БД
+    остаётся в UTC (см. отдельный тест на persist)."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path)
+
+    client_factory = _make_client_factory(
+        call_errors={account.name: [PeerFloodError(request=GetHistoryRequest)]},
+    )
+    notifier = _FakeOperatorNotifier()
+
+    before = datetime.now(timezone.utc)
+    asyncio.run(
+        _run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier)
+    )
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        blocked_until_utc = account_repository.get(account.id).blocked_until
+    finally:
+        account_repository.close()
+
+    stop_notifications = [m for m in notifier.sent if m.startswith("⚠️")]
+    assert len(stop_notifications) == 1
+    assert "UTC" not in stop_notifications[0]
+    assert "по Тбилиси" in stop_notifications[0]
+
+    from reader.time_display import format_tbilisi
+
+    assert format_tbilisi(blocked_until_utc) in stop_notifications[0]
+    # blocked_until_utc сам по себе никуда не сдвинут — сравнение с "before"
+    # (тоже UTC) остаётся корректным без какой-либо поправки на +4 часа.
+    assert blocked_until_utc > before
+
+
+def test_execute_flood_wait_stop_notification_shows_tbilisi_time_not_utc(tmp_path):
+    """То же самое для настоящего FloodWaitError (STOP_ACCOUNT-исход, exc.
+    seconds >= _MAX_TOLERABLE_FLOOD_WAIT_SECONDS) — Telegram-provided
+    длительность используется как и раньше, меняется только то, как
+    итоговое время показано оператору."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path)
+
+    client_factory = _make_client_factory(
+        call_errors={account.name: [FloodWaitError(request=GetHistoryRequest, capture=624)]},
+    )
+    notifier = _FakeOperatorNotifier()
+
+    asyncio.run(
+        _run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier)
+    )
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        blocked_until_utc = account_repository.get(account.id).blocked_until
+    finally:
+        account_repository.close()
+
+    from reader.time_display import format_tbilisi
+
+    stop_notifications = [m for m in notifier.sent if m.startswith("⚠️")]
+    assert len(stop_notifications) == 1
+    assert "UTC" not in stop_notifications[0]
+    assert format_tbilisi(blocked_until_utc) in stop_notifications[0]
+
+
 def test_execute_chat_admin_required_stops_account_and_notifies_operator(tmp_path):
     """ChatAdminRequiredError теперь останавливает аккаунт (как PeerFlood),
     а не просто пропускает кандидата — именно эта ошибка на попытке
@@ -4336,6 +4404,97 @@ def test_execute_skips_account_with_active_blocked_until(tmp_path, monkeypatch):
         assert invite_repository.list() == []
     finally:
         invite_repository.close()
+
+
+def test_execute_skipped_account_message_shows_tbilisi_time_not_utc(tmp_path, monkeypatch):
+    """Тот же сценарий (активный blocked_until), но проверяем именно
+    отображение: сообщение больше не содержит "UTC" и показывает время,
+    сдвинутое на +4 часа (Asia/Tbilisi), а не сырое значение из БД."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path)
+
+    blocked_until_utc = datetime.now(timezone.utc) + timedelta(hours=5)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        account_repository.update(
+            account.id, blocked_until=blocked_until_utc, blocked_reason="flood_wait",
+        )
+    finally:
+        account_repository.close()
+
+    import reader.inviter.service as service_module
+
+    all_logs: list[str] = []
+    monkeypatch.setattr(service_module.logger, "info", all_logs.append)
+    monkeypatch.setattr(service_module.logger, "warning", all_logs.append)
+
+    asyncio.run(_run_service(db_path, client_factory=_make_client_factory(), execute=True))
+
+    skip_messages = [m for m in all_logs if m.startswith(f"Account {account.name} пропущен:")]
+    assert len(skip_messages) == 1
+    assert "UTC" not in skip_messages[0]
+
+    from reader.time_display import format_tbilisi
+
+    assert format_tbilisi(blocked_until_utc) in skip_messages[0]
+
+
+def test_execute_peer_flood_blocked_until_stored_in_db_remains_utc(tmp_path):
+    """Отображение переведено на Тбилиси, но само значение blocked_until в
+    БД должно остаться в UTC (см. задачу: "внутреннее хранение datetime в
+    БД НЕ менять; blocked_until ... продолжать хранить в UTC")."""
+    db_path = _setup_db(tmp_path)
+    campaign, account = _setup_single_candidate_campaign(db_path)
+
+    client_factory = _make_client_factory(
+        call_errors={account.name: [PeerFloodError(request=GetHistoryRequest)]},
+    )
+
+    before = datetime.now(timezone.utc)
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+    after = datetime.now(timezone.utc)
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        blocked_until = account_repository.get(account.id).blocked_until
+    finally:
+        account_repository.close()
+
+    # UTC — не сдвинуто на +4 часа: значение попадает точно в окно
+    # [before, after] + fallback-кулдаун (сутки), а не на 4 часа дальше.
+    assert blocked_until.utcoffset() == timedelta(0)
+    assert before + timedelta(hours=23) < blocked_until < after + timedelta(hours=25)
+
+
+def test_is_blocked_by_flood_wait_expiry_logic_unaffected_by_display_change(tmp_path):
+    """Логика определения истечения блокировки (_is_blocked_by_flood_wait)
+    — прямой unit-тест: сравнение остаётся в UTC, никакой поправки на
+    Asia/Tbilisi здесь не появилось (это меняет только текст сообщений,
+    см. _format_blocked_account_message/_handle_invite_error)."""
+    from reader.inviter.service import _is_blocked_by_flood_wait
+
+    now = datetime.now(timezone.utc)
+    account_repository = TelegramAccountRepository(db_path=tmp_path / "inviter.db")
+    try:
+        active = account_repository.create(
+            name="active", phone="+995500000001", session_name="a1", session_path="a1.session",
+        )
+        active = account_repository.update(active.id, blocked_until=now + timedelta(hours=1))
+
+        expired = account_repository.create(
+            name="expired", phone="+995500000002", session_name="a2", session_path="a2.session",
+        )
+        expired = account_repository.update(expired.id, blocked_until=now - timedelta(hours=1))
+
+        not_blocked = account_repository.create(
+            name="free", phone="+995500000003", session_name="a3", session_path="a3.session",
+        )
+    finally:
+        account_repository.close()
+
+    assert _is_blocked_by_flood_wait(active, now) is True
+    assert _is_blocked_by_flood_wait(expired, now) is False
+    assert _is_blocked_by_flood_wait(not_blocked, now) is False
 
 
 def test_execute_blocked_account_does_not_create_telegram_client(tmp_path):

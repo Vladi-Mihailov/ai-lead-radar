@@ -249,6 +249,52 @@ def test_list_accounts_returns_empty_list_when_no_accounts(tmp_path):
     assert manage.list_accounts(db_path) == []
 
 
+# ---- _format_account_line (list-accounts вывод) ----
+
+
+def test_format_account_line_shows_no_blocked_until_when_not_blocked(tmp_path):
+    db_path = tmp_path / "users.db"
+    account = manage.ensure_account(
+        db_path, name="@acc1", phone="", session_name="acc1", session_path="data/sessions/acc1",
+        daily_limit=24, enabled=True,
+    )
+
+    line = manage._format_account_line(account)
+
+    assert "blocked_until=нет" in line
+
+
+def test_format_account_line_shows_blocked_until_in_tbilisi_time_not_utc(tmp_path):
+    """Перевод отображения времени на Asia/Tbilisi (см. задачу) —
+    list-accounts больше не должен показывать "UTC" и должен показывать
+    время, сдвинутое на +4 часа относительно сохранённого в БД UTC-значения."""
+    from datetime import datetime, timedelta, timezone
+
+    from reader.inviter.repository import TelegramAccountRepository
+
+    db_path = tmp_path / "users.db"
+    account = manage.ensure_account(
+        db_path, name="@acc1", phone="", session_name="acc1", session_path="data/sessions/acc1",
+        daily_limit=24, enabled=True,
+    )
+
+    blocked_until_utc = datetime(2026, 8, 14, 11, 44, tzinfo=timezone.utc)
+    repository = TelegramAccountRepository(db_path)
+    try:
+        account = repository.update(account.id, blocked_until=blocked_until_utc, blocked_reason="flood_wait")
+    finally:
+        repository.close()
+
+    line = manage._format_account_line(account)
+
+    assert "UTC" not in line
+    assert "blocked_until=до 2026-08-14 15:44 по Тбилиси" in line
+    # Значение в БД, которое мы читаем обратно, всё ещё UTC — форматирование
+    # не затронуло сами данные.
+    assert account.blocked_until == blocked_until_utc
+    assert account.blocked_until.utcoffset() == timedelta(0)
+
+
 # ---- ensure_campaign ----
 
 

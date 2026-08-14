@@ -6,7 +6,7 @@ Repository — настоящие (SQLite/tmp_path), FineProvider/NotificationSe
 """
 
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from datetime import time as dt_time
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -27,6 +27,7 @@ from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E
 from reader.jobs.fine_job import FineJob  # noqa: E402
 from reader.jobs.scheduler import Scheduler  # noqa: E402
 from reader.notifications.base import NotificationResult, NotificationService  # noqa: E402
+from reader.time_display import to_tbilisi  # noqa: E402
 from reader.users.models import TelegramUserInfo  # noqa: E402
 
 _CHAT_ID = -100999
@@ -808,6 +809,30 @@ async def test_fine_list_with_no_tasks(fx):
     assert result.text == "Активных задач мониторинга нет."
 
 
+async def test_fine_list_shows_last_checked_at_in_tbilisi_time(fx):
+    """task.last_checked_at приходит из SQLite CURRENT_TIMESTAMP — naive,
+    но фактически UTC (см. reader/time_display.py.to_tbilisi) — "Последняя
+    проверка" должна показывать время, сдвинутое на +4 часа, а не сырое
+    значение из БД (см. задачу про перевод отображения времени)."""
+    await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
+    task = fx.task_repository.list_active()[0]
+
+    before = datetime.now(timezone.utc)
+    fx.task_repository.record_check_result(task.id, last_check_status="ok", last_error=None)
+    after = datetime.now(timezone.utc)
+
+    result = await fx.command.handle(_ctx(["list"]))
+
+    checked_task = fx.task_repository.get(task.id)
+    assert checked_task.last_checked_at is not None
+
+    expected = to_tbilisi(checked_task.last_checked_at).strftime("%d.%m.%Y %H:%M")
+    assert f"Последняя проверка: {expected}" in result.text
+    # Сдвинуто ровно на +4 часа относительно окна [before, after] (UTC).
+    assert to_tbilisi(before) - timedelta(minutes=1) <= to_tbilisi(checked_task.last_checked_at)
+    assert to_tbilisi(checked_task.last_checked_at) <= to_tbilisi(after) + timedelta(minutes=1)
+
+
 # ---- fine stop ----
 
 
@@ -1275,6 +1300,20 @@ async def test_fine_status(fx):
     assert "Ошибок: 0" in result.text
     assert "Последняя ошибка: Нет" in result.text
     assert "ещё не запускался" in result.text
+
+
+async def test_fine_status_shows_last_run_at_in_tbilisi_time_not_utc(fx):
+    """FineJobStatus.last_run_at — aware UTC (datetime.now(timezone.utc),
+    см. reader/jobs/fine_job.py) — "fine status" должен показать его по
+    Asia/Tbilisi (+4 часа), а не сырое UTC-значение (см. задачу про
+    перевод отображения времени)."""
+    utc_value = datetime(2026, 8, 14, 11, 44, tzinfo=timezone.utc)
+    fx.fine_job.status.last_run_at = utc_value
+
+    result = await fx.command.handle(_ctx(["status"]))
+
+    assert "14.08.2026 15:44" in result.text
+    assert "11:44" not in result.text
 
 
 async def test_fine_status_reflects_scheduler_running_state(fx):
