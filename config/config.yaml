@@ -46,7 +46,15 @@ fine_monitor:
   # Чаты для уведомлений о новых штрафах. Если пусто — используется
   # app.lead_forward_to (LEAD_FORWARD_TO из .env), тот же чат, куда уже
   # идут лиды.
-  notification_chat_ids: []
+  #
+  # Задано ЯВНО (а не оставлено пустым) начиная с расширения
+  # LEAD_FORWARD_TO до трёх получателей лидов (@ali_na_l_i, @alena_ogi,
+  # @vladimihailov, см. задачу) — иначе Fine Monitor автоматически стал
+  # бы фоллбэчиться на все три через app.lead_forward_to. @alenaogir —
+  # тот же получатель, что и получал уведомления Fine Monitor до этого
+  # расширения (сюда же раньше фоллбэчился LEAD_FORWARD_TO).
+  notification_chat_ids:
+    - "@alenaogir"
 
   # Кому разрешены служебные команды (fine add/list/stop/check/status).
   # ОБЯЗАТЕЛЬНО заполнить Telegram User ID операторов при enabled: true —

@@ -150,6 +150,24 @@ def test_resolve_notification_chat_ids_prefers_explicit_config(tmp_path, monkeyp
     assert resolve_notification_chat_ids(settings) == ["operator_chat"]
 
 
+def test_resolve_notification_chat_ids_unaffected_by_multiple_lead_forward_to_recipients(
+    tmp_path, monkeypatch,
+):
+    """Расширение LEAD_FORWARD_TO до нескольких получателей лидов (см.
+    задачу) не должно фанаутить уведомления Fine Monitor всем им сразу —
+    пока fine_monitor.notification_chat_ids задан явно (как в _CONFIG_YAML,
+    "@operator_chat"), фоллбэк на app.lead_forward_to не срабатывает,
+    независимо от того, сколько получателей лидов сконфигурировано."""
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("LEAD_FORWARD_TO", "ali_na_l_i,alena_ogi,vladimihailov")
+    config_path = _write_config(tmp_path, _CONFIG_YAML)
+
+    settings = load_settings(config_path)
+
+    assert settings.app.lead_forward_to == ["ali_na_l_i", "alena_ogi", "vladimihailov"]
+    assert resolve_notification_chat_ids(settings) == ["operator_chat"]
+
+
 def test_resolve_notification_chat_ids_falls_back_to_lead_forward_to(tmp_path, monkeypatch):
     _set_required_env(monkeypatch)
     monkeypatch.setenv("LEAD_FORWARD_TO", "@lead_chat")

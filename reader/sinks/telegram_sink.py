@@ -25,6 +25,14 @@ class TelegramSink(BaseSink):
         self._resolved: list[_ResolvedTarget] = []
 
     async def start(self) -> None:
+        # Дедупликация ПОСЛЕ резолва, по entity.id — а не по сырой строке
+        # из forward_to: одна и та же цель может быть указана в разных
+        # формах (регистр username, с "@"/без, username и её же numeric
+        # id) и всё равно резолвится в одну и ту же Telegram-сущность.
+        # Сравнение сырых строк такие дубликаты не поймало бы, а без этой
+        # проверки один и тот же получатель получал бы каждый лид дважды
+        # (см. задачу про расширение LEAD_FORWARD_TO до трёх получателей).
+        seen_entity_ids: set[int] = set()
         for target in self._forward_to:
             label = self._label(target)
             try:
@@ -32,6 +40,15 @@ class TelegramSink(BaseSink):
             except Exception as exc:
                 logger.error("✖ Получатель %s не найден", label)
                 raise RuntimeError(f"Не найден получатель {label}") from exc
+
+            entity_id = getattr(entity, "id", None)
+            if entity_id is not None and entity_id in seen_entity_ids:
+                logger.info(
+                    "— Получатель %s — дубликат уже добавленного, пропущен", label
+                )
+                continue
+            if entity_id is not None:
+                seen_entity_ids.add(entity_id)
 
             self._resolved.append(_ResolvedTarget(entity=entity, label=label))
             logger.info("✔ Получатель %s найден", label)
@@ -70,6 +87,8 @@ class TelegramSink(BaseSink):
                         "Не удалось отправить контекст (группа/автор/ссылка) в %s",
                         target.label,
                     )
+                else:
+                    logger.info("✔ Лид доставлен в %s (оригинал + контекст)", target.label)
 
                 continue
 
@@ -77,6 +96,8 @@ class TelegramSink(BaseSink):
                 await self._client.send_message(target.entity, self._format(event), link_preview=False)
             except Exception:
                 logger.exception("Не удалось отправить лид в чат %s", target.label)
+            else:
+                logger.info("✔ Лид доставлен в %s (текстовая копия)", target.label)
 
     @staticmethod
     def _label(target: int | str) -> str:
