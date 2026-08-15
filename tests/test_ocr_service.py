@@ -25,6 +25,7 @@ def _parsed(**overrides):
         owner_full_name="Иванов Иван Иванович",
         driver_full_name="Петров Пётр Петрович",
         policyholder_full_name="Петров Пётр Петрович",
+        category="passenger_car",
         registration_number="A123BC777", vin="JTMBR12345678901", chassis_number=None,
         manufacturer="Toyota", model="RAV4",
     )
@@ -55,7 +56,8 @@ async def test_extract_parses_full_result(monkeypatch):
     assert result.owner_full_name == "Иванов Иван Иванович"
     assert result.driver_full_name == "Петров Пётр Петрович"
     assert result.policyholder_full_name == "Петров Пётр Петрович"
-    assert result.fields_found_count == 7
+    assert result.category == "passenger_car"
+    assert result.fields_found_count == 8
 
 
 async def test_extract_strips_whitespace_from_fields(monkeypatch):
@@ -69,6 +71,32 @@ async def test_extract_strips_whitespace_from_fields(monkeypatch):
 
     result = await service.extract([(b"bytes", "image/jpeg")])
     assert result.registration_number == "A123BC777"
+
+
+async def test_extract_passes_through_latin_script_name_fields_unchanged(monkeypatch):
+    """Латиница/транслитерация ФИО — правило самого prompt'а (см.
+    reader/ocr/prompt.py), не код: OcrService не должен как-либо
+    трогать/перекодировать значения, которые модель уже вернула латиницей —
+    просто trim, как для любой другой строки (см. _clean())."""
+    service = _service()
+    fake_response = types.SimpleNamespace(
+        output_parsed=_parsed(
+            owner_full_name="Ivanov Ivan Ivanovich",
+            driver_full_name="  Petrov Petr Petrovich  ",
+            policyholder_full_name="Petrov Petr Petrovich",
+        )
+    )
+
+    async def fake_parse(**kwargs):
+        return fake_response
+
+    monkeypatch.setattr(service._client.responses, "parse", fake_parse)
+
+    result = await service.extract([(b"bytes", "image/jpeg")])
+
+    assert result.owner_full_name == "Ivanov Ivan Ivanovich"
+    assert result.driver_full_name == "Petrov Petr Petrovich"
+    assert result.policyholder_full_name == "Petrov Petr Petrovich"
 
 
 async def test_extract_partial_result_leaves_missing_fields_none(monkeypatch):
@@ -93,7 +121,7 @@ async def test_extract_partial_result_leaves_missing_fields_none(monkeypatch):
     assert result.owner_full_name is None
     assert result.driver_full_name is None
     assert result.policyholder_full_name is None
-    assert result.fields_found_count == 3
+    assert result.fields_found_count == 4
 
 
 async def test_extract_owner_full_name_is_none_for_legal_entity_owner(monkeypatch):
@@ -114,6 +142,37 @@ async def test_extract_owner_full_name_is_none_for_legal_entity_owner(monkeypatc
     assert result.owner_full_name is None
     assert result.driver_full_name == "Петров Пётр Петрович"
     assert result.policyholder_full_name == "Петров Пётр Петрович"
+
+
+async def test_extract_passes_through_recognized_category(monkeypatch):
+    service = _service()
+    fake_response = types.SimpleNamespace(output_parsed=_parsed(category="motorcycle"))
+
+    async def fake_parse(**kwargs):
+        return fake_response
+
+    monkeypatch.setattr(service._client.responses, "parse", fake_parse)
+
+    result = await service.extract([(b"bytes", "image/jpeg")])
+
+    assert result.category == "motorcycle"
+
+
+async def test_extract_category_is_none_when_not_reliably_determined(monkeypatch):
+    """category = null не заменяется программно на passenger_car — модель
+    сама решает, что не может надёжно определить категорию (см. задачу:
+    "нельзя просто возвращать passenger_car по умолчанию")."""
+    service = _service()
+    fake_response = types.SimpleNamespace(output_parsed=_parsed(category=None))
+
+    async def fake_parse(**kwargs):
+        return fake_response
+
+    monkeypatch.setattr(service._client.responses, "parse", fake_parse)
+
+    result = await service.extract([(b"bytes", "image/jpeg")])
+
+    assert result.category is None
 
 
 async def test_extract_sends_one_content_part_per_image(monkeypatch):

@@ -76,6 +76,7 @@ def _full_result(**overrides) -> OcrResult:
         owner_full_name="Иванов Иван Иванович",
         driver_full_name="Петров Пётр Петрович",
         policyholder_full_name="Петров Пётр Петрович",
+        category="passenger_car",
         registration_number="A123BC777", vin="JTMBR12345678901", chassis_number=None,
         manufacturer="Toyota", model="RAV4",
     )
@@ -195,6 +196,7 @@ async def test_openai_success_shows_all_fields():
     assert "Собственник: Иванов Иван Иванович" in reply
     assert "Водитель: Петров Пётр Петрович" in reply
     assert "Страхователь: Петров Пётр Петрович" in reply
+    assert "Категория: passenger_car" in reply
     assert "Марка: Toyota" in reply
     assert "Модель: RAV4" in reply
     assert "VIN: JTMBR12345678901" in reply
@@ -205,7 +207,7 @@ async def test_openai_success_shows_all_fields():
 async def test_partial_result_shows_not_recognized_for_missing_fields():
     event = _FakeEvent(photo=object())
     partial = _full_result(
-        vin=None, chassis_number=None,
+        vin=None, chassis_number=None, category=None,
         owner_full_name=None, driver_full_name=None, policyholder_full_name=None,
     )
     command = _command(_FakeOcrService(result=partial))
@@ -218,6 +220,7 @@ async def test_partial_result_shows_not_recognized_for_missing_fields():
     assert "Собственник: не распознано" in reply
     assert "Водитель: не распознано" in reply
     assert "Страхователь: не распознано" in reply
+    assert "Категория: не распознано" in reply
     assert "Марка: Toyota" in reply
 
 
@@ -236,6 +239,7 @@ async def test_all_fields_empty_result_replies_with_nothing_recognized_error():
     event = _FakeEvent(photo=object())
     empty = OcrResult(
         owner_full_name=None, driver_full_name=None, policyholder_full_name=None,
+        category=None,
         registration_number=None, vin=None, chassis_number=None,
         manufacturer=None, model=None,
     )
@@ -246,6 +250,45 @@ async def test_all_fields_empty_result_replies_with_nothing_recognized_error():
     assert event.replies == [
         "Не удалось распознать документ. Попробуйте прислать более чёткое фото."
     ]
+
+
+# ---- категория ТС (category) ----
+
+
+async def test_category_motorcycle_is_shown_as_recognized_by_the_model():
+    event = _FakeEvent(photo=object())
+    result = _full_result(category="motorcycle")
+    command = _command(_FakeOcrService(result=result))
+
+    await command.handle(_ctx(event))
+
+    assert "Категория: motorcycle" in event.replies[0]
+
+
+async def test_category_trailer_is_shown_as_recognized_by_the_model():
+    event = _FakeEvent(photo=object())
+    result = _full_result(category="trailer")
+    command = _command(_FakeOcrService(result=result))
+
+    await command.handle(_ctx(event))
+
+    assert "Категория: trailer" in event.replies[0]
+
+
+async def test_category_null_is_shown_as_not_recognized_not_defaulted_to_passenger_car():
+    """category=null от модели должен показаться как "не распознано" —
+    код НИГДЕ не подставляет passenger_car по умолчанию (см. задачу:
+    "нельзя просто возвращать passenger_car по умолчанию, не анализируя
+    документ")."""
+    event = _FakeEvent(photo=object())
+    result = _full_result(category=None)
+    command = _command(_FakeOcrService(result=result))
+
+    await command.handle(_ctx(event))
+
+    reply = event.replies[0]
+    assert "Категория: не распознано" in reply
+    assert "Категория: passenger_car" not in reply
 
 
 # ---- разделение ролей ФИО: owner (техпаспорт) / driver+policyholder (права) ----
@@ -365,11 +408,12 @@ async def test_image_order_does_not_affect_which_roles_are_filled():
 
 
 async def test_vehicle_fields_are_independent_of_name_roles():
-    """Сценарий 6 задачи: vehicle-поля (registration_number/vin/
+    """Сценарий 6 задачи: vehicle-поля (category/registration_number/vin/
     chassis_number/manufacturer/model) всегда показываются одинаково,
     независимо от того, какие роли ФИО заполнены — они читаются из
     отдельных атрибутов OcrResult и не связаны с owner/driver/policyholder
-    никаким кодом."""
+    никаким кодом. category — тоже vehicle-поле (техпаспорт), см. задачу
+    про добавление категории ТС."""
     event = _FakeEvent(photo=object())
     result = _full_result(
         owner_full_name=None, driver_full_name=None, policyholder_full_name=None,
@@ -379,6 +423,7 @@ async def test_vehicle_fields_are_independent_of_name_roles():
     await command.handle(_ctx(event))
 
     reply = event.replies[0]
+    assert "Категория: passenger_car" in reply
     assert "Марка: Toyota" in reply
     assert "Модель: RAV4" in reply
     assert "VIN: JTMBR12345678901" in reply

@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import logging
+from typing import Literal
 
 from openai import (
     APIConnectionError,
@@ -45,6 +46,11 @@ class _VehicleFieldsSchema(BaseModel):
     owner_full_name: str | None
     driver_full_name: str | None
     policyholder_full_name: str | None
+    # Литерал, а не str — "никаких произвольных значений category" (см.
+    # задачу) обеспечивается самой schema (strict-режим Structured
+    # Outputs): модель структурно не может вернуть ничего, кроме этих трёх
+    # значений или null, никакая валидация после факта не нужна.
+    category: Literal["passenger_car", "motorcycle", "trailer"] | None
     registration_number: str | None
     vin: str | None
     chassis_number: str | None
@@ -128,6 +134,10 @@ class OcrService:
             owner_full_name=_clean(parsed.owner_full_name),
             driver_full_name=_clean(parsed.driver_full_name),
             policyholder_full_name=_clean(parsed.policyholder_full_name),
+            # category — уже ограничен enum'ом на уровне schema (см.
+            # _VehicleFieldsSchema.category), _clean() ему не нужен: это не
+            # свободный текст, который может прийти с лишними пробелами.
+            category=parsed.category,
             registration_number=_clean(parsed.registration_number),
             vin=_clean(parsed.vin),
             chassis_number=_clean(parsed.chassis_number),

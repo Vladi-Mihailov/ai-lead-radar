@@ -19,6 +19,15 @@ class OcrResult:
       ни одного места, которое присваивало бы одному полю значение
       другого).
 
+    category — категория ТС (passenger_car/motorcycle/trailer/null),
+    определяется ТОЛЬКО по техпаспорту (тип/назначение/марка/модель и
+    другие признаки самого документа — см. reader/ocr/prompt.py), НЕ
+    подставляется программно по умолчанию: null означает, что по документу
+    нельзя определить категорию достаточно надёжно, а не "скорее всего
+    passenger_car". Ограничено фиксированным enum'ом на уровне Structured
+    Outputs schema (см. reader/ocr/service.py::_VehicleFieldsSchema) —
+    модель физически не может вернуть никакое другое значение.
+
     registration_number/vin/chassis_number/manufacturer/model — ТОЛЬКО из
     техпаспорта, не изменились по смыслу с прошлой версии schema.
 
@@ -32,6 +41,7 @@ class OcrResult:
     owner_full_name: str | None
     driver_full_name: str | None
     policyholder_full_name: str | None
+    category: str | None
     registration_number: str | None
     vin: str | None
     chassis_number: str | None
@@ -44,7 +54,7 @@ class OcrResult:
             1
             for value in (
                 self.owner_full_name, self.driver_full_name, self.policyholder_full_name,
-                self.registration_number, self.vin, self.chassis_number,
+                self.category, self.registration_number, self.vin, self.chassis_number,
                 self.manufacturer, self.model,
             )
             if value
