@@ -34,19 +34,22 @@ class OcrServiceError(Exception):
 
 class _VehicleFieldsSchema(BaseModel):
     """Wire-schema для OpenAI Structured Outputs — по аналогии с
-    auto-insurance (app/ocr/provider.py::_VehicleFieldsSchema), плюс
-    full_name (см. reader/ocr/models.py::OcrResult и reader/ocr/prompt.py
-    про сознательное отличие от auto-insurance). Не добавлять сюда поле,
-    не обновив одновременно prompt.py и OcrResult — schema (в strict-режиме
-    Structured Outputs) это единственный механизм, ограничивающий, что
-    вообще может вернуть модель."""
+    auto-insurance (app/ocr/provider.py::_VehicleFieldsSchema), но с тремя
+    раздельными ролями ФИО вместо одного full_name (см.
+    reader/ocr/models.py::OcrResult и reader/ocr/prompt.py про источники
+    каждой роли). Не добавлять сюда поле, не обновив одновременно
+    prompt.py и OcrResult — schema (в strict-режиме Structured Outputs)
+    это единственный механизм, ограничивающий, что вообще может вернуть
+    модель."""
 
+    owner_full_name: str | None
+    driver_full_name: str | None
+    policyholder_full_name: str | None
     registration_number: str | None
     vin: str | None
     chassis_number: str | None
     manufacturer: str | None
     model: str | None
-    full_name: str | None
 
 
 class OcrService:
@@ -122,12 +125,14 @@ class OcrService:
         if parsed is None:
             raise OcrServiceError("model did not return the expected structured output")
         return OcrResult(
+            owner_full_name=_clean(parsed.owner_full_name),
+            driver_full_name=_clean(parsed.driver_full_name),
+            policyholder_full_name=_clean(parsed.policyholder_full_name),
             registration_number=_clean(parsed.registration_number),
             vin=_clean(parsed.vin),
             chassis_number=_clean(parsed.chassis_number),
             manufacturer=_clean(parsed.manufacturer),
             model=_clean(parsed.model),
-            full_name=_clean(parsed.full_name),
         )
 
 

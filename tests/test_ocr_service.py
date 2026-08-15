@@ -22,8 +22,11 @@ _REQUEST = httpx.Request("POST", "https://api.openai.com/v1/responses")
 
 def _parsed(**overrides):
     fields = dict(
+        owner_full_name="Иванов Иван Иванович",
+        driver_full_name="Петров Пётр Петрович",
+        policyholder_full_name="Петров Пётр Петрович",
         registration_number="A123BC777", vin="JTMBR12345678901", chassis_number=None,
-        manufacturer="Toyota", model="RAV4", full_name="Иванов Иван Иванович",
+        manufacturer="Toyota", model="RAV4",
     )
     fields.update(overrides)
     return types.SimpleNamespace(**fields)
@@ -49,8 +52,10 @@ async def test_extract_parses_full_result(monkeypatch):
     assert result.chassis_number is None
     assert result.manufacturer == "Toyota"
     assert result.model == "RAV4"
-    assert result.full_name == "Иванов Иван Иванович"
-    assert result.fields_found_count == 5
+    assert result.owner_full_name == "Иванов Иван Иванович"
+    assert result.driver_full_name == "Петров Пётр Петрович"
+    assert result.policyholder_full_name == "Петров Пётр Петрович"
+    assert result.fields_found_count == 7
 
 
 async def test_extract_strips_whitespace_from_fields(monkeypatch):
@@ -69,7 +74,10 @@ async def test_extract_strips_whitespace_from_fields(monkeypatch):
 async def test_extract_partial_result_leaves_missing_fields_none(monkeypatch):
     service = _service()
     fake_response = types.SimpleNamespace(
-        output_parsed=_parsed(vin=None, chassis_number=None, full_name=None)
+        output_parsed=_parsed(
+            vin=None, chassis_number=None,
+            owner_full_name=None, driver_full_name=None, policyholder_full_name=None,
+        )
     )
 
     async def fake_parse(**kwargs):
@@ -82,8 +90,30 @@ async def test_extract_partial_result_leaves_missing_fields_none(monkeypatch):
     assert result.registration_number == "A123BC777"
     assert result.vin is None
     assert result.chassis_number is None
-    assert result.full_name is None
+    assert result.owner_full_name is None
+    assert result.driver_full_name is None
+    assert result.policyholder_full_name is None
     assert result.fields_found_count == 3
+
+
+async def test_extract_owner_full_name_is_none_for_legal_entity_owner(monkeypatch):
+    """owner_full_name = null, когда собственник в техпаспорте — юрлицо (см.
+    reader/ocr/prompt.py) — на уровне OcrService это просто передача через
+    None, сама классификация "юрлицо vs физлицо" — задача модели/промпта,
+    не кода."""
+    service = _service()
+    fake_response = types.SimpleNamespace(output_parsed=_parsed(owner_full_name=None))
+
+    async def fake_parse(**kwargs):
+        return fake_response
+
+    monkeypatch.setattr(service._client.responses, "parse", fake_parse)
+
+    result = await service.extract([(b"bytes", "image/jpeg")])
+
+    assert result.owner_full_name is None
+    assert result.driver_full_name == "Петров Пётр Петрович"
+    assert result.policyholder_full_name == "Петров Пётр Петрович"
 
 
 async def test_extract_sends_one_content_part_per_image(monkeypatch):

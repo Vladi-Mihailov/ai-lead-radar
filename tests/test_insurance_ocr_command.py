@@ -73,8 +73,11 @@ class _FakeOcrService:
 
 def _full_result(**overrides) -> OcrResult:
     fields = dict(
+        owner_full_name="Иванов Иван Иванович",
+        driver_full_name="Петров Пётр Петрович",
+        policyholder_full_name="Петров Пётр Петрович",
         registration_number="A123BC777", vin="JTMBR12345678901", chassis_number=None,
-        manufacturer="Toyota", model="RAV4", full_name="Иванов Иван Иванович",
+        manufacturer="Toyota", model="RAV4",
     )
     fields.update(overrides)
     return OcrResult(**fields)
@@ -189,7 +192,9 @@ async def test_openai_success_shows_all_fields():
     await command.handle(_ctx(event))
 
     reply = event.replies[0]
-    assert "ФИО: Иванов Иван Иванович" in reply
+    assert "Собственник: Иванов Иван Иванович" in reply
+    assert "Водитель: Петров Пётр Петрович" in reply
+    assert "Страхователь: Петров Пётр Петрович" in reply
     assert "Марка: Toyota" in reply
     assert "Модель: RAV4" in reply
     assert "VIN: JTMBR12345678901" in reply
@@ -199,7 +204,10 @@ async def test_openai_success_shows_all_fields():
 
 async def test_partial_result_shows_not_recognized_for_missing_fields():
     event = _FakeEvent(photo=object())
-    partial = _full_result(vin=None, chassis_number=None, full_name=None)
+    partial = _full_result(
+        vin=None, chassis_number=None,
+        owner_full_name=None, driver_full_name=None, policyholder_full_name=None,
+    )
     command = _command(_FakeOcrService(result=partial))
 
     await command.handle(_ctx(event))
@@ -207,7 +215,9 @@ async def test_partial_result_shows_not_recognized_for_missing_fields():
     reply = event.replies[0]
     assert "VIN: не распознано" in reply
     assert "Номер шасси: не распознано" in reply
-    assert "ФИО: не распознано" in reply
+    assert "Собственник: не распознано" in reply
+    assert "Водитель: не распознано" in reply
+    assert "Страхователь: не распознано" in reply
     assert "Марка: Toyota" in reply
 
 
@@ -225,8 +235,9 @@ async def test_openai_error_replies_with_generic_message():
 async def test_all_fields_empty_result_replies_with_nothing_recognized_error():
     event = _FakeEvent(photo=object())
     empty = OcrResult(
+        owner_full_name=None, driver_full_name=None, policyholder_full_name=None,
         registration_number=None, vin=None, chassis_number=None,
-        manufacturer=None, model=None, full_name=None,
+        manufacturer=None, model=None,
     )
     command = _command(_FakeOcrService(result=empty))
 
@@ -235,6 +246,166 @@ async def test_all_fields_empty_result_replies_with_nothing_recognized_error():
     assert event.replies == [
         "Не удалось распознать документ. Попробуйте прислать более чёткое фото."
     ]
+
+
+# ---- разделение ролей ФИО: owner (техпаспорт) / driver+policyholder (права) ----
+
+
+async def test_individual_owner_in_techpassport_plus_license_fills_all_three_roles():
+    """Сценарий 1 задачи: физлицо в техпаспорте + права — owner из
+    техпаспорта, driver/policyholder из прав, все три роли заполнены и не
+    перепутаны."""
+    event = _FakeEvent(photo=object())
+    result = _full_result(
+        owner_full_name="Иванов Иван Иванович",
+        driver_full_name="Петров Пётр Петрович",
+        policyholder_full_name="Петров Пётр Петрович",
+    )
+    command = _command(_FakeOcrService(result=result))
+
+    await command.handle(_ctx(event))
+
+    reply = event.replies[0]
+    assert "Собственник: Иванов Иван Иванович" in reply
+    assert "Водитель: Петров Пётр Петрович" in reply
+    assert "Страхователь: Петров Пётр Петрович" in reply
+
+
+async def test_legal_entity_owner_in_techpassport_yields_null_owner_plus_license_roles():
+    """Сценарий 2 задачи: юрлицо в техпаспорте + права — owner_full_name
+    приходит от модели уже как None (классификация "юрлицо" — задача
+    prompt/модели, не кода), driver/policyholder из прав по-прежнему
+    заполнены."""
+    event = _FakeEvent(photo=object())
+    result = _full_result(
+        owner_full_name=None,
+        driver_full_name="Петров Пётр Петрович",
+        policyholder_full_name="Петров Пётр Петрович",
+    )
+    command = _command(_FakeOcrService(result=result))
+
+    await command.handle(_ctx(event))
+
+    reply = event.replies[0]
+    assert "Собственник: не распознано" in reply
+    assert "Водитель: Петров Пётр Петрович" in reply
+    assert "Страхователь: Петров Пётр Петрович" in reply
+
+
+async def test_only_techpassport_present_fills_owner_but_not_driver_or_policyholder():
+    """Сценарий 3 задачи: среди изображений только техпаспорт — owner
+    может быть заполнен, driver/policyholder — null (нет источника)."""
+    event = _FakeEvent(photo=object())
+    result = _full_result(
+        owner_full_name="Иванов Иван Иванович",
+        driver_full_name=None,
+        policyholder_full_name=None,
+    )
+    command = _command(_FakeOcrService(result=result))
+
+    await command.handle(_ctx(event))
+
+    reply = event.replies[0]
+    assert "Собственник: Иванов Иван Иванович" in reply
+    assert "Водитель: не распознано" in reply
+    assert "Страхователь: не распознано" in reply
+
+
+async def test_only_license_present_fills_driver_and_policyholder_but_not_owner():
+    """Сценарий 4 задачи: среди изображений только права — owner = null
+    (нет техпаспорта), driver/policyholder заполнены."""
+    event = _FakeEvent(photo=object())
+    result = _full_result(
+        owner_full_name=None,
+        driver_full_name="Петров Пётр Петрович",
+        policyholder_full_name="Петров Пётр Петрович",
+    )
+    command = _command(_FakeOcrService(result=result))
+
+    await command.handle(_ctx(event))
+
+    reply = event.replies[0]
+    assert "Собственник: не распознано" in reply
+    assert "Водитель: Петров Пётр Петрович" in reply
+    assert "Страхователь: Петров Пётр Петрович" in reply
+
+
+async def test_image_order_does_not_affect_which_roles_are_filled():
+    """Сценарий 5 задачи: порядок изображений не влияет на результат — на
+    уровне команды это означает, что порядок событий в альбоме не меняет
+    ни набор картинок, переданных в OcrService, ни то, куда уходит reply
+    (см. также test_album_with_multiple_photos_collects_all_images и
+    test_recipient_order_does_not_affect_outcome-подобные тесты в других
+    частях проекта)."""
+    result = _full_result()
+
+    order_a = [
+        _FakeEvent(raw_text="", grouped_id=1, photo=object(), download_bytes=b"techpassport"),
+        _FakeEvent(raw_text="insurance ocr", grouped_id=1, photo=object(), download_bytes=b"license"),
+    ]
+    order_b = [
+        _FakeEvent(raw_text="insurance ocr", grouped_id=2, photo=object(), download_bytes=b"license"),
+        _FakeEvent(raw_text="", grouped_id=2, photo=object(), download_bytes=b"techpassport"),
+    ]
+
+    ocr_a = _FakeOcrService(result=result)
+    await _command(ocr_a).handle_album(order_a)
+
+    ocr_b = _FakeOcrService(result=result)
+    await _command(ocr_b).handle_album(order_b)
+
+    images_a = {data for data, _mime in ocr_a.extract_calls[0]}
+    images_b = {data for data, _mime in ocr_b.extract_calls[0]}
+    assert images_a == images_b == {b"techpassport", b"license"}
+
+    # В обоих случаях reply ушёл на сообщение с командой, с тем же текстом.
+    trigger_a = next(e for e in order_a if e.raw_text == "insurance ocr")
+    trigger_b = next(e for e in order_b if e.raw_text == "insurance ocr")
+    assert trigger_a.replies == trigger_b.replies
+
+
+async def test_vehicle_fields_are_independent_of_name_roles():
+    """Сценарий 6 задачи: vehicle-поля (registration_number/vin/
+    chassis_number/manufacturer/model) всегда показываются одинаково,
+    независимо от того, какие роли ФИО заполнены — они читаются из
+    отдельных атрибутов OcrResult и не связаны с owner/driver/policyholder
+    никаким кодом."""
+    event = _FakeEvent(photo=object())
+    result = _full_result(
+        owner_full_name=None, driver_full_name=None, policyholder_full_name=None,
+    )
+    command = _command(_FakeOcrService(result=result))
+
+    await command.handle(_ctx(event))
+
+    reply = event.replies[0]
+    assert "Марка: Toyota" in reply
+    assert "Модель: RAV4" in reply
+    assert "VIN: JTMBR12345678901" in reply
+    assert "Госномер: A123BC777" in reply
+
+
+async def test_no_fallback_between_owner_driver_and_policyholder_roles():
+    """Сценарий 7 задачи: если policyholder_full_name = null, а
+    driver_full_name заполнен — reply НЕ должен подставить driver вместо
+    страхователя (и наоборот). Каждая роль читается независимо (см.
+    reader/commands/insurance_ocr.py::_REPLY_FIELDS — простой getattr на
+    свой атрибут, без единого места, которое копировало бы значение
+    одного поля в другое)."""
+    event = _FakeEvent(photo=object())
+    result = _full_result(
+        owner_full_name="Иванов Иван Иванович",
+        driver_full_name="Петров Пётр Петрович",
+        policyholder_full_name=None,
+    )
+    command = _command(_FakeOcrService(result=result))
+
+    await command.handle(_ctx(event))
+
+    reply = event.replies[0]
+    assert "Водитель: Петров Пётр Петрович" in reply
+    assert "Страхователь: не распознано" in reply
+    assert "Страхователь: Петров Пётр Петрович" not in reply
 
 
 # ---- права доступа (unauthorized sender) — на уровне альбома, т.к. для
