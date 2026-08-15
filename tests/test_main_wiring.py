@@ -18,8 +18,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import httpx  # noqa: E402
 import pytest  # noqa: E402
 
+from reader.commands.album_collector import AlbumCollector  # noqa: E402
 from reader.commands.dispatcher import CommandDispatcher  # noqa: E402
 from reader.commands.fine import FineCommand  # noqa: E402
+from reader.commands.insurance_ocr import InsuranceOcrCommand  # noqa: E402
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
 from reader.fines.notification_coordinator import FineNotificationCoordinator  # noqa: E402
@@ -30,6 +32,7 @@ from reader.jobs.fine_job import FineJob  # noqa: E402
 from reader.jobs.scheduler import Scheduler  # noqa: E402
 from reader.main import (  # noqa: E402
     build_fine_monitor_components,
+    build_insurance_ocr_components,
     resolve_allowed_user_ids,
     resolve_notification_chat_ids,
     validate_fine_monitor_config,
@@ -37,6 +40,7 @@ from reader.main import (  # noqa: E402
 from reader.notifications.telegram_notification_service import (  # noqa: E402
     TelegramNotificationService,
 )
+from reader.ocr.service import OcrService  # noqa: E402
 from reader.settings import ConfigError, load_settings  # noqa: E402
 from reader.sources.telegram_source import TelegramSource  # noqa: E402
 from reader.users.repository import UserRepository  # noqa: E402
@@ -322,3 +326,102 @@ def test_resolve_allowed_user_ids_returns_empty_list_without_fallback(tmp_path, 
     settings = load_settings(config_path)
 
     assert resolve_allowed_user_ids(settings) == []
+
+
+# ---- ocr (insurance ocr) ----
+
+
+def test_load_settings_defaults_ocr_section(tmp_path, monkeypatch):
+    """config.yaml без секции ocr вовсе, .env без OPENAI_API_KEY — команда
+    просто не должна быть настроена (см. reader/main.py::run() — она в
+    этом случае не поднимается вовсе, как и TelegramSink при пустом
+    app.lead_forward_to)."""
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    config_path = _write_config(tmp_path, _CONFIG_YAML)
+
+    settings = load_settings(config_path)
+
+    assert settings.ocr.openai_api_key is None
+    assert settings.ocr.service_chat_id is None
+    assert settings.ocr.allowed_user_ids == []
+    assert settings.ocr.vision_model == "gpt-5-mini"
+    assert settings.ocr.album_debounce_seconds == 1.5
+
+
+def test_load_settings_parses_explicit_ocr_section(tmp_path, monkeypatch):
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-real")
+    config_with_ocr = _CONFIG_YAML + (
+        "\nocr:\n"
+        '  service_chat_id: "@insurance_ocr_service_chat"\n'
+        "  allowed_user_ids:\n"
+        "    - 222\n"
+        "  vision_model: gpt-5-mini\n"
+        "  album_debounce_seconds: 2.5\n"
+    )
+    config_path = _write_config(tmp_path, config_with_ocr)
+
+    settings = load_settings(config_path)
+
+    assert settings.ocr.openai_api_key == "test-key-not-real"
+    assert settings.ocr.service_chat_id == "insurance_ocr_service_chat"
+    assert settings.ocr.allowed_user_ids == [222]
+    assert settings.ocr.vision_model == "gpt-5-mini"
+    assert settings.ocr.album_debounce_seconds == 2.5
+
+
+def test_load_settings_parses_numeric_ocr_service_chat_id(tmp_path, monkeypatch):
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-real")
+    config_with_ocr = _CONFIG_YAML + (
+        "\nocr:\n"
+        "  service_chat_id: -1009876543210\n"
+        "  allowed_user_ids:\n"
+        "    - 222\n"
+    )
+    config_path = _write_config(tmp_path, config_with_ocr)
+
+    settings = load_settings(config_path)
+
+    assert settings.ocr.service_chat_id == -1009876543210
+
+
+async def test_build_insurance_ocr_components_wires_dependencies_correctly(tmp_path, monkeypatch):
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-real")
+    config_with_ocr = _CONFIG_YAML + (
+        "\nocr:\n"
+        '  service_chat_id: "@insurance_ocr_service_chat"\n'
+        "  allowed_user_ids:\n"
+        "    - 222\n"
+    )
+    config_path = _write_config(tmp_path, config_with_ocr)
+    settings = load_settings(config_path)
+
+    user_repository = UserRepository(tmp_path / "users.db")
+    source = TelegramSource(settings.telegram, groups=[], user_repository=user_repository)
+
+    try:
+        command_dispatcher, insurance_command, album_collector = build_insurance_ocr_components(
+            settings, source,
+        )
+
+        assert isinstance(command_dispatcher, CommandDispatcher)
+        assert isinstance(insurance_command, InsuranceOcrCommand)
+        assert isinstance(album_collector, AlbumCollector)
+        assert isinstance(insurance_command._ocr_service, OcrService)
+
+        # Тот же TelegramClient, что и у остального Reader — второе
+        # подключение к Telegram не создано (см. задачу).
+        assert command_dispatcher._client is source.client
+
+        # Свой, отдельный от fine_monitor, чат/список операторов.
+        assert command_dispatcher._chat_id == "insurance_ocr_service_chat"
+        assert command_dispatcher._allowed_user_ids == {222}
+
+        # AlbumCollector зовёт именно InsuranceOcrCommand.handle_album — не
+        # копию/дублирующую бизнес-логику.
+        assert album_collector._on_group_ready == insurance_command.handle_album
+    finally:
+        user_repository.close()

@@ -147,11 +147,35 @@ class InviterSettings(BaseModel):
     worker: InviterWorkerSettings = Field(default_factory=InviterWorkerSettings)
 
 
+class OcrSettings(BaseModel):
+    """`insurance ocr` — распознавание документов автомобиля через OpenAI
+    (см. reader/ocr/, reader/commands/insurance_ocr.py). Независимая от
+    fine_monitor команда/чат — свой service_chat_id и allowed_user_ids
+    (см. задачу: отдельный служебный чат, не Fine Monitor).
+
+    openai_api_key — ТОЛЬКО из .env (OPENAI_API_KEY), никогда из
+    config.yaml, как и остальные секреты проекта (TELEGRAM_API_HASH и
+    т.п.). None (значение по умолчанию, если .env не задаёт переменную) —
+    команда просто не поднимается (см. reader/main.py) — как и с
+    app.lead_forward_to, отсутствие конфигурации не должно ронять запуск
+    всего Reader."""
+
+    openai_api_key: str | None = None
+    vision_model: str = "gpt-5-mini"
+    service_chat_id: int | str | None = None
+    allowed_user_ids: list[int] = Field(default_factory=list)
+    # Сколько ждать без новых сообщений той же альбомной группы, прежде
+    # чем считать альбом собранным целиком (см.
+    # reader/commands/album_collector.py::AlbumCollector).
+    album_debounce_seconds: float = 1.5
+
+
 class Settings(BaseModel):
     telegram: TelegramSettings
     app: AppSettings
     fine_monitor: FineMonitorSettings
     inviter: InviterSettings = Field(default_factory=InviterSettings)
+    ocr: OcrSettings = Field(default_factory=OcrSettings)
 
 
 def load_settings(config_path: Path) -> Settings:
@@ -194,6 +218,7 @@ def load_settings(config_path: Path) -> Settings:
     fine_monitor_raw = raw.get("fine_monitor", {})
     inviter_raw = raw.get("inviter", {})
     inviter_worker_raw = inviter_raw.get("worker", {})
+    ocr_raw = raw.get("ocr", {})
 
     # Имя live-сессии: TELEGRAM_SESSION_NAME (.env) имеет приоритет над
     # session_name_live (config.yaml), а если ничего не задано — reader_live.
@@ -307,6 +332,16 @@ def load_settings(config_path: Path) -> Settings:
                         inviter_worker_raw.get("poll_interval_seconds", 600)
                     ),
                 ),
+            ),
+            ocr=OcrSettings(
+                openai_api_key=os.getenv("OPENAI_API_KEY") or None,
+                vision_model=ocr_raw.get("vision_model", "gpt-5-mini"),
+                service_chat_id=(
+                    _normalize_chat_id(ocr_raw["service_chat_id"])
+                    if ocr_raw.get("service_chat_id") else None
+                ),
+                allowed_user_ids=list(ocr_raw.get("allowed_user_ids", [])),
+                album_debounce_seconds=float(ocr_raw.get("album_debounce_seconds", 1.5)),
             ),
         )
     except (KeyError, ValueError) as exc:

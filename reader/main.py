@@ -9,8 +9,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import httpx  # noqa: E402
 
+from reader.commands.album_collector import AlbumCollector  # noqa: E402
 from reader.commands.dispatcher import CommandDispatcher  # noqa: E402
 from reader.commands.fine import FineCommand  # noqa: E402
+from reader.commands.insurance_ocr import InsuranceOcrCommand  # noqa: E402
 from reader.core.engine import MatchEngine  # noqa: E402
 from reader.core.pipeline import Pipeline  # noqa: E402
 from reader.fines.check_service import FineCheckService  # noqa: E402
@@ -27,6 +29,7 @@ from reader.logging_setup import setup_logging  # noqa: E402
 from reader.notifications.telegram_notification_service import (  # noqa: E402
     TelegramNotificationService,
 )
+from reader.ocr.service import OcrService  # noqa: E402
 from reader.scenarios import KeywordMatcher, ScenarioLoadError, load_scenarios  # noqa: E402
 from reader.settings import ConfigError, Settings, load_settings  # noqa: E402
 from reader.sinks.console_sink import ConsoleSink  # noqa: E402
@@ -225,6 +228,50 @@ async def _run_fine_monitor(
         await http_client.aclose()
 
 
+def build_insurance_ocr_components(
+    settings: Settings, source: TelegramSource,
+) -> tuple[CommandDispatcher, InsuranceOcrCommand, AlbumCollector]:
+    """Чистая сборка зависимостей "insurance ocr" — без единого await, без
+    обращения к сети/Telegram (см. build_fine_monitor_components — тот же
+    приём, ради тестируемости без реального Telegram/OpenAI, см.
+    test_main_wiring.py). Полностью независима от fine_monitor: свой
+    CommandDispatcher (свой chat_id/allowed_user_ids), свой OcrService."""
+    ocr = settings.ocr
+    ocr_service = OcrService(api_key=ocr.openai_api_key, model=ocr.vision_model)
+    insurance_command = InsuranceOcrCommand(ocr_service, allowed_user_ids=ocr.allowed_user_ids)
+    command_dispatcher = CommandDispatcher(source.client, ocr.service_chat_id, ocr.allowed_user_ids)
+    album_collector = AlbumCollector(
+        on_group_ready=insurance_command.handle_album,
+        debounce_seconds=ocr.album_debounce_seconds,
+    )
+    return command_dispatcher, insurance_command, album_collector
+
+
+async def _run_insurance_ocr(settings: Settings, source: TelegramSource) -> None:
+    """"insurance ocr" — свой CommandDispatcher (свой служебный чат, не
+    Fine Monitor, см. задачу) плюс AlbumCollector, зарегистрированный ещё
+    одним независимым NewMessage-handler'ом на том же чате (см.
+    reader/commands/album_collector.py) — на том же Telegram-клиенте, что
+    и основной Reader, второе подключение не создаётся.
+
+    Никогда не завершается сама по себе (await asyncio.Event().wait() —
+    вся работа происходит в зарегистрированных event handler'ах), как и
+    _run_fine_monitor()'s scheduler.run_forever()."""
+    await source.wait_until_ready()
+
+    command_dispatcher, insurance_command, album_collector = build_insurance_ocr_components(
+        settings, source,
+    )
+    command_dispatcher.register(insurance_command)
+
+    await command_dispatcher.start()
+    await album_collector.start(source.client, settings.ocr.service_chat_id)
+
+    logger.info("Insurance OCR command enabled (chat=%s)", settings.ocr.service_chat_id)
+
+    await asyncio.Event().wait()
+
+
 async def _run_concurrently(coroutines: list) -> None:
     """Как asyncio.gather, но при ошибке в одной корутине отменяет
     остальные, а не оставляет их работать дальше (или висеть навсегда:
@@ -298,6 +345,20 @@ async def run() -> None:
         )
     else:
         logger.info("Fine monitor disabled (fine_monitor.enabled=false)")
+
+    if settings.ocr.service_chat_id and settings.ocr.openai_api_key:
+        if settings.ocr.allowed_user_ids:
+            background.append(_run_insurance_ocr(settings, source))
+        else:
+            logger.warning(
+                "Insurance OCR: ocr.service_chat_id/OPENAI_API_KEY заданы, но "
+                "ocr.allowed_user_ids пуст — команда не поднята (иначе ей не "
+                "смог бы воспользоваться ни один оператор)."
+            )
+    else:
+        logger.info(
+            "Insurance OCR disabled (ocr.service_chat_id/OPENAI_API_KEY не заданы)"
+        )
 
     try:
         await _run_concurrently(background)
