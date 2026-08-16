@@ -27,6 +27,7 @@ true/false) — см. FLAG_ATTRS.
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime
 from typing import Literal, get_args
 
 from reader.ocr.models import FLAG_ATTRS, REPLY_FIELD_LABELS, OcrResult
@@ -38,6 +39,16 @@ _FLAG_FALSE = "-"
 _HEADER_LABEL = "Распознано"
 
 _CATEGORY_VALUES: tuple[str, ...] = get_args(Literal["passenger_car", "motorcycle", "trailer"])
+
+# Допустимые значения "Банк:"/"Период:" в Telegram-поле — синтаксическая
+# валидация здесь, реальный PaymentBank/tpl.ge-формат периода ("bank_of_georgia",
+# "15-D" и т.п.) — забота reader/checkout/mapping.py (resolve_payment_bank/
+# resolve_policy_period), эта строгая проверка НЕ дублируется там (mapping.py
+# доверяет уже провалидированному парсером значению, тот же принцип, что и
+# у Категория/_CATEGORY_VALUES выше). "1-Y" в Telegram-flow не поддерживается.
+_PAYMENT_BANK_VALUES = ("bog", "liberty")
+_POLICY_PERIOD_VALUES = ("15", "30", "90")
+_PERIOD_START_FORMAT = "%d.%m.%Y"
 
 _LABEL_TO_ATTR: dict[str, str] = dict(REPLY_FIELD_LABELS)
 _ATTR_SET = frozenset(_LABEL_TO_ATTR.values())
@@ -107,6 +118,30 @@ def parse_correction_reply(text: str) -> dict[str, str | bool | None]:
             + f" (или '{_NOT_RECOGNIZED}')."
         )
 
+    payment_bank = corrections.get("payment_bank")
+    if payment_bank is not None and payment_bank not in _PAYMENT_BANK_VALUES:
+        raise ReplyParseError(
+            f"Недопустимое значение Банк: '{payment_bank}'. Допустимо: "
+            + ", ".join(_PAYMENT_BANK_VALUES)
+            + f" (или '{_NOT_RECOGNIZED}')."
+        )
+
+    policy_period = corrections.get("policy_period")
+    if policy_period is not None and policy_period not in _POLICY_PERIOD_VALUES:
+        raise ReplyParseError(
+            f"Недопустимое значение Период: '{policy_period}'. Допустимо: "
+            + ", ".join(_POLICY_PERIOD_VALUES)
+            + f" (или '{_NOT_RECOGNIZED}')."
+        )
+
+    period_start = corrections.get("period_start")
+    if period_start is not None and not _is_valid_period_start(period_start):
+        raise ReplyParseError(
+            f"Недопустимое значение Начало периода: '{period_start}'. "
+            f"Ожидается существующая дата в формате ДД.ММ.ГГГГ (например, "
+            f"01.03.2026) (или '{_NOT_RECOGNIZED}')."
+        )
+
     return corrections
 
 
@@ -169,3 +204,18 @@ def _none_if_not_recognized(value: str) -> str | None:
     if not value or value.strip().lower() == _NOT_RECOGNIZED:
         return None
     return value
+
+
+def _is_valid_period_start(value: str) -> bool:
+    """Строго ДД.ММ.ГГГГ (два/два/четыре знака — не "1.1.2026") и
+    существующая календарная дата (datetime.strptime сам отклонит
+    31.02.2026 и т.п.) — как и остальные значения, "01" не то же самое, что
+    "1" (см. задачу: "строго валидировать DD.MM.YYYY")."""
+    if len(value) != 10 or value[2] != "." or value[5] != ".":
+        return False
+    try:
+        # Календарная дата, не момент времени — naive datetime намеренный.
+        datetime.strptime(value, _PERIOD_START_FORMAT)  # noqa: DTZ007
+    except ValueError:
+        return False
+    return True

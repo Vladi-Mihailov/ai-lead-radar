@@ -19,7 +19,6 @@ import httpx  # noqa: E402
 import pytest  # noqa: E402
 
 from reader.checkout.lock_repository import CheckoutLockRepository  # noqa: E402
-from reader.checkout.models import PaymentBank  # noqa: E402
 from reader.checkout.payment_gateway import (  # noqa: E402
     CardSecrets,
     PlaywrightBankGatewayClient,
@@ -545,18 +544,21 @@ def test_load_settings_rejects_malformed_policy_period(tmp_path, monkeypatch):
         load_settings(config_path)
 
 
-def test_load_settings_fails_fast_when_payment_bank_set_without_policy_period_phone_email(
+def test_load_settings_legacy_payment_bank_alone_does_not_fail_fast_and_does_not_enable_checkout(
     tmp_path, monkeypatch,
 ):
-    """payment_bank задан — значит checkout ВКЛЮЧАЕТСЯ, и тогда
-    policy_period/phone/email обязаны быть заданы тоже (см.
-    reader/settings.py::load_settings) — иначе fail-fast, а не тихое
-    "не настроено" (в отличие от случая, когда payment_bank вовсе не
-    задан — см. test_load_settings_defaults_checkout_section)."""
+    """payment_bank/policy_period — LEGACY (см. reader/settings.py::
+    CheckoutSettings): банк-эквайер и период полиса теперь поля конкретной
+    Telegram-заявки, а не runtime-настройка, поэтому payment_bank, заданный
+    в одиночку (без phone/email), больше НЕ считается "checkout включён" и
+    не требует policy_period/phone/email — в отличие от старого поведения
+    (см. git history), где payment_bank один запускал fail-fast."""
     _set_required_env(monkeypatch)
     only_bank = _CONFIG_YAML + "\ncheckout:\n  payment_bank: bank_of_georgia\n"
-    with pytest.raises(ConfigError, match="policy_period"):
-        load_settings(_write_config(tmp_path, only_bank))
+    settings = load_settings(_write_config(tmp_path, only_bank))
+
+    assert settings.checkout.payment_bank == "bank_of_georgia"
+    assert is_checkout_configured(settings) is False
 
 
 def test_load_settings_fails_fast_when_phone_or_email_missing(tmp_path, monkeypatch):
@@ -602,8 +604,11 @@ async def test_build_checkout_components_wires_dependencies_correctly(tmp_path, 
         assert isinstance(handler._service, CheckoutService)
         assert isinstance(handler._service._tpl_client, TplGeClient)
         assert isinstance(handler._service._reference_data, TplReferenceDataClient)
-        assert handler._service._payment_bank == PaymentBank.BANK_OF_GEORGIA
-        assert handler._service._policy_period == "30-D"
+        # payment_bank/policy_period больше НЕ конструкторные атрибуты
+        # CheckoutService (см. reader/checkout/service.py) — это поля
+        # конкретной Telegram-заявки, а не runtime-настройка.
+        assert not hasattr(handler._service, "_payment_bank")
+        assert not hasattr(handler._service, "_policy_period")
 
         # Реальный OcrPersonalInfoProvider, а не fail-closed default, с
         # phone/email именно из config.yaml (см. reader/main.py::

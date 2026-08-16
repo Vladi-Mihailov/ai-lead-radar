@@ -170,11 +170,14 @@ class OcrService:
             vin=_clean(parsed.vin),
             chassis_number=_clean(parsed.chassis_number),
             registration_number=_clean(parsed.registration_number),
-            # Не из OCR — попадают в Telegram-draft из checkout settings (см.
+            # Не из OCR — попадают в Telegram-draft как default-значения (см.
             # reader/commands/insurance_ocr.py), не заставляем модель их
             # угадывать.
             email=None,
             phone=None,
+            payment_bank=None,
+            policy_period=None,
+            period_start=None,
         )
 
 

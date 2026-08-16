@@ -159,14 +159,15 @@ class CheckoutSettings(BaseModel):
     чате и с теми же ocr.allowed_user_ids, что и "insurance ocr" — не имеет
     собственного chat_id/allowed_user_ids (см. reader/main.py).
 
-    payment_bank — банк-эквайер задан ЖЁСТКО конфигом (см. задачу: "банк
-    оператор не выбирает"), единственное подтверждённое browser research'ом
-    значение — "bank_of_georgia" (см. reader/checkout/models.py::PaymentBank).
-
-    policy_period — период полиса ("15-D"/"30-D"/"90-D"/"1-Y", см.
-    reader/checkout/reference_data.py::parse_policy_period) — тоже фиксированный
-    конфигом, а не выбирается оператором за отсутствием этого шага в
-    Telegram-flow задачи.
+    payment_bank/policy_period — LEGACY, оставлены только ради backward
+    compatibility со старыми config.yaml (не ломаем загрузку, если они
+    заданы), но БОЛЬШЕ НИ НА ЧТО не влияют в runtime: банк-эквайер и период
+    полиса теперь поля КОНКРЕТНОЙ Telegram-заявки — "Банк:"/"Период:" в
+    черновике "Распознано: ..." (default "bog"/"15", см.
+    reader/commands/insurance_ocr.py), которые оператор может
+    скорректировать per-request correction-reply'ем (см.
+    reader/checkout/mapping.py::resolve_payment_bank/resolve_policy_period).
+    Не участвуют в is_checkout_configured()/fail-fast ниже.
 
     phone/email — значение ПО УМОЛЧАНИЮ для Email/Телефон в Telegram-черновике
     "Распознано: ..." (см. reader/commands/insurance_ocr.py) — оператор может
@@ -177,10 +178,11 @@ class CheckoutSettings(BaseModel):
     config/config.yaml — не секрет (телефон/email агентства, не персональные
     данные клиента), поэтому в config.yaml, а не в .env.
 
-    Все четыре поля None по умолчанию — checkout просто не поднимается (см.
-    reader/main.py), как и "insurance ocr" при пустых ocr.service_chat_id/
-    OPENAI_API_KEY. Если payment_bank задан (checkout включается) —
-    policy_period/phone/email обязаны быть заданы тоже (см. load_settings)."""
+    Все четыре поля None по умолчанию. checkout поднимается, когда заданы
+    phone И email (см. reader/main.py::is_checkout_configured) — как и
+    "insurance ocr" при пустых ocr.service_chat_id/OPENAI_API_KEY, их
+    отсутствие не ошибка запуска. Если задано только одно из phone/email —
+    fail-fast (см. load_settings)."""
 
     payment_bank: str | None = None
     policy_period: str | None = None
@@ -263,6 +265,11 @@ def load_settings(config_path: Path) -> Settings:
     ocr_raw = raw.get("ocr", {})
     checkout_raw = raw.get("checkout", {})
 
+    # payment_bank/policy_period — LEGACY (см. reader/settings.py::
+    # CheckoutSettings): формат по-прежнему валидируется, чтобы не молча
+    # игнорировать явную опечатку в старом config.yaml, но больше НЕ
+    # участвуют в решении "включён ли checkout" (см. ниже) — это поля
+    # конкретной Telegram-заявки, а не runtime-настройка.
     payment_bank = checkout_raw.get("payment_bank") or None
     if payment_bank is not None and payment_bank not in _VALID_PAYMENT_BANKS:
         raise ConfigError(
@@ -282,21 +289,17 @@ def load_settings(config_path: Path) -> Settings:
     checkout_phone = checkout_raw.get("phone") or None
     checkout_email = checkout_raw.get("email") or None
 
-    if payment_bank is not None:
+    if checkout_phone is not None or checkout_email is not None:
         missing_checkout_fields = [
             name
-            for name, value in [
-                ("policy_period", policy_period),
-                ("phone", checkout_phone),
-                ("email", checkout_email),
-            ]
+            for name, value in [("phone", checkout_phone), ("email", checkout_email)]
             if not value
         ]
         if missing_checkout_fields:
             raise ConfigError(
-                "checkout.payment_bank задан, но не заданы: "
+                "checkout.phone/checkout.email заданы не оба сразу — не задано: "
                 + ", ".join(f"checkout.{name}" for name in missing_checkout_fields)
-                + " — все обязательны для включения checkout (см. reader/settings.py::CheckoutSettings)"
+                + " (см. reader/settings.py::CheckoutSettings)"
             )
 
     # Имя live-сессии: TELEGRAM_SESSION_NAME (.env) имеет приоритет над

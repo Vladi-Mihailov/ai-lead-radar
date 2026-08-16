@@ -32,6 +32,7 @@ def _effective(**overrides) -> OcrResult:
         vin="WVWZZZ1KZAW123456", chassis_number=None,
         manufacturer="Toyota", model="Camry",
         email=_EMAIL, phone=_PHONE,
+        payment_bank="bog", policy_period="15", period_start="16.08.2026",
     )
     fields.update(overrides)
     return OcrResult(**fields)

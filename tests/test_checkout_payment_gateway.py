@@ -47,6 +47,7 @@ def _state() -> CheckoutState:
         category="passenger_car", registration_number="AA001AA",
         vin="WVWZZZ1KZAW123456", chassis_number=None, manufacturer="Toyota", model="Camry",
         email="tplgee@mail.ru", phone="925000000000",
+        payment_bank="bog", policy_period="15", period_start="16.08.2026",
     )
     return CheckoutState(
         id="checkout-1", chat_id=-100, ocr_message_id=1, operator_user_id=111,

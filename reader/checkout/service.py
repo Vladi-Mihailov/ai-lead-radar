@@ -31,6 +31,9 @@ from reader.checkout.lock_repository import CheckoutLockRepository
 from reader.checkout.mapping import (
     MappingError,
     required_vehicle_fields_missing,
+    resolve_payment_bank,
+    resolve_period_start,
+    resolve_policy_period,
     sanitize_registration_number,
     select_frame_number,
 )
@@ -67,6 +70,7 @@ logger = logging.getLogger(__name__)
 
 _BANK_DISPLAY_NAME = {
     PaymentBank.BANK_OF_GEORGIA: "Bank of Georgia",
+    PaymentBank.LIBERTY_BANK: "Liberty Bank",
 }
 
 _CODE_PROMPT_TEXT = "Введите код подтверждения — reply на это сообщение."
@@ -125,13 +129,18 @@ def _recovery_message(lock_checkout_id: str) -> str:
 
 
 class CheckoutService:
+    """payment_bank/policy_period/period_start больше НЕ конструкторные
+    настройки — теперь это поля конкретной заявки (Telegram "Банк:"/
+    "Период:"/"Начало периода:", см. reader/ocr/models.py::OcrResult),
+    оператор может менять их per-request через correction-reply. Резолв в
+    реальные PaymentBank/tpl.ge-значения — см. reader/checkout/mapping.py и
+    _build_payload ниже."""
+
     def __init__(
         self,
         *,
         tpl_client: TplGeClient,
         reference_data: TplReferenceDataClient,
-        payment_bank: PaymentBank,
-        policy_period: str,
         lock_repository: CheckoutLockRepository,
         personal_info_provider: PersonalInfoProvider | None = None,
         bank_gateway: BankGatewayClient | None = None,
@@ -141,8 +150,6 @@ class CheckoutService:
     ):
         self._tpl_client = tpl_client
         self._reference_data = reference_data
-        self._payment_bank = payment_bank
-        self._policy_period = policy_period
         self._lock_repository = lock_repository
         self._personal_info_provider = personal_info_provider or NoPersonalInfoProvider()
         self._bank_gateway = bank_gateway or NotImplementedBankGatewayClient()
@@ -328,7 +335,7 @@ class CheckoutService:
             )
 
         try:
-            payload = await self._build_payload(checkout_id, effective)
+            payload, payment_bank = await self._build_payload(checkout_id, effective)
         except (MappingError, ReferenceDataError) as exc:
             state.status = CheckoutStatus.MAPPING_FAILED
             return CheckoutOutcome(reply_text=f"Не удалось сопоставить данные с tpl.ge: {exc}", state=state)
@@ -359,7 +366,7 @@ class CheckoutService:
         try:
             redirect_url = await self._tpl_client.get_payment_redirect_url(
                 u_id=checkout_id,
-                bank=self._payment_bank,
+                bank=payment_bank,
                 payer_title=payload.insurer_title,
                 payer_identification_number=payload.insurer_identification_number,
             )
@@ -375,9 +382,11 @@ class CheckoutService:
         state.status = CheckoutStatus.PAYMENT_REDIRECT_READY
         self._persist_lock(state)
 
-        return await self._run_bank_gateway(state, redirect_url)
+        return await self._run_bank_gateway(state, redirect_url, payment_bank)
 
-    async def _run_bank_gateway(self, state: CheckoutState, redirect_url: str) -> CheckoutOutcome:
+    async def _run_bank_gateway(
+        self, state: CheckoutState, redirect_url: str, payment_bank: PaymentBank,
+    ) -> CheckoutOutcome:
         state.status = CheckoutStatus.PAYMENT_IN_PROGRESS
         self._persist_lock(state)
 
@@ -387,7 +396,7 @@ class CheckoutService:
             state.status = CheckoutStatus.FAILED
             state.failure_reason = FailureReason.BROWSER_CRASHED
             self._persist_lock(state)
-            bank_name = _BANK_DISPLAY_NAME.get(self._payment_bank, self._payment_bank.value)
+            bank_name = _BANK_DISPLAY_NAME.get(payment_bank, payment_bank.value)
             return CheckoutOutcome(
                 reply_text=(
                     f"Заявка создана (uId={state.id}), ссылка на оплату через {bank_name} готова, "
@@ -407,11 +416,18 @@ class CheckoutService:
 
         return await self._apply_bank_result(state, result)
 
-    async def _build_payload(self, checkout_id: str, effective: OcrResult) -> TplPolicyPayload:
+    async def _build_payload(self, checkout_id: str, effective: OcrResult) -> tuple[TplPolicyPayload, PaymentBank]:
         registration_number = sanitize_registration_number(effective.registration_number)
         frame_number = select_frame_number(effective)
+        # Банк/период/дата начала — поля ИМЕННО ЭТОЙ заявки (см.
+        # reader/ocr/models.py::OcrResult и CheckoutService docstring), не
+        # конструкторные настройки — резолвятся здесь же, вместе с
+        # остальной синхронной валидацией, до первого await.
+        payment_bank = resolve_payment_bank(effective.payment_bank)
+        policy_period = resolve_policy_period(effective.policy_period)
+        start_date = resolve_period_start(effective.period_start)
 
-        category_product = await self._reference_data.category_product(effective.category, self._policy_period)
+        category_product = await self._reference_data.category_product(effective.category, policy_period)
 
         manufacturer = await self._reference_data.resolve_manufacturer(effective.manufacturer)
         if manufacturer is None:
@@ -429,9 +445,9 @@ class CheckoutService:
         info = resolution.info
         assert info is not None  # для type checker — is_complete уже это гарантирует
 
-        return TplPolicyPayload(
+        payload = TplPolicyPayload(
             u_id=checkout_id,
-            start_date=self._clock().date().isoformat(),
+            start_date=start_date,
             frame_number=frame_number,
             vehicle_category_id=category_product.vehicle_category_id,
             vehicle_registration_number=registration_number,
@@ -469,3 +485,4 @@ class CheckoutService:
             vehicle_driver_citizenship_id=info.driver.citizenship_id,
             visitor_id=str(uuid.uuid4()),
         )
+        return payload, payment_bank

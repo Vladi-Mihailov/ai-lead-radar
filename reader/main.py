@@ -10,7 +10,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import httpx  # noqa: E402
 
 from reader.checkout.lock_repository import CheckoutLockRepository  # noqa: E402
-from reader.checkout.models import PaymentBank  # noqa: E402
 from reader.checkout.payment_gateway import (  # noqa: E402
     CardSecrets,
     CardSecretsError,
@@ -266,10 +265,13 @@ def build_insurance_ocr_components(
 
 
 def is_checkout_configured(settings: Settings) -> bool:
-    """checkout.payment_bank и checkout.policy_period оба обязательны (см.
+    """checkout.phone и checkout.email оба обязательны (см.
     reader/settings.py::CheckoutSettings) — как и с "insurance ocr", их
-    отсутствие означает "функциональность не поднята", а не ошибку запуска."""
-    return bool(settings.checkout.payment_bank and settings.checkout.policy_period)
+    отсутствие означает "функциональность не поднята", а не ошибку запуска.
+    payment_bank/policy_period больше НЕ участвуют в этом решении — это
+    поля конкретной Telegram-заявки (см. reader/ocr/models.py::OcrResult),
+    а не runtime-конфигурация."""
+    return bool(settings.checkout.phone and settings.checkout.email)
 
 
 def build_checkout_components(
@@ -293,7 +295,7 @@ def build_checkout_components(
     tpl_client = TplGeClient(http_client)
     reference_data = TplReferenceDataClient(http_client)
     # phone/email гарантированно заданы здесь (см. reader/settings.py::
-    # load_settings — fail-fast, если payment_bank задан без них).
+    # load_settings — fail-fast, если одно из них задано без другого).
     personal_info_provider = OcrPersonalInfoProvider(
         reference_data=reference_data, phone=checkout.phone, email=checkout.email,
     )
@@ -305,8 +307,6 @@ def build_checkout_components(
     checkout_service = CheckoutService(
         tpl_client=tpl_client,
         reference_data=reference_data,
-        payment_bank=PaymentBank(checkout.payment_bank),
-        policy_period=checkout.policy_period,
         lock_repository=lock_repository,
         personal_info_provider=personal_info_provider,
         bank_gateway=bank_gateway,
@@ -362,13 +362,13 @@ async def _run_insurance_ocr(settings: Settings, source: TelegramSource) -> None
                     settings, source, checkout_http_client, card_secrets=card_secrets,
                 )
                 await checkout_handler.start(source.client, settings.ocr.service_chat_id)
-                logger.info(
-                    "Checkout tpl.ge enabled (bank=%s, period=%s)",
-                    settings.checkout.payment_bank, settings.checkout.policy_period,
-                )
+                # Банк/период — теперь поля конкретной Telegram-заявки (см.
+                # reader/ocr/models.py::OcrResult), не runtime-настройки —
+                # в этом логе больше нечего показывать про них.
+                logger.info("Checkout tpl.ge enabled")
         else:
             logger.info(
-                "Checkout tpl.ge disabled (checkout.payment_bank/policy_period не заданы)"
+                "Checkout tpl.ge disabled (checkout.phone/email не заданы)"
             )
 
         await asyncio.Event().wait()

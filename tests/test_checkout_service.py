@@ -16,6 +16,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import logging
 
+import pytest  # noqa: E402
+
 from reader.checkout.lock_repository import CheckoutLockRepository  # noqa: E402
 from reader.checkout.models import CheckoutStatus, FailureReason, PaymentBank  # noqa: E402
 from reader.checkout.payment_gateway import BankGatewayError, BankGatewayOutcome, BankGatewayResult  # noqa: E402
@@ -40,6 +42,9 @@ _SETTINGS_PHONE = "925000000000"
 _SETTINGS_EMAIL = "tplgee@mail.ru"
 
 
+_DEFAULT_PERIOD_START = "16.08.2026"
+
+
 def _ocr_message(**overrides) -> str:
     fields = dict(
         policyholder="Petrov Petr",
@@ -47,6 +52,7 @@ def _ocr_message(**overrides) -> str:
         category="passenger_car", manufacturer="Toyota", model="Camry",
         vin="WVWZZZ1KZAW123456", chassis="не распознано", plate="AA001AA",
         email=_SETTINGS_EMAIL, phone=_SETTINGS_PHONE,
+        bank="bog", period="15", period_start=_DEFAULT_PERIOD_START,
         # Happy-path по умолчанию: и водитель, и владелец совпадают со
         # страхователем (~99% реальных заявок, см. reader/ocr/models.py) —
         # отдельные ФИО не нужны.
@@ -66,7 +72,10 @@ def _ocr_message(**overrides) -> str:
         f"Номер шасси: {fields['chassis']}\n"
         f"Госномер: {fields['plate']}\n"
         f"Email: {fields['email']}\n"
-        f"Телефон: {fields['phone']}\n\n"
+        f"Телефон: {fields['phone']}\n"
+        f"Банк: {fields['bank']}\n"
+        f"Период: {fields['period']}\n"
+        f"Начало периода: {fields['period_start']}\n\n"
         f"Водитель = страхователь: {fields['driver_flag']}\n"
         f"Водитель: {fields['driver']}\n\n"
         f"Владелец = страхователь: {fields['owner_flag']}\n"
@@ -103,8 +112,10 @@ class _FakeReferenceData:
         self.model_found = model_found
         self.category_error = category_error
         self.country_found = country_found
+        self.category_product_calls: list = []
 
     async def category_product(self, category, policy_period):
+        self.category_product_calls.append((category, policy_period))
         if self.category_error is not None:
             raise self.category_error
         return CategoryProduct(vehicle_category_id=7, product_id=2, price=50.0)
@@ -185,7 +196,7 @@ def _memory_lock_repository() -> CheckoutLockRepository:
 
 def _service(
     *, tpl_client=None, reference_data=None, personal_info_provider=None, bank_gateway=None,
-    lock_repository=None, store=None, policy_document_provider=None,
+    lock_repository=None, store=None, policy_document_provider=None, clock=None,
 ):
     tpl_client = tpl_client or _FakeTplClient()
     reference_data = reference_data or _FakeReferenceData()
@@ -193,13 +204,12 @@ def _service(
     service = CheckoutService(
         tpl_client=tpl_client,
         reference_data=reference_data,
-        payment_bank=PaymentBank.BANK_OF_GEORGIA,
-        policy_period="30-D",
         lock_repository=lock_repository,
         personal_info_provider=personal_info_provider,
         bank_gateway=bank_gateway,
         policy_document_provider=policy_document_provider,
         store=store,
+        clock=clock,
     )
     return service, tpl_client, reference_data, lock_repository
 
@@ -1034,6 +1044,171 @@ async def test_operator_can_change_email_and_phone_via_correction_reply():
     assert payload.insurer_phone == "599111222"
     assert payload.vehicle_owner_email == "operator@example.com"
     assert payload.vehicle_driver_phone == "599111222"
+
+
+# ---- Банк/Период/Начало периода: поля конкретной заявки (не runtime config) ----
+
+
+async def test_default_bank_reaches_redirect_call_as_bank_of_georgia():
+    service, tpl_client, _ref, _lock = _service_with_real_personal_info(bank_gateway=_completed_gateway())
+
+    outcome = await service.handle_pay(
+        chat_id=_CHAT_ID, ocr_message_id=40, ocr_message_text=_ocr_message(), operator_user_id=_OPERATOR_ID,
+    )
+
+    assert outcome.state.status == CheckoutStatus.COMPLETED
+    assert tpl_client.redirect_calls[0]["bank"] == PaymentBank.BANK_OF_GEORGIA
+
+
+async def test_correction_bank_liberty_is_resolved_and_used_for_redirect_call():
+    """Оператор может изменить bog -> liberty; преобразование в реальный
+    PaymentBank — см. reader/checkout/mapping.py::resolve_payment_bank."""
+    service, tpl_client, _ref, _lock = _service_with_real_personal_info(bank_gateway=_completed_gateway())
+
+    outcome = await service.handle_correction(
+        chat_id=_CHAT_ID, ocr_message_id=41, ocr_message_text=_ocr_message(),
+        correction_text="Банк: liberty",
+        operator_user_id=_OPERATOR_ID,
+    )
+
+    assert outcome.state.status == CheckoutStatus.COMPLETED
+    assert tpl_client.redirect_calls[0]["bank"] == PaymentBank.LIBERTY_BANK
+
+
+async def test_correction_invalid_bank_is_rejected_before_starting_checkout():
+    service, tpl_client, _ref, _lock = _service()
+
+    outcome = await service.handle_correction(
+        chat_id=_CHAT_ID, ocr_message_id=42, ocr_message_text=_ocr_message(),
+        correction_text="Банк: tbc",
+        operator_user_id=_OPERATOR_ID,
+    )
+
+    assert outcome.state is None
+    assert tpl_client.created_payloads == []
+
+
+async def test_default_policy_period_resolves_to_tpl_ge_format():
+    service, _tpl, reference_data, _lock = _service_with_real_personal_info(
+        bank_gateway=_completed_gateway(),
+    )
+
+    await service.handle_pay(
+        chat_id=_CHAT_ID, ocr_message_id=43, ocr_message_text=_ocr_message(), operator_user_id=_OPERATOR_ID,
+    )
+
+    assert reference_data.category_product_calls == [("passenger_car", "15-D")]
+
+
+@pytest.mark.parametrize("value,expected", [("30", "30-D"), ("90", "90-D")])
+async def test_correction_policy_period_resolves_to_tpl_ge_format(value, expected):
+    service, _tpl, reference_data, _lock = _service_with_real_personal_info(
+        bank_gateway=_completed_gateway(),
+    )
+
+    outcome = await service.handle_correction(
+        chat_id=_CHAT_ID, ocr_message_id=44, ocr_message_text=_ocr_message(),
+        correction_text=f"Период: {value}",
+        operator_user_id=_OPERATOR_ID,
+    )
+
+    assert outcome.state.status == CheckoutStatus.COMPLETED
+    assert reference_data.category_product_calls == [("passenger_car", expected)]
+
+
+@pytest.mark.parametrize("value", ["1-Y", "365"])
+async def test_correction_invalid_policy_period_is_rejected(value):
+    """1-Y (годовой полис) и любое другое значение вне 15/30/90 не
+    поддерживаются в Telegram-flow."""
+    service, tpl_client, _ref, _lock = _service()
+
+    outcome = await service.handle_correction(
+        chat_id=_CHAT_ID, ocr_message_id=45, ocr_message_text=_ocr_message(),
+        correction_text=f"Период: {value}",
+        operator_user_id=_OPERATOR_ID,
+    )
+
+    assert outcome.state is None
+    assert tpl_client.created_payloads == []
+
+
+async def test_default_period_start_reaches_payload_start_date():
+    service, tpl_client, _ref, _lock = _service_with_real_personal_info(bank_gateway=_completed_gateway())
+
+    await service.handle_pay(
+        chat_id=_CHAT_ID, ocr_message_id=46, ocr_message_text=_ocr_message(), operator_user_id=_OPERATOR_ID,
+    )
+
+    assert tpl_client.created_payloads[0].start_date == "2026-08-16"
+
+
+async def test_correction_period_start_reaches_payload_start_date():
+    service, tpl_client, _ref, _lock = _service_with_real_personal_info(bank_gateway=_completed_gateway())
+
+    outcome = await service.handle_correction(
+        chat_id=_CHAT_ID, ocr_message_id=47, ocr_message_text=_ocr_message(),
+        correction_text="Начало периода: 01.09.2026",
+        operator_user_id=_OPERATOR_ID,
+    )
+
+    assert outcome.state.status == CheckoutStatus.COMPLETED
+    assert tpl_client.created_payloads[0].start_date == "2026-09-01"
+
+
+async def test_correction_invalid_period_start_is_rejected():
+    service, tpl_client, _ref, _lock = _service()
+
+    outcome = await service.handle_correction(
+        chat_id=_CHAT_ID, ocr_message_id=48, ocr_message_text=_ocr_message(),
+        correction_text="Начало периода: 31.02.2026",
+        operator_user_id=_OPERATOR_ID,
+    )
+
+    assert outcome.state is None
+    assert tpl_client.created_payloads == []
+
+
+async def test_pay_after_midnight_does_not_change_period_start():
+    """Заявка создана ДО полуночи (period_start уже зафиксирован в тексте
+    Telegram-сообщения — см. reader/commands/insurance_ocr.py), оператор
+    подтверждает "pay" ПОСЛЕ полуночи: checkout не должен звать today()
+    заново — start_date payload'а берётся из сохранённого значения, а не из
+    текущих часов сервиса (см. reader/checkout/service.py::_build_payload,
+    resolve_period_start)."""
+    from datetime import datetime, timezone
+
+    def later_clock():  # на день позже полуночи относительно period_start заявки
+        return datetime(2026, 8, 17, 1, 0, tzinfo=timezone.utc)
+
+    service, tpl_client, _ref, _lock = _service_with_real_personal_info(
+        bank_gateway=_completed_gateway(), clock=later_clock,
+    )
+
+    outcome = await service.handle_pay(
+        chat_id=_CHAT_ID, ocr_message_id=49,
+        ocr_message_text=_ocr_message(period_start="16.08.2026"),
+        operator_user_id=_OPERATOR_ID,
+    )
+
+    assert outcome.state.status == CheckoutStatus.COMPLETED
+    assert tpl_client.created_payloads[0].start_date == "2026-08-16"
+
+
+async def test_all_three_new_fields_reach_real_checkout_payload_together():
+    service, tpl_client, reference_data, _lock = _service_with_real_personal_info(
+        bank_gateway=_completed_gateway(),
+    )
+
+    outcome = await service.handle_correction(
+        chat_id=_CHAT_ID, ocr_message_id=50, ocr_message_text=_ocr_message(),
+        correction_text="Банк: liberty\nПериод: 90\nНачало периода: 01.12.2026",
+        operator_user_id=_OPERATOR_ID,
+    )
+
+    assert outcome.state.status == CheckoutStatus.COMPLETED
+    assert tpl_client.redirect_calls[0]["bank"] == PaymentBank.LIBERTY_BANK
+    assert reference_data.category_product_calls == [("passenger_car", "90-D")]
+    assert tpl_client.created_payloads[0].start_date == "2026-12-01"
 
 
 # ---- mapping / reference data ошибки ----

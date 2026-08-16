@@ -36,6 +36,13 @@ _INSURER_SECTION: tuple[ReplyField, ...] = (
     ReplyField("Госномер", "registration_number"),
     ReplyField("Email", "email"),
     ReplyField("Телефон", "phone"),
+    # Checkout-поля заявки (не из OCR — см. docstring OcrResult ниже и
+    # reader/commands/insurance_ocr.py про default'ы): банк-эквайер, период
+    # полиса, дата начала периода. Редактируются correction-reply'ем так же,
+    # как остальные поля (см. reader/checkout/parser.py).
+    ReplyField("Банк", "payment_bank"),
+    ReplyField("Период", "policy_period"),
+    ReplyField("Начало периода", "period_start"),
 )
 _DRIVER_SECTION: tuple[ReplyField, ...] = (
     ReplyField("Водитель = страхователь", "driver_same_as_policyholder", is_flag=True),
@@ -96,10 +103,21 @@ class OcrResult:
 
     passport_number/citizenship — из паспорта страхователя. category/
     manufacturer/model/vin/chassis_number/registration_number — из
-    техпаспорта. email/phone — НЕ распознаются OCR (не часть Structured
-    Output, см. reader/ocr/service.py); попадают в Telegram-сообщение из
-    checkout settings (см. reader/commands/insurance_ocr.py) и могут быть
-    изменены оператором через correction-reply, как и остальные поля.
+    техпаспорта. email/phone/payment_bank/policy_period/period_start — НЕ
+    распознаются OCR (не часть Structured Output, см. reader/ocr/service.py);
+    попадают в Telegram-сообщение как default-значения заявки (см.
+    reader/commands/insurance_ocr.py) и могут быть изменены оператором через
+    correction-reply, как и остальные поля:
+    - payment_bank — "bog"/"liberty" (default "bog"), см.
+      reader/checkout/mapping.py::resolve_payment_bank про реальный
+      PaymentBank/tpl.ge bank ID;
+    - policy_period — "15"/"30"/"90" (default "15", "1-Y" в Telegram-flow не
+      поддерживается), см. reader/checkout/mapping.py::resolve_policy_period;
+    - period_start — "DD.MM.YYYY" (default — календарная дата создания OCR-
+      заявки, вычисленная РОВНО ОДИН РАЗ при формировании черновика и с тех
+      пор хранящаяся в самом тексте Telegram-сообщения — checkout НЕ берёт
+      today() заново при "pay", см. reader/checkout/mapping.py::
+      resolve_period_start).
 
     None у текстового поля — "не найдено/не распознано", а не
     предположение."""
@@ -119,13 +137,16 @@ class OcrResult:
     registration_number: str | None
     email: str | None
     phone: str | None
+    payment_bank: str | None
+    policy_period: str | None
+    period_start: str | None
 
     @property
     def fields_found_count(self) -> int:
         """Только поля, которые реально распознаёт/не распознаёт OCR — без
-        двух bool-флагов (у них всегда есть значение) и без email/phone
-        (это config-defaults, а не результат распознавания документа), см.
-        docstring класса."""
+        двух bool-флагов (у них всегда есть значение) и без email/phone/
+        payment_bank/policy_period/period_start (это config/draft-defaults, а
+        не результат распознавания документа), см. docstring класса."""
         return sum(
             1
             for value in (

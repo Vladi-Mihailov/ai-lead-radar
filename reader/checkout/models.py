@@ -46,14 +46,22 @@ INDIVIDUAL_PERSON_TYPE = "I"
 
 
 class PaymentBank(str, Enum):
-    """Банк-эквайер tpl.ge, жёстко заданный конфигом (checkout.payment_bank,
-    см. задачу: "банк оператор не выбирает"). Единственное подтверждённое
-    browser research'ем значение — Bank of Georgia (URL-путь эквайера
-    "/ecommerce/bog", см. reader/checkout/tpl_client.py). Liberty Bank виден
-    в UI tpl.ge, но его путь эквайера НЕ исследовался — добавлять его сюда
-    без отдельного research means угадывать API, поэтому его здесь нет."""
+    """Банк-эквайер tpl.ge — теперь поле конкретной заявки (Telegram "Банк:
+    bog"/"liberty", см. reader/ocr/models.py::OcrResult и
+    reader/checkout/mapping.py::resolve_payment_bank), а не фиксированный
+    конфигом.
+
+    BANK_OF_GEORGIA — единственное подтверждённое browser research'ом
+    значение, URL-путь эквайера "/ecommerce/bog" (см.
+    reader/checkout/tpl_client.py). LIBERTY_BANK — реальный выбор,
+    существующий в UI tpl.ge, но его путь эквайера НЕ исследован: этот enum
+    описывает сам business-выбор банка (валидное значение Telegram-поля),
+    _BANK_PATH_SEGMENT в tpl_client.py намеренно не содержит для него
+    записи — get_payment_redirect_url() честно откажет с понятной ошибкой
+    вместо угадывания URL."""
 
     BANK_OF_GEORGIA = "bank_of_georgia"
+    LIBERTY_BANK = "liberty_bank"
 
 
 class CheckoutStatus(str, Enum):

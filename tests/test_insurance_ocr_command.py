@@ -5,6 +5,7 @@ Telegram/OpenAI.
 """
 
 import sys
+from datetime import datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -14,11 +15,16 @@ from reader.commands.base import CommandContext, CommandError  # noqa: E402
 from reader.commands.insurance_ocr import InsuranceOcrCommand  # noqa: E402
 from reader.ocr.models import OcrResult  # noqa: E402
 from reader.ocr.service import OcrServiceError  # noqa: E402
+from reader.time_display import TBILISI_TZ  # noqa: E402
 
 _USER_ID = 111
 _CHAT_ID = -100999
 _DEFAULT_EMAIL = "tplgee@mail.ru"
 _DEFAULT_PHONE = "925000000000"
+# Фиксированная "дата создания OCR-заявки" — тесты не должны зависеть от
+# реального today() (см. задачу: "вычислить дату один раз при создании
+# draft, сохранить её").
+_FIXED_NOW = datetime(2026, 8, 16, 23, 59, tzinfo=TBILISI_TZ)
 
 
 class _FakeDocument:
@@ -86,6 +92,7 @@ def _full_result(**overrides) -> OcrResult:
         manufacturer="Toyota", model="RAV4",
         registration_number="A123BC777", vin="JTMBR12345678901", chassis_number=None,
         email=None, phone=None,
+        payment_bank=None, policy_period=None, period_start=None,
     )
     fields.update(overrides)
     return OcrResult(**fields)
@@ -101,12 +108,14 @@ def _ctx(event, args=("ocr",)) -> CommandContext:
 def _command(
     ocr_service=None, *, allowed_user_ids=(_USER_ID,),
     default_email=_DEFAULT_EMAIL, default_phone=_DEFAULT_PHONE,
+    clock=None,
 ) -> InsuranceOcrCommand:
     return InsuranceOcrCommand(
         ocr_service or _FakeOcrService(),
         allowed_user_ids=list(allowed_user_ids),
         default_email=default_email,
         default_phone=default_phone,
+        clock=clock or (lambda: _FIXED_NOW),
     )
 
 
@@ -262,6 +271,7 @@ async def test_all_fields_empty_result_replies_with_nothing_recognized_error():
         manufacturer=None, model=None,
         registration_number=None, vin=None, chassis_number=None,
         email=None, phone=None,
+        payment_bank=None, policy_period=None, period_start=None,
     )
     command = _command(_FakeOcrService(result=empty))
 
@@ -468,6 +478,54 @@ async def test_missing_contact_defaults_show_not_recognized():
     reply = event.replies[0]
     assert "Email: не распознано" in reply
     assert "Телефон: не распознано" in reply
+
+
+# ---- Банк/Период/Начало периода: default-значения новой checkout-заявки ----
+
+
+async def test_default_payment_bank_is_bog():
+    event = _FakeEvent(photo=object())
+    command = _command(_FakeOcrService(result=_full_result()))
+
+    await command.handle(_ctx(event))
+
+    assert "Банк: bog" in event.replies[0]
+
+
+async def test_default_policy_period_is_15():
+    event = _FakeEvent(photo=object())
+    command = _command(_FakeOcrService(result=_full_result()))
+
+    await command.handle(_ctx(event))
+
+    assert "Период: 15" in event.replies[0]
+
+
+async def test_default_period_start_is_ocr_draft_creation_date():
+    """Начало периода — календарная дата создания ИМЕННО ЭТОГО OCR-
+    черновика (см. reader/commands/insurance_ocr.py про clock), а не
+    произвольная "сегодня"."""
+    event = _FakeEvent(photo=object())
+    command = _command(_FakeOcrService(result=_full_result()), clock=lambda: _FIXED_NOW)
+
+    await command.handle(_ctx(event))
+
+    assert "Начало периода: 16.08.2026" in event.replies[0]
+
+
+async def test_ocr_recognized_bank_period_and_period_start_are_not_overridden_by_defaults():
+    """Defensive (см. аналогичный тест для email/phone) — если бы OCR
+    (гипотетически) уже вернул эти поля, дефолт не должен их затирать."""
+    event = _FakeEvent(photo=object())
+    result = _full_result(payment_bank="liberty", policy_period="30", period_start="01.01.2026")
+    command = _command(_FakeOcrService(result=result))
+
+    await command.handle(_ctx(event))
+
+    reply = event.replies[0]
+    assert "Банк: liberty" in reply
+    assert "Период: 30" in reply
+    assert "Начало периода: 01.01.2026" in reply
 
 
 # ---- права доступа (unauthorized sender) — на уровне альбома, т.к. для

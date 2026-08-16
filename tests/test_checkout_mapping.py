@@ -13,9 +13,13 @@ import pytest  # noqa: E402
 from reader.checkout.mapping import (  # noqa: E402
     MappingError,
     required_vehicle_fields_missing,
+    resolve_payment_bank,
+    resolve_period_start,
+    resolve_policy_period,
     sanitize_registration_number,
     select_frame_number,
 )
+from reader.checkout.models import PaymentBank  # noqa: E402
 from reader.ocr.models import OcrResult  # noqa: E402
 
 
@@ -36,6 +40,9 @@ def _full_result(**overrides) -> OcrResult:
         chassis_number=None,
         email="tplgee@mail.ru",
         phone="925000000000",
+        payment_bank="bog",
+        policy_period="15",
+        period_start="16.08.2026",
     )
     fields.update(overrides)
     return OcrResult(**fields)
@@ -138,3 +145,77 @@ def test_owner_same_as_policyholder_false_without_full_name_blocks_checkout():
 def test_owner_same_as_policyholder_false_with_full_name_is_not_missing():
     result = _full_result(owner_same_as_policyholder=False, owner_full_name="Sidorov Petr")
     assert "Владелец" not in required_vehicle_fields_missing(result)
+
+
+# ---- required_vehicle_fields_missing: Банк/Период/Начало периода ----
+
+
+def test_required_vehicle_fields_missing_flags_absent_payment_bank():
+    result = _full_result(payment_bank=None)
+    assert "Банк" in required_vehicle_fields_missing(result)
+
+
+def test_required_vehicle_fields_missing_flags_absent_policy_period():
+    result = _full_result(policy_period=None)
+    assert "Период" in required_vehicle_fields_missing(result)
+
+
+def test_required_vehicle_fields_missing_flags_absent_period_start():
+    result = _full_result(period_start=None)
+    assert "Начало периода" in required_vehicle_fields_missing(result)
+
+
+# ---- resolve_payment_bank: "bog"/"liberty" -> PaymentBank ----
+
+
+def test_resolve_payment_bank_bog_maps_to_bank_of_georgia():
+    assert resolve_payment_bank("bog") == PaymentBank.BANK_OF_GEORGIA
+
+
+def test_resolve_payment_bank_liberty_maps_to_liberty_bank():
+    """"liberty" — реальный выбор в UI tpl.ge, не придуманное значение (см.
+    reader/checkout/models.py::PaymentBank) — но его ecommerce-путь не
+    подтверждён research'ом (см. reader/checkout/tpl_client.py, не тронут
+    этой задачей)."""
+    assert resolve_payment_bank("liberty") == PaymentBank.LIBERTY_BANK
+
+
+def test_resolve_payment_bank_rejects_unknown_value():
+    with pytest.raises(MappingError):
+        resolve_payment_bank("tbc")
+
+
+# ---- resolve_policy_period: "15"/"30"/"90" -> "<N>-D" ----
+
+
+@pytest.mark.parametrize("value,expected", [("15", "15-D"), ("30", "30-D"), ("90", "90-D")])
+def test_resolve_policy_period_maps_to_tpl_ge_period_format(value, expected):
+    assert resolve_policy_period(value) == expected
+
+
+def test_resolve_policy_period_rejects_annual_period():
+    """1-Y (годовой полис) в Telegram-flow сознательно не поддерживается."""
+    with pytest.raises(MappingError):
+        resolve_policy_period("1-Y")
+
+
+def test_resolve_policy_period_rejects_unsupported_value():
+    with pytest.raises(MappingError):
+        resolve_policy_period("365")
+
+
+# ---- resolve_period_start: "ДД.ММ.ГГГГ" -> "YYYY-MM-DD" ----
+
+
+def test_resolve_period_start_converts_to_iso_format():
+    assert resolve_period_start("16.08.2026") == "2026-08-16"
+
+
+def test_resolve_period_start_rejects_invalid_date():
+    with pytest.raises(MappingError):
+        resolve_period_start("31.02.2026")  # 31 февраля не существует
+
+
+def test_resolve_period_start_rejects_malformed_string():
+    with pytest.raises(MappingError):
+        resolve_period_start("2026-08-16")

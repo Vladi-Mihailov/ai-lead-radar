@@ -1,10 +1,12 @@
 import logging
 from dataclasses import replace
-from typing import Protocol
+from datetime import date, datetime
+from typing import Callable, Protocol
 
 from reader.commands.base import Command, CommandContext, CommandError, CommandResult
 from reader.ocr.models import REPLY_SECTIONS, OcrResult
 from reader.ocr.service import OcrServiceError
+from reader.time_display import TBILISI_TZ
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,14 @@ _OCR_FAILED_ERROR = "Не удалось получить ответ серви�
 _NOTHING_RECOGNIZED_ERROR = "Не удалось распознать документ. Попробуйте прислать более чёткое фото."
 
 _NOT_RECOGNIZED = "не распознано"
+
+# Default-значения новой checkout-заявки (см. reader/ocr/models.py::OcrResult)
+# — НЕ из config, фиксированы бизнес-требованием: банк-эквайер и период
+# полиса оператор чаще всего не меняет, дата начала периода — календарная
+# дата создания ИМЕННО ЭТОГО OCR-черновика (см. _process_and_reply).
+_DEFAULT_PAYMENT_BANK = "bog"
+_DEFAULT_POLICY_PERIOD = "15"
+_PERIOD_START_FORMAT = "%d.%m.%Y"
 
 
 class OcrServiceLike(Protocol):
@@ -57,17 +67,31 @@ def _is_ocr_trigger(text: str | None) -> bool:
     return len(parts) >= 2 and parts[0].lower() == "insurance" and parts[1].lower() == "ocr"
 
 
-def _with_contact_defaults(result: OcrResult, *, default_email: str | None, default_phone: str | None) -> OcrResult:
-    """email/phone не распознаются OCR (см. reader/ocr/models.py::OcrResult) —
-    заполняются значением из checkout settings ДО того, как Telegram-текст
-    сформирован, чтобы оператор мог их скорректировать тем же
-    correction-reply, что и остальные поля (единственная запись о
-    распознанных/эффективных полях — сам текст сообщения, см.
-    reader/checkout/parser.py)."""
+def _with_draft_defaults(
+    result: OcrResult,
+    *,
+    default_email: str | None,
+    default_phone: str | None,
+    today: date,
+) -> OcrResult:
+    """email/phone/payment_bank/policy_period/period_start не распознаются
+    OCR (см. reader/ocr/models.py::OcrResult) — заполняются default-
+    значениями ДО того, как Telegram-текст сформирован, чтобы оператор мог
+    их скорректировать тем же correction-reply, что и остальные поля
+    (единственная запись о распознанных/эффективных полях — сам текст
+    сообщения, см. reader/checkout/parser.py).
+
+    today — календарная дата создания ИМЕННО ЭТОГО черновика (см.
+    _process_and_reply, вызывается один раз за обработку), а не today()
+    заново при каждом обращении — иначе "Начало периода" молча съезжало бы,
+    если оператор подтвердит заявку позже/после полуночи (см. задачу)."""
     return replace(
         result,
         email=result.email or default_email,
         phone=result.phone or default_phone,
+        payment_bank=result.payment_bank or _DEFAULT_PAYMENT_BANK,
+        policy_period=result.policy_period or _DEFAULT_POLICY_PERIOD,
+        period_start=result.period_start or today.strftime(_PERIOD_START_FORMAT),
     )
 
 
@@ -124,11 +148,15 @@ class InsuranceOcrCommand(Command):
         allowed_user_ids: list[int],
         default_email: str | None = None,
         default_phone: str | None = None,
+        clock: Callable[[], datetime] | None = None,
     ):
         self._ocr_service = ocr_service
         self._allowed_user_ids = set(allowed_user_ids)
         self._default_email = default_email
         self._default_phone = default_phone
+        # Тбилисская дата, а не UTC/naive — тот же часовой пояс, что и у
+        # остального оператор-фейсинг вывода (см. reader/time_display.py).
+        self._clock = clock or (lambda: datetime.now(TBILISI_TZ))
 
     async def handle(self, ctx: CommandContext) -> CommandResult:
         if not ctx.args or ctx.args[0].lower() != "ocr":
@@ -195,8 +223,14 @@ class InsuranceOcrCommand(Command):
             await trigger.reply(_NOTHING_RECOGNIZED_ERROR)
             return
 
-        result = _with_contact_defaults(
-            result, default_email=self._default_email, default_phone=self._default_phone,
+        # Дата вычисляется РОВНО ОДИН РАЗ здесь (не заново при "pay" —
+        # см. reader/checkout/mapping.py::resolve_period_start) и с этого
+        # момента живёт только в тексте сообщения, как и остальные поля.
+        result = _with_draft_defaults(
+            result,
+            default_email=self._default_email,
+            default_phone=self._default_phone,
+            today=self._clock().date(),
         )
         await trigger.reply(_format_result(result))
 

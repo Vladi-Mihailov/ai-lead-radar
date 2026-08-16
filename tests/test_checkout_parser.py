@@ -34,7 +34,10 @@ def _full_ocr_message() -> str:
         "Номер шасси: не распознано\n"
         "Госномер: AA001AA\n"
         "Email: tplgee@mail.ru\n"
-        "Телефон: 925000000000\n\n"
+        "Телефон: 925000000000\n"
+        "Банк: bog\n"
+        "Период: 15\n"
+        "Начало периода: 16.08.2026\n\n"
         "Водитель = страхователь: -\n"
         "Водитель: Petrov Petr\n\n"
         "Владелец = страхователь: +\n"
@@ -60,6 +63,9 @@ def _full_ocr_result() -> OcrResult:
         registration_number="AA001AA",
         email="tplgee@mail.ru",
         phone="925000000000",
+        payment_bank="bog",
+        policy_period="15",
+        period_start="16.08.2026",
     )
 
 
@@ -164,6 +170,50 @@ def test_parse_correction_reply_error_message_lists_expected_format():
         parse_correction_reply("абракадабра")
     assert "pay" in str(exc_info.value)
     assert "Марка" in str(exc_info.value)
+
+
+# ---- parse_correction_reply: Банк/Период/Начало периода ----
+
+
+def test_parse_correction_reply_default_bank_is_accepted():
+    assert parse_correction_reply("Банк: bog") == {"payment_bank": "bog"}
+
+
+def test_parse_correction_reply_accepts_liberty_bank_correction():
+    assert parse_correction_reply("Банк: liberty") == {"payment_bank": "liberty"}
+
+
+def test_parse_correction_reply_rejects_invalid_bank():
+    with pytest.raises(ReplyParseError, match="Банк"):
+        parse_correction_reply("Банк: tbc")
+
+
+@pytest.mark.parametrize("value", ["15", "30", "90"])
+def test_parse_correction_reply_accepts_all_valid_policy_periods(value):
+    assert parse_correction_reply(f"Период: {value}") == {"policy_period": value}
+
+
+@pytest.mark.parametrize("value", ["1-Y", "365", "60", "1"])
+def test_parse_correction_reply_rejects_invalid_policy_period(value):
+    """"1-Y" (годовой полис) в Telegram-flow сознательно не поддерживается —
+    как и любое другое значение вне 15/30/90."""
+    with pytest.raises(ReplyParseError, match="Период"):
+        parse_correction_reply(f"Период: {value}")
+
+
+def test_parse_correction_reply_accepts_valid_period_start():
+    corrections = parse_correction_reply("Начало периода: 01.03.2026")
+    assert corrections == {"period_start": "01.03.2026"}
+
+
+@pytest.mark.parametrize("value", ["31.02.2026", "1.3.2026", "01/03/2026", "2026-03-01", "00.03.2026", "01.13.2026"])
+def test_parse_correction_reply_rejects_invalid_period_start(value):
+    with pytest.raises(ReplyParseError, match="Начало периода"):
+        parse_correction_reply(f"Начало периода: {value}")
+
+
+def test_parse_correction_reply_not_recognized_marker_clears_period_start():
+    assert parse_correction_reply("Начало периода: не распознано") == {"period_start": None}
 
 
 # ---- parse_correction_reply: флаги "Водитель/Владелец = страхователь" ----
@@ -311,6 +361,7 @@ def _ocr_result_with_power_of_attorney_owner() -> OcrResult:
         category="passenger_car", manufacturer="Toyota", model="Camry",
         vin="JTMBR12345678901", chassis_number=None, registration_number="AA001AA",
         email="tplgee@mail.ru", phone="925000000000",
+        payment_bank="bog", policy_period="15", period_start="16.08.2026",
     )
 
 
@@ -334,3 +385,36 @@ def test_correction_reply_can_clear_power_of_attorney_owner_by_switching_flag_to
     updated = apply_corrections(original, corrections)
 
     assert updated.owner_same_as_policyholder is True
+
+
+# ---- apply_corrections: Банк/Период/Начало периода ----
+
+
+def test_apply_corrections_can_change_bank_from_default():
+    original = parse_ocr_message(_full_ocr_message())  # payment_bank="bog"
+    corrections = parse_correction_reply("Банк: liberty")
+
+    updated = apply_corrections(original, corrections)
+
+    assert updated.payment_bank == "liberty"
+
+
+def test_apply_corrections_can_change_policy_period():
+    original = parse_ocr_message(_full_ocr_message())  # policy_period="15"
+    corrections = parse_correction_reply("Период: 30")
+
+    updated = apply_corrections(original, corrections)
+
+    assert updated.policy_period == "30"
+
+
+def test_apply_corrections_can_change_period_start():
+    original = parse_ocr_message(_full_ocr_message())  # period_start="16.08.2026"
+    corrections = parse_correction_reply("Начало периода: 01.09.2026")
+
+    updated = apply_corrections(original, corrections)
+
+    assert updated.period_start == "01.09.2026"
+    # остальное не изменилось
+    assert updated.payment_bank == original.payment_bank
+    assert updated.policy_period == original.policy_period
