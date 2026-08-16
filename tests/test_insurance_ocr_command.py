@@ -76,6 +76,8 @@ def _full_result(**overrides) -> OcrResult:
         owner_full_name="Иванов Иван Иванович",
         driver_full_name="Петров Пётр Петрович",
         policyholder_full_name="Петров Пётр Петрович",
+        passport_number="AB1234567",
+        citizenship="Georgia",
         category="passenger_car",
         registration_number="A123BC777", vin="JTMBR12345678901", chassis_number=None,
         manufacturer="Toyota", model="RAV4",
@@ -196,6 +198,8 @@ async def test_openai_success_shows_all_fields():
     assert "Собственник: Иванов Иван Иванович" in reply
     assert "Водитель: Петров Пётр Петрович" in reply
     assert "Страхователь: Петров Пётр Петрович" in reply
+    assert "Номер паспорта: AB1234567" in reply
+    assert "Гражданство: Georgia" in reply
     assert "Категория: passenger_car" in reply
     assert "Марка: Toyota" in reply
     assert "Модель: RAV4" in reply
@@ -209,6 +213,7 @@ async def test_partial_result_shows_not_recognized_for_missing_fields():
     partial = _full_result(
         vin=None, chassis_number=None, category=None,
         owner_full_name=None, driver_full_name=None, policyholder_full_name=None,
+        passport_number=None, citizenship=None,
     )
     command = _command(_FakeOcrService(result=partial))
 
@@ -220,6 +225,8 @@ async def test_partial_result_shows_not_recognized_for_missing_fields():
     assert "Собственник: не распознано" in reply
     assert "Водитель: не распознано" in reply
     assert "Страхователь: не распознано" in reply
+    assert "Номер паспорта: не распознано" in reply
+    assert "Гражданство: не распознано" in reply
     assert "Категория: не распознано" in reply
     assert "Марка: Toyota" in reply
 
@@ -239,6 +246,7 @@ async def test_all_fields_empty_result_replies_with_nothing_recognized_error():
     event = _FakeEvent(photo=object())
     empty = OcrResult(
         owner_full_name=None, driver_full_name=None, policyholder_full_name=None,
+        passport_number=None, citizenship=None,
         category=None,
         registration_number=None, vin=None, chassis_number=None,
         manufacturer=None, model=None,

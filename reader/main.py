@@ -9,6 +9,19 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import httpx  # noqa: E402
 
+from reader.checkout.lock_repository import CheckoutLockRepository  # noqa: E402
+from reader.checkout.models import PaymentBank  # noqa: E402
+from reader.checkout.payment_gateway import (  # noqa: E402
+    CardSecrets,
+    CardSecretsError,
+    PlaywrightBankGatewayClient,
+    PlaywrightBrowserLauncher,
+)
+from reader.checkout.personal_info import OcrPersonalInfoProvider  # noqa: E402
+from reader.checkout.reference_data import TplReferenceDataClient  # noqa: E402
+from reader.checkout.service import CheckoutService  # noqa: E402
+from reader.checkout.telegram_integration import CheckoutReplyHandler  # noqa: E402
+from reader.checkout.tpl_client import TplGeClient  # noqa: E402
 from reader.commands.album_collector import AlbumCollector  # noqa: E402
 from reader.commands.dispatcher import CommandDispatcher  # noqa: E402
 from reader.commands.fine import FineCommand  # noqa: E402
@@ -247,12 +260,67 @@ def build_insurance_ocr_components(
     return command_dispatcher, insurance_command, album_collector
 
 
+def is_checkout_configured(settings: Settings) -> bool:
+    """checkout.payment_bank и checkout.policy_period оба обязательны (см.
+    reader/settings.py::CheckoutSettings) — как и с "insurance ocr", их
+    отсутствие означает "функциональность не поднята", а не ошибку запуска."""
+    return bool(settings.checkout.payment_bank and settings.checkout.policy_period)
+
+
+def build_checkout_components(
+    settings: Settings,
+    source: TelegramSource,
+    http_client: httpx.AsyncClient,
+    *,
+    card_secrets: CardSecrets | None = None,
+) -> CheckoutReplyHandler:
+    """Чистая сборка зависимостей checkout tpl.ge (см. reader/checkout/) —
+    без единого await, тот же приём, что и build_insurance_ocr_components.
+    Работает в ТОМ ЖЕ служебном чате и с теми же allowed_user_ids, что и
+    "insurance ocr" (см. reader/settings.py::CheckoutSettings) — отдельного
+    chat_id для checkout нет.
+
+    card_secrets — если не передан явно, читается из окружения
+    (CardSecrets.load(), см. reader/checkout/payment_gateway.py) — параметр
+    существует ради тестируемости (см. test_main_wiring.py), в реальном
+    запуске (_run_insurance_ocr) не передаётся."""
+    checkout = settings.checkout
+    tpl_client = TplGeClient(http_client)
+    reference_data = TplReferenceDataClient(http_client)
+    # phone/email гарантированно заданы здесь (см. reader/settings.py::
+    # load_settings — fail-fast, если payment_bank задан без них).
+    personal_info_provider = OcrPersonalInfoProvider(
+        reference_data=reference_data, phone=checkout.phone, email=checkout.email,
+    )
+    card_secrets = card_secrets if card_secrets is not None else CardSecrets.load()
+    bank_gateway = PlaywrightBankGatewayClient(
+        launcher=PlaywrightBrowserLauncher(), card_secrets=card_secrets,
+    )
+    lock_repository = CheckoutLockRepository(settings.app.users_db_file)
+    checkout_service = CheckoutService(
+        tpl_client=tpl_client,
+        reference_data=reference_data,
+        payment_bank=PaymentBank(checkout.payment_bank),
+        policy_period=checkout.policy_period,
+        lock_repository=lock_repository,
+        personal_info_provider=personal_info_provider,
+        bank_gateway=bank_gateway,
+    )
+    return CheckoutReplyHandler(
+        checkout_service=checkout_service, allowed_user_ids=settings.ocr.allowed_user_ids,
+    )
+
+
 async def _run_insurance_ocr(settings: Settings, source: TelegramSource) -> None:
     """"insurance ocr" — свой CommandDispatcher (свой служебный чат, не
     Fine Monitor, см. задачу) плюс AlbumCollector, зарегистрированный ещё
     одним независимым NewMessage-handler'ом на том же чате (см.
-    reader/commands/album_collector.py) — на том же Telegram-клиенте, что
-    и основной Reader, второе подключение не создаётся.
+    reader/commands/album_collector.py), плюс (если настроен, см.
+    is_checkout_configured) CheckoutReplyHandler (см. reader/checkout/) —
+    ещё один независимый NewMessage-handler на том же чате, реагирующий на
+    reply "pay"/исправленными полями на "Распознано: ..." (см. задачу про
+    checkout tpl.ge). На том же Telegram-клиенте, что и основной Reader,
+    второе подключение не создаётся.
 
     Никогда не завершается сама по себе (await asyncio.Event().wait() —
     вся работа происходит в зарегистрированных event handler'ах), как и
@@ -269,7 +337,39 @@ async def _run_insurance_ocr(settings: Settings, source: TelegramSource) -> None
 
     logger.info("Insurance OCR command enabled (chat=%s)", settings.ocr.service_chat_id)
 
-    await asyncio.Event().wait()
+    checkout_http_client: httpx.AsyncClient | None = None
+    try:
+        if is_checkout_configured(settings):
+            try:
+                card_secrets = CardSecrets.load()
+            except CardSecretsError as exc:
+                # Fail-fast, но только для checkout — не роняем весь Reader
+                # (тот же приём, что и с пустым ocr.allowed_user_ids). str(exc)
+                # безопасен для лога — перечисляет только ИМЕНА переменных
+                # окружения, никогда их значения (см.
+                # reader/checkout/payment_gateway.py::CardSecrets).
+                logger.warning("Checkout tpl.ge disabled: %s", exc)
+                card_secrets = None
+
+            if card_secrets is not None:
+                checkout_http_client = httpx.AsyncClient()
+                checkout_handler = build_checkout_components(
+                    settings, source, checkout_http_client, card_secrets=card_secrets,
+                )
+                await checkout_handler.start(source.client, settings.ocr.service_chat_id)
+                logger.info(
+                    "Checkout tpl.ge enabled (bank=%s, period=%s)",
+                    settings.checkout.payment_bank, settings.checkout.policy_period,
+                )
+        else:
+            logger.info(
+                "Checkout tpl.ge disabled (checkout.payment_bank/policy_period не заданы)"
+            )
+
+        await asyncio.Event().wait()
+    finally:
+        if checkout_http_client is not None:
+            await checkout_http_client.aclose()
 
 
 async def _run_concurrently(coroutines: list) -> None:

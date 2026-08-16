@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import time
 from pathlib import Path
 
@@ -9,6 +10,11 @@ from pydantic import BaseModel, Field
 
 class ConfigError(Exception):
     """Ошибка загрузки или валидации конфигурации."""
+
+
+# см. reader/settings.py::CheckoutSettings и reader/checkout/models.py::PaymentBank
+_VALID_PAYMENT_BANKS = {"bank_of_georgia"}
+_POLICY_PERIOD_RE = re.compile(r"^\d+-[DY]$")
 
 
 _LEGACY_SESSION_NAME = "reader_session"
@@ -147,6 +153,40 @@ class InviterSettings(BaseModel):
     worker: InviterWorkerSettings = Field(default_factory=InviterWorkerSettings)
 
 
+class CheckoutSettings(BaseModel):
+    """Оформление полиса ОСАГО на tpl.ge по reply "pay"/исправленным полям
+    на "insurance ocr" (см. reader/checkout/). Работает в ТОМ ЖЕ служебном
+    чате и с теми же ocr.allowed_user_ids, что и "insurance ocr" — не имеет
+    собственного chat_id/allowed_user_ids (см. reader/main.py).
+
+    payment_bank — банк-эквайер задан ЖЁСТКО конфигом (см. задачу: "банк
+    оператор не выбирает"), единственное подтверждённое browser research'ом
+    значение — "bank_of_georgia" (см. reader/checkout/models.py::PaymentBank).
+
+    policy_period — период полиса ("15-D"/"30-D"/"90-D"/"1-Y", см.
+    reader/checkout/reference_data.py::parse_policy_period) — тоже фиксированный
+    конфигом, а не выбирается оператором за отсутствием этого шага в
+    Telegram-flow задачи.
+
+    phone/email — ОДНО и то же значение для ВСЕХ заявок (см. задачу:
+    "Для всех заявок") — используется как identification_number- независимые
+    контактные данные во всех трёх ролях payload'а (страхователь/водитель/
+    собственник), см. reader/checkout/personal_info.py::OcrPersonalInfoProvider.
+    Текущее production-значение зафиксировано в config/config.yaml — не
+    секрет (телефон/email агентства, не персональные данные клиента),
+    поэтому в config.yaml, а не в .env.
+
+    Все четыре поля None по умолчанию — checkout просто не поднимается (см.
+    reader/main.py), как и "insurance ocr" при пустых ocr.service_chat_id/
+    OPENAI_API_KEY. Если payment_bank задан (checkout включается) —
+    policy_period/phone/email обязаны быть заданы тоже (см. load_settings)."""
+
+    payment_bank: str | None = None
+    policy_period: str | None = None
+    phone: str | None = None
+    email: str | None = None
+
+
 class OcrSettings(BaseModel):
     """`insurance ocr` — распознавание документов автомобиля через OpenAI
     (см. reader/ocr/, reader/commands/insurance_ocr.py). Независимая от
@@ -176,6 +216,7 @@ class Settings(BaseModel):
     fine_monitor: FineMonitorSettings
     inviter: InviterSettings = Field(default_factory=InviterSettings)
     ocr: OcrSettings = Field(default_factory=OcrSettings)
+    checkout: CheckoutSettings = Field(default_factory=CheckoutSettings)
 
 
 def load_settings(config_path: Path) -> Settings:
@@ -219,6 +260,43 @@ def load_settings(config_path: Path) -> Settings:
     inviter_raw = raw.get("inviter", {})
     inviter_worker_raw = inviter_raw.get("worker", {})
     ocr_raw = raw.get("ocr", {})
+    checkout_raw = raw.get("checkout", {})
+
+    payment_bank = checkout_raw.get("payment_bank") or None
+    if payment_bank is not None and payment_bank not in _VALID_PAYMENT_BANKS:
+        raise ConfigError(
+            f"checkout.payment_bank='{payment_bank}' не поддержан. Единственное "
+            f"подтверждённое browser research'ом значение: "
+            + ", ".join(sorted(_VALID_PAYMENT_BANKS))
+        )
+
+    policy_period = checkout_raw.get("policy_period") or None
+    if policy_period is not None and not _POLICY_PERIOD_RE.match(policy_period):
+        raise ConfigError(
+            f"checkout.policy_period='{policy_period}' имеет неверный формат — "
+            "ожидается <число>-D или <число>-Y (например, 30-D или 1-Y), см. "
+            "reader/checkout/reference_data.py::parse_policy_period"
+        )
+
+    checkout_phone = checkout_raw.get("phone") or None
+    checkout_email = checkout_raw.get("email") or None
+
+    if payment_bank is not None:
+        missing_checkout_fields = [
+            name
+            for name, value in [
+                ("policy_period", policy_period),
+                ("phone", checkout_phone),
+                ("email", checkout_email),
+            ]
+            if not value
+        ]
+        if missing_checkout_fields:
+            raise ConfigError(
+                "checkout.payment_bank задан, но не заданы: "
+                + ", ".join(f"checkout.{name}" for name in missing_checkout_fields)
+                + " — все обязательны для включения checkout (см. reader/settings.py::CheckoutSettings)"
+            )
 
     # Имя live-сессии: TELEGRAM_SESSION_NAME (.env) имеет приоритет над
     # session_name_live (config.yaml), а если ничего не задано — reader_live.
@@ -342,6 +420,12 @@ def load_settings(config_path: Path) -> Settings:
                 ),
                 allowed_user_ids=list(ocr_raw.get("allowed_user_ids", [])),
                 album_debounce_seconds=float(ocr_raw.get("album_debounce_seconds", 1.5)),
+            ),
+            checkout=CheckoutSettings(
+                payment_bank=payment_bank,
+                policy_period=policy_period,
+                phone=checkout_phone,
+                email=checkout_email,
             ),
         )
     except (KeyError, ValueError) as exc:

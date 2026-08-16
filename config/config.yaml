@@ -115,3 +115,34 @@ ocr:
   # Сколько секунд без новых сообщений той же альбомной группы ждать, прежде
   # чем считать альбом (несколько фото одной командой) собранным целиком.
   album_debounce_seconds: 1.5
+
+# Оформление полиса ОСАГО на tpl.ge по reply "pay"/исправленным полям на
+# сообщение "insurance ocr" (см. reader/checkout/). Работает в ТОМ ЖЕ чате
+# и с теми же ocr.allowed_user_ids, что и insurance ocr выше — отдельного
+# chat_id/allowed_user_ids здесь нет.
+#
+# payment_bank/policy_period/phone/email — ВСЕ ЧЕТЫРЕ обязательны для
+# включения: если payment_bank задан, а любое из остальных трёх — нет,
+# load_settings() откажется запускаться (fail-fast, см. reader/settings.py).
+#
+# identification_number/citizenship страхователя (для payload tpl.ge)
+# приходят из OCR/исправленного reply (см. reader/checkout/personal_info.py
+# ::OcrPersonalInfoProvider) — используются для ВСЕХ трёх ролей payload'а
+# (страхователь/водитель/собственник), отдельных номеров для водителя и
+# собственника пока нет (бизнес-решение, см. задачу).
+checkout:
+  # Банк-эквайер — ОПЕРАТОР ЕГО НЕ ВЫБИРАЕТ, значение фиксировано конфигом.
+  # Единственное подтверждённое browser research'ом значение:
+  # bank_of_georgia (см. reader/checkout/models.py::PaymentBank). Не
+  # заполнено по умолчанию — заполните перед включением.
+  payment_bank:
+  # Период полиса — "15-D"/"30-D"/"90-D"/"1-Y" (см.
+  # reader/checkout/reference_data.py::parse_policy_period). Telegram-flow
+  # задачи не предусматривает выбор периода оператором, поэтому он тоже
+  # фиксирован конфигом. Не заполнено по умолчанию — заполните перед включением.
+  policy_period:
+  # Телефон/email — ОДНИ И ТЕ ЖЕ для ВСЕХ заявок (не персональные данные
+  # клиента, контакты агентства — поэтому здесь, а не в .env). Текущая
+  # production-конфигурация, зафиксированная задачей.
+  phone: "925000000000"
+  email: "tplgee@mail.ru"

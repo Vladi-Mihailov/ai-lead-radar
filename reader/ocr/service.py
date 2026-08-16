@@ -46,6 +46,17 @@ class _VehicleFieldsSchema(BaseModel):
     owner_full_name: str | None
     driver_full_name: str | None
     policyholder_full_name: str | None
+    # Номер паспорта/ID СТРАХОВАТЕЛЯ — только из паспорта/ID, отдельного от
+    # техпаспорта/прав документа (см. reader/ocr/prompt.py и
+    # reader/ocr/models.py::OcrResult про источник и назначение — checkout
+    # tpl.ge). Свободная строка (не Literal) — в отличие от category,
+    # значений здесь не 3 штуки, а произвольный номер документа.
+    passport_number: str | None
+    # Свободная строка (название страны на английском, см.
+    # reader/ocr/prompt.py) — сопоставление со справочником tpl.ge
+    # происходит вне OCR (см. reader/checkout/reference_data.py), поэтому
+    # здесь не Literal с фиксированным списком стран.
+    citizenship: str | None
     # Литерал, а не str — "никаких произвольных значений category" (см.
     # задачу) обеспечивается самой schema (strict-режим Structured
     # Outputs): модель структурно не может вернуть ничего, кроме этих трёх
@@ -134,6 +145,8 @@ class OcrService:
             owner_full_name=_clean(parsed.owner_full_name),
             driver_full_name=_clean(parsed.driver_full_name),
             policyholder_full_name=_clean(parsed.policyholder_full_name),
+            passport_number=_clean(parsed.passport_number),
+            citizenship=_clean(parsed.citizenship),
             # category — уже ограничен enum'ом на уровне schema (см.
             # _VehicleFieldsSchema.category), _clean() ему не нужен: это не
             # свободный текст, который может прийти с лишними пробелами.

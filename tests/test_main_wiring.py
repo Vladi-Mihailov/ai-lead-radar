@@ -18,6 +18,18 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import httpx  # noqa: E402
 import pytest  # noqa: E402
 
+from reader.checkout.lock_repository import CheckoutLockRepository  # noqa: E402
+from reader.checkout.models import PaymentBank  # noqa: E402
+from reader.checkout.payment_gateway import (  # noqa: E402
+    CardSecrets,
+    PlaywrightBankGatewayClient,
+    PlaywrightBrowserLauncher,
+)
+from reader.checkout.personal_info import OcrPersonalInfoProvider  # noqa: E402
+from reader.checkout.reference_data import TplReferenceDataClient  # noqa: E402
+from reader.checkout.service import CheckoutService  # noqa: E402
+from reader.checkout.telegram_integration import CheckoutReplyHandler  # noqa: E402
+from reader.checkout.tpl_client import TplGeClient  # noqa: E402
 from reader.commands.album_collector import AlbumCollector  # noqa: E402
 from reader.commands.dispatcher import CommandDispatcher  # noqa: E402
 from reader.commands.fine import FineCommand  # noqa: E402
@@ -31,8 +43,10 @@ from reader.jobs.archive_fine_job import ArchiveFineJob  # noqa: E402
 from reader.jobs.fine_job import FineJob  # noqa: E402
 from reader.jobs.scheduler import Scheduler  # noqa: E402
 from reader.main import (  # noqa: E402
+    build_checkout_components,
     build_fine_monitor_components,
     build_insurance_ocr_components,
+    is_checkout_configured,
     resolve_allowed_user_ids,
     resolve_notification_chat_ids,
     validate_fine_monitor_config,
@@ -425,3 +439,163 @@ async def test_build_insurance_ocr_components_wires_dependencies_correctly(tmp_p
         assert album_collector._on_group_ready == insurance_command.handle_album
     finally:
         user_repository.close()
+
+
+# ---- checkout (tpl.ge) ----
+
+
+def test_load_settings_defaults_checkout_section(tmp_path, monkeypatch):
+    _set_required_env(monkeypatch)
+    config_path = _write_config(tmp_path, _CONFIG_YAML)
+
+    settings = load_settings(config_path)
+
+    assert settings.checkout.payment_bank is None
+    assert settings.checkout.policy_period is None
+    assert settings.checkout.phone is None
+    assert settings.checkout.email is None
+    assert is_checkout_configured(settings) is False
+
+
+def test_load_settings_parses_explicit_checkout_section(tmp_path, monkeypatch):
+    _set_required_env(monkeypatch)
+    config_with_checkout = _CONFIG_YAML + (
+        "\ncheckout:\n"
+        "  payment_bank: bank_of_georgia\n"
+        "  policy_period: 30-D\n"
+        '  phone: "925000000000"\n'
+        '  email: "tplgee@mail.ru"\n'
+    )
+    config_path = _write_config(tmp_path, config_with_checkout)
+
+    settings = load_settings(config_path)
+
+    assert settings.checkout.payment_bank == "bank_of_georgia"
+    assert settings.checkout.policy_period == "30-D"
+    assert settings.checkout.phone == "925000000000"
+    assert settings.checkout.email == "tplgee@mail.ru"
+    assert is_checkout_configured(settings) is True
+
+
+def test_load_settings_rejects_unsupported_payment_bank(tmp_path, monkeypatch):
+    _set_required_env(monkeypatch)
+    config_with_checkout = _CONFIG_YAML + (
+        "\ncheckout:\n"
+        "  payment_bank: liberty_bank\n"  # не подтверждено research'ом
+        "  policy_period: 30-D\n"
+        '  phone: "925000000000"\n'
+        '  email: "tplgee@mail.ru"\n'
+    )
+    config_path = _write_config(tmp_path, config_with_checkout)
+
+    with pytest.raises(ConfigError, match="payment_bank"):
+        load_settings(config_path)
+
+
+def test_load_settings_rejects_malformed_policy_period(tmp_path, monkeypatch):
+    _set_required_env(monkeypatch)
+    config_with_checkout = _CONFIG_YAML + (
+        "\ncheckout:\n"
+        "  payment_bank: bank_of_georgia\n"
+        "  policy_period: one-month\n"
+        '  phone: "925000000000"\n'
+        '  email: "tplgee@mail.ru"\n'
+    )
+    config_path = _write_config(tmp_path, config_with_checkout)
+
+    with pytest.raises(ConfigError, match="policy_period"):
+        load_settings(config_path)
+
+
+def test_load_settings_fails_fast_when_payment_bank_set_without_policy_period_phone_email(
+    tmp_path, monkeypatch,
+):
+    """payment_bank задан — значит checkout ВКЛЮЧАЕТСЯ, и тогда
+    policy_period/phone/email обязаны быть заданы тоже (см.
+    reader/settings.py::load_settings) — иначе fail-fast, а не тихое
+    "не настроено" (в отличие от случая, когда payment_bank вовсе не
+    задан — см. test_load_settings_defaults_checkout_section)."""
+    _set_required_env(monkeypatch)
+    only_bank = _CONFIG_YAML + "\ncheckout:\n  payment_bank: bank_of_georgia\n"
+    with pytest.raises(ConfigError, match="policy_period"):
+        load_settings(_write_config(tmp_path, only_bank))
+
+
+def test_load_settings_fails_fast_when_phone_or_email_missing(tmp_path, monkeypatch):
+    _set_required_env(monkeypatch)
+    missing_email = _CONFIG_YAML + (
+        "\ncheckout:\n"
+        "  payment_bank: bank_of_georgia\n"
+        "  policy_period: 30-D\n"
+        '  phone: "925000000000"\n'
+    )
+    with pytest.raises(ConfigError, match="email"):
+        load_settings(_write_config(tmp_path, missing_email))
+
+
+async def test_build_checkout_components_wires_dependencies_correctly(tmp_path, monkeypatch):
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-real")
+    config_with_all = _CONFIG_YAML + (
+        "\nocr:\n"
+        '  service_chat_id: "@insurance_ocr_service_chat"\n'
+        "  allowed_user_ids:\n"
+        "    - 222\n"
+        "\ncheckout:\n"
+        "  payment_bank: bank_of_georgia\n"
+        "  policy_period: 30-D\n"
+        '  phone: "925000000000"\n'
+        '  email: "tplgee@mail.ru"\n'
+    )
+    config_path = _write_config(tmp_path, config_with_all)
+    settings = load_settings(config_path)
+
+    user_repository = UserRepository(tmp_path / "users.db")
+    source = TelegramSource(settings.telegram, groups=[], user_repository=user_repository)
+    http_client = httpx.AsyncClient()
+
+    fake_card_secrets = CardSecrets(card_number="4111", expiry_month="12", expiry_year="30", cvv="123")
+    handler = None
+
+    try:
+        handler = build_checkout_components(settings, source, http_client, card_secrets=fake_card_secrets)
+
+        assert isinstance(handler, CheckoutReplyHandler)
+        assert isinstance(handler._service, CheckoutService)
+        assert isinstance(handler._service._tpl_client, TplGeClient)
+        assert isinstance(handler._service._reference_data, TplReferenceDataClient)
+        assert handler._service._payment_bank == PaymentBank.BANK_OF_GEORGIA
+        assert handler._service._policy_period == "30-D"
+
+        # Реальный OcrPersonalInfoProvider, а не fail-closed default, с
+        # phone/email именно из config.yaml (см. reader/main.py::
+        # build_checkout_components и задачу: "Checkout service должен
+        # получать их через settings/dependency injection").
+        personal_info_provider = handler._service._personal_info_provider
+        assert isinstance(personal_info_provider, OcrPersonalInfoProvider)
+        assert personal_info_provider._phone == "925000000000"
+        assert personal_info_provider._email == "tplgee@mail.ru"
+        assert personal_info_provider._reference_data is handler._service._reference_data
+
+        # Реальный банковский gateway (Playwright boundary), не
+        # NotImplementedBankGatewayClient — карта из переданного card_secrets
+        # (в реальном запуске — CardSecrets.load() из окружения, см.
+        # reader/main.py::_run_insurance_ocr).
+        bank_gateway = handler._service._bank_gateway
+        assert isinstance(bank_gateway, PlaywrightBankGatewayClient)
+        assert bank_gateway._card_secrets is fake_card_secrets
+        assert isinstance(bank_gateway._launcher, PlaywrightBrowserLauncher)
+
+        # Lock repository — тот же users_db_file, что и у остальных
+        # repository проекта (см. reader/checkout/lock_repository.py про
+        # restart/recovery).
+        assert isinstance(handler._service._lock_repository, CheckoutLockRepository)
+
+        # Тот же чат/операторы, что и insurance ocr — свой chat_id checkout
+        # не заводит (см. reader/settings.py::CheckoutSettings).
+        assert handler._allowed_user_ids == {222}
+    finally:
+        if handler is not None:
+            handler._service._lock_repository.close()
+        user_repository.close()
+        await http_client.aclose()

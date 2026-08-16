@@ -2,7 +2,7 @@ import logging
 from typing import Protocol
 
 from reader.commands.base import Command, CommandContext, CommandError, CommandResult
-from reader.ocr.models import OcrResult
+from reader.ocr.models import REPLY_FIELD_LABELS, OcrResult
 from reader.ocr.service import OcrServiceError
 
 logger = logging.getLogger(__name__)
@@ -19,25 +19,11 @@ _NOTHING_RECOGNIZED_ERROR = "Не удалось распознать докум
 
 _NOT_RECOGNIZED = "не распознано"
 
-# (подпись в ответе, атрибут OcrResult) — порядок соответствует примеру из
-# задачи (Собственник, Водитель, Страхователь, Категория, Марка, Модель,
-# VIN, ...) — три РАЗНЫЕ роли ФИО и category читаются каждая из своего
-# атрибута НЕЗАВИСИМО, без какого-либо fallback/подстановки по умолчанию
-# (см. reader/ocr/models.py про разные источники-документы каждого поля;
-# category, как и остальные vehicle-поля, распознаётся моделью, а не
-# устанавливается кодом — "не распознано" здесь означает именно null от
-# модели, а не "предполагаем passenger_car").
-_REPLY_FIELDS = (
-    ("Собственник", "owner_full_name"),
-    ("Водитель", "driver_full_name"),
-    ("Страхователь", "policyholder_full_name"),
-    ("Категория", "category"),
-    ("Марка", "manufacturer"),
-    ("Модель", "model"),
-    ("VIN", "vin"),
-    ("Номер шасси", "chassis_number"),
-    ("Госномер", "registration_number"),
-)
+# Формат/порядок полей — см. reader/ocr/models.py::REPLY_FIELD_LABELS
+# (общий источник правды с reader/checkout/parser.py, который разбирает тот
+# же формат в обратную сторону — reply оператора с "pay"/исправленными
+# полями, см. задачу про checkout).
+_REPLY_FIELDS = REPLY_FIELD_LABELS
 
 
 class OcrServiceLike(Protocol):

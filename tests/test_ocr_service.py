@@ -25,6 +25,8 @@ def _parsed(**overrides):
         owner_full_name="Иванов Иван Иванович",
         driver_full_name="Петров Пётр Петрович",
         policyholder_full_name="Петров Пётр Петрович",
+        passport_number="AB1234567",
+        citizenship="Georgia",
         category="passenger_car",
         registration_number="A123BC777", vin="JTMBR12345678901", chassis_number=None,
         manufacturer="Toyota", model="RAV4",
@@ -56,8 +58,10 @@ async def test_extract_parses_full_result(monkeypatch):
     assert result.owner_full_name == "Иванов Иван Иванович"
     assert result.driver_full_name == "Петров Пётр Петрович"
     assert result.policyholder_full_name == "Петров Пётр Петрович"
+    assert result.passport_number == "AB1234567"
+    assert result.citizenship == "Georgia"
     assert result.category == "passenger_car"
-    assert result.fields_found_count == 8
+    assert result.fields_found_count == 10
 
 
 async def test_extract_strips_whitespace_from_fields(monkeypatch):
@@ -121,7 +125,7 @@ async def test_extract_partial_result_leaves_missing_fields_none(monkeypatch):
     assert result.owner_full_name is None
     assert result.driver_full_name is None
     assert result.policyholder_full_name is None
-    assert result.fields_found_count == 4
+    assert result.fields_found_count == 6
 
 
 async def test_extract_owner_full_name_is_none_for_legal_entity_owner(monkeypatch):
@@ -173,6 +177,38 @@ async def test_extract_category_is_none_when_not_reliably_determined(monkeypatch
     result = await service.extract([(b"bytes", "image/jpeg")])
 
     assert result.category is None
+
+
+async def test_extract_passes_through_passport_number_and_citizenship(monkeypatch):
+    service = _service()
+    fake_response = types.SimpleNamespace(
+        output_parsed=_parsed(passport_number="  PN0011223  ", citizenship="Russia Federation")
+    )
+
+    async def fake_parse(**kwargs):
+        return fake_response
+
+    monkeypatch.setattr(service._client.responses, "parse", fake_parse)
+
+    result = await service.extract([(b"bytes", "image/jpeg")])
+
+    assert result.passport_number == "PN0011223"  # trim, как и остальные строковые поля
+    assert result.citizenship == "Russia Federation"
+
+
+async def test_extract_leaves_passport_number_and_citizenship_none_when_no_passport_document(monkeypatch):
+    service = _service()
+    fake_response = types.SimpleNamespace(output_parsed=_parsed(passport_number=None, citizenship=None))
+
+    async def fake_parse(**kwargs):
+        return fake_response
+
+    monkeypatch.setattr(service._client.responses, "parse", fake_parse)
+
+    result = await service.extract([(b"bytes", "image/jpeg")])
+
+    assert result.passport_number is None
+    assert result.citizenship is None
 
 
 async def test_extract_sends_one_content_part_per_image(monkeypatch):
