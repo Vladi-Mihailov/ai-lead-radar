@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import logging
+from dataclasses import dataclass
 from typing import Literal
 
 from openai import (
@@ -34,20 +35,25 @@ class OcrServiceError(Exception):
 
 
 class _VehicleFieldsSchema(BaseModel):
-    """Wire-schema для OpenAI Structured Outputs — по аналогии с
-    auto-insurance (app/ocr/provider.py::_VehicleFieldsSchema), но с тремя
-    раздельными ролями ФИО вместо одного full_name (см.
-    reader/ocr/models.py::OcrResult и reader/ocr/prompt.py про источники
-    каждой роли). Не добавлять сюда поле, не обновив одновременно
-    prompt.py и OcrResult — schema (в strict-режиме Structured Outputs)
-    это единственный механизм, ограничивающий, что вообще может вернуть
-    модель."""
+    """Wire-schema для OpenAI Structured Outputs (см. reader/ocr/models.py::
+    OcrResult и reader/ocr/prompt.py про источники каждого поля). Модель
+    возвращает три СЫРЫХ значения ФИО (по одному на документ-источник) —
+    сравнение/вывод policyholder/driver/owner/same_as-флагов делает код
+    (см. _derive_name_roles), не модель. Не добавлять сюда поле, не
+    обновив одновременно prompt.py и OcrResult — schema (в strict-режиме
+    Structured Outputs) это единственный механизм, ограничивающий, что
+    вообще может вернуть модель."""
 
-    owner_full_name: str | None
-    driver_full_name: str | None
-    policyholder_full_name: str | None
+    registration_owner_full_name: str | None
+    passport_full_name: str | None
+    # ФИО отдельного владельца/доверителя ТОЛЬКО из доверенности — null,
+    # если доверенности нет среди изображений, либо модель не может
+    # уверенно определить нужное лицо (в доверенности может быть несколько
+    # людей, см. reader/ocr/prompt.py). Не переиспользуем techpassport для
+    # этого поля — источник только доверенность.
+    power_of_attorney_owner_full_name: str | None
     # Номер паспорта/ID СТРАХОВАТЕЛЯ — только из паспорта/ID, отдельного от
-    # техпаспорта/прав документа (см. reader/ocr/prompt.py и
+    # техпаспорта документа (см. reader/ocr/prompt.py и
     # reader/ocr/models.py::OcrResult про источник и назначение — checkout
     # tpl.ge). Свободная строка (не Literal) — в отличие от category,
     # значений здесь не 3 штуки, а произвольный номер документа.
@@ -141,22 +147,99 @@ class OcrService:
         parsed = response.output_parsed
         if parsed is None:
             raise OcrServiceError("model did not return the expected structured output")
+
+        roles = _derive_name_roles(
+            registration_owner_full_name=_clean(parsed.registration_owner_full_name),
+            passport_full_name=_clean(parsed.passport_full_name),
+            power_of_attorney_owner_full_name=_clean(parsed.power_of_attorney_owner_full_name),
+        )
         return OcrResult(
-            owner_full_name=_clean(parsed.owner_full_name),
-            driver_full_name=_clean(parsed.driver_full_name),
-            policyholder_full_name=_clean(parsed.policyholder_full_name),
+            policyholder_full_name=roles.policyholder_full_name,
+            driver_same_as_policyholder=roles.driver_same_as_policyholder,
+            driver_full_name=roles.driver_full_name,
+            owner_same_as_policyholder=roles.owner_same_as_policyholder,
+            owner_full_name=roles.owner_full_name,
             passport_number=_clean(parsed.passport_number),
             citizenship=_clean(parsed.citizenship),
             # category — уже ограничен enum'ом на уровне schema (см.
             # _VehicleFieldsSchema.category), _clean() ему не нужен: это не
             # свободный текст, который может прийти с лишними пробелами.
             category=parsed.category,
-            registration_number=_clean(parsed.registration_number),
-            vin=_clean(parsed.vin),
-            chassis_number=_clean(parsed.chassis_number),
             manufacturer=_clean(parsed.manufacturer),
             model=_clean(parsed.model),
+            vin=_clean(parsed.vin),
+            chassis_number=_clean(parsed.chassis_number),
+            registration_number=_clean(parsed.registration_number),
+            # Не из OCR — попадают в Telegram-draft из checkout settings (см.
+            # reader/commands/insurance_ocr.py), не заставляем модель их
+            # угадывать.
+            email=None,
+            phone=None,
         )
+
+
+@dataclass(frozen=True)
+class _NameRoles:
+    policyholder_full_name: str | None
+    driver_full_name: str | None
+    driver_same_as_policyholder: bool
+    owner_full_name: str | None
+    owner_same_as_policyholder: bool
+
+
+def _derive_name_roles(
+    *,
+    registration_owner_full_name: str | None,
+    passport_full_name: str | None,
+    power_of_attorney_owner_full_name: str | None,
+) -> _NameRoles:
+    """Страхователь — ТОЛЬКО из техпаспорта (см. reader/ocr/models.py про
+    правила источников); без него не придумываем страхователя из одного
+    паспорта/прав. Если оба ФИО распознаны и отличаются — водитель отдельный
+    (из паспорта/прав). Иначе (совпадают, или доступен только техпаспорт) —
+    водитель = страхователь по умолчанию (~99% бизнес-случаев).
+
+    Владелец — независимо от driver-логики: доверенность с уверенно
+    определённым лицом имеет приоритет над default owner_same_as_
+    policyholder=True (см. reader/ocr/models.py); техпаспорт для отдельного
+    владельца повторно не используется."""
+    if power_of_attorney_owner_full_name is not None:
+        owner_full_name = power_of_attorney_owner_full_name
+        owner_same_as_policyholder = False
+    else:
+        owner_full_name = None
+        owner_same_as_policyholder = True
+
+    if registration_owner_full_name is None:
+        return _NameRoles(
+            policyholder_full_name=None, driver_full_name=None, driver_same_as_policyholder=True,
+            owner_full_name=owner_full_name, owner_same_as_policyholder=owner_same_as_policyholder,
+        )
+
+    if passport_full_name is None or _names_match(registration_owner_full_name, passport_full_name):
+        return _NameRoles(
+            policyholder_full_name=registration_owner_full_name,
+            driver_full_name=None,
+            driver_same_as_policyholder=True,
+            owner_full_name=owner_full_name,
+            owner_same_as_policyholder=owner_same_as_policyholder,
+        )
+
+    return _NameRoles(
+        policyholder_full_name=registration_owner_full_name,
+        driver_full_name=passport_full_name,
+        driver_same_as_policyholder=False,
+        owner_full_name=owner_full_name,
+        owner_same_as_policyholder=owner_same_as_policyholder,
+    )
+
+
+def _names_match(a: str, b: str) -> bool:
+    return _normalize_name(a) == _normalize_name(b)
+
+
+def _normalize_name(value: str) -> str:
+    return " ".join(value.split()).casefold()
 
 
 def _clean(value: object) -> str | None:

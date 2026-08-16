@@ -1,22 +1,28 @@
 """Источник данных, которые tpl.ge требует (личный номер, гражданство,
-телефон, email для страхователя/водителя/собственника — см.
+телефон, email для страхователя/водителя/владельца — см.
 reader/checkout/models.py::PersonalInfo), но которых нет в
 reader/ocr/models.py::OcrResult напрямую как готовых id/подтверждённых
 значений.
 
-Источники определены бизнесом (см. задачу):
+Источники:
 - identification_number/citizenship — ОДНО значение с паспорта СТРАХОВАТЕЛЯ
-  (OcrResult.passport_number/citizenship, см. reader/ocr/prompt.py),
-  используется как identification_number/citizenship_id ДЛЯ ВСЕХ ТРЁХ РОЛЕЙ
-  payload'а (insurer=driver=owner) — так решил бизнес для текущей итерации,
-  раздельных номеров для водителя/собственника пока нет;
-- phone/email — ОДНО и то же значение для всех заявок (см. задачу: "Для
-  всех заявок"), из reader/settings.py::CheckoutSettings, не из OCR.
+  (OcrResult.passport_number/citizenship, см. reader/ocr/prompt.py).
+  Отдельных номеров/гражданства для водителя/владельца сейчас нет — если
+  соответствующий driver_same_as_policyholder/owner_same_as_policyholder
+  True (реальный tpl.ge-флаг, см. reader/checkout/mapping.py), эта роль
+  использует те же данные, что и страхователь; если False — checkout
+  честно блокируется (см. resolve() ниже), а не придумывает отдельные
+  значения;
+- phone/email — из OcrResult.phone/email (по умолчанию — checkout settings,
+  см. reader/commands/insurance_ocr.py, но оператор мог их скорректировать
+  correction-reply'ем для конкретной заявки), с fallback на
+  settings-значения, переданные в конструктор, если по какой-то причине
+  оператор явно очистил поле ("не распознано").
 
 citizenship — свободный текст от OCR (название страны), поэтому
 преобразуется в citizenship_id ЧЕРЕЗ реальный справочник tpl.ge (см.
 reader/checkout/reference_data.py::resolve_country) — никакой id здесь не
-хардкодится (см. задачу: "не придумывай ID")."""
+хардкодится."""
 
 from __future__ import annotations
 
@@ -54,7 +60,12 @@ class OcrPersonalInfoProvider:
     - гражданство не распознано (citizenship is None);
     - гражданство распознано, но не найдено в справочнике tpl.ge
       (reference_data.resolve_country() вернул None) — например, опечатка
-      или страна, которой нет в справочнике tpl.ge."""
+      или страна, которой нет в справочнике tpl.ge;
+    - driver_same_as_policyholder/owner_same_as_policyholder = False —
+      отдельных identification_number/citizenship для водителя/владельца
+      сейчас нет ни в OCR, ни в correction-reply формате (см.
+      reader/ocr/models.py), поэтому эта комбинация блокирует checkout, а не
+      придумывает значения."""
 
     def __init__(self, *, reference_data: TplReferenceDataClient, phone: str, email: str):
         self._reference_data = reference_data
@@ -80,6 +91,17 @@ class OcrPersonalInfoProvider:
             else:
                 citizenship_id = country.id
 
+        if not effective.driver_same_as_policyholder:
+            missing.append(
+                "Водитель: отдельные личный номер/гражданство (Водитель = страхователь: -) "
+                "пока не поддерживаются"
+            )
+        if not effective.owner_same_as_policyholder:
+            missing.append(
+                "Владелец: отдельные личный номер/гражданство (Владелец = страхователь: -) "
+                "пока не поддерживаются"
+            )
+
         if missing:
             return PersonalInfoResolution(info=None, missing=tuple(missing))
 
@@ -89,13 +111,13 @@ class OcrPersonalInfoProvider:
         person = PersonalInfo(
             identification_number=effective.passport_number,
             citizenship_id=citizenship_id,
-            phone=self._phone,
-            email=self._email,
+            phone=effective.phone or self._phone,
+            email=effective.email or self._email,
         )
-        # Одно и то же значение для всех трёх ролей (см. docstring модуля) —
-        # намеренно НЕ три разных объекта с одинаковыми полями, а один и тот
-        # же PersonalInfo, чтобы не создавать видимость, будто у ролей может
-        # быть разный identification_number/citizenship в этой реализации.
+        # driver_same_as_policyholder/owner_same_as_policyholder уже
+        # гарантированно True здесь (иначе выше добавили бы запись в missing)
+        # — то же самое значение для всех трёх ролей одного и того же
+        # PersonalInfo, а не три копии с формально одинаковыми полями.
         return PersonalInfoResolution(info=RolePersonalInfo(insurer=person, driver=person, owner=person))
 
 
@@ -111,6 +133,6 @@ class NoPersonalInfoProvider:
         missing = (
             "Страхователь: личный номер, гражданство, телефон, email",
             "Водитель: личный номер, гражданство, телефон, email",
-            "Собственник: личный номер, гражданство, телефон, email",
+            "Владелец: личный номер, гражданство, телефон, email",
         )
         return PersonalInfoResolution(info=None, missing=missing)

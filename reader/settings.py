@@ -168,13 +168,14 @@ class CheckoutSettings(BaseModel):
     конфигом, а не выбирается оператором за отсутствием этого шага в
     Telegram-flow задачи.
 
-    phone/email — ОДНО и то же значение для ВСЕХ заявок (см. задачу:
-    "Для всех заявок") — используется как identification_number- независимые
-    контактные данные во всех трёх ролях payload'а (страхователь/водитель/
-    собственник), см. reader/checkout/personal_info.py::OcrPersonalInfoProvider.
-    Текущее production-значение зафиксировано в config/config.yaml — не
-    секрет (телефон/email агентства, не персональные данные клиента),
-    поэтому в config.yaml, а не в .env.
+    phone/email — значение ПО УМОЛЧАНИЮ для Email/Телефон в Telegram-черновике
+    "Распознано: ..." (см. reader/commands/insurance_ocr.py) — оператор может
+    скорректировать их под конкретную заявку correction-reply'ем, как и
+    остальные поля; используются как контактные данные страхователя/
+    водителя/владельца, см. reader/checkout/personal_info.py::
+    OcrPersonalInfoProvider. Текущее production-значение зафиксировано в
+    config/config.yaml — не секрет (телефон/email агентства, не персональные
+    данные клиента), поэтому в config.yaml, а не в .env.
 
     Все четыре поля None по умолчанию — checkout просто не поднимается (см.
     reader/main.py), как и "insurance ocr" при пустых ocr.service_chat_id/

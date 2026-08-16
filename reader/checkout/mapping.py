@@ -38,12 +38,13 @@ CATEGORY_KEY_SUFFIX = {
 
 _REGISTRATION_NUMBER_RE = re.compile(r"^[A-Za-z0-9]+$")
 
-# Поля OcrResult, без которых заявку в tpl.ge собрать нельзя в принципе —
-# (label, attr); vin/chassis_number проверяются отдельно (см.
-# required_vehicle_fields_missing) — валиден любой ОДИН из них.
+# Поля OcrResult, без которых заявку в tpl.ge собрать нельзя в принципе,
+# ВСЕГДА (без условий) — (label, attr); vin/chassis_number проверяются
+# отдельно (см. required_vehicle_fields_missing) — валиден любой ОДИН из
+# них. Водитель/владелец сюда не входят — они требуются только когда
+# соответствующий same_as_policyholder=False (см. ниже) — ~99% заявок эта
+# роль совпадает со страхователем и отдельного ФИО не требует.
 _REQUIRED_VEHICLE_FIELDS: tuple[tuple[str, str], ...] = (
-    ("Собственник", "owner_full_name"),
-    ("Водитель", "driver_full_name"),
     ("Страхователь", "policyholder_full_name"),
     ("Категория", "category"),
     ("Марка", "manufacturer"),
@@ -62,10 +63,16 @@ def required_vehicle_fields_missing(effective: OcrResult) -> list[str]:
     """Человекочитаемый список (см. reader/ocr/models.py::REPLY_FIELD_LABELS
     метки) полей, без которых нельзя даже начать сопоставление с tpl.ge —
     ПУСТОЙ список означает "можно продолжать" (см.
-    reader/checkout/service.py)."""
+    reader/checkout/service.py). Водитель/владелец — required только когда
+    оператор явно указал "... = страхователь: -" (иначе checkout использует
+    те же данные, что у страхователя, см. reader/checkout/personal_info.py)."""
     missing = [label for label, attr in _REQUIRED_VEHICLE_FIELDS if not getattr(effective, attr)]
     if not effective.vin and not effective.chassis_number:
         missing.append("VIN/Номер шасси")
+    if not effective.driver_same_as_policyholder and not effective.driver_full_name:
+        missing.append("Водитель")
+    if not effective.owner_same_as_policyholder and not effective.owner_full_name:
+        missing.append("Владелец")
     return missing
 
 

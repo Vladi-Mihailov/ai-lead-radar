@@ -42,16 +42,20 @@ _SETTINGS_EMAIL = "tplgee@mail.ru"
 
 def _ocr_message(**overrides) -> str:
     fields = dict(
-        owner="Ivanov Ivan", driver="Petrov Petr", policyholder="Petrov Petr",
+        policyholder="Petrov Petr",
         passport_number="AB1234567", citizenship="Georgia",
         category="passenger_car", manufacturer="Toyota", model="Camry",
         vin="WVWZZZ1KZAW123456", chassis="не распознано", plate="AA001AA",
+        email=_SETTINGS_EMAIL, phone=_SETTINGS_PHONE,
+        # Happy-path по умолчанию: и водитель, и владелец совпадают со
+        # страхователем (~99% реальных заявок, см. reader/ocr/models.py) —
+        # отдельные ФИО не нужны.
+        driver_flag="+", driver="не распознано",
+        owner_flag="+", owner="не распознано",
     )
     fields.update(overrides)
     return (
         "Распознано:\n\n"
-        f"Собственник: {fields['owner']}\n"
-        f"Водитель: {fields['driver']}\n"
         f"Страхователь: {fields['policyholder']}\n"
         f"Номер паспорта: {fields['passport_number']}\n"
         f"Гражданство: {fields['citizenship']}\n"
@@ -60,7 +64,13 @@ def _ocr_message(**overrides) -> str:
         f"Модель: {fields['model']}\n"
         f"VIN: {fields['vin']}\n"
         f"Номер шасси: {fields['chassis']}\n"
-        f"Госномер: {fields['plate']}\n\n"
+        f"Госномер: {fields['plate']}\n"
+        f"Email: {fields['email']}\n"
+        f"Телефон: {fields['phone']}\n\n"
+        f"Водитель = страхователь: {fields['driver_flag']}\n"
+        f"Водитель: {fields['driver']}\n\n"
+        f"Владелец = страхователь: {fields['owner_flag']}\n"
+        f"Владелец: {fields['owner']}\n\n"
         "Проверь данные."
     )
 
@@ -885,6 +895,145 @@ async def test_pay_retriable_after_missing_personal_info_status_not_locked():
 
     assert second.state.status == CheckoutStatus.COMPLETED
     assert len(tpl_client.created_payloads) == 1
+
+
+# ---- Водитель/Владелец = страхователь: новая бизнес-логика ролей ----
+
+
+async def test_driver_plus_does_not_require_separate_full_name_and_uses_insurer_title():
+    """"+" (по умолчанию) — не требует отдельного ФИО, tpl.ge payload
+    получает то же title, что и у страхователя (см.
+    reader/checkout/service.py::_build_payload — реальный payload
+    дублирует поля, отдельного driverSameAsInsurer-флага research не
+    подтвердил)."""
+    service, tpl_client, _ref, _lock = _service_with_real_personal_info(bank_gateway=_completed_gateway())
+
+    outcome = await service.handle_pay(
+        chat_id=_CHAT_ID, ocr_message_id=30, ocr_message_text=_ocr_message(), operator_user_id=_OPERATOR_ID,
+    )
+
+    assert outcome.state.status == CheckoutStatus.COMPLETED
+    payload = tpl_client.created_payloads[0]
+    assert payload.vehicle_driver_title == payload.insurer_title == "Petrov Petr"
+
+
+async def test_owner_plus_does_not_require_separate_full_name_and_uses_insurer_title():
+    service, tpl_client, _ref, _lock = _service_with_real_personal_info(bank_gateway=_completed_gateway())
+
+    outcome = await service.handle_pay(
+        chat_id=_CHAT_ID, ocr_message_id=31, ocr_message_text=_ocr_message(), operator_user_id=_OPERATOR_ID,
+    )
+
+    assert outcome.state.status == CheckoutStatus.COMPLETED
+    payload = tpl_client.created_payloads[0]
+    assert payload.vehicle_owner_title == payload.insurer_title == "Petrov Petr"
+
+
+async def test_correction_driver_flag_minus_without_full_name_blocks_checkout():
+    """"-" без отдельного ФИО блокирует checkout с понятным сообщением."""
+    service, tpl_client, _ref, _lock = _service_with_real_personal_info(bank_gateway=_completed_gateway())
+
+    outcome = await service.handle_correction(
+        chat_id=_CHAT_ID, ocr_message_id=32, ocr_message_text=_ocr_message(),
+        correction_text="Водитель = страхователь: -",
+        operator_user_id=_OPERATOR_ID,
+    )
+
+    assert outcome.state.status == CheckoutStatus.MISSING_VEHICLE_DATA
+    assert "Водитель" in outcome.reply_text
+    assert tpl_client.created_payloads == []
+
+
+async def test_correction_driver_flag_minus_with_full_name_reaches_missing_personal_info():
+    """"-" С отдельным ФИО проходит проверку обязательных vehicle-полей, но
+    checkout всё равно останавливается на personal_info — отдельных
+    identification_number/citizenship для водителя сейчас нет (см.
+    reader/checkout/personal_info.py)."""
+    service, tpl_client, _ref, _lock = _service_with_real_personal_info(bank_gateway=_completed_gateway())
+
+    outcome = await service.handle_correction(
+        chat_id=_CHAT_ID, ocr_message_id=33, ocr_message_text=_ocr_message(),
+        correction_text="Водитель = страхователь: -\nВодитель: Sidorov Petr",
+        operator_user_id=_OPERATOR_ID,
+    )
+
+    assert outcome.state.status == CheckoutStatus.MISSING_PERSONAL_INFO
+    assert "Водитель" in outcome.reply_text
+    assert tpl_client.created_payloads == []
+
+
+async def test_correction_owner_flag_minus_without_full_name_blocks_checkout():
+    service, tpl_client, _ref, _lock = _service_with_real_personal_info(bank_gateway=_completed_gateway())
+
+    outcome = await service.handle_correction(
+        chat_id=_CHAT_ID, ocr_message_id=34, ocr_message_text=_ocr_message(),
+        correction_text="Владелец = страхователь: -",
+        operator_user_id=_OPERATOR_ID,
+    )
+
+    assert outcome.state.status == CheckoutStatus.MISSING_VEHICLE_DATA
+    assert "Владелец" in outcome.reply_text
+    assert tpl_client.created_payloads == []
+
+
+async def test_correction_owner_flag_minus_with_full_name_reaches_missing_personal_info():
+    service, tpl_client, _ref, _lock = _service_with_real_personal_info(bank_gateway=_completed_gateway())
+
+    outcome = await service.handle_correction(
+        chat_id=_CHAT_ID, ocr_message_id=35, ocr_message_text=_ocr_message(),
+        correction_text="Владелец = страхователь: -\nВладелец: Sidorov Petr",
+        operator_user_id=_OPERATOR_ID,
+    )
+
+    assert outcome.state.status == CheckoutStatus.MISSING_PERSONAL_INFO
+    assert "Владелец" in outcome.reply_text
+    assert tpl_client.created_payloads == []
+
+
+async def test_correction_invalid_flag_value_is_rejected_before_starting_checkout():
+    service, tpl_client, _ref, _lock = _service()
+
+    outcome = await service.handle_correction(
+        chat_id=_CHAT_ID, ocr_message_id=36, ocr_message_text=_ocr_message(),
+        correction_text="Водитель = страхователь: yes",
+        operator_user_id=_OPERATOR_ID,
+    )
+
+    assert outcome.state is None
+    assert "+" in outcome.reply_text and "-" in outcome.reply_text
+    assert tpl_client.created_payloads == []
+
+
+# ---- Email/Телефон: default из settings, редактируемы correction-reply'ем ----
+
+
+async def test_email_and_phone_from_settings_are_used_in_payload_by_default():
+    service, tpl_client, _ref, _lock = _service_with_real_personal_info(bank_gateway=_completed_gateway())
+
+    await service.handle_pay(
+        chat_id=_CHAT_ID, ocr_message_id=37, ocr_message_text=_ocr_message(), operator_user_id=_OPERATOR_ID,
+    )
+
+    payload = tpl_client.created_payloads[0]
+    assert payload.insurer_email == _SETTINGS_EMAIL
+    assert payload.insurer_phone == _SETTINGS_PHONE
+
+
+async def test_operator_can_change_email_and_phone_via_correction_reply():
+    service, tpl_client, _ref, _lock = _service_with_real_personal_info(bank_gateway=_completed_gateway())
+
+    outcome = await service.handle_correction(
+        chat_id=_CHAT_ID, ocr_message_id=38, ocr_message_text=_ocr_message(),
+        correction_text="Email: operator@example.com\nТелефон: 599111222",
+        operator_user_id=_OPERATOR_ID,
+    )
+
+    assert outcome.state.status == CheckoutStatus.COMPLETED
+    payload = tpl_client.created_payloads[0]
+    assert payload.insurer_email == "operator@example.com"
+    assert payload.insurer_phone == "599111222"
+    assert payload.vehicle_owner_email == "operator@example.com"
+    assert payload.vehicle_driver_phone == "599111222"
 
 
 # ---- mapping / reference data ошибки ----

@@ -20,7 +20,16 @@ POST https://web-back.tpl.ge/api/policies (см. задачу/отчёт researc
 }
 Только insurerType/vehicleOwnerType/vehicleDriverType="I" (физлицо)
 поддерживаются — значение для юрлица не подтверждено research'ем и не
-угадывается (см. задачу)."""
+угадывается.
+
+Отдельных driverSameAsInsurer/ownerSameAsInsurer (или похожих bool-полей) в
+реальном payload'е research НЕ зафиксировал — vehicleOwner*/vehicleDriver*
+это всегда полный, дублированный набор полей. Поэтому same_as-семантика
+(см. reader/ocr/models.py::OcrResult.driver_same_as_policyholder/
+owner_same_as_policyholder) реализована на уровне маппинга (см.
+reader/checkout/service.py::_build_payload) — при same_as=True в эти поля
+подставляются те же данные, что и у страхователя, а не изобретается
+отдельное bool-поле, которого нет в реальном контракте."""
 
 from __future__ import annotations
 
@@ -139,16 +148,16 @@ def is_locked_status(status: CheckoutStatus, failure_reason: FailureReason | Non
 
 @dataclass
 class PersonalInfo:
-    """Данные, которых НЕТ в reader/ocr/models.py::OcrResult и которые
-    tpl.ge требует для каждой из трёх ролей (страхователь/водитель/
-    собственник) — личный номер, гражданство (id страны tpl.ge,
-    см. reader/checkout/reference_data.py), телефон, email.
-
-    Источник этих данных — ОТКРЫТЫЙ вопрос (см. reader/checkout/personal_info.py
-    и итоговый отчёт по задаче) — ни OCR, ни Telegram-формат исправленных
-    полей их сейчас не поставляют, поэтому здесь нет ни одного значения по
-    умолчанию/фиктивного значения (см. задачу: "не придумывай их значения и
-    не ставь фиктивные production defaults")."""
+    """Данные, которые tpl.ge требует для каждой из трёх ролей (страхователь/
+    водитель/владелец) — личный номер, гражданство (id страны tpl.ge, см.
+    reader/checkout/reference_data.py), телефон, email. См.
+    reader/checkout/personal_info.py::OcrPersonalInfoProvider — источник:
+    identification_number/citizenship_id всегда с паспорта страхователя
+    (OcrResult.passport_number/citizenship); phone/email — из
+    OcrResult.phone/email (checkout settings по умолчанию, correction-reply
+    может их изменить). Водитель/владелец используют то же самое значение,
+    только когда driver_same_as_policyholder/owner_same_as_policyholder —
+    иначе checkout блокируется, а не изобретает отдельные данные."""
 
     identification_number: str
     citizenship_id: int

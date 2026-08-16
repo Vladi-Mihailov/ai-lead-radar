@@ -1,104 +1,135 @@
 from dataclasses import dataclass
 
-# (подпись в Telegram-сообщении, атрибут OcrResult) — единственный источник
-# правды для формата "Распознано: ..." (см. reader/commands/insurance_ocr.py
-# ::_format_result) И для его обратного разбора в reader/checkout/parser.py
-# (там же разбирается reply оператора с исправленными полями — тот же
-# формат, см. задачу про checkout). Живёт здесь, а не в insurance_ocr.py,
-# именно потому что нужен ОБОИМ модулям, а checkout не должен зависеть от
-# reader/commands/insurance_ocr.py (см. задачу: "не смешивай checkout-код с
-# OCR service").
+# Единственный источник правды для формата Telegram-сообщения "Распознано:
+# ..." (см. reader/commands/insurance_ocr.py::_format_result) и для его
+# обратного разбора (см. reader/checkout/parser.py) — оба модуля читают
+# структуру отсюда, а не дублируют список полей/меток у себя.
 #
-# "Номер паспорта"/"Гражданство" — добавлены для checkout tpl.ge (см. задачу:
-# tpl.ge требует personal_number/citizenship страхователя — источник теперь
-# определён: паспорт/ID страхователя, см. reader/ocr/prompt.py). Расположены
-# именно между "Страхователь" и "Категория" — таков зафиксированный задачей
-# формат Telegram-сообщения.
-REPLY_FIELD_LABELS: tuple[tuple[str, str], ...] = (
-    ("Собственник", "owner_full_name"),
-    ("Водитель", "driver_full_name"),
-    ("Страхователь", "policyholder_full_name"),
-    ("Номер паспорта", "passport_number"),
-    ("Гражданство", "citizenship"),
-    ("Категория", "category"),
-    ("Марка", "manufacturer"),
-    ("Модель", "model"),
-    ("VIN", "vin"),
-    ("Номер шасси", "chassis_number"),
-    ("Госномер", "registration_number"),
+# Три визуальных блока (см. формат сообщения):
+# 1) данные страхователя + ТС + контакты;
+# 2) флаг "Водитель = страхователь" и, если он "-", отдельное ФИО водителя;
+# 3) то же самое для владельца.
+# is_flag=True — поле рендерится как "+"/"-" (bool), а не как текст/
+# "не распознано". empty_when_none=True — None рендерится как ПУСТАЯ строка
+# после ":" (не как "не распознано") — только для Водитель/Владелец: их
+# отсутствие означает "совпадает со страхователем", а не "не удалось
+# распознать" (см. reader/commands/insurance_ocr.py::_format_result).
+
+
+@dataclass(frozen=True)
+class ReplyField:
+    label: str
+    attr: str
+    is_flag: bool = False
+    empty_when_none: bool = False
+
+
+_INSURER_SECTION: tuple[ReplyField, ...] = (
+    ReplyField("Страхователь", "policyholder_full_name"),
+    ReplyField("Номер паспорта", "passport_number"),
+    ReplyField("Гражданство", "citizenship"),
+    ReplyField("Категория", "category"),
+    ReplyField("Марка", "manufacturer"),
+    ReplyField("Модель", "model"),
+    ReplyField("VIN", "vin"),
+    ReplyField("Номер шасси", "chassis_number"),
+    ReplyField("Госномер", "registration_number"),
+    ReplyField("Email", "email"),
+    ReplyField("Телефон", "phone"),
 )
+_DRIVER_SECTION: tuple[ReplyField, ...] = (
+    ReplyField("Водитель = страхователь", "driver_same_as_policyholder", is_flag=True),
+    ReplyField("Водитель", "driver_full_name", empty_when_none=True),
+)
+_OWNER_SECTION: tuple[ReplyField, ...] = (
+    ReplyField("Владелец = страхователь", "owner_same_as_policyholder", is_flag=True),
+    ReplyField("Владелец", "owner_full_name", empty_when_none=True),
+)
+
+# Порядок секций = порядок блоков в Telegram-сообщении (см.
+# reader/commands/insurance_ocr.py::_format_result — блоки разделяются
+# пустой строкой).
+REPLY_SECTIONS: tuple[tuple[ReplyField, ...], ...] = (_INSURER_SECTION, _DRIVER_SECTION, _OWNER_SECTION)
+
+# Плоский (метка, атрибут) — для парсера (см. reader/checkout/parser.py),
+# которому не важна разбивка на блоки, только соответствие метки атрибуту.
+REPLY_FIELD_LABELS: tuple[tuple[str, str], ...] = tuple(
+    (f.label, f.attr) for section in REPLY_SECTIONS for f in section
+)
+
+# Атрибуты двух bool-флагов ("+"/"-" в тексте, а не свободное значение) —
+# парсер должен обрабатывать их иначе, чем обычные текстовые поля.
+FLAG_ATTRS: frozenset[str] = frozenset(f.attr for section in REPLY_SECTIONS for f in section if f.is_flag)
 
 
 @dataclass(frozen=True)
 class OcrResult:
-    """Результат распознавания документов автомобиля — по аналогии со
-    схемой auto-insurance (app/ocr/models.py::OcrResult), но с тремя
-    ролями ФИО вместо одного full_name (см. задачу: три РАЗНЫЕ бизнес-роли
-    с РАЗНЫМИ источниками-документами, а не один и тот же человек по
-    умолчанию):
+    """Результат распознавания документов автомобиля + состояние checkout-
+    заявки tpl.ge (одна и та же структура — см. reader/checkout/parser.py,
+    который восстанавливает её из текста Telegram-сообщения).
 
-    - owner_full_name — ТОЛЬКО из техпаспорта; null, если собственник в
-      техпаспорте — юридическое лицо (см. reader/ocr/prompt.py).
-    - driver_full_name — ТОЛЬКО из водительского удостоверения.
-    - policyholder_full_name — ТОЛЬКО из водительского удостоверения,
-      извлекается НЕЗАВИСИМО от driver_full_name (для текущего сценария
-      обычно совпадает с ним по значению, но это два отдельных поля без
-      кода-уровня fallback — см. reader/commands/insurance_ocr.py, там нет
-      ни одного места, которое присваивало бы одному полю значение
-      другого).
+    Источники ФИО (см. reader/ocr/prompt.py) — паспорт/ID страхователя ЛИБО
+    водительское удостоверение (для водителя) и техпаспорт/свидетельство
+    регистрации ТС (для страхователя), плюс доверенность (для отдельного
+    владельца):
+    - policyholder_full_name — из техпаспорта. Если паспорт/права и
+      техпаспорт распознаны и ФИО совпадает — то же самое ФИО, driver
+      same_as-флаг True. Если ФИО различаются — policyholder берётся из
+      техпаспорта, driver_full_name — из паспорта/прав,
+      driver_same_as_policyholder=False. Если техпаспортное ФИО не
+      распознано — policyholder_full_name=None (ФИО одного паспорта не
+      может заменить страхователя — это другая бизнес-роль).
+    - driver_same_as_policyholder/owner_same_as_policyholder — bool
+      (никогда None): ~99% случаев водитель и владелец совпадают со
+      страхователем, поэтому это два явных флага, а не отдельная
+      обязательная роль. driver_full_name/owner_full_name заполняются
+      только когда соответствующий флаг False.
+    - owner_same_as_policyholder/owner_full_name — определяются ТОЛЬКО
+      доверенностью (техпаспорт для этого повторно не используется, см.
+      reader/ocr/prompt.py): если среди документов есть доверенность и
+      модель уверенно определила в ней ФИО владельца/доверителя для этой
+      операции — owner_same_as_policyholder=False, owner_full_name — это
+      ФИО. Иначе (доверенности нет, или лицо нельзя определить уверенно) —
+      True/None. Оба поля можно скорректировать через correction-reply (см.
+      reader/checkout/parser.py) — исправленный оператором reply
+      authoritative для конкретного checkout.
 
-    - passport_number — номер паспорта/ID СТРАХОВАТЕЛЯ, ТОЛЬКО из паспорта/
-      ID физического лица (см. reader/ocr/prompt.py) — ОТДЕЛЬНЫЙ документ от
-      водительского удостоверения/техпаспорта. Ни в коем случае не VIN,
-      номер водительского удостоверения, номер шасси или госномер ТС (см.
-      задачу: "не путай с другими номерами документов"). Нужен для checkout
-      tpl.ge (см. reader/checkout/personal_info.py) — используется как
-      identification_number для ВСЕХ трёх ролей payload'а (страхователь/
-      водитель/собственник), см. reader/checkout/personal_info.py про это
-      бизнес-решение.
-    - citizenship — гражданство, ТОЛЬКО из того же паспорта/ID страхователя,
-      что и passport_number. Ожидаемый формат — название страны на английском
-      (см. reader/ocr/prompt.py) — сопоставляется со справочником
-      tpl.ge/api/core/countries на уровне reader/checkout/reference_data.py,
-      никакой числовой id здесь не хранится.
+    passport_number/citizenship — из паспорта страхователя. category/
+    manufacturer/model/vin/chassis_number/registration_number — из
+    техпаспорта. email/phone — НЕ распознаются OCR (не часть Structured
+    Output, см. reader/ocr/service.py); попадают в Telegram-сообщение из
+    checkout settings (см. reader/commands/insurance_ocr.py) и могут быть
+    изменены оператором через correction-reply, как и остальные поля.
 
-    category — категория ТС (passenger_car/motorcycle/trailer/null),
-    определяется ТОЛЬКО по техпаспорту (тип/назначение/марка/модель и
-    другие признаки самого документа — см. reader/ocr/prompt.py), НЕ
-    подставляется программно по умолчанию: null означает, что по документу
-    нельзя определить категорию достаточно надёжно, а не "скорее всего
-    passenger_car". Ограничено фиксированным enum'ом на уровне Structured
-    Outputs schema (см. reader/ocr/service.py::_VehicleFieldsSchema) —
-    модель физически не может вернуть никакое другое значение.
+    None у текстового поля — "не найдено/не распознано", а не
+    предположение."""
 
-    registration_number/vin/chassis_number/manufacturer/model — ТОЛЬКО из
-    техпаспорта, не изменились по смыслу с прошлой версии schema.
-
-    Каждое поле — None означает "не найдено/не распознано/не тот
-    источник", а не предположение (см. reader/ocr/prompt.py — модель прямо
-    просят не угадывать и не смешивать документы). Ничего не
-    нормализуется/не сверяется со справочником (в отличие от
-    auto-insurance/app/ocr/parser.py — это web/checkout-специфика, здесь
-    не нужна)."""
-
-    owner_full_name: str | None
-    driver_full_name: str | None
     policyholder_full_name: str | None
+    driver_same_as_policyholder: bool
+    driver_full_name: str | None
+    owner_same_as_policyholder: bool
+    owner_full_name: str | None
     passport_number: str | None
     citizenship: str | None
     category: str | None
-    registration_number: str | None
-    vin: str | None
-    chassis_number: str | None
     manufacturer: str | None
     model: str | None
+    vin: str | None
+    chassis_number: str | None
+    registration_number: str | None
+    email: str | None
+    phone: str | None
 
     @property
     def fields_found_count(self) -> int:
+        """Только поля, которые реально распознаёт/не распознаёт OCR — без
+        двух bool-флагов (у них всегда есть значение) и без email/phone
+        (это config-defaults, а не результат распознавания документа), см.
+        docstring класса."""
         return sum(
             1
             for value in (
-                self.owner_full_name, self.driver_full_name, self.policyholder_full_name,
+                self.policyholder_full_name, self.driver_full_name, self.owner_full_name,
                 self.passport_number, self.citizenship,
                 self.category, self.registration_number, self.vin, self.chassis_number,
                 self.manufacturer, self.model,

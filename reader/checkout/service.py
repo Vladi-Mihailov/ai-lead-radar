@@ -445,12 +445,24 @@ class CheckoutService:
             insurer_email=info.insurer.email,
             insurer_phone=info.insurer.phone,
             insurer_citizenship_id=info.insurer.citizenship_id,
-            vehicle_owner_title=effective.owner_full_name,
+            # tpl.ge не подтвердил research'ом отдельные driverSameAsInsurer/
+            # ownerSameAsInsurer поля в payload'е — при same_as=True реальный
+            # payload дублирует данные страхователя в эти поля (см.
+            # reader/checkout/models.py::TplPolicyPayload docstring).
+            vehicle_owner_title=(
+                effective.policyholder_full_name
+                if effective.owner_same_as_policyholder
+                else effective.owner_full_name
+            ),
             vehicle_owner_identification_number=info.owner.identification_number,
             vehicle_owner_email=info.owner.email,
             vehicle_owner_phone=info.owner.phone,
             vehicle_owner_citizenship_id=info.owner.citizenship_id,
-            vehicle_driver_title=effective.driver_full_name,
+            vehicle_driver_title=(
+                effective.policyholder_full_name
+                if effective.driver_same_as_policyholder
+                else effective.driver_full_name
+            ),
             vehicle_driver_identification_number=info.driver.identification_number,
             vehicle_driver_email=info.driver.email,
             vehicle_driver_phone=info.driver.phone,

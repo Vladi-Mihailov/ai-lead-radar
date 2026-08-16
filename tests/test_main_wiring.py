@@ -426,6 +426,12 @@ async def test_build_insurance_ocr_components_wires_dependencies_correctly(tmp_p
         assert isinstance(album_collector, AlbumCollector)
         assert isinstance(insurance_command._ocr_service, OcrService)
 
+        # checkout не настроен в этом конфиге — Email/Телефон по умолчанию
+        # для Telegram-черновика тоже не заданы (см. reader/settings.py::
+        # CheckoutSettings).
+        assert insurance_command._default_email is None
+        assert insurance_command._default_phone is None
+
         # Тот же TelegramClient, что и у остального Reader — второе
         # подключение к Telegram не создано (см. задачу).
         assert command_dispatcher._client is source.client
@@ -437,6 +443,38 @@ async def test_build_insurance_ocr_components_wires_dependencies_correctly(tmp_p
         # AlbumCollector зовёт именно InsuranceOcrCommand.handle_album — не
         # копию/дублирующую бизнес-логику.
         assert album_collector._on_group_ready == insurance_command.handle_album
+    finally:
+        user_repository.close()
+
+
+async def test_build_insurance_ocr_components_wires_checkout_contact_defaults(tmp_path, monkeypatch):
+    """Email/Телефон checkout settings попадают в InsuranceOcrCommand как
+    default_email/default_phone для Telegram-черновика "Распознано: ..."
+    (см. reader/commands/insurance_ocr.py)."""
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-real")
+    config = _CONFIG_YAML + (
+        "\nocr:\n"
+        '  service_chat_id: "@insurance_ocr_service_chat"\n'
+        "  allowed_user_ids:\n"
+        "    - 222\n"
+        "\ncheckout:\n"
+        "  payment_bank: bank_of_georgia\n"
+        "  policy_period: 30-D\n"
+        '  phone: "925000000000"\n'
+        '  email: "tplgee@mail.ru"\n'
+    )
+    config_path = _write_config(tmp_path, config)
+    settings = load_settings(config_path)
+
+    user_repository = UserRepository(tmp_path / "users.db")
+    source = TelegramSource(settings.telegram, groups=[], user_repository=user_repository)
+
+    try:
+        _dispatcher, insurance_command, _albums = build_insurance_ocr_components(settings, source)
+
+        assert insurance_command._default_email == "tplgee@mail.ru"
+        assert insurance_command._default_phone == "925000000000"
     finally:
         user_repository.close()
 

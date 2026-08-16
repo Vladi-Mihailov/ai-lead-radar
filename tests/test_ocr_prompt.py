@@ -16,8 +16,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from reader.ocr.prompt import SYSTEM_PROMPT  # noqa: E402
 
 
-def test_prompt_requires_latin_script_for_all_three_name_fields():
-    assert "owner_full_name, driver_full_name и policyholder_full_name" in SYSTEM_PROMPT
+def test_prompt_requires_latin_script_for_all_three_name_source_fields():
+    assert (
+        "registration_owner_full_name, passport_full_name и "
+        "power_of_attorney_owner_full_name" in SYSTEM_PROMPT
+    )
     assert "ВСЕГДА латиницей" in SYSTEM_PROMPT
 
 
@@ -40,25 +43,72 @@ def test_prompt_forbids_mixing_scripts_in_one_value():
 
 def test_prompt_scopes_latin_script_rule_to_name_fields_only():
     """Марка/модель и остальные vehicle-поля не должны затрагиваться этим
-    правилом (см. задачу: "Остальные поля не менять")."""
+    правилом."""
     assert (
-        "ни на одно другое поле (manufacturer, model и т.д.) оно не распространяется"
-        in SYSTEM_PROMPT
+        "ни на одно другое поле (manufacturer, model и "
+        "т.д.) оно не распространяется" in SYSTEM_PROMPT
     )
 
 
-def test_prompt_still_forbids_owner_full_name_for_legal_entities():
-    """Regression: правило про латиницу не должно было случайно затронуть
-    уже существующее правило про юрлицо-собственника."""
-    assert "owner_full_name = null" in SYSTEM_PROMPT
+def test_prompt_still_forbids_registration_owner_full_name_for_legal_entities():
+    """Regression: правило про латиницу не должно было затронуть уже
+    существующее правило про юрлицо-собственника."""
+    assert "registration_owner_full_name = null" in SYSTEM_PROMPT
     assert "юридическое лицо" in SYSTEM_PROMPT
 
 
 def test_prompt_still_requires_category_from_techpassport_only():
     """Regression: остальные правила (category и т.п.) не изменились при
-    добавлении правила про латиницу."""
-    assert "category НЕ определяется по паспорту/ID или водительскому удостоверению" in SYSTEM_PROMPT
+    добавлении доверенности как источника."""
+    assert (
+        "category НЕ определяется по паспорту/ID, водительскому "
+        "удостоверению или доверенности" in SYSTEM_PROMPT
+    )
 
 
 def test_prompt_still_forbids_guessing_missing_values():
     assert "Не угадывай отсутствующие или нечитаемые значения" in SYSTEM_PROMPT
+
+
+def test_prompt_still_requires_passport_number_and_citizenship_from_passport_only():
+    assert "passport_number — номер паспорта/ID СТРАХОВАТЕЛЯ" in SYSTEM_PROMPT
+    assert "citizenship — гражданство, указанное в ТОМ ЖЕ паспорте/ID" in SYSTEM_PROMPT
+
+
+def test_prompt_allows_drivers_license_as_fallback_source_for_driver_name():
+    """Новая бизнес-логика ролей: водительское удостоверение теперь
+    допустимый (fallback) источник ФИО водителя — наравне с паспортом/ID,
+    если паспорта нет среди изображений."""
+    assert "если паспорта/ID нет, но есть водительское удостоверение" in SYSTEM_PROMPT
+    assert "возьми ФИО с него" in SYSTEM_PROMPT
+
+
+# ---- доверенность: отдельный владелец ----
+
+
+def test_prompt_declares_power_of_attorney_as_a_document_type():
+    assert "- доверенность;" in SYSTEM_PROMPT
+
+
+def test_prompt_requires_power_of_attorney_owner_field():
+    assert "power_of_attorney_owner_full_name" in SYSTEM_PROMPT
+
+
+def test_prompt_requires_confident_identification_of_the_represented_owner():
+    """В доверенности может быть несколько человек — модель должна извлечь
+    именно того, кого документ представляет владельцем/доверителем, а не
+    поверенного/представителя, действующего по доверенности."""
+    assert "доверителем/представляемым собственником автомобиля" in SYSTEM_PROMPT
+    assert "не поверенного/представителя" in SYSTEM_PROMPT
+
+
+def test_prompt_forbids_guessing_ambiguous_power_of_attorney_person():
+    assert (
+        "если нельзя уверенно определить, кто именно из них "
+        "владелец/доверитель для этой операции, верни null" in SYSTEM_PROMPT
+    )
+    assert "лучше null, чем неверное лицо" in SYSTEM_PROMPT
+
+
+def test_prompt_scopes_power_of_attorney_to_owner_field_only():
+    assert "Доверенность — источник ТОЛЬКО для power_of_attorney_owner_full_name" in SYSTEM_PROMPT

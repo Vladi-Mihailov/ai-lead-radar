@@ -1,8 +1,9 @@
 import logging
+from dataclasses import replace
 from typing import Protocol
 
 from reader.commands.base import Command, CommandContext, CommandError, CommandResult
-from reader.ocr.models import REPLY_FIELD_LABELS, OcrResult
+from reader.ocr.models import REPLY_SECTIONS, OcrResult
 from reader.ocr.service import OcrServiceError
 
 logger = logging.getLogger(__name__)
@@ -18,12 +19,6 @@ _OCR_FAILED_ERROR = "Не удалось получить ответ серви�
 _NOTHING_RECOGNIZED_ERROR = "Не удалось распознать документ. Попробуйте прислать более чёткое фото."
 
 _NOT_RECOGNIZED = "не распознано"
-
-# Формат/порядок полей — см. reader/ocr/models.py::REPLY_FIELD_LABELS
-# (общий источник правды с reader/checkout/parser.py, который разбирает тот
-# же формат в обратную сторону — reply оператора с "pay"/исправленными
-# полями, см. задачу про checkout).
-_REPLY_FIELDS = REPLY_FIELD_LABELS
 
 
 class OcrServiceLike(Protocol):
@@ -62,12 +57,37 @@ def _is_ocr_trigger(text: str | None) -> bool:
     return len(parts) >= 2 and parts[0].lower() == "insurance" and parts[1].lower() == "ocr"
 
 
+def _with_contact_defaults(result: OcrResult, *, default_email: str | None, default_phone: str | None) -> OcrResult:
+    """email/phone не распознаются OCR (см. reader/ocr/models.py::OcrResult) —
+    заполняются значением из checkout settings ДО того, как Telegram-текст
+    сформирован, чтобы оператор мог их скорректировать тем же
+    correction-reply, что и остальные поля (единственная запись о
+    распознанных/эффективных полях — сам текст сообщения, см.
+    reader/checkout/parser.py)."""
+    return replace(
+        result,
+        email=result.email or default_email,
+        phone=result.phone or default_phone,
+    )
+
+
 def _format_result(result: OcrResult) -> str:
     lines = ["Распознано:", ""]
-    for label, attr in _REPLY_FIELDS:
-        value = getattr(result, attr) or _NOT_RECOGNIZED
-        lines.append(f"{label}: {value}")
-    lines.append("")
+    for section in REPLY_SECTIONS:
+        for field in section:
+            value = getattr(result, field.attr)
+            if field.is_flag:
+                rendered = "+" if value else "-"
+            elif field.empty_when_none:
+                # Водитель/Владелец: None означает "совпадает со
+                # страхователем", а не "не удалось распознать" — никогда не
+                # показываем "не распознано" для этих двух полей (см.
+                # reader/ocr/models.py::ReplyField.empty_when_none).
+                rendered = value or ""
+            else:
+                rendered = value or _NOT_RECOGNIZED
+            lines.append(f"{field.label}: {rendered}")
+        lines.append("")
     lines.append("Проверь данные.")
     return "\n".join(lines)
 
@@ -97,9 +117,18 @@ class InsuranceOcrCommand(Command):
 
     name = "insurance"
 
-    def __init__(self, ocr_service: OcrServiceLike, *, allowed_user_ids: list[int]):
+    def __init__(
+        self,
+        ocr_service: OcrServiceLike,
+        *,
+        allowed_user_ids: list[int],
+        default_email: str | None = None,
+        default_phone: str | None = None,
+    ):
         self._ocr_service = ocr_service
         self._allowed_user_ids = set(allowed_user_ids)
+        self._default_email = default_email
+        self._default_phone = default_phone
 
     async def handle(self, ctx: CommandContext) -> CommandResult:
         if not ctx.args or ctx.args[0].lower() != "ocr":
@@ -166,6 +195,9 @@ class InsuranceOcrCommand(Command):
             await trigger.reply(_NOTHING_RECOGNIZED_ERROR)
             return
 
+        result = _with_contact_defaults(
+            result, default_email=self._default_email, default_phone=self._default_phone,
+        )
         await trigger.reply(_format_result(result))
 
     @staticmethod

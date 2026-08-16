@@ -4,27 +4,38 @@
    "Распознано: ..." (см. reader/commands/insurance_ocr.py::_format_result)
    обратно в OcrResult. Нужен потому что checkout не хранит сам OcrResult
    нигде отдельно — единственная запись о распознанных полях это то самое
-   Telegram-сообщение, на которое отвечает оператор (см. задачу и
-   reader/checkout/service.py). Источник правды по меткам/порядку полей —
-   reader/ocr/models.py::REPLY_FIELD_LABELS, тот же, что использует и
-   _format_result — гарантирует, что разбор не разъедется с форматом вывода.
+   Telegram-сообщение, на которое отвечает оператор. Источник правды по
+   меткам/порядку полей — reader/ocr/models.py::REPLY_SECTIONS/
+   REPLY_FIELD_LABELS, тот же, что использует и _format_result — гарантирует,
+   что разбор не разъедется с форматом вывода. Лениентный разбор: строки, не
+   похожие ни на одну известную метку (в т.ч. собственный заголовок
+   "Распознано:"), просто пропускаются — сообщение уже гарантированно
+   сгенерировано нашим кодом.
 
-2. parse_correction_reply() — разбор ИСПРАВЛЕННЫХ полей, которые оператор
-   присылает вместо "pay" (см. задачу, тот же 9-полевой формат, но не
-   обязательно все поля сразу — см. apply_corrections()).
+2. parse_correction_reply() — строгий разбор ИСПРАВЛЕННЫХ полей, которые
+   оператор присылает вместо "pay" (не обязательно все поля сразу — см.
+   apply_corrections()). В отличие от (1), это текст от человека, поэтому
+   разбор строгий: неизвестная метка и повторно указанное поле — ошибка, а
+   не молчаливый пропуск.
 
-НЕ делает попытку заново распознать текст через OCR (см. задачу: "Не
-пытайся повторно OCR-ить этот текст") — чистый текстовый парсинг."""
+Оба флага "... = страхователь" поддерживают только "+"/"-" (никаких yes/no/
+true/false) — см. FLAG_ATTRS.
+
+НЕ делает попытку заново распознать текст через OCR — чистый текстовый
+парсинг."""
 
 from __future__ import annotations
 
 from dataclasses import replace
 from typing import Literal, get_args
 
-from reader.ocr.models import REPLY_FIELD_LABELS, OcrResult
+from reader.ocr.models import FLAG_ATTRS, REPLY_FIELD_LABELS, OcrResult
 
 _NOT_RECOGNIZED = "не распознано"
 _PAY_TRIGGER = "pay"
+_FLAG_TRUE = "+"
+_FLAG_FALSE = "-"
+_HEADER_LABEL = "Распознано"
 
 _CATEGORY_VALUES: tuple[str, ...] = get_args(Literal["passenger_car", "motorcycle", "trailer"])
 
@@ -44,43 +55,48 @@ def is_pay_trigger(text: str) -> bool:
 
 
 def parse_ocr_message(text: str) -> OcrResult:
-    """Обратный разбор "Распознано: ...\\n\\nСобственник: ...\\n...\\n\\nПроверь
-    данные." (см. reader/commands/insurance_ocr.py::_format_result) — строго
-    ожидает все 9 полей; если реплай указывает не на наше "Распознано:"
+    """Строго ожидает все поля reader/ocr/models.py::REPLY_FIELD_LABELS
+    (в т.ч. оба флага); если реплай указывает не на наше "Распознано:"
     сообщение (или на повреждённый/чужой текст) — ReplyParseError."""
-    if not (text or "").strip().startswith("Распознано:"):
+    if not (text or "").strip().startswith(f"{_HEADER_LABEL}:"):
         raise ReplyParseError(
             "Это не похоже на сообщение с результатом распознавания (\"Распознано: ...\")."
         )
 
-    fields = _parse_labeled_lines(text)
-    missing = _ATTR_SET - fields.keys()
+    raw_fields = _scan_lines(text, strict=False)
+    missing = _ATTR_SET - raw_fields.keys()
     if missing:
         raise ReplyParseError(
             "Не удалось разобрать исходное сообщение распознавания — отсутствуют поля: "
             + ", ".join(sorted(missing))
         )
 
-    return OcrResult(**{attr: _none_if_not_recognized(value) for attr, value in fields.items()})
+    values = {
+        attr: _convert_value(label=label, attr=attr, raw=raw_fields[attr])
+        for label, attr in REPLY_FIELD_LABELS
+    }
+    return OcrResult(**values)
 
 
-def parse_correction_reply(text: str) -> dict[str, str | None]:
-    """Разбирает reply оператора с исправленными полями (тот же формат, что
-    и "Распознано: ...", но без require'а всех строк сразу — см.
-    apply_corrections()). ReplyParseError — если ни одной распознаваемой
-    метки не найдено (значит это не исправленные поля и не "pay" — см.
-    reader/checkout/service.py, который сам решает, что это "непонятный
-    reply"), либо если Категория указана, но не входит в допустимый enum."""
-    fields = _parse_labeled_lines(text)
-    if not fields:
+def parse_correction_reply(text: str) -> dict[str, str | bool | None]:
+    """Разбирает reply оператора с исправленными полями — не обязательно все
+    сразу (см. apply_corrections()). ReplyParseError — если ни одной
+    распознаваемой метки не найдено (значит это не исправленные поля и не
+    "pay"), если метка неизвестна, если метка повторяется, если значение
+    флага не "+"/"-", либо если Категория указана, но не входит в
+    допустимый enum."""
+    raw_fields = _scan_lines(text, strict=True)
+    if not raw_fields:
         raise ReplyParseError(
             "Не понял ответ. Ответьте `pay` для оформления, или пришлите исправленные "
             "поля в формате:\n\n"
             + "\n".join(f"{label}: ..." for label, _attr in REPLY_FIELD_LABELS)
         )
 
-    corrections: dict[str, str | None] = {
-        attr: _none_if_not_recognized(value) for attr, value in fields.items()
+    label_by_attr = {attr: label for label, attr in REPLY_FIELD_LABELS}
+    corrections: dict[str, str | bool | None] = {
+        attr: _convert_value(label=label_by_attr[attr], attr=attr, raw=raw)
+        for attr, raw in raw_fields.items()
     }
 
     category = corrections.get("category")
@@ -94,26 +110,59 @@ def parse_correction_reply(text: str) -> dict[str, str | None]:
     return corrections
 
 
-def apply_corrections(original: OcrResult, corrections: dict[str, str | None]) -> OcrResult:
-    """original — распознанные поля исходного OCR-сообщения; corrections —
+def apply_corrections(original: OcrResult, corrections: dict[str, str | bool | None]) -> OcrResult:
+    """original — эффективные поля исходного OCR-сообщения; corrections —
     только те поля, что оператор явно указал в reply (см.
     parse_correction_reply). Поля, отсутствующие в corrections, остаются
-    значениями original — оператор мог прислать не все 9 строк, если менял
+    значениями original — оператор мог прислать не все строки, если менял
     только часть полей."""
     return replace(original, **corrections)
 
 
-def _parse_labeled_lines(text: str) -> dict[str, str]:
+def _scan_lines(text: str, *, strict: bool) -> dict[str, str]:
+    """strict=False (parse_ocr_message, наше собственное сообщение) —
+    неизвестные метки (включая заголовок "Распознано:") молча пропускаются.
+    strict=True (parse_correction_reply, текст оператора) — неизвестная или
+    повторная метка это ReplyParseError."""
     fields: dict[str, str] = {}
     for line in (text or "").splitlines():
         label, sep, value = line.partition(":")
         if not sep:
             continue
-        attr = _LABEL_TO_ATTR.get(label.strip())
-        if attr is None:
+        label = label.strip()
+        if not strict and label == _HEADER_LABEL:
             continue
+
+        attr = _LABEL_TO_ATTR.get(label)
+        if attr is None:
+            if strict:
+                raise ReplyParseError(f"Неизвестное поле '{label}'.")
+            continue
+
+        if attr in fields:
+            if strict:
+                raise ReplyParseError(f"Поле '{label}' указано более одного раза.")
+            continue
+
         fields[attr] = value.strip()
     return fields
+
+
+def _convert_value(*, label: str, attr: str, raw: str) -> str | bool | None:
+    if attr in FLAG_ATTRS:
+        return _parse_flag(label=label, raw=raw)
+    return _none_if_not_recognized(raw)
+
+
+def _parse_flag(*, label: str, raw: str) -> bool:
+    value = raw.strip()
+    if value == _FLAG_TRUE:
+        return True
+    if value == _FLAG_FALSE:
+        return False
+    raise ReplyParseError(
+        f"Недопустимое значение '{label}: {raw}'. Допустимо только '{_FLAG_TRUE}' или '{_FLAG_FALSE}'."
+    )
 
 
 def _none_if_not_recognized(value: str) -> str | None:

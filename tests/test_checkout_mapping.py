@@ -1,5 +1,6 @@
 """Тесты reader/checkout/mapping.py — VIN/шасси приоритет, санитайзинг
-госномера, список обязательных полей."""
+госномера, список обязательных полей (включая условное требование
+Водитель/Владелец при same_as=False)."""
 
 import sys
 from pathlib import Path
@@ -20,17 +21,21 @@ from reader.ocr.models import OcrResult  # noqa: E402
 
 def _full_result(**overrides) -> OcrResult:
     fields = dict(
-        owner_full_name="Ivanov Ivan",
-        driver_full_name="Petrov Petr",
         policyholder_full_name="Petrov Petr",
+        driver_same_as_policyholder=True,
+        driver_full_name=None,
+        owner_same_as_policyholder=True,
+        owner_full_name=None,
         passport_number="AB1234567",
         citizenship="Georgia",
         category="passenger_car",
+        manufacturer="Toyota",
+        model="Camry",
         registration_number="AA001AA",
         vin="WVWZZZ1KZAW123456",
         chassis_number=None,
-        manufacturer="Toyota",
-        model="Camry",
+        email="tplgee@mail.ru",
+        phone="925000000000",
     )
     fields.update(overrides)
     return OcrResult(**fields)
@@ -77,19 +82,16 @@ def test_sanitize_registration_number_rejects_empty_value():
         sanitize_registration_number("")
 
 
-# ---- required_vehicle_fields_missing ----
+# ---- required_vehicle_fields_missing: базовые поля (всегда обязательны) ----
 
 
 def test_required_vehicle_fields_missing_empty_for_complete_result():
     assert required_vehicle_fields_missing(_full_result()) == []
 
 
-def test_required_vehicle_fields_missing_lists_absent_names():
-    result = _full_result(owner_full_name=None, driver_full_name=None)
-    missing = required_vehicle_fields_missing(result)
-    assert "Собственник" in missing
-    assert "Водитель" in missing
-    assert "Страхователь" not in missing
+def test_required_vehicle_fields_missing_flags_absent_policyholder():
+    result = _full_result(policyholder_full_name=None)
+    assert "Страхователь" in required_vehicle_fields_missing(result)
 
 
 def test_required_vehicle_fields_missing_flags_absent_vin_and_chassis_together():
@@ -101,3 +103,38 @@ def test_required_vehicle_fields_missing_flags_absent_vin_and_chassis_together()
 def test_required_vehicle_fields_missing_does_not_flag_vin_when_only_chassis_present():
     result = _full_result(vin=None, chassis_number="CHASSIS1")
     assert "VIN/Номер шасси" not in required_vehicle_fields_missing(result)
+
+
+# ---- required_vehicle_fields_missing: Водитель/Владелец — условно ----
+
+
+def test_driver_same_as_policyholder_true_does_not_require_separate_full_name():
+    """"+" не требует отдельного ФИО."""
+    result = _full_result(driver_same_as_policyholder=True, driver_full_name=None)
+    assert "Водитель" not in required_vehicle_fields_missing(result)
+
+
+def test_driver_same_as_policyholder_false_without_full_name_blocks_checkout():
+    """"-" без отдельного ФИО блокирует checkout."""
+    result = _full_result(driver_same_as_policyholder=False, driver_full_name=None)
+    assert "Водитель" in required_vehicle_fields_missing(result)
+
+
+def test_driver_same_as_policyholder_false_with_full_name_is_not_missing():
+    result = _full_result(driver_same_as_policyholder=False, driver_full_name="Ivanov Ivan")
+    assert "Водитель" not in required_vehicle_fields_missing(result)
+
+
+def test_owner_same_as_policyholder_true_does_not_require_separate_full_name():
+    result = _full_result(owner_same_as_policyholder=True, owner_full_name=None)
+    assert "Владелец" not in required_vehicle_fields_missing(result)
+
+
+def test_owner_same_as_policyholder_false_without_full_name_blocks_checkout():
+    result = _full_result(owner_same_as_policyholder=False, owner_full_name=None)
+    assert "Владелец" in required_vehicle_fields_missing(result)
+
+
+def test_owner_same_as_policyholder_false_with_full_name_is_not_missing():
+    result = _full_result(owner_same_as_policyholder=False, owner_full_name="Sidorov Petr")
+    assert "Владелец" not in required_vehicle_fields_missing(result)

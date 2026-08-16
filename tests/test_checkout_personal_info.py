@@ -22,11 +22,16 @@ _EMAIL = "tplgee@mail.ru"
 
 def _effective(**overrides) -> OcrResult:
     fields = dict(
-        owner_full_name="Ivanov Ivan", driver_full_name="Petrov Petr", policyholder_full_name="Petrov Petr",
+        policyholder_full_name="Petrov Petr",
+        driver_same_as_policyholder=True,
+        driver_full_name=None,
+        owner_same_as_policyholder=True,
+        owner_full_name=None,
         passport_number="AB1234567", citizenship="Georgia",
         category="passenger_car", registration_number="AA001AA",
         vin="WVWZZZ1KZAW123456", chassis_number=None,
         manufacturer="Toyota", model="Camry",
+        email=_EMAIL, phone=_PHONE,
     )
     fields.update(overrides)
     return OcrResult(**fields)
@@ -76,28 +81,38 @@ async def test_resolve_fills_citizenship_id_via_reference_data():
     assert reference_data.resolve_country_calls == ["Russia Federation"]
 
 
-async def test_resolve_fills_phone_and_email_from_constructor_args_not_ocr():
-    """phone/email приходят из settings (переданы в конструктор), а не из
-    OcrResult — у OcrResult вообще нет таких полей (см. задачу: "Phone/email
-    не нужно OCR-ить")."""
+async def test_resolve_fills_phone_and_email_from_effective_ocr_result():
+    """phone/email приходят из OcrResult.phone/email (см. задачу: попадают
+    туда из checkout settings, но оператор мог их скорректировать
+    correction-reply'ем для конкретной заявки)."""
     provider, _ref = _provider()
-    resolution = await provider.resolve(_effective())
+    resolution = await provider.resolve(_effective(email="operator@example.com", phone="599111222"))
+
+    for role in (resolution.info.insurer, resolution.info.driver, resolution.info.owner):
+        assert role.phone == "599111222"
+        assert role.email == "operator@example.com"
+
+
+async def test_resolve_falls_back_to_constructor_phone_and_email_when_effective_is_none():
+    """Если оператор явно очистил Email/Телефон ("не распознано") —
+    fallback на settings-значение из конструктора, а не блокировка (это
+    поле уже имеет безопасный дефолт)."""
+    provider, _ref = _provider()
+    resolution = await provider.resolve(_effective(email=None, phone=None))
 
     for role in (resolution.info.insurer, resolution.info.driver, resolution.info.owner):
         assert role.phone == _PHONE
         assert role.email == _EMAIL
 
 
-async def test_resolve_uses_same_person_for_all_three_roles():
-    """Бизнес-решение задачи: один и тот же identification_number/
-    citizenship/phone/email для страхователя/водителя/собственника."""
+async def test_resolve_uses_same_person_for_all_three_roles_when_same_as_policyholder():
     provider, _ref = _provider()
     resolution = await provider.resolve(_effective())
 
     assert resolution.info.insurer == resolution.info.driver == resolution.info.owner
 
 
-# ---- отсутствие/неизвестные значения блокируют ----
+# ---- отсутствие/неизвестные значения страхователя блокируют ----
 
 
 async def test_resolve_blocks_when_passport_number_missing():
@@ -143,6 +158,43 @@ async def test_resolve_reports_both_missing_fields_together():
     assert len(resolution.missing) == 2
 
 
+# ---- driver/owner same_as=False — не придумываем отдельные данные, блокируем ----
+
+
+async def test_resolve_blocks_when_driver_not_same_as_policyholder():
+    provider, _ref = _provider()
+    resolution = await provider.resolve(
+        _effective(driver_same_as_policyholder=False, driver_full_name="Ivanov Ivan")
+    )
+
+    assert not resolution.is_complete
+    assert any("Водитель" in item for item in resolution.missing)
+
+
+async def test_resolve_blocks_when_owner_not_same_as_policyholder():
+    provider, _ref = _provider()
+    resolution = await provider.resolve(
+        _effective(owner_same_as_policyholder=False, owner_full_name="Sidorov Petr")
+    )
+
+    assert not resolution.is_complete
+    assert any("Владелец" in item for item in resolution.missing)
+
+
+async def test_resolve_reports_driver_and_owner_missing_together_with_insurer_issues():
+    provider, _ref = _provider()
+    resolution = await provider.resolve(
+        _effective(
+            passport_number=None,
+            driver_same_as_policyholder=False,
+            owner_same_as_policyholder=False,
+        )
+    )
+
+    assert not resolution.is_complete
+    assert len(resolution.missing) == 3
+
+
 # ---- NoPersonalInfoProvider (fail-closed default) ----
 
 
@@ -151,4 +203,4 @@ async def test_no_personal_info_provider_always_blocks():
     resolution = await provider.resolve(_effective())
 
     assert not resolution.is_complete
-    assert len(resolution.missing) == 3  # страхователь/водитель/собственник
+    assert len(resolution.missing) == 3  # страхователь/водитель/владелец

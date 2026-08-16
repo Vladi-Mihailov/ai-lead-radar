@@ -251,7 +251,12 @@ def build_insurance_ocr_components(
     CommandDispatcher (свой chat_id/allowed_user_ids), свой OcrService."""
     ocr = settings.ocr
     ocr_service = OcrService(api_key=ocr.openai_api_key, model=ocr.vision_model)
-    insurance_command = InsuranceOcrCommand(ocr_service, allowed_user_ids=ocr.allowed_user_ids)
+    insurance_command = InsuranceOcrCommand(
+        ocr_service,
+        allowed_user_ids=ocr.allowed_user_ids,
+        default_email=settings.checkout.email,
+        default_phone=settings.checkout.phone,
+    )
     command_dispatcher = CommandDispatcher(source.client, ocr.service_chat_id, ocr.allowed_user_ids)
     album_collector = AlbumCollector(
         on_group_ready=insurance_command.handle_album,

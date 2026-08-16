@@ -40,10 +40,13 @@ def _secrets() -> CardSecrets:
 
 def _state() -> CheckoutState:
     effective = OcrResult(
-        owner_full_name="Ivanov Ivan", driver_full_name="Petrov Petr", policyholder_full_name="Petrov Petr",
+        policyholder_full_name="Petrov Petr",
+        driver_same_as_policyholder=True, driver_full_name=None,
+        owner_same_as_policyholder=True, owner_full_name=None,
         passport_number="AB1234567", citizenship="Georgia",
         category="passenger_car", registration_number="AA001AA",
         vin="WVWZZZ1KZAW123456", chassis_number=None, manufacturer="Toyota", model="Camry",
+        email="tplgee@mail.ru", phone="925000000000",
     )
     return CheckoutState(
         id="checkout-1", chat_id=-100, ocr_message_id=1, operator_user_id=111,
