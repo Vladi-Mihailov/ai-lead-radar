@@ -48,11 +48,21 @@ import logging
 import os
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Protocol
 
 from reader.checkout.models import CheckoutState, FailureReason
 
 logger = logging.getLogger(__name__)
+
+# Каталог для production-диагностики timeout'а банковской формы (см.
+# _capture_form_timeout_diagnostics ниже) — ТОЛЬКО метаданные страницы и
+# screenshot/HTML ДО заполнения полей карты (см. docstring метода): ни один
+# secrets/PII там появиться не может, т.к. до этой точки ни разу не
+# вызывается page.fill() с данными карты. Относительно текущей рабочей
+# директории процесса — тот же принцип, что и остальные data/* пути проекта
+# (data/sessions, data/users.db).
+_PAYMENT_DEBUG_DIR = Path("data/payment_debug")
 
 # Подтверждены research'ом (см. docstring модуля) — реальные id полей формы
 # оплаты на mpi.gc.ge.
@@ -319,6 +329,17 @@ class PlaywrightBankGatewayClient:
                     "Checkout %s: банковская форма карты не появилась вовремя (%s)",
                     state.id, type(exc).__name__,
                 )
+                if page is not None:
+                    # Диагностика — best-effort, никогда не должна маскировать
+                    # исходный timeout (см. задачу: производственное
+                    # расследование "почему форма не найдена", без speculative
+                    # fix'а selector'ов/таймаутов).
+                    try:
+                        await self._capture_form_timeout_diagnostics(state, page)
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "Checkout %s: диагностика timeout формы упала неожиданно", state.id,
+                        )
                 await self._safe_close(page)
                 return BankGatewayResult(
                     outcome=BankGatewayOutcome.FAILED,
@@ -367,6 +388,83 @@ class PlaywrightBankGatewayClient:
         # случай будущей реализации, где сессия остаётся открытой между
         # start() и submit_confirmation_code().
         return None
+
+    @staticmethod
+    async def _capture_form_timeout_diagnostics(state: CheckoutState, page: BrowserPageLike) -> None:
+        """Production-диагностика ТОЛЬКО для этапа ДО ввода карточных данных
+        (см. задачу) — вызывается ИСКЛЮЧИТЕЛЬНО из ветки "Timeout" в start(),
+        до которой ни разу не выполняется page.fill() с данными карты. Никогда
+        не логирует/не сохраняет card number/CVV/OTP/значения .env — только
+        метаданные страницы (url/title/frames/load state) и screenshot/HTML
+        ДО ввода. Каждый шаг best-effort и независим от остальных: реальный
+        Playwright Page умеет всё нижеперечисленное, но метод намеренно не
+        требует этого от BrowserPageLike-протокола (используется getattr —
+        см. задачу: "не меняй selectors/timeouts/state-machine", протокол
+        тоже не расширяем формально ради этого)."""
+        page_url = None
+        try:
+            page_url = page.url  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001, S110 — диагностика best-effort, отсутствие значения видно ниже в логе как None
+            pass
+
+        page_title = None
+        title_fn = getattr(page, "title", None)
+        if title_fn is not None:
+            try:
+                page_title = await title_fn()
+            except Exception:  # noqa: BLE001, S110
+                pass
+
+        load_state = None
+        evaluate_fn = getattr(page, "evaluate", None)
+        if evaluate_fn is not None:
+            try:
+                load_state = await evaluate_fn("document.readyState")
+            except Exception:  # noqa: BLE001, S110
+                pass
+
+        frame_urls: list[str] = []
+        frames = getattr(page, "frames", None)
+        if frames is not None:
+            try:
+                for frame in frames:
+                    try:
+                        frame_urls.append(str(frame.url))
+                    except Exception:  # noqa: BLE001
+                        frame_urls.append("<unavailable>")
+            except Exception:  # noqa: BLE001, S110
+                pass
+
+        logger.warning(
+            "Checkout %s: диагностика timeout банковской формы\n"
+            "page_url=%s\npage_title=%s\nload_state=%s\nframes_count=%d\nframe_urls=%s",
+            state.id, page_url, page_title, load_state, len(frame_urls), frame_urls,
+        )
+
+        try:
+            _PAYMENT_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception:  # noqa: BLE001
+            logger.warning("Checkout %s: не удалось создать каталог диагностики %s", state.id, _PAYMENT_DEBUG_DIR)
+            return
+
+        screenshot_fn = getattr(page, "screenshot", None)
+        if screenshot_fn is not None:
+            screenshot_path = _PAYMENT_DEBUG_DIR / f"{state.id}-form-timeout.png"
+            try:
+                await screenshot_fn(path=str(screenshot_path))
+                logger.warning("Checkout %s: screenshot диагностики сохранён: %s", state.id, screenshot_path)
+            except Exception:  # noqa: BLE001
+                logger.warning("Checkout %s: не удалось сохранить screenshot диагностики", state.id)
+
+        content_fn = getattr(page, "content", None)
+        if content_fn is not None:
+            html_path = _PAYMENT_DEBUG_DIR / f"{state.id}-form-timeout.html"
+            try:
+                html = await content_fn()
+                html_path.write_text(html, encoding="utf-8")
+                logger.warning("Checkout %s: HTML диагностики сохранён: %s", state.id, html_path)
+            except Exception:  # noqa: BLE001
+                logger.warning("Checkout %s: не удалось сохранить HTML диагностики", state.id)
 
     @staticmethod
     async def _safe_close(page: BrowserPageLike | None) -> None:

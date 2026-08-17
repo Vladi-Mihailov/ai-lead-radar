@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import httpx
 
 from reader.checkout.models import PaymentBank, TplPolicyPayload
@@ -27,6 +29,46 @@ from reader.checkout.models import PaymentBank, TplPolicyPayload
 _POLICIES_URL = "https://web-back.tpl.ge/api/policies"
 _ECOMMERCE_BASE_URL = "https://ecommerce-api.tpl.ge/ecommerce"
 _TPL_GE_BASE_URL = "https://tpl.ge/ka/policies"
+
+# httpx логирует КАЖДЫЙ запрос на уровне INFO целиком с URL, включая query-
+# параметры (см. httpx._client: logger.info('HTTP Request: %s %s "%s %d
+# %s"', request.method, request.url, ...), logger = logging.getLogger
+# ("httpx")). Для GET .../ecommerce/{bank} (см. get_payment_redirect_url
+# ниже) query-параметры содержат payerTitle/payerIdentificationNumber — PII
+# страхователя, которое НЕ должно попадать в production-логи. НЕ глушим
+# httpx-логирование целиком (см. задачу: "не отключай всё HTTP-логирование
+# вслепую") — POST /api/policies и справочники tpl.ge (см.
+# reader/checkout/reference_data.py) продолжают логироваться как раньше,
+# редактируется query-строка ТОЛЬКО у записей с этим конкретным URL.
+_ECOMMERCE_URL_MARKER = "ecommerce-api.tpl.ge/ecommerce/"
+
+
+class _RedactEcommerceUrlFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if not args:
+            return True
+
+        redacted = False
+        new_args = list(args) if isinstance(args, tuple) else args
+        if isinstance(args, tuple):
+            for index, value in enumerate(args):
+                text = str(value)
+                if _ECOMMERCE_URL_MARKER in text and "?" in text:
+                    new_args[index] = text.split("?", 1)[0] + "?<redacted>"
+                    redacted = True
+            if redacted:
+                record.args = tuple(new_args)
+        return True
+
+
+def _install_ecommerce_url_log_redaction() -> None:
+    httpx_logger = logging.getLogger("httpx")
+    if not any(isinstance(f, _RedactEcommerceUrlFilter) for f in httpx_logger.filters):
+        httpx_logger.addFilter(_RedactEcommerceUrlFilter())
+
+
+_install_ecommerce_url_log_redaction()
 
 # Единственное подтверждённое research'ом значение paymentType в запросе
 # ecommerce/{bank} — назначение остальных возможных значений не исследовано.

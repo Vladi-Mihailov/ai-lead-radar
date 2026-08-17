@@ -98,6 +98,51 @@ class _FakeLauncher:
         return self._page
 
 
+class _FakeFrame:
+    def __init__(self, url: str):
+        self.url = url
+
+
+class _DiagnosticFakePage(_FakePage):
+    """_FakePage + всё, что реальный Playwright Page умеет для диагностики
+    timeout'а формы (см. reader/checkout/payment_gateway.py::
+    PlaywrightBankGatewayClient._capture_form_timeout_diagnostics) — url/
+    title()/evaluate()/frames/screenshot()/content(). Отдельный класс, а не
+    расширение самого _FakePage, чтобы существующие тесты (без этих
+    методов) продолжали проверять, что диагностика — best-effort и не
+    требует их наличия (см. getattr в самом методе)."""
+
+    def __init__(self, *, url="https://mpi.gc.ge/unexpected-page", title="Unexpected Page",
+                 load_state="complete", frame_urls=(), screenshot_error=None, content_error=None, **kwargs):
+        super().__init__(**kwargs)
+        self.url = url
+        self._title = title
+        self._load_state = load_state
+        self.frames = [_FakeFrame(u) for u in frame_urls]
+        self._screenshot_error = screenshot_error
+        self._content_error = content_error
+        self.screenshot_calls: list[str] = []
+        self.content_calls = 0
+
+    async def title(self):
+        return self._title
+
+    async def evaluate(self, expression):
+        assert expression == "document.readyState"
+        return self._load_state
+
+    async def screenshot(self, *, path):
+        self.screenshot_calls.append(path)
+        if self._screenshot_error is not None:
+            raise self._screenshot_error
+
+    async def content(self):
+        self.content_calls += 1
+        if self._content_error is not None:
+            raise self._content_error
+        return "<html><body>mpi.gc.ge unexpected page</body></html>"
+
+
 # ---- CardSecrets ----
 
 
@@ -311,3 +356,144 @@ async def test_submit_confirmation_code_error_never_contains_the_code():
 async def test_cancel_is_a_safe_noop():
     client = PlaywrightBankGatewayClient(launcher=_FakeLauncher(_FakePage()), card_secrets=_secrets())
     await client.cancel(_state())  # не должно поднимать исключение
+
+
+# ---- диагностика timeout'а банковской формы (см. задачу: production-
+# расследование "Playwright не находит форму", без speculative fix'а
+# selector'ов/таймаутов) ----
+
+
+def _use_tmp_payment_debug_dir(monkeypatch, tmp_path):
+    import reader.checkout.payment_gateway as payment_gateway_module
+
+    directory = tmp_path / "payment_debug"
+    monkeypatch.setattr(payment_gateway_module, "_PAYMENT_DEBUG_DIR", directory)
+    return directory
+
+
+async def test_form_timeout_logs_page_metadata_and_frame_urls(monkeypatch, tmp_path, caplog):
+    _use_tmp_payment_debug_dir(monkeypatch, tmp_path)
+    page = _DiagnosticFakePage(
+        fail_on="wait_for_selector", error=_TimeoutError("timed out"),
+        url="https://mpi.gc.ge/unexpected?o.id=abc", title="Some Other Page",
+        load_state="interactive", frame_urls=["https://mpi.gc.ge/frame1", "https://pay.example/frame2"],
+    )
+    launcher = _FakeLauncher(page)
+    client = PlaywrightBankGatewayClient(launcher=launcher, card_secrets=_secrets())
+
+    with caplog.at_level(logging.WARNING, logger="reader.checkout.payment_gateway"):
+        result = await client.start(_state(), "https://mpi.gc.ge/page1")
+
+    assert result.failure_reason == FailureReason.UNEXPECTED_BANK_PAGE
+    assert "checkout-1" in caplog.text
+    assert "page_url=https://mpi.gc.ge/unexpected?o.id=abc" in caplog.text
+    assert "page_title=Some Other Page" in caplog.text
+    assert "load_state=interactive" in caplog.text
+    assert "frames_count=2" in caplog.text
+    assert "https://mpi.gc.ge/frame1" in caplog.text
+    assert "https://pay.example/frame2" in caplog.text
+
+
+async def test_form_timeout_saves_screenshot_before_any_card_data_entered(monkeypatch, tmp_path):
+    debug_dir = _use_tmp_payment_debug_dir(monkeypatch, tmp_path)
+    page = _DiagnosticFakePage(fail_on="wait_for_selector", error=_TimeoutError("timed out"))
+    launcher = _FakeLauncher(page)
+    client = PlaywrightBankGatewayClient(launcher=launcher, card_secrets=_secrets())
+
+    await client.start(_state(), "https://mpi.gc.ge/page1")
+
+    expected_path = debug_dir / "checkout-1-form-timeout.png"
+    assert page.screenshot_calls == [str(expected_path)]
+    # Ни один page.fill() с данными карты не вызывался до timeout'а —
+    # screenshot физически не может содержать номер карты/CVV.
+    assert not any(name == "fill" for name, *_ in page.calls)
+
+
+async def test_form_timeout_saves_html_snapshot(monkeypatch, tmp_path):
+    debug_dir = _use_tmp_payment_debug_dir(monkeypatch, tmp_path)
+    page = _DiagnosticFakePage(fail_on="wait_for_selector", error=_TimeoutError("timed out"))
+    launcher = _FakeLauncher(page)
+    client = PlaywrightBankGatewayClient(launcher=launcher, card_secrets=_secrets())
+
+    await client.start(_state(), "https://mpi.gc.ge/page1")
+
+    html_path = debug_dir / "checkout-1-form-timeout.html"
+    assert html_path.exists()
+    assert "mpi.gc.ge unexpected page" in html_path.read_text(encoding="utf-8")
+
+
+async def test_form_timeout_diagnostics_never_log_or_save_card_secrets(monkeypatch, tmp_path, caplog):
+    _use_tmp_payment_debug_dir(monkeypatch, tmp_path)
+    page = _DiagnosticFakePage(fail_on="wait_for_selector", error=_TimeoutError("timed out"))
+    launcher = _FakeLauncher(page)
+    client = PlaywrightBankGatewayClient(launcher=launcher, card_secrets=_secrets())
+
+    with caplog.at_level(logging.DEBUG):
+        await client.start(_state(), "https://mpi.gc.ge/page1")
+
+    for record in caplog.records:
+        message = record.getMessage()
+        assert _CARD_NUMBER not in message
+        assert _CVV not in message
+
+
+async def test_form_timeout_diagnostics_are_best_effort_when_screenshot_fails(monkeypatch, tmp_path, caplog):
+    """Сбой САМОЙ диагностики (например, screenshot упал) не должен
+    маскировать исходный timeout и не должен мешать вернуть корректный
+    FAILED-результат (см. задачу: диагностика — best-effort)."""
+    _use_tmp_payment_debug_dir(monkeypatch, tmp_path)
+    page = _DiagnosticFakePage(
+        fail_on="wait_for_selector", error=_TimeoutError("timed out"),
+        screenshot_error=RuntimeError("disk full"),
+    )
+    launcher = _FakeLauncher(page)
+    client = PlaywrightBankGatewayClient(launcher=launcher, card_secrets=_secrets())
+
+    with caplog.at_level(logging.WARNING, logger="reader.checkout.payment_gateway"):
+        result = await client.start(_state(), "https://mpi.gc.ge/page1")
+
+    assert result.outcome == BankGatewayOutcome.FAILED
+    assert result.failure_reason == FailureReason.UNEXPECTED_BANK_PAGE
+    assert page.closed is True
+    assert "не удалось сохранить screenshot" in caplog.text
+
+
+async def test_form_timeout_diagnostics_gracefully_skip_when_page_lacks_diagnostic_methods(tmp_path, monkeypatch):
+    """Существующий _FakePage (без url/title/frames/screenshot/content) —
+    диагностика не должна требовать их (см. getattr в
+    _capture_form_timeout_diagnostics) — old regression from
+    test_start_timeout_waiting_for_card_form_is_unexpected_bank_page must
+    keep passing unmodified; здесь дополнительно проверяем, что каталог
+    диагностики вообще не создаётся, если сохранить нечего."""
+    debug_dir = tmp_path / "payment_debug"
+    import reader.checkout.payment_gateway as payment_gateway_module
+
+    monkeypatch.setattr(payment_gateway_module, "_PAYMENT_DEBUG_DIR", debug_dir)
+
+    page = _FakePage(fail_on="wait_for_selector", error=_TimeoutError("timed out"))
+    launcher = _FakeLauncher(page)
+    client = PlaywrightBankGatewayClient(launcher=launcher, card_secrets=_secrets())
+
+    result = await client.start(_state(), "https://mpi.gc.ge/page1")
+
+    assert result.failure_reason == FailureReason.UNEXPECTED_BANK_PAGE
+    # _FakePage не реализует screenshot/content — mkdir всё равно создаёт
+    # каталог (см. реализация: mkdir идёт до getattr-проверок screenshot/
+    # content), но ни один файл не появляется.
+    assert list(debug_dir.glob("*")) == [] if debug_dir.exists() else True
+
+
+async def test_no_diagnostics_captured_for_non_timeout_browser_crash(monkeypatch, tmp_path):
+    """Диагностика — только для ветки "Timeout" (см. задачу: "только для
+    этапа до ввода карточных данных" применительно к timeout'у формы, не ко
+    ВСЕМ сбоям браузера) — при обычном browser crash ничего не сохраняется."""
+    debug_dir = _use_tmp_payment_debug_dir(monkeypatch, tmp_path)
+    page = _DiagnosticFakePage(fail_on="goto", error=ConnectionError("network down"))
+    launcher = _FakeLauncher(page)
+    client = PlaywrightBankGatewayClient(launcher=launcher, card_secrets=_secrets())
+
+    result = await client.start(_state(), "https://mpi.gc.ge/page1")
+
+    assert result.failure_reason == FailureReason.BROWSER_CRASHED
+    assert page.screenshot_calls == []
+    assert not debug_dir.exists() or list(debug_dir.glob("*")) == []
