@@ -407,6 +407,125 @@ async def test_different_names_split_policyholder_from_registration_and_driver_f
     assert result.owner_full_name is None
 
 
+# ---- driver_same_as_policyholder: сравнение только по фамилии+имени ----
+
+
+async def test_driver_same_as_policyholder_true_when_passport_name_omits_patronymic(monkeypatch):
+    """Полное ФИО техпаспорта vs фамилия+имя паспорта/прав (без отчества) —
+    один и тот же человек, отдельный водитель не выводится."""
+    service = _service()
+    fake_response = types.SimpleNamespace(
+        output_parsed=_parsed(
+            registration_owner_full_name="Buivolenko Viktor Igorevich",
+            passport_full_name="Buivolenko Viktor",
+        )
+    )
+
+    async def fake_parse(**kwargs):
+        return fake_response
+
+    monkeypatch.setattr(service._client.responses, "parse", fake_parse)
+
+    result = await service.extract([(b"bytes", "image/jpeg")])
+
+    assert result.driver_same_as_policyholder is True
+    assert result.driver_full_name is None
+    # Страхователь остаётся полным ФИО, не усечённым до фамилии+имени.
+    assert result.policyholder_full_name == "Buivolenko Viktor Igorevich"
+
+
+async def test_driver_same_as_policyholder_true_when_both_have_different_patronymics(monkeypatch):
+    """Отчества присутствуют в обоих документах, но различаются —
+    фамилия+имя совпадают, поэтому это всё равно один и тот же человек."""
+    service = _service()
+    fake_response = types.SimpleNamespace(
+        output_parsed=_parsed(
+            registration_owner_full_name="Buivolenko Viktor Igorevich",
+            passport_full_name="Buivolenko Viktor Petrovich",
+        )
+    )
+
+    async def fake_parse(**kwargs):
+        return fake_response
+
+    monkeypatch.setattr(service._client.responses, "parse", fake_parse)
+
+    result = await service.extract([(b"bytes", "image/jpeg")])
+
+    assert result.driver_same_as_policyholder is True
+    assert result.driver_full_name is None
+    assert result.policyholder_full_name == "Buivolenko Viktor Igorevich"
+
+
+async def test_driver_same_as_policyholder_false_when_first_name_differs_same_surname(monkeypatch):
+    """Фамилия совпадает, имя — нет: разные люди, водитель выводится
+    отдельно и полностью, как распознано."""
+    service = _service()
+    fake_response = types.SimpleNamespace(
+        output_parsed=_parsed(
+            registration_owner_full_name="Buivolenko Viktor Igorevich",
+            passport_full_name="Buivolenko Petr",
+        )
+    )
+
+    async def fake_parse(**kwargs):
+        return fake_response
+
+    monkeypatch.setattr(service._client.responses, "parse", fake_parse)
+
+    result = await service.extract([(b"bytes", "image/jpeg")])
+
+    assert result.driver_same_as_policyholder is False
+    assert result.driver_full_name == "Buivolenko Petr"
+    assert result.policyholder_full_name == "Buivolenko Viktor Igorevich"
+
+
+async def test_driver_same_as_policyholder_false_when_surname_differs_same_first_name(monkeypatch):
+    """Имя совпадает, фамилия — нет: тоже разные люди."""
+    service = _service()
+    fake_response = types.SimpleNamespace(
+        output_parsed=_parsed(
+            registration_owner_full_name="Buivolenko Viktor Igorevich",
+            passport_full_name="Sidorov Viktor",
+        )
+    )
+
+    async def fake_parse(**kwargs):
+        return fake_response
+
+    monkeypatch.setattr(service._client.responses, "parse", fake_parse)
+
+    result = await service.extract([(b"bytes", "image/jpeg")])
+
+    assert result.driver_same_as_policyholder is False
+    assert result.driver_full_name == "Sidorov Viktor"
+
+
+async def test_power_of_attorney_owner_logic_unaffected_by_relaxed_driver_name_matching(monkeypatch):
+    """Регресс: смягчение сравнения для driver никак не должно влиять на
+    независимую owner/доверенность-логику (см. reader/ocr/models.py)."""
+    service = _service()
+    fake_response = types.SimpleNamespace(
+        output_parsed=_parsed(
+            registration_owner_full_name="Buivolenko Viktor Igorevich",
+            passport_full_name="Buivolenko Viktor",
+            power_of_attorney_owner_full_name="Sidorov Semyon",
+        )
+    )
+
+    async def fake_parse(**kwargs):
+        return fake_response
+
+    monkeypatch.setattr(service._client.responses, "parse", fake_parse)
+
+    result = await service.extract([(b"bytes", "image/jpeg")])
+
+    assert result.driver_same_as_policyholder is True
+    assert result.driver_full_name is None
+    assert result.owner_same_as_policyholder is False
+    assert result.owner_full_name == "Sidorov Semyon"
+
+
 async def test_only_registration_certificate_name_available_uses_it_as_policyholder(monkeypatch):
     """Единственный надёжный источник — техпаспорт: используем его ФИО как
     policyholder, не изобретаем отдельного водителя."""
