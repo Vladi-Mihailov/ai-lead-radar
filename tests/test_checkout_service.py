@@ -31,6 +31,7 @@ from reader.checkout.reference_data import (  # noqa: E402
     ReferenceDataError,
 )
 from reader.checkout.service import CheckoutService  # noqa: E402
+from reader.checkout.store import CheckoutStore  # noqa: E402
 from reader.checkout.tpl_client import TplGeClientError  # noqa: E402
 
 _CHAT_ID = -100999
@@ -355,7 +356,9 @@ async def test_pay_reaches_waiting_for_code_and_completes_after_correct_code():
 
     await service.mark_code_prompt_sent(started.state.id, prompt_message_id := 555)
 
-    outcome = await service.handle_code_reply(chat_id=_CHAT_ID, prompt_message_id=prompt_message_id, code="123456")
+    outcome = await service.handle_code_reply(
+        chat_id=_CHAT_ID, prompt_message_id=prompt_message_id, code="123456", operator_user_id=_OPERATOR_ID,
+    )
 
     assert outcome.state.status == CheckoutStatus.COMPLETED
     assert outcome.reply_text == "✅ Оплата успешно завершена."
@@ -374,7 +377,9 @@ async def test_code_message_correlation_ignores_replies_to_other_messages():
     await service.mark_code_prompt_sent(started.state.id, 555)
 
     # reply на СЛУЧАЙНОЕ другое сообщение с цифрами — не должен считаться кодом.
-    outcome = await service.handle_code_reply(chat_id=_CHAT_ID, prompt_message_id=999999, code="123456")
+    outcome = await service.handle_code_reply(
+        chat_id=_CHAT_ID, prompt_message_id=999999, code="123456", operator_user_id=_OPERATOR_ID,
+    )
 
     assert outcome is None
     assert bank_gateway.received_codes == []
@@ -398,7 +403,9 @@ async def test_invalid_otp_with_retry_stays_in_waiting_for_code():
     )
     await service.mark_code_prompt_sent(started.state.id, 555)
 
-    first_attempt = await service.handle_code_reply(chat_id=_CHAT_ID, prompt_message_id=555, code="000000")
+    first_attempt = await service.handle_code_reply(
+        chat_id=_CHAT_ID, prompt_message_id=555, code="000000", operator_user_id=_OPERATOR_ID,
+    )
     assert first_attempt.state.status == CheckoutStatus.WAITING_FOR_CONFIRMATION_CODE
     assert first_attempt.needs_code_prompt_registration is True
     assert "ещё раз" in first_attempt.reply_text
@@ -406,7 +413,9 @@ async def test_invalid_otp_with_retry_stays_in_waiting_for_code():
     # Telegram-интеграция отправила бы новый prompt и зарегистрировала его id.
     await service.mark_code_prompt_sent(started.state.id, 777)
 
-    second_attempt = await service.handle_code_reply(chat_id=_CHAT_ID, prompt_message_id=777, code="123456")
+    second_attempt = await service.handle_code_reply(
+        chat_id=_CHAT_ID, prompt_message_id=777, code="123456", operator_user_id=_OPERATOR_ID,
+    )
     assert second_attempt.state.status == CheckoutStatus.COMPLETED
     assert bank_gateway.received_codes == ["000000", "123456"]
 
@@ -425,12 +434,173 @@ async def test_stale_otp_prompt_no_longer_active_after_success_is_ignored_by_sec
         chat_id=_CHAT_ID, ocr_message_id=1, ocr_message_text=_ocr_message(), operator_user_id=_OPERATOR_ID,
     )
     await service.mark_code_prompt_sent(started.state.id, 555)
-    await service.handle_code_reply(chat_id=_CHAT_ID, prompt_message_id=555, code="123456")
+    await service.handle_code_reply(
+        chat_id=_CHAT_ID, prompt_message_id=555, code="123456", operator_user_id=_OPERATOR_ID,
+    )
 
-    second_reply = await service.handle_code_reply(chat_id=_CHAT_ID, prompt_message_id=555, code="999999")
+    second_reply = await service.handle_code_reply(
+        chat_id=_CHAT_ID, prompt_message_id=555, code="999999", operator_user_id=_OPERATOR_ID,
+    )
 
     assert second_reply.state.status == CheckoutStatus.COMPLETED
     assert bank_gateway.received_codes == ["123456"]  # второй код НЕ ушёл в gateway
+
+
+# ---- OTP ownership: код принимается ТОЛЬКО от того, кто запустил pay ----
+# (см. задачу: checkout/pay больше не ограничен ocr.allowed_user_ids —
+# допуск к самому чату открыт любому участнику, поэтому ownership
+# конкретного платежа обязана определяться operator_user_id заявки, а не
+# общим списком allowed-пользователей).
+
+_OTHER_OPERATOR_ID = 222
+
+
+async def test_otp_from_same_operator_who_sent_pay_is_accepted():
+    bank_gateway = _FakeBankGateway(
+        start_results=[BankGatewayResult(outcome=BankGatewayOutcome.AWAITING_CODE, message="ждём код")],
+        code_results=[BankGatewayResult(outcome=BankGatewayOutcome.COMPLETED, message="Готово.")],
+    )
+    service, _tpl, _ref, _lock = _service_with_real_personal_info(bank_gateway=bank_gateway)
+
+    started = await service.handle_pay(
+        chat_id=_CHAT_ID, ocr_message_id=60, ocr_message_text=_ocr_message(), operator_user_id=_OPERATOR_ID,
+    )
+    await service.mark_code_prompt_sent(started.state.id, 555)
+
+    outcome = await service.handle_code_reply(
+        chat_id=_CHAT_ID, prompt_message_id=555, code="123456", operator_user_id=_OPERATOR_ID,
+    )
+
+    assert outcome.state.status == CheckoutStatus.COMPLETED
+    assert bank_gateway.received_codes == ["123456"]
+
+
+async def test_otp_from_different_user_than_who_sent_pay_is_rejected():
+    """user A -> pay (operator_user_id=A); user B присылает OTP -> должен
+    быть отклонён с понятной ошибкой, код НЕ уходит в bank_gateway (не
+    "любой участник чата может подтвердить чужой платёж")."""
+    bank_gateway = _FakeBankGateway(
+        start_results=[BankGatewayResult(outcome=BankGatewayOutcome.AWAITING_CODE, message="ждём код")],
+    )
+    service, _tpl, _ref, _lock = _service_with_real_personal_info(bank_gateway=bank_gateway)
+
+    started = await service.handle_pay(
+        chat_id=_CHAT_ID, ocr_message_id=61, ocr_message_text=_ocr_message(), operator_user_id=_OPERATOR_ID,
+    )
+    await service.mark_code_prompt_sent(started.state.id, 555)
+
+    outcome = await service.handle_code_reply(
+        chat_id=_CHAT_ID, prompt_message_id=555, code="123456", operator_user_id=_OTHER_OPERATOR_ID,
+    )
+
+    assert outcome is not None  # это НАШ prompt (не "вообще не про код") — просто отклонён
+    assert outcome.state.status == CheckoutStatus.WAITING_FOR_CONFIRMATION_CODE  # не продвинулся
+    assert bank_gateway.received_codes == []
+    assert "оператор" in outcome.reply_text.lower()
+
+
+async def test_otp_from_wrong_user_then_correct_user_still_completes():
+    """После отказа user B корректный код от user A (того же, кто слал
+    pay) всё ещё должен нормально пройти — отказ не портит state."""
+    bank_gateway = _FakeBankGateway(
+        start_results=[BankGatewayResult(outcome=BankGatewayOutcome.AWAITING_CODE, message="ждём код")],
+        code_results=[BankGatewayResult(outcome=BankGatewayOutcome.COMPLETED, message="Готово.")],
+    )
+    service, _tpl, _ref, _lock = _service_with_real_personal_info(bank_gateway=bank_gateway)
+
+    started = await service.handle_pay(
+        chat_id=_CHAT_ID, ocr_message_id=62, ocr_message_text=_ocr_message(), operator_user_id=_OPERATOR_ID,
+    )
+    await service.mark_code_prompt_sent(started.state.id, 555)
+
+    rejected = await service.handle_code_reply(
+        chat_id=_CHAT_ID, prompt_message_id=555, code="000000", operator_user_id=_OTHER_OPERATOR_ID,
+    )
+    assert rejected.state.status == CheckoutStatus.WAITING_FOR_CONFIRMATION_CODE
+
+    accepted = await service.handle_code_reply(
+        chat_id=_CHAT_ID, prompt_message_id=555, code="123456", operator_user_id=_OPERATOR_ID,
+    )
+    assert accepted.state.status == CheckoutStatus.COMPLETED
+    assert bank_gateway.received_codes == ["123456"]  # код от "чужого" оператора не дошёл до банка
+
+
+async def test_operator_user_id_is_whoever_actually_sent_pay_not_who_sent_ocr_documents():
+    """"Не связывать ownership с тем, кто первоначально отправил документы
+    на OCR" (см. задачу) — этот сервис вообще не знает, кто слал документы
+    (это на уровне InsuranceOcrCommand, не CheckoutService), поэтому
+    operator_user_id заявки — это buквально тот, кто вызвал handle_pay,
+    вне зависимости от того, кто ранее прислал OCR-черновик."""
+    service, _tpl, _ref, _lock = _service_with_real_personal_info(bank_gateway=_completed_gateway())
+
+    outcome = await service.handle_pay(
+        chat_id=_CHAT_ID, ocr_message_id=63, ocr_message_text=_ocr_message(), operator_user_id=_OTHER_OPERATOR_ID,
+    )
+
+    assert outcome.state.operator_user_id == _OTHER_OPERATOR_ID
+
+
+async def test_two_concurrent_checkouts_do_not_mix_operator_or_otp():
+    """Два РАЗНЫХ checkout (разные ocr_message_id) в одном чате, каждый со
+    своим оператором и своим кодом — код одного НЕ должен подтвердить
+    другой (см. задачу: "Concurrent flows")."""
+    bank_gateway_a = _FakeBankGateway(
+        start_results=[BankGatewayResult(outcome=BankGatewayOutcome.AWAITING_CODE, message="ждём код")],
+        code_results=[BankGatewayResult(outcome=BankGatewayOutcome.COMPLETED, message="Готово.")],
+    )
+    bank_gateway_b = _FakeBankGateway(
+        start_results=[BankGatewayResult(outcome=BankGatewayOutcome.AWAITING_CODE, message="ждём код")],
+        code_results=[BankGatewayResult(outcome=BankGatewayOutcome.COMPLETED, message="Готово.")],
+    )
+    # Общий store — оба checkout из одного и того же реального процесса/чата.
+    store = CheckoutStore()
+
+    service_a, _tpl_a, ref_a, _lock_a = _service_with_real_personal_info(bank_gateway=bank_gateway_a, store=store)
+    # Тот же store переиспользуем для "второго checkout", подменяя только
+    # bank_gateway (имитирует два параллельных pay в одном процессе/store).
+    service_b, _tpl_b, _ref_b, _lock_b = _service(
+        reference_data=ref_a, personal_info_provider=service_a._personal_info_provider,
+        bank_gateway=bank_gateway_b, store=store,
+    )
+
+    started_a = await service_a.handle_pay(
+        chat_id=_CHAT_ID, ocr_message_id=70, ocr_message_text=_ocr_message(), operator_user_id=_OPERATOR_ID,
+    )
+    started_b = await service_b.handle_pay(
+        chat_id=_CHAT_ID, ocr_message_id=71, ocr_message_text=_ocr_message(), operator_user_id=_OTHER_OPERATOR_ID,
+    )
+    assert started_a.state.status == CheckoutStatus.WAITING_FOR_CONFIRMATION_CODE
+    assert started_b.state.status == CheckoutStatus.WAITING_FOR_CONFIRMATION_CODE
+
+    await service_a.mark_code_prompt_sent(started_a.state.id, 900)
+    await service_b.mark_code_prompt_sent(started_b.state.id, 901)
+
+    # Код заявки B (по её собственному prompt_message_id), отправленный
+    # оператором заявки A — не должен пройти ни как "чужой чат/сообщение"
+    # (id 901 принадлежит B), ни быть перепутан с заявкой A.
+    outcome = await service_b.handle_code_reply(
+        chat_id=_CHAT_ID, prompt_message_id=901, code="123456", operator_user_id=_OPERATOR_ID,
+    )
+    assert outcome.state.id == started_b.state.id  # это точно заявка B, не A
+    assert outcome.state.status == CheckoutStatus.WAITING_FOR_CONFIRMATION_CODE  # отклонён (чужой operator)
+    assert bank_gateway_b.received_codes == []
+
+    # Правильный оператор B со своим кодом на СВОЙ prompt — проходит и не
+    # трогает состояние A.
+    completed_b = await service_b.handle_code_reply(
+        chat_id=_CHAT_ID, prompt_message_id=901, code="999999", operator_user_id=_OTHER_OPERATOR_ID,
+    )
+    assert completed_b.state.status == CheckoutStatus.COMPLETED
+    assert bank_gateway_b.received_codes == ["999999"]
+
+    # Заявка A вообще не была затронута — её собственный prompt/оператор
+    # по-прежнему нужен для её собственного завершения.
+    completed_a = await service_a.handle_code_reply(
+        chat_id=_CHAT_ID, prompt_message_id=900, code="123456", operator_user_id=_OPERATOR_ID,
+    )
+    assert completed_a.state.id == started_a.state.id
+    assert completed_a.state.status == CheckoutStatus.COMPLETED
+    assert bank_gateway_a.received_codes == ["123456"]
 
 
 # ---- OTP expired ----
@@ -453,7 +623,9 @@ async def test_otp_expired_marks_checkout_failed():
     )
     await service.mark_code_prompt_sent(started.state.id, 555)
 
-    outcome = await service.handle_code_reply(chat_id=_CHAT_ID, prompt_message_id=555, code="123456")
+    outcome = await service.handle_code_reply(
+        chat_id=_CHAT_ID, prompt_message_id=555, code="123456", operator_user_id=_OPERATOR_ID,
+    )
 
     assert outcome.state.status == CheckoutStatus.FAILED
     assert outcome.state.failure_reason == FailureReason.OTP_EXPIRED
@@ -1312,7 +1484,9 @@ async def test_confirmation_code_is_never_logged(caplog):
 
     secret_code = "987654"
     with caplog.at_level(logging.DEBUG):
-        await service.handle_code_reply(chat_id=_CHAT_ID, prompt_message_id=321, code=secret_code)
+        await service.handle_code_reply(
+            chat_id=_CHAT_ID, prompt_message_id=321, code=secret_code, operator_user_id=_OPERATOR_ID,
+        )
 
     for record in caplog.records:
         assert secret_code not in record.getMessage()
@@ -1335,7 +1509,9 @@ async def test_confirmation_code_never_appears_in_exception_text(caplog):
     service._bank_gateway = _ExplodingGateway()
     secret_code = "135790"
     with caplog.at_level(logging.DEBUG):
-        outcome = await service.handle_code_reply(chat_id=_CHAT_ID, prompt_message_id=654, code=secret_code)
+        outcome = await service.handle_code_reply(
+            chat_id=_CHAT_ID, prompt_message_id=654, code=secret_code, operator_user_id=_OPERATOR_ID,
+        )
 
     assert secret_code not in outcome.reply_text
     for record in caplog.records:

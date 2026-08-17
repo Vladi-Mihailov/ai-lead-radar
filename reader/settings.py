@@ -157,9 +157,15 @@ class CheckoutSettings(BaseModel):
     """Оформление полиса ОСАГО на tpl.ge по reply "pay"/исправленным полям
     на "insurance ocr" (см. reader/checkout/). Работает в ТОМ ЖЕ служебном
     чате, что и "insurance ocr" — не имеет собственного chat_id (см.
-    reader/main.py). Допуск к checkout reply/оплате по-прежнему проверяется
-    по ocr.allowed_user_ids (см. reader/checkout/telegram_integration.py) —
-    в отличие от самого OCR, эта авторизация не расширена (см. задачу).
+    reader/main.py). Допуск к checkout reply/pay/OTP БОЛЬШЕ НЕ проверяется
+    по ocr.allowed_user_ids (см. reader/checkout/telegram_integration.py::
+    CheckoutReplyHandler) — production показал, что sender_id вне этого
+    списка молча игнорировался даже в правильном чате; единственная
+    граница доступа теперь сам чат. Ownership конкретного checkout/payment
+    flow при этом определяется тем, кто фактически прислал "pay" (см.
+    reader/checkout/models.py::CheckoutState.operator_user_id) — код
+    подтверждения принимает ТОЛЬКО тот же sender_id, см.
+    reader/checkout/service.py::CheckoutService.handle_code_reply.
 
     payment_bank/policy_period — LEGACY, оставлены только ради backward
     compatibility со старыми config.yaml (не ломаем загрузку, если они

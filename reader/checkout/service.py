@@ -228,12 +228,22 @@ class CheckoutService:
             raise ValueError(f"Неизвестный checkout id={checkout_id}")
         self._store.register_code_prompt_message(state, message_id)
 
-    async def handle_code_reply(self, *, chat_id: int, prompt_message_id: int, code: str) -> CheckoutOutcome | None:
+    async def handle_code_reply(
+        self, *, chat_id: int, prompt_message_id: int, code: str, operator_user_id: int | None,
+    ) -> CheckoutOutcome | None:
         """None — это вообще не reply на наш "код подтверждения" prompt
         (см. reader/checkout/telegram_integration.py, которое в этом случае
         не отвечает ничего). code нигде не логируется и не сохраняется как
         атрибут состояния — передаётся в bank_gateway одним вызовом и
-        забывается (см. задачу: "OTP никогда не логировать")."""
+        забывается (см. задачу: "OTP никогда не логировать").
+
+        operator_user_id — отправитель ЭТОГО reply. Код подтверждения
+        принимается ТОЛЬКО от того же sender_id, что запустил именно этот
+        checkout ("pay"/исправление, см. state.operator_user_id и
+        reader/checkout/telegram_integration.py) — допуск к самому
+        OCR/checkout в чате теперь открыт для любого участника (allowed_
+        user_ids не используется), поэтому ownership конкретного платежа
+        обязана определяться этим, а не общим списком (см. задачу)."""
         state = self._store.get_by_code_prompt_message(chat_id, prompt_message_id)
         if state is None:
             return None
@@ -243,6 +253,20 @@ class CheckoutService:
             # задачу: "повторный OTP не создаёт новую policy/payment"),
             # просто честно сообщаем текущий статус.
             return CheckoutOutcome(reply_text=_duplicate_message(state), state=state)
+
+        if operator_user_id != state.operator_user_id:
+            logger.warning(
+                "Checkout %s: код подтверждения отклонён — отправитель не совпадает с "
+                "инициатором оплаты этой заявки",
+                state.id,
+            )
+            return CheckoutOutcome(
+                reply_text=(
+                    "Код подтверждения для этой заявки должен ввести тот оператор, "
+                    "который отправил \"pay\" — попросите его продублировать код."
+                ),
+                state=state,
+            )
 
         try:
             result = await self._bank_gateway.submit_confirmation_code(state, code)

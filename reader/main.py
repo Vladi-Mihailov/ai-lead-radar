@@ -253,9 +253,15 @@ def build_insurance_ocr_components(
     "любой участник настроенного OCR-чата") — restrict_to_allowed_users=False
     только для ЭТОГО инстанса CommandDispatcher, поэтому проверка для
     fine-команды (отдельный инстанс, см. build_fine_monitor_components)
-    не затрагивается. ocr.allowed_user_ids по-прежнему используется ниже,
-    в build_checkout_components, для допуска к checkout reply/payment —
-    это отдельная, не расширяемая этой задачей авторизация."""
+    не затрагивается. Допуск к checkout reply/pay/OTP (см.
+    build_checkout_components) тоже больше НЕ проверяет ocr.allowed_user_ids
+    (production показал, что sender_id вне этого списка молча игнорировался
+    даже в правильном чате) — единственное оставшееся применение
+    ocr.allowed_user_ids во всём OCR/checkout flow это стартовый sanity-гейт
+    ниже (is_checkout_configured/"ocr.allowed_user_ids пуст — команда не
+    поднята") и передача в конструктор CommandDispatcher (где она ни на что
+    не влияет при restrict_to_allowed_users=False) — оставлены, чтобы
+    случайно пустой список не включал сервис молча, а не как авторизация."""
     ocr = settings.ocr
     ocr_service = OcrService(api_key=ocr.openai_api_key, model=ocr.vision_model)
     insurance_command = InsuranceOcrCommand(
@@ -292,9 +298,13 @@ def build_checkout_components(
 ) -> CheckoutReplyHandler:
     """Чистая сборка зависимостей checkout tpl.ge (см. reader/checkout/) —
     без единого await, тот же приём, что и build_insurance_ocr_components.
-    Работает в ТОМ ЖЕ служебном чате и с теми же allowed_user_ids, что и
-    "insurance ocr" (см. reader/settings.py::CheckoutSettings) — отдельного
-    chat_id для checkout нет.
+    Работает в ТОМ ЖЕ служебном чате, что и "insurance ocr" (см.
+    reader/settings.py::CheckoutSettings) — отдельного chat_id для checkout
+    нет. Допуск к reply/pay/OTP — любой участник этого чата (см.
+    reader/checkout/telegram_integration.py::CheckoutReplyHandler,
+    ocr.allowed_user_ids здесь больше НЕ используется как authorization) —
+    ownership конкретного checkout при этом определяется фактическим
+    sender_id "pay", см. CheckoutState.operator_user_id.
 
     card_secrets — если не передан явно, читается из окружения
     (CardSecrets.load(), см. reader/checkout/payment_gateway.py) — параметр
@@ -320,9 +330,7 @@ def build_checkout_components(
         personal_info_provider=personal_info_provider,
         bank_gateway=bank_gateway,
     )
-    return CheckoutReplyHandler(
-        checkout_service=checkout_service, allowed_user_ids=settings.ocr.allowed_user_ids,
-    )
+    return CheckoutReplyHandler(checkout_service=checkout_service)
 
 
 async def _run_insurance_ocr(settings: Settings, source: TelegramSource) -> None:

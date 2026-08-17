@@ -649,9 +649,12 @@ async def test_build_checkout_components_wires_dependencies_correctly(tmp_path, 
         # restart/recovery).
         assert isinstance(handler._service._lock_repository, CheckoutLockRepository)
 
-        # Тот же чат/операторы, что и insurance ocr — свой chat_id checkout
-        # не заводит (см. reader/settings.py::CheckoutSettings).
-        assert handler._allowed_user_ids == {222}
+        # CheckoutReplyHandler больше НЕ хранит allowed_user_ids — допуск к
+        # reply/pay/OTP определяется только чатом (см. задачу:
+        # production показал, что sender_id вне ocr.allowed_user_ids молча
+        # игнорировался даже в правильном чате). Ownership конкретного
+        # checkout определяется operator_user_id заявки, не общим списком.
+        assert not hasattr(handler, "_allowed_user_ids")
     finally:
         if handler is not None:
             handler._service._lock_repository.close()

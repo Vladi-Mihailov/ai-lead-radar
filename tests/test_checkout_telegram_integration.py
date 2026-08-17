@@ -8,11 +8,13 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from reader.checkout.models import CheckoutStatus  # noqa: E402
 from reader.checkout.policy_document import PolicyDocument  # noqa: E402
 from reader.checkout.service import CheckoutOutcome  # noqa: E402
 from reader.checkout.telegram_integration import CheckoutReplyHandler  # noqa: E402
 
 _USER_ID = 111
+_OTHER_USER_ID = 999
 _CHAT_ID = -100999
 
 
@@ -58,8 +60,12 @@ class _FakeEvent:
 
 
 class _FakeState:
-    def __init__(self, checkout_id: str):
+    def __init__(self, checkout_id: str, *, status: CheckoutStatus = CheckoutStatus.COMPLETED):
         self.id = checkout_id
+        # _log_outcome (см. reader/checkout/telegram_integration.py) читает
+        # state.status для normal/WARNING логирования — реальный
+        # CheckoutState всегда его содержит.
+        self.status = status
 
 
 class _FakeCheckoutService:
@@ -90,9 +96,9 @@ class _FakeCheckoutService:
         self.mark_code_prompt_sent_calls.append((checkout_id, message_id))
 
 
-def _handler(service=None, *, allowed_user_ids=(_USER_ID,)) -> tuple[CheckoutReplyHandler, _FakeCheckoutService]:
+def _handler(service=None) -> tuple[CheckoutReplyHandler, _FakeCheckoutService]:
     service = service or _FakeCheckoutService()
-    return CheckoutReplyHandler(checkout_service=service, allowed_user_ids=list(allowed_user_ids)), service
+    return CheckoutReplyHandler(checkout_service=service), service
 
 
 _OCR_MESSAGE_TEXT = (
@@ -136,6 +142,23 @@ async def test_pay_reply_is_case_insensitive():
     assert len(service.pay_calls) == 1
 
 
+async def test_pay_reply_from_any_user_in_the_chat_is_processed():
+    """Допуск к checkout больше не ограничен ocr.allowed_user_ids (см.
+    задачу: production показал, что sender_id вне списка молча игнорировался
+    даже в правильном чате) — единственная граница это сам чат."""
+    handler, service = _handler()
+    event = _FakeEvent(
+        raw_text="pay", sender_id=_OTHER_USER_ID, reply_to_msg_id=42,
+        reply_message=_FakeMessage(raw_text=_OCR_MESSAGE_TEXT),
+    )
+
+    await handler.on_new_message(event)
+
+    assert len(service.pay_calls) == 1
+    assert service.pay_calls[0]["operator_user_id"] == _OTHER_USER_ID
+    assert event.replies == ["pay-ok"]
+
+
 # ---- edited-data reply ----
 
 
@@ -154,6 +177,20 @@ async def test_correction_reply_triggers_handle_correction():
     assert call["ocr_message_text"] == _OCR_MESSAGE_TEXT
     assert event.replies == ["correction-ok"]
     assert service.pay_calls == []
+
+
+async def test_correction_reply_from_any_user_in_the_chat_is_processed():
+    handler, service = _handler()
+    event = _FakeEvent(
+        raw_text="Марка: Honda", sender_id=_OTHER_USER_ID, reply_to_msg_id=42,
+        reply_message=_FakeMessage(raw_text=_OCR_MESSAGE_TEXT),
+    )
+
+    await handler.on_new_message(event)
+
+    assert len(service.correction_calls) == 1
+    assert service.correction_calls[0]["operator_user_id"] == _OTHER_USER_ID
+    assert event.replies == ["correction-ok"]
 
 
 # ---- игнорируется, если это не reply на наше сообщение ----
@@ -195,20 +232,20 @@ async def test_reply_to_deleted_message_is_ignored():
     assert event.replies == []
 
 
-# ---- доступ ----
+# ---- reply из другого чата не обрабатывается (см. start(): chats=[entity]
+# — граница по чату остаётся единственной; здесь просто фиксируем, что
+# chat_id из события идёт как есть в сервис, без какой-либо доп. проверки
+# по sender_id/allowed_user_ids) ----
 
 
-async def test_unauthorized_sender_is_ignored():
-    handler, service = _handler(allowed_user_ids=(_USER_ID,))
-    event = _FakeEvent(
-        raw_text="pay", sender_id=999, reply_to_msg_id=42,
-        reply_message=_FakeMessage(raw_text=_OCR_MESSAGE_TEXT),
-    )
-
-    await handler.on_new_message(event)
-
-    assert service.pay_calls == []
-    assert event.replies == []
+async def test_reply_uses_event_chat_id_as_is_no_sender_authorization_left():
+    """Регресс: raw_text/chat_id/sender_id идут в сервис напрямую — нет
+    больше self._allowed_user_ids/проверки в CheckoutReplyHandler (см.
+    задачу). Единственная граница допуска — то, что start() регистрирует
+    handler с chats=[настроенный чат] (см. test_start_* ниже и
+    tests/test_telegram_event_filters.py)."""
+    handler, _service = _handler()
+    assert not hasattr(handler, "_allowed_user_ids")
 
 
 # ---- код подтверждения ----
@@ -222,11 +259,30 @@ async def test_code_reply_is_routed_to_handle_code_reply_first():
     await handler.on_new_message(event)
 
     assert len(service.code_calls) == 1
-    assert service.code_calls[0] == {"chat_id": _CHAT_ID, "prompt_message_id": 555, "code": "123456"}
+    assert service.code_calls[0] == {
+        "chat_id": _CHAT_ID, "prompt_message_id": 555, "code": "123456", "operator_user_id": _USER_ID,
+    }
     assert event.replies == ["код принят"]
     # раз это оказался код — pay/correction вообще не вызываются
     assert service.pay_calls == []
     assert service.correction_calls == []
+
+
+async def test_code_reply_passes_actual_sender_as_operator_user_id():
+    """CheckoutReplyHandler сам не решает, чей это код — просто передаёт
+    фактического отправителя дальше; проверка "тот ли это оператор,
+    который запустил pay" — забота CheckoutService.handle_code_reply (см.
+    reader/checkout/service.py и tests/test_checkout_service.py)."""
+    service = _FakeCheckoutService(code_outcome=CheckoutOutcome(reply_text="код принят", state=None))
+    handler, _svc = _handler(service)
+    event = _FakeEvent(
+        raw_text="123456", sender_id=_OTHER_USER_ID, reply_to_msg_id=555,
+        reply_message=_FakeMessage(raw_text=_OCR_MESSAGE_TEXT),
+    )
+
+    await handler.on_new_message(event)
+
+    assert service.code_calls[0]["operator_user_id"] == _OTHER_USER_ID
 
 
 async def test_non_code_reply_falls_through_to_ocr_message_check_when_code_outcome_is_none():
@@ -256,7 +312,7 @@ async def test_no_reply_sent_when_outcome_reply_text_is_none():
 
 
 async def test_pay_outcome_awaiting_code_registers_sent_message_as_code_prompt():
-    state = _FakeState("checkout-otp-1")
+    state = _FakeState("checkout-otp-1", status=CheckoutStatus.WAITING_FOR_CONFIRMATION_CODE)
     service = _FakeCheckoutService(
         pay_outcome=CheckoutOutcome(
             reply_text="Введите код подтверждения — reply на это сообщение.",
@@ -274,7 +330,7 @@ async def test_pay_outcome_awaiting_code_registers_sent_message_as_code_prompt()
 
 
 async def test_code_retry_outcome_also_registers_new_prompt_message():
-    state = _FakeState("checkout-otp-2")
+    state = _FakeState("checkout-otp-2", status=CheckoutStatus.WAITING_FOR_CONFIRMATION_CODE)
     service = _FakeCheckoutService(
         code_outcome=CheckoutOutcome(
             reply_text="Неверный код, попробуйте ещё раз.", state=state, needs_code_prompt_registration=True,
@@ -290,7 +346,7 @@ async def test_code_retry_outcome_also_registers_new_prompt_message():
 
 
 async def test_completed_outcome_does_not_register_code_prompt():
-    state = _FakeState("checkout-done")
+    state = _FakeState("checkout-done", status=CheckoutStatus.COMPLETED)
     service = _FakeCheckoutService(
         pay_outcome=CheckoutOutcome(reply_text="✅ Оплата успешно завершена.", state=state),
     )
@@ -326,7 +382,7 @@ async def test_confirmation_code_text_is_never_logged_or_stored_by_handler(caplo
 
 
 async def test_policy_document_is_attached_as_file_to_the_reply():
-    state = _FakeState("checkout-pdf-1")
+    state = _FakeState("checkout-pdf-1", status=CheckoutStatus.COMPLETED)
     document = PolicyDocument(filename="policy.pdf", content=b"%PDF-fake-content")
     service = _FakeCheckoutService(
         pay_outcome=CheckoutOutcome(
@@ -347,7 +403,7 @@ async def test_policy_document_is_attached_as_file_to_the_reply():
 
 
 async def test_no_file_sent_when_policy_document_is_absent():
-    state = _FakeState("checkout-no-pdf")
+    state = _FakeState("checkout-no-pdf", status=CheckoutStatus.COMPLETED)
     service = _FakeCheckoutService(
         pay_outcome=CheckoutOutcome(reply_text="✅ Оплата успешно завершена.", state=state),
     )
@@ -357,3 +413,77 @@ async def test_no_file_sent_when_policy_document_is_absent():
     await handler.on_new_message(event)
 
     assert event.sent_files == [None]
+
+
+# ---- нормальное логирование (см. задачу: "видно без PII/secrets") ----
+
+
+async def test_logs_reply_received_metadata_for_every_reply(caplog):
+    handler, _service = _handler()
+    event = _FakeEvent(
+        raw_text="pay", sender_id=_OTHER_USER_ID, reply_to_msg_id=42,
+        reply_message=_FakeMessage(raw_text=_OCR_MESSAGE_TEXT),
+    )
+
+    with caplog.at_level("INFO", logger="reader.checkout.telegram_integration"):
+        await handler.on_new_message(event)
+
+    assert f"chat_id={_CHAT_ID}" in caplog.text
+    assert f"sender_id={_OTHER_USER_ID}" in caplog.text
+    assert "reply_to_msg_id=42" in caplog.text
+    assert "command=pay" in caplog.text
+
+
+async def test_logs_pay_outcome_with_status_and_reason(caplog):
+    """Missing-vehicle-data — "проблемный" статус, ожидаем WARNING (см.
+    _REJECTED_STATUSES в reader/checkout/telegram_integration.py) с
+    checkout_id/status/reason (=reply_text, уже человекочитаем)."""
+    state = _FakeState("checkout-log-1", status=CheckoutStatus.MISSING_VEHICLE_DATA)
+    service = _FakeCheckoutService(
+        pay_outcome=CheckoutOutcome(reply_text="Не хватает данных для оформления: Марка.", state=state),
+    )
+    handler, _svc = _handler(service)
+    event = _FakeEvent(raw_text="pay", reply_to_msg_id=42, reply_message=_FakeMessage(raw_text=_OCR_MESSAGE_TEXT))
+
+    with caplog.at_level("WARNING", logger="reader.checkout.telegram_integration"):
+        await handler.on_new_message(event)
+
+    assert "Checkout pay outcome" in caplog.text
+    assert "checkout-log-1" in caplog.text
+    assert "missing_vehicle_data" in caplog.text
+    assert "Марка" in caplog.text
+
+
+async def test_logs_otp_accepted_outcome_at_info_level(caplog):
+    state = _FakeState("checkout-otp-log-1", status=CheckoutStatus.COMPLETED)
+    service = _FakeCheckoutService(
+        code_outcome=CheckoutOutcome(reply_text="✅ Оплата успешно завершена.", state=state),
+    )
+    handler, _svc = _handler(service)
+    event = _FakeEvent(raw_text="123456", reply_to_msg_id=555, reply_message=_FakeMessage(raw_text=_OCR_MESSAGE_TEXT))
+
+    with caplog.at_level("INFO", logger="reader.checkout.telegram_integration"):
+        await handler.on_new_message(event)
+
+    otp_records = [r for r in caplog.records if "Checkout otp outcome" in r.getMessage()]
+    assert len(otp_records) == 1
+    assert "checkout-otp-log-1" in otp_records[0].getMessage()
+    assert "completed" in otp_records[0].getMessage()
+    # OTP сам никогда не появляется в логе.
+    assert "123456" not in caplog.text
+
+
+async def test_logs_completed_pay_outcome_at_info_level(caplog):
+    state = _FakeState("checkout-log-2", status=CheckoutStatus.COMPLETED)
+    service = _FakeCheckoutService(
+        pay_outcome=CheckoutOutcome(reply_text="✅ Оплата успешно завершена.", state=state),
+    )
+    handler, _svc = _handler(service)
+    event = _FakeEvent(raw_text="pay", reply_to_msg_id=42, reply_message=_FakeMessage(raw_text=_OCR_MESSAGE_TEXT))
+
+    with caplog.at_level("INFO", logger="reader.checkout.telegram_integration"):
+        await handler.on_new_message(event)
+
+    info_records = [r for r in caplog.records if r.levelname == "INFO" and "Checkout pay outcome" in r.getMessage()]
+    assert len(info_records) == 1
+    assert "completed" in info_records[0].getMessage()
