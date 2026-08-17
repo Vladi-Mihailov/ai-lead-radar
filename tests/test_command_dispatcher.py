@@ -24,9 +24,10 @@ _OTHER_USER_ID = 222
 class _FakeEvent:
     """Минимальная имитация telethon.events.NewMessage.Event."""
 
-    def __init__(self, *, sender_id, text, chat_id=_OPERATOR_CHAT_ID):
+    def __init__(self, *, sender_id, text, chat_id=_OPERATOR_CHAT_ID, out=False):
         self.chat_id = chat_id
         self.sender_id = sender_id
+        self.out = out
         self.raw_text = text
         self.sent_replies: list[str] = []
 
@@ -125,6 +126,23 @@ async def test_restrict_to_allowed_users_false_processes_any_sender_in_the_chat(
     await dispatcher.handle_event(event)
 
     assert event.sent_replies == ["echo:hello"]
+
+
+async def test_handle_event_logs_diagnostic_metadata_for_every_event(caplog):
+    """Диагностика (см. задачу про production-расследование недоставки OCR-
+    событий) — логируется САМЫМ ПЕРВЫМ, до проверки allowed_user_ids/текста,
+    для ЛЮБОГО отправителя, включая того, кому allowed_user_ids отказал бы."""
+    dispatcher = _dispatcher()
+    dispatcher.register(_EchoCommand())
+
+    event = _FakeEvent(sender_id=_OTHER_USER_ID, text="echo hello", out=False)
+    with caplog.at_level("INFO", logger="reader.commands.dispatcher"):
+        await dispatcher.handle_event(event)
+
+    assert f"chat_id={_OPERATOR_CHAT_ID}" in caplog.text
+    assert f"sender_id={_OTHER_USER_ID}" in caplog.text
+    assert "out=False" in caplog.text
+    assert "media=none" in caplog.text
 
 
 async def test_unknown_command_is_silently_ignored():

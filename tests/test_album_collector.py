@@ -20,9 +20,15 @@ _DEBOUNCE = 0.05
 
 
 class _FakeEvent:
-    def __init__(self, *, grouped_id=None, message_id=1):
+    def __init__(self, *, grouped_id=None, message_id=1, chat_id=-100999, sender_id=111, out=False):
         self.grouped_id = grouped_id
         self.id = message_id
+        # Читаются диагностическим логом в начале on_new_message (см. задачу
+        # про production-расследование недоставки OCR-событий) — реальные
+        # telethon.events.NewMessage.Event всегда их содержат.
+        self.chat_id = chat_id
+        self.sender_id = sender_id
+        self.out = out
 
 
 class _FakeClient:
@@ -124,6 +130,23 @@ async def test_exception_in_callback_does_not_propagate(caplog):
         await asyncio.sleep(_DEBOUNCE * 3)
 
     assert "Не удалось обработать альбом" in caplog.text
+
+
+async def test_on_new_message_logs_diagnostic_metadata_for_every_event(caplog):
+    """Диагностика (см. задачу про production-расследование недоставки OCR-
+    событий) — логируется САМЫМ ПЕРВЫМ, до проверки grouped_id, для ЛЮБОГО
+    отправителя/типа сообщения (в т.ч. одиночного, без grouped_id)."""
+    collector, _calls = _collector()
+    event = _FakeEvent(grouped_id=None, chat_id=-100777, sender_id=999999, out=False)
+
+    with caplog.at_level("INFO", logger="reader.commands.album_collector"):
+        await collector.on_new_message(event)
+
+    assert "chat_id=-100777" in caplog.text
+    assert "sender_id=999999" in caplog.text
+    assert "out=False" in caplog.text
+    assert "media=none" in caplog.text
+    assert "grouped_id=None" in caplog.text
 
 
 async def test_start_resolves_entity_and_registers_handler():

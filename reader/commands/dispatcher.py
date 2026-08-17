@@ -7,6 +7,18 @@ from reader.commands.base import Command, CommandContext, CommandError
 logger = logging.getLogger(__name__)
 
 
+def _media_kind(event) -> str:
+    """Только тип вложения — без содержимого/имени файла (см. задачу:
+    диагностика без персональных данных)."""
+    if getattr(event, "photo", None) is not None:
+        return "photo"
+    if getattr(event, "document", None) is not None:
+        return "document"
+    if getattr(event, "media", None) is not None:
+        return "other"
+    return "none"
+
+
 class CommandDispatcher:
     """Единая точка входа для служебных команд оператора (fine, ...).
 
@@ -61,6 +73,19 @@ class CommandDispatcher:
         logger.info("✔ Диспетчер команд подключён к чату оператора")
 
     async def handle_event(self, event: events.NewMessage.Event) -> None:
+        # Диагностика (см. задачу про production-расследование недоставки
+        # OCR-событий от стороннего отправителя) — самый первый Telethon
+        # handler на этом чате, до любой фильтрации/парсинга. Только
+        # метаданные, без текста/содержимого документа.
+        logger.info(
+            "CommandDispatcher event received\nchat_id=%s\nsender_id=%s\nout=%s\nmedia=%s\ngrouped_id=%s",
+            event.chat_id,
+            event.sender_id,
+            event.out,
+            _media_kind(event),
+            getattr(event, "grouped_id", None),
+        )
+
         # Явная проверка user_id — самая дешёвая, до любого парсинга.
         # Фильтр chats= в start() уже гарантирует нужный чат; здесь отсекаем
         # по отправителю внутри этого чата (например, если это группа).

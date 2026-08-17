@@ -9,6 +9,18 @@ logger = logging.getLogger(__name__)
 _DEFAULT_DEBOUNCE_SECONDS = 1.5
 
 
+def _media_kind(event) -> str:
+    """Только тип вложения — без содержимого/имени файла (см. задачу:
+    диагностика без персональных данных)."""
+    if getattr(event, "photo", None) is not None:
+        return "photo"
+    if getattr(event, "document", None) is not None:
+        return "document"
+    if getattr(event, "media", None) is not None:
+        return "other"
+    return "none"
+
+
 class AlbumCollector:
     """Собирает Telegram-альбом (несколько фото одним сообщением пользователя
     — Telegram шлёт их как ОТДЕЛЬНЫЕ NewMessage-события с общим grouped_id;
@@ -60,7 +72,20 @@ class AlbumCollector:
         logger.info("✔ Сборщик альбомов подключён к чату")
 
     async def on_new_message(self, event: events.NewMessage.Event) -> None:
+        # Диагностика (см. задачу про production-расследование недоставки
+        # OCR-событий от стороннего отправителя) — самый первый Telethon
+        # handler на этом чате для этого класса, до любой фильтрации по
+        # grouped_id. Только метаданные, без текста/содержимого документа.
         grouped_id = getattr(event, "grouped_id", None)
+        logger.info(
+            "AlbumCollector event received\nchat_id=%s\nsender_id=%s\nout=%s\nmedia=%s\ngrouped_id=%s",
+            event.chat_id,
+            event.sender_id,
+            event.out,
+            _media_kind(event),
+            grouped_id,
+        )
+
         if grouped_id is None:
             # Одиночное сообщение — не альбом, этим классом не обрабатывается.
             return
