@@ -23,10 +23,18 @@ class CommandDispatcher:
         client: TelegramClient,
         chat_id: int | str,
         allowed_user_ids: list[int],
+        *,
+        restrict_to_allowed_users: bool = True,
     ):
         self._client = client
         self._chat_id = chat_id
         self._allowed_user_ids = set(allowed_user_ids)
+        # False — этот конкретный чат/инстанс диспетчера допускает ЛЮБОГО
+        # участника чата к зарегистрированным на нём командам (см. задачу:
+        # "Insurance OCR" больше не ограничен конкретным оператором) — но
+        # НЕ меняет поведение других инстансов CommandDispatcher (например,
+        # fine-команды), у которых этот флаг остаётся True по умолчанию.
+        self._restrict_to_allowed_users = restrict_to_allowed_users
         self._commands: dict[str, Command] = {}
 
     def register(self, command: Command) -> None:
@@ -56,7 +64,10 @@ class CommandDispatcher:
         # Явная проверка user_id — самая дешёвая, до любого парсинга.
         # Фильтр chats= в start() уже гарантирует нужный чат; здесь отсекаем
         # по отправителю внутри этого чата (например, если это группа).
-        if event.sender_id not in self._allowed_user_ids:
+        # restrict_to_allowed_users=False (см. __init__) пропускает эту
+        # проверку целиком — используется только для инстансов, где допуск
+        # по отправителю внутри чата не нужен (см. задачу).
+        if self._restrict_to_allowed_users and event.sender_id not in self._allowed_user_ids:
             logger.info(
                 "Команда fine проигнорирована:\nsender_id=%s,\nallowed_user_ids=%s",
                 event.sender_id,

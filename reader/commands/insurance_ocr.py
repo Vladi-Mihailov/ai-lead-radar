@@ -1,4 +1,3 @@
-import logging
 from dataclasses import replace
 from datetime import date, datetime
 from typing import Callable, Protocol
@@ -7,8 +6,6 @@ from reader.commands.base import Command, CommandContext, CommandError, CommandR
 from reader.ocr.models import REPLY_SECTIONS, OcrResult
 from reader.ocr.service import OcrServiceError
 from reader.time_display import TBILISI_TZ
-
-logger = logging.getLogger(__name__)
 
 _SUPPORTED_MIME_TYPES = ("image/jpeg", "image/png", "image/webp")
 
@@ -145,13 +142,11 @@ class InsuranceOcrCommand(Command):
         self,
         ocr_service: OcrServiceLike,
         *,
-        allowed_user_ids: list[int],
         default_email: str | None = None,
         default_phone: str | None = None,
         clock: Callable[[], datetime] | None = None,
     ):
         self._ocr_service = ocr_service
-        self._allowed_user_ids = set(allowed_user_ids)
         self._default_email = default_email
         self._default_phone = default_phone
         # Тбилисская дата, а не UTC/naive — тот же часовой пояс, что и у
@@ -180,21 +175,15 @@ class InsuranceOcrCommand(Command):
         собраны (см. reader/commands/album_collector.py). Если ни одно из
         событий группы не несёт "insurance ocr" — это не наш альбом,
         игнорируем молча (как и CommandDispatcher игнорирует произвольные
-        сообщения в чате)."""
+        сообщения в чате).
+
+        Допуск по отправителю НЕ проверяется (см. задачу: "внутри
+        настроенного OCR-чата документы может отправлять любой участник") —
+        единственное требование это сам чат, а его уже гарантирует
+        AlbumCollector.start(), зарегистрированный с chats=[тот же чат]
+        (см. reader/commands/album_collector.py и reader/main.py)."""
         trigger = self._find_trigger(events)
         if trigger is None:
-            return
-
-        # CommandDispatcher сам проверяет allowed_user_ids ДО вызова
-        # handle() (см. reader/commands/dispatcher.py), но AlbumCollector
-        # получает события в обход диспетчера — та же проверка нужна и
-        # здесь, иначе альбом от неавторизованного отправителя был бы
-        # обработан.
-        if getattr(trigger, "sender_id", None) not in self._allowed_user_ids:
-            logger.info(
-                "Альбом insurance ocr проигнорирован: sender_id=%s не в allowed_user_ids",
-                getattr(trigger, "sender_id", None),
-            )
             return
 
         await self._process_and_reply(events, trigger=trigger)

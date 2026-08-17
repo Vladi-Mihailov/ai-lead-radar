@@ -283,6 +283,11 @@ async def test_build_fine_monitor_components_wires_dependencies_correctly(tmp_pa
         # CommandDispatcher слушает первый из настроенных чатов уведомлений.
         assert command_dispatcher._chat_id == "operator_chat"
         assert command_dispatcher._allowed_user_ids == {111}
+        # fine-команда НЕ затронута задачей про Insurance OCR — допуск по
+        # sender_id для неё остаётся включённым (см. reader/main.py::
+        # build_insurance_ocr_components, где restrict_to_allowed_users=False
+        # передаётся ТОЛЬКО для инстанса CommandDispatcher чата OCR).
+        assert command_dispatcher._restrict_to_allowed_users is True
 
         # FineCommand собран, но ещё не зарегистрирован в build_fine_monitor_components —
         # регистрация делается отдельно, в _run_fine_monitor.
@@ -438,6 +443,16 @@ async def test_build_insurance_ocr_components_wires_dependencies_correctly(tmp_p
         # Свой, отдельный от fine_monitor, чат/список операторов.
         assert command_dispatcher._chat_id == "insurance_ocr_service_chat"
         assert command_dispatcher._allowed_user_ids == {222}
+        # Допуск к самому OCR больше не ограничен конкретным отправителем
+        # (см. задачу) — любой участник настроенного чата. allowed_user_ids
+        # всё ещё передаётся (используется дальше для checkout, см.
+        # build_checkout_components), но restrict_to_allowed_users=False
+        # отключает проверку sender_id именно для этого инстанса.
+        assert command_dispatcher._restrict_to_allowed_users is False
+
+        # InsuranceOcrCommand больше не принимает allowed_user_ids вовсе —
+        # допуск к OCR определяется только чатом.
+        assert not hasattr(insurance_command, "_allowed_user_ids")
 
         # AlbumCollector зовёт именно InsuranceOcrCommand.handle_album — не
         # копию/дублирующую бизнес-логику.

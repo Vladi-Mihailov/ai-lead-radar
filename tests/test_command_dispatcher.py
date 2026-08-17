@@ -76,7 +76,10 @@ def _dispatcher(**overrides) -> CommandDispatcher:
     client = overrides.pop("client", _FakeClient())
     chat_id = overrides.pop("chat_id", _OPERATOR_CHAT_ID)
     allowed_user_ids = overrides.pop("allowed_user_ids", [_ALLOWED_USER_ID])
-    return CommandDispatcher(client, chat_id, allowed_user_ids)
+    restrict_to_allowed_users = overrides.pop("restrict_to_allowed_users", True)
+    return CommandDispatcher(
+        client, chat_id, allowed_user_ids, restrict_to_allowed_users=restrict_to_allowed_users,
+    )
 
 
 async def test_known_command_from_allowed_user_gets_reply():
@@ -107,6 +110,21 @@ async def test_disallowed_user_is_silently_ignored():
     await dispatcher.handle_event(event)
 
     assert event.sent_replies == []
+
+
+async def test_restrict_to_allowed_users_false_processes_any_sender_in_the_chat():
+    """restrict_to_allowed_users=False (см. reader/main.py::
+    build_insurance_ocr_components) — используется, например, чтобы
+    Insurance OCR допускал любого участника чата, но не меняет поведение
+    других инстансов CommandDispatcher (allowed_user_ids по умолчанию
+    остаётся строгим, см. test_disallowed_user_is_silently_ignored)."""
+    dispatcher = _dispatcher(restrict_to_allowed_users=False)
+    dispatcher.register(_EchoCommand())
+
+    event = _FakeEvent(sender_id=_OTHER_USER_ID, text="echo hello")
+    await dispatcher.handle_event(event)
+
+    assert event.sent_replies == ["echo:hello"]
 
 
 async def test_unknown_command_is_silently_ignored():

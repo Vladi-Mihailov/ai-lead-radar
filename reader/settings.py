@@ -156,8 +156,10 @@ class InviterSettings(BaseModel):
 class CheckoutSettings(BaseModel):
     """Оформление полиса ОСАГО на tpl.ge по reply "pay"/исправленным полям
     на "insurance ocr" (см. reader/checkout/). Работает в ТОМ ЖЕ служебном
-    чате и с теми же ocr.allowed_user_ids, что и "insurance ocr" — не имеет
-    собственного chat_id/allowed_user_ids (см. reader/main.py).
+    чате, что и "insurance ocr" — не имеет собственного chat_id (см.
+    reader/main.py). Допуск к checkout reply/оплате по-прежнему проверяется
+    по ocr.allowed_user_ids (см. reader/checkout/telegram_integration.py) —
+    в отличие от самого OCR, эта авторизация не расширена (см. задачу).
 
     payment_bank/policy_period — LEGACY, оставлены только ради backward
     compatibility со старыми config.yaml (не ломаем загрузку, если они
@@ -193,8 +195,15 @@ class CheckoutSettings(BaseModel):
 class OcrSettings(BaseModel):
     """`insurance ocr` — распознавание документов автомобиля через OpenAI
     (см. reader/ocr/, reader/commands/insurance_ocr.py). Независимая от
-    fine_monitor команда/чат — свой service_chat_id и allowed_user_ids
-    (см. задачу: отдельный служебный чат, не Fine Monitor).
+    fine_monitor команда/чат — свой service_chat_id (см. задачу: отдельный
+    служебный чат, не Fine Monitor).
+
+    allowed_user_ids — допуск к самому OCR по нему БОЛЬШЕ НЕ проверяется
+    (см. reader/main.py::build_insurance_ocr_components — любой участник
+    service_chat_id может прислать документы); это поле используется
+    reader/main.py::build_checkout_components ТОЛЬКО как допуск к checkout
+    reply/оплате (см. reader/checkout/telegram_integration.py) — отдельная,
+    не затронутая этой задачей авторизация.
 
     openai_api_key — ТОЛЬКО из .env (OPENAI_API_KEY), никогда из
     config.yaml, как и остальные секреты проекта (TELEGRAM_API_HASH и

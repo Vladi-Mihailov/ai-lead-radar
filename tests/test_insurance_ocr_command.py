@@ -106,13 +106,12 @@ def _ctx(event, args=("ocr",)) -> CommandContext:
 
 
 def _command(
-    ocr_service=None, *, allowed_user_ids=(_USER_ID,),
+    ocr_service=None, *,
     default_email=_DEFAULT_EMAIL, default_phone=_DEFAULT_PHONE,
     clock=None,
 ) -> InsuranceOcrCommand:
     return InsuranceOcrCommand(
         ocr_service or _FakeOcrService(),
-        allowed_user_ids=list(allowed_user_ids),
         default_email=default_email,
         default_phone=default_phone,
         clock=clock or (lambda: _FIXED_NOW),
@@ -528,19 +527,42 @@ async def test_ocr_recognized_bank_period_and_period_start_are_not_overridden_by
     assert "Начало периода: 01.01.2026" in reply
 
 
-# ---- права доступа (unauthorized sender) — на уровне альбома, т.к. для
-# одиночного сообщения это уже проверяет CommandDispatcher до handle() ----
+# ---- допуск: любой отправитель внутри настроенного OCR-чата (см. задачу:
+# "Insurance OCR больше не ограничен конкретным оператором") — sender_id
+# InsuranceOcrCommand больше не проверяет вовсе, ни для одиночного
+# сообщения (handle), ни для альбома (handle_album). Единственное, что
+# ограничивает допуск — сам чат (см. reader/main.py: CommandDispatcher и
+# AlbumCollector регистрируются с chats=[настроенный OCR-чат]).
 
 
-async def test_handle_album_ignores_unauthorized_sender():
-    trigger = _FakeEvent(raw_text="insurance ocr", sender_id=999, photo=object())
+async def test_handle_processes_document_from_any_sender_in_the_chat():
+    """Одиночное сообщение от произвольного (не "менеджера") sender_id —
+    распознаётся так же, как и от кого угодно ещё."""
+    event = _FakeEvent(photo=object(), sender_id=999999)
     ocr_service = _FakeOcrService(result=_full_result())
-    command = _command(ocr_service, allowed_user_ids=(_USER_ID,))
+    command = _command(ocr_service)
+
+    await command.handle(_ctx(event))
+
+    assert len(event.replies) == 1
+    assert "Распознано:" in event.replies[0]
+    assert len(ocr_service.extract_calls) == 1
+
+
+async def test_handle_album_processes_album_from_any_sender_in_the_chat():
+    """Регресс поверх удалённой проверки sender_id/allowed_user_ids:
+    альбом от произвольного отправителя внутри чата тоже распознаётся —
+    единственное требование это сам чат (гарантируется AlbumCollector/
+    CommandDispatcher's chats=-фильтром, а не проверкой здесь)."""
+    trigger = _FakeEvent(raw_text="insurance ocr", sender_id=999999, photo=object())
+    ocr_service = _FakeOcrService(result=_full_result())
+    command = _command(ocr_service)
 
     await command.handle_album([trigger])
 
-    assert trigger.replies == []
-    assert ocr_service.extract_calls == []
+    assert len(trigger.replies) == 1
+    assert "Распознано:" in trigger.replies[0]
+    assert len(ocr_service.extract_calls) == 1
 
 
 # ---- альбом (несколько фото, caption на одном из сообщений) ----
