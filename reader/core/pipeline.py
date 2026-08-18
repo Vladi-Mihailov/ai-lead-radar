@@ -34,6 +34,17 @@ class Pipeline:
                 await self._process(message)
         finally:
             await self._source.stop()
+            # sink.stop() — тот же приём изоляции ошибок, что и вокруг
+            # sink.handle() в _process: сбой остановки одного sink'а (см.
+            # LeadAiSink — дожидается/отменяет фоновые AI-задачи) не должен
+            # мешать остановке остальных.
+            for sink in self._sinks:
+                try:
+                    await sink.stop()
+                except Exception:
+                    logger.exception(
+                        "Sink %s не смог корректно остановиться", type(sink).__name__
+                    )
 
     async def _process(self, message: Message) -> None:
         matches = self._engine.evaluate(message)

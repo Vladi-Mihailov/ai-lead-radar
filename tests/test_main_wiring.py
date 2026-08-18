@@ -45,6 +45,7 @@ from reader.main import (  # noqa: E402
     build_checkout_components,
     build_fine_monitor_components,
     build_insurance_ocr_components,
+    build_lead_ai_sink,
     is_checkout_configured,
     resolve_allowed_user_ids,
     resolve_notification_chat_ids,
@@ -55,6 +56,7 @@ from reader.notifications.telegram_notification_service import (  # noqa: E402
 )
 from reader.ocr.service import OcrService  # noqa: E402
 from reader.settings import ConfigError, load_settings  # noqa: E402
+from reader.sinks.lead_ai_sink import LeadAiSink  # noqa: E402
 from reader.sources.telegram_source import TelegramSource  # noqa: E402
 from reader.users.repository import UserRepository  # noqa: E402
 
@@ -660,3 +662,128 @@ async def test_build_checkout_components_wires_dependencies_correctly(tmp_path, 
             handler._service._lock_repository.close()
         user_repository.close()
         await http_client.aclose()
+
+
+# ---- lead_ai (AI-анализ лида, только для настроенного recipient) ----
+
+
+def test_load_settings_defaults_lead_ai_section(tmp_path, monkeypatch):
+    """config.yaml без секции lead_ai вовсе — AI-анализ должен быть
+    полностью выключен по умолчанию (см. reader/settings.py::LeadAiSettings),
+    как и остальные опциональные интеграции проекта."""
+    _set_required_env(monkeypatch)
+    config_path = _write_config(tmp_path, _CONFIG_YAML)
+
+    settings = load_settings(config_path)
+
+    assert settings.lead_ai.enabled is False
+    assert settings.lead_ai.recipient is None
+    assert settings.lead_ai.model == "gpt-5-mini"
+
+
+def test_load_settings_parses_explicit_lead_ai_section(tmp_path, monkeypatch):
+    _set_required_env(monkeypatch)
+    config_with_lead_ai = _CONFIG_YAML + (
+        "\nlead_ai:\n"
+        "  enabled: true\n"
+        '  recipient: "@alena_ogi"\n'
+        "  model: gpt-5-mini\n"
+    )
+    config_path = _write_config(tmp_path, config_with_lead_ai)
+
+    settings = load_settings(config_path)
+
+    assert settings.lead_ai.enabled is True
+    assert settings.lead_ai.recipient == "alena_ogi"
+    assert settings.lead_ai.model == "gpt-5-mini"
+
+
+def test_load_settings_parses_numeric_lead_ai_recipient(tmp_path, monkeypatch):
+    _set_required_env(monkeypatch)
+    config_with_lead_ai = _CONFIG_YAML + (
+        "\nlead_ai:\n"
+        "  enabled: true\n"
+        "  recipient: -1009876543210\n"
+    )
+    config_path = _write_config(tmp_path, config_with_lead_ai)
+
+    settings = load_settings(config_path)
+
+    assert settings.lead_ai.recipient == -1009876543210
+
+
+def _lead_ai_source(tmp_path, settings, user_repository) -> TelegramSource:
+    return TelegramSource(settings.telegram, groups=[], user_repository=user_repository)
+
+
+def test_build_lead_ai_sink_returns_none_when_disabled(tmp_path, monkeypatch):
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-real")
+    config_path = _write_config(tmp_path, _CONFIG_YAML)
+    settings = load_settings(config_path)
+
+    user_repository = UserRepository(tmp_path / "users.db")
+    try:
+        source = _lead_ai_source(tmp_path, settings, user_repository)
+        assert build_lead_ai_sink(settings, source) is None
+    finally:
+        user_repository.close()
+
+
+def test_build_lead_ai_sink_returns_none_when_recipient_missing(tmp_path, monkeypatch):
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-real")
+    config_with_lead_ai = _CONFIG_YAML + "\nlead_ai:\n  enabled: true\n"
+    config_path = _write_config(tmp_path, config_with_lead_ai)
+    settings = load_settings(config_path)
+
+    user_repository = UserRepository(tmp_path / "users.db")
+    try:
+        source = _lead_ai_source(tmp_path, settings, user_repository)
+        assert build_lead_ai_sink(settings, source) is None
+    finally:
+        user_repository.close()
+
+
+def test_build_lead_ai_sink_returns_none_when_openai_api_key_missing(tmp_path, monkeypatch):
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    config_with_lead_ai = _CONFIG_YAML + (
+        "\nlead_ai:\n  enabled: true\n  recipient: \"@alena_ogi\"\n"
+    )
+    config_path = _write_config(tmp_path, config_with_lead_ai)
+    settings = load_settings(config_path)
+
+    user_repository = UserRepository(tmp_path / "users.db")
+    try:
+        source = _lead_ai_source(tmp_path, settings, user_repository)
+        assert build_lead_ai_sink(settings, source) is None
+    finally:
+        user_repository.close()
+
+
+def test_build_lead_ai_sink_wires_configured_recipient_and_model(tmp_path, monkeypatch):
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-real")
+    config_with_lead_ai = _CONFIG_YAML + (
+        "\nlead_ai:\n"
+        "  enabled: true\n"
+        '  recipient: "@alena_ogi"\n'
+        "  model: gpt-5-mini\n"
+    )
+    config_path = _write_config(tmp_path, config_with_lead_ai)
+    settings = load_settings(config_path)
+
+    user_repository = UserRepository(tmp_path / "users.db")
+    try:
+        source = _lead_ai_source(tmp_path, settings, user_repository)
+        sink = build_lead_ai_sink(settings, source)
+
+        assert isinstance(sink, LeadAiSink)
+        assert sink._recipient == "alena_ogi"
+        assert sink._service._model == "gpt-5-mini"
+        # Тот же TelegramClient, что и у остального Reader — второе
+        # подключение к Telegram не создано.
+        assert sink._client is source.client
+    finally:
+        user_repository.close()

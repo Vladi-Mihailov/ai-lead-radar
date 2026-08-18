@@ -37,6 +37,7 @@ from reader.groups import GroupLoadError, load_groups  # noqa: E402
 from reader.jobs.archive_fine_job import ArchiveFineJob  # noqa: E402
 from reader.jobs.fine_job import FineJob  # noqa: E402
 from reader.jobs.scheduler import Scheduler  # noqa: E402
+from reader.lead_ai.service import LeadAiService  # noqa: E402
 from reader.logging_setup import setup_logging  # noqa: E402
 from reader.notifications.telegram_notification_service import (  # noqa: E402
     TelegramNotificationService,
@@ -46,6 +47,7 @@ from reader.scenarios import KeywordMatcher, ScenarioLoadError, load_scenarios  
 from reader.settings import ConfigError, Settings, load_settings  # noqa: E402
 from reader.sinks.console_sink import ConsoleSink  # noqa: E402
 from reader.sinks.file_sink import FileSink  # noqa: E402
+from reader.sinks.lead_ai_sink import LeadAiSink  # noqa: E402
 from reader.sinks.telegram_sink import TelegramSink  # noqa: E402
 from reader.sources.telegram_source import TelegramSource  # noqa: E402
 from reader.users.repository import UserRepository  # noqa: E402
@@ -279,6 +281,31 @@ def build_insurance_ocr_components(
     return command_dispatcher, insurance_command, album_collector
 
 
+def build_lead_ai_sink(settings: Settings, source: TelegramSource) -> LeadAiSink | None:
+    """Чистая сборка LeadAiSink — без единого await, без обращения к
+    сети/Telegram (тот же приём, что и build_insurance_ocr_components, ради
+    тестируемости, см. test_main_wiring.py). None, если lead_ai.enabled=false
+    ЛИБО recipient/OPENAI_API_KEY не заданы — тогда run() просто не
+    добавляет этот sink в список, и pipeline/остальные sinks (в т.ч.
+    TelegramSink для @ali_na_l_i/@alenaogir/@alena_ogi) ведут себя ровно
+    так же, как до этой задачи (см. reader/settings.py::LeadAiSettings).
+
+    openai_api_key берётся из settings.ocr (см. LeadAiSettings docstring) —
+    второй OPENAI_API_KEY не заводится."""
+    lead_ai = settings.lead_ai
+    if not lead_ai.enabled:
+        return None
+    if not lead_ai.recipient or not settings.ocr.openai_api_key:
+        logger.warning(
+            "lead_ai.enabled=true, но lead_ai.recipient/OPENAI_API_KEY не заданы — "
+            "AI-анализ лидов не поднят."
+        )
+        return None
+
+    service = LeadAiService(api_key=settings.ocr.openai_api_key, model=lead_ai.model)
+    return LeadAiSink(source.client, lead_ai.recipient, service)
+
+
 def is_checkout_configured(settings: Settings) -> bool:
     """checkout.phone и checkout.email оба обязательны (см.
     reader/settings.py::CheckoutSettings) — как и с "insurance ocr", их
@@ -446,6 +473,16 @@ async def run() -> None:
     if settings.app.lead_forward_to:
         sinks.append(TelegramSink(source.client, settings.app.lead_forward_to))
         logger.info("Пересылка лидов включена, чатов: %d", len(settings.app.lead_forward_to))
+
+    # Добавлен ПОСЛЕ TelegramSink — к моменту, когда этот sink начинает
+    # AI-анализ, оригинальный лид уже доставлен всем настроенным
+    # получателям (в т.ч. lead_ai.recipient), см. reader/sinks/lead_ai_sink.py.
+    lead_ai_sink = build_lead_ai_sink(settings, source)
+    if lead_ai_sink is not None:
+        sinks.append(lead_ai_sink)
+        logger.info("Lead AI анализ включён (получатель=%s)", settings.lead_ai.recipient)
+    else:
+        logger.info("Lead AI анализ отключён (lead_ai.enabled=false либо не настроен)")
 
     pipeline = Pipeline(source, engine, sinks, user_repository)
 

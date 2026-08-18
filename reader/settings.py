@@ -228,6 +228,28 @@ class OcrSettings(BaseModel):
     album_debounce_seconds: float = 1.5
 
 
+class LeadAiSettings(BaseModel):
+    """AI-анализ найденного лида поверх keyword pipeline (см.
+    reader/lead_ai/, reader/sinks/lead_ai_sink.py) — работает ТОЛЬКО для
+    одного получателя (recipient), независимо от того, сколько получателей
+    настроено в app.lead_forward_to/LEAD_FORWARD_TO, и НЕ зависит от их
+    порядка. Явная настройка получателя (а не "первый"/"последний" элемент
+    app.lead_forward_to) — так пересылка другим получателям остаётся
+    буквально нетронутой этой функциональностью (см. задачу).
+
+    openai_api_key отдельно не хранится — используется уже существующий
+    ocr.openai_api_key (OPENAI_API_KEY из .env, см. reader/main.py): один
+    и тот же секрет на весь проект, второй ключ не заводится.
+
+    enabled=false (default) -> AI-анализ не поднимается вовсе, поведение
+    pipeline/sinks идентично состоянию до этой задачи (см.
+    reader/main.py::run())."""
+
+    enabled: bool = False
+    recipient: int | str | None = None
+    model: str = "gpt-5-mini"
+
+
 class Settings(BaseModel):
     telegram: TelegramSettings
     app: AppSettings
@@ -235,6 +257,7 @@ class Settings(BaseModel):
     inviter: InviterSettings = Field(default_factory=InviterSettings)
     ocr: OcrSettings = Field(default_factory=OcrSettings)
     checkout: CheckoutSettings = Field(default_factory=CheckoutSettings)
+    lead_ai: LeadAiSettings = Field(default_factory=LeadAiSettings)
 
 
 def load_settings(config_path: Path) -> Settings:
@@ -279,6 +302,7 @@ def load_settings(config_path: Path) -> Settings:
     inviter_worker_raw = inviter_raw.get("worker", {})
     ocr_raw = raw.get("ocr", {})
     checkout_raw = raw.get("checkout", {})
+    lead_ai_raw = raw.get("lead_ai", {})
 
     # payment_bank/policy_period — LEGACY (см. reader/settings.py::
     # CheckoutSettings): формат по-прежнему валидируется, чтобы не молча
@@ -445,6 +469,14 @@ def load_settings(config_path: Path) -> Settings:
                 policy_period=policy_period,
                 phone=checkout_phone,
                 email=checkout_email,
+            ),
+            lead_ai=LeadAiSettings(
+                enabled=bool(lead_ai_raw.get("enabled", False)),
+                recipient=(
+                    _normalize_chat_id(lead_ai_raw["recipient"])
+                    if lead_ai_raw.get("recipient") else None
+                ),
+                model=lead_ai_raw.get("model", "gpt-5-mini"),
             ),
         )
     except (KeyError, ValueError) as exc:

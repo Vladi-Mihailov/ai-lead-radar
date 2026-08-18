@@ -43,14 +43,21 @@ class _FakeSource(BaseSource):
 
 
 class _FakeSink(BaseSink):
-    def __init__(self, fail=False):
+    def __init__(self, fail=False, fail_stop=False):
         self.handled_events = []
         self._fail = fail
+        self._fail_stop = fail_stop
+        self.stop_called = False
 
     async def handle(self, event):
         if self._fail:
             raise RuntimeError("симулированный сбой sink")
         self.handled_events.append(event)
+
+    async def stop(self):
+        self.stop_called = True
+        if self._fail_stop:
+            raise RuntimeError("симулированный сбой sink.stop()")
 
 
 def _message(
@@ -196,6 +203,44 @@ async def test_sink_failure_still_isolated_as_before(tmp_path):
 
         # Несмотря на сбой sink, keywords всё равно должны обновиться.
         assert user_repository.get_keywords(111) == ["страховка"]
+    finally:
+        user_repository.close()
+
+
+# ---- sink.stop(): вызывается при остановке Pipeline, ошибка изолирована
+# (см. reader/sinks/lead_ai_sink.py::LeadAiSink.stop() — дожидается/
+# отменяет фоновые AI-задачи при shutdown) ----
+
+
+async def test_pipeline_calls_sink_stop_on_shutdown(tmp_path):
+    user_repository = UserRepository(tmp_path / "users.db")
+    try:
+        sink = _FakeSink()
+        source = _FakeSource([_message(text="нужна страховка")])
+        pipeline = Pipeline(source, _engine(), [sink], user_repository)
+
+        await pipeline.run()
+
+        assert sink.stop_called is True
+    finally:
+        user_repository.close()
+
+
+async def test_sink_stop_failure_does_not_propagate(tmp_path):
+    """Ошибка sink.stop() (см. LeadAiSink — дожидается фоновых задач) не
+    должна мешать остановке остальных sink'ов/Pipeline в целом — та же
+    изоляция ошибок, что и вокруг sink.handle()."""
+    user_repository = UserRepository(tmp_path / "users.db")
+    try:
+        failing_stop_sink = _FakeSink(fail_stop=True)
+        other_sink = _FakeSink()
+        source = _FakeSource([_message(text="нужна страховка")])
+        pipeline = Pipeline(source, _engine(), [failing_stop_sink, other_sink], user_repository)
+
+        await pipeline.run()  # не должно бросить исключение
+
+        assert failing_stop_sink.stop_called is True
+        assert other_sink.stop_called is True
     finally:
         user_repository.close()
 
