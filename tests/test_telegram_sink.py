@@ -112,7 +112,11 @@ async def test_middle_recipient_failure_does_not_block_the_other_two(caplog):
     )
     sink = await _sink(client, ["ali_na_l_i", "alena_ogi", "vladimihailov"])
 
-    with caplog.at_level("INFO", logger="reader.sinks.telegram_sink"):
+    # Доставка (форвард+контекст/fallback) теперь реализована в
+    # reader/sinks/telegram_lead_delivery.py (см. рефакторинг — вынесено,
+    # чтобы reader/sinks/lead_ai_sink.py мог переиспользовать тот же
+    # формат/fallback, а не дублировать TelegramSink) — оттуда и логи.
+    with caplog.at_level("INFO", logger="reader.sinks.telegram_lead_delivery"):
         await sink.handle(_event())
 
     # Все три попытки форварда произошли — ошибка одного не остановила цикл.

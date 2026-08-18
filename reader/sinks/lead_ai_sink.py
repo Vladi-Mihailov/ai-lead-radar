@@ -8,6 +8,7 @@ from reader.core.models import LeadEvent
 from reader.lead_ai.models import LeadAiAnalysis
 from reader.lead_ai.service import LeadAiService, LeadAiServiceError
 from reader.sinks.base import BaseSink
+from reader.sinks.telegram_lead_delivery import ResolvedTarget, TelegramLeadDelivery, resolve_label
 
 logger = logging.getLogger(__name__)
 
@@ -28,51 +29,55 @@ _MAX_CONCURRENT_ANALYSES = 5
 
 # Сколько ждать активные фоновые задачи при stop() (см. docstring метода)
 # прежде чем отменить недоделанные — с запасом над _ANALYSIS_TIMEOUT_SECONDS,
-# чтобы обычное завершение анализа/отправки не обрывалось искусственно.
+# чтобы обычное завершение анализа/доставки не обрывалось искусственно.
 _SHUTDOWN_WAIT_TIMEOUT_SECONDS = 25.0
-
-_UNAVAILABLE_TEXT = "🤖 AI-анализ\n\nAI-анализ временно недоступен."
 
 
 class LeadAiSink(BaseSink):
-    """Follow-up AI-анализ лида — ТОЛЬКО для одного получателя (см.
+    """AI-отфильтрованная доставка — ТОЛЬКО для одного получателя (см.
     settings.lead_ai.recipient), независимо от того, сколько получателей
-    настроено в app.lead_forward_to. Оригинальный лид этому получателю уже
-    доставлен другим sink'ом (TelegramSink, см. reader/main.py — порядок
-    sinks в списке) — этот sink НИЧЕГО не пересылает сам, только
-    отправляет отдельное follow-up сообщение с результатом анализа.
+    настроено в app.lead_forward_to. В ОТЛИЧИЕ от TelegramSink, этот sink
+    НЕ пересылает оригинал сразу — recipient не должен увидеть кандидата
+    ДО того, как AI примет решение (см. задачу): handle() запускает
+    fire-and-forget фоновую задачу (_classify_and_maybe_deliver), которая
+    сначала классифицирует лид через OpenAI и ТОЛЬКО при relevant=True:
+      1) доставляет оригинал/контекст этому получателю, переиспользуя
+         TelegramLeadDelivery (reader/sinks/telegram_lead_delivery.py) —
+         тот же формат "оригинал + контекст"/fallback на текстовую копию,
+         что и у TelegramSink для остальных получателей;
+      2) следом отправляет follow-up "🤖 AI-анализ" с типом/причиной/
+         suggested_reply.
 
-    handle() — fire-and-forget: запускает анализ в фоновой asyncio.Task и
-    немедленно возвращается, НЕ дожидаясь ответа OpenAI. Pipeline._process
-    вызывает sink'и последовательно (см. reader/core/pipeline.py) — если бы
-    handle() ждал OpenAI (до _ANALYSIS_TIMEOUT_SECONDS), это задерживало бы
-    обработку ВСЕХ следующих сообщений в очереди, а не только AI-анализ
-    текущего лида. Фоновые задачи хранятся в self._background_tasks (иначе
-    единственная ссылка на Task существовала бы только в event loop'е, и
-    сборщик мусора мог бы забрать её до завершения — см. предупреждение в
-    документации asyncio.create_task) и удаляются оттуда по завершении.
+    Pipeline._process вызывает sink'и последовательно (см.
+    reader/core/pipeline.py) — если бы handle() ждал OpenAI (до
+    _ANALYSIS_TIMEOUT_SECONDS), это задерживало бы обработку ВСЕХ
+    следующих сообщений в очереди, а не только AI-анализ текущего лида.
+    Фоновые задачи хранятся в self._background_tasks (иначе единственная
+    ссылка на Task существовала бы только в event loop'е, и сборщик мусора
+    мог бы забрать её до завершения — см. предупреждение в документации
+    asyncio.create_task) и удаляются оттуда по завершении.
 
-    AI недоступен/упал/не успел за timeout -> follow-up либо не
-    отправляется, либо заменяется коротким "временно недоступен" (см.
-    _send_unavailable) — сама доставка лида к этому моменту уже завершена
-    предыдущими sink'ами и не откатывается: любое исключение фоновой
-    задачи только логируется, наружу (в Pipeline) никогда не пробрасывается
-    — оно и не может, т.к. создание задачи уже никак не связано со стеком
-    вызова handle()."""
+    Fail-closed для ЭТОГО получателя (см. задачу): relevant=False, timeout,
+    ошибка OpenAI или любое неожиданное исключение — получатель НЕ видит
+    вообще ничего (ни оригинал, ни follow-up) — только warning/error в
+    лог. Сама доставка другим получателям (TelegramSink) к этому моменту
+    уже завершена независимо и не откатывается."""
 
     def __init__(self, client: TelegramClient, recipient: int | str, service: LeadAiService):
         self._client = client
         self._recipient = recipient
         self._service = service
-        self._entity = None
+        self._resolved_target: ResolvedTarget | None = None
+        self._delivery = TelegramLeadDelivery(client)
         self._semaphore = asyncio.Semaphore(_MAX_CONCURRENT_ANALYSES)
         self._background_tasks: set[asyncio.Task] = set()
 
     async def start(self) -> None:
-        self._entity = await self._client.get_entity(self._recipient)
+        entity = await self._client.get_entity(self._recipient)
+        self._resolved_target = ResolvedTarget(entity=entity, label=resolve_label(self._recipient))
 
     async def handle(self, event: LeadEvent) -> None:
-        task = asyncio.create_task(self._analyze_and_notify(event))
+        task = asyncio.create_task(self._classify_and_maybe_deliver(event))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
@@ -92,7 +97,7 @@ class LeadAiSink(BaseSink):
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
-    async def _analyze_and_notify(self, event: LeadEvent) -> None:
+    async def _classify_and_maybe_deliver(self, event: LeadEvent) -> None:
         async with self._semaphore:
             started = time.monotonic()
             logger.info("lead_ai analysis started")
@@ -103,14 +108,14 @@ class LeadAiSink(BaseSink):
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
+                # Fail-closed (см. задачу): recipient не получает ничего —
+                # ни оригинал, ни follow-up, только лог.
                 logger.warning(
                     "lead_ai analysis timed out after %.1fs", _ANALYSIS_TIMEOUT_SECONDS,
                 )
-                await self._send_unavailable()
                 return
             except LeadAiServiceError:
                 logger.warning("lead_ai analysis failed")
-                await self._send_unavailable()
                 return
             except Exception:
                 # Фоновая задача — исключение отсюда никогда не попало бы в
@@ -126,29 +131,37 @@ class LeadAiSink(BaseSink):
                 analysis.relevant, analysis.lead_type, latency,
             )
 
-            await self._send(_format(analysis))
+            if not analysis.relevant:
+                # Fail-closed: нерелевантный кандидат не должен попасть в
+                # Telegram этому получателю вообще (см. задачу) — ни
+                # оригинал, ни follow-up.
+                return
 
-    async def _send_unavailable(self) -> None:
-        await self._send(_UNAVAILABLE_TEXT)
+            # relevant=True — ТОЛЬКО теперь доставляем оригинал/контекст
+            # (см. докстрок класса) — до этого момента recipient не видел
+            # кандидата вовсе.
+            await self._delivery.deliver(self._resolved_target, event)
+            await self._send_follow_up(analysis)
 
-    async def _send(self, text: str) -> None:
+    async def _send_follow_up(self, analysis: LeadAiAnalysis) -> None:
         try:
-            await self._client.send_message(self._entity, text, link_preview=False)
+            await self._client.send_message(
+                self._resolved_target.entity, _format(analysis), link_preview=False,
+            )
         except Exception:
             logger.exception("Не удалось отправить AI-анализ получателю lead_ai")
 
 
 def _format(analysis: LeadAiAnalysis) -> str:
-    lines = ["🤖 AI-анализ", ""]
-    if analysis.relevant:
-        lines.append("✅ Потенциальный лид")
-        lines.append(f"Тип: {analysis.lead_type}")
-        lines.append(f"Причина: {analysis.reason}")
-        lines.append("")
-        lines.append("Предлагаемый ответ:")
-        lines.append(analysis.suggested_reply)
-    else:
-        lines.append("❌ Не лид")
-        lines.append(f"Тип: {analysis.lead_type}")
-        lines.append(f"Причина: {analysis.reason}")
-    return "\n".join(lines)
+    return "\n".join(
+        [
+            "🤖 AI-анализ",
+            "",
+            "✅ Потенциальный лид",
+            f"Тип: {analysis.lead_type}",
+            f"Причина: {analysis.reason}",
+            "",
+            "Предлагаемый ответ:",
+            analysis.suggested_reply,
+        ]
+    )

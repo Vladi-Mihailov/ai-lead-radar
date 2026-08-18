@@ -2,13 +2,16 @@
 LeadAiService фейковые, ни один тест не обращается к настоящему Telegram
 или OpenAI API.
 
-Покрывает: follow-up отправляется отдельным сообщением, raw JSON не
-показывается, AI timeout/ошибка не пробрасываются наружу (fail-open — сам
-sink ничего не бросает, см. reader/core/pipeline.py, который и так оборачивает
-sink.handle в try/except, но LeadAiSink не должен полагаться только на это),
-а также fire-and-forget семантику handle() (см. задачу: AI-анализ не должен
-задерживать Pipeline._process) и её жизненный цикл — сохранение фоновых
-задач от GC, stop() при shutdown, ограничение concurrency."""
+Покрывает ключевое архитектурное требование (см. задачу): recipient
+(@alena_ogi) НЕ должен увидеть кандидата до того, как AI примет решение —
+handle() классифицирует лид ПЕРВЫМ, и только при relevant=True доставляет
+оригинал (форвард + контекст, переиспользуя TelegramLeadDelivery — тот же
+формат/fallback, что и у TelegramSink) и следом AI follow-up. Для
+relevant=False, timeout, ошибки OpenAI или неожиданного исключения —
+recipient не получает ВООБЩЕ НИЧЕГО (fail-closed) — ни оригинал, ни
+follow-up, только warning/error в лог. Также покрывает fire-and-forget
+семантику handle() и её жизненный цикл — сохранение фоновых задач от GC,
+stop() при shutdown, ограничение concurrency."""
 
 import asyncio
 import sys
@@ -16,6 +19,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -34,16 +38,30 @@ class _FakeEntity:
 
 
 class _FakeTelegramClient:
-    def __init__(self):
+    """forward_messages/send_message — то же, что реально использует
+    TelegramLeadDelivery (см. tests/test_telegram_sink.py — тот же фейк по
+    духу): forward_error позволяет проверить fallback на текстовую копию."""
+
+    def __init__(self, *, forward_error=None):
         self.get_entity_calls: list = []
+        self.forward_calls: list = []
         self.send_message_calls: list = []
+        self._forward_error = forward_error
+        self._forwarded_counter = 1000
 
     async def get_entity(self, target):
         self.get_entity_calls.append(target)
         return _FakeEntity(id=hash(str(target)) % 10_000_000, source=target)
 
-    async def send_message(self, entity, text, *, link_preview=None):
-        self.send_message_calls.append((entity.source, text))
+    async def forward_messages(self, entity, *, messages, from_peer):
+        self.forward_calls.append(entity.source)
+        if self._forward_error is not None:
+            raise self._forward_error
+        self._forwarded_counter += 1
+        return SimpleNamespace(id=self._forwarded_counter)
+
+    async def send_message(self, entity, text, *, parse_mode=None, link_preview=None, reply_to=None):
+        self.send_message_calls.append((entity.source, text, reply_to))
 
 
 class _FakeLeadAiService:
@@ -93,10 +111,14 @@ async def _handle_and_wait(sink: LeadAiSink, event: LeadEvent) -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# ---- follow-up отдельным сообщением, relevant=true ----
+def _follow_up_texts(client) -> list[str]:
+    return [text for _r, text, _reply_to in client.send_message_calls if "🤖 AI-анализ" in text]
 
 
-async def test_relevant_result_sends_lead_follow_up_message():
+# ---- relevant=True: оригинал (форвард+контекст) + ОДИН AI follow-up ----
+
+
+async def test_relevant_result_delivers_original_then_sends_one_follow_up():
     client = _FakeTelegramClient()
     analysis = LeadAiAnalysis(
         relevant=True, lead_type="money_transfer_ru_ge",
@@ -108,33 +130,48 @@ async def test_relevant_result_sends_lead_follow_up_message():
 
     await _handle_and_wait(sink, _event())
 
-    assert len(client.send_message_calls) == 1
-    recipient, text = client.send_message_calls[0]
-    assert recipient == "alena_ogi"
-    assert "🤖 AI-анализ" in text
+    # Оригинал доставлен ровно один раз (форвард + контекст, reply_to задан).
+    assert client.forward_calls == ["alena_ogi"]
+    context_messages = [
+        (r, text, reply_to) for r, text, reply_to in client.send_message_calls
+        if reply_to is not None
+    ]
+    assert len(context_messages) == 1
+    assert context_messages[0][0] == "alena_ogi"
+
+    # Плюс ровно один AI follow-up, отдельным сообщением (не reply, не
+    # дублирует контекст).
+    follow_ups = _follow_up_texts(client)
+    assert len(follow_ups) == 1
+    text = follow_ups[0]
     assert "✅ Потенциальный лид" in text
     assert "Тип: money_transfer_ru_ge" in text
     assert "Предлагаемый ответ:" in text
     assert analysis.suggested_reply in text
 
+    # Итого — ровно 2 сообщения этому получателю (контекст + follow-up),
+    # оригинал НЕ продублирован.
+    assert len(client.send_message_calls) == 2
 
-async def test_irrelevant_result_sends_not_a_lead_follow_up_message():
-    client = _FakeTelegramClient()
-    analysis = LeadAiAnalysis(
-        relevant=False, lead_type="irrelevant",
-        reason="человек спрашивает только про обмен наличных в обменнике",
-        suggested_reply="",
-    )
+
+async def test_relevant_result_falls_back_to_text_copy_when_forward_fails():
+    """Тот же fallback, что и у TelegramSink (см. TelegramLeadDelivery) —
+    переиспользуется, а не теряется при рефакторинге."""
+    client = _FakeTelegramClient(forward_error=RuntimeError("boom"))
+    analysis = LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_reply="s")
     service = _FakeLeadAiService(result=analysis)
     sink = await _sink(client, service)
 
     await _handle_and_wait(sink, _event())
 
-    assert len(client.send_message_calls) == 1
-    _recipient, text = client.send_message_calls[0]
-    assert "❌ Не лид" in text
-    assert "Тип: irrelevant" in text
-    assert "Предлагаемый ответ" not in text
+    assert client.forward_calls == ["alena_ogi"]
+    non_follow_up = [
+        (r, text, reply_to) for r, text, reply_to in client.send_message_calls
+        if "🤖 AI-анализ" not in text
+    ]
+    assert len(non_follow_up) == 1
+    assert non_follow_up[0][2] is None  # fallback — не reply, форвард не удался
+    assert len(_follow_up_texts(client)) == 1
 
 
 async def test_raw_json_is_never_shown_to_manager():
@@ -147,27 +184,63 @@ async def test_raw_json_is_never_shown_to_manager():
 
     await _handle_and_wait(sink, _event())
 
-    _recipient, text = client.send_message_calls[0]
-    assert "{" not in text
-    assert '"relevant"' not in text
+    follow_up = _follow_up_texts(client)[0]
+    assert "{" not in follow_up
+    assert '"relevant"' not in follow_up
 
 
-# ---- fail-open: ошибка/timeout AI не ломает доставку (follow-up просто заменяется) ----
+# ---- fail-closed: relevant=False/timeout/ошибка/неожиданное исключение
+# -> получателю НИЧЕГО не уходит (ни оригинал, ни follow-up) ----
 
 
-async def test_service_error_does_not_raise_and_sends_unavailable_message():
+async def test_relevant_false_sends_nothing_at_all():
+    client = _FakeTelegramClient()
+    analysis = LeadAiAnalysis(
+        relevant=False, lead_type="irrelevant",
+        reason="человек спрашивает только про обмен наличных в обменнике",
+        suggested_reply="",
+    )
+    service = _FakeLeadAiService(result=analysis)
+    sink = await _sink(client, service)
+
+    await _handle_and_wait(sink, _event())
+
+    # Ни оригинал (форвард), ни контекст, ни follow-up — recipient не
+    # должен увидеть кандидата вовсе (см. задачу).
+    assert client.forward_calls == []
+    assert client.send_message_calls == []
+
+
+async def test_lead_type_irrelevant_sends_nothing_even_with_other_fields_set():
+    """lead_type="irrelevant" — отдельная проверка (см. задачу), не только
+    как побочный эффект relevant=False: даже если бы reason/suggested_reply
+    были непустыми, ничего не должно уйти менеджеру."""
+    client = _FakeTelegramClient()
+    analysis = LeadAiAnalysis(
+        relevant=False, lead_type="irrelevant",
+        reason="есть текст причины", suggested_reply="есть предложенный ответ",
+    )
+    service = _FakeLeadAiService(result=analysis)
+    sink = await _sink(client, service)
+
+    await _handle_and_wait(sink, _event())
+
+    assert client.forward_calls == []
+    assert client.send_message_calls == []
+
+
+async def test_service_error_sends_nothing_at_all():
     client = _FakeTelegramClient()
     service = _FakeLeadAiService(error=LeadAiServiceError("boom"))
     sink = await _sink(client, service)
 
     await _handle_and_wait(sink, _event())  # не должно бросить исключение
 
-    assert len(client.send_message_calls) == 1
-    _recipient, text = client.send_message_calls[0]
-    assert "временно недоступен" in text
+    assert client.forward_calls == []
+    assert client.send_message_calls == []
 
 
-async def test_timeout_does_not_raise_and_sends_unavailable_message(monkeypatch):
+async def test_timeout_sends_nothing_at_all(monkeypatch):
     client = _FakeTelegramClient()
     service = _FakeLeadAiService(hang=True)
     monkeypatch.setattr("reader.sinks.lead_ai_sink._ANALYSIS_TIMEOUT_SECONDS", 0.01)
@@ -175,25 +248,11 @@ async def test_timeout_does_not_raise_and_sends_unavailable_message(monkeypatch)
 
     await _handle_and_wait(sink, _event())  # не должно бросить исключение / не должно зависнуть
 
-    assert len(client.send_message_calls) == 1
-    _recipient, text = client.send_message_calls[0]
-    assert "временно недоступен" in text
+    assert client.forward_calls == []
+    assert client.send_message_calls == []
 
 
-async def test_send_message_failure_after_successful_analysis_does_not_raise():
-    class _FailingSendClient(_FakeTelegramClient):
-        async def send_message(self, entity, text, *, link_preview=None):
-            raise RuntimeError("telegram недоступен")
-
-    client = _FailingSendClient()
-    analysis = LeadAiAnalysis(relevant=False, lead_type="irrelevant", reason="r", suggested_reply="")
-    service = _FakeLeadAiService(result=analysis)
-    sink = await _sink(client, service)
-
-    await _handle_and_wait(sink, _event())  # не должно бросить исключение
-
-
-async def test_unexpected_analyze_exception_does_not_raise_and_is_swallowed():
+async def test_unexpected_analyze_exception_sends_nothing_and_is_swallowed():
     """Даже совсем неожиданное исключение из analyze() (не LeadAiServiceError)
     не должно "утечь" как непойманное исключение фоновой задачи (asyncio
     иначе залогировал бы "Task exception was never retrieved")."""
@@ -206,9 +265,68 @@ async def test_unexpected_analyze_exception_does_not_raise_and_is_swallowed():
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     assert all(not isinstance(r, Exception) for r in results)
-    # Никакого follow-up для неожиданной ошибки не отправляется (в отличие
-    # от LeadAiServiceError/timeout, для которых есть "временно недоступен").
+    assert client.forward_calls == []
     assert client.send_message_calls == []
+
+
+async def test_send_message_failure_after_successful_analysis_does_not_raise():
+    class _FailingSendClient(_FakeTelegramClient):
+        async def send_message(self, entity, text, *, parse_mode=None, link_preview=None, reply_to=None):
+            raise RuntimeError("telegram недоступен")
+
+    client = _FailingSendClient()
+    analysis = LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_reply="s")
+    service = _FakeLeadAiService(result=analysis)
+    sink = await _sink(client, service)
+
+    await _handle_and_wait(sink, _event())  # не должно бросить исключение
+
+
+# ---- ключевое требование: recipient не видит кандидата ДО классификации ----
+
+
+async def test_recipient_receives_nothing_until_ai_classification_completes():
+    """До завершения фоновой AI-задачи (даже если relevant в итоге True)
+    ни форвард, ни какое-либо сообщение НЕ должны были уйти получателю —
+    решение принимается ДО первой отправки (см. задачу)."""
+    client = _FakeTelegramClient()
+    release = asyncio.Event()
+
+    class _PausedService:
+        async def analyze(self, message_text):
+            await release.wait()
+            return LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_reply="s")
+
+    sink = await _sink(client, _PausedService())
+
+    await sink.handle(_event())
+    await asyncio.sleep(0)  # даём фоновой задаче стартовать и дойти до release.wait()
+
+    # Классификация ещё не завершена — получатель не увидел вообще ничего.
+    assert client.forward_calls == []
+    assert client.send_message_calls == []
+
+    release.set()
+    await asyncio.gather(*list(sink._background_tasks), return_exceptions=True)
+
+    # После relevant=True — оригинал и follow-up доставлены.
+    assert client.forward_calls == ["alena_ogi"]
+    assert len(_follow_up_texts(client)) == 1
+
+
+# ---- один LeadEvent не приводит к двойной отправке оригинала ----
+
+
+async def test_single_relevant_event_delivers_original_exactly_once():
+    client = _FakeTelegramClient()
+    analysis = LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_reply="s")
+    service = _FakeLeadAiService(result=analysis)
+    sink = await _sink(client, service)
+
+    await _handle_and_wait(sink, _event())
+
+    assert client.forward_calls == ["alena_ogi"]  # ровно один форвард, не два
+    assert len(_follow_up_texts(client)) == 1  # ровно один follow-up, не два
 
 
 # ---- LeadAiSink работает только с настроенным получателем ----
@@ -216,14 +334,15 @@ async def test_unexpected_analyze_exception_does_not_raise_and_is_swallowed():
 
 async def test_sink_only_targets_its_configured_recipient():
     client = _FakeTelegramClient()
-    analysis = LeadAiAnalysis(relevant=False, lead_type="irrelevant", reason="r", suggested_reply="")
+    analysis = LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_reply="s")
     service = _FakeLeadAiService(result=analysis)
     sink = await _sink(client, service, recipient="alena_ogi")
 
     await _handle_and_wait(sink, _event())
 
     assert client.get_entity_calls == ["alena_ogi"]
-    assert [c[0] for c in client.send_message_calls] == ["alena_ogi"]
+    assert client.forward_calls == ["alena_ogi"]
+    assert all(r == "alena_ogi" for r, _t, _rt in client.send_message_calls)
 
 
 async def test_sink_passes_message_text_to_service():
@@ -242,10 +361,11 @@ async def test_sink_passes_message_text_to_service():
 
 async def test_handle_returns_immediately_without_waiting_for_analysis():
     """Ключевое архитектурное требование: handle() не должен ждать даже
-    небольшую задержку analyze() — follow-up отправляется уже ПОСЛЕ того,
-    как handle() вернул управление, из фоновой задачи."""
+    небольшую задержку analyze() — доставка (оригинал + follow-up)
+    происходит уже ПОСЛЕ того, как handle() вернул управление, из фоновой
+    задачи."""
     client = _FakeTelegramClient()
-    analysis = LeadAiAnalysis(relevant=False, lead_type="irrelevant", reason="r", suggested_reply="")
+    analysis = LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_reply="s")
     service = _FakeLeadAiService(result=analysis, delay=0.2)
     sink = await _sink(client, service)
 
@@ -254,12 +374,14 @@ async def test_handle_returns_immediately_without_waiting_for_analysis():
     elapsed = time.monotonic() - started
 
     assert elapsed < 0.05
-    # follow-up ещё не отправлен — фоновая задача только запущена.
+    # Ничего ещё не отправлено — фоновая задача только запущена.
+    assert client.forward_calls == []
     assert client.send_message_calls == []
     assert len(sink._background_tasks) == 1
 
     await asyncio.gather(*list(sink._background_tasks))
-    assert len(client.send_message_calls) == 1
+    assert client.forward_calls == ["alena_ogi"]
+    assert len(_follow_up_texts(client)) == 1
 
 
 async def test_handle_does_not_wait_even_for_a_hanging_analysis():
@@ -305,16 +427,19 @@ async def test_background_task_is_kept_referenced_until_completion():
 
 async def test_stop_waits_for_pending_background_task_to_complete():
     client = _FakeTelegramClient()
-    analysis = LeadAiAnalysis(relevant=False, lead_type="irrelevant", reason="r", suggested_reply="")
+    analysis = LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_reply="s")
     service = _FakeLeadAiService(result=analysis, delay=0.1)
     sink = await _sink(client, service)
 
     await sink.handle(_event())
-    assert client.send_message_calls == []  # фоновая задача только запущена
+    assert client.forward_calls == []  # фоновая задача только запущена
+    assert client.send_message_calls == []
 
     await sink.stop()
 
-    assert len(client.send_message_calls) == 1  # stop() дождался её завершения
+    # stop() дождался её завершения — оригинал + follow-up доставлены.
+    assert client.forward_calls == ["alena_ogi"]
+    assert len(_follow_up_texts(client)) == 1
     assert sink._background_tasks == set()
 
 
@@ -338,6 +463,7 @@ async def test_stop_cancels_task_that_does_not_finish_within_shutdown_timeout(mo
     await sink.stop()  # не должен зависнуть/бросить исключение
 
     assert sink._background_tasks == set()
+    assert client.send_message_calls == []
 
 
 # ---- ограничение concurrency (semaphore) ----
@@ -356,7 +482,7 @@ async def test_concurrent_analyses_are_limited_by_semaphore(monkeypatch):
             state["max_seen"] = max(state["max_seen"], state["current"])
             await release.wait()
             state["current"] -= 1
-            return LeadAiAnalysis(relevant=False, lead_type="irrelevant", reason="r", suggested_reply="")
+            return LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_reply="s")
 
     sink = await _sink(client, _ConcurrencyTrackingService())
 
@@ -371,4 +497,5 @@ async def test_concurrent_analyses_are_limited_by_semaphore(monkeypatch):
 
     release.set()
     await asyncio.gather(*list(sink._background_tasks), return_exceptions=True)
-    assert len(client.send_message_calls) == 5
+    assert len(client.forward_calls) == 5
+    assert len(_follow_up_texts(client)) == 5

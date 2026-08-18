@@ -49,6 +49,7 @@ from reader.main import (  # noqa: E402
     is_checkout_configured,
     resolve_allowed_user_ids,
     resolve_notification_chat_ids,
+    resolve_telegram_sink_recipients,
     validate_fine_monitor_config,
 )
 from reader.notifications.telegram_notification_service import (  # noqa: E402
@@ -787,3 +788,56 @@ def test_build_lead_ai_sink_wires_configured_recipient_and_model(tmp_path, monke
         assert sink._client is source.client
     finally:
         user_repository.close()
+
+
+# ---- resolve_telegram_sink_recipients: получатель lead_ai исключается из
+# обычной пересылки TelegramSink (см. задачу — AI должен решить ДО первой
+# отправки этому получателю, обычный TelegramSink его больше не касается) ----
+
+
+def test_resolve_telegram_sink_recipients_excludes_lead_ai_recipient():
+    result = resolve_telegram_sink_recipients(
+        ["ali_na_l_i", "alena_ogi", "alenaogir"], "alena_ogi",
+    )
+
+    assert result == ["ali_na_l_i", "alenaogir"]
+
+
+def test_resolve_telegram_sink_recipients_is_case_insensitive_for_usernames():
+    """Telegram username'ы регистронезависимы (см. TelegramSink.start(),
+    та же дедупликация "один и тот же аккаунт" — только там уже после
+    резолва в entity.id, а не по сырой строке, как здесь)."""
+    result = resolve_telegram_sink_recipients(
+        ["ali_na_l_i", "ALENA_OGI", "alenaogir"], "alena_ogi",
+    )
+
+    assert result == ["ali_na_l_i", "alenaogir"]
+
+
+def test_resolve_telegram_sink_recipients_matches_numeric_recipient():
+    result = resolve_telegram_sink_recipients(
+        ["ali_na_l_i", -1009876543210, "alenaogir"], -1009876543210,
+    )
+
+    assert result == ["ali_na_l_i", "alenaogir"]
+
+
+def test_resolve_telegram_sink_recipients_returns_list_unchanged_when_lead_ai_recipient_is_none():
+    """lead_ai_recipient=None — вызывающий код (run()) передаёт None именно
+    когда LeadAiSink не поднят (lead_ai.enabled=false либо не настроен) —
+    тогда список получателей TelegramSink не должен как-либо меняться."""
+    forward_to = ["ali_na_l_i", "alena_ogi", "alenaogir"]
+
+    result = resolve_telegram_sink_recipients(forward_to, None)
+
+    assert result == forward_to
+
+
+def test_resolve_telegram_sink_recipients_is_noop_when_recipient_not_in_list():
+    """lead_ai.recipient не входит в app.lead_forward_to вовсе — фильтрация
+    ничего не меняет (edge case конфигурации, не должен ронять wiring)."""
+    result = resolve_telegram_sink_recipients(
+        ["ali_na_l_i", "alenaogir"], "someone_else",
+    )
+
+    assert result == ["ali_na_l_i", "alenaogir"]

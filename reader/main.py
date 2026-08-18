@@ -287,8 +287,8 @@ def build_lead_ai_sink(settings: Settings, source: TelegramSource) -> LeadAiSink
     тестируемости, см. test_main_wiring.py). None, если lead_ai.enabled=false
     ЛИБО recipient/OPENAI_API_KEY не заданы — тогда run() просто не
     добавляет этот sink в список, и pipeline/остальные sinks (в т.ч.
-    TelegramSink для @ali_na_l_i/@alenaogir/@alena_ogi) ведут себя ровно
-    так же, как до этой задачи (см. reader/settings.py::LeadAiSettings).
+    TelegramSink для @ali_na_l_i/@alenaogir) ведут себя ровно так же, как
+    до этой задачи (см. reader/settings.py::LeadAiSettings).
 
     openai_api_key берётся из settings.ocr (см. LeadAiSettings docstring) —
     второй OPENAI_API_KEY не заводится."""
@@ -304,6 +304,35 @@ def build_lead_ai_sink(settings: Settings, source: TelegramSource) -> LeadAiSink
 
     service = LeadAiService(api_key=settings.ocr.openai_api_key, model=lead_ai.model)
     return LeadAiSink(source.client, lead_ai.recipient, service)
+
+
+def resolve_telegram_sink_recipients(
+    forward_to: list[int | str], lead_ai_recipient: int | str | None,
+) -> list[int | str]:
+    """app.lead_forward_to (LEAD_FORWARD_TO) БЕЗ lead_ai_recipient, если он
+    задан — доставка этому получателю теперь целиком управляется
+    LeadAiSink (сначала AI-классификация, оригинал отправляется только при
+    relevant=True, см. reader/sinks/lead_ai_sink.py) — обычный TelegramSink
+    не должен доставлять ему оригинал сразу, до AI-решения (см. задачу).
+
+    lead_ai_recipient должен передаваться вызывающим кодом (см. run()) РОВНО
+    когда build_lead_ai_sink() реально вернул sink (а не просто когда
+    lead_ai.enabled=true) — иначе при отсутствии recipient/OPENAI_API_KEY
+    получатель не получил бы лид вообще ниоткуда. Если lead_ai_recipient
+    is None — список возвращается как есть, TelegramSink получает всех
+    сконфигурированных получателей, как и до появления lead_ai."""
+    if lead_ai_recipient is None:
+        return forward_to
+    return [target for target in forward_to if not _same_recipient(target, lead_ai_recipient)]
+
+
+def _same_recipient(a: int | str, b: int | str) -> bool:
+    """Username'ы в Telegram регистронезависимы (см. TelegramSink.start() —
+    та же дедупликация по факту "один и тот же аккаунт" применяется и там,
+    хоть и после резолва в entity.id, а не по сырой строке, как здесь)."""
+    if isinstance(a, str) and isinstance(b, str):
+        return a.lower() == b.lower()
+    return a == b
 
 
 def is_checkout_configured(settings: Settings) -> bool:
@@ -470,14 +499,20 @@ async def run() -> None:
         ConsoleSink(),
         FileSink(settings.app.leads_output_file),
     ]
-    if settings.app.lead_forward_to:
-        sinks.append(TelegramSink(source.client, settings.app.lead_forward_to))
-        logger.info("Пересылка лидов включена, чатов: %d", len(settings.app.lead_forward_to))
-
-    # Добавлен ПОСЛЕ TelegramSink — к моменту, когда этот sink начинает
-    # AI-анализ, оригинальный лид уже доставлен всем настроенным
-    # получателям (в т.ч. lead_ai.recipient), см. reader/sinks/lead_ai_sink.py.
+    # build_lead_ai_sink() — ДО построения TelegramSink: если он поднят,
+    # его recipient должен быть исключён из обычной пересылки (см.
+    # resolve_telegram_sink_recipients — AI должен решить ДО первой
+    # отправки этому получателю, TelegramSink его больше не касается).
     lead_ai_sink = build_lead_ai_sink(settings, source)
+
+    telegram_forward_to = resolve_telegram_sink_recipients(
+        settings.app.lead_forward_to,
+        settings.lead_ai.recipient if lead_ai_sink is not None else None,
+    )
+    if telegram_forward_to:
+        sinks.append(TelegramSink(source.client, telegram_forward_to))
+        logger.info("Пересылка лидов включена, чатов: %d", len(telegram_forward_to))
+
     if lead_ai_sink is not None:
         sinks.append(lead_ai_sink)
         logger.info("Lead AI анализ включён (получатель=%s)", settings.lead_ai.recipient)
