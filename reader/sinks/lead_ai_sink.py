@@ -5,6 +5,7 @@ import time
 from telethon import TelegramClient
 
 from reader.core.models import LeadEvent
+from reader.lead_ai.greeting import tbilisi_greeting
 from reader.lead_ai.models import LeadAiAnalysis
 from reader.lead_ai.service import LeadAiService, LeadAiServiceError
 from reader.sinks.base import BaseSink
@@ -46,7 +47,8 @@ class LeadAiSink(BaseSink):
          тот же формат "оригинал + контекст"/fallback на текстовую копию,
          что и у TelegramSink для остальных получателей;
       2) следом отправляет follow-up "🤖 AI-анализ" с типом/причиной/
-         suggested_reply.
+         suggested_messages (приветствие в начале — см.
+         reader/lead_ai/greeting.py, добавляется кодом, не моделью).
 
     Pipeline._process вызывает sink'и последовательно (см.
     reader/core/pipeline.py) — если бы handle() ждал OpenAI (до
@@ -153,7 +155,7 @@ class LeadAiSink(BaseSink):
 
 
 def _format(analysis: LeadAiAnalysis) -> str:
-    return "\n".join(
+    header = "\n".join(
         [
             "🤖 AI-анализ",
             "",
@@ -161,7 +163,12 @@ def _format(analysis: LeadAiAnalysis) -> str:
             f"Тип: {analysis.lead_type}",
             f"Причина: {analysis.reason}",
             "",
-            "Предлагаемый ответ:",
-            analysis.suggested_reply,
+            "Предлагаемые сообщения:",
         ]
     )
+    # Приветствие — первое "сообщение" в списке, но НЕ от модели (см.
+    # reader/lead_ai/greeting.py про то, почему это код, а не suggested_
+    # messages) — остальные строки визуально разделены пустой строкой (как
+    # менеджер будет отправлять их клиенту по одной), без нумерации.
+    messages = [tbilisi_greeting(), *analysis.suggested_messages]
+    return header + "\n\n" + "\n\n".join(messages)

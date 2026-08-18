@@ -148,7 +148,7 @@ async def test_other_recipients_receive_original_when_ai_says_relevant(tmp_path)
         LeadAiAnalysis(
             relevant=True, lead_type="money_transfer_ru_ge",
             reason="хочет перевести деньги из России в Грузию",
-            suggested_reply="Подскажите сумму и в какой валюте хотите получить?",
+            suggested_messages=["Мы так переводили", "Подскажите сумму"],
         )
     )
     telegram_sink, lead_ai_sink = _build_sinks(client, lead_ai_service)
@@ -169,7 +169,7 @@ async def test_other_recipients_receive_original_when_ai_says_relevant(tmp_path)
 async def test_other_recipients_receive_original_when_ai_says_irrelevant(tmp_path):
     client = _FakeTelegramClient()
     lead_ai_service = _FakeLeadAiService(
-        LeadAiAnalysis(relevant=False, lead_type="irrelevant", reason="r", suggested_reply="")
+        LeadAiAnalysis(relevant=False, lead_type="irrelevant", reason="r", suggested_messages=[])
     )
     telegram_sink, lead_ai_sink = _build_sinks(client, lead_ai_service)
 
@@ -216,7 +216,7 @@ async def test_ai_filtered_recipient_gets_original_and_one_follow_up_when_releva
         LeadAiAnalysis(
             relevant=True, lead_type="money_transfer_ru_ge",
             reason="хочет перевести деньги из России в Грузию",
-            suggested_reply="Подскажите сумму и в какой валюте хотите получить?",
+            suggested_messages=["Мы так переводили", "Подскажите сумму"],
         )
     )
     telegram_sink, lead_ai_sink = _build_sinks(client, lead_ai_service)
@@ -241,7 +241,7 @@ async def test_ai_filtered_recipient_gets_original_and_one_follow_up_when_releva
 async def test_ai_filtered_recipient_gets_nothing_when_irrelevant(tmp_path):
     client = _FakeTelegramClient()
     lead_ai_service = _FakeLeadAiService(
-        LeadAiAnalysis(relevant=False, lead_type="irrelevant", reason="r", suggested_reply="")
+        LeadAiAnalysis(relevant=False, lead_type="irrelevant", reason="r", suggested_messages=[])
     )
     telegram_sink, lead_ai_sink = _build_sinks(client, lead_ai_service)
 
@@ -291,7 +291,7 @@ async def test_ai_filtered_recipient_receives_nothing_before_classification_comp
         async def analyze(self, message_text):
             self.analyze_calls.append(message_text)
             await release.wait()
-            return LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_reply="s")
+            return LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_messages=["s"])
 
     telegram_sink, lead_ai_sink = _build_sinks(client, _PausedService())
     # _process() вызывается напрямую (см. ниже) — start() нужно вызвать
@@ -330,7 +330,7 @@ async def test_ai_filtered_recipient_receives_nothing_before_classification_comp
 async def test_single_lead_event_delivers_original_exactly_once_to_each_recipient(tmp_path):
     client = _FakeTelegramClient()
     lead_ai_service = _FakeLeadAiService(
-        LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_reply="s")
+        LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_messages=["s"])
     )
     telegram_sink, lead_ai_sink = _build_sinks(client, lead_ai_service)
 

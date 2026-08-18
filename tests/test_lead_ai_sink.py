@@ -9,9 +9,12 @@ handle() классифицирует лид ПЕРВЫМ, и только пр�
 формат/fallback, что и у TelegramSink) и следом AI follow-up. Для
 relevant=False, timeout, ошибки OpenAI или неожиданного исключения —
 recipient не получает ВООБЩЕ НИЧЕГО (fail-closed) — ни оригинал, ни
-follow-up, только warning/error в лог. Также покрывает fire-and-forget
-семантику handle() и её жизненный цикл — сохранение фоновых задач от GC,
-stop() при shutdown, ограничение concurrency."""
+follow-up, только warning/error в лог. Также покрывает:
+- формат follow-up сообщения — "Предлагаемые сообщения" БЕЗ нумерации,
+  каждая фраза отдельным "абзацем" (пустая строка между ними), приветствие
+  зависит от времени Asia/Tbilisi и добавляется кодом (не моделью);
+- fire-and-forget семантику handle() и её жизненный цикл — сохранение
+  фоновых задач от GC, stop() при shutdown, ограничение concurrency."""
 
 import asyncio
 import sys
@@ -115,6 +118,9 @@ def _follow_up_texts(client) -> list[str]:
     return [text for _r, text, _reply_to in client.send_message_calls if "🤖 AI-анализ" in text]
 
 
+_GREETINGS = ("Доброе утро", "Добрый день", "Добрый вечер")
+
+
 # ---- relevant=True: оригинал (форвард+контекст) + ОДИН AI follow-up ----
 
 
@@ -123,7 +129,7 @@ async def test_relevant_result_delivers_original_then_sends_one_follow_up():
     analysis = LeadAiAnalysis(
         relevant=True, lead_type="money_transfer_ru_ge",
         reason="человек ищет способ перевести деньги из России на грузинскую карту",
-        suggested_reply="Можем помочь с переводом из России в Грузию. Подскажите сумму и в какой валюте хотите получить?",
+        suggested_messages=["Мы так переводили", "Подскажите сумму"],
     )
     service = _FakeLeadAiService(result=analysis)
     sink = await _sink(client, service)
@@ -146,8 +152,9 @@ async def test_relevant_result_delivers_original_then_sends_one_follow_up():
     text = follow_ups[0]
     assert "✅ Потенциальный лид" in text
     assert "Тип: money_transfer_ru_ge" in text
-    assert "Предлагаемый ответ:" in text
-    assert analysis.suggested_reply in text
+    assert "Предлагаемые сообщения:" in text
+    for message in analysis.suggested_messages:
+        assert message in text
 
     # Итого — ровно 2 сообщения этому получателю (контекст + follow-up),
     # оригинал НЕ продублирован.
@@ -158,7 +165,10 @@ async def test_relevant_result_falls_back_to_text_copy_when_forward_fails():
     """Тот же fallback, что и у TelegramSink (см. TelegramLeadDelivery) —
     переиспользуется, а не теряется при рефакторинге."""
     client = _FakeTelegramClient(forward_error=RuntimeError("boom"))
-    analysis = LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_reply="s")
+    analysis = LeadAiAnalysis(
+        relevant=True, lead_type="fine_payment", reason="r",
+        suggested_messages=["В этой же группе помогают с оплатой штрафа"],
+    )
     service = _FakeLeadAiService(result=analysis)
     sink = await _sink(client, service)
 
@@ -177,7 +187,7 @@ async def test_relevant_result_falls_back_to_text_copy_when_forward_fails():
 async def test_raw_json_is_never_shown_to_manager():
     client = _FakeTelegramClient()
     analysis = LeadAiAnalysis(
-        relevant=True, lead_type="fine_payment", reason="r", suggested_reply="s",
+        relevant=True, lead_type="fine_payment", reason="r", suggested_messages=["s"],
     )
     service = _FakeLeadAiService(result=analysis)
     sink = await _sink(client, service)
@@ -189,6 +199,134 @@ async def test_raw_json_is_never_shown_to_manager():
     assert '"relevant"' not in follow_up
 
 
+# ---- формат follow-up: без нумерации, приветствие по времени Asia/Tbilisi ----
+
+
+async def test_follow_up_starts_with_a_greeting():
+    client = _FakeTelegramClient()
+    analysis = LeadAiAnalysis(
+        relevant=True, lead_type="insurance_georgia", reason="r",
+        suggested_messages=["https://t.me/car_ins_georgia", "Оформили нам быстро"],
+    )
+    service = _FakeLeadAiService(result=analysis)
+    sink = await _sink(client, service)
+
+    await _handle_and_wait(sink, _event())
+
+    text = _follow_up_texts(client)[0]
+    assert any(greeting in text for greeting in _GREETINGS)
+
+
+async def test_follow_up_uses_greeting_matching_current_tbilisi_time(monkeypatch):
+    monkeypatch.setattr("reader.sinks.lead_ai_sink.tbilisi_greeting", lambda: "Добрый вечер")
+    client = _FakeTelegramClient()
+    analysis = LeadAiAnalysis(
+        relevant=True, lead_type="fine_payment", reason="r",
+        suggested_messages=["В этой же группе помогают с оплатой штрафа"],
+    )
+    service = _FakeLeadAiService(result=analysis)
+    sink = await _sink(client, service)
+
+    await _handle_and_wait(sink, _event())
+
+    text = _follow_up_texts(client)[0]
+    assert "Добрый вечер" in text
+    assert "Доброе утро" not in text
+    assert "Добрый день" not in text
+
+
+async def test_follow_up_suggested_messages_are_not_numbered():
+    client = _FakeTelegramClient()
+    analysis = LeadAiAnalysis(
+        relevant=True, lead_type="insurance_georgia", reason="r",
+        suggested_messages=[
+            "https://t.me/car_ins_georgia", "Мы тут вчера делали",
+            "Оформили нам быстро", "Минут 7",
+        ],
+    )
+    service = _FakeLeadAiService(result=analysis)
+    sink = await _sink(client, service)
+
+    await _handle_and_wait(sink, _event())
+
+    text = _follow_up_texts(client)[0]
+    for marker in ("1.", "2.", "1)", "1️⃣", "2️⃣", "•"):
+        assert marker not in text
+
+
+async def test_follow_up_separates_each_suggested_message_with_a_blank_line():
+    client = _FakeTelegramClient()
+    analysis = LeadAiAnalysis(
+        relevant=True, lead_type="insurance_georgia", reason="r",
+        suggested_messages=["https://t.me/car_ins_georgia", "Оформили нам быстро"],
+    )
+    service = _FakeLeadAiService(result=analysis)
+    sink = await _sink(client, service)
+
+    await _handle_and_wait(sink, _event())
+
+    text = _follow_up_texts(client)[0]
+    assert "https://t.me/car_ins_georgia\n\nОформили нам быстро" in text
+
+
+async def test_insurance_georgia_follow_up_contains_the_link():
+    client = _FakeTelegramClient()
+    analysis = LeadAiAnalysis(
+        relevant=True, lead_type="insurance_georgia", reason="r",
+        suggested_messages=["https://t.me/car_ins_georgia", "Мы тут вчера делали", "Оформили нам быстро", "Минут 7"],
+    )
+    service = _FakeLeadAiService(result=analysis)
+    sink = await _sink(client, service)
+
+    await _handle_and_wait(sink, _event())
+
+    text = _follow_up_texts(client)[0]
+    assert "https://t.me/car_ins_georgia" in text
+
+
+async def test_online_rubles_insurance_follow_up_contains_expected_phrases():
+    client = _FakeTelegramClient()
+    analysis = LeadAiAnalysis(
+        relevant=True, lead_type="insurance_georgia", reason="спрашивает про онлайн-оплату в рублях",
+        suggested_messages=[
+            "https://t.me/car_ins_georgia",
+            "Мы онлайн страхование сделали в рублях",
+            "После границы дороже, курс не выгодный",
+            "Оформили нам быстро",
+            "Минут 7",
+        ],
+    )
+    service = _FakeLeadAiService(result=analysis)
+    sink = await _sink(client, service)
+
+    await _handle_and_wait(sink, _event(text="Можно оплатить онлайн в рублях?"))
+
+    text = _follow_up_texts(client)[0]
+    for expected in (
+        "Мы онлайн страхование сделали в рублях",
+        "После границы дороже, курс не выгодный",
+        "Оформили нам быстро",
+        "Минут 7",
+    ):
+        assert expected in text
+
+
+async def test_fine_check_follow_up_contains_expected_phrases():
+    client = _FakeTelegramClient()
+    analysis = LeadAiAnalysis(
+        relevant=True, lead_type="fine_check", reason="хочет проверить штрафы",
+        suggested_messages=["Мы тут проверяли", "В этой же группе помогают с оплатой штрафа"],
+    )
+    service = _FakeLeadAiService(result=analysis)
+    sink = await _sink(client, service)
+
+    await _handle_and_wait(sink, _event(text="Где проверить штраф?"))
+
+    text = _follow_up_texts(client)[0]
+    assert "Мы тут проверяли" in text
+    assert "В этой же группе помогают с оплатой штрафа" in text
+
+
 # ---- fail-closed: relevant=False/timeout/ошибка/неожиданное исключение
 # -> получателю НИЧЕГО не уходит (ни оригинал, ни follow-up) ----
 
@@ -198,7 +336,7 @@ async def test_relevant_false_sends_nothing_at_all():
     analysis = LeadAiAnalysis(
         relevant=False, lead_type="irrelevant",
         reason="человек спрашивает только про обмен наличных в обменнике",
-        suggested_reply="",
+        suggested_messages=[],
     )
     service = _FakeLeadAiService(result=analysis)
     sink = await _sink(client, service)
@@ -213,12 +351,12 @@ async def test_relevant_false_sends_nothing_at_all():
 
 async def test_lead_type_irrelevant_sends_nothing_even_with_other_fields_set():
     """lead_type="irrelevant" — отдельная проверка (см. задачу), не только
-    как побочный эффект relevant=False: даже если бы reason/suggested_reply
+    как побочный эффект relevant=False: даже если бы reason/suggested_messages
     были непустыми, ничего не должно уйти менеджеру."""
     client = _FakeTelegramClient()
     analysis = LeadAiAnalysis(
         relevant=False, lead_type="irrelevant",
-        reason="есть текст причины", suggested_reply="есть предложенный ответ",
+        reason="есть текст причины", suggested_messages=["есть предложенное сообщение"],
     )
     service = _FakeLeadAiService(result=analysis)
     sink = await _sink(client, service)
@@ -275,7 +413,7 @@ async def test_send_message_failure_after_successful_analysis_does_not_raise():
             raise RuntimeError("telegram недоступен")
 
     client = _FailingSendClient()
-    analysis = LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_reply="s")
+    analysis = LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_messages=["s"])
     service = _FakeLeadAiService(result=analysis)
     sink = await _sink(client, service)
 
@@ -295,7 +433,7 @@ async def test_recipient_receives_nothing_until_ai_classification_completes():
     class _PausedService:
         async def analyze(self, message_text):
             await release.wait()
-            return LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_reply="s")
+            return LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_messages=["s"])
 
     sink = await _sink(client, _PausedService())
 
@@ -319,7 +457,7 @@ async def test_recipient_receives_nothing_until_ai_classification_completes():
 
 async def test_single_relevant_event_delivers_original_exactly_once():
     client = _FakeTelegramClient()
-    analysis = LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_reply="s")
+    analysis = LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_messages=["s"])
     service = _FakeLeadAiService(result=analysis)
     sink = await _sink(client, service)
 
@@ -334,7 +472,7 @@ async def test_single_relevant_event_delivers_original_exactly_once():
 
 async def test_sink_only_targets_its_configured_recipient():
     client = _FakeTelegramClient()
-    analysis = LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_reply="s")
+    analysis = LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_messages=["s"])
     service = _FakeLeadAiService(result=analysis)
     sink = await _sink(client, service, recipient="alena_ogi")
 
@@ -347,7 +485,7 @@ async def test_sink_only_targets_its_configured_recipient():
 
 async def test_sink_passes_message_text_to_service():
     client = _FakeTelegramClient()
-    analysis = LeadAiAnalysis(relevant=False, lead_type="irrelevant", reason="r", suggested_reply="")
+    analysis = LeadAiAnalysis(relevant=False, lead_type="irrelevant", reason="r", suggested_messages=[])
     service = _FakeLeadAiService(result=analysis)
     sink = await _sink(client, service)
 
@@ -365,7 +503,7 @@ async def test_handle_returns_immediately_without_waiting_for_analysis():
     происходит уже ПОСЛЕ того, как handle() вернул управление, из фоновой
     задачи."""
     client = _FakeTelegramClient()
-    analysis = LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_reply="s")
+    analysis = LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_messages=["s"])
     service = _FakeLeadAiService(result=analysis, delay=0.2)
     sink = await _sink(client, service)
 
@@ -409,7 +547,7 @@ async def test_background_task_is_kept_referenced_until_completion():
     завершится (иначе GC мог бы забрать единственную живую ссылку на неё,
     см. предупреждение asyncio.create_task про "fire-and-forget" задачи)."""
     client = _FakeTelegramClient()
-    analysis = LeadAiAnalysis(relevant=False, lead_type="irrelevant", reason="r", suggested_reply="")
+    analysis = LeadAiAnalysis(relevant=False, lead_type="irrelevant", reason="r", suggested_messages=[])
     service = _FakeLeadAiService(result=analysis, delay=0.05)
     sink = await _sink(client, service)
 
@@ -427,7 +565,7 @@ async def test_background_task_is_kept_referenced_until_completion():
 
 async def test_stop_waits_for_pending_background_task_to_complete():
     client = _FakeTelegramClient()
-    analysis = LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_reply="s")
+    analysis = LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_messages=["s"])
     service = _FakeLeadAiService(result=analysis, delay=0.1)
     sink = await _sink(client, service)
 
@@ -446,7 +584,7 @@ async def test_stop_waits_for_pending_background_task_to_complete():
 async def test_stop_is_a_noop_when_nothing_is_pending():
     client = _FakeTelegramClient()
     service = _FakeLeadAiService(result=LeadAiAnalysis(
-        relevant=False, lead_type="irrelevant", reason="r", suggested_reply="",
+        relevant=False, lead_type="irrelevant", reason="r", suggested_messages=[],
     ))
     sink = await _sink(client, service)
 
@@ -482,7 +620,7 @@ async def test_concurrent_analyses_are_limited_by_semaphore(monkeypatch):
             state["max_seen"] = max(state["max_seen"], state["current"])
             await release.wait()
             state["current"] -= 1
-            return LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_reply="s")
+            return LeadAiAnalysis(relevant=True, lead_type="fine_payment", reason="r", suggested_messages=["s"])
 
     sink = await _sink(client, _ConcurrencyTrackingService())
 

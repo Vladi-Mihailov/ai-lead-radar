@@ -3,9 +3,19 @@
 напрямую (по аналогии с tests/test_ocr_service.py), сеть не используется
 вовсе.
 
+Как и раньше (см. tests/test_ocr_service.py), это тесты СЕРВИСА, а не
+самой модели OpenAI: analyze() мокается на ОЖИДАЕМЫЙ результат — тест
+документирует/фиксирует, какую классификацию reader/lead_ai/prompt.py
+должен вызывать у модели для каждого сценария (полноценно проверить
+реальное поведение GPT можно только вручную/на проде), и проверяет, что
+сервис корректно нормализует/пробрасывает этот результат.
+
 Покрывает регрессионные сценарии из задачи: штрафы (оплата/проверка),
 денежные переводы Россия->Грузия, обменник/курс/цена в долларах ->
-irrelevant, страховка (Грузия/Турция/Армения/без страны/медицинская)."""
+irrelevant, страховка (Грузия/Турция/Армения/без страны/медицинская), а
+также повышенный recall страховых лидов — планирование автомобильной
+поездки само по себе является потенциальным лидом, keyword ("перев") не
+доказательство (может быть "перевал", не иметь отношения к переводу денег)."""
 
 import sys
 import types
@@ -46,7 +56,8 @@ async def test_fine_payment_message_is_relevant(monkeypatch):
     service = _service()
     analysis = LeadAiAnalysis(
         relevant=True, lead_type="fine_payment",
-        reason="хочет оплатить штраф", suggested_reply="Пришлите госномер автомобиля.",
+        reason="хочет оплатить штраф",
+        suggested_messages=["Добрый день", "В этой же группе помогают с оплатой штрафа"],
     )
     monkeypatch.setattr(service._client.responses, "parse", _fake_parse_returning(analysis))
 
@@ -60,11 +71,28 @@ async def test_fine_check_message_is_fine_check(monkeypatch):
     service = _service()
     analysis = LeadAiAnalysis(
         relevant=True, lead_type="fine_check",
-        reason="хочет проверить штрафы", suggested_reply="Пришлите госномер автомобиля.",
+        reason="хочет проверить штрафы",
+        suggested_messages=["Добрый день", "Мы тут проверяли"],
     )
     monkeypatch.setattr(service._client.responses, "parse", _fake_parse_returning(analysis))
 
     result = await service.analyze("Можете посмотреть штрафы по номеру?")
+
+    assert result.relevant is True
+    assert result.lead_type == "fine_check"
+
+
+async def test_fine_check_link_question_is_fine_check(monkeypatch):
+    """Регрессия из задачи: «можно ссылку проверить наличие штрафа?»."""
+    service = _service()
+    analysis = LeadAiAnalysis(
+        relevant=True, lead_type="fine_check",
+        reason="просит ссылку/способ проверить штраф",
+        suggested_messages=["Добрый день", "Мы тут проверяли"],
+    )
+    monkeypatch.setattr(service._client.responses, "parse", _fake_parse_returning(analysis))
+
+    result = await service.analyze("Можно ссылку посмотреть наличие штрафа?")
 
     assert result.relevant is True
     assert result.lead_type == "fine_check"
@@ -75,7 +103,7 @@ async def test_money_transfer_ru_ge_message_is_money_transfer_ru_ge(monkeypatch)
     analysis = LeadAiAnalysis(
         relevant=True, lead_type="money_transfer_ru_ge",
         reason="хочет перевести деньги из России на грузинскую карту",
-        suggested_reply="Подскажите сумму и в какой валюте хотите получить?",
+        suggested_messages=["Добрый день", "Мы так переводили", "Подскажите сумму"],
     )
     monkeypatch.setattr(service._client.responses, "parse", _fake_parse_returning(analysis))
 
@@ -89,7 +117,7 @@ async def test_currency_exchange_office_message_is_irrelevant(monkeypatch):
     service = _service()
     analysis = LeadAiAnalysis(
         relevant=False, lead_type="irrelevant",
-        reason="спрашивает про обменник, не про перевод Россия->Грузия", suggested_reply="",
+        reason="спрашивает про обменник, не про перевод Россия->Грузия", suggested_messages=[],
     )
     monkeypatch.setattr(service._client.responses, "parse", _fake_parse_returning(analysis))
 
@@ -103,7 +131,7 @@ async def test_usd_rate_question_is_irrelevant(monkeypatch):
     service = _service()
     analysis = LeadAiAnalysis(
         relevant=False, lead_type="irrelevant",
-        reason="спрашивает курс доллара, без намерения перевода", suggested_reply="",
+        reason="спрашивает курс доллара, без намерения перевода", suggested_messages=[],
     )
     monkeypatch.setattr(service._client.responses, "parse", _fake_parse_returning(analysis))
 
@@ -116,7 +144,7 @@ async def test_price_in_dollars_without_transfer_intent_is_irrelevant(monkeypatc
     service = _service()
     analysis = LeadAiAnalysis(
         relevant=False, lead_type="irrelevant",
-        reason="обсуждает цену товара в долларах, не перевод денег", suggested_reply="",
+        reason="обсуждает цену товара в долларах, не перевод денег", suggested_messages=[],
     )
     monkeypatch.setattr(service._client.responses, "parse", _fake_parse_returning(analysis))
 
@@ -130,7 +158,7 @@ async def test_insurance_georgia_message(monkeypatch):
     analysis = LeadAiAnalysis(
         relevant=True, lead_type="insurance_georgia",
         reason="нужна страховка для Грузии",
-        suggested_reply="Можем оформить автомобильную страховку для Грузии. Пришлите документы на автомобиль.",
+        suggested_messages=["Добрый день", "https://t.me/car_ins_georgia", "Оформили нам быстро"],
     )
     monkeypatch.setattr(service._client.responses, "parse", _fake_parse_returning(analysis))
 
@@ -144,7 +172,7 @@ async def test_insurance_turkey_message(monkeypatch):
     analysis = LeadAiAnalysis(
         relevant=True, lead_type="insurance_turkey",
         reason="нужна страховка для Турции",
-        suggested_reply="Можем оформить автомобильную страховку для Турции.",
+        suggested_messages=["Добрый день", "Оформили нам быстро"],
     )
     monkeypatch.setattr(service._client.responses, "parse", _fake_parse_returning(analysis))
 
@@ -158,7 +186,7 @@ async def test_insurance_armenia_message(monkeypatch):
     analysis = LeadAiAnalysis(
         relevant=True, lead_type="insurance_armenia",
         reason="нужна страховка для Армении",
-        suggested_reply="Можем оформить автомобильную страховку для Армении.",
+        suggested_messages=["Добрый день", "Оформили нам быстро"],
     )
     monkeypatch.setattr(service._client.responses, "parse", _fake_parse_returning(analysis))
 
@@ -172,7 +200,7 @@ async def test_insurance_without_country_is_insurance_general(monkeypatch):
     analysis = LeadAiAnalysis(
         relevant=True, lead_type="insurance_general",
         reason="нужна страховка, страна неясна",
-        suggested_reply="Можем оформить автомобильную страховку. Подскажите, для какой страны она нужна?",
+        suggested_messages=["Добрый день", "Для какой страны нужна страховка?"],
     )
     monkeypatch.setattr(service._client.responses, "parse", _fake_parse_returning(analysis))
 
@@ -185,13 +213,118 @@ async def test_medical_insurance_is_irrelevant(monkeypatch):
     service = _service()
     analysis = LeadAiAnalysis(
         relevant=False, lead_type="irrelevant",
-        reason="медицинская страховка, не автомобильная", suggested_reply="",
+        reason="медицинская страховка, не автомобильная", suggested_messages=[],
     )
     monkeypatch.setattr(service._client.responses, "parse", _fake_parse_returning(analysis))
 
     result = await service.analyze("Нужна медицинская страховка для поездки")
 
     assert result.relevant is False
+
+
+# ---- повышенный recall: поездка на автомобиле сама по себе — страховой лид ----
+
+
+async def test_car_trip_to_georgia_with_mountain_pass_question_is_insurance_georgia(monkeypatch):
+    """Регрессия из задачи: человек прямо про страховку не спрашивает, но
+    сам едет в Грузию на автомобиле — это insurance_georgia, не irrelevant."""
+    service = _service()
+    analysis = LeadAiAnalysis(
+        relevant=True, lead_type="insurance_georgia",
+        reason="человек сам планирует поездку в Грузию на автомобиле",
+        suggested_messages=["Добрый день", "Мы тут вчера делали", "Оформили нам быстро"],
+    )
+    monkeypatch.setattr(service._client.responses, "parse", _fake_parse_returning(analysis))
+
+    result = await service.analyze(
+        "Добрый день! Думаем съездить в Тбилиси в начале октября. Какая дорога "
+        "будет на перевале, может быть снег? На летней тогда не проехать?"
+    )
+
+    assert result.relevant is True
+    assert result.lead_type == "insurance_georgia"
+
+
+async def test_driving_to_georgia_is_insurance_georgia(monkeypatch):
+    service = _service()
+    analysis = LeadAiAnalysis(
+        relevant=True, lead_type="insurance_georgia",
+        reason="едет в Грузию на своей машине",
+        suggested_messages=["Добрый день", "Мы тут вчера делали"],
+    )
+    monkeypatch.setattr(service._client.responses, "parse", _fake_parse_returning(analysis))
+
+    result = await service.analyze("Едем в Грузию на машине")
+
+    assert result.relevant is True
+    assert result.lead_type == "insurance_georgia"
+
+
+async def test_driving_to_turkey_is_insurance_turkey(monkeypatch):
+    service = _service()
+    analysis = LeadAiAnalysis(
+        relevant=True, lead_type="insurance_turkey",
+        reason="едет в Турцию на своей машине",
+        suggested_messages=["Добрый день", "Оформили нам быстро"],
+    )
+    monkeypatch.setattr(service._client.responses, "parse", _fake_parse_returning(analysis))
+
+    result = await service.analyze("На машине в Турцию")
+
+    assert result.relevant is True
+    assert result.lead_type == "insurance_turkey"
+
+
+async def test_driving_to_armenia_is_insurance_armenia(monkeypatch):
+    service = _service()
+    analysis = LeadAiAnalysis(
+        relevant=True, lead_type="insurance_armenia",
+        reason="едет в Армению на своей машине",
+        suggested_messages=["Добрый день", "Оформили нам быстро"],
+    )
+    monkeypatch.setattr(service._client.responses, "parse", _fake_parse_returning(analysis))
+
+    result = await service.analyze("Едем в Армению на машине")
+
+    assert result.relevant is True
+    assert result.lead_type == "insurance_armenia"
+
+
+async def test_weather_question_without_car_trip_signal_is_irrelevant(monkeypatch):
+    """Регрессия из задачи: просто вопрос про погоду в Тбилиси, БЕЗ
+    признака собственной автомобильной поездки — не должен превращаться в
+    страховой лид (keyword — не доказательство, см. задачу)."""
+    service = _service()
+    analysis = LeadAiAnalysis(
+        relevant=False, lead_type="irrelevant",
+        reason="просто вопрос про погоду, без признака поездки на автомобиле",
+        suggested_messages=[],
+    )
+    monkeypatch.setattr(service._client.responses, "parse", _fake_parse_returning(analysis))
+
+    result = await service.analyze("Какая погода в Тбилиси?")
+
+    assert result.relevant is False
+    assert result.lead_type == "irrelevant"
+
+
+async def test_mountain_pass_word_is_not_classified_as_money_transfer(monkeypatch):
+    """Регрессия из задачи: "перевал" может ложно совпасть по keyword
+    "перев" с "перевод", но по смыслу это дорога, а не перевод денег —
+    money_transfer_ru_ge здесь неверно в любом случае (сообщение — про
+    поездку/страховку, см. test_car_trip_to_georgia_with_mountain_pass_
+    question_is_insurance_georgia, а не про деньги)."""
+    service = _service()
+    analysis = LeadAiAnalysis(
+        relevant=True, lead_type="insurance_georgia",
+        reason="про перевал/дорогу в рамках поездки в Грузию, не про деньги",
+        suggested_messages=["Добрый день", "Мы тут вчера делали"],
+    )
+    monkeypatch.setattr(service._client.responses, "parse", _fake_parse_returning(analysis))
+
+    result = await service.analyze("Как сейчас дорога через перевал в Верхнем Ларсе?")
+
+    assert result.lead_type != "money_transfer_ru_ge"
 
 
 # ---- inconsistent model result нормализуется Python-кодом ----
@@ -203,7 +336,7 @@ async def test_inconsistent_model_result_is_normalized(monkeypatch):
     service = _service()
     analysis = LeadAiAnalysis(
         relevant=True, lead_type="irrelevant",
-        reason="противоречиво", suggested_reply="что-то",
+        reason="противоречиво", suggested_messages=["что-то"],
     )
     monkeypatch.setattr(service._client.responses, "parse", _fake_parse_returning(analysis))
 
@@ -211,7 +344,7 @@ async def test_inconsistent_model_result_is_normalized(monkeypatch):
 
     assert result.relevant is False
     assert result.lead_type == "irrelevant"
-    assert result.suggested_reply == ""
+    assert result.suggested_messages == []
 
 
 # ---- транспорт/ошибки — тот же приём, что и OcrService ----
@@ -233,7 +366,7 @@ async def test_analyze_retries_once_on_rate_limit_then_succeeds(monkeypatch):
     service = _service()
     resp = httpx.Response(429, request=_REQUEST)
     calls = {"count": 0}
-    analysis = LeadAiAnalysis(relevant=False, lead_type="irrelevant", reason="r", suggested_reply="")
+    analysis = LeadAiAnalysis(relevant=False, lead_type="irrelevant", reason="r", suggested_messages=[])
 
     async def fake_parse(**kwargs):
         calls["count"] += 1
@@ -318,7 +451,7 @@ async def test_analyze_never_leaks_exception_text_into_lead_ai_service_error(mon
 async def test_analyze_truncates_overly_long_message_text(monkeypatch):
     service = _service()
     captured = {}
-    analysis = LeadAiAnalysis(relevant=False, lead_type="irrelevant", reason="r", suggested_reply="")
+    analysis = LeadAiAnalysis(relevant=False, lead_type="irrelevant", reason="r", suggested_messages=[])
 
     async def fake_parse(**kwargs):
         captured.update(kwargs)

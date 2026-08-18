@@ -27,7 +27,12 @@ class LeadAiAnalysis(BaseModel):
     relevant: bool
     lead_type: LeadType
     reason: str
-    suggested_reply: str
+    # Короткие отдельные Telegram-сообщения в реальном стиле менеджера (см.
+    # reader/lead_ai/prompt.py) — БЕЗ приветствия: "Доброе утро"/"Добрый
+    # день"/"Добрый вечер" добавляется отдельно, кодом, по текущему времени
+    # Asia/Tbilisi (см. reader/lead_ai/greeting.py) — модель не имеет
+    # надёжного доступа к реальному времени и не должна его придумывать.
+    suggested_messages: list[str]
 
 
 def normalize_lead_ai_analysis(analysis: LeadAiAnalysis) -> LeadAiAnalysis:
@@ -35,17 +40,22 @@ def normalize_lead_ai_analysis(analysis: LeadAiAnalysis) -> LeadAiAnalysis:
     strict Structured Outputs (schema ограничивает ТИПЫ полей, не связи
     между их значениями). Инварианты, которые обязаны выполняться:
 
-    - relevant=False -> lead_type="irrelevant" и suggested_reply=""
-    - relevant=True  -> lead_type != "irrelevant"
+    - relevant=False -> lead_type="irrelevant" и suggested_messages=[]
+    - relevant=True  -> lead_type != "irrelevant" и suggested_messages
+      содержит только непустые (после strip) строки
 
-    Если модель вернула что-то, нарушающее любой из инвариантов (например
+    Если модель вернула что-то, нарушающее первый инвариант (например
     relevant=True с lead_type="irrelevant", или relevant=False с непустым
-    suggested_reply) — результат приводится к безопасному "не лид", а не
+    suggested_messages) — результат приводится к безопасному "не лид", а не
     трактуется в пользу relevant=True: лучше пропустить сомнительный лид,
-    чем показать менеджеру придуманную категорию/ответ (см. задачу: "при
-    сомнении лучше irrelevant, чем придумывать потребность")."""
+    чем показать менеджеру придуманную категорию/сообщения (см. задачу:
+    "при сомнении лучше irrelevant, чем придумывать потребность")."""
     if not analysis.relevant or analysis.lead_type == "irrelevant":
         return analysis.model_copy(
-            update={"relevant": False, "lead_type": "irrelevant", "suggested_reply": ""}
+            update={"relevant": False, "lead_type": "irrelevant", "suggested_messages": []}
         )
+
+    cleaned_messages = [msg.strip() for msg in analysis.suggested_messages if msg and msg.strip()]
+    if cleaned_messages != analysis.suggested_messages:
+        return analysis.model_copy(update={"suggested_messages": cleaned_messages})
     return analysis
