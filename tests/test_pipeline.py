@@ -155,6 +155,33 @@ async def test_new_keywords_from_later_message_accumulate(tmp_path):
         user_repository.close()
 
 
+async def test_car_border_crossing_scenario_match_adds_synthetic_tag_to_user_keywords(tmp_path):
+    """Регрессия (см. задачу): сообщение, совпавшее со сценарием
+    car_border_crossing, должно давать пользователю не только реальное
+    matched_keyword, но и синтетический тег car_border_crossing (см.
+    reader/users/keyword_matches.py) — чтобы одна inviter-кампания с
+    keyword=car_border_crossing подхватывала всех таких пользователей."""
+    scenarios = [Scenario(name="car_border_crossing", enabled=True, keywords=("ларс", "как граница"))]
+    engine = MatchEngine(KeywordMatcher(scenarios))
+
+    user_repository = UserRepository(tmp_path / "users.db")
+    try:
+        sink = _FakeSink()
+        source = _FakeSource([_message(text="Какая очередь на Ларсе?")])
+        pipeline = Pipeline(source, engine, [sink], user_repository)
+
+        await pipeline.run()
+
+        keywords = user_repository.get_keywords(111)
+        assert "ларс" in keywords
+        assert "car_border_crossing" in keywords
+        # Реальное matched keyword сохранено, тег добавлен ДОПОЛНИТЕЛЬНО.
+        assert keywords == ["ларс", "car_border_crossing"]
+        assert len(sink.handled_events) == 1
+    finally:
+        user_repository.close()
+
+
 async def test_message_without_sender_id_does_not_break_processing(tmp_path):
     user_repository = UserRepository(tmp_path / "users.db")
     try:

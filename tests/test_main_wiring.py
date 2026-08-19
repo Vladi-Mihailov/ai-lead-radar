@@ -731,6 +731,50 @@ def test_build_lead_ai_sink_returns_none_when_disabled(tmp_path, monkeypatch):
         user_repository.close()
 
 
+def test_lead_ai_disabled_end_to_end_never_constructs_openai_client_and_keeps_all_recipients(
+    tmp_path, monkeypatch,
+):
+    """Полное отключение Lead AI (см. задачу): lead_ai.enabled=false (текущее
+    значение по умолчанию в config.yaml, см. reader/settings.py::
+    LeadAiSettings) должно означать, что (1) LeadAiService/OpenAI-клиент
+    НИКОГДА не создаётся — здесь это проверяется буквально, подменой
+    reader.main.LeadAiService на класс, который бросает исключение при
+    конструировании, и (2) resolve_telegram_sink_recipients() не исключает
+    НИКОГО из LEAD_FORWARD_TO, включая @alena_ogi — обычный TelegramSink
+    получает всех сконфигурированных получателей, как до появления lead_ai."""
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-real")
+    monkeypatch.setenv("LEAD_FORWARD_TO", "ali_na_l_i,alena_ogi,alenaogir")
+
+    class _PoisonLeadAiService:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError(
+                "LeadAiService не должен создаваться при lead_ai.enabled=false"
+            )
+
+    monkeypatch.setattr("reader.main.LeadAiService", _PoisonLeadAiService)
+
+    config_path = _write_config(tmp_path, _CONFIG_YAML)  # без секции lead_ai -> enabled=false
+    settings = load_settings(config_path)
+    assert settings.lead_ai.enabled is False
+    assert settings.app.lead_forward_to == ["ali_na_l_i", "alena_ogi", "alenaogir"]
+
+    user_repository = UserRepository(tmp_path / "users.db")
+    try:
+        source = _lead_ai_source(tmp_path, settings, user_repository)
+
+        lead_ai_sink = build_lead_ai_sink(settings, source)  # не должен бросить/создать сервис
+        assert lead_ai_sink is None
+
+        telegram_forward_to = resolve_telegram_sink_recipients(
+            settings.app.lead_forward_to, None,
+        )
+        assert telegram_forward_to == ["ali_na_l_i", "alena_ogi", "alenaogir"]
+        assert "alena_ogi" in telegram_forward_to
+    finally:
+        user_repository.close()
+
+
 def test_build_lead_ai_sink_returns_none_when_recipient_missing(tmp_path, monkeypatch):
     _set_required_env(monkeypatch)
     monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-real")
