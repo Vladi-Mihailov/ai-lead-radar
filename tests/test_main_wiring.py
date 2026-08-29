@@ -256,6 +256,10 @@ async def test_build_fine_monitor_components_wires_dependencies_correctly(tmp_pa
         # Тот же UserRepository, что и у FineNotificationCoordinator — нужен
         # "fine check" для строки "Telegram: ..." в результате.
         assert fine_command._user_repository is user_repository
+        # Тот же TelegramClient, что и у остального Reader — второе
+        # подключение не создано; нужен для резолва @username, которого
+        # ещё нет в локальной БД (см. задачу про баг "не найден в базе").
+        assert fine_command._telegram_client is source.client
 
         # Scheduler получил оба job'а — FineJob и ArchiveFineJob, тот же
         # task_repository/check_service/notification_coordinator у обоих

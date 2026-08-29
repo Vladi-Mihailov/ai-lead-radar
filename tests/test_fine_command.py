@@ -15,6 +15,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import pytest  # noqa: E402
+from telethon.errors import UsernameInvalidError, UsernameNotOccupiedError  # noqa: E402
+from telethon.tl.types import User as TelethonUser  # noqa: E402
 
 from reader.commands.base import CommandContext, CommandError  # noqa: E402
 from reader.commands.fine import FineCommand  # noqa: E402
@@ -88,6 +90,7 @@ class _FakeUserRepository:
     ):
         self._users_by_id: dict[int, TelegramUserInfo] = {}
         self._car_numbers_by_user_id: dict[int, set[str]] = {}
+        self.upsert_calls: list[TelegramUserInfo] = []
 
         for user in users or []:
             self._users_by_id[user.user_id] = user
@@ -112,6 +115,40 @@ class _FakeUserRepository:
 
     def add_car_numbers(self, user_id: int, car_numbers: list[str]) -> None:
         self._car_numbers_by_user_id.setdefault(user_id, set()).update(car_numbers)
+
+    def upsert(self, user: TelegramUserInfo) -> None:
+        """Как настоящий UserRepository.upsert() — идемпотентно
+        перезаписывает запись по user_id, не создавая дублей."""
+        self.upsert_calls.append(user)
+        self._users_by_id[user.user_id] = user
+
+
+class _FakeTelegramClient:
+    """Ровно то, что нужно FineCommand от TelegramClient — get_entity() (см.
+    reader/commands/fine.py::TelegramUsernameResolverLike). entities —
+    username (без "@", регистр не важен) -> telethon.tl.types.User;
+    not_found_usernames — username'ы, для которых Telegram подтверждённо
+    не находит пользователя (UsernameNotOccupiedError); errors — username
+    -> произвольное исключение, имитирующее технический сбой (сеть,
+    FloodWait и т.п.), не связанный с фактом "юзернейм не существует"."""
+
+    def __init__(self, *, entities=None, not_found_usernames=(), errors=None):
+        self._entities = {k.lower(): v for k, v in (entities or {}).items()}
+        self._not_found_usernames = {u.lower() for u in not_found_usernames}
+        self._errors = {k.lower(): v for k, v in (errors or {}).items()}
+        self.get_entity_calls: list[str] = []
+
+    async def get_entity(self, entity):
+        username = str(entity).lstrip("@").lower()
+        self.get_entity_calls.append(username)
+
+        if username in self._errors:
+            raise self._errors[username]
+        if username in self._not_found_usernames:
+            raise UsernameNotOccupiedError(request=None)
+        if username in self._entities:
+            return self._entities[username]
+        raise UsernameNotOccupiedError(request=None)
 
 
 class _FakeNotificationService(NotificationService):
@@ -176,12 +213,13 @@ class _Fixture:
 
     def __init__(
         self, tmp_path, records_by_car=None, provider_error=None, provider=None,
-        user_repository=None,
+        user_repository=None, telegram_client=None,
     ):
         db_path = tmp_path / "users.db"
         self.task_repository = FineMonitoringTaskRepository(db_path)
         self.detected_fine_repository = DetectedFineRepository(db_path)
         self.user_repository = user_repository
+        self.telegram_client = telegram_client
         self.provider = provider if provider is not None else _FakeProvider(records_by_car, error=provider_error)
         self.check_service = FineCheckService(
             self.provider, self.task_repository, self.detected_fine_repository
@@ -208,6 +246,7 @@ class _Fixture:
             run_times=_RUN_TIMES,
             tz=_TBILISI,
             user_repository=self.user_repository,
+            telegram_client=self.telegram_client,
         )
 
     def close(self):
@@ -338,6 +377,11 @@ async def test_fine_add_without_username_keeps_old_behavior(tmp_path):
 
 
 async def test_fine_add_with_unknown_username_fails_and_creates_nothing(tmp_path):
+    """Без сконфигурированного Telegram-клиента (telegram_client=None, как
+    и по умолчанию) резолв через Telegram просто не выполняется — @username,
+    которого нет в локальной БД, по-прежнему считается не найденным, но
+    БЕЗ формулировки "не найден в базе" (см. задачу про баг: отсутствие в
+    нашей БД само по себе больше не должно звучать как причина ошибки)."""
     fx = _Fixture(tmp_path, user_repository=_FakeUserRepository())
     try:
         with pytest.raises(CommandError) as exc_info:
@@ -345,11 +389,241 @@ async def test_fine_add_with_unknown_username_fails_and_creates_nothing(tmp_path
 
         assert "@unknown" in exc_info.value.message
         assert "не найден" in exc_info.value.message
+        assert "в базе" not in exc_info.value.message
         assert "Автомобиль не добавлен" in exc_info.value.message
 
         # Задача мониторинга НЕ создана, car_numbers не тронуты.
         assert fx.task_repository.list_active() == []
         assert fx.user_repository.find_by_car_number("A123AA777") == []
+    finally:
+        fx.close()
+
+
+# ---- fine add @username: резолв через Telegram, если нет в локальной БД ----
+
+
+async def test_fine_add_with_username_not_in_db_resolves_via_telegram_and_creates_user(tmp_path):
+    """Главный regression-тест бага: @username нет в локальной БД, но
+    Telegram успешно резолвит его — пользователь создаётся, и мониторинг
+    добавляется сразу, без повторной команды оператора."""
+    entity = TelethonUser(
+        id=555, username="Santinorussia", first_name="Santino", last_name=None,
+        access_hash=999888, bot=False,
+    )
+    client = _FakeTelegramClient(entities={"santinorussia": entity})
+    user_repository = _FakeUserRepository()
+    fx = _Fixture(tmp_path, user_repository=user_repository, telegram_client=client)
+    try:
+        result = await fx.command.handle(
+            _ctx(["add", "A123AA777", "@Santinorussia"])
+        )
+
+        assert "✅ Мониторинг штрафов добавлен" in result.text
+        assert "Telegram: Santino (@Santinorussia)" in result.text
+
+        [task] = fx.task_repository.list_active()
+        assert task.car_number == "A123AA777"
+
+        # Пользователь реально создан upsert()'ом — с минимальным набором
+        # полей (см. задачу), а не выдуманным user_id/access_hash.
+        assert len(user_repository.upsert_calls) == 1
+        created = user_repository.upsert_calls[0]
+        assert created.user_id == 555
+        assert created.username == "Santinorussia"
+        assert created.first_name == "Santino"
+        assert created.access_hash == 999888
+        assert created.is_bot is False
+
+        # Автомобиль сразу добавлен этому пользователю (тем же существующим
+        # механизмом add_car_numbers, что и для уже известных пользователей).
+        found = fx.user_repository.find_by_car_number("A123AA777")
+        assert [u.user_id for u in found] == [555]
+
+        assert client.get_entity_calls == ["santinorussia"]
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_not_in_db_saves_available_profile_fields(tmp_path):
+    entity = TelethonUser(
+        id=777, username="ivan_petrov", first_name="Иван", last_name="Петров",
+        access_hash=123123, bot=False,
+    )
+    client = _FakeTelegramClient(entities={"ivan_petrov": entity})
+    user_repository = _FakeUserRepository()
+    fx = _Fixture(tmp_path, user_repository=user_repository, telegram_client=client)
+    try:
+        await fx.command.handle(_ctx(["add", "A123AA777", "@ivan_petrov"]))
+
+        [created] = user_repository.upsert_calls
+        assert created.user_id == 777
+        assert created.username == "ivan_petrov"
+        assert created.first_name == "Иван"
+        assert created.last_name == "Петров"
+        assert created.access_hash == 123123
+        assert created.is_bot is False
+        assert created.peer_type == "User"
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_telegram_not_found_fails_with_clear_error(tmp_path):
+    """Telegram подтверждённо не знает такого username (не "в базе", а
+    именно в Telegram) — ошибка, но с новой, точной формулировкой."""
+    client = _FakeTelegramClient(not_found_usernames=["santinorussia"])
+    user_repository = _FakeUserRepository()
+    fx = _Fixture(tmp_path, user_repository=user_repository, telegram_client=client)
+    try:
+        with pytest.raises(CommandError) as exc_info:
+            await fx.command.handle(_ctx(["add", "A123AA777", "@Santinorussia"]))
+
+        assert "@Santinorussia" in exc_info.value.message
+        assert "не найден" in exc_info.value.message
+        assert "в базе" not in exc_info.value.message
+        assert "Автомобиль не добавлен" in exc_info.value.message
+
+        assert fx.task_repository.list_active() == []
+        assert user_repository.upsert_calls == []
+        assert fx.user_repository.find_by_car_number("A123AA777") == []
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_invalid_syntax_fails_with_clear_error(tmp_path):
+    client = _FakeTelegramClient(errors={"bad username": UsernameInvalidError(request=None)})
+    fx = _Fixture(tmp_path, user_repository=_FakeUserRepository(), telegram_client=client)
+    try:
+        with pytest.raises(CommandError) as exc_info:
+            await fx.command.handle(_ctx(["add", "A123AA777", "@bad username"]))
+
+        assert "не найден" in exc_info.value.message
+        assert fx.task_repository.list_active() == []
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_telegram_resolve_technical_error_creates_no_partial_state(
+    tmp_path,
+):
+    """Резолв упал технически (не "юзернейм не существует", а, например,
+    сеть/FloodWait) — отдельная, явно техническая ошибка, и никакого
+    частично созданного состояния (ни task, ни user, ни car_numbers)."""
+    client = _FakeTelegramClient(errors={"santinorussia": RuntimeError("connection reset")})
+    user_repository = _FakeUserRepository()
+    fx = _Fixture(tmp_path, user_repository=user_repository, telegram_client=client)
+    try:
+        with pytest.raises(CommandError) as exc_info:
+            await fx.command.handle(_ctx(["add", "A123AA777", "@Santinorussia"]))
+
+        assert "@Santinorussia" in exc_info.value.message
+        assert "техническ" in exc_info.value.message
+        assert "Автомобиль не добавлен" in exc_info.value.message
+
+        assert fx.task_repository.list_active() == []
+        assert user_repository.upsert_calls == []
+        assert fx.user_repository.find_by_car_number("A123AA777") == []
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_resolved_entity_not_a_user_is_treated_as_not_found(tmp_path):
+    """entity, резолвнутая Telegram, — не обычный User (например, канал) —
+    трактуется как "не найден", а не подставляется как владелец автомобиля."""
+    class _NotAUser:
+        id = 999
+
+    client = _FakeTelegramClient(entities={"somechannel": _NotAUser()})
+    user_repository = _FakeUserRepository()
+    fx = _Fixture(tmp_path, user_repository=user_repository, telegram_client=client)
+    try:
+        with pytest.raises(CommandError) as exc_info:
+            await fx.command.handle(_ctx(["add", "A123AA777", "@somechannel"]))
+
+        assert "не найден" in exc_info.value.message
+        assert user_repository.upsert_calls == []
+        assert fx.task_repository.list_active() == []
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_repeated_command_does_not_create_duplicate_user(tmp_path):
+    """Повтор той же команды (например, оператор случайно отправил её
+    дважды) не должен создавать дубликат пользователя — второй раз
+    find_by_username() уже находит его в локальной БД, Telegram вообще не
+    запрашивается повторно."""
+    entity = TelethonUser(
+        id=555, username="santinorussia", first_name="Santino", last_name=None,
+        access_hash=999888, bot=False,
+    )
+    client = _FakeTelegramClient(entities={"santinorussia": entity})
+    user_repository = _FakeUserRepository()
+    fx = _Fixture(tmp_path, user_repository=user_repository, telegram_client=client)
+    try:
+        await fx.command.handle(_ctx(["add", "A123AA777", "@santinorussia"]))
+        # Тот же номер автомобиля уже отслеживается — второй раз с тем же
+        # периодом это ожидаемо validate_no_overlap-ошибка, поэтому берём
+        # ДРУГОЙ номер для второго вызова той же команды с тем же @username.
+        await fx.command.handle(_ctx(["add", "B999BB999", "@santinorussia"]))
+
+        assert len(user_repository.upsert_calls) == 1  # НЕ два
+        assert client.get_entity_calls == ["santinorussia"]  # второй раз не резолвился
+
+        found_a = fx.user_repository.find_by_car_number("A123AA777")
+        found_b = fx.user_repository.find_by_car_number("B999BB999")
+        assert [u.user_id for u in found_a] == [555]
+        assert [u.user_id for u in found_b] == [555]
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_race_reads_back_authoritative_row_after_upsert(tmp_path):
+    """Race: между первым find_by_username() (до резолва — пусто) и
+    upsert() внутри _resolve_and_store_new_user тот же user_id мог быть
+    записан ПАРАЛЛЕЛЬНО (см. задачу). Проверяем, что код читает владельца
+    ЗАНОВО из репозитория ПОСЛЕ upsert(), а не собирает _OwnerLinkResult
+    напрямую из Telegram entity — поэтому в результате всегда то, что
+    реально в БД (в том числе значения, записанные конкурентно), без
+    дублей и без потери гонки."""
+    concurrently_written = TelegramUserInfo(
+        user_id=555, username="santinorussia", first_name="Записано параллельно", last_name=None,
+        access_hash=999888,
+    )
+
+    class _RepositoryWithConcurrentWriter(_FakeUserRepository):
+        """Первый find_by_username() (до резолва) — пусто. Второй (после
+        upsert(), см. _resolve_and_store_new_user) — как будто в БД уже
+        оказалась запись от параллельного писателя, а не буквально то, что
+        только что передал наш upsert()."""
+
+        def __init__(self):
+            super().__init__()
+            self._lookups = 0
+
+        def find_by_username(self, username):
+            self._lookups += 1
+            if self._lookups == 1:
+                return None
+            return concurrently_written
+
+    entity = TelethonUser(
+        id=555, username="santinorussia", first_name="Santino", last_name=None,
+        access_hash=999888, bot=False,
+    )
+    client = _FakeTelegramClient(entities={"santinorussia": entity})
+    user_repository = _RepositoryWithConcurrentWriter()
+    fx = _Fixture(tmp_path, user_repository=user_repository, telegram_client=client)
+    try:
+        result = await fx.command.handle(_ctx(["add", "A123AA777", "@santinorussia"]))
+
+        # upsert() всё равно вызван один раз (идемпотентно на стороне
+        # настоящего UserRepository — INSERT ... ON CONFLICT DO UPDATE, без
+        # дублей), но итоговый владелец в ответе оператору — из СВЕЖЕГО
+        # чтения репозитория, а не собран напрямую из Telegram entity.
+        assert len(user_repository.upsert_calls) == 1
+        assert "✅ Мониторинг штрафов добавлен" in result.text
+        # Значение first_name — из СВЕЖЕГО чтения (concurrently_written),
+        # а не из Telegram entity ("Santino") — подтверждает read-after-write.
+        assert "Telegram: Записано параллельно (@santinorussia)" in result.text
     finally:
         fx.close()
 

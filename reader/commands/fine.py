@@ -12,6 +12,9 @@ from datetime import time as dt_time
 from typing import NamedTuple, Protocol
 from zoneinfo import ZoneInfo
 
+from telethon.errors import UsernameInvalidError, UsernameNotOccupiedError
+from telethon.tl.types import User
+
 from reader.commands.base import Command, CommandContext, CommandError, CommandResult
 from reader.fines.check_service import FineCheckService
 from reader.fines.detected_fine_repository import DetectedFineRepository
@@ -85,11 +88,29 @@ class FineUserRepositoryLike(Protocol):
     что и UserLookupLike (reader/fines/notification_coordinator.py), но
     надмножество: fine add @username дополнительно должен резолвить
     username -> пользователь и привязывать car_number этому пользователю,
-    чего fine check/fine add-bulk (только find_by_car_number) не требуют."""
+    чего fine check/fine add-bulk (только find_by_car_number) не требуют.
+
+    upsert — нужен, чтобы завести пользователя, которого ещё нет в
+    локальной БД, но которого удалось резолвить через Telegram (см.
+    _resolve_and_store_new_user/задачу про баг "не найден в базе")."""
 
     def find_by_car_number(self, car_number: str) -> list[TelegramUserInfo]: ...
     def find_by_username(self, username: str) -> TelegramUserInfo | None: ...
     def add_car_numbers(self, user_id: int, car_numbers: list[str]) -> None: ...
+    def upsert(self, user: TelegramUserInfo) -> None: ...
+
+
+class TelegramUsernameResolverLike(Protocol):
+    """Ровно то, что нужно FineCommand от TelegramClient — резолв
+    @username через уже авторизованную Telethon-сессию (тот же клиент,
+    что и у остального Reader, см. reader/main.py::
+    build_fine_monitor_components — второе подключение не создаётся), для
+    пользователей, которых ещё нет в локальной БД (см. задачу). None
+    (значение по умолчанию) — резолв просто не выполняется, как и раньше:
+    @username, которого нет в БД, считается не найденным без сетевого
+    обращения (см. _resolve_car_owner_for_add)."""
+
+    async def get_entity(self, entity): ...
 
 
 class _OwnerLinkResult(NamedTuple):
@@ -160,6 +181,7 @@ class FineCommand(Command):
         run_times: list[dt_time],
         tz: ZoneInfo,
         user_repository: FineUserRepositoryLike | None = None,
+        telegram_client: TelegramUsernameResolverLike | None = None,
     ):
         self._task_repository = task_repository
         self._check_service = check_service
@@ -172,6 +194,11 @@ class FineCommand(Command):
         # None — как и у FineNotificationCoordinator (см. её докстрок) —
         # "Telegram: ..." в результате fine check тогда покажет "не найден".
         self._user_repository = user_repository
+        # None — резолв @username, которого нет в локальной БД, через
+        # Telegram просто не выполняется (см. TelegramUsernameResolverLike
+        # и _resolve_car_owner_for_add) — тот же приём, что и у
+        # user_repository=None.
+        self._telegram_client = telegram_client
 
     async def handle(self, ctx: CommandContext) -> CommandResult:
         if not ctx.args:
@@ -235,7 +262,7 @@ class FineCommand(Command):
         # должно получиться состояния "task создан, а владелец — нет").
         owner_result: _OwnerLinkResult | None = None
         if owner_username is not None:
-            owner_result = self._resolve_car_owner_for_add(car_number, owner_username)
+            owner_result = await self._resolve_car_owner_for_add(car_number, owner_username)
 
         task = self._task_repository.create(
             car_number=car_number,
@@ -263,22 +290,35 @@ class FineCommand(Command):
 
         return CommandResult(text="\n".join(lines))
 
-    def _resolve_car_owner_for_add(self, car_number: str, raw_username: str) -> _OwnerLinkResult:
-        """Только чтение (find_by_username/find_by_car_number) — ничего не
-        пишет, вызывается ДО task_repository.create() (см. _handle_add).
+    async def _resolve_car_owner_for_add(self, car_number: str, raw_username: str) -> _OwnerLinkResult:
+        """Читает find_by_username/find_by_car_number, и (см. _resolve_and_
+        store_new_user) может ЗАПИСАТЬ нового пользователя, если его ещё
+        нет в локальной БД, но Telegram успешно резолвит username — тем не
+        менее, для car_number/task_repository это по-прежнему только
+        чтение: сам мониторинг создаётся ПОСЛЕ, в _handle_add.
 
         Бросает CommandError (и тогда задача мониторинга НЕ создаётся —
         см. _handle_add) в ЛЮБОМ случае, когда владельца нельзя однозначно
-        определить: @username не найден, номер уже привязан к ДРУГОМУ
-        пользователю, или номер вообще неоднозначен (привязан к нескольким).
-        Единственные исходы, при которых задача создаётся — car_number
-        ещё ни у кого не записан, либо уже записан именно у запрошенного
-        @username (см. задачу: вся pre-validation владельца должна
-        произойти до создания task, без частичных состояний)."""
+        определить: @username не существует в Telegram (или резолв не
+        удался технически), номер уже привязан к ДРУГОМУ пользователю, или
+        номер вообще неоднозначен (привязан к нескольким). Единственные
+        исходы, при которых задача создаётся — car_number ещё ни у кого не
+        записан, либо уже записан именно у запрошенного @username (см.
+        задачу: вся pre-validation владельца должна произойти до создания
+        task, без частичных состояний).
+
+        Отсутствие @username в НАШЕЙ локальной БД само по себе больше НЕ
+        ошибка (см. задачу про баг "не найден в базе") — прежде чем
+        признать пользователя не найденным, делается попытка резолва через
+        уже авторизованную Telethon-сессию (см. _resolve_and_store_new_user)."""
         owner = self._user_repository.find_by_username(raw_username) if self._user_repository else None
+
+        if owner is None and self._user_repository is not None and self._telegram_client is not None:
+            owner = await self._resolve_and_store_new_user(raw_username)
+
         if owner is None:
             raise CommandError(
-                f"❌ Telegram-пользователь @{raw_username} не найден в базе.\n\n"
+                f"❌ Telegram-пользователь @{raw_username} не найден.\n\n"
                 "Автомобиль не добавлен."
             )
 
@@ -308,6 +348,53 @@ class FineCommand(Command):
             "— связь неоднозначна и требует ручной проверки.\n\n"
             "Автомобиль не добавлен."
         )
+
+    async def _resolve_and_store_new_user(self, raw_username: str) -> TelegramUserInfo | None:
+        """@raw_username отсутствует в локальной БД (см. вызывающий код —
+        _resolve_car_owner_for_add) — пробуем резолвить его через уже
+        авторизованную Telethon-сессию (self._telegram_client, тот же
+        клиент, что и у остального Reader) и, если успешно, сразу завести
+        запись в users тем же UserRepository.upsert(), которым уже
+        пользуются reader/sources/telegram_source.py, reader/users/sync.py
+        и reader/users/history_sync.py — без второй, дублирующей реализации
+        маппинга Telegram entity -> TelegramUserInfo (см.
+        TelegramUserInfo.from_telethon_user).
+
+        Возвращает None, если Telegram подтверждённо не знает такого
+        username (UsernameNotOccupiedError/UsernameInvalidError — синтаксис
+        неверный или юзернейм никем не занят) либо резолвнутая entity — не
+        обычный пользователь (например, это оказался канал/чат, а не
+        User) — тогда вызывающий код сформирует финальное "не найден".
+
+        Любая ДРУГАЯ ошибка (сеть, FloodWait, прочий сбой RPC) — это
+        CommandError с отдельным, явно техническим текстом, пойманный ДО
+        task_repository.create() (см. _handle_add: lookup происходит до
+        создания задачи) — так что частично созданной задачи мониторинга
+        без владельца не остаётся ни в одном из исходов."""
+        try:
+            entity = await self._telegram_client.get_entity(f"@{raw_username}")
+        except (UsernameNotOccupiedError, UsernameInvalidError, ValueError):
+            return None
+        except Exception as exc:
+            raise CommandError(
+                f"❌ Не удалось проверить Telegram-пользователя @{raw_username} "
+                "(техническая ошибка при обращении к Telegram).\n\n"
+                "Автомобиль не добавлен."
+            ) from exc
+
+        if not isinstance(entity, User):
+            return None
+
+        self._user_repository.upsert(TelegramUserInfo.from_telethon_user(entity))
+
+        # Race: между find_by_username() (в _resolve_car_owner_for_add) и
+        # этим upsert() тот же пользователь мог уже появиться в БД (другим
+        # путём, см. reader/core/pipeline.py/history_sync.py) — upsert()
+        # идемпотентен (INSERT ... ON CONFLICT DO UPDATE, см.
+        # reader/users/repository.py), дубля не возникает; читаем заново, а
+        # не строим _OwnerLinkResult из entity напрямую, чтобы в любом
+        # случае вернуть ИМЕННО то, что реально сохранено в БД.
+        return self._user_repository.find_by_username(raw_username)
 
     async def _handle_add_bulk(self, ctx: CommandContext, args: list[str]) -> CommandResult:
         start_raw, end_raw, car_numbers_raw = self._split_bulk_args(args)

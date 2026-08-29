@@ -158,6 +158,7 @@ def build_fine_monitor_components(
         run_times=fine_monitor.check_times,
         tz=tz,
         user_repository=user_repository,
+        telegram_client=source.client,
     )
 
     return fine_job, scheduler, notification_service, command_dispatcher, fine_command
