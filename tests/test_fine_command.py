@@ -677,7 +677,8 @@ async def test_fine_add_with_username_conflicting_owner_creates_no_task(tmp_path
 
         assert "⚠️" in exc_info.value.message
         assert "@user1" in exc_info.value.message
-        assert "Автомобиль не добавлен" in exc_info.value.message
+        assert "@user2" in exc_info.value.message
+        assert "не установлен" in exc_info.value.message
 
         # Regression: количество задач НЕ изменилось.
         assert fx.task_repository.list_active() == tasks_before
@@ -772,6 +773,256 @@ async def test_fine_add_with_explicit_dates_and_username(tmp_path):
 
         assert "Период: 01.08.2026–31.08.2026" in result.text
         assert "Telegram: Иван Петров (@owner)" in result.text
+    finally:
+        fx.close()
+
+
+# ---- fine add @username: номер уже на активном мониторинге -> обогащаем
+# существующую запись владельцем, вместо второй (дублирующей) задачи ----
+
+
+async def test_fine_add_with_username_enriches_existing_monitoring_when_username_known_locally(tmp_path):
+    """Номер уже на активном мониторинге БЕЗ владельца; @username уже есть
+    в локальной БД — обогащаем существующую запись, вторую НЕ создаём."""
+    owner = TelegramUserInfo(user_id=222, username="owner", first_name=None, last_name=None)
+    fx = _Fixture(tmp_path, user_repository=_FakeUserRepository(users=[owner]))
+    try:
+        await fx.command.handle(_ctx(["add", "A123AA777"]))  # без владельца, как раньше
+        [task_before] = fx.task_repository.list_active()
+
+        result = await fx.command.handle(_ctx(["add", "A123AA777", "@owner"]))
+
+        assert "уже был на мониторинге" in result.text
+        assert "Добавлен Telegram-пользователь" in result.text
+        assert "@owner" in result.text
+
+        # НЕ создана вторая (дублирующая) задача мониторинга того же номера.
+        [task_after] = fx.task_repository.list_active()
+        assert task_after.id == task_before.id
+
+        found = fx.user_repository.find_by_car_number("A123AA777")
+        assert [u.user_id for u in found] == [222]
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_not_in_db_resolves_and_enriches_existing_monitoring(tmp_path):
+    """Номер уже на активном мониторинге БЕЗ владельца; @username НЕТ в
+    локальной БД — резолвим через Telegram (см. 3948738), создаём
+    пользователя, и обогащаем существующую запись мониторинга (а не только
+    создаём пользователя без применения к уже существующему номеру)."""
+    entity = TelethonUser(
+        id=555, username="santinorussia", first_name="Santino", last_name=None,
+        access_hash=999888, bot=False,
+    )
+    client = _FakeTelegramClient(entities={"santinorussia": entity})
+    user_repository = _FakeUserRepository()
+    fx = _Fixture(tmp_path, user_repository=user_repository, telegram_client=client)
+    try:
+        await fx.command.handle(_ctx(["add", "A123AA777"]))
+        [task_before] = fx.task_repository.list_active()
+
+        result = await fx.command.handle(_ctx(["add", "A123AA777", "@santinorussia"]))
+
+        assert "уже был на мониторинге" in result.text
+        assert "Добавлен Telegram-пользователь" in result.text
+
+        [task_after] = fx.task_repository.list_active()
+        assert task_after.id == task_before.id  # без дубля задачи
+        assert len(user_repository.upsert_calls) == 1  # пользователь создан ровно один раз
+
+        found = fx.user_repository.find_by_car_number("A123AA777")
+        assert [u.user_id for u in found] == [555]
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_already_linked_to_existing_monitoring_is_idempotent(tmp_path):
+    """Номер уже на мониторинге И уже связан именно с этим @username —
+    идемпотентно: ни вторая задача, ни дубль пользователя/car_numbers."""
+    owner = TelegramUserInfo(user_id=222, username="owner", first_name=None, last_name=None)
+    fx = _Fixture(tmp_path, user_repository=_FakeUserRepository(users=[owner]))
+    try:
+        await fx.command.handle(_ctx(["add", "A123AA777", "@owner"]))
+        [task_before] = fx.task_repository.list_active()
+
+        result = await fx.command.handle(_ctx(["add", "A123AA777", "@owner"]))
+
+        assert "уже на мониторинге" in result.text
+        assert "уже связан" in result.text
+        assert "@owner" in result.text
+
+        [task_after] = fx.task_repository.list_active()
+        assert task_after.id == task_before.id
+
+        found = fx.user_repository.find_by_car_number("A123AA777")
+        assert [u.user_id for u in found] == [222]  # без дублей
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_conflicting_owner_on_existing_monitoring_does_not_change_link(
+    tmp_path,
+):
+    """Номер уже на мониторинге и связан с ДРУГИМ пользователем — конфликт,
+    связь НЕ переписывается автоматически, вторая задача НЕ создаётся."""
+    old_owner = TelegramUserInfo(user_id=1, username="old_username", first_name=None, last_name=None)
+    new_owner = TelegramUserInfo(user_id=2, username="new_username", first_name=None, last_name=None)
+    fx = _Fixture(tmp_path, user_repository=_FakeUserRepository(users=[old_owner, new_owner]))
+    try:
+        await fx.command.handle(_ctx(["add", "A123AA777", "@old_username"]))
+        [task_before] = fx.task_repository.list_active()
+
+        with pytest.raises(CommandError) as exc_info:
+            await fx.command.handle(_ctx(["add", "A123AA777", "@new_username"]))
+
+        assert "@old_username" in exc_info.value.message
+        assert "@new_username" in exc_info.value.message
+        assert "не установлен" in exc_info.value.message
+
+        [task_after] = fx.task_repository.list_active()
+        assert task_after.id == task_before.id  # без второй задачи
+
+        found = fx.user_repository.find_by_car_number("A123AA777")
+        assert [u.user_id for u in found] == [1]  # связь не изменилась
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_existing_owner_without_username_enriched_by_same_telegram_id(
+    tmp_path,
+):
+    """Владелец car_number уже известен по user_id, но БЕЗ username
+    (например, попал в БД через forward/историю без ника) — оператор
+    передаёт @username, который Telegram резолвит в ТОТ ЖЕ user_id: профиль
+    обогащается (username/имя сохраняются на ТУ ЖЕ запись), новый
+    пользователь не создаётся, номер не дублируется."""
+    owner_without_username = TelegramUserInfo(
+        user_id=555, username=None, first_name=None, last_name=None,
+    )
+    entity = TelethonUser(
+        id=555, username="santinorussia", first_name="Santino", last_name=None,
+        access_hash=999888, bot=False,
+    )
+    client = _FakeTelegramClient(entities={"santinorussia": entity})
+    user_repository = _FakeUserRepository(
+        users_by_car_number={"A123AA777": [owner_without_username]}, users=[owner_without_username],
+    )
+    fx = _Fixture(tmp_path, user_repository=user_repository, telegram_client=client)
+    try:
+        await fx.command.handle(_ctx(["add", "B999BB999"]))  # просто чтобы была хоть одна задача
+        car_number_tasks_before = fx.task_repository.get_active_by_car_number("A123AA777")
+        assert car_number_tasks_before == []  # у A123AA777 задачи мониторинга ещё нет вовсе —
+        # обогащается именно СВЯЗЬ пользователь<->номер (users.car_numbers),
+        # не запись fine_monitoring_tasks (см. задачу: "изучи модель данных").
+
+        result = await fx.command.handle(_ctx(["add", "A123AA777", "@santinorussia"]))
+
+        assert "✅ Мониторинг штрафов добавлен" in result.text
+        assert "Telegram: Santino (@santinorussia)" in result.text
+
+        # upsert() обновил ТУ ЖЕ запись (тот же user_id=555) — не создал новую.
+        [updated] = user_repository.upsert_calls
+        assert updated.user_id == 555
+        assert updated.username == "santinorussia"
+
+        found = fx.user_repository.find_by_car_number("A123AA777")
+        assert [u.user_id for u in found] == [555]  # тот же пользователь, без дублей
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_existing_owner_without_username_conflicts_on_different_telegram_id(
+    tmp_path,
+):
+    """Владелец car_number уже известен по user_id (без username), но
+    переданный @username Telegram резолвит в ДРУГОЙ user_id — это конфликт,
+    а не "обогащение профиля": связь не переписывается."""
+    owner_without_username = TelegramUserInfo(
+        user_id=555, username=None, first_name=None, last_name=None,
+    )
+    different_entity = TelethonUser(
+        id=999, username="someone_else", first_name="Someone", last_name=None,
+        access_hash=111222, bot=False,
+    )
+    client = _FakeTelegramClient(entities={"someone_else": different_entity})
+    user_repository = _FakeUserRepository(
+        users_by_car_number={"A123AA777": [owner_without_username]}, users=[owner_without_username],
+    )
+    fx = _Fixture(tmp_path, user_repository=user_repository, telegram_client=client)
+    try:
+        with pytest.raises(CommandError) as exc_info:
+            await fx.command.handle(_ctx(["add", "A123AA777", "@someone_else"]))
+
+        assert "уже связан" in exc_info.value.message
+        assert "@someone_else" in exc_info.value.message
+        assert "не установлен" in exc_info.value.message
+
+        # Ни задача мониторинга, ни существующая связь владельца не
+        # тронуты. @someone_else — реально резолвленный Telegram-
+        # пользователь, поэтому он кэшируется в users (как и в 3948738),
+        # но НЕ становится владельцем этого автомобиля.
+        assert fx.task_repository.list_active() == []
+        [cached] = user_repository.upsert_calls
+        assert cached.user_id == 999
+        found = fx.user_repository.find_by_car_number("A123AA777")
+        assert [u.user_id for u in found] == [555]  # связь не изменилась
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_resolve_failure_leaves_existing_monitoring_unchanged(tmp_path):
+    """Номер уже на активном мониторинге БЕЗ владельца; Telegram-резолв
+    нового @username не удаётся (не найден) — существующая задача
+    мониторинга остаётся полностью без изменений (даты/статус), владелец
+    не привязывается."""
+    client = _FakeTelegramClient(not_found_usernames=["ghost_user"])
+    user_repository = _FakeUserRepository()
+    fx = _Fixture(tmp_path, user_repository=user_repository, telegram_client=client)
+    try:
+        await fx.command.handle(_ctx(["add", "A123AA777"]))
+        [task_before] = fx.task_repository.list_active()
+
+        with pytest.raises(CommandError) as exc_info:
+            await fx.command.handle(_ctx(["add", "A123AA777", "@ghost_user"]))
+
+        assert "не найден" in exc_info.value.message
+        assert "в базе" not in exc_info.value.message
+
+        [task_after] = fx.task_repository.list_active()
+        assert task_after == task_before  # задача мониторинга не изменилась вовсе
+        assert user_repository.upsert_calls == []
+        assert fx.user_repository.find_by_car_number("A123AA777") == []
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_enrichment_preserves_existing_monitoring_dates_and_settings(
+    tmp_path,
+):
+    """Даты/остальные параметры существующей задачи мониторинга (период,
+    id, статус, telegram_chat_id, created_by_user_id) НЕ должны меняться в
+    результате обогащения владельцем — единственное изменение — привязка
+    пользователя к car_number (users.car_numbers), задача мониторинга не
+    трогается вовсе."""
+    owner = TelegramUserInfo(user_id=222, username="owner", first_name=None, last_name=None)
+    fx = _Fixture(tmp_path, user_repository=_FakeUserRepository(users=[owner]))
+    try:
+        await fx.command.handle(
+            _ctx(["add", "A123AA777", "01.08.2026", "31.08.2026"], user_id=333)
+        )
+        [task_before] = fx.task_repository.list_active()
+
+        await fx.command.handle(_ctx(["add", "A123AA777", "15.08.2026", "20.08.2026", "@owner"]))
+
+        [task_after] = fx.task_repository.list_active()
+        assert task_after.id == task_before.id
+        assert task_after.start_date == task_before.start_date
+        assert task_after.end_date == task_before.end_date
+        assert task_after.status == task_before.status
+        assert task_after.telegram_chat_id == task_before.telegram_chat_id
+        assert task_after.created_by_user_id == task_before.created_by_user_id
+        assert task_after.updated_at == task_before.updated_at
     finally:
         fx.close()
 

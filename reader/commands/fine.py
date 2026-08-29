@@ -26,6 +26,7 @@ from reader.fines.notification_coordinator import (
 from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.fines.validation import (
     FineValidationError,
+    find_overlapping_task,
     normalize_car_number,
     parse_date,
     resolve_monitoring_period,
@@ -255,14 +256,37 @@ class FineCommand(Command):
         start_date, end_date = resolve_monitoring_period(start_raw, end_raw, today=today)
 
         existing = self._task_repository.get_active_by_car_number(car_number)
-        validate_no_overlap(start_date, end_date, existing)
 
         # Lookup @username ДО создания задачи — если пользователь не
         # найден, задача мониторинга вообще не создаётся (см. задачу: не
         # должно получиться состояния "task создан, а владелец — нет").
+        # Намеренно ДО validate_no_overlap(): если номер уже на активном
+        # мониторинге (период пересекается) И передан @username — это не
+        # ошибка "уже добавлен", а сценарий "обогатить существующую запись
+        # владельцем" (см. задачу и ветку ниже) — она должна успеть
+        # определить владельца (найти/резолвнуть через Telegram/поймать
+        # конфликт) ДО того, как validate_no_overlap возможно бросит
+        # исключение "уже есть активная задача".
         owner_result: _OwnerLinkResult | None = None
         if owner_username is not None:
             owner_result = await self._resolve_car_owner_for_add(car_number, owner_username)
+
+        if owner_result is not None and find_overlapping_task(start_date, end_date, existing) is not None:
+            # Номер уже в активном мониторинге — вторую (дублирующую)
+            # задачу НЕ создаём (см. задачу), существующие даты/настройки
+            # этой активной задачи не трогаем вовсе. _resolve_car_owner_
+            # for_add() выше уже сама разрешила все конфликтные исходы
+            # (не найден/конфликт с другим пользователем — CommandError,
+            # брошенный до этой строки) — здесь owner_result гарантированно
+            # успешен: новая привязка либо уже существующая (идемпотентно).
+            newly_linked = owner_result.user_id_to_link is not None
+            if newly_linked:
+                self._user_repository.add_car_numbers(owner_result.user_id_to_link, [car_number])
+            return CommandResult(
+                text=self._format_enrichment_result(car_number, owner_result, newly_linked=newly_linked)
+            )
+
+        validate_no_overlap(start_date, end_date, existing)
 
         task = self._task_repository.create(
             car_number=car_number,
@@ -289,6 +313,23 @@ class FineCommand(Command):
         lines.append(f"Проверка: {_format_check_times(self._run_times)} по Тбилиси")
 
         return CommandResult(text="\n".join(lines))
+
+    @staticmethod
+    def _format_enrichment_result(
+        car_number: str, owner_result: _OwnerLinkResult, *, newly_linked: bool,
+    ) -> str:
+        """Ответ оператору для сценария "номер уже на активном мониторинге,
+        владелец обогащён" (см. _handle_add) — БЕЗ повторного создания
+        задачи мониторинга и без изменения её дат/настроек (см. задачу)."""
+        if newly_linked:
+            return (
+                f"✔ Автомобиль {car_number} уже был на мониторинге.\n"
+                f"Добавлен Telegram-пользователь {owner_result.telegram_line}."
+            )
+        return (
+            f"✔ Автомобиль {car_number} уже на мониторинге и уже связан "
+            f"с {owner_result.telegram_line}."
+        )
 
     async def _resolve_car_owner_for_add(self, car_number: str, raw_username: str) -> _OwnerLinkResult:
         """Читает find_by_username/find_by_car_number, и (см. _resolve_and_
@@ -335,10 +376,13 @@ class FineCommand(Command):
             return _OwnerLinkResult(format_car_owner_display([owner]), None)
 
         if len(existing_owners) == 1:
+            # Автоматически связь НЕ перезаписываем (см. задачу — потенциально
+            # опасный конфликт, независимо от того, это новый номер или уже
+            # существующая запись мониторинга, которую пытались обогатить).
             raise CommandError(
-                f"⚠️ Автомобиль {car_number} уже связан с другим Telegram-пользователем: "
-                f"{format_car_owner_display(existing_owners)}.\n\n"
-                "Автомобиль не добавлен."
+                f"⚠️ Автомобиль {car_number} уже связан с "
+                f"{format_car_owner_display(existing_owners)}.\n"
+                f"Новый пользователь @{raw_username} не установлен."
             )
 
         # Несколько пользователей уже имеют этот номер в car_numbers —

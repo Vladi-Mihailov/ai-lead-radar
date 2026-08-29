@@ -71,6 +71,28 @@ def resolve_monitoring_period(
     return start_date, end_date
 
 
+def find_overlapping_task(
+    start_date: date,
+    end_date: date,
+    existing_tasks: list[FineMonitoringTask],
+) -> FineMonitoringTask | None:
+    """Первая (в порядке существующего списка) активная задача из
+    existing_tasks, чей период пересекается с [start_date, end_date], либо
+    None, если пересечений нет. existing_tasks — уже отфильтрованные по
+    номеру и статусу 'active' задачи (см.
+    FineMonitoringTaskRepository.get_active_by_car_number()).
+
+    Общая, не бросающая исключение проверка — используется и
+    validate_no_overlap() ниже (оператору нужна ошибка), и
+    reader/commands/fine.py (сценарий "номер уже на мониторинге, обогатить
+    существующую запись владельцем" — там нужен сам факт пересечения, а не
+    исключение, см. задачу)."""
+    for task in existing_tasks:
+        if start_date <= task.end_date and task.start_date <= end_date:
+            return task
+    return None
+
+
 def validate_no_overlap(
     start_date: date,
     end_date: date,
@@ -78,10 +100,10 @@ def validate_no_overlap(
 ) -> None:
     """existing_tasks — уже отфильтрованные по номеру и статусу 'active'
     задачи (см. FineMonitoringTaskRepository.get_active_by_car_number)."""
-    for task in existing_tasks:
-        if start_date <= task.end_date and task.start_date <= end_date:
-            raise FineValidationError(
-                f"Для этого номера уже есть активная задача (ID {task.id}), "
-                f"период {task.start_date.strftime(_DATE_FORMAT)}"
-                f"–{task.end_date.strftime(_DATE_FORMAT)}, пересекающийся с указанным"
-            )
+    task = find_overlapping_task(start_date, end_date, existing_tasks)
+    if task is not None:
+        raise FineValidationError(
+            f"Для этого номера уже есть активная задача (ID {task.id}), "
+            f"период {task.start_date.strftime(_DATE_FORMAT)}"
+            f"–{task.end_date.strftime(_DATE_FORMAT)}, пересекающийся с указанным"
+        )
