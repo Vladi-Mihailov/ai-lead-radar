@@ -656,10 +656,36 @@ async def test_fine_add_with_username_already_owning_number_is_idempotent(tmp_pa
         fx.close()
 
 
-async def test_fine_add_with_username_conflicting_owner_creates_no_task(tmp_path):
-    """Вся pre-validation владельца — ДО task_repository.create(): конфликт
-    (номер уже у ДРУГОГО пользователя) должен целиком блокировать команду,
-    а не создавать задачу с последующим предупреждением."""
+async def test_fine_add_with_username_re_adding_existing_owner_among_several_is_idempotent(tmp_path):
+    """car_number уже связан с несколькими пользователями (валидное
+    состояние, см. задачу) — повторное добавление ОДНОГО ИЗ них не должно
+    создавать дубль связи и не должно затрагивать остальных владельцев."""
+    user1 = TelegramUserInfo(user_id=1, username="user1", first_name=None, last_name=None)
+    user2 = TelegramUserInfo(user_id=2, username="user2", first_name=None, last_name=None)
+    fx = _Fixture(
+        tmp_path,
+        user_repository=_FakeUserRepository(
+            users_by_car_number={"A123AA777": [user1, user2]}, users=[user1, user2],
+        ),
+    )
+    try:
+        result = await fx.command.handle(_ctx(["add", "A123AA777", "@user2"]))
+
+        assert "Telegram: @user2" in result.text
+        assert "⚠️" not in result.text
+
+        found = fx.user_repository.find_by_car_number("A123AA777")
+        assert sorted(u.user_id for u in found) == [1, 2]  # без дублей, user1 не тронут
+    finally:
+        fx.close()
+
+
+async def test_fine_add_with_username_links_second_owner_when_car_already_has_one_owner(tmp_path):
+    """Один автомобиль может быть валидно связан сразу с несколькими
+    Telegram-пользователями (см. задачу) — car_number уже связан с user1,
+    добавление user2 не должно быть ошибкой: user2 связывается
+    ДОПОЛНИТЕЛЬНО, user1 не отвязывается, задача мониторинга создаётся как
+    обычно (номер ещё не был на активном мониторинге)."""
     user1 = TelegramUserInfo(user_id=1, username="user1", first_name=None, last_name=None)
     user2 = TelegramUserInfo(user_id=2, username="user2", first_name=None, last_name=None)
     fx = _Fixture(
@@ -669,30 +695,24 @@ async def test_fine_add_with_username_conflicting_owner_creates_no_task(tmp_path
         ),
     )
     try:
-        tasks_before = fx.task_repository.list_active()
-        assert tasks_before == []
+        result = await fx.command.handle(_ctx(["add", "A123AA777", "@user2"]))
 
-        with pytest.raises(CommandError) as exc_info:
-            await fx.command.handle(_ctx(["add", "A123AA777", "@user2"]))
+        assert "✅ Мониторинг штрафов добавлен" in result.text
+        assert "⚠️" not in result.text
 
-        assert "⚠️" in exc_info.value.message
-        assert "@user1" in exc_info.value.message
-        assert "@user2" in exc_info.value.message
-        assert "не установлен" in exc_info.value.message
-
-        # Regression: количество задач НЕ изменилось.
-        assert fx.task_repository.list_active() == tasks_before
-        assert len(fx.task_repository.list_active()) == 0
+        [task] = fx.task_repository.list_active()
+        assert task.car_number == "A123AA777"
 
         found = fx.user_repository.find_by_car_number("A123AA777")
-        assert [u.user_id for u in found] == [1]  # user2 НЕ добавлен
+        assert sorted(u.user_id for u in found) == [1, 2]  # оба владельца, user1 не отвязан
     finally:
         fx.close()
 
 
-async def test_fine_add_with_username_ambiguous_existing_owners_creates_no_task(tmp_path):
-    """Тот же принцип для неоднозначной привязки (несколько существующих
-    владельцев) — задача НЕ создаётся."""
+async def test_fine_add_with_username_links_third_owner_when_car_already_has_two_owners(tmp_path):
+    """Наличие 2+ пользователей у одного car_number — валидное состояние,
+    не конфликт: третий пользователь добавляется точно так же
+    дополнительно, без ошибки."""
     user1 = TelegramUserInfo(user_id=1, username="user1", first_name=None, last_name=None)
     user2 = TelegramUserInfo(user_id=2, username="user2", first_name=None, last_name=None)
     user3 = TelegramUserInfo(user_id=3, username="user3", first_name=None, last_name=None)
@@ -703,30 +723,23 @@ async def test_fine_add_with_username_ambiguous_existing_owners_creates_no_task(
         ),
     )
     try:
-        tasks_before = fx.task_repository.list_active()
-        assert tasks_before == []
+        result = await fx.command.handle(_ctx(["add", "A123AA777", "@user3"]))
 
-        with pytest.raises(CommandError) as exc_info:
-            await fx.command.handle(_ctx(["add", "A123AA777", "@user3"]))
+        assert "✅ Мониторинг штрафов добавлен" in result.text
+        assert "⚠️" not in result.text
 
-        assert "⚠️" in exc_info.value.message
-        assert "неоднозначна" in exc_info.value.message
-        assert "Автомобиль не добавлен" in exc_info.value.message
-
-        # Regression: количество задач НЕ изменилось.
-        assert fx.task_repository.list_active() == tasks_before
-        assert len(fx.task_repository.list_active()) == 0
+        [task] = fx.task_repository.list_active()
+        assert task.car_number == "A123AA777"
 
         found = fx.user_repository.find_by_car_number("A123AA777")
-        assert sorted(u.user_id for u in found) == [1, 2]  # user3 не добавлен
+        assert sorted(u.user_id for u in found) == [1, 2, 3]  # все трое связаны
     finally:
         fx.close()
 
 
-async def test_fine_add_with_username_conflict_does_not_change_task_count_alongside_other_tasks(tmp_path):
-    """Более сильная версия regression-теста: конфликт по ОДНОМУ номеру не
-    должен влиять на количество задач мониторинга вообще — даже когда в
-    базе уже есть другие, не связанные с этим конфликтом задачи."""
+async def test_fine_add_with_username_linking_additional_owner_does_not_affect_unrelated_tasks(tmp_path):
+    """Добавление второго владельца для ОДНОГО car_number не должно
+    затрагивать задачи мониторинга других, не связанных с ним номеров."""
     user1 = TelegramUserInfo(user_id=1, username="user1", first_name=None, last_name=None)
     user2 = TelegramUserInfo(user_id=2, username="user2", first_name=None, last_name=None)
     fx = _Fixture(
@@ -737,13 +750,14 @@ async def test_fine_add_with_username_conflict_does_not_change_task_count_alongs
     )
     try:
         await fx.command.handle(_ctx(["add", "B999BB999"]))
-        count_before = len(fx.task_repository.list_active())
-        assert count_before == 1
+        [unrelated_task_before] = fx.task_repository.list_active()
 
-        with pytest.raises(CommandError):
-            await fx.command.handle(_ctx(["add", "A123AA777", "@user2"]))
+        await fx.command.handle(_ctx(["add", "A123AA777", "@user2"]))
 
-        assert len(fx.task_repository.list_active()) == count_before
+        tasks_after = fx.task_repository.list_active()
+        assert len(tasks_after) == 2
+        unrelated_task_after = next(t for t in tasks_after if t.car_number == "B999BB999")
+        assert unrelated_task_after.id == unrelated_task_before.id
     finally:
         fx.close()
 
@@ -861,11 +875,13 @@ async def test_fine_add_with_username_already_linked_to_existing_monitoring_is_i
         fx.close()
 
 
-async def test_fine_add_with_username_conflicting_owner_on_existing_monitoring_does_not_change_link(
+async def test_fine_add_with_username_links_second_owner_on_existing_monitoring_without_duplicate_task(
     tmp_path,
 ):
-    """Номер уже на мониторинге и связан с ДРУГИМ пользователем — конфликт,
-    связь НЕ переписывается автоматически, вторая задача НЕ создаётся."""
+    """Номер уже на активном мониторинге и связан с ОДНИМ пользователем —
+    добавление ВТОРОГО @username не конфликт: пользователь связывается
+    дополнительно, первый не отвязывается, вторая (дублирующая) задача
+    мониторинга НЕ создаётся (см. задачу про требование №1)."""
     old_owner = TelegramUserInfo(user_id=1, username="old_username", first_name=None, last_name=None)
     new_owner = TelegramUserInfo(user_id=2, username="new_username", first_name=None, last_name=None)
     fx = _Fixture(tmp_path, user_repository=_FakeUserRepository(users=[old_owner, new_owner]))
@@ -873,18 +889,16 @@ async def test_fine_add_with_username_conflicting_owner_on_existing_monitoring_d
         await fx.command.handle(_ctx(["add", "A123AA777", "@old_username"]))
         [task_before] = fx.task_repository.list_active()
 
-        with pytest.raises(CommandError) as exc_info:
-            await fx.command.handle(_ctx(["add", "A123AA777", "@new_username"]))
+        result = await fx.command.handle(_ctx(["add", "A123AA777", "@new_username"]))
 
-        assert "@old_username" in exc_info.value.message
-        assert "@new_username" in exc_info.value.message
-        assert "не установлен" in exc_info.value.message
+        assert "уже был на мониторинге" in result.text
+        assert "@new_username" in result.text
 
         [task_after] = fx.task_repository.list_active()
         assert task_after.id == task_before.id  # без второй задачи
 
         found = fx.user_repository.find_by_car_number("A123AA777")
-        assert [u.user_id for u in found] == [1]  # связь не изменилась
+        assert sorted(u.user_id for u in found) == [1, 2]  # оба владельца связаны
     finally:
         fx.close()
 
@@ -932,12 +946,13 @@ async def test_fine_add_with_username_existing_owner_without_username_enriched_b
         fx.close()
 
 
-async def test_fine_add_with_username_existing_owner_without_username_conflicts_on_different_telegram_id(
+async def test_fine_add_with_username_existing_owner_without_username_gets_a_second_owner_linked(
     tmp_path,
 ):
-    """Владелец car_number уже известен по user_id (без username), но
-    переданный @username Telegram резолвит в ДРУГОЙ user_id — это конфликт,
-    а не "обогащение профиля": связь не переписывается."""
+    """Владелец car_number уже известен по user_id (без username), а
+    переданный @username Telegram резолвит в ДРУГОЙ user_id — это не
+    конфликт: второй пользователь связывается с этим же car_number
+    дополнительно, первый (без username) не отвязывается."""
     owner_without_username = TelegramUserInfo(
         user_id=555, username=None, first_name=None, last_name=None,
     )
@@ -951,22 +966,19 @@ async def test_fine_add_with_username_existing_owner_without_username_conflicts_
     )
     fx = _Fixture(tmp_path, user_repository=user_repository, telegram_client=client)
     try:
-        with pytest.raises(CommandError) as exc_info:
-            await fx.command.handle(_ctx(["add", "A123AA777", "@someone_else"]))
+        result = await fx.command.handle(_ctx(["add", "A123AA777", "@someone_else"]))
 
-        assert "уже связан" in exc_info.value.message
-        assert "@someone_else" in exc_info.value.message
-        assert "не установлен" in exc_info.value.message
+        assert "✅ Мониторинг штрафов добавлен" in result.text
 
-        # Ни задача мониторинга, ни существующая связь владельца не
-        # тронуты. @someone_else — реально резолвленный Telegram-
-        # пользователь, поэтому он кэшируется в users (как и в 3948738),
-        # но НЕ становится владельцем этого автомобиля.
-        assert fx.task_repository.list_active() == []
+        [task] = fx.task_repository.list_active()
+        assert task.car_number == "A123AA777"
+
+        # @someone_else реально резолвлен и закэширован в users (как и в
+        # 3948738) И связан с этим car_number, первый владелец не тронут.
         [cached] = user_repository.upsert_calls
         assert cached.user_id == 999
         found = fx.user_repository.find_by_car_number("A123AA777")
-        assert [u.user_id for u in found] == [555]  # связь не изменилась
+        assert sorted(u.user_id for u in found) == [555, 999]
     finally:
         fx.close()
 
@@ -1548,7 +1560,10 @@ async def test_fine_check_shows_full_name_with_username(tmp_path):
         fx.close()
 
 
-async def test_fine_check_shows_ambiguous_owner_when_multiple_users_match(tmp_path):
+async def test_fine_check_shows_all_owners_when_multiple_users_match(tmp_path):
+    """Один car_number, валидно связанный сразу с несколькими Telegram-
+    пользователями (см. задачу) — "fine check" должен показать ВСЕХ, а не
+    скрывать их за общей фразой."""
     fx = _Fixture(
         tmp_path,
         records_by_car={"AA001AA": [_record(car_number="AA001AA")]},
@@ -1566,7 +1581,7 @@ async def test_fine_check_shows_ambiguous_owner_when_multiple_users_match(tmp_pa
 
         result = await fx.command.handle(_ctx(["check", "AA001AA"]))
 
-        assert "Telegram: найдено несколько пользователей" in result.text
+        assert "Telegram: @user_one, @user_two" in result.text
     finally:
         fx.close()
 

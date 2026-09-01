@@ -117,13 +117,12 @@ class TelegramUsernameResolverLike(Protocol):
 class _OwnerLinkResult(NamedTuple):
     """Результат разбора необязательного "@username" в конце fine add —
     только чтение (find_by_username/find_by_car_number), ничего не пишет
-    (см. _resolve_car_owner_for_add). Возвращается ТОЛЬКО в случае успеха
-    (уже привязан этому же пользователю или ещё ни у кого не записан) —
-    любой конфликт (username не найден, номер уже у другого/нескольких
-    пользователей) — это CommandError, брошенный ДО task_repository.
-    create(), а не часть этого результата: задача мониторинга не должна
-    создаваться, если владелец не удалось однозначно определить (см.
-    задачу)."""
+    (см. _resolve_car_owner_for_add). Возвращается ТОЛЬКО в случае успеха —
+    единственный оставшийся повод для CommandError ДО task_repository.
+    create() — сам @username не удалось найти/резолвить в Telegram.
+    Один car_number МОЖЕТ быть связан сразу с несколькими Telegram-
+    пользователями (см. задачу) — это не конфликт: запрошенный @username
+    просто добавляется как ЕЩЁ ОДНА связь, существующие не трогаются."""
 
     telegram_line: str  # "Telegram: ..." в ответе об успешном добавлении
     user_id_to_link: int | None  # кому вызвать add_car_numbers() — None,
@@ -275,10 +274,10 @@ class FineCommand(Command):
             # Номер уже в активном мониторинге — вторую (дублирующую)
             # задачу НЕ создаём (см. задачу), существующие даты/настройки
             # этой активной задачи не трогаем вовсе. _resolve_car_owner_
-            # for_add() выше уже сама разрешила все конфликтные исходы
-            # (не найден/конфликт с другим пользователем — CommandError,
-            # брошенный до этой строки) — здесь owner_result гарантированно
-            # успешен: новая привязка либо уже существующая (идемпотентно).
+            # for_add() выше уже сама разрешила единственный оставшийся
+            # повод для ошибки (username не найден — CommandError, брошенный
+            # до этой строки) — здесь owner_result гарантированно успешен:
+            # новая ДОПОЛНИТЕЛЬНАЯ привязка либо уже существующая (идемпотентно).
             newly_linked = owner_result.user_id_to_link is not None
             if newly_linked:
                 self._user_repository.add_car_numbers(owner_result.user_id_to_link, [car_number])
@@ -338,15 +337,16 @@ class FineCommand(Command):
         менее, для car_number/task_repository это по-прежнему только
         чтение: сам мониторинг создаётся ПОСЛЕ, в _handle_add.
 
-        Бросает CommandError (и тогда задача мониторинга НЕ создаётся —
-        см. _handle_add) в ЛЮБОМ случае, когда владельца нельзя однозначно
-        определить: @username не существует в Telegram (или резолв не
-        удался технически), номер уже привязан к ДРУГОМУ пользователю, или
-        номер вообще неоднозначен (привязан к нескольким). Единственные
-        исходы, при которых задача создаётся — car_number ещё ни у кого не
-        записан, либо уже записан именно у запрошенного @username (см.
-        задачу: вся pre-validation владельца должна произойти до создания
-        task, без частичных состояний).
+        Один car_number МОЖЕТ быть связан сразу с несколькими Telegram-
+        пользователями (реальный случай: несколько водителей одной
+        машины) — это НЕ конфликт (см. задачу). Единственный оставшийся
+        повод для CommandError (и тогда задача мониторинга НЕ создаётся —
+        см. _handle_add) — сам @username не удалось найти/резолвить в
+        Telegram. Если car_number уже связан с одним или несколькими
+        ДРУГИМИ пользователями, запрошенный @username просто добавляется
+        как ЕЩЁ ОДНА связь — существующие не трогаются и не удаляются.
+        Повторное добавление уже существующей связи user ↔ car —
+        идемпотентно (ничего повторно не пишет).
 
         Отсутствие @username в НАШЕЙ локальной БД само по себе больше НЕ
         ошибка (см. задачу про баг "не найден в базе") — прежде чем
@@ -365,33 +365,15 @@ class FineCommand(Command):
 
         existing_owners = self._user_repository.find_by_car_number(car_number)
 
-        if not existing_owners:
-            # Ещё ни у кого не записан — привязываем запрошенному пользователю.
-            return _OwnerLinkResult(format_car_owner_display([owner]), owner.user_id)
-
-        if len(existing_owners) == 1 and existing_owners[0].user_id == owner.user_id:
-            # Уже привязан именно ему — успех без дублей, повторно писать
-            # car_numbers не нужно (add_car_numbers и так идемпотентен, но
-            # тут даже вызывать незачем).
+        if any(existing.user_id == owner.user_id for existing in existing_owners):
+            # Уже привязан именно ему (независимо от того, сколько ещё
+            # других пользователей уже связано с этим car_number) — успех
+            # без дублей, повторно писать car_numbers не нужно.
             return _OwnerLinkResult(format_car_owner_display([owner]), None)
 
-        if len(existing_owners) == 1:
-            # Автоматически связь НЕ перезаписываем (см. задачу — потенциально
-            # опасный конфликт, независимо от того, это новый номер или уже
-            # существующая запись мониторинга, которую пытались обогатить).
-            raise CommandError(
-                f"⚠️ Автомобиль {car_number} уже связан с "
-                f"{format_car_owner_display(existing_owners)}.\n"
-                f"Новый пользователь @{raw_username} не установлен."
-            )
-
-        # Несколько пользователей уже имеют этот номер в car_numbers —
-        # неоднозначно, молча выбирать "победителя" нельзя (см. задачу).
-        raise CommandError(
-            f"⚠️ Автомобиль {car_number} уже связан с несколькими Telegram-пользователями "
-            "— связь неоднозначна и требует ручной проверки.\n\n"
-            "Автомобиль не добавлен."
-        )
+        # car_number ещё не связан с этим пользователем — связываем
+        # ДОПОЛНИТЕЛЬНО, не заменяя и не удаляя уже существующие связи.
+        return _OwnerLinkResult(format_car_owner_display([owner]), owner.user_id)
 
     async def _resolve_and_store_new_user(self, raw_username: str) -> TelegramUserInfo | None:
         """@raw_username отсутствует в локальной БД (см. вызывающий код —
@@ -698,16 +680,13 @@ class FineCommand(Command):
         )
 
     def _car_owner_display(self, car_number: str) -> str:
+        """Один car_number может быть валидно связан сразу с несколькими
+        Telegram-пользователями (см. format_car_owner_display) — это
+        обычное состояние, не повод для WARNING в логе."""
         if self._user_repository is None:
             return format_car_owner_display([])
 
-        users = self._user_repository.find_by_car_number(car_number)
-        if len(users) > 1:
-            logger.warning(
-                "По номеру %s найдено несколько Telegram-пользователей: user_id=%s",
-                car_number, [user.user_id for user in users],
-            )
-        return format_car_owner_display(users)
+        return format_car_owner_display(self._user_repository.find_by_car_number(car_number))
 
     async def _handle_update_all(self, ctx: CommandContext) -> CommandResult:
         """fine update-all — берёт все активные задачи мониторинга и

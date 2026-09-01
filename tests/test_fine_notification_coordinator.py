@@ -304,9 +304,10 @@ async def test_car_owner_display_shows_full_name_with_id_when_username_missing(t
         fine_repo.close()
 
 
-async def test_car_owner_display_reports_ambiguous_match(tmp_path, caplog):
-    """car_number найден одновременно у нескольких пользователей — нельзя
-    молча выбирать "победителя"."""
+async def test_car_owner_display_shows_all_owners_when_multiple_users_linked(tmp_path):
+    """Один car_number валидно связан сразу с несколькими Telegram-
+    пользователями (см. задачу) — уведомление о найденном штрафе должно
+    перечислить ВСЕХ, а не скрывать их за общей фразой."""
     task_repo, fine_repo = _make_repos(tmp_path)
     try:
         _create_task_and_fine(task_repo, fine_repo, car_number="AA001AA", created_by_user_id=42)
@@ -324,12 +325,10 @@ async def test_car_owner_display_reports_ambiguous_match(tmp_path, caplog):
             fine_repo, task_repo, notification_service, user_repository,
         )
 
-        with caplog.at_level("WARNING", logger="reader.fines.notification_coordinator"):
-            await coordinator.flush_pending()
+        await coordinator.flush_pending()
 
         sent_event = notification_service.notify_calls[0][0]
-        assert sent_event.car_owner_display == "найдено несколько пользователей"
-        assert any("AA001AA" in r.getMessage() and "[1, 2]" in r.getMessage() for r in caplog.records)
+        assert sent_event.car_owner_display == "@user_one, @user_two"
     finally:
         task_repo.close()
         fine_repo.close()

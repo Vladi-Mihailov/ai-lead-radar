@@ -93,8 +93,9 @@ class NewFineEvent:
     due_date: date | None
     delivered_status: str | None
     # Готовая для показа строка вида "@ivan_petrov"/"Иван Петров (@ivan_petrov)"/
-    # "не найден"/"найдено несколько пользователей" — Telegram-ВЛАДЕЛЕЦ
-    # автомобиля, определяемый по car_number -> users.car_numbers ->
+    # "не найден"/"@ivan_petrov, @another_user" (несколько владельцев одного
+    # car_number — валидное состояние, см. format_car_owner_display) —
+    # Telegram-ВЛАДЕЛЕЦ(Ы) автомобиля, определяемый по car_number -> users.car_numbers ->
     # UserRepository.find_by_car_number() (см. FineNotificationCoordinator).
     # Это НЕ fine_monitoring_tasks.created_by_user_id (тот, кто создал
     # задачу мониторинга) — раньше поле ошибочно показывало именно его,

@@ -4,7 +4,6 @@
 Ничего не знает про Telegram — только про NotificationService (интерфейс).
 """
 
-import logging
 from typing import Protocol
 
 from reader.fines.detected_fine_repository import DetectedFineRepository
@@ -12,8 +11,6 @@ from reader.fines.models import FineMonitoringTask, NewFineEvent
 from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.notifications.base import NotificationResult, NotificationService
 from reader.users.models import TelegramUserInfo
-
-logger = logging.getLogger(__name__)
 
 
 class UserLookupLike(Protocol):
@@ -33,25 +30,22 @@ class UserLookupLike(Protocol):
 
 def format_car_owner_display(users: list[TelegramUserInfo]) -> str:
     """"@username", "Имя Фамилия (@username)", "Имя Фамилия (ID N)" или
-    "ID N" — ровно для ОДНОГО найденного владельца. Отдельно и явно
-    обрабатывает случаи, когда владелец неизвестен:
+    "ID N" для одного владельца; для нескольких — то же самое для каждого,
+    через ", " (см. задачу: один car_number может быть валидно связан
+    сразу с несколькими Telegram-пользователями — это НЕ конфликт и не
+    повод скрывать их имена за общей фразой).
 
-    - users пуст (car_number не встречался ни у одного пользователя,
-      либо UserRepository вообще не передан) -> "не найден". Никогда не
-      подставляем сюда чей-либо user_id "на всякий случай" — это была бы
-      ложная информация о владельце (см. задачу про production-баг с
-      created_by_user_id);
-    - users содержит больше одного элемента (add_car_numbers() не
-      гарантирует, что один номер принадлежит ровно одному
-      Telegram-пользователю — см. UserRepository.find_by_car_number()) ->
-      "найдено несколько пользователей", вместо того чтобы молча выбрать
-      случайного "победителя"."""
+    users пуст (car_number не встречался ни у одного пользователя, либо
+    UserRepository вообще не передан) -> "не найден". Никогда не
+    подставляем сюда чей-либо user_id "на всякий случай" — это была бы
+    ложная информация о владельце (см. задачу про production-баг с
+    created_by_user_id)."""
     if not users:
         return "не найден"
-    if len(users) > 1:
-        return "найдено несколько пользователей"
+    return ", ".join(_format_single_owner(user) for user in users)
 
-    user = users[0]
+
+def _format_single_owner(user: TelegramUserInfo) -> str:
     full_name = user.full_name
     username = user.username
 
@@ -110,13 +104,10 @@ class FineNotificationCoordinator:
         )
 
     def _car_owner_display(self, car_number: str) -> str:
+        """Один car_number может быть валидно связан сразу с несколькими
+        Telegram-пользователями (см. format_car_owner_display) — это
+        обычное состояние, не повод для WARNING в логе."""
         if self._user_repository is None:
             return format_car_owner_display([])
 
-        users = self._user_repository.find_by_car_number(car_number)
-        if len(users) > 1:
-            logger.warning(
-                "По номеру %s найдено несколько Telegram-пользователей: user_id=%s",
-                car_number, [user.user_id for user in users],
-            )
-        return format_car_owner_display(users)
+        return format_car_owner_display(self._user_repository.find_by_car_number(car_number))
