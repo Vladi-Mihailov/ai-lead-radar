@@ -261,6 +261,61 @@ def test_telegram_accounts_migrates_existing_table_without_verify_membership(tmp
         repository.close()
 
 
+def test_telegram_accounts_migrates_existing_table_without_telegram_user_id(tmp_path):
+    """Сценарий, реально ожидаемый на продакшене (см. задачу про
+    физическую идентичность Telegram-аккаунта): таблица уже содержит все
+    прежние колонки, но ещё не имеет telegram_user_id — открытие
+    репозитория должно добавить её как NULLABLE, без пересоздания таблицы
+    и без потери существующих записей/значений."""
+    db_path = tmp_path / "inviter.db"
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE telegram_accounts (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                name                TEXT NOT NULL,
+                phone               TEXT NOT NULL,
+                session_name        TEXT NOT NULL,
+                session_path        TEXT NOT NULL,
+                daily_limit         INTEGER NOT NULL DEFAULT 30,
+                enabled             BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at        TIMESTAMP,
+                blocked_until       TIMESTAMP,
+                blocked_reason      TEXT,
+                verify_membership   INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO telegram_accounts (name, phone, session_name, session_path, daily_limit) "
+            "VALUES ('@Iv_vla_sov', '+995568759201', 'Iv_vla_sov', 'data/sessions/Iv_vla_sov', 24)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    repository = TelegramAccountRepository(db_path)
+    try:
+        columns = {row[1] for row in repository._conn.execute(
+            "PRAGMA table_info(telegram_accounts)"
+        )}
+        assert "telegram_user_id" in columns
+
+        accounts = repository.list()
+        assert len(accounts) == 1
+        assert accounts[0].name == "@Iv_vla_sov"
+        assert accounts[0].daily_limit == 24  # существующие значения не потеряны
+        assert accounts[0].telegram_user_id is None  # NULLABLE, ничего не выдумывается
+
+        updated = repository.update(accounts[0].id, telegram_user_id=8838087889)
+        assert updated.telegram_user_id == 8838087889
+    finally:
+        repository.close()
+
+
 # ---- TelegramAccountRepository: create/get/update/list ----
 
 
@@ -276,6 +331,7 @@ def test_telegram_account_create_get_update_list(tmp_path):
         assert account.enabled is True
         assert account.last_used_at is None
         assert account.verify_membership is True  # значение по умолчанию
+        assert account.telegram_user_id is None  # значение по умолчанию — NULLABLE
 
         fetched = repository.get(account.id)
         assert fetched == account
@@ -287,12 +343,17 @@ def test_telegram_account_create_get_update_list(tmp_path):
         assert updated.phone == "+995500000001"
         assert updated.verify_membership is True
 
+        with_tg_id = repository.update(account.id, telegram_user_id=5502837130)
+        assert with_tg_id.telegram_user_id == 5502837130
+
         second_account = repository.create(
             name="Второй", phone="+995500000002",
             session_name="acc2", session_path="data/sessions/acc2.session",
             daily_limit=10, enabled=False, verify_membership=False,
+            telegram_user_id=6557324579,
         )
         assert second_account.verify_membership is False
+        assert second_account.telegram_user_id == 6557324579
         listed = repository.list()
         assert [a.id for a in listed] == [account.id, second_account.id]
     finally:

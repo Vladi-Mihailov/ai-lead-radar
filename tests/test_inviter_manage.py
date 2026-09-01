@@ -5,8 +5,10 @@ manage.py: data/users.db не входит в git, поэтому на ново�
 TelegramAccountRepository/InviteCampaignRepository всегда пустые).
 """
 
+import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -15,6 +17,7 @@ from reader.inviter import manage  # noqa: E402
 from reader.inviter.repository import (  # noqa: E402
     InviteCampaignRepository,
     TelegramAccountRepository,
+    UserCampaignInviteRepository,
 )
 
 
@@ -112,6 +115,11 @@ def test_parse_args_add_campaign_defaults():
     assert args.keyword == "страх"
     assert args.target_chat == "@tplgee"
     assert args.enabled is True
+
+
+def test_parse_args_sync_accounts():
+    args = manage._parse_args(["sync-accounts"])
+    assert args.command == "sync-accounts"
 
 
 def test_parse_args_add_campaign_disabled():
@@ -363,3 +371,302 @@ def test_ensure_account_and_ensure_campaign_are_independent(tmp_path):
     finally:
         account_repository.close()
         campaign_repository.close()
+
+
+# ---- sync_accounts (backfill/сверка telegram_user_id, см. задачу про -----
+# ---- физическую идентичность Telegram-аккаунта) ---------------------------
+
+
+class _FakeSyncClient:
+    """Ровно то, что нужно sync_accounts() от TelegramClient — connect()/
+    is_user_authorized()/get_me()/disconnect(). connect_error, если задан,
+    имитирует сбой подключения (битая/удалённая сессия)."""
+
+    def __init__(self, *, connect_error=None, authorized=True, me=None):
+        self._connect_error = connect_error
+        self._authorized = authorized
+        self._me = me
+        self.disconnected = False
+
+    async def connect(self) -> None:
+        if self._connect_error is not None:
+            raise self._connect_error
+
+    async def is_user_authorized(self) -> bool:
+        return self._authorized
+
+    async def get_me(self):
+        return self._me
+
+    async def disconnect(self) -> None:
+        self.disconnected = True
+
+
+def _make_sync_client_factory(*, by_name=None):
+    """by_name — {account.name: _FakeSyncClient(...)} для аккаунтов,
+    которым нужно смоделировать конкретный сценарий; остальные получают
+    клиент по умолчанию (авторизован, get_me().id уникален для account.id
+    — как и в tests/test_inviter_candidates.py _FakeTelegramClient)."""
+    by_name = by_name or {}
+
+    def factory(account):
+        if account.name in by_name:
+            return by_name[account.name]
+        return _FakeSyncClient(me=SimpleNamespace(id=900_000_000 + account.id, username=None, phone=None))
+
+    return factory
+
+
+def test_sync_accounts_fills_telegram_user_id_for_new_account(tmp_path):
+    db_path = tmp_path / "users.db"
+    manage.ensure_account(
+        db_path, name="@vladimihailov", phone="+995500000001",
+        session_name="vladimihailov", session_path="data/sessions/vladimihailov",
+        daily_limit=1, enabled=True,
+    )
+
+    client = _FakeSyncClient(me=SimpleNamespace(id=5502837130, username=None, phone=None))
+    results = asyncio.run(
+        manage.sync_accounts(db_path, client_factory=_make_sync_client_factory(
+            by_name={"@vladimihailov": client},
+        ))
+    )
+
+    assert [r.status for r in results] == ["updated"]
+    assert client.disconnected is True
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        accounts = account_repository.list()
+        assert len(accounts) == 1
+        assert accounts[0].telegram_user_id == 5502837130
+    finally:
+        account_repository.close()
+
+
+def test_sync_accounts_processes_disabled_accounts_too(tmp_path):
+    """Историческая отключённая запись-дубликат (см. id=7/id=8 в проде)
+    тоже должна пройти sync — backfill не фильтрует по enabled."""
+    db_path = tmp_path / "users.db"
+    manage.ensure_account(
+        db_path, name="@Misha_Offroad", phone="+995568759201",
+        session_name="Misha_Offroad", session_path="data/sessions/Misha_Offroad",
+        daily_limit=1, enabled=False,
+    )
+
+    client = _FakeSyncClient(me=SimpleNamespace(id=8838087889, username=None, phone=None))
+    results = asyncio.run(
+        manage.sync_accounts(db_path, client_factory=_make_sync_client_factory(
+            by_name={"@Misha_Offroad": client},
+        ))
+    )
+
+    assert [r.status for r in results] == ["updated"]
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        accounts = account_repository.list()
+        assert accounts[0].telegram_user_id == 8838087889
+        # enabled НЕ тронут — backfill никогда не включает/выключает аккаунты.
+        assert accounts[0].enabled is False
+    finally:
+        account_repository.close()
+
+
+def test_sync_accounts_never_changes_enabled_flag(tmp_path):
+    db_path = tmp_path / "users.db"
+    manage.ensure_account(
+        db_path, name="@acc1", phone="", session_name="acc1", session_path="data/sessions/acc1",
+        daily_limit=1, enabled=True,
+    )
+    manage.ensure_account(
+        db_path, name="@acc2", phone="", session_name="acc2", session_path="data/sessions/acc2",
+        daily_limit=1, enabled=False,
+    )
+
+    asyncio.run(manage.sync_accounts(db_path, client_factory=_make_sync_client_factory()))
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        enabled_by_name = {a.name: a.enabled for a in account_repository.list()}
+    finally:
+        account_repository.close()
+    assert enabled_by_name == {"@acc1": True, "@acc2": False}
+
+
+def test_sync_accounts_never_deletes_rows(tmp_path):
+    db_path = tmp_path / "users.db"
+    manage.ensure_account(
+        db_path, name="@acc1", phone="", session_name="acc1", session_path="data/sessions/acc1",
+        daily_limit=1, enabled=True,
+    )
+    manage.ensure_account(
+        db_path, name="@acc2", phone="", session_name="acc2", session_path="data/sessions/acc2",
+        daily_limit=1, enabled=True,
+    )
+
+    asyncio.run(manage.sync_accounts(db_path, client_factory=_make_sync_client_factory()))
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        assert len(account_repository.list()) == 2
+    finally:
+        account_repository.close()
+
+
+def test_sync_accounts_never_touches_user_campaign_invites(tmp_path):
+    db_path = tmp_path / "users.db"
+    account = manage.ensure_account(
+        db_path, name="@acc1", phone="", session_name="acc1", session_path="data/sessions/acc1",
+        daily_limit=1, enabled=True,
+    )
+    campaign = manage.ensure_campaign(
+        db_path, name="ОСАГО", keyword="осаго", target_chat="@t", enabled=True,
+    )
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invite_repository.create(
+            user_id=1, campaign_id=campaign.id, account_id=account.id, status="joined",
+        )
+        before = invite_repository.list()
+
+        asyncio.run(manage.sync_accounts(db_path, client_factory=_make_sync_client_factory()))
+
+        after = invite_repository.list()
+    finally:
+        invite_repository.close()
+    assert after == before
+
+
+def test_sync_accounts_connect_failure_does_not_corrupt_identity(tmp_path):
+    """Битая/удалённая сессия — connect() падает — telegram_user_id
+    остаётся None (или прежним значением), запись не удаляется, отчёт
+    показывает connect_failed."""
+    db_path = tmp_path / "users.db"
+    manage.ensure_account(
+        db_path, name="@acc1", phone="", session_name="acc1", session_path="data/sessions/acc1",
+        daily_limit=1, enabled=True,
+    )
+
+    client = _FakeSyncClient(connect_error=RuntimeError("session file is corrupted"))
+    results = asyncio.run(
+        manage.sync_accounts(db_path, client_factory=_make_sync_client_factory(
+            by_name={"@acc1": client},
+        ))
+    )
+
+    assert [r.status for r in results] == ["connect_failed"]
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        accounts = account_repository.list()
+        assert len(accounts) == 1
+        assert accounts[0].telegram_user_id is None
+    finally:
+        account_repository.close()
+
+
+def test_sync_accounts_not_authorized_does_not_corrupt_identity(tmp_path):
+    db_path = tmp_path / "users.db"
+    manage.ensure_account(
+        db_path, name="@acc1", phone="", session_name="acc1", session_path="data/sessions/acc1",
+        daily_limit=1, enabled=True,
+    )
+
+    client = _FakeSyncClient(authorized=False)
+    results = asyncio.run(
+        manage.sync_accounts(db_path, client_factory=_make_sync_client_factory(
+            by_name={"@acc1": client},
+        ))
+    )
+
+    assert [r.status for r in results] == ["not_authorized"]
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        assert account_repository.list()[0].telegram_user_id is None
+    finally:
+        account_repository.close()
+
+
+def test_sync_accounts_identity_mismatch_does_not_overwrite_stored_tg_id(tmp_path):
+    db_path = tmp_path / "users.db"
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        account_repository.create(
+            name="@acc1", phone="+995500000001", session_name="acc1",
+            session_path="data/sessions/acc1", daily_limit=1, telegram_user_id=111,
+        )
+    finally:
+        account_repository.close()
+
+    client = _FakeSyncClient(me=SimpleNamespace(id=999, username=None, phone=None))
+    results = asyncio.run(
+        manage.sync_accounts(db_path, client_factory=_make_sync_client_factory(
+            by_name={"@acc1": client},
+        ))
+    )
+
+    assert [r.status for r in results] == ["identity_mismatch"]
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        assert account_repository.list()[0].telegram_user_id == 111
+    finally:
+        account_repository.close()
+
+
+def test_sync_accounts_does_not_auto_merge_duplicates_only_reports(tmp_path, capsys):
+    """Дубликат telegram_user_id — только предупреждение в stdout, ни одна
+    запись не удаляется/не отключается (см. report_duplicate_accounts)."""
+    db_path = tmp_path / "users.db"
+    manage.ensure_account(
+        db_path, name="@Iv_vla_sov", phone="+995568759201", session_name="Iv_vla_sov",
+        session_path="data/sessions/Iv_vla_sov", daily_limit=1, enabled=True,
+    )
+    manage.ensure_account(
+        db_path, name="@Misha_Offroad", phone="+995568759201", session_name="Misha_Offroad",
+        session_path="data/sessions/Misha_Offroad", daily_limit=1, enabled=False,
+    )
+
+    shared_me = SimpleNamespace(id=8838087889, username=None, phone=None)
+    asyncio.run(
+        manage.sync_accounts(db_path, client_factory=_make_sync_client_factory(
+            by_name={
+                "@Iv_vla_sov": _FakeSyncClient(me=shared_me),
+                "@Misha_Offroad": _FakeSyncClient(me=shared_me),
+            },
+        ))
+    )
+
+    output = capsys.readouterr().out
+    assert "ДУБЛИКАТ" in output
+    assert "8838087889" in output
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        accounts = account_repository.list()
+        assert len(accounts) == 2  # ничего не слито и не удалено
+        assert {a.name: a.enabled for a in accounts} == {
+            "@Iv_vla_sov": True, "@Misha_Offroad": False,
+        }
+    finally:
+        account_repository.close()
+
+
+def test_report_duplicate_accounts_returns_empty_when_all_unique(tmp_path):
+    db_path = tmp_path / "users.db"
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        account_repository.create(
+            name="@acc1", phone="", session_name="acc1", session_path="acc1",
+            telegram_user_id=1,
+        )
+        account_repository.create(
+            name="@acc2", phone="", session_name="acc2", session_path="acc2",
+            telegram_user_id=2,
+        )
+        duplicates = manage.report_duplicate_accounts(account_repository.list())
+    finally:
+        account_repository.close()
+    assert duplicates == []

@@ -40,21 +40,43 @@
 daily_limit/blocked_until):
 
     python -m reader.inviter.manage list-accounts
+
+Заполнить/сверить telegram_user_id (см. TelegramAccount.telegram_user_id и
+reader/inviter/identity.py) для ВСЕХ существующих аккаунтов (в т.ч.
+enabled=False) — по очереди подключается к каждому по его .session-файлу,
+читает get_me() и сохраняет в БД реальный telegram_user_id/username/phone.
+Ничего не включает/выключает, ничего не удаляет, session_name/session_path
+не трогает, user_campaign_invites не изменяет. В конце печатает
+предупреждение (без автослияния), если несколько DB-записей оказались
+одним и тем же физическим Telegram-аккаунтом:
+
+    python -m reader.inviter.manage sync-accounts
 """
 
 import argparse
+import asyncio
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from telethon import TelegramClient  # noqa: E402
+
+from reader.inviter.identity import (  # noqa: E402
+    AccountIdentityMismatchError,
+    SessionNotAuthorizedError,
+    fetch_telegram_identity,
+    reconcile_account_identity,
+)
 from reader.inviter.models import InviteCampaign, TelegramAccount  # noqa: E402
 from reader.inviter.repository import (  # noqa: E402
     InviteCampaignRepository,
     TelegramAccountRepository,
 )
-from reader.settings import ConfigError, load_settings  # noqa: E402
+from reader.settings import ConfigError, Settings, load_settings  # noqa: E402
 from reader.time_display import format_tbilisi  # noqa: E402
 
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
@@ -112,6 +134,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     add_campaign.add_argument("--keyword", required=True)
     add_campaign.add_argument("--target-chat", required=True, help='Например, "@tplgee".')
     add_campaign.add_argument("--enabled", action=argparse.BooleanOptionalAction, default=True)
+
+    subparsers.add_parser(
+        "sync-accounts",
+        help=(
+            "Подключиться к каждому существующему аккаунту (по .session-файлу) и "
+            "сверить/заполнить telegram_user_id/username/phone через get_me(). "
+            "Ничего не включает/выключает, ничего не удаляет, дубликаты "
+            "telegram_user_id только печатаются, не сливаются автоматически."
+        ),
+    )
 
     return parser.parse_args(argv)
 
@@ -192,6 +224,106 @@ def ensure_campaign(
         repository.close()
 
 
+@dataclass(frozen=True)
+class AccountSyncResult:
+    """Один результат sync_accounts() — для читаемого вывода CLI и для
+    тестов (см. tests/test_inviter_manage.py). detail — свободный текст
+    (сообщение исключения при connect_failed/identity_mismatch, либо
+    итоговый telegram_user_id при updated/unchanged)."""
+
+    account_id: int
+    name: str
+    status: str
+    detail: str = ""
+
+
+def _build_sync_client_factory(settings: Settings) -> Callable[[TelegramAccount], TelegramClient]:
+    """Та же конвенция инлайн-создания TelegramClient, что и в
+    reader/inviter/authorize.py — без импорта фабрики из
+    reader/inviter/main.py (та собрана вокруг остальных зависимостей
+    InviterService, здесь они не нужны)."""
+
+    def factory(account: TelegramAccount) -> TelegramClient:
+        return TelegramClient(
+            account.session_path, settings.telegram.api_id, settings.telegram.api_hash,
+            receive_updates=False,
+        )
+
+    return factory
+
+
+async def sync_accounts(
+    db_path, *, client_factory: Callable[[TelegramAccount], TelegramClient],
+) -> list[AccountSyncResult]:
+    """Backfill/сверка telegram_user_id + name/phone для ВСЕХ аккаунтов
+    (в т.ч. enabled=False) — см. reader/inviter/identity.py. Никогда не
+    меняет enabled, никогда не удаляет строки, никогда не трогает
+    user_campaign_invites, никогда не меняет session_name/session_path.
+    Пишет в БД ТОЛЬКО после успешного is_user_authorized() (см.
+    fetch_telegram_identity). Дубликаты telegram_user_id только
+    печатаются (см. report_duplicate_accounts) — без автослияния."""
+    account_repository = TelegramAccountRepository(db_path)
+    results: list[AccountSyncResult] = []
+    try:
+        for account in account_repository.list():
+            client = client_factory(account)
+            try:
+                await client.connect()
+            except Exception as exc:
+                results.append(AccountSyncResult(account.id, account.name, "connect_failed", str(exc)))
+                continue
+
+            try:
+                try:
+                    identity = await fetch_telegram_identity(client)
+                except SessionNotAuthorizedError:
+                    results.append(AccountSyncResult(account.id, account.name, "not_authorized"))
+                    continue
+
+                try:
+                    updated = reconcile_account_identity(account_repository, account, identity)
+                except AccountIdentityMismatchError as exc:
+                    results.append(
+                        AccountSyncResult(account.id, account.name, "identity_mismatch", str(exc))
+                    )
+                    continue
+
+                status = "updated" if updated != account else "unchanged"
+                results.append(
+                    AccountSyncResult(
+                        account.id, updated.name, status,
+                        f"telegram_user_id={updated.telegram_user_id}",
+                    )
+                )
+            finally:
+                await client.disconnect()
+
+        report_duplicate_accounts(account_repository.list())
+    finally:
+        account_repository.close()
+    return results
+
+
+def report_duplicate_accounts(accounts: list[TelegramAccount]) -> list[tuple[int, list[int]]]:
+    """Группирует ВСЕ аккаунты (в т.ч. enabled=False) по непустому
+    telegram_user_id и печатает предупреждение для каждой группы из более
+    чем одной записи — см. задачу про id=6/id=7 и id=8/id=9. Никогда не
+    сливает и не меняет записи, только сообщает оператору."""
+    by_tg_id: dict[int, list[TelegramAccount]] = {}
+    for account in accounts:
+        if account.telegram_user_id is not None:
+            by_tg_id.setdefault(account.telegram_user_id, []).append(account)
+
+    duplicates: list[tuple[int, list[int]]] = []
+    for tg_id, group in sorted(by_tg_id.items()):
+        if len(group) > 1:
+            ids = [a.id for a in group]
+            names = ", ".join(a.name for a in group)
+            print(f"⚠️  ДУБЛИКАТ: telegram_user_id={tg_id} — DB IDs {ids} ({names})")
+            duplicates.append((tg_id, ids))
+    return duplicates
+
+
 def main() -> None:
     args = _parse_args(sys.argv[1:])
     try:
@@ -226,6 +358,15 @@ def main() -> None:
                 f"keyword={campaign.keyword}, target_chat={campaign.target_chat}, "
                 f"enabled={campaign.enabled})"
             )
+        elif args.command == "sync-accounts":
+            results = asyncio.run(
+                sync_accounts(
+                    settings.app.users_db_file,
+                    client_factory=_build_sync_client_factory(settings),
+                )
+            )
+            for result in results:
+                print(f"[{result.status}] id={result.account_id} {result.name} {result.detail}")
     except ConfigError as exc:
         print(f"Ошибка запуска: {exc}", file=sys.stderr)
         sys.exit(1)

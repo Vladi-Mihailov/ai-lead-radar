@@ -31,7 +31,18 @@ class TelegramAccount:
     required..."/InvokeWithoutUpdatesRequest(GetParticipantRequest)) —
     без этого флага такие аккаунты бесполезно повторяли бы заведомо
     неработающий запрос на каждый цикл. По умолчанию True — обратная
-    совместимость с уже существующими аккаунтами/поведением (см. задачу)."""
+    совместимость с уже существующими аккаунтами/поведением (см. задачу).
+
+    telegram_user_id — СТАБИЛЬНЫЙ идентификатор физического Telegram-
+    аккаунта (me.id из get_me(), см. reader/inviter/identity.py), в отличие
+    от name/phone/session_name/session_path — все они изменяемые
+    profile/конфигурационные атрибуты (см. задачу про обнаруженные дубли:
+    два разных DB-ряда/session-файла, фактически авторизованные как ОДИН и
+    тот же Telegram-аккаунт, и переименование @alena_ogi -> @ao777oa777 БЕЗ
+    создания нового физического аккаунта). None — identity ещё не
+    подтверждена/не заполнена (см. задачу про backfill существующих
+    аккаунтов) — не значит "неизвестный/новый Telegram-аккаунт", просто
+    "ещё не проверено через живую сессию"."""
 
     id: int
     name: str
@@ -45,6 +56,7 @@ class TelegramAccount:
     blocked_until: datetime | None = None
     blocked_reason: str | None = None
     verify_membership: bool = True
+    telegram_user_id: int | None = None
 
 
 @dataclass(frozen=True)

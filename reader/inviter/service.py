@@ -40,6 +40,13 @@ from telethon.tl.functions.channels import InviteToChannelRequest
 from telethon.tl.functions.messages import AddChatUserRequest
 from telethon.tl.types import Channel, ChannelForbidden, InputPeerUser, User
 
+from reader.inviter.identity import (
+    AccountIdentityMismatchError,
+    SessionNotAuthorizedError,
+    fetch_telegram_identity,
+    find_duplicate_account,
+    reconcile_account_identity,
+)
 from reader.inviter.models import InviteCampaign, InviteCandidate, TelegramAccount
 from reader.inviter.repository import (
     InviteCampaignRepository,
@@ -202,6 +209,10 @@ class DryRunTelegramClient(Protocol):
     вызывается."""
 
     async def connect(self) -> None: ...
+
+    async def is_user_authorized(self) -> bool: ...
+
+    async def get_me(self): ...
 
     async def get_entity(self, entity): ...
 
@@ -996,6 +1007,57 @@ class InviterService:
         pending = self._invite_repository.count_today_pending(account.id)
         return account.daily_limit - joined - pending
 
+    async def _verify_account_identity(
+        self, client: DryRunTelegramClient, account: TelegramAccount,
+    ) -> TelegramAccount | None:
+        """Вызывается СРАЗУ после успешного connect(), ДО любого другого
+        запроса (в т.ч. до _warm_up_account) — см. reader/inviter/
+        identity.py и задачу про production-дубли (два DB-ряда/session-
+        файла, фактически авторизованные как один физический Telegram-
+        аккаунт). Возвращает None, если этим аккаунтом сейчас нельзя
+        приглашать (сессия не авторизована, сессия перезалогинена на
+        другой Telegram-аккаунт, или это дубликат уже используемого
+        физического аккаунта) — вызывающий код обязан в этом случае не
+        делать НИ ОДНОГО InviteToChannelRequest/AddChatUserRequest для
+        этого account и молча пропустить его (та же "тихая" схема, что и
+        для blocked_until/отсутствующей сессии/исчерпанного лимита выше —
+        без _notify_account_result, чтобы не спамить оператора на каждый
+        тик фонового воркера постоянным условием).
+
+        При успехе возвращает account — тот же объект, если identity уже
+        совпадала и name/phone не изменились, либо свежепрочитанный из БД
+        (см. reconcile_account_identity) с обновлёнными
+        telegram_user_id/name/phone — вызывающий код обязан продолжить
+        работу именно с этим (возможно новым) объектом."""
+        try:
+            identity = await fetch_telegram_identity(client)
+        except SessionNotAuthorizedError:
+            logger.error(
+                f"[EXECUTE]\nAccount: {account.name}\n"
+                f"Сессия подключилась, но не авторизована в Telegram — "
+                f"аккаунт пропущен, приглашения не отправляются."
+            )
+            return None
+
+        try:
+            account = reconcile_account_identity(self._account_repository, account, identity)
+        except AccountIdentityMismatchError as exc:
+            logger.error(f"[EXECUTE]\nAccount: {account.name}\n{exc}")
+            return None
+
+        duplicate = find_duplicate_account(self._account_repository, account)
+        if duplicate is not None:
+            logger.error(
+                f"[EXECUTE]\nAccount: {account.name}\n"
+                f"telegram_user_id={account.telegram_user_id} совпадает с "
+                f"id={duplicate.id} ({duplicate.name}) — физический дубликат "
+                f"Telegram-аккаунта, используется только id={duplicate.id}, "
+                f"этот аккаунт (id={account.id}) пропущен."
+            )
+            return None
+
+        return account
+
     async def _execute_account(
         self,
         campaign: InviteCampaign,
@@ -1106,6 +1168,11 @@ class InviterService:
                     f"[EXECUTE]\nAccount: {account.name}\nFAILED\nНе удалось подключиться: {exc}"
                 )
             else:
+                verified_account = await self._verify_account_identity(client, account)
+                if verified_account is None:
+                    return None
+                account = verified_account
+
                 # "Разогрев" — один раз сразу после подключения, до резолва
                 # target_chat и до первого приглашения (НЕ перед каждым
                 # кандидатом, см. _warm_up_account).

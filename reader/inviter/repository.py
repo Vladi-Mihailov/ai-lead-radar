@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS telegram_accounts (
     last_used_at        TIMESTAMP,
     blocked_until       TIMESTAMP,
     blocked_reason      TEXT,
-    verify_membership   INTEGER NOT NULL DEFAULT 1
+    verify_membership   INTEGER NOT NULL DEFAULT 1,
+    telegram_user_id    INTEGER
 )
 """
 
@@ -45,6 +46,7 @@ _TELEGRAM_ACCOUNTS_COLUMN_MIGRATIONS = {
     "verify_membership": (
         "ALTER TABLE telegram_accounts ADD COLUMN verify_membership INTEGER NOT NULL DEFAULT 1"
     ),
+    "telegram_user_id": "ALTER TABLE telegram_accounts ADD COLUMN telegram_user_id INTEGER",
 }
 
 _INVITE_CAMPAIGNS_SCHEMA = """
@@ -278,6 +280,7 @@ class TelegramAccountRepository:
         "name", "phone", "session_name", "session_path",
         "daily_limit", "enabled", "last_used_at",
         "blocked_until", "blocked_reason", "verify_membership",
+        "telegram_user_id",
     )
 
     def __init__(self, db_path: Path):
@@ -308,15 +311,16 @@ class TelegramAccountRepository:
         daily_limit: int = 30,
         enabled: bool = True,
         verify_membership: bool = True,
+        telegram_user_id: int | None = None,
     ) -> TelegramAccount:
         cursor = self._conn.execute(
             """
             INSERT INTO telegram_accounts (
                 name, phone, session_name, session_path, daily_limit, enabled,
-                verify_membership
+                verify_membership, telegram_user_id
             ) VALUES (
                 :name, :phone, :session_name, :session_path, :daily_limit, :enabled,
-                :verify_membership
+                :verify_membership, :telegram_user_id
             )
             """,
             {
@@ -327,6 +331,7 @@ class TelegramAccountRepository:
                 "daily_limit": daily_limit,
                 "enabled": enabled,
                 "verify_membership": verify_membership,
+                "telegram_user_id": telegram_user_id,
             },
         )
         self._conn.commit()
@@ -363,7 +368,7 @@ class TelegramAccountRepository:
             """
             SELECT id, name, phone, session_name, session_path, daily_limit,
                    enabled, created_at, last_used_at, blocked_until, blocked_reason,
-                   verify_membership
+                   verify_membership, telegram_user_id
             FROM telegram_accounts WHERE id = ?
             """,
             (account_id,),
@@ -375,7 +380,7 @@ class TelegramAccountRepository:
             """
             SELECT id, name, phone, session_name, session_path, daily_limit,
                    enabled, created_at, last_used_at, blocked_until, blocked_reason,
-                   verify_membership
+                   verify_membership, telegram_user_id
             FROM telegram_accounts ORDER BY id
             """
         ).fetchall()
@@ -389,7 +394,7 @@ def _row_to_account(row) -> TelegramAccount:
     (
         id_, name, phone, session_name, session_path, daily_limit,
         enabled, created_at, last_used_at, blocked_until, blocked_reason,
-        verify_membership,
+        verify_membership, telegram_user_id,
     ) = row
     return TelegramAccount(
         id=id_,
@@ -404,6 +409,7 @@ def _row_to_account(row) -> TelegramAccount:
         blocked_until=_parse_datetime(blocked_until),
         blocked_reason=blocked_reason,
         verify_membership=bool(verify_membership),
+        telegram_user_id=telegram_user_id,
     )
 
 

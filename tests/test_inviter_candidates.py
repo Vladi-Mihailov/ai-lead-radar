@@ -141,9 +141,27 @@ class _FakeTelegramClient:
         target_entity=None, call_errors=None,
         get_input_entity_error=None, entity_responses=None,
         participant_check_errors=None,
+        is_authorized=True, get_me_result=None, get_me_error=None,
     ):
         self.account = account
         self._connect_error = connect_error
+        # is_authorized/get_me_result/get_me_error — проверка identity (см.
+        # InviterService._verify_account_identity/reader/inviter/
+        # identity.py), выполняется СРАЗУ после connect(), до
+        # get_entity(campaign.target_chat). is_authorized=True по
+        # умолчанию — не мешает ни одному существующему тесту, которому
+        # identity вообще не важна. get_me_result=None (по умолчанию) —
+        # get_me() возвращает id, СОВПАДАЮЩИЙ с уже сохранённым
+        # account.telegram_user_id (если он задан — "сессия матчится с
+        # тем, что и так в БД"), либо, если он ещё не задан, детерминированное
+        # значение, УНИКАЛЬНОЕ для этого account.id (900_000_000 + id) —
+        # так разные тестовые аккаунты в одном тесте никогда случайно не
+        # совпадут по telegram_user_id, а username/phone остаются None,
+        # чтобы reconcile_account_identity() не менял name/phone
+        # существующих тестов молча.
+        self._is_authorized = is_authorized
+        self._get_me_result = get_me_result
+        self._get_me_error = get_me_error
         self._get_entity_error = get_entity_error
         self._target_entity = target_entity if target_entity is not None else SimpleNamespace(id=999)
         # Список ошибок (или None = успех) — по одной на очередной вызов
@@ -176,6 +194,21 @@ class _FakeTelegramClient:
         if self._connect_error is not None:
             raise self._connect_error
         self.connected = True
+
+    async def is_user_authorized(self) -> bool:
+        return self._is_authorized
+
+    async def get_me(self):
+        if self._get_me_error is not None:
+            raise self._get_me_error
+        if self._get_me_result is not None:
+            return self._get_me_result
+        default_id = (
+            self.account.telegram_user_id
+            if self.account.telegram_user_id is not None
+            else 900_000_000 + self.account.id
+        )
+        return SimpleNamespace(id=default_id, username=None, phone=None)
 
     async def get_entity(self, entity):
         self.get_entity_calls.append(entity)
@@ -227,6 +260,7 @@ def _make_client_factory(
     *, connect_errors=None, get_entity_errors=None, call_errors=None,
     target_entities=None, get_input_entity_errors=None, entity_responses=None,
     participant_check_errors=None,
+    is_authorized_overrides=None, get_me_results=None, get_me_errors=None,
     created=None,
 ):
     """connect_errors/get_entity_errors/call_errors/get_input_entity_errors —
@@ -252,6 +286,9 @@ def _make_client_factory(
     get_input_entity_errors = get_input_entity_errors or {}
     entity_responses = entity_responses or {}
     participant_check_errors = participant_check_errors or {}
+    is_authorized_overrides = is_authorized_overrides or {}
+    get_me_results = get_me_results or {}
+    get_me_errors = get_me_errors or {}
 
     def factory(account):
         client = _FakeTelegramClient(
@@ -263,6 +300,9 @@ def _make_client_factory(
             get_input_entity_error=get_input_entity_errors.get(account.name),
             entity_responses=entity_responses.get(account.name),
             participant_check_errors=participant_check_errors.get(account.name),
+            is_authorized=is_authorized_overrides.get(account.name, True),
+            get_me_result=get_me_results.get(account.name),
+            get_me_error=get_me_errors.get(account.name),
         )
         if created is not None:
             created.append(client)
@@ -5268,3 +5308,455 @@ def test_worker_attempt_respects_daily_limit_even_when_hourly_limit_allows(tmp_p
         account_repository.close()
         campaign_repository.close()
         invite_repository.close()
+
+
+# ---- идентичность физического Telegram-аккаунта: telegram_user_id (см. ----
+# ---- reader/inviter/identity.py и задачу про production-дубли: два ----
+# ---- DB-ряда/session-файла, фактически авторизованные как ОДИН и тот же ----
+# ---- Telegram-аккаунт) -----------------------------------------------------
+
+
+def test_execute_fills_empty_telegram_user_id_from_get_me(tmp_path):
+    """Новый аккаунт (telegram_user_id ещё не задан) после первого же
+    успешного подключения должен получить реальный telegram_user_id из
+    get_me() — backfill "на лету" (см. _verify_account_identity)."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        account = account_repository.create(
+            name="acc1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=1,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    asyncio.run(
+        _run_service(
+            db_path,
+            client_factory=_make_client_factory(
+                get_me_results={"acc1": SimpleNamespace(id=555, username=None, phone=None)},
+            ),
+            execute=True,
+        )
+    )
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        refreshed = account_repository.get(account.id)
+    finally:
+        account_repository.close()
+    assert refreshed.telegram_user_id == 555
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        assert len(invite_repository.list()) == 1
+    finally:
+        invite_repository.close()
+
+
+def test_execute_matching_telegram_user_id_proceeds_normally(tmp_path):
+    """telegram_user_id уже сохранён и совпадает с get_me() — тот же
+    физический аккаунт, приглашение отправляется как обычно."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        account = account_repository.create(
+            name="acc1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=1, telegram_user_id=555,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    asyncio.run(
+        _run_service(
+            db_path,
+            client_factory=_make_client_factory(
+                get_me_results={"acc1": SimpleNamespace(id=555, username=None, phone=None)},
+            ),
+            execute=True,
+        )
+    )
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        refreshed = account_repository.get(account.id)
+    finally:
+        account_repository.close()
+    assert refreshed.telegram_user_id == 555
+    assert refreshed.name == "acc1"
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        assert len(invite_repository.list()) == 1
+    finally:
+        invite_repository.close()
+
+
+def test_execute_updates_name_when_username_changes_but_tg_id_same(tmp_path):
+    """Реальный случай из прода: @alena_ogi переименовался в @ao777oa777,
+    оставаясь тем же telegram_user_id=6557324579 — name должен обновиться,
+    session_name/session_path трогать нельзя, новая запись не создаётся."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        account = account_repository.create(
+            name="@alena_ogi", phone="+995500000001", session_name="alenaogir",
+            session_path="alenaogir.session", daily_limit=1, telegram_user_id=6557324579,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    asyncio.run(
+        _run_service(
+            db_path,
+            client_factory=_make_client_factory(
+                get_me_results={
+                    "@alena_ogi": SimpleNamespace(id=6557324579, username="ao777oa777", phone=None),
+                },
+            ),
+            execute=True,
+        )
+    )
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        refreshed = account_repository.get(account.id)
+        all_accounts = account_repository.list()
+    finally:
+        account_repository.close()
+
+    assert refreshed.telegram_user_id == 6557324579
+    assert refreshed.name == "@ao777oa777"
+    assert refreshed.session_name == "alenaogir"
+    assert refreshed.session_path == "alenaogir.session"
+    assert len(all_accounts) == 1
+
+
+def test_execute_syncs_phone_when_changed(tmp_path):
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        account = account_repository.create(
+            name="acc1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=1, telegram_user_id=555,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    asyncio.run(
+        _run_service(
+            db_path,
+            client_factory=_make_client_factory(
+                get_me_results={
+                    "acc1": SimpleNamespace(id=555, username=None, phone="+79495447392"),
+                },
+            ),
+            execute=True,
+        )
+    )
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        refreshed = account_repository.get(account.id)
+    finally:
+        account_repository.close()
+    assert refreshed.phone == "+79495447392"
+
+
+def test_execute_keeps_existing_phone_when_get_me_phone_is_empty(tmp_path):
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        account = account_repository.create(
+            name="acc1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=1, telegram_user_id=555,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    asyncio.run(
+        _run_service(
+            db_path,
+            client_factory=_make_client_factory(
+                get_me_results={"acc1": SimpleNamespace(id=555, username=None, phone=None)},
+            ),
+            execute=True,
+        )
+    )
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        refreshed = account_repository.get(account.id)
+    finally:
+        account_repository.close()
+    assert refreshed.phone == "+995500000001"
+
+
+def test_execute_skips_account_when_stored_tg_id_does_not_match_session(tmp_path, caplog):
+    """Сессия перезалогинена на другой Telegram-аккаунт — ни одного
+    InviteToChannelRequest/AddChatUserRequest, telegram_user_id в БД не
+    перезаписывается, история user_campaign_invites не меняется."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        account = account_repository.create(
+            name="acc1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=1, telegram_user_id=111,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    with caplog.at_level("ERROR", logger="reader.inviter.service"):
+        asyncio.run(
+            _run_service(
+                db_path,
+                client_factory=_make_client_factory(
+                    get_me_results={"acc1": SimpleNamespace(id=999, username=None, phone=None)},
+                    created=created_clients,
+                ),
+                execute=True,
+            )
+        )
+
+    assert "111" in caplog.text
+    assert "999" in caplog.text
+
+    assert created_clients[0].call_requests == []
+    assert created_clients[0].get_entity_calls == []
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        refreshed = account_repository.get(account.id)
+    finally:
+        account_repository.close()
+    assert refreshed.telegram_user_id == 111
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        assert invite_repository.list() == []
+    finally:
+        invite_repository.close()
+
+
+def test_execute_skips_duplicate_enabled_account_sharing_same_tg_id(tmp_path):
+    """Реальный случай из прода: id=6 @Iv_vla_sov и id=7 @Misha_Offroad
+    оба физически являются telegram_user_id=8838087889 — при одновременном
+    enabled=True для обоих используется только запись с меньшим id,
+    вторая пропускается ПОЛНОСТЬЮ (даже get_entity(target_chat) не
+    вызывается)."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        primary = account_repository.create(
+            name="@Iv_vla_sov", phone="+995568759201", session_name="Iv_vla_sov",
+            session_path="Iv_vla_sov.session", daily_limit=1, telegram_user_id=8838087889,
+        )
+        account_repository.create(
+            name="@Misha_Offroad", phone="+995568759201", session_name="Misha_Offroad",
+            session_path="Misha_Offroad.session", daily_limit=1, telegram_user_id=8838087889,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    asyncio.run(
+        _run_service(
+            db_path,
+            client_factory=_make_client_factory(
+                get_me_results={
+                    "@Iv_vla_sov": SimpleNamespace(id=8838087889, username=None, phone=None),
+                    "@Misha_Offroad": SimpleNamespace(id=8838087889, username=None, phone=None),
+                },
+                created=created_clients,
+            ),
+            execute=True,
+        )
+    )
+
+    by_name = {client.account.name: client for client in created_clients}
+    assert by_name["@Iv_vla_sov"].call_requests
+    assert by_name["@Misha_Offroad"].call_requests == []
+    assert by_name["@Misha_Offroad"].get_entity_calls == []
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == 1
+        assert invites[0].account_id == primary.id
+    finally:
+        invite_repository.close()
+
+
+def test_execute_disabled_duplicate_does_not_block_enabled_primary(tmp_path):
+    """Исторический отключённый дубликат (enabled=False, как реальные
+    id=7/id=8 в проде) не должен мешать основному enabled-аккаунту с тем
+    же telegram_user_id — и вообще не должен подключаться (см. run():
+    accounts фильтруются по enabled ДО _execute_account)."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        primary = account_repository.create(
+            name="@Iv_vla_sov", phone="+995568759201", session_name="Iv_vla_sov",
+            session_path="Iv_vla_sov.session", daily_limit=1, telegram_user_id=8838087889,
+        )
+        account_repository.create(
+            name="@Misha_Offroad", phone="+995568759201", session_name="Misha_Offroad",
+            session_path="Misha_Offroad.session", daily_limit=1, telegram_user_id=8838087889,
+            enabled=False,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    asyncio.run(
+        _run_service(
+            db_path,
+            client_factory=_make_client_factory(
+                get_me_results={
+                    "@Iv_vla_sov": SimpleNamespace(id=8838087889, username=None, phone=None),
+                },
+                created=created_clients,
+            ),
+            execute=True,
+        )
+    )
+
+    assert [client.account.name for client in created_clients] == ["@Iv_vla_sov"]
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == 1
+        assert invites[0].account_id == primary.id
+    finally:
+        invite_repository.close()
+
+
+def test_execute_skips_account_when_session_not_authorized(tmp_path, caplog):
+    """is_user_authorized() == False (сессия подключилась, но не
+    авторизована) — аккаунт пропускается, ни одного приглашения, БД не
+    искажается (telegram_user_id остаётся None, а не каким-то мусором)."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        account = account_repository.create(
+            name="acc1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=1,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    with caplog.at_level("ERROR", logger="reader.inviter.service"):
+        asyncio.run(
+            _run_service(
+                db_path,
+                client_factory=_make_client_factory(
+                    is_authorized_overrides={"acc1": False},
+                    created=created_clients,
+                ),
+                execute=True,
+            )
+        )
+
+    assert "не авторизована" in caplog.text
+    assert created_clients[0].call_requests == []
+    assert created_clients[0].get_entity_calls == []
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        refreshed = account_repository.get(account.id)
+    finally:
+        account_repository.close()
+    assert refreshed.telegram_user_id is None
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        assert invite_repository.list() == []
+    finally:
+        invite_repository.close()
+
+
+def test_dry_run_does_not_perform_identity_check(tmp_path):
+    """Dry-run никогда не отправляет InviteToChannelRequest/
+    AddChatUserRequest — проверка идентичности там не нужна и не
+    выполняется вовсе, даже если бы она провалилась."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        account = account_repository.create(
+            name="acc1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=1, telegram_user_id=111,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    asyncio.run(
+        _run_service(
+            db_path,
+            client_factory=_make_client_factory(
+                is_authorized_overrides={"acc1": False},
+                get_me_errors={"acc1": RuntimeError("get_me() must not be called in dry-run")},
+            ),
+            execute=False,
+        )
+    )
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        refreshed = account_repository.get(account.id)
+    finally:
+        account_repository.close()
+    assert refreshed.telegram_user_id == 111
