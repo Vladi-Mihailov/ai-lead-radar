@@ -86,7 +86,12 @@ def reconcile_account_identity(
     - не совпадает -> AccountIdentityMismatchError, ничего не пишем в БД.
 
     session_name/session_path НИКОГДА не трогаются — идентичность привязана
-    к самому Telegram-аккаунту, а не к тому, как называется файл сессии."""
+    к самому Telegram-аккаунту, а не к тому, как называется файл сессии.
+
+    Если name реально меняется — старое значение добавляется в
+    previous_names (если его там ещё нет), а не теряется молча (см. задачу:
+    "DB row 7 исторически была @Misha_Offroad", даже если её name синхронизируют
+    на актуальный username того же физического аккаунта)."""
     if (
         account.telegram_user_id is not None
         and account.telegram_user_id != identity.telegram_user_id
@@ -108,35 +113,80 @@ def reconcile_account_identity(
     ):
         return account
 
+    new_previous_names = list(account.previous_names)
+    if new_name != account.name and account.name not in new_previous_names:
+        new_previous_names.append(account.name)
+
     return account_repository.update(
         account.id,
         telegram_user_id=identity.telegram_user_id,
         name=new_name,
         phone=new_phone,
+        previous_names=new_previous_names,
     )
 
 
-def find_duplicate_account(
+_DUPLICATE_OLD_REASON = "duplicate_telegram_user_id"
+
+
+def resolve_duplicate_group(
     account_repository: TelegramAccountRepository,
-    account: TelegramAccount,
-) -> TelegramAccount | None:
-    """Другая запись telegram_accounts с тем же telegram_user_id, что и
-    account — физический дубликат (см. задачу про id=6/id=7 и id=8/id=9).
-    Среди ВСЕХ совпадающих (включая сам account) детерминированно выбираем
-    запись с наименьшим id как "основную" — если ею оказался не account,
-    значит account — дубликат и его использовать нельзя. Отключённые
-    (enabled=False) записи не считаются конфликтом — они не участвуют в
-    рантайме инвайтера (см. reader/inviter/worker.py _enabled_pairs)."""
-    if account.telegram_user_id is None:
-        return None
+    telegram_user_id: int,
+) -> None:
+    """Для ВСЕХ DB-записей с этим telegram_user_id (независимо от enabled)
+    гарантирует, что ровно одна остаётся CURRENT (is_old=False), а
+    остальные помечены is_old=True, enabled=False, old_reason=
+    "duplicate_telegram_user_id" (см. задачу про автоматическое
+    обнаружение дублей после переименования/перелогина: id=6/id=7 и
+    id=8/id=9).
 
-    matching = [
-        other
-        for other in account_repository.list()
-        if other.enabled and other.telegram_user_id == account.telegram_user_id
-    ]
-    if len(matching) <= 1:
-        return None
+    is_old — ЛИПКИЙ (sticky) флаг: запись, уже помеченная is_old=True, НЕ
+    рассматривается как кандидат на CURRENT в последующих вызовах (даже
+    если её потом вручную enable — см. задачу "OLD имеет приоритет"),
+    восстановить статус CURRENT можно только вручную правкой БД. Это же
+    делает функцию идемпотентной — повторный вызов без изменения входных
+    данных не производит новых записей в БД.
 
-    primary = min(matching, key=lambda other: other.id)
-    return None if primary.id == account.id else primary
+    Выбор CURRENT среди ещё не помеченных (candidates), по убыванию
+    приоритета:
+      1. если ровно один из candidates enabled — он CURRENT;
+      2. если ни одного или несколько enabled — CURRENT детерминированно
+         наименьший id среди candidates (без изменения enabled — см.
+         задачу "никогда не включать аккаунт автоматически").
+    Если candidates пуст (защитный случай — не должен происходить в
+    норме, т.к. группа не может стать полностью is_old сама по себе),
+    CURRENT восстанавливается как наименьший id во всей группе, тоже без
+    включения enabled.
+
+    Ни одна запись не удаляется и не сливается — user_campaign_invites
+    остаётся нетронутым (там нет ссылок на telegram_accounts.is_old)."""
+    group = [a for a in account_repository.list() if a.telegram_user_id == telegram_user_id]
+    if len(group) <= 1:
+        return
+
+    candidates = [a for a in group if not a.is_old]
+
+    if not candidates:
+        winner_id = min(a.id for a in group)
+    elif len(candidates) == 1:
+        winner_id = candidates[0].id
+    else:
+        enabled_candidates = [a for a in candidates if a.enabled]
+        if len(enabled_candidates) == 1:
+            winner_id = enabled_candidates[0].id
+        else:
+            winner_id = min(a.id for a in candidates)
+
+    for account in group:
+        if account.id == winner_id:
+            if account.is_old or account.old_reason is not None:
+                account_repository.update(account.id, is_old=False, old_reason=None)
+        else:
+            if (
+                not account.is_old
+                or account.enabled
+                or account.old_reason != _DUPLICATE_OLD_REASON
+            ):
+                account_repository.update(
+                    account.id, is_old=True, enabled=False, old_reason=_DUPLICATE_OLD_REASON,
+                )

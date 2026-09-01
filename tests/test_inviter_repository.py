@@ -316,6 +316,70 @@ def test_telegram_accounts_migrates_existing_table_without_telegram_user_id(tmp_
         repository.close()
 
 
+def test_telegram_accounts_migrates_existing_table_without_is_old_columns(tmp_path):
+    """Таблица уже содержит telegram_user_id (из предыдущей миграции), но
+    ещё не имеет is_old/old_reason/previous_names (см. задачу про
+    автоматическое обнаружение дублей после переименования/перелогина) —
+    открытие репозитория должно добавить все три колонки как NULLABLE
+    (is_old — NOT NULL DEFAULT 0), без пересоздания таблицы и без потери
+    существующих записей/значений."""
+    db_path = tmp_path / "inviter.db"
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE telegram_accounts (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                name                TEXT NOT NULL,
+                phone               TEXT NOT NULL,
+                session_name        TEXT NOT NULL,
+                session_path        TEXT NOT NULL,
+                daily_limit         INTEGER NOT NULL DEFAULT 30,
+                enabled             BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at        TIMESTAMP,
+                blocked_until       TIMESTAMP,
+                blocked_reason      TEXT,
+                verify_membership   INTEGER NOT NULL DEFAULT 1,
+                telegram_user_id    INTEGER
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO telegram_accounts "
+            "(name, phone, session_name, session_path, daily_limit, telegram_user_id) "
+            "VALUES ('@Iv_vla_sov', '+995568759201', 'Iv_vla_sov', 'data/sessions/Iv_vla_sov', 24, 8838087889)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    repository = TelegramAccountRepository(db_path)
+    try:
+        columns = {row[1] for row in repository._conn.execute(
+            "PRAGMA table_info(telegram_accounts)"
+        )}
+        assert {"is_old", "old_reason", "previous_names"} <= columns
+
+        accounts = repository.list()
+        assert len(accounts) == 1
+        assert accounts[0].telegram_user_id == 8838087889  # существующее значение не потеряно
+        assert accounts[0].is_old is False  # DEFAULT 0 — обратная совместимость
+        assert accounts[0].old_reason is None
+        assert accounts[0].previous_names == []
+
+        updated = repository.update(
+            accounts[0].id, is_old=True, old_reason="duplicate_telegram_user_id",
+            previous_names=["@Misha_Offroad"],
+        )
+        assert updated.is_old is True
+        assert updated.old_reason == "duplicate_telegram_user_id"
+        assert updated.previous_names == ["@Misha_Offroad"]
+    finally:
+        repository.close()
+
+
 # ---- TelegramAccountRepository: create/get/update/list ----
 
 

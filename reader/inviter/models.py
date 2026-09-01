@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 
@@ -42,7 +42,24 @@ class TelegramAccount:
     создания нового физического аккаунта). None — identity ещё не
     подтверждена/не заполнена (см. задачу про backfill существующих
     аккаунтов) — не значит "неизвестный/новый Telegram-аккаунт", просто
-    "ещё не проверено через живую сессию"."""
+    "ещё не проверено через живую сессию".
+
+    is_old — эта DB-запись физически совпадает (telegram_user_id) с ДРУГОЙ,
+    более приоритетной записью (см. reader/inviter/identity.py
+    resolve_duplicate_group и задачу про автоматическое обнаружение
+    дублей после переименования/перелогина) — устаревшая
+    регистрация/session того же самого Telegram-аккаунта, сохраняется
+    только ради истории user_campaign_invites, инвайтером больше НИКОГДА
+    не используется (даже если кто-то вручную выставит enabled=True — см.
+    InviterService._verify_account_identity). old_reason — машинно
+    заданная причина (сейчас единственное значение —
+    "duplicate_telegram_user_id"), None пока is_old=False.
+
+    previous_names — история ПРЕЖНИХ значений name для этой же записи (см.
+    reconcile_account_identity) — name синхронизируется с реальным текущим
+    username при каждой успешной проверке идентичности, поэтому старое имя
+    иначе было бы безвозвратно потеряно, включая для is_old=True записей
+    (см. задачу: "DB row 7 исторически была @Misha_Offroad")."""
 
     id: int
     name: str
@@ -57,6 +74,9 @@ class TelegramAccount:
     blocked_reason: str | None = None
     verify_membership: bool = True
     telegram_user_id: int | None = None
+    is_old: bool = False
+    old_reason: str | None = None
+    previous_names: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

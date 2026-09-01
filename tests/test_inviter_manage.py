@@ -616,9 +616,12 @@ def test_sync_accounts_identity_mismatch_does_not_overwrite_stored_tg_id(tmp_pat
         account_repository.close()
 
 
-def test_sync_accounts_does_not_auto_merge_duplicates_only_reports(tmp_path, capsys):
-    """Дубликат telegram_user_id — только предупреждение в stdout, ни одна
-    запись не удаляется/не отключается (см. report_duplicate_accounts)."""
+def test_sync_accounts_auto_resolves_duplicates_marks_loser_old_and_disabled(tmp_path, capsys):
+    """Реальный случай из прода (id=6/id=7): дубликат telegram_user_id
+    теперь разрешается АВТОМАТИЧЕСКИ — ровно одна запись остаётся CURRENT
+    (is_old=False), вторая помечается is_old=True/enabled=False. Ни одна
+    строка не удаляется/не сливается (см. reader/inviter/identity.py
+    resolve_duplicate_group)."""
     db_path = tmp_path / "users.db"
     manage.ensure_account(
         db_path, name="@Iv_vla_sov", phone="+995568759201", session_name="Iv_vla_sov",
@@ -640,33 +643,95 @@ def test_sync_accounts_does_not_auto_merge_duplicates_only_reports(tmp_path, cap
     )
 
     output = capsys.readouterr().out
-    assert "ДУБЛИКАТ" in output
+    assert "CURRENT" in output
+    assert "OLD" in output
     assert "8838087889" in output
+    assert "DUPLICATES RESOLVED: 1" in output
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        accounts = {a.name: a for a in account_repository.list()}
+        assert len(accounts) == 2  # ничего не слито и не удалено
+    finally:
+        account_repository.close()
+
+    assert accounts["@Iv_vla_sov"].is_old is False
+    assert accounts["@Iv_vla_sov"].enabled is True
+    assert accounts["@Misha_Offroad"].is_old is True
+    assert accounts["@Misha_Offroad"].enabled is False
+    assert accounts["@Misha_Offroad"].old_reason == "duplicate_telegram_user_id"
+
+
+def test_sync_accounts_does_not_auto_enable_when_all_duplicates_disabled(tmp_path):
+    """Реальный случай из прода (id=8/id=9 до вмешательства оператора):
+    обе записи disabled — CURRENT определяется, но enabled НИКОГДА не
+    включается автоматически ни для одной из них."""
+    db_path = tmp_path / "users.db"
+    manage.ensure_account(
+        db_path, name="@m_vlad_i_mir", phone="+79495447392", session_name="inviter_m_vlad_i_mir",
+        session_path="data/sessions/inviter_m_vlad_i_mir", daily_limit=1, enabled=False,
+    )
+    manage.ensure_account(
+        db_path, name="@bdlapq", phone="+79495447392", session_name="inviter_bdlapq",
+        session_path="data/sessions/inviter_bdlapq", daily_limit=1, enabled=False,
+    )
+
+    shared_me = SimpleNamespace(id=8847286898, username=None, phone=None)
+    asyncio.run(
+        manage.sync_accounts(db_path, client_factory=_make_sync_client_factory(
+            by_name={
+                "@m_vlad_i_mir": _FakeSyncClient(me=shared_me),
+                "@bdlapq": _FakeSyncClient(me=shared_me),
+            },
+        ))
+    )
 
     account_repository = TelegramAccountRepository(db_path)
     try:
         accounts = account_repository.list()
-        assert len(accounts) == 2  # ничего не слито и не удалено
-        assert {a.name: a.enabled for a in accounts} == {
-            "@Iv_vla_sov": True, "@Misha_Offroad": False,
-        }
     finally:
         account_repository.close()
+    assert all(a.enabled is False for a in accounts)  # ни одна не включена автоматически
+    assert sum(1 for a in accounts if not a.is_old) == 1  # ровно одна CURRENT
 
 
-def test_report_duplicate_accounts_returns_empty_when_all_unique(tmp_path):
+def test_sync_accounts_is_idempotent(tmp_path):
+    """Повторный запуск sync-accounts с теми же данными — второй прогон
+    не меняет ни is_old/enabled/telegram_user_id, ни account-count (см.
+    задачу: "repeated sync идемпотентен")."""
     db_path = tmp_path / "users.db"
+    manage.ensure_account(
+        db_path, name="@Iv_vla_sov", phone="+995568759201", session_name="Iv_vla_sov",
+        session_path="data/sessions/Iv_vla_sov", daily_limit=1, enabled=True,
+    )
+    manage.ensure_account(
+        db_path, name="@Misha_Offroad", phone="+995568759201", session_name="Misha_Offroad",
+        session_path="data/sessions/Misha_Offroad", daily_limit=1, enabled=False,
+    )
+
+    def make_factory():
+        shared_me = SimpleNamespace(id=8838087889, username=None, phone=None)
+        return _make_sync_client_factory(by_name={
+            "@Iv_vla_sov": _FakeSyncClient(me=shared_me),
+            "@Misha_Offroad": _FakeSyncClient(me=shared_me),
+        })
+
+    asyncio.run(manage.sync_accounts(db_path, client_factory=make_factory()))
+
     account_repository = TelegramAccountRepository(db_path)
     try:
-        account_repository.create(
-            name="@acc1", phone="", session_name="acc1", session_path="acc1",
-            telegram_user_id=1,
-        )
-        account_repository.create(
-            name="@acc2", phone="", session_name="acc2", session_path="acc2",
-            telegram_user_id=2,
-        )
-        duplicates = manage.report_duplicate_accounts(account_repository.list())
+        after_first = account_repository.list()
     finally:
         account_repository.close()
-    assert duplicates == []
+
+    second_results = asyncio.run(manage.sync_accounts(db_path, client_factory=make_factory()))
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        after_second = account_repository.list()
+    finally:
+        account_repository.close()
+
+    assert after_first == after_second
+    # Второй прогон не меняет данные — статус "unchanged" для обоих аккаунтов.
+    assert {r.status for r in second_results} == {"unchanged"}

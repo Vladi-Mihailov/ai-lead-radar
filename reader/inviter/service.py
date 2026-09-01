@@ -44,8 +44,8 @@ from reader.inviter.identity import (
     AccountIdentityMismatchError,
     SessionNotAuthorizedError,
     fetch_telegram_identity,
-    find_duplicate_account,
     reconcile_account_identity,
+    resolve_duplicate_group,
 )
 from reader.inviter.models import InviteCampaign, InviteCandidate, TelegramAccount
 from reader.inviter.repository import (
@@ -1045,14 +1045,23 @@ class InviterService:
             logger.error(f"[EXECUTE]\nAccount: {account.name}\n{exc}")
             return None
 
-        duplicate = find_duplicate_account(self._account_repository, account)
-        if duplicate is not None:
+        # Пересчитывает CURRENT/OLD для ВСЕХ DB-записей с этим
+        # telegram_user_id (см. resolve_duplicate_group) — не только для
+        # этого account, поэтому перечитываем его заново: сам account тоже
+        # мог быть только что помечен is_old (если, например, другая
+        # запись оказалась более приоритетной) или, наоборот, разблокирован.
+        resolve_duplicate_group(self._account_repository, account.telegram_user_id)
+        refreshed = self._account_repository.get(account.id)
+        if refreshed is not None:
+            account = refreshed
+
+        if account.is_old:
             logger.error(
                 f"[EXECUTE]\nAccount: {account.name}\n"
-                f"telegram_user_id={account.telegram_user_id} совпадает с "
-                f"id={duplicate.id} ({duplicate.name}) — физический дубликат "
-                f"Telegram-аккаунта, используется только id={duplicate.id}, "
-                f"этот аккаунт (id={account.id}) пропущен."
+                f"Запись id={account.id} помечена как устаревшая (is_old, причина: "
+                f"{account.old_reason}) — физический Telegram-аккаунт "
+                f"telegram_user_id={account.telegram_user_id} уже представлен другой, "
+                f"текущей записью, этот аккаунт пропущен."
             )
             return None
 

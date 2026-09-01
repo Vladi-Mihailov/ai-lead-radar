@@ -5760,3 +5760,152 @@ def test_dry_run_does_not_perform_identity_check(tmp_path):
     finally:
         account_repository.close()
     assert refreshed.telegram_user_id == 111
+
+
+# ---- is_old (CURRENT/OLD): автоматическое обнаружение дублей после -----
+# ---- переименования/перелогина (см. reader/inviter/identity.py --------
+# ---- resolve_duplicate_group и задачу про id=6/id=7, id=8/id=9) -------
+
+
+def test_execute_old_row_is_never_used_even_if_manually_enabled(tmp_path, caplog):
+    """"OLD имеет приоритет": даже если DB-запись уже помечена is_old=True
+    (в паре с другой, CURRENT, записью того же физического аккаунта) и
+    кто-то (оператор/баг) вручную выставил ей enabled=1, worker не должен
+    делать ни одного InviteToChannelRequest/AddChatUserRequest от её
+    имени — is_old не реклассифицируется обратно в CURRENT, enabled
+    принудительно возвращается в False."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        primary = account_repository.create(
+            name="@Iv_vla_sov", phone="+995568759201", session_name="Iv_vla_sov",
+            session_path="Iv_vla_sov.session", daily_limit=1,
+            telegram_user_id=8838087889, enabled=True,
+        )
+        duplicate = account_repository.create(
+            name="@Misha_Offroad", phone="+995568759201", session_name="Misha_Offroad",
+            session_path="Misha_Offroad.session", daily_limit=1,
+            telegram_user_id=8838087889, enabled=False,
+        )
+        # Уже разрешённый дубликат из предыдущего sync/тика — is_old=True,
+        # затем оператор (или баг) вручную снова выставил ему enabled=1.
+        account_repository.update(
+            duplicate.id, is_old=True, old_reason="duplicate_telegram_user_id",
+        )
+        account_repository.update(duplicate.id, enabled=True)
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    with caplog.at_level("ERROR", logger="reader.inviter.service"):
+        asyncio.run(
+            _run_service(
+                db_path,
+                client_factory=_make_client_factory(
+                    get_me_results={
+                        "@Iv_vla_sov": SimpleNamespace(id=8838087889, username=None, phone=None),
+                        "@Misha_Offroad": SimpleNamespace(id=8838087889, username=None, phone=None),
+                    },
+                    created=created_clients,
+                ),
+                execute=True,
+            )
+        )
+
+    assert "is_old" in caplog.text
+
+    by_name = {client.account.name: client for client in created_clients}
+    assert by_name["@Misha_Offroad"].call_requests == []
+    assert by_name["@Misha_Offroad"].get_entity_calls == []
+    assert by_name["@Iv_vla_sov"].call_requests  # CURRENT работает как обычно
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        refreshed_duplicate = account_repository.get(duplicate.id)
+        refreshed_primary = account_repository.get(primary.id)
+    finally:
+        account_repository.close()
+    # is_old остаётся True (не реклассифицирован), enabled принудительно возвращён в False.
+    assert refreshed_duplicate.is_old is True
+    assert refreshed_duplicate.enabled is False
+    assert refreshed_primary.is_old is False
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == 1
+        assert invites[0].account_id == primary.id
+    finally:
+        invite_repository.close()
+
+
+def test_execute_automatically_flags_disabled_duplicate_as_old_without_operator_action(tmp_path):
+    """Оператору не нужно вручную искать дубли: исторически просто
+    disabled дубликат (без is_old — как id=7/id=8 сразу после миграции)
+    автоматически получает is_old=True/old_reason как побочный эффект
+    ОБЫЧНОЙ проверки идентичности основного (enabled) аккаунта — сам
+    дубликат при этом ни разу не подключается (не enabled)."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        primary = account_repository.create(
+            name="@Iv_vla_sov", phone="+995568759201", session_name="Iv_vla_sov",
+            session_path="Iv_vla_sov.session", daily_limit=1,
+            telegram_user_id=8838087889, enabled=True,
+        )
+        duplicate = account_repository.create(
+            name="@Misha_Offroad", phone="+995568759201", session_name="Misha_Offroad",
+            session_path="Misha_Offroad.session", daily_limit=1,
+            telegram_user_id=8838087889, enabled=False,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    asyncio.run(
+        _run_service(
+            db_path,
+            client_factory=_make_client_factory(
+                get_me_results={
+                    "@Iv_vla_sov": SimpleNamespace(id=8838087889, username=None, phone=None),
+                },
+                created=created_clients,
+            ),
+            execute=True,
+        )
+    )
+
+    # Дубликат ни разу не подключался (не enabled) — но его identity всё
+    # равно была разрешена как побочный эффект проверки primary.
+    assert [client.account.name for client in created_clients] == ["@Iv_vla_sov"]
+
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        refreshed_primary = account_repository.get(primary.id)
+        refreshed_duplicate = account_repository.get(duplicate.id)
+    finally:
+        account_repository.close()
+
+    assert refreshed_primary.is_old is False
+    assert refreshed_duplicate.is_old is True
+    assert refreshed_duplicate.old_reason == "duplicate_telegram_user_id"
+    assert refreshed_duplicate.enabled is False
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == 1
+        assert invites[0].account_id == primary.id
+    finally:
+        invite_repository.close()

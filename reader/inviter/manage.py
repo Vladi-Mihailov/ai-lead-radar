@@ -44,13 +44,28 @@ daily_limit/blocked_until):
 Заполнить/сверить telegram_user_id (см. TelegramAccount.telegram_user_id и
 reader/inviter/identity.py) для ВСЕХ существующих аккаунтов (в т.ч.
 enabled=False) — по очереди подключается к каждому по его .session-файлу,
-читает get_me() и сохраняет в БД реальный telegram_user_id/username/phone.
-Ничего не включает/выключает, ничего не удаляет, session_name/session_path
-не трогает, user_campaign_invites не изменяет. В конце печатает
-предупреждение (без автослияния), если несколько DB-записей оказались
-одним и тем же физическим Telegram-аккаунтом:
+читает get_me() и сохраняет в БД реальный telegram_user_id/username/phone
+(старое имя сохраняется в TelegramAccount.previous_names, а не теряется).
+Ничего не удаляет, session_name/session_path не трогает,
+user_campaign_invites не изменяет.
+
+После этого автоматически разрешает дубликаты telegram_user_id (см.
+reader/inviter/identity.py resolve_duplicate_group): среди всех DB-записей
+с одним и тем же telegram_user_id ровно одна остаётся CURRENT
+(is_old=False), остальные автоматически помечаются is_old=True и
+enabled=False (но НЕ удаляются — user_campaign_invites у них остаётся
+нетронутым). Никогда не включает enabled=True автоматически — если ни
+одна из дублирующихся записей не была enabled, ни одна и не станет:
 
     python -m reader.inviter.manage sync-accounts
+
+Пример вывода:
+    id=6 @Iv_vla_sov TG_ID=8838087889 CURRENT enabled=1
+    id=7 @Iv_vla_sov TG_ID=8838087889 OLD enabled=0 (previously: @Misha_Offroad)
+
+    CURRENT: 9
+    OLD: 2
+    DUPLICATES RESOLVED: 2
 """
 
 import argparse
@@ -70,6 +85,7 @@ from reader.inviter.identity import (  # noqa: E402
     SessionNotAuthorizedError,
     fetch_telegram_identity,
     reconcile_account_identity,
+    resolve_duplicate_group,
 )
 from reader.inviter.models import InviteCampaign, TelegramAccount  # noqa: E402
 from reader.inviter.repository import (  # noqa: E402
@@ -139,9 +155,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "sync-accounts",
         help=(
             "Подключиться к каждому существующему аккаунту (по .session-файлу) и "
-            "сверить/заполнить telegram_user_id/username/phone через get_me(). "
-            "Ничего не включает/выключает, ничего не удаляет, дубликаты "
-            "telegram_user_id только печатаются, не сливаются автоматически."
+            "сверить/заполнить telegram_user_id/username/phone через get_me(), затем "
+            "автоматически разрешить дубликаты telegram_user_id: ровно одна запись "
+            "на физический аккаунт остаётся CURRENT, остальные помечаются OLD и "
+            "enabled=false (без удаления строк и без автовключения enabled)."
         ),
     )
 
@@ -257,11 +274,15 @@ async def sync_accounts(
 ) -> list[AccountSyncResult]:
     """Backfill/сверка telegram_user_id + name/phone для ВСЕХ аккаунтов
     (в т.ч. enabled=False) — см. reader/inviter/identity.py. Никогда не
-    меняет enabled, никогда не удаляет строки, никогда не трогает
-    user_campaign_invites, никогда не меняет session_name/session_path.
-    Пишет в БД ТОЛЬКО после успешного is_user_authorized() (см.
-    fetch_telegram_identity). Дубликаты telegram_user_id только
-    печатаются (см. report_duplicate_accounts) — без автослияния."""
+    удаляет строки, никогда не трогает user_campaign_invites, никогда не
+    меняет session_name/session_path. Пишет в БД ТОЛЬКО после успешного
+    is_user_authorized() (см. fetch_telegram_identity).
+
+    После сверки identity автоматически разрешает дубликаты
+    telegram_user_id (см. resolve_all_duplicates/resolve_duplicate_group)
+    — это ЕДИНСТВЕННОЕ место, где sync-accounts меняет enabled: только
+    принудительно ВЫКЛЮЧАЕТ проигравшие дубликаты (is_old=True), никогда
+    не включает ни одну запись автоматически."""
     account_repository = TelegramAccountRepository(db_path)
     results: list[AccountSyncResult] = []
     try:
@@ -298,30 +319,69 @@ async def sync_accounts(
             finally:
                 await client.disconnect()
 
-        report_duplicate_accounts(account_repository.list())
+        summary = resolve_all_duplicates(account_repository)
+        print()
+        for account in account_repository.list():
+            if account.telegram_user_id is not None:
+                print(_format_current_old_line(account))
+        print()
+        print(f"CURRENT: {summary.current}")
+        print(f"OLD: {summary.old}")
+        print(f"DUPLICATES RESOLVED: {summary.duplicates_resolved}")
     finally:
         account_repository.close()
     return results
 
 
-def report_duplicate_accounts(accounts: list[TelegramAccount]) -> list[tuple[int, list[int]]]:
-    """Группирует ВСЕ аккаунты (в т.ч. enabled=False) по непустому
-    telegram_user_id и печатает предупреждение для каждой группы из более
-    чем одной записи — см. задачу про id=6/id=7 и id=8/id=9. Никогда не
-    сливает и не меняет записи, только сообщает оператору."""
-    by_tg_id: dict[int, list[TelegramAccount]] = {}
-    for account in accounts:
-        if account.telegram_user_id is not None:
-            by_tg_id.setdefault(account.telegram_user_id, []).append(account)
+@dataclass(frozen=True)
+class DuplicateResolutionSummary:
+    """Итог resolve_all_duplicates() — для вывода sync-accounts и тестов."""
 
-    duplicates: list[tuple[int, list[int]]] = []
-    for tg_id, group in sorted(by_tg_id.items()):
+    current: int
+    old: int
+    duplicates_resolved: int
+
+
+def resolve_all_duplicates(account_repository: TelegramAccountRepository) -> DuplicateResolutionSummary:
+    """Для КАЖДОГО непустого telegram_user_id в БД вызывает
+    resolve_duplicate_group (см. reader/inviter/identity.py) — гарантирует
+    ровно одну CURRENT-запись на физический Telegram-аккаунт, остальные
+    помечает is_old=True/enabled=False. Идемпотентно — повторный вызов без
+    изменения входных данных не производит новых записей в БД.
+
+    duplicates_resolved считает группы (telegram_user_id), у которых
+    сейчас БОЛЬШЕ ОДНОЙ DB-записи — то есть присутствующие дубликаты,
+    поддерживаемые в разрешённом состоянии, а не только вновь
+    обнаруженные в этом конкретном запуске."""
+    accounts = account_repository.list()
+    telegram_user_ids = sorted({a.telegram_user_id for a in accounts if a.telegram_user_id is not None})
+
+    duplicates_resolved = 0
+    for telegram_user_id in telegram_user_ids:
+        group = [a for a in accounts if a.telegram_user_id == telegram_user_id]
         if len(group) > 1:
-            ids = [a.id for a in group]
-            names = ", ".join(a.name for a in group)
-            print(f"⚠️  ДУБЛИКАТ: telegram_user_id={tg_id} — DB IDs {ids} ({names})")
-            duplicates.append((tg_id, ids))
-    return duplicates
+            duplicates_resolved += 1
+        resolve_duplicate_group(account_repository, telegram_user_id)
+
+    refreshed = account_repository.list()
+    current = sum(1 for a in refreshed if a.telegram_user_id is not None and not a.is_old)
+    old = sum(1 for a in refreshed if a.is_old)
+    return DuplicateResolutionSummary(current=current, old=old, duplicates_resolved=duplicates_resolved)
+
+
+def _format_current_old_line(account: TelegramAccount) -> str:
+    """Одна строка отчёта sync-accounts (см. docstring модуля). Показывает
+    АКТУАЛЬНЫЙ синхронизированный name (не историческое имя — Telegram
+    правдиво возвращает один и тот же username для обеих session-записей
+    одного физического аккаунта), но не теряет старое имя — оно видно в
+    "(previously: ...)", если previous_names не пуст (см. задачу: "DB row
+    7 исторически была @Misha_Offroad")."""
+    state = "OLD" if account.is_old else "CURRENT"
+    suffix = f" (previously: {', '.join(account.previous_names)})" if account.previous_names else ""
+    return (
+        f"id={account.id} {account.name} TG_ID={account.telegram_user_id} "
+        f"{state} enabled={int(account.enabled)}{suffix}"
+    )
 
 
 def main() -> None:
