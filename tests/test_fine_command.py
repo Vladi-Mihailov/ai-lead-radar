@@ -267,10 +267,10 @@ def fx(tmp_path):
 async def test_fine_add_with_explicit_dates(fx):
     result = await fx.command.handle(_ctx(["add", "b957ma09", "03.08.2026", "13.08.2026"]))
 
-    assert "✅ Мониторинг штрафов добавлен" in result.text
-    assert "Автомобиль: B957MA09" in result.text
-    assert "Период: 03.08.2026–13.08.2026" in result.text
-    assert "09:00, 15:00 и 21:00" in result.text
+    assert "✅ Номер добавлен на мониторинг" in result.text
+    assert "🚗 B957MA09" in result.text
+    assert "📅 Мониторинг: 03.08.2026 — 13.08.2026" in result.text
+    assert "🔎 Штрафы проверены: новых штрафов нет" in result.text
     # Внутренний ID задачи — деталь реализации БД, оператору не нужен.
     assert "ID" not in result.text
 
@@ -285,7 +285,7 @@ async def test_fine_add_with_explicit_dates(fx):
 async def test_fine_add_without_dates_defaults_to_today_plus_30_days(fx):
     result = await fx.command.handle(_ctx(["add", "AA001AA"]))
 
-    assert "✅ Мониторинг штрафов добавлен" in result.text
+    assert "✅ Номер добавлен на мониторинг" in result.text
 
     [task] = fx.task_repository.list_active()
     assert (task.end_date - task.start_date) == timedelta(days=30)
@@ -320,14 +320,26 @@ async def test_fine_add_rejects_end_before_start(fx):
     assert "END_DATE" in exc_info.value.message
 
 
-async def test_fine_add_rejects_overlapping_active_task(fx):
+async def test_fine_add_resets_period_instead_of_rejecting_when_active_task_exists(fx):
+    """Повторное добавление автомобиля, уже находящегося на активном
+    мониторинге, больше НЕ ошибка (см. задачу про изменение бизнес-логики):
+    период существующей задачи перезаписывается на today..today+30,
+    вторая (дублирующая) задача не создаётся, даже если оператор указал
+    свои собственные (пересекающиеся или нет) даты."""
+    today = datetime.now(timezone.utc).astimezone(_TBILISI).date()
+
     await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
+    [task_before] = fx.task_repository.list_active()
 
-    with pytest.raises(CommandError) as exc_info:
-        await fx.command.handle(_ctx(["add", "AA001AA", "15.08.2026", "20.09.2026"]))
+    result = await fx.command.handle(_ctx(["add", "AA001AA", "15.08.2026", "20.09.2026"]))
 
-    assert "уже есть активная задача" in exc_info.value.message
-    assert len(fx.task_repository.list_active()) == 1
+    assert "✅ Номер добавлен на мониторинг" in result.text
+    expected_period = f"{today.strftime('%d.%m.%Y')} — {(today + timedelta(days=30)).strftime('%d.%m.%Y')}"
+    assert f"📅 Мониторинг: {expected_period}" in result.text
+    [task_after] = fx.task_repository.list_active()
+    assert task_after.id == task_before.id  # без второй задачи
+    assert task_after.start_date == today
+    assert task_after.end_date == today + timedelta(days=30)
 
 
 # ---- fine add NUMBER @username ----
@@ -353,8 +365,8 @@ async def test_fine_add_with_username_links_owner_not_creator(tmp_path):
         found = fx.user_repository.find_by_car_number("A123AA777")
         assert [u.user_id for u in found] == [OWNER_USER_ID]
 
-        assert "✅ Мониторинг штрафов добавлен" in result.text
-        assert "Telegram: @owner" in result.text
+        assert "✅ Номер добавлен на мониторинг" in result.text
+        assert "👤 @owner" in result.text
     finally:
         fx.close()
 
@@ -366,8 +378,8 @@ async def test_fine_add_without_username_keeps_old_behavior(tmp_path):
     try:
         result = await fx.command.handle(_ctx(["add", "A123AA777"]))
 
-        assert "✅ Мониторинг штрафов добавлен" in result.text
-        assert "Telegram:" not in result.text
+        assert "✅ Номер добавлен на мониторинг" in result.text
+        assert "👤 не найден" in result.text
         assert fx.user_repository.find_by_car_number("A123AA777") == []
 
         [task] = fx.task_repository.list_active()
@@ -418,8 +430,8 @@ async def test_fine_add_with_username_not_in_db_resolves_via_telegram_and_create
             _ctx(["add", "A123AA777", "@Santinorussia"])
         )
 
-        assert "✅ Мониторинг штрафов добавлен" in result.text
-        assert "Telegram: Santino (@Santinorussia)" in result.text
+        assert "✅ Номер добавлен на мониторинг" in result.text
+        assert "👤 Santino (@Santinorussia)" in result.text
 
         [task] = fx.task_repository.list_active()
         assert task.car_number == "A123AA777"
@@ -590,10 +602,10 @@ async def test_fine_add_with_username_race_reads_back_authoritative_row_after_up
     )
 
     class _RepositoryWithConcurrentWriter(_FakeUserRepository):
-        """Первый find_by_username() (до резолва) — пусто. Второй (после
-        upsert(), см. _resolve_and_store_new_user) — как будто в БД уже
-        оказалась запись от параллельного писателя, а не буквально то, что
-        только что передал наш upsert()."""
+        """Первый find_by_username() (до резолва) — пусто. После upsert() —
+        как будто в БД уже оказалась запись от параллельного писателя (и
+        find_by_username(), и find_by_car_number() читают её), а не
+        буквально то, что только что передал наш upsert()."""
 
         def __init__(self):
             super().__init__()
@@ -604,6 +616,11 @@ async def test_fine_add_with_username_race_reads_back_authoritative_row_after_up
             if self._lookups == 1:
                 return None
             return concurrently_written
+
+        def find_by_car_number(self, car_number):
+            if car_number == "A123AA777" and self.upsert_calls:
+                return [concurrently_written]
+            return super().find_by_car_number(car_number)
 
     entity = TelethonUser(
         id=555, username="santinorussia", first_name="Santino", last_name=None,
@@ -620,10 +637,10 @@ async def test_fine_add_with_username_race_reads_back_authoritative_row_after_up
         # дублей), но итоговый владелец в ответе оператору — из СВЕЖЕГО
         # чтения репозитория, а не собран напрямую из Telegram entity.
         assert len(user_repository.upsert_calls) == 1
-        assert "✅ Мониторинг штрафов добавлен" in result.text
+        assert "✅ Номер добавлен на мониторинг" in result.text
         # Значение first_name — из СВЕЖЕГО чтения (concurrently_written),
         # а не из Telegram entity ("Santino") — подтверждает read-after-write.
-        assert "Telegram: Записано параллельно (@santinorussia)" in result.text
+        assert "👤 Записано параллельно (@santinorussia)" in result.text
     finally:
         fx.close()
 
@@ -647,7 +664,7 @@ async def test_fine_add_with_username_already_owning_number_is_idempotent(tmp_pa
     try:
         result = await fx.command.handle(_ctx(["add", "A123AA777", "@owner"]))
 
-        assert "Telegram: @owner" in result.text
+        assert "👤 @owner" in result.text
         assert "⚠️" not in result.text
 
         found = fx.user_repository.find_by_car_number("A123AA777")
@@ -671,7 +688,7 @@ async def test_fine_add_with_username_re_adding_existing_owner_among_several_is_
     try:
         result = await fx.command.handle(_ctx(["add", "A123AA777", "@user2"]))
 
-        assert "Telegram: @user2" in result.text
+        assert "👤 @user1, @user2" in result.text  # показаны ВСЕ владельцы
         assert "⚠️" not in result.text
 
         found = fx.user_repository.find_by_car_number("A123AA777")
@@ -697,7 +714,7 @@ async def test_fine_add_with_username_links_second_owner_when_car_already_has_on
     try:
         result = await fx.command.handle(_ctx(["add", "A123AA777", "@user2"]))
 
-        assert "✅ Мониторинг штрафов добавлен" in result.text
+        assert "✅ Номер добавлен на мониторинг" in result.text
         assert "⚠️" not in result.text
 
         [task] = fx.task_repository.list_active()
@@ -725,7 +742,7 @@ async def test_fine_add_with_username_links_third_owner_when_car_already_has_two
     try:
         result = await fx.command.handle(_ctx(["add", "A123AA777", "@user3"]))
 
-        assert "✅ Мониторинг штрафов добавлен" in result.text
+        assert "✅ Номер добавлен на мониторинг" in result.text
         assert "⚠️" not in result.text
 
         [task] = fx.task_repository.list_active()
@@ -785,8 +802,8 @@ async def test_fine_add_with_explicit_dates_and_username(tmp_path):
             _ctx(["add", "A123AA777", "01.08.2026", "31.08.2026", "@owner"])
         )
 
-        assert "Период: 01.08.2026–31.08.2026" in result.text
-        assert "Telegram: Иван Петров (@owner)" in result.text
+        assert "📅 Мониторинг: 01.08.2026 — 31.08.2026" in result.text
+        assert "👤 Иван Петров (@owner)" in result.text
     finally:
         fx.close()
 
@@ -806,9 +823,8 @@ async def test_fine_add_with_username_enriches_existing_monitoring_when_username
 
         result = await fx.command.handle(_ctx(["add", "A123AA777", "@owner"]))
 
-        assert "уже был на мониторинге" in result.text
-        assert "Добавлен Telegram-пользователь" in result.text
-        assert "@owner" in result.text
+        assert "✅ Номер добавлен на мониторинг" in result.text
+        assert "👤 @owner" in result.text
 
         # НЕ создана вторая (дублирующая) задача мониторинга того же номера.
         [task_after] = fx.task_repository.list_active()
@@ -838,8 +854,8 @@ async def test_fine_add_with_username_not_in_db_resolves_and_enriches_existing_m
 
         result = await fx.command.handle(_ctx(["add", "A123AA777", "@santinorussia"]))
 
-        assert "уже был на мониторинге" in result.text
-        assert "Добавлен Telegram-пользователь" in result.text
+        assert "✅ Номер добавлен на мониторинг" in result.text
+        assert "👤 Santino (@santinorussia)" in result.text
 
         [task_after] = fx.task_repository.list_active()
         assert task_after.id == task_before.id  # без дубля задачи
@@ -851,9 +867,12 @@ async def test_fine_add_with_username_not_in_db_resolves_and_enriches_existing_m
         fx.close()
 
 
-async def test_fine_add_with_username_already_linked_to_existing_monitoring_is_idempotent(tmp_path):
+async def test_fine_add_with_username_already_linked_to_existing_monitoring_updates_period(tmp_path):
     """Номер уже на мониторинге И уже связан именно с этим @username —
-    идемпотентно: ни вторая задача, ни дубль пользователя/car_numbers."""
+    ни вторая задача, ни дубль пользователя/car_numbers, но период всё
+    равно перезаписывается на today..today+30 (см. задачу: "Повторное
+    добавление того же user также должно обновлять период")."""
+    today = datetime.now(timezone.utc).astimezone(_TBILISI).date()
     owner = TelegramUserInfo(user_id=222, username="owner", first_name=None, last_name=None)
     fx = _Fixture(tmp_path, user_repository=_FakeUserRepository(users=[owner]))
     try:
@@ -862,12 +881,13 @@ async def test_fine_add_with_username_already_linked_to_existing_monitoring_is_i
 
         result = await fx.command.handle(_ctx(["add", "A123AA777", "@owner"]))
 
-        assert "уже на мониторинге" in result.text
-        assert "уже связан" in result.text
-        assert "@owner" in result.text
+        assert "✅ Номер добавлен на мониторинг" in result.text
+        assert "👤 @owner" in result.text
 
         [task_after] = fx.task_repository.list_active()
         assert task_after.id == task_before.id
+        assert task_after.start_date == today
+        assert task_after.end_date == today + timedelta(days=30)
 
         found = fx.user_repository.find_by_car_number("A123AA777")
         assert [u.user_id for u in found] == [222]  # без дублей
@@ -891,7 +911,7 @@ async def test_fine_add_with_username_links_second_owner_on_existing_monitoring_
 
         result = await fx.command.handle(_ctx(["add", "A123AA777", "@new_username"]))
 
-        assert "уже был на мониторинге" in result.text
+        assert "✅ Номер добавлен на мониторинг" in result.text
         assert "@new_username" in result.text
 
         [task_after] = fx.task_repository.list_active()
@@ -932,8 +952,8 @@ async def test_fine_add_with_username_existing_owner_without_username_enriched_b
 
         result = await fx.command.handle(_ctx(["add", "A123AA777", "@santinorussia"]))
 
-        assert "✅ Мониторинг штрафов добавлен" in result.text
-        assert "Telegram: Santino (@santinorussia)" in result.text
+        assert "✅ Номер добавлен на мониторинг" in result.text
+        assert "👤 Santino (@santinorussia)" in result.text
 
         # upsert() обновил ТУ ЖЕ запись (тот же user_id=555) — не создал новую.
         [updated] = user_repository.upsert_calls
@@ -968,7 +988,7 @@ async def test_fine_add_with_username_existing_owner_without_username_gets_a_sec
     try:
         result = await fx.command.handle(_ctx(["add", "A123AA777", "@someone_else"]))
 
-        assert "✅ Мониторинг штрафов добавлен" in result.text
+        assert "✅ Номер добавлен на мониторинг" in result.text
 
         [task] = fx.task_repository.list_active()
         assert task.car_number == "A123AA777"
@@ -1009,14 +1029,15 @@ async def test_fine_add_with_username_resolve_failure_leaves_existing_monitoring
         fx.close()
 
 
-async def test_fine_add_with_username_enrichment_preserves_existing_monitoring_dates_and_settings(
+async def test_fine_add_with_username_enrichment_resets_period_but_preserves_other_settings(
     tmp_path,
 ):
-    """Даты/остальные параметры существующей задачи мониторинга (период,
-    id, статус, telegram_chat_id, created_by_user_id) НЕ должны меняться в
-    результате обогащения владельцем — единственное изменение — привязка
-    пользователя к car_number (users.car_numbers), задача мониторинга не
-    трогается вовсе."""
+    """Период существующей задачи мониторинга (start_date/end_date)
+    ПЕРЕЗАПИСЫВАЕТСЯ на today..today+30 при обогащении владельцем (см.
+    задачу про изменение бизнес-логики) — но id/статус/telegram_chat_id/
+    created_by_user_id НЕ меняются: единственные изменения — период и
+    привязка пользователя к car_number (users.car_numbers)."""
+    today = datetime.now(timezone.utc).astimezone(_TBILISI).date()
     owner = TelegramUserInfo(user_id=222, username="owner", first_name=None, last_name=None)
     fx = _Fixture(tmp_path, user_repository=_FakeUserRepository(users=[owner]))
     try:
@@ -1029,12 +1050,11 @@ async def test_fine_add_with_username_enrichment_preserves_existing_monitoring_d
 
         [task_after] = fx.task_repository.list_active()
         assert task_after.id == task_before.id
-        assert task_after.start_date == task_before.start_date
-        assert task_after.end_date == task_before.end_date
+        assert task_after.start_date == today
+        assert task_after.end_date == today + timedelta(days=30)
         assert task_after.status == task_before.status
         assert task_after.telegram_chat_id == task_before.telegram_chat_id
         assert task_after.created_by_user_id == task_before.created_by_user_id
-        assert task_after.updated_at == task_before.updated_at
     finally:
         fx.close()
 
@@ -1045,6 +1065,251 @@ async def test_fine_add_rejects_bare_at_symbol(fx):
 
     assert "Неверный формат команды" in exc_info.value.message
     assert fx.task_repository.list_active() == []
+
+
+# ---- fine add: повторное добавление автомобиля с активной задачей -------
+# ---- всегда сбрасывает период на today..today+30 (см. задачу про --------
+# ---- изменение бизнес-логики повторного добавления) ----------------------
+
+
+async def test_fine_add_shortens_period_when_old_end_date_is_later_than_today_plus_30(tmp_path):
+    """Старый end_date позже today+30 — период всё равно заменяется на
+    today..today+30, а не сохраняется/продлевается (см. задачу)."""
+    today = datetime.now(timezone.utc).astimezone(_TBILISI).date()
+    fx = _Fixture(tmp_path, records_by_car={"AA001AA": []})
+    try:
+        far_future_end = (today + timedelta(days=90)).strftime("%d.%m.%Y")
+        await fx.command.handle(
+            _ctx(["add", "AA001AA", today.strftime("%d.%m.%Y"), far_future_end])
+        )
+        [task_before] = fx.task_repository.list_active()
+        assert task_before.end_date == today + timedelta(days=90)
+
+        result = await fx.command.handle(_ctx(["add", "AA001AA"]))
+
+        [task_after] = fx.task_repository.list_active()
+        assert task_after.id == task_before.id
+        assert task_after.start_date == today
+        assert task_after.end_date == today + timedelta(days=30)
+        assert "✅ Номер добавлен на мониторинг" in result.text
+    finally:
+        fx.close()
+
+
+async def test_fine_add_extends_period_when_old_end_date_is_earlier_than_today_plus_30(tmp_path):
+    """Старый end_date раньше today+30 (но ещё не истёк) — период тоже
+    заменяется на today..today+30, а не остаётся коротким (см. задачу)."""
+    today = datetime.now(timezone.utc).astimezone(_TBILISI).date()
+    fx = _Fixture(tmp_path, records_by_car={"AA001AA": []})
+    try:
+        near_end = (today + timedelta(days=5)).strftime("%d.%m.%Y")
+        await fx.command.handle(
+            _ctx(["add", "AA001AA", today.strftime("%d.%m.%Y"), near_end])
+        )
+        [task_before] = fx.task_repository.list_active()
+        assert task_before.end_date == today + timedelta(days=5)
+
+        result = await fx.command.handle(_ctx(["add", "AA001AA"]))
+
+        [task_after] = fx.task_repository.list_active()
+        assert task_after.id == task_before.id
+        assert task_after.start_date == today
+        assert task_after.end_date == today + timedelta(days=30)
+        assert "✅ Номер добавлен на мониторинг" in result.text
+    finally:
+        fx.close()
+
+
+async def test_fine_add_links_third_owner_on_existing_monitoring_and_updates_period(tmp_path):
+    """Добавление ТРЕТЬЕГО Telegram-пользователя на автомобиль, уже
+    связанный с двумя, — не конфликт: связь добавляется дополнительно, и
+    период всё равно обновляется (см. задачу: несколько владельцев —
+    валидное состояние)."""
+    today = datetime.now(timezone.utc).astimezone(_TBILISI).date()
+    user1 = TelegramUserInfo(user_id=1, username="user1", first_name=None, last_name=None)
+    user2 = TelegramUserInfo(user_id=2, username="user2", first_name=None, last_name=None)
+    user3 = TelegramUserInfo(user_id=3, username="user3", first_name=None, last_name=None)
+    fx = _Fixture(tmp_path, user_repository=_FakeUserRepository(users=[user1, user2, user3]))
+    try:
+        await fx.command.handle(_ctx(["add", "A123AA777", "@user1"]))
+        await fx.command.handle(_ctx(["add", "A123AA777", "@user2"]))
+        [task_before] = fx.task_repository.list_active()
+
+        result = await fx.command.handle(_ctx(["add", "A123AA777", "@user3"]))
+
+        assert "✅ Номер добавлен на мониторинг" in result.text
+        [task_after] = fx.task_repository.list_active()
+        assert task_after.id == task_before.id
+        assert task_after.start_date == today
+        assert task_after.end_date == today + timedelta(days=30)
+
+        found = fx.user_repository.find_by_car_number("A123AA777")
+        assert sorted(u.user_id for u in found) == [1, 2, 3]
+    finally:
+        fx.close()
+
+
+async def test_fine_add_does_not_touch_completed_task_creates_new_one_instead(tmp_path):
+    """Завершённая (completed) задача НЕ считается активной (см.
+    get_active_by_car_number) — повторное добавление того же номера
+    создаёт НОВУЮ задачу обычным путём, а completed-задача остаётся как
+    есть, ни один её атрибут не меняется (см. задачу: "Исторические
+    completed tasks не менять")."""
+    fx = _Fixture(tmp_path)
+    try:
+        await fx.command.handle(_ctx(["add", "AA001AA", "01.01.2026", "31.01.2026"]))
+        [old_task] = fx.task_repository.list_active()
+        fx.task_repository.set_status(old_task.id, "completed")
+        completed_before = fx.task_repository.get(old_task.id)
+        assert completed_before.status == "completed"
+
+        result = await fx.command.handle(_ctx(["add", "AA001AA"]))
+
+        # Обычное создание — активной задачи не было (completed не считается).
+        assert "✅ Номер добавлен на мониторинг" in result.text
+        [new_task] = fx.task_repository.list_active()
+        assert new_task.id != old_task.id
+
+        completed_after = fx.task_repository.get(old_task.id)
+        assert completed_after == completed_before  # завершённая задача не изменилась вовсе
+    finally:
+        fx.close()
+
+
+async def test_fine_add_runs_immediate_check_on_both_new_creation_and_reset(tmp_path):
+    """Немедленная проверка штрафов выполняется И для нового автомобиля, И
+    для сброса периода уже отслеживаемого (см. задачу) — тот же самый
+    механизм (FineCheckService.check_task() +
+    FineNotificationCoordinator.flush_pending()), что и "fine check"/"fine
+    update-all", без параллельной реализации. Новый штраф, найденный при
+    первом создании, реально отправляется через notification_service, а
+    не только упоминается в тексте ответа; повторное добавление того же
+    номера видит тот же штраф уже не новым."""
+    fx = _Fixture(tmp_path, records_by_car={"AA001AA": [_record(car_number="AA001AA")]})
+    try:
+        first_result = await fx.command.handle(_ctx(["add", "AA001AA"]))
+
+        assert "🔎 Штрафы проверены: найдено новых — 1" in first_result.text
+        assert len(fx.notification_service.notify_calls) == 1  # реально отправлено
+
+        second_result = await fx.command.handle(_ctx(["add", "AA001AA"]))
+
+        assert "🔎 Штрафы проверены: новых штрафов нет" in second_result.text
+        assert len(fx.notification_service.notify_calls) == 1  # не задублировано
+    finally:
+        fx.close()
+
+
+# ---- fine add: единое итоговое сообщение оператору (см. задачу) ---------
+
+
+async def test_fine_add_summary_no_fines_found_shows_all_required_fields(tmp_path):
+    """Успешное добавление без штрафов — итоговое сообщение содержит все
+    обязательные поля: номер, всех связанных Telegram-пользователей,
+    фактические start_date/end_date, результат немедленной проверки."""
+    owner1 = TelegramUserInfo(user_id=1, username="MarysuaZ", first_name=None, last_name=None)
+    owner2 = TelegramUserInfo(user_id=2, username="VeronaWarm", first_name=None, last_name=None)
+    today = datetime.now(timezone.utc).astimezone(_TBILISI).date()
+    fx = _Fixture(
+        tmp_path,
+        records_by_car={"M295YB196": []},
+        user_repository=_FakeUserRepository(users=[owner1, owner2]),
+    )
+    try:
+        await fx.command.handle(_ctx(["add", "M295YB196", "@MarysuaZ"]))
+        result = await fx.command.handle(_ctx(["add", "M295YB196", "@VeronaWarm"]))
+
+        expected_period = (
+            f"{today.strftime('%d.%m.%Y')} — {(today + timedelta(days=30)).strftime('%d.%m.%Y')}"
+        )
+        assert result.text == (
+            "✅ Номер добавлен на мониторинг\n\n"
+            "🚗 M295YB196\n"
+            "👤 @MarysuaZ, @VeronaWarm\n"
+            f"📅 Мониторинг: {expected_period}\n"
+            "🔎 Штрафы проверены: новых штрафов нет"
+        )
+    finally:
+        fx.close()
+
+
+async def test_fine_add_summary_reports_fines_found_without_duplicating_detailed_notification(
+    tmp_path,
+):
+    """Если немедленная проверка находит штраф — сообщение отражает
+    фактический результат (не "новых штрафов нет"), а подробное
+    уведомление о самом штрафе доставляется отдельно, тем же
+    FineNotificationCoordinator, без дублирования в итоговом сообщении."""
+    fx = _Fixture(tmp_path, records_by_car={"M295YB196": [_record(car_number="M295YB196")]})
+    try:
+        result = await fx.command.handle(_ctx(["add", "M295YB196"]))
+
+        assert "✅ Номер добавлен на мониторинг" in result.text
+        assert "🔎 Штрафы проверены: найдено новых — 1" in result.text
+        assert "новых штрафов нет" not in result.text
+        # Итоговое сообщение короткое — не пересказывает сам штраф (номер
+        # протокола/даты и т.п.), это уже задача отдельного уведомления.
+        assert "AB123456" not in result.text
+
+        # Подробное уведомление реально отправлено — ровно один раз, тем
+        # же координатором, не второй параллельной реализацией.
+        assert len(fx.notification_service.notify_calls) == 1
+        [sent_event] = fx.notification_service.notify_calls[0]
+        assert sent_event.external_fine_id == "AB123456"
+    finally:
+        fx.close()
+
+
+async def test_fine_add_summary_shows_warning_when_immediate_check_fails(tmp_path):
+    """Немедленная проверка завершилась ошибкой — задача мониторинга и
+    связи с Telegram-пользователями всё равно сохранены (см. задачу), но
+    сообщение явно предупреждает, а не заявляет "Штрафы проверены"."""
+    owner = TelegramUserInfo(user_id=222, username="owner", first_name=None, last_name=None)
+    fx = _Fixture(
+        tmp_path,
+        provider_error=FineProviderError("police.ge недоступен"),
+        user_repository=_FakeUserRepository(users=[owner]),
+    )
+    try:
+        result = await fx.command.handle(_ctx(["add", "M295YB196", "@owner"]))
+
+        assert result.text.startswith(
+            "⚠️ Номер добавлен на мониторинг, но проверить штрафы сейчас не удалось"
+        )
+        assert "Штрафы проверены" not in result.text
+        assert "🔎 Проверка не выполнена: police.ge недоступен" in result.text
+        assert "🚗 M295YB196" in result.text
+        assert "👤 @owner" in result.text
+
+        # Задача и связь с владельцем всё равно сохранены.
+        [task] = fx.task_repository.list_active()
+        assert task.car_number == "M295YB196"
+        found = fx.user_repository.find_by_car_number("M295YB196")
+        assert [u.user_id for u in found] == [222]
+
+        # Ни одного уведомления не отправлено — проверка не завершилась успешно.
+        assert fx.notification_service.notify_calls == []
+    finally:
+        fx.close()
+
+
+async def test_fine_add_summary_shows_all_telegram_users_for_reused_car(tmp_path):
+    """Реальный случай из задачи: M295YB196 уже связан с @MarysuaZ и
+    @VeronaWarm — повторное добавление (без нового @username) должно
+    показать ОБОИХ в итоговом сообщении, а не одного/никого."""
+    owner1 = TelegramUserInfo(user_id=1, username="MarysuaZ", first_name=None, last_name=None)
+    owner2 = TelegramUserInfo(user_id=2, username="VeronaWarm", first_name=None, last_name=None)
+    fx = _Fixture(
+        tmp_path,
+        records_by_car={"M295YB196": []},
+        user_repository=_FakeUserRepository(users_by_car_number={"M295YB196": [owner1, owner2]}),
+    )
+    try:
+        result = await fx.command.handle(_ctx(["add", "M295YB196"]))
+
+        assert "👤 @MarysuaZ, @VeronaWarm" in result.text
+    finally:
+        fx.close()
 
 
 # ---- fine add bulk ----
@@ -1238,27 +1503,36 @@ async def test_fine_add_bulk_command_accepts_space_separated_numbers(fx):
     assert car_numbers == {"H663KH702", "C072H0977"}
 
 
-async def test_fine_add_bulk_command_reports_already_in_monitoring(fx):
+async def test_fine_add_bulk_command_resets_period_for_already_tracked_number(fx):
+    """С новой бизнес-логикой (см. задачу про изменение поведения при
+    повторном добавлении) _handle_add() больше не бросает ошибку для уже
+    отслеживаемого номера — вместо этого обновляет период существующей
+    задачи. add-bulk делегирует туда же (см. _handle_add_bulk_command), поэтому
+    такой номер тоже считается "Добавлено", а не "Уже в мониторинге", и
+    задача НЕ дублируется."""
     await fx.command.handle(_ctx(["add", "H663KH702"]))
+    [task_before] = fx.task_repository.get_active_by_car_number("H663KH702")
 
     result = await fx.command.handle(_ctx(["add-bulk", "H663KH702", "C072H0977"]))
 
-    assert "Добавлено: 1" in result.text
-    assert "Уже в мониторинге: 1" in result.text
+    assert "Добавлено: 2" in result.text
+    assert "Уже в мониторинге: 0" in result.text
     assert len(fx.task_repository.list_active()) == 2
+    [task_after] = fx.task_repository.get_active_by_car_number("H663KH702")
+    assert task_after.id == task_before.id  # не дублирована, только период обновлён
 
 
 async def test_fine_add_bulk_command_deduplicates_within_message(fx):
     # Дубль внутри самого сообщения — второе появление того же номера
-    # обрабатывается тем же путём, что и "уже в мониторинге" (см.
-    # _handle_add_bulk_command): validate_no_overlap() внутри _handle_add()
-    # уже видит задачу, созданную первым появлением этого же номера.
+    # теперь тоже успешно обрабатывается _handle_add_bulk_command() (см.
+    # _handle_add): второе появление находит задачу, созданную первым, и
+    # обновляет её период вместо ошибки — задача по-прежнему одна.
     result = await fx.command.handle(
         _ctx(["add-bulk", "H663KH702", "h663kh702", "C072H0977"])
     )
 
-    assert "Добавлено: 2" in result.text
-    assert "Уже в мониторинге: 1" in result.text
+    assert "Добавлено: 3" in result.text
+    assert "Уже в мониторинге: 0" in result.text
     car_numbers = sorted(task.car_number for task in fx.task_repository.list_active())
     assert car_numbers == ["C072H0977", "H663KH702"]
 
@@ -1411,10 +1685,20 @@ async def test_fine_stop_already_stopped_car_returns_command_error(fx):
 
 
 async def test_fine_stop_stops_all_active_tasks_for_car_number(fx):
-    # validate_no_overlap не запрещает две непересекающиеся по датам
-    # активные задачи для одного номера — fine stop должен остановить обе.
-    await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "10.08.2026"]))
-    await fx.command.handle(_ctx(["add", "AA001AA", "15.08.2026", "20.08.2026"]))
+    # С новой бизнес-логикой (см. задачу) через "fine add" у одного номера
+    # больше нельзя завести вторую активную задачу — повторное добавление
+    # обновляет период существующей. Две активные задачи для одного номера
+    # теперь возможны только как унаследованное/историческое состояние —
+    # создаём их напрямую через репозиторий, а не через команду, но
+    # fine stop всё равно должен останавливать обе.
+    fx.task_repository.create(
+        car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 10),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+    )
+    fx.task_repository.create(
+        car_number="AA001AA", label=None, start_date=date(2026, 8, 15), end_date=date(2026, 8, 20),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+    )
     task_ids = [task.id for task in fx.task_repository.list_active()]
     assert len(task_ids) == 2
 
@@ -1443,6 +1727,10 @@ async def test_fine_stop_rejects_wrong_argument_count(fx):
 
 
 async def test_fine_check_by_car_number(tmp_path):
+    """fine add теперь тоже запускает немедленную проверку (см. задачу) —
+    единственный штраф уже учтён как новый ПРИ добавлении, поэтому
+    последующий "fine check" находит его снова (тот же провайдер), но уже
+    не как новый (дедуп по fingerprint+task, см. DetectedFineRepository)."""
     fx = _Fixture(tmp_path, records_by_car={"AA001AA": [_record(car_number="AA001AA")]})
     try:
         await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
@@ -1452,7 +1740,7 @@ async def test_fine_check_by_car_number(tmp_path):
         assert "✅ Проверка завершена" in result.text
         assert "Автомобиль: AA001AA" in result.text
         assert "Найдено штрафов: 1" in result.text
-        assert "Новых: 1" in result.text
+        assert "Новых: 0" in result.text
         assert "мс" in result.text
     finally:
         fx.close()
@@ -1482,11 +1770,13 @@ async def test_fine_check_shows_owner_by_car_number_not_task_creator(tmp_path):
         result = await fx.command.handle(_ctx(["check", "AA001AA"]))
 
         assert "Telegram: @owner_ivan" in result.text
-        # Остальное содержимое результата не потеряно.
+        # Остальное содержимое результата не потеряно. Штраф уже учтён как
+        # новый при "fine add" (см. test_fine_check_by_car_number) — здесь
+        # снова найден, но уже не новый.
         assert "✅ Проверка завершена" in result.text
         assert "Автомобиль: AA001AA" in result.text
         assert "Найдено штрафов: 1" in result.text
-        assert "Новых: 1" in result.text
+        assert "Новых: 0" in result.text
         assert "мс" in result.text
     finally:
         fx.close()
@@ -1668,8 +1958,11 @@ async def test_fine_check_does_not_duplicate_already_notified_fine_on_repeat(tmp
 
 
 async def test_fine_check_checks_all_active_tasks_for_car_number(tmp_path):
-    # Две непересекающиеся по датам активные задачи для одного номера —
-    # fine check должен проверить обе и просуммировать результат.
+    # Две активные задачи для одного номера — теперь возможны только как
+    # унаследованное/историческое состояние (см. задачу: "fine add" больше
+    # не создаёт вторую активную задачу для уже отслеживаемого номера) —
+    # создаём их напрямую через репозиторий. fine check должен проверить
+    # обе и просуммировать результат.
     fx = _Fixture(
         tmp_path,
         records_by_car={
@@ -1680,8 +1973,14 @@ async def test_fine_check_checks_all_active_tasks_for_car_number(tmp_path):
         },
     )
     try:
-        await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "10.08.2026"]))
-        await fx.command.handle(_ctx(["add", "AA001AA", "15.08.2026", "20.08.2026"]))
+        fx.task_repository.create(
+            car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 10),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+        fx.task_repository.create(
+            car_number="AA001AA", label=None, start_date=date(2026, 8, 15), end_date=date(2026, 8, 20),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
         assert len(fx.task_repository.list_active()) == 2
 
         result = await fx.command.handle(_ctx(["check", "AA001AA"]))
@@ -1709,6 +2008,9 @@ async def test_fine_update_all_checks_all_active_car_numbers(tmp_path):
     try:
         await fx.command.handle(_ctx(["add", "AA001AA"]))
         await fx.command.handle(_ctx(["add", "BB002BB"]))
+        # fine add теперь тоже запускает немедленную проверку (см. задачу) —
+        # считаем здесь только запросы, сделанные именно update-all.
+        fx.provider.requested_plates.clear()
 
         result = await fx.command.handle(_ctx(["update-all"]))
 
@@ -1716,7 +2018,9 @@ async def test_fine_update_all_checks_all_active_car_numbers(tmp_path):
         assert "✅ Массовая проверка завершена" in result.text
         assert "Всего: 2" in result.text
         assert "Проверено: 2" in result.text
-        assert "Новые штрафы: 1" in result.text
+        # fp-1 уже учтён как новый штраф при "fine add AA001AA" — здесь он
+        # найден снова, но уже не новый (дедуп по fingerprint+task).
+        assert "Новые штрафы: 0" in result.text
         assert "Ошибок: 0" in result.text
     finally:
         fx.close()
@@ -1753,6 +2057,9 @@ async def test_fine_update_all_skips_inactive_car_numbers(fx):
     await fx.command.handle(_ctx(["add", "AA001AA"]))
     await fx.command.handle(_ctx(["add", "BB002BB"]))
     await fx.command.handle(_ctx(["stop", "BB002BB"]))
+    # fine add теперь тоже запускает немедленную проверку (см. задачу) —
+    # считаем здесь только запросы, сделанные именно update-all.
+    fx.provider.requested_plates.clear()
 
     result = await fx.command.handle(_ctx(["update-all"]))
 
@@ -1769,13 +2076,17 @@ async def test_fine_update_all_error_on_one_car_does_not_stop_others(tmp_path):
     try:
         await fx.command.handle(_ctx(["add", "AA001AA"]))
         await fx.command.handle(_ctx(["add", "BB002BB"]))
+        # fine add теперь тоже запускает немедленную проверку (см. задачу) —
+        # считаем здесь только запросы, сделанные именно update-all.
+        provider.requested_plates.clear()
 
         result = await fx.command.handle(_ctx(["update-all"]))
 
         assert sorted(provider.requested_plates) == ["AA001AA", "BB002BB"]
         assert "Всего: 2" in result.text
         assert "Проверено: 1" in result.text
-        assert "Новые штрафы: 1" in result.text
+        # Штраф BB002BB уже учтён как новый при "fine add BB002BB".
+        assert "Новые штрафы: 0" in result.text
         assert "Ошибок: 1" in result.text
         assert "• AA001AA — police.ge недоступен для AA001AA" in result.text
     finally:

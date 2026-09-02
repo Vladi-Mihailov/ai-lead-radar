@@ -26,7 +26,6 @@ from reader.fines.notification_coordinator import (
 from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.fines.validation import (
     FineValidationError,
-    find_overlapping_task,
     normalize_car_number,
     parse_date,
     resolve_monitoring_period,
@@ -122,11 +121,25 @@ class _OwnerLinkResult(NamedTuple):
     create() — сам @username не удалось найти/резолвить в Telegram.
     Один car_number МОЖЕТ быть связан сразу с несколькими Telegram-
     пользователями (см. задачу) — это не конфликт: запрошенный @username
-    просто добавляется как ЕЩЁ ОДНА связь, существующие не трогаются."""
+    просто добавляется как ЕЩЁ ОДНА связь, существующие не трогаются.
+    Итоговый ответ оператору показывает ВСЕХ связанных пользователей (см.
+    _handle_add/_car_owner_display), не только этого — поэтому здесь
+    хранится только то, кого физически связать."""
 
-    telegram_line: str  # "Telegram: ..." в ответе об успешном добавлении
     user_id_to_link: int | None  # кому вызвать add_car_numbers() — None,
     # если car_number уже есть у этого же пользователя (дублировать не нужно)
+
+
+class _ImmediateCheckOutcome(NamedTuple):
+    """Результат немедленной проверки штрафов сразу после fine add (см.
+    _run_immediate_check_for_add/_format_add_summary) — ok=False только
+    когда сама проверка завершилась ошибкой (FineCheckService вернул
+    status='error'), не когда штрафов просто не нашлось (это ok=True,
+    new_fines_count=0). error_message заполнен только при ok=False."""
+
+    ok: bool
+    new_fines_count: int
+    error_message: str | None
 
 
 def _split_bulk_numbers(args: list[str]) -> list[str]:
@@ -256,79 +269,110 @@ class FineCommand(Command):
 
         existing = self._task_repository.get_active_by_car_number(car_number)
 
-        # Lookup @username ДО создания задачи — если пользователь не
-        # найден, задача мониторинга вообще не создаётся (см. задачу: не
-        # должно получиться состояния "task создан, а владелец — нет").
-        # Намеренно ДО validate_no_overlap(): если номер уже на активном
-        # мониторинге (период пересекается) И передан @username — это не
-        # ошибка "уже добавлен", а сценарий "обогатить существующую запись
-        # владельцем" (см. задачу и ветку ниже) — она должна успеть
-        # определить владельца (найти/резолвнуть через Telegram/поймать
-        # конфликт) ДО того, как validate_no_overlap возможно бросит
-        # исключение "уже есть активная задача".
+        # Lookup @username ДО создания/обновления задачи — если пользователь
+        # не найден, ничего не меняется (см. задачу: не должно получиться
+        # состояния "task тронут, а владелец — нет"). owner_username может
+        # быть указан при ЛЮБОМ исходе ниже (новая задача или уже
+        # существующая активная) — единственный оставшийся повод для
+        # CommandError здесь — сам @username не удалось найти/резолвить.
         owner_result: _OwnerLinkResult | None = None
         if owner_username is not None:
             owner_result = await self._resolve_car_owner_for_add(car_number, owner_username)
 
-        if owner_result is not None and find_overlapping_task(start_date, end_date, existing) is not None:
-            # Номер уже в активном мониторинге — вторую (дублирующую)
-            # задачу НЕ создаём (см. задачу), существующие даты/настройки
-            # этой активной задачи не трогаем вовсе. _resolve_car_owner_
-            # for_add() выше уже сама разрешила единственный оставшийся
-            # повод для ошибки (username не найден — CommandError, брошенный
-            # до этой строки) — здесь owner_result гарантированно успешен:
-            # новая ДОПОЛНИТЕЛЬНАЯ привязка либо уже существующая (идемпотентно).
-            newly_linked = owner_result.user_id_to_link is not None
-            if newly_linked:
-                self._user_repository.add_car_numbers(owner_result.user_id_to_link, [car_number])
-            return CommandResult(
-                text=self._format_enrichment_result(car_number, owner_result, newly_linked=newly_linked)
+        if existing:
+            # Автомобиль уже под активным мониторингом (см. задачу) —
+            # вторую (дублирующую) задачу НЕ создаём, существующая
+            # переиспользуется. Период ВСЕГДА перезаписывается
+            # относительно СЕГОДНЯШНЕЙ даты (тем же resolve_monitoring_period(
+            # None, None, ...), что и для новой задачи по умолчанию — не
+            # второй параллельный расчёт периода), а не продлевается от
+            # старого end_date — независимо от того, что было указано в
+            # команде (см. задачу: "start_date = today, end_date =
+            # today + N дней" при каждом повторном добавлении). Остальные
+            # настройки задачи (label/telegram_chat_id/created_by_user_id/
+            # archive-режим) не трогаем — см. reset_period().
+            # "Обычно у номера ровно одна активная задача (см. _handle_stop)
+            # — берём первую, как и остальной код на этом же допущении.
+            reset_start, reset_end = resolve_monitoring_period(None, None, today=today)
+            task = self._task_repository.reset_period(
+                existing[0].id, start_date=reset_start, end_date=reset_end,
             )
-
-        validate_no_overlap(start_date, end_date, existing)
-
-        task = self._task_repository.create(
-            car_number=car_number,
-            label=None,
-            start_date=start_date,
-            end_date=end_date,
-            telegram_chat_id=ctx.chat_id,
-            created_by_user_id=ctx.user_id,
-        )
+        else:
+            validate_no_overlap(start_date, end_date, existing)
+            task = self._task_repository.create(
+                car_number=car_number,
+                label=None,
+                start_date=start_date,
+                end_date=end_date,
+                telegram_chat_id=ctx.chat_id,
+                created_by_user_id=ctx.user_id,
+            )
 
         if owner_result is not None and owner_result.user_id_to_link is not None:
             # self._user_repository гарантированно не None здесь — иначе
             # _resolve_car_owner_for_add() уже бросил бы CommandError выше.
             self._user_repository.add_car_numbers(owner_result.user_id_to_link, [car_number])
 
-        lines = [
-            "✅ Мониторинг штрафов добавлен",
-            "",
-            f"Автомобиль: {task.car_number}",
-        ]
-        if owner_result is not None:
-            lines.append(f"Telegram: {owner_result.telegram_line}")
-        lines.append(f"Период: {_fmt_date(start_date)}–{_fmt_date(end_date)}")
-        lines.append(f"Проверка: {_format_check_times(self._run_times)} по Тбилиси")
+        # Немедленная проверка штрафов ПОСЛЕ того, как задача создана/
+        # обновлена и связи с Telegram-пользователями сохранены (см.
+        # задачу) — для НОВОГО автомобиля и для сброса периода уже
+        # существующего одинаково, тем же самым FineCheckService.
+        # check_task()/FineNotificationCoordinator.flush_pending(), что и
+        # "fine check"/"fine update-all" (см. _handle_check), без
+        # параллельной реализации проверки. Ошибка проверки НЕ откатывает
+        # и не блокирует уже сохранённую задачу/связи — только отражается
+        # в итоговом сообщении оператору (см. _format_add_summary).
+        check_outcome = await self._run_immediate_check_for_add(task)
 
-        return CommandResult(text="\n".join(lines))
+        return CommandResult(
+            text=self._format_add_summary(task, self._car_owner_display(car_number), check_outcome)
+        )
+
+    async def _run_immediate_check_for_add(self, task: FineMonitoringTask) -> _ImmediateCheckOutcome:
+        check_result = await self._check_service.check_task(task)
+        if check_result.status == "error":
+            return _ImmediateCheckOutcome(
+                ok=False, new_fines_count=0, error_message=check_result.error_message,
+            )
+
+        # Тот же механизм доставки, что и у FineJob/fine check — тем же
+        # самым координатором, а не копией логики.
+        await self._notification_coordinator.flush_pending()
+        return _ImmediateCheckOutcome(
+            ok=True, new_fines_count=len(check_result.new_fines), error_message=None,
+        )
 
     @staticmethod
-    def _format_enrichment_result(
-        car_number: str, owner_result: _OwnerLinkResult, *, newly_linked: bool,
+    def _format_add_summary(
+        task: FineMonitoringTask, owner_display: str, check_outcome: _ImmediateCheckOutcome,
     ) -> str:
-        """Ответ оператору для сценария "номер уже на активном мониторинге,
-        владелец обогащён" (см. _handle_add) — БЕЗ повторного создания
-        задачи мониторинга и без изменения её дат/настроек (см. задачу)."""
-        if newly_linked:
-            return (
-                f"✔ Автомобиль {car_number} уже был на мониторинге.\n"
-                f"Добавлен Telegram-пользователь {owner_result.telegram_line}."
+        """Единый итоговый ответ оператору для fine add — и для нового
+        автомобиля, и для сброса периода уже отслеживаемого (см. задачу).
+        owner_display — уже ВСЕ связанные Telegram-пользователи этого
+        car_number (см. _car_owner_display/format_car_owner_display), а не
+        только тот, кого только что резолвили/связали. Детальное
+        уведомление о самом найденном штрафе доставляется отдельно, тем же
+        FineNotificationCoordinator (см. _run_immediate_check_for_add) —
+        здесь только короткая факт-строка результата, без дублирования."""
+        if check_outcome.ok:
+            title = "✅ Номер добавлен на мониторинг"
+            check_line = (
+                f"🔎 Штрафы проверены: найдено новых — {check_outcome.new_fines_count}"
+                if check_outcome.new_fines_count
+                else "🔎 Штрафы проверены: новых штрафов нет"
             )
-        return (
-            f"✔ Автомобиль {car_number} уже на мониторинге и уже связан "
-            f"с {owner_result.telegram_line}."
-        )
+        else:
+            title = "⚠️ Номер добавлен на мониторинг, но проверить штрафы сейчас не удалось"
+            check_line = f"🔎 Проверка не выполнена: {check_outcome.error_message}"
+
+        return "\n".join([
+            title,
+            "",
+            f"🚗 {task.car_number}",
+            f"👤 {owner_display}",
+            f"📅 Мониторинг: {_fmt_date(task.start_date)} — {_fmt_date(task.end_date)}",
+            check_line,
+        ])
 
     async def _resolve_car_owner_for_add(self, car_number: str, raw_username: str) -> _OwnerLinkResult:
         """Читает find_by_username/find_by_car_number, и (см. _resolve_and_
@@ -369,11 +413,11 @@ class FineCommand(Command):
             # Уже привязан именно ему (независимо от того, сколько ещё
             # других пользователей уже связано с этим car_number) — успех
             # без дублей, повторно писать car_numbers не нужно.
-            return _OwnerLinkResult(format_car_owner_display([owner]), None)
+            return _OwnerLinkResult(None)
 
         # car_number ещё не связан с этим пользователем — связываем
         # ДОПОЛНИТЕЛЬНО, не заменяя и не удаляя уже существующие связи.
-        return _OwnerLinkResult(format_car_owner_display([owner]), owner.user_id)
+        return _OwnerLinkResult(owner.user_id)
 
     async def _resolve_and_store_new_user(self, raw_username: str) -> TelegramUserInfo | None:
         """@raw_username отсутствует в локальной БД (см. вызывающий код —

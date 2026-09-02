@@ -140,6 +140,14 @@ SET status = 'active',
 WHERE id = :id
 """
 
+_UPDATE_RESET_PERIOD = """
+UPDATE fine_monitoring_tasks
+SET start_date = :start_date,
+    end_date = :end_date,
+    updated_at = CURRENT_TIMESTAMP
+WHERE id = :id
+"""
+
 
 def _row_to_task(row) -> FineMonitoringTask:
     (
@@ -385,6 +393,30 @@ class FineMonitoringTaskRepository:
             },
         )
         self._conn.commit()
+
+    def reset_period(self, task_id: int, *, start_date: date, end_date: date) -> FineMonitoringTask:
+        """Перезаписывает start_date/end_date уже АКТИВНОЙ задачи (см.
+        reader/commands/fine.py _handle_add — повторное добавление
+        автомобиля, у которого уже есть active-задача, сбрасывает её
+        период относительно сегодняшней даты, а не продлевает от старого
+        end_date). В отличие от return_to_active_monitoring() (для
+        completed/архивных задач, возвращаемых в активный режим) — не
+        трогает status/archive_check_enabled/next_archive_check_at:
+        задача и так уже активна, остальные настройки менять не нужно."""
+        self._conn.execute(
+            _UPDATE_RESET_PERIOD,
+            {
+                "id": task_id,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+            },
+        )
+        self._conn.commit()
+
+        task = self.get(task_id)
+        if task is None:
+            raise RuntimeError(f"Задача мониторинга {task_id} не найдена")
+        return task
 
     def close(self) -> None:
         self._conn.close()

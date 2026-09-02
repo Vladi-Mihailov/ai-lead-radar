@@ -681,3 +681,56 @@ def test_return_to_active_monitoring_resets_task_to_frequent_mode(tmp_path):
         assert [t.id for t in repo.list_active()] == [task.id]
     finally:
         repo.close()
+
+
+def test_reset_period_updates_only_dates_and_returns_task(tmp_path):
+    """См. reader/commands/fine.py _handle_add — повторное добавление
+    автомобиля, у которого уже есть active-задача. В отличие от
+    return_to_active_monitoring() — не трогает status/archive_check_enabled/
+    next_archive_check_at, только start_date/end_date/updated_at."""
+    repo = _make_repo(tmp_path)
+    try:
+        task = repo.create(
+            car_number="AA001AA", label="метка", start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+
+        new_start = date(2026, 9, 2)
+        new_end = date(2026, 10, 2)
+        updated = repo.reset_period(task.id, start_date=new_start, end_date=new_end)
+
+        assert updated.id == task.id
+        assert updated.start_date == new_start
+        assert updated.end_date == new_end
+        # Остальные настройки не тронуты.
+        assert updated.status == "active"
+        assert updated.label == "метка"
+        assert updated.telegram_chat_id == _CHAT_ID
+        assert updated.created_by_user_id == _USER_ID
+        assert updated.archive_check_enabled is False
+        assert updated.next_archive_check_at is None
+
+        fetched = repo.get(task.id)
+        assert fetched == updated
+    finally:
+        repo.close()
+
+
+def test_reset_period_does_not_touch_other_active_tasks(tmp_path):
+    repo = _make_repo(tmp_path)
+    try:
+        task_a = repo.create(
+            car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+        task_b = repo.create(
+            car_number="BB002BB", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+
+        repo.reset_period(task_a.id, start_date=date(2026, 9, 2), end_date=date(2026, 10, 2))
+
+        untouched = repo.get(task_b.id)
+        assert untouched == task_b
+    finally:
+        repo.close()
