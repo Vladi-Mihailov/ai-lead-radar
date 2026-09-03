@@ -297,6 +297,13 @@ class FineCommand(Command):
             task = self._task_repository.reset_period(
                 existing[0].id, start_date=reset_start, end_date=reset_end,
             )
+            # Задача могла быть изначально заведена клиентским ботом
+            # (@GEShtrafbot, monitoring_scope='client_bot', см.
+            # reader/fines/models.py::FineMonitoringScope) — оператор,
+            # явно выполнив "fine add" для того же номера, берёт её под
+            # операторский контроль. Апгрейд необратим и не требует
+            # отдельной ветки: no-op, если задача и так уже 'operator'.
+            self._task_repository.ensure_operator_scope(task.id)
         else:
             validate_no_overlap(start_date, end_date, existing)
             task = self._task_repository.create(

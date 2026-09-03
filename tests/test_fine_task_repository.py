@@ -11,6 +11,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import pytest  # noqa: E402
+
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
 
 _CHAT_ID = -100999
@@ -732,5 +734,212 @@ def test_reset_period_does_not_touch_other_active_tasks(tmp_path):
 
         untouched = repo.get(task_b.id)
         assert untouched == task_b
+    finally:
+        repo.close()
+
+
+# ---- monitoring_scope (@GEShtrafbot foundation, см. design report) ----
+
+
+def test_create_defaults_monitoring_scope_to_operator(tmp_path):
+    repo = _make_repo(tmp_path)
+    try:
+        task = repo.create(
+            car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+
+        assert task.monitoring_scope == "operator"
+    finally:
+        repo.close()
+
+
+def test_create_accepts_explicit_client_bot_scope(tmp_path):
+    """Новая задача, впервые заведённая только флоу клиентского бота
+    (см. design), создаётся с monitoring_scope='client_bot' — существующие
+    вызовы create() без этого параметра не затронуты (см. предыдущий тест)."""
+    repo = _make_repo(tmp_path)
+    try:
+        task = repo.create(
+            car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+            monitoring_scope="client_bot",
+        )
+
+        assert task.monitoring_scope == "client_bot"
+        assert repo.get(task.id).monitoring_scope == "client_bot"
+    finally:
+        repo.close()
+
+
+def test_migration_adds_monitoring_scope_column_and_defaults_existing_rows_to_operator(tmp_path):
+    """Существующая (уже на сервере) строка, созданная ДО появления
+    monitoring_scope — легаси-схема даже без архивных колонок, самый
+    старый возможный случай — после открытия репозитория должна стать
+    monitoring_scope='operator', то есть сохранить ровно то поведение,
+    которое она и так имела (единственное расписание до @GEShtrafbot)."""
+    db_path = tmp_path / "users.db"
+
+    legacy_conn = sqlite3.connect(db_path)
+    legacy_conn.execute(_LEGACY_SCHEMA)
+    legacy_conn.execute(
+        "INSERT INTO fine_monitoring_tasks "
+        "(car_number, label, start_date, end_date, status, telegram_chat_id, created_by_user_id) "
+        "VALUES ('AA001AA', NULL, '2026-01-01', '2026-01-31', 'active', -100999, 111)"
+    )
+    legacy_conn.commit()
+    legacy_conn.close()
+
+    repo = FineMonitoringTaskRepository(db_path)
+    try:
+        columns = {
+            row[1] for row in repo._conn.execute("PRAGMA table_info(fine_monitoring_tasks)")
+        }
+        assert "monitoring_scope" in columns
+
+        [task] = repo.list_active()
+        assert task.car_number == "AA001AA"
+        assert task.monitoring_scope == "operator"
+    finally:
+        repo.close()
+
+
+def test_ensure_operator_scope_upgrades_client_bot_task(tmp_path):
+    repo = _make_repo(tmp_path)
+    try:
+        task = repo.create(
+            car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+            monitoring_scope="client_bot",
+        )
+
+        updated = repo.ensure_operator_scope(task.id)
+
+        assert updated.monitoring_scope == "operator"
+        assert repo.get(task.id).monitoring_scope == "operator"
+    finally:
+        repo.close()
+
+
+def test_ensure_operator_scope_is_noop_for_already_operator_task(tmp_path):
+    """Операторская задача никогда не 'понижается' — вызов метода на уже
+    'operator' задаче ничего не ломает и не меняет остальные поля."""
+    repo = _make_repo(tmp_path)
+    try:
+        task = repo.create(
+            car_number="AA001AA", label="метка", start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+        assert task.monitoring_scope == "operator"
+
+        updated = repo.ensure_operator_scope(task.id)
+
+        assert updated.monitoring_scope == "operator"
+        assert updated.label == "метка"
+        assert updated.start_date == task.start_date
+        assert updated.end_date == task.end_date
+    finally:
+        repo.close()
+
+
+def test_ensure_operator_scope_raises_for_unknown_task(tmp_path):
+    repo = _make_repo(tmp_path)
+    try:
+        with pytest.raises(RuntimeError):
+            repo.ensure_operator_scope(999999)
+    finally:
+        repo.close()
+
+
+def test_list_active_by_scope_partitions_operator_and_client_bot_tasks(tmp_path):
+    """Ключевое инвариант scheduling-модели (см. design): каждая активная
+    задача попадает РОВНО в одну из двух выборок — операторскую или
+    клиентскую, никогда в обе сразу."""
+    repo = _make_repo(tmp_path)
+    try:
+        operator_task = repo.create(
+            car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+        client_task = repo.create(
+            car_number="BB002BB", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+            monitoring_scope="client_bot",
+        )
+        stopped_client_task = repo.create(
+            car_number="CC003CC", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+            monitoring_scope="client_bot",
+        )
+        repo.set_status(stopped_client_task.id, "stopped")
+
+        operator_tasks = repo.list_active_by_scope("operator")
+        client_tasks = repo.list_active_by_scope("client_bot")
+
+        assert [t.id for t in operator_tasks] == [operator_task.id]
+        assert [t.id for t in client_tasks] == [client_task.id]  # остановленная не попадает
+
+        # Ни одна активная задача не встречается в обеих выборках сразу.
+        assert {t.id for t in operator_tasks} & {t.id for t in client_tasks} == set()
+    finally:
+        repo.close()
+
+
+# ---- extend_period_if_shorter ----
+
+
+def test_extend_period_if_shorter_extends_when_candidate_is_later(tmp_path):
+    repo = _make_repo(tmp_path)
+    try:
+        task = repo.create(
+            car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+
+        updated = repo.extend_period_if_shorter(task.id, date(2026, 9, 30))
+
+        assert updated.end_date == date(2026, 9, 30)
+        assert updated.start_date == task.start_date  # start_date не трогается
+        assert repo.get(task.id).end_date == date(2026, 9, 30)
+    finally:
+        repo.close()
+
+
+def test_extend_period_if_shorter_never_shortens(tmp_path):
+    repo = _make_repo(tmp_path)
+    try:
+        task = repo.create(
+            car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 9, 30),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+
+        updated = repo.extend_period_if_shorter(task.id, date(2026, 8, 15))
+
+        assert updated.end_date == date(2026, 9, 30)  # без изменений
+        assert repo.get(task.id).end_date == date(2026, 9, 30)
+    finally:
+        repo.close()
+
+
+def test_extend_period_if_shorter_is_noop_when_candidate_equals_current(tmp_path):
+    repo = _make_repo(tmp_path)
+    try:
+        task = repo.create(
+            car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+
+        updated = repo.extend_period_if_shorter(task.id, date(2026, 8, 31))
+
+        assert updated.end_date == date(2026, 8, 31)
+    finally:
+        repo.close()
+
+
+def test_extend_period_if_shorter_raises_for_unknown_task(tmp_path):
+    repo = _make_repo(tmp_path)
+    try:
+        with pytest.raises(RuntimeError):
+            repo.extend_period_if_shorter(999999, date(2026, 12, 31))
     finally:
         repo.close()

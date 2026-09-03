@@ -2,7 +2,7 @@ import sqlite3
 from datetime import date, datetime
 from pathlib import Path
 
-from reader.fines.models import FineMonitoringTask, FineTaskStatus
+from reader.fines.models import FineMonitoringScope, FineMonitoringTask, FineTaskStatus
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS fine_monitoring_tasks (
@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS fine_monitoring_tasks (
     last_check_status   TEXT,
     last_error          TEXT,
     archive_check_enabled INTEGER NOT NULL DEFAULT 0,
-    next_archive_check_at TIMESTAMP
+    next_archive_check_at TIMESTAMP,
+    monitoring_scope    TEXT NOT NULL DEFAULT 'operator'
 )
 """
 
@@ -49,15 +50,24 @@ _COLUMN_MIGRATIONS = {
     "next_archive_check_at": (
         "ALTER TABLE fine_monitoring_tasks ADD COLUMN next_archive_check_at TIMESTAMP"
     ),
+    # monitoring_scope (см. reader/fines/models.py::FineMonitoringScope) —
+    # DEFAULT 'operator' присваивает существующим строкам ровно то
+    # поведение, которое они и так имели (единственное фоновое расписание
+    # до появления @GEShtrafbot, см. design) — миграция сама по себе никого
+    # не переводит в 'client_bot'.
+    "monitoring_scope": (
+        "ALTER TABLE fine_monitoring_tasks "
+        "ADD COLUMN monitoring_scope TEXT NOT NULL DEFAULT 'operator'"
+    ),
 }
 
 _INSERT = """
 INSERT INTO fine_monitoring_tasks (
     car_number, label, start_date, end_date, status,
-    telegram_chat_id, created_by_user_id
+    telegram_chat_id, created_by_user_id, monitoring_scope
 ) VALUES (
     :car_number, :label, :start_date, :end_date, 'active',
-    :telegram_chat_id, :created_by_user_id
+    :telegram_chat_id, :created_by_user_id, :monitoring_scope
 )
 """
 
@@ -65,7 +75,7 @@ _SELECT_FIELDS = """
     id, car_number, label, start_date, end_date, status,
     telegram_chat_id, created_by_user_id, created_at, updated_at,
     last_checked_at, last_check_status, last_error,
-    archive_check_enabled, next_archive_check_at
+    archive_check_enabled, next_archive_check_at, monitoring_scope
 """
 
 _SELECT_BY_ID = f"SELECT {_SELECT_FIELDS} FROM fine_monitoring_tasks WHERE id = ?"
@@ -77,6 +87,11 @@ _SELECT_ACTIVE = f"""
 _SELECT_ACTIVE_BY_CAR = f"""
     SELECT {_SELECT_FIELDS} FROM fine_monitoring_tasks
     WHERE car_number = ? AND status = 'active'
+"""
+
+_SELECT_ACTIVE_BY_SCOPE = f"""
+    SELECT {_SELECT_FIELDS} FROM fine_monitoring_tasks
+    WHERE status = 'active' AND monitoring_scope = ?
 """
 
 _SELECT_DUE_FOR_ARCHIVE_CHECK = f"""
@@ -148,6 +163,24 @@ SET start_date = :start_date,
 WHERE id = :id
 """
 
+# monitoring_scope != 'operator' в WHERE — не пишем (и не сдвигаем
+# updated_at) там, где задача и так уже 'operator', см.
+# ensure_operator_scope().
+_ENSURE_OPERATOR_SCOPE = """
+UPDATE fine_monitoring_tasks
+SET monitoring_scope = 'operator', updated_at = CURRENT_TIMESTAMP
+WHERE id = ? AND monitoring_scope != 'operator'
+"""
+
+# end_date сравнивается с ТЕМ ЖЕ самым :end_date, что и записывается —
+# однострочный compare-and-set: пишем, только если кандидат СТРОГО позже
+# уже сохранённого значения (см. extend_period_if_shorter()).
+_EXTEND_PERIOD_IF_SHORTER = """
+UPDATE fine_monitoring_tasks
+SET end_date = :end_date, updated_at = CURRENT_TIMESTAMP
+WHERE id = :id AND end_date < :end_date
+"""
+
 
 def _row_to_task(row) -> FineMonitoringTask:
     (
@@ -166,6 +199,7 @@ def _row_to_task(row) -> FineMonitoringTask:
         last_error,
         archive_check_enabled,
         next_archive_check_at,
+        monitoring_scope,
     ) = row
 
     return FineMonitoringTask(
@@ -186,6 +220,7 @@ def _row_to_task(row) -> FineMonitoringTask:
         next_archive_check_at=(
             datetime.fromisoformat(next_archive_check_at) if next_archive_check_at else None
         ),
+        monitoring_scope=monitoring_scope,
     )
 
 
@@ -231,6 +266,7 @@ class FineMonitoringTaskRepository:
         end_date: date,
         telegram_chat_id: int,
         created_by_user_id: int,
+        monitoring_scope: FineMonitoringScope = "operator",
     ) -> FineMonitoringTask:
         cursor = self._conn.execute(
             _INSERT,
@@ -241,6 +277,7 @@ class FineMonitoringTaskRepository:
                 "end_date": end_date.isoformat(),
                 "telegram_chat_id": telegram_chat_id,
                 "created_by_user_id": created_by_user_id,
+                "monitoring_scope": monitoring_scope,
             },
         )
         self._conn.commit()
@@ -256,6 +293,19 @@ class FineMonitoringTaskRepository:
 
     def list_active(self) -> list[FineMonitoringTask]:
         rows = self._conn.execute(_SELECT_ACTIVE).fetchall()
+        return [_row_to_task(row) for row in rows]
+
+    def list_active_by_scope(self, scope: FineMonitoringScope) -> list[FineMonitoringTask]:
+        """Как list_active(), но только задачи конкретного monitoring_scope.
+        Взаимоисключающее партиционирование для будущих FineJob('operator')/
+        ClientFineJob('client_bot') — см. design про "минимальную и чистую
+        scheduling-модель": ОДНА задача проверяется РОВНО одним фоновым
+        job'ом (никогда обоими сразу), поэтому общая для оператора и
+        клиента машина не проверяется дважды. Ни один существующий
+        вызывающий код (FineJob/fine list/fine update-all) не переключён на
+        этот метод в этой задаче — используется только напрямую там, где
+        уже вызывается явно."""
+        rows = self._conn.execute(_SELECT_ACTIVE_BY_SCOPE, (scope,)).fetchall()
         return [_row_to_task(row) for row in rows]
 
     def get_active_by_car_number(self, car_number: str) -> list[FineMonitoringTask]:
@@ -410,6 +460,46 @@ class FineMonitoringTaskRepository:
                 "start_date": start_date.isoformat(),
                 "end_date": end_date.isoformat(),
             },
+        )
+        self._conn.commit()
+
+        task = self.get(task_id)
+        if task is None:
+            raise RuntimeError(f"Задача мониторинга {task_id} не найдена")
+        return task
+
+    def ensure_operator_scope(self, task_id: int) -> FineMonitoringTask:
+        """Повышает monitoring_scope задачи до 'operator', если она была
+        'client_bot' — используется reader/commands/fine.py::_handle_add,
+        когда оператор явно выполняет "fine add" для номера, задача
+        которого уже существует и была изначально заведена клиентским
+        ботом (см. design). Апгрейд НЕОБРАТИМ — обратного метода
+        "понизить до client_bot" не существует: однажды взятая оператором
+        под контроль задача остаётся 'operator' навсегда.
+
+        No-op без единой записи (в т.ч. без сдвига updated_at), если
+        задача и так уже 'operator' — тот же принцип, что и у
+        UserRepository.update_access_hash()."""
+        self._conn.execute(_ENSURE_OPERATOR_SCOPE, (task_id,))
+        self._conn.commit()
+
+        task = self.get(task_id)
+        if task is None:
+            raise RuntimeError(f"Задача мониторинга {task_id} не найдена")
+        return task
+
+    def extend_period_if_shorter(self, task_id: int, candidate_end_date: date) -> FineMonitoringTask:
+        """Продлевает end_date задачи, ТОЛЬКО если candidate_end_date
+        строго позже уже сохранённого — никогда не сокращает период. В
+        отличие от reset_period() (которым пользуется оператор через
+        "fine add" — там период безусловно перезаписывается) — нужен для
+        клиентских подписок: у одной задачи может быть несколько
+        подписчиков с разными периодами одновременно, и период самой
+        задачи должен покрывать самого "долгого" из них, а не последнего
+        добавленного/продлившего подписку (см. design)."""
+        self._conn.execute(
+            _EXTEND_PERIOD_IF_SHORTER,
+            {"id": task_id, "end_date": candidate_end_date.isoformat()},
         )
         self._conn.commit()
 

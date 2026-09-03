@@ -4,6 +4,15 @@ from typing import Any, Literal
 
 FineTaskStatus = Literal["active", "completed", "stopped"]
 
+# Владелец расписания проверки задачи (см. design про "минимальную и чистую
+# scheduling-модель"): 'operator' — существующий FineJob (текущее расписание,
+# не меняется), 'client_bot' — будущий ClientFineJob (2 раза в сутки,
+# см. reader/public_bot/). Партиционирование ВЗАИМОИСКЛЮЧАЮЩЕЕ — одна задача
+# проверяется ровно одним фоновым job'ом, без дублирующих проверок общих
+# машин. Апгрейд 'client_bot' -> 'operator' возможен (см.
+# FineMonitoringTaskRepository.ensure_operator_scope), обратно — никогда.
+FineMonitoringScope = Literal["operator", "client_bot"]
+
 
 @dataclass(frozen=True)
 class FineMonitoringTask:
@@ -29,6 +38,10 @@ class FineMonitoringTask:
     # FineMonitoringTask(...) (см. tests/test_fine_validation.py) без правки.
     archive_check_enabled: bool = False
     next_archive_check_at: datetime | None = None
+    # Default 'operator' сохраняет поведение для существующих строк
+    # (миграция) и для существующих вызовов FineMonitoringTask(...)/
+    # create(...) без этого параметра — см. FineMonitoringScope выше.
+    monitoring_scope: FineMonitoringScope = "operator"
 
 
 @dataclass(frozen=True)

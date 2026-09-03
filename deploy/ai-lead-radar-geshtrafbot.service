@@ -1,0 +1,34 @@
+[Unit]
+Description=AI Lead Radar - @GEShtrafbot (public client bot)
+After=network-online.target
+Wants=network-online.target
+
+# ИСХОДНЫЙ АРТЕФАКТ — НЕ установлен и не запущен (см. Stage 2 report).
+# Не копировать в /etc/systemd/system и не enable/start без отдельного,
+# явного решения — это отдельный процесс от ai-lead-radar.service, и его
+# включение означает, что @GEShtrafbot реально начнёт принимать сообщения
+# от публики.
+#
+# User/Group/WorkingDirectory — те же, что и у ai-lead-radar.service и
+# ai-lead-radar-inviter.service (см. `systemctl cat ai-lead-radar.service`
+# на сервере) — тот же venv/аккаунт, отдельный процесс, отдельная
+# .session (data/sessions/geshtrafbot.session, см.
+# reader/public_bot/main.py) и отдельные логи. .env — тот же файл, что и у
+# остальных процессов (WorkingDirectory совпадает, load_dotenv() ищет .env
+# в cwd) — GESHTRAFBOT_TOKEN должен быть заполнен там ДО первого запуска.
+[Service]
+Type=simple
+User=leadradar
+Group=leadradar
+WorkingDirectory=/home/leadradar/ai-lead-radar
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/leadradar/.venv/bin/python -m reader.public_bot.main
+
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

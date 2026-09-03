@@ -342,6 +342,46 @@ async def test_fine_add_resets_period_instead_of_rejecting_when_active_task_exis
     assert task_after.end_date == today + timedelta(days=30)
 
 
+async def test_fine_add_upgrades_existing_client_bot_task_to_operator_scope(fx):
+    """Задача могла быть изначально заведена клиентским ботом (@GEShtrafbot,
+    monitoring_scope='client_bot', см. design report про scheduling-модель).
+    Оператор, явно выполнив "fine add" для того же номера, берёт её под
+    операторский контроль — апгрейд необратим."""
+    client_bot_task = fx.task_repository.create(
+        car_number="AA001AA", label=None,
+        start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+        telegram_chat_id=555, created_by_user_id=777,
+        monitoring_scope="client_bot",
+    )
+    assert client_bot_task.monitoring_scope == "client_bot"
+
+    await fx.command.handle(_ctx(["add", "AA001AA"]))
+
+    [task_after] = fx.task_repository.list_active()
+    assert task_after.id == client_bot_task.id  # та же задача, не вторая
+    assert task_after.monitoring_scope == "operator"
+
+
+async def test_fine_add_does_not_change_scope_of_already_operator_task(fx):
+    """Операторская задача никогда не 'понижается' обратно в client_bot —
+    повторный fine add на уже 'operator' задачу это гарантированно не меняет."""
+    await fx.command.handle(_ctx(["add", "AA001AA"]))
+    [task_before] = fx.task_repository.list_active()
+    assert task_before.monitoring_scope == "operator"
+
+    await fx.command.handle(_ctx(["add", "AA001AA"]))
+
+    [task_after] = fx.task_repository.list_active()
+    assert task_after.monitoring_scope == "operator"
+
+
+async def test_fine_add_on_brand_new_car_defaults_to_operator_scope(fx):
+    await fx.command.handle(_ctx(["add", "BB002BB"]))
+
+    [task] = fx.task_repository.list_active()
+    assert task.monitoring_scope == "operator"
+
+
 # ---- fine add NUMBER @username ----
 
 
