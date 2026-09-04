@@ -202,36 +202,6 @@ async def test_delegated_active_subscription_delivers_to_both_recipients(tmp_pat
         fx.close()
 
 
-async def test_ownerless_delegated_subscription_delivers_only_to_trusted_operator(tmp_path):
-    """Trusted Add Car без клиента ("Отмена" на "Добавить Telegram
-    клиента?", см. design report) — telegram_user_id остаётся NULL
-    НАВСЕГДА (не pending_claim — никто не ждётся), доставка идёт ТОЛЬКО
-    создавшему trusted-оператору, роль 'owner' в принципе недостижима."""
-    now = _now()
-    fx = _Fixture(tmp_path)
-    try:
-        task_id = fx.make_task("AA001AA")
-        fine_id = fx.make_fine(task_id, "AA001AA")
-        sub = fx.subscription_repository.create_without_owner(
-            monitoring_task_id=task_id, car_number="AA001AA",
-            created_by_telegram_user_id=555, created_by_telegram_chat_id=555,
-            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
-        )
-
-        result = await fx.service.run_once(now=now)
-
-        assert result.delivered == 1
-        assert fx.sender.sent == [(555, fx.sender.sent[0][1])]
-        assert fx.delivery_repository.is_delivered(fine_id, sub.id, "trusted_operator") is True
-        assert fx.delivery_repository.get(fine_id, sub.id, "owner") is None  # даже не пытались
-        # Без CTA — та же логика, что и у обычного trusted_operator (не owner).
-        _, text, buttons = fx.sender.sent_full[0]
-        assert CTA_TEXT_BLOCK not in text
-        assert buttons is None
-    finally:
-        fx.close()
-
-
 async def test_pending_claim_delivers_only_to_trusted_operator(tmp_path):
     """См. design report Stage 4: "trusted creator при pending claim
     продолжает получать уведомления" — owner ещё не claimed, доставка ему

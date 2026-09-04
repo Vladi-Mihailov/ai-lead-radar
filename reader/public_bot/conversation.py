@@ -24,10 +24,28 @@ telegram_user_id из конфига (reader/settings.py::PublicBotSettings,
 никогда по username) — после ввода номера авто ВСЕГДА видит
 ADD_CLIENT_DECISION_PROMPT ("👤 Добавить Telegram клиента?"): "OK" ведёт к
 OWNER_USERNAME_PROMPT (как раньше), "Отмена" ставит машину на мониторинг
-БЕЗ клиента вовсе (см. SubscriptionService.add_delegated_car_without_client) —
-username клиента НЕ обязателен, у клиента он может отсутствовать. Никакого
-отдельного экрана "Для себя/Для другого" по-прежнему нет (упрощение — см.
-design report)."""
+БЕЗ клиента и БЕЗ subscription вовсе (см.
+SubscriptionService.add_delegated_car_without_client) — username клиента
+НЕ обязателен, у клиента он может отсутствовать. Никакого отдельного
+экрана "Для себя/Для другого" по-прежнему нет (упрощение — см. design
+report).
+
+Trusted-operator TASK-LEVEL admin (см. design report: пересмотр
+архитектуры — fine_monitoring_tasks остаётся ЕДИНСТВЕННЫМ source of truth
+автомобилей/monitoring jobs, fine_monitoring_subscriptions — ТОЛЬКО
+access/delivery слой для реальных клиентов): для telegram_user_id из
+trusted_operator_user_ids "📋 Мои авто"/"🔎 Проверить сейчас"/"⛔
+Остановить мониторинг" работают НАПРЯМУЮ с fine_monitoring_tasks (см.
+_format_trusted_tasks_reply/_build_trusted_task_picker_reply/
+handle_trusted_check_now_choice/handle_trusted_stop_pick/
+handle_trusted_stop_confirm) — subscription для этого НЕ требуется вовсе,
+видны ВСЕ активные задачи, включая исторические операторские без единой
+подписки. Для обычных пользователей поведение этих трёх пунктов меню НЕ
+меняется (см. _build_picker_reply/_format_my_cars_reply — subscription-
+based, как и раньше). is_trusted() перепроверяется на КАЖДОМ шаге этого
+flow заново по РЕАЛЬНОМУ event.sender_id — callback task_id публичен и не
+является доказательством авторизации сам по себе (тот же принцип, что и у
+subscription_id выше)."""
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -51,6 +69,16 @@ PERIOD_CHOICES = (30, 90, 180, 365)
 _START_PREFIX = "/start"
 _CLAIM_PAYLOAD_PREFIX = "claim_"
 
+# Trusted-operator task-level admin (см. design report) — production уже
+# сейчас содержит 250+ активных задач одновременно; список ВСЕХ (текст) и
+# picker (inline-кнопки) обрезаются одним и тем же лимитом — без него
+# текстовое сообщение рискует превысить лимит длины Telegram-сообщения, а
+# inline-клавиатура стала бы физически непригодной для использования.
+# Это ИЗВЕСТНОЕ упрощение (см. финальный отчёт) — полноценный поиск по
+# номеру/пагинация для больших автопарков остаются рекомендуемым
+# следующим шагом, не реализованы в этой задаче.
+_TRUSTED_TASK_LIST_LIMIT = 50
+
 
 @dataclass(frozen=True)
 class BotReply:
@@ -64,7 +92,15 @@ class BotReply:
     перепроверяется server-side при нажатии (см.
     SubscriptionService.get_actionable_subscription), а не на этапе
     показа списка (см. design report Stage 4: "никаких действий с чужими
-    subscriptions по callback payload")."""
+    subscriptions по callback payload").
+
+    trusted_check_now_options/trusted_stop_options/
+    trusted_stop_confirm_task_id — task-level аналоги для trusted-
+    оператора (см. design report про пересмотр архитектуры) — (task_id,
+    car_number) вместо (subscription_id, car_number); тот же принцип:
+    task_id публичен, авторизация — ИСКЛЮЧИТЕЛЬНО server-side повторная
+    проверка (is_trusted + задача существует и активна, см.
+    SubscriptionService.get_active_task_for_trusted_admin)."""
 
     text: str
     show_main_menu: bool = False
@@ -73,6 +109,10 @@ class BotReply:
     check_now_options: list[tuple[int, str]] | None = None
     stop_options: list[tuple[int, str]] | None = None
     stop_confirm_subscription_id: int | None = None
+    trusted_check_now_options: list[tuple[int, str]] | None = None
+    trusted_stop_options: list[tuple[int, str]] | None = None
+    trusted_stop_confirm_task_id: int | None = None
+    trusted_stop_confirm_button_label: str | None = None
 
 
 class ConversationController:
@@ -185,17 +225,45 @@ class ConversationController:
 
         if stripped_text == texts.MY_CARS_LABEL:
             self._states.clear(chat_id)
+            if self._is_trusted(telegram_user_id):
+                return self._format_trusted_tasks_reply()
             return self._format_my_cars_reply(telegram_user_id)
 
         if stripped_text == texts.CHECK_NOW_LABEL:
             self._states.clear(chat_id)
+            if self._is_trusted(telegram_user_id):
+                return self._build_trusted_task_picker_reply(kind="checknow")
             return self._build_picker_reply(telegram_user_id, kind="checknow")
 
         if stripped_text == texts.STOP_LABEL:
             self._states.clear(chat_id)
+            if self._is_trusted(telegram_user_id):
+                return self._build_trusted_task_picker_reply(kind="stop")
             return self._build_picker_reply(telegram_user_id, kind="stop")
 
         return None
+
+    def _format_trusted_tasks_reply(self) -> BotReply:
+        """"📋 Мои авто" для trusted-оператора — ВСЕ активные
+        fine_monitoring_tasks (см. design report), subscription для
+        отображения не требуется вовсе."""
+        tasks = self._subscriptions.list_all_active_tasks()
+        return BotReply(text=texts.format_trusted_tasks_list(tasks, limit=_TRUSTED_TASK_LIST_LIMIT))
+
+    def _build_trusted_task_picker_reply(self, *, kind: str) -> BotReply:
+        """Список ВСЕХ активных задач для 🔎/⛔ trusted-оператора — task_id
+        в кнопках (не subscription_id, не car_number): владение/
+        актуальность перепроверяются server-side при нажатии (см.
+        handle_trusted_check_now_choice/handle_trusted_stop_pick), список
+        сам по себе — не источник авторизации."""
+        tasks = self._subscriptions.list_all_active_tasks()
+        if not tasks:
+            return BotReply(text=texts.NO_ACTIVE_TASKS_TEXT)
+
+        options = [(t.id, t.car_number) for t in tasks[:_TRUSTED_TASK_LIST_LIMIT]]
+        if kind == "checknow":
+            return BotReply(text=texts.TRUSTED_CHECK_NOW_PICK_PROMPT, trusted_check_now_options=options)
+        return BotReply(text=texts.TRUSTED_STOP_PICK_PROMPT, trusted_stop_options=options)
 
     def _build_picker_reply(self, telegram_user_id: int, *, kind: str) -> BotReply:
         """Список авто, с которыми telegram_user_id может действовать
@@ -540,8 +608,8 @@ class ConversationController:
         return BotReply(
             text=texts.format_delegated_add_car_without_client_summary(
                 car_number=car_number,
-                start_date=outcome.subscription.start_date,
-                end_date=outcome.subscription.end_date,
+                start_date=outcome.task.start_date,
+                end_date=outcome.task.end_date,
                 check_ok=outcome.check_ok,
                 new_fines_count=outcome.new_fines_count,
             )
@@ -601,3 +669,69 @@ class ConversationController:
 
     def handle_stop_cancel(self) -> BotReply:
         return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
+
+    # ---- trusted-operator task-level admin (см. design report: пересмотр
+    # архитектуры) — 🔎/⛔ работают НАПРЯМУЮ с fine_monitoring_tasks, без
+    # subscription. is_trusted() перепроверяется ЗАНОВО на каждом шаге по
+    # РЕАЛЬНОМУ telegram_user_id (никогда не из предыдущего шага/payload) —
+    # callback task_id публичен и НЕ является доказательством авторизации
+    # сам по себе. ----
+
+    async def handle_trusted_check_now_choice(
+        self, task_id: int, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """None — вызывающий telegram_user_id НЕ trusted ИЛИ задача не
+        существует/не активна (см.
+        SubscriptionService.get_active_task_for_trusted_admin, вызывается
+        внутри check_now_task()) — Telethon-адаптер (handlers.py) в этом
+        случае отвечает алертом и ничего не проверяет. Оба случая
+        намеренно неразличимы для вызывающего кода (см. общий принцип
+        авторизации в проекте: не раскрывать ПОЧЕМУ именно отказано)."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+
+        outcome = await self._subscriptions.check_now_task(task_id)
+        if outcome is None:
+            return None
+        return BotReply(text=texts.format_check_now_result(outcome))
+
+    def handle_trusted_stop_pick(self, task_id: int, *, telegram_user_id: int) -> BotReply | None:
+        """Первый шаг — показывает подтверждение, ЕЩЁ НИЧЕГО не
+        останавливает. Текст/кнопка подтверждения зависят от того, есть ли
+        у задачи ещё actionable (active/pending_claim) client-подписки
+        (см. design report): 0 — обычное подтверждение; 1+ — явное
+        предупреждение "также отслеживается клиентом(-ами)", кнопка
+        "Остановить для всех"."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+
+        task = self._subscriptions.get_active_task_for_trusted_admin(task_id)
+        if task is None:
+            return None
+
+        subscriber_count = self._subscriptions.count_active_or_pending_subscribers_for_task(task_id)
+        return BotReply(
+            text=texts.format_trusted_stop_confirm_prompt(task.car_number, subscriber_count),
+            trusted_stop_confirm_task_id=task.id,
+            trusted_stop_confirm_button_label=texts.trusted_stop_confirm_button_label(subscriber_count),
+        )
+
+    def handle_trusted_stop_confirm(self, task_id: int, *, telegram_user_id: int) -> BotReply:
+        """Финальный шаг — is_trusted()+задача существует/активна
+        перепроверяются ЗАНОВО здесь (а не только доверяются тому, что
+        пользователь дошёл до этого экрана, см. design report: "на КАЖДОМ
+        действии и особенно финальном Stop повторно проверять") —
+        SubscriptionService.stop_task_for_trusted_admin() сам делает
+        итоговую проверку актуальности задачи ещё раз перед записью."""
+        if not self._is_trusted(telegram_user_id):
+            return BotReply(text=texts.CALLBACK_NOT_AUTHORIZED_TEXT, show_main_menu=True)
+
+        task = self._subscriptions.get_active_task_for_trusted_admin(task_id)
+        if task is None:
+            return BotReply(text=texts.TRUSTED_STOP_FAILED_TEXT, show_main_menu=True)
+
+        stopped = self._subscriptions.stop_task_for_trusted_admin(task_id)
+        if not stopped:
+            return BotReply(text=texts.TRUSTED_STOP_FAILED_TEXT, show_main_menu=True)
+
+        return BotReply(text=texts.format_stop_success(task.car_number), show_main_menu=True)

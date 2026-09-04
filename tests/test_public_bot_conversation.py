@@ -557,7 +557,11 @@ def test_claim_deep_link_start_rejects_unknown_token(fx):
     assert reply.text == texts.CLAIM_INVALID_TEXT
 
 
-async def test_trusted_my_cars_shows_managed_section_separately(trusted_fx):
+async def test_trusted_my_cars_shows_all_active_tasks_not_subscriptions(trusted_fx):
+    """См. design report: пересмотр архитектуры — "Мои авто" для trusted
+    оператора теперь task-based (ВСЕ активные fine_monitoring_tasks), а не
+    subscription-based (own+managed) — старый MANAGED_CARS_HEADER-раздел
+    здесь больше не показывается."""
     trusted_fx.user_repository.upsert(
         TelegramUserInfo(
             user_id=777, username="real_owner", first_name=None, last_name=None,
@@ -572,9 +576,9 @@ async def test_trusted_my_cars_shows_managed_section_separately(trusted_fx):
         texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert texts.MANAGED_CARS_HEADER in reply.text
+    assert reply.text.startswith(texts.TRUSTED_TASKS_HEADER)
     assert "M295YB196" in reply.text
-    assert "Владелец: @real_owner" in reply.text
+    assert texts.MANAGED_CARS_HEADER not in reply.text
 
 
 def test_ordinary_user_my_cars_has_no_managed_section(fx):
@@ -723,3 +727,268 @@ async def test_unrelated_user_cannot_check_or_stop_delegated_subscription(truste
 
     stop_reply = trusted_fx.controller.handle_stop_pick(subscription.id, telegram_user_id=999999)
     assert stop_reply is None
+
+
+# ==== trusted-operator task-level admin (см. design report: пересмотр
+# архитектуры — fine_monitoring_tasks = source of truth, subscription для
+# этих трёх пунктов меню trusted-оператору НЕ требуется) ====
+
+
+def _make_operator_task(fx, car_number="E911EE95", *, status="active") -> int:
+    """Задача БЕЗ единой fine_monitoring_subscriptions строки — как
+    исторические операторские автомобили на production (см. design
+    report diagnosis: 1245 из 1248 задач без единой подписки)."""
+    task = fx.task_repository.create(
+        car_number=car_number, label=None,
+        start_date=date(2026, 8, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=-100999, created_by_user_id=111,
+    )
+    if status != "active":
+        fx.task_repository.set_status(task.id, status)
+    return task.id
+
+
+async def test_trusted_my_cars_shows_task_without_any_subscription(trusted_fx):
+    """Явное требование: trusted видит task без subscription — 📋 Мои
+    авто показывает ВСЕ активные fine_monitoring_tasks, subscription не
+    требуется вовсе."""
+    _make_operator_task(trusted_fx, "E911EE95")
+
+    reply = trusted_fx.controller.handle_text(
+        texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert "E911EE95" in reply.text
+    assert trusted_fx.subscription_repository.list_by_user(_TRUSTED_ID) == []
+
+
+async def test_trusted_my_cars_shows_all_active_tasks_operator_and_client_bot(trusted_fx):
+    """Явное требование: trusted видит ВСЕ active tasks — операторские И
+    клиентские, независимо от scope."""
+    _make_operator_task(trusted_fx, "E911EE95")
+    client_task = trusted_fx.task_repository.create(
+        car_number="M398YK763", label=None,
+        start_date=date(2026, 9, 1), end_date=date(2027, 9, 1),
+        telegram_chat_id=_TRUSTED_ID, created_by_user_id=_TRUSTED_ID,
+        monitoring_scope="client_bot",
+    )
+    _make_operator_task(trusted_fx, "COMPLETED1", status="completed")
+
+    reply = trusted_fx.controller.handle_text(
+        texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert "E911EE95" in reply.text
+    assert client_task.car_number in reply.text
+    assert "COMPLETED1" not in reply.text  # completed — не активна, не должна попасть в список
+
+
+def test_ordinary_user_my_cars_never_shows_task_only_cars(fx):
+    """Явное требование: ordinary user НЕ видит чужие/task-only cars —
+    "Мои авто" для обычного пользователя остаётся строго
+    subscription-based, задачи без подписки на него в принципе не влияют."""
+    _make_operator_task(fx, "E911EE95")
+
+    reply = fx.controller.handle_text(
+        texts.MY_CARS_LABEL, chat_id=1, telegram_user_id=1, username=None,
+    )
+
+    assert "E911EE95" not in reply.text
+    assert reply.text == texts.NO_CARS_TEXT
+
+
+async def test_trusted_check_now_works_for_task_without_subscription(trusted_fx):
+    """Явное требование: trusted Check Now работает для task без
+    subscription — реальный FineCheckService.check_task()."""
+    task_id = _make_operator_task(trusted_fx, "E911EE95")
+
+    pick_reply = trusted_fx.controller.handle_text(
+        texts.CHECK_NOW_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+    assert pick_reply.trusted_check_now_options is not None
+    [(picked_task_id, car_number)] = [
+        (tid, car) for tid, car in pick_reply.trusted_check_now_options if car == "E911EE95"
+    ]
+    assert picked_task_id == task_id
+
+    check_reply = await trusted_fx.controller.handle_trusted_check_now_choice(
+        task_id, telegram_user_id=_TRUSTED_ID,
+    )
+
+    assert check_reply is not None
+    assert "E911EE95" in check_reply.text
+    assert "новых штрафов нет" in check_reply.text
+
+
+async def test_trusted_check_now_uses_existing_dedup(tmp_path):
+    """Тот же дедуп/detected_fines, что и везде — второй "Проверить
+    сейчас" на ту же задачу без новых штрафов от провайдера не находит
+    уже виденный штраф повторно как новый."""
+    fixture = _Fixture(
+        tmp_path, records_by_car={"E911EE95": [_record(car_number="E911EE95")]},
+        trusted_operator_user_ids={_TRUSTED_ID},
+    )
+    try:
+        task_id = _make_operator_task(fixture, "E911EE95")
+
+        first = await fixture.controller.handle_trusted_check_now_choice(
+            task_id, telegram_user_id=_TRUSTED_ID,
+        )
+        assert "найдено новых штрафов — 1" in first.text
+
+        second = await fixture.controller.handle_trusted_check_now_choice(
+            task_id, telegram_user_id=_TRUSTED_ID,
+        )
+        assert "новых штрафов нет" in second.text
+    finally:
+        fixture.close()
+
+
+async def test_ordinary_user_cannot_forge_trusted_check_now_callback(fx):
+    """Явное требование: ordinary user не может вызвать task-level Check
+    Now forged callback — even зная реальный task_id, не-trusted
+    telegram_user_id получает None (та же server-side проверка, что и
+    у любого другого callback)."""
+    task_id = _make_operator_task(fx, "E911EE95")
+
+    reply = await fx.controller.handle_trusted_check_now_choice(task_id, telegram_user_id=1)
+
+    assert reply is None
+
+
+async def test_trusted_stop_task_without_subscribers_shows_plain_confirm(trusted_fx):
+    """Явное требование: trusted Stop task без subscribers — обычное
+    подтверждение, без предупреждения про клиентов."""
+    task_id = _make_operator_task(trusted_fx, "E911EE95")
+
+    pick_reply = trusted_fx.controller.handle_trusted_stop_pick(task_id, telegram_user_id=_TRUSTED_ID)
+
+    assert pick_reply is not None
+    assert pick_reply.text == "Остановить мониторинг для E911EE95?"
+    assert pick_reply.trusted_stop_confirm_task_id == task_id
+    assert pick_reply.trusted_stop_confirm_button_label == "⛔ Остановить"
+
+
+async def test_trusted_stop_task_with_one_subscriber_shows_singular_warning(trusted_fx):
+    """Явное требование: warning при active/pending subscribers —
+    единственное число ("клиентом")."""
+    task = trusted_fx.task_repository.create(
+        car_number="M398YK763", label=None,
+        start_date=date(2026, 9, 1), end_date=date(2027, 9, 1),
+        telegram_chat_id=_TRUSTED_ID, created_by_user_id=_TRUSTED_ID,
+        monitoring_scope="client_bot",
+    )
+    trusted_fx.subscription_repository.create(
+        monitoring_task_id=task.id, car_number="M398YK763",
+        telegram_user_id=777, telegram_chat_id=777, telegram_username="client_one",
+        start_date=date(2026, 9, 1), end_date=date(2027, 9, 1),
+    )
+
+    pick_reply = trusted_fx.controller.handle_trusted_stop_pick(task.id, telegram_user_id=_TRUSTED_ID)
+
+    assert pick_reply is not None
+    assert "также отслеживается клиентом." in pick_reply.text
+    assert "клиентами" not in pick_reply.text
+    assert pick_reply.trusted_stop_confirm_button_label == "⛔ Остановить для всех"
+
+
+async def test_trusted_stop_task_with_several_subscribers_shows_plural_warning(trusted_fx):
+    """Явное требование: если клиентов несколько — текст должен корректно
+    отражать это (множественное число)."""
+    task = trusted_fx.task_repository.create(
+        car_number="M398YK763", label=None,
+        start_date=date(2026, 9, 1), end_date=date(2027, 9, 1),
+        telegram_chat_id=_TRUSTED_ID, created_by_user_id=_TRUSTED_ID,
+        monitoring_scope="client_bot",
+    )
+    trusted_fx.subscription_repository.create(
+        monitoring_task_id=task.id, car_number="M398YK763",
+        telegram_user_id=777, telegram_chat_id=777, telegram_username="client_one",
+        start_date=date(2026, 9, 1), end_date=date(2027, 9, 1),
+    )
+    trusted_fx.subscription_repository.create_pending_claim(
+        monitoring_task_id=task.id, car_number="M398YK763",
+        owner_username_hint="client_two",
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        start_date=date(2026, 9, 1), end_date=date(2027, 9, 1),
+        claim_token="tok-1", claim_token_expires_at=datetime.now(timezone.utc) + timedelta(days=7),
+    )
+
+    pick_reply = trusted_fx.controller.handle_trusted_stop_pick(task.id, telegram_user_id=_TRUSTED_ID)
+
+    assert pick_reply is not None
+    assert "также отслеживается клиентами." in pick_reply.text
+    assert pick_reply.trusted_stop_confirm_button_label == "⛔ Остановить для всех"
+
+
+def test_trusted_stop_confirm_rechecks_authorization_and_task_state(trusted_fx):
+    """Явное требование: final Stop повторно проверяет authorization — не
+    только на pick-шаге, но и на самом confirm-callback (тот же принцип,
+    что и у обычного stop_confirm)."""
+    task_id = _make_operator_task(trusted_fx, "E911EE95")
+
+    # Не-trusted (даже если он как-то узнал task_id) — отклонён.
+    forged = trusted_fx.controller.handle_trusted_stop_confirm(task_id, telegram_user_id=999999)
+    assert forged.text == texts.CALLBACK_NOT_AUTHORIZED_TEXT
+    assert trusted_fx.task_repository.get(task_id).status == "active"  # ничего не изменилось
+
+    stop_reply = trusted_fx.controller.handle_trusted_stop_confirm(task_id, telegram_user_id=_TRUSTED_ID)
+
+    assert "остановлен" in stop_reply.text
+    assert trusted_fx.task_repository.get(task_id).status == "stopped"
+
+
+def test_trusted_stop_confirm_rejects_already_inactive_task(trusted_fx):
+    """Задача уже не active (кто-то другой остановил её между pick и
+    confirm, либо истёк период) — final Stop отклоняет, а не пытается
+    остановить повторно."""
+    task_id = _make_operator_task(trusted_fx, "E911EE95", status="completed")
+
+    reply = trusted_fx.controller.handle_trusted_stop_confirm(task_id, telegram_user_id=_TRUSTED_ID)
+
+    assert reply.text == texts.TRUSTED_STOP_FAILED_TEXT
+
+
+def test_forced_stop_does_not_leave_client_with_misleading_active_state(trusted_fx):
+    """Явное требование: forced Stop не оставляет клиенту ложное состояние
+    "мониторинг активен" — client-подписка, привязанная к принудительно
+    остановленной задаче, должна перестать показываться клиенту как
+    активная в его собственном "Мои авто"."""
+    task = trusted_fx.task_repository.create(
+        car_number="M398YK763", label=None,
+        start_date=date(2026, 9, 1), end_date=date(2027, 9, 1),
+        telegram_chat_id=_TRUSTED_ID, created_by_user_id=_TRUSTED_ID,
+        monitoring_scope="client_bot",
+    )
+    trusted_fx.subscription_repository.create(
+        monitoring_task_id=task.id, car_number="M398YK763",
+        telegram_user_id=777, telegram_chat_id=777, telegram_username="client_one",
+        start_date=date(2026, 9, 1), end_date=date(2027, 9, 1),
+    )
+
+    trusted_fx.controller.handle_trusted_stop_confirm(task.id, telegram_user_id=_TRUSTED_ID)
+
+    client_reply = trusted_fx.controller.handle_text(
+        texts.MY_CARS_LABEL, chat_id=777, telegram_user_id=777, username="client_one",
+    )
+    assert "✅ Активен" not in client_reply.text
+    assert "⛔ Остановлен" in client_reply.text
+    # Клиент также больше не может действовать через 🔎/⛔ этой подпиской.
+    [subscription] = trusted_fx.subscription_repository.list_by_user(777)
+    assert (
+        trusted_fx.service.get_actionable_subscription(subscription.id, telegram_user_id=777) is not None
+    )  # get_actionable_subscription не фильтрует по статусу — это ожидаемо
+    actionable = trusted_fx.service.list_actionable_subscriptions(777, today=_today())
+    assert actionable == []  # но список для действий её больше не покажет
+
+
+def test_unrelated_user_forged_task_id_rejected_for_stop_pick(trusted_fx):
+    """Явное требование: unrelated user forged task_id rejected — не-
+    trusted telegram_user_id, даже зная реальный task_id, получает None
+    на stop-pick."""
+    task_id = _make_operator_task(trusted_fx, "E911EE95")
+
+    reply = trusted_fx.controller.handle_trusted_stop_pick(task_id, telegram_user_id=1)
+
+    assert reply is None
+    assert trusted_fx.task_repository.get(task_id).status == "active"

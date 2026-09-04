@@ -270,6 +270,21 @@ class PublicBotSettings(BaseModel):
     config.yaml никто не получает доступ к delegated-режиму, обычный
     self-service flow при этом не меняется ни для кого.
 
+    ⚠️ БЕЗОПАСНОСТЬ: trusted_operator_user_ids — это НЕ только delegated
+    Add Car. С момента введения task-level admin (см. design report:
+    пересмотр архитектуры — fine_monitoring_tasks как единственный source
+    of truth) этот allowlist даёт ПОЛНЫЙ operator-level доступ ко ВСЕМ
+    fine_monitoring_tasks через @GEShtrafbot ("📋 Мои авто"/"🔎 Проверить
+    сейчас"/"⛔ Остановить мониторинг" видят/проверяют/останавливают ЛЮБУЮ
+    активную задачу мониторинга, включая исторические операторские без
+    единой client-подписки) — ПОЛНЫЙ АНАЛОГ операторских команд "fine
+    list"/"fine check"/"fine stop" (reader/commands/fine.py), просто через
+    другой интерфейс. Добавлять сюда numeric id имеет смысл ТОЛЬКО для
+    людей, которым и так уже доверено выполнять эти команды в операторском
+    чате (см. fine_monitor.allowed_user_ids) — это ДВА независимых списка
+    в config.yaml, синхронизировать их вручную обязан тот, кто редактирует
+    config.
+
     payment_help_contact_username — destination коммерческого CTA-блока
     ("💳 Оплатить в рублях"/"🛡 Оформить страховку") в owner-уведомлении о
     новом штрафе (см. reader/public_bot/delivery_texts.py,

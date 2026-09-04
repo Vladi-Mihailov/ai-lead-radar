@@ -17,7 +17,6 @@ import pytest  # noqa: E402
 
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
 from reader.public_bot.subscription_repository import (  # noqa: E402
-    DuplicateActiveOwnerlessSubscriptionError,
     DuplicatePendingClaimError,
     FineSubscriptionRepository,
 )
@@ -97,143 +96,121 @@ def test_self_service_create_leaves_delegation_fields_none(tmp_path):
         repo.close()
 
 
-# ---- create_without_owner (trusted Add Car без клиента, см. design report) ----
+# ---- count_active_or_pending_for_task / stop_all_for_task (trusted
+# task-level admin ⛔, см. design report: пересмотр архитектуры) ----
 
 
-def test_create_without_owner_leaves_all_owner_fields_null(tmp_path):
+def test_count_active_or_pending_for_task_counts_active_and_pending(tmp_path):
     db_path = tmp_path / "users.db"
     task_id = _make_task(db_path)
 
     repo = FineSubscriptionRepository(db_path)
     try:
-        sub = repo.create_without_owner(
+        repo.create(
             monitoring_task_id=task_id, car_number="B957MA09",
-            created_by_telegram_user_id=_TRUSTED_ID,
-            created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+            telegram_user_id=1, telegram_chat_id=1, telegram_username="one",
             start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
         )
+        repo.create_pending_claim(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            owner_username_hint="two",
+            created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+            claim_token="tok-1", claim_token_expires_at=_future_expiry(),
+        )
+        stopped_sub = repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            telegram_user_id=3, telegram_chat_id=3, telegram_username="three",
+            start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        )
+        repo.stop_by_owner_or_creator(stopped_sub.id, telegram_user_id=3)
 
-        assert sub.status == "active"
-        assert sub.telegram_user_id is None
-        assert sub.telegram_chat_id is None
-        assert sub.telegram_username is None
-        assert sub.owner_username_hint is None
-        assert sub.claim_token is None
-        assert sub.created_by_telegram_user_id == _TRUSTED_ID
-        assert sub.created_by_telegram_chat_id == _TRUSTED_CHAT_ID
-        assert sub.is_delegated() is True
+        count = repo.count_active_or_pending_for_task(task_id)
+
+        assert count == 2
     finally:
         repo.close()
 
 
-def test_get_active_ownerless_for_creator_and_task_finds_it(tmp_path):
+def test_count_active_or_pending_for_task_is_zero_when_none(tmp_path):
     db_path = tmp_path / "users.db"
     task_id = _make_task(db_path)
 
     repo = FineSubscriptionRepository(db_path)
     try:
-        created = repo.create_without_owner(
-            monitoring_task_id=task_id, car_number="B957MA09",
-            created_by_telegram_user_id=_TRUSTED_ID,
-            created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
-        )
-
-        found = repo.get_active_ownerless_for_creator_and_task(task_id, _TRUSTED_ID)
-
-        assert found is not None
-        assert found.id == created.id
+        assert repo.count_active_or_pending_for_task(task_id) == 0
     finally:
         repo.close()
 
 
-def test_get_active_ownerless_for_creator_and_task_ignores_other_creators(tmp_path):
+def test_stop_all_for_task_stops_active_and_pending_ignores_other_tasks(tmp_path):
     db_path = tmp_path / "users.db"
     task_id = _make_task(db_path)
+    other_task_id = _make_task(db_path, car_number="OTHER01")
 
     repo = FineSubscriptionRepository(db_path)
     try:
-        repo.create_without_owner(
+        active_sub = repo.create(
             monitoring_task_id=task_id, car_number="B957MA09",
-            created_by_telegram_user_id=_TRUSTED_ID,
-            created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+            telegram_user_id=1, telegram_chat_id=1, telegram_username="one",
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+        )
+        pending_sub = repo.create_pending_claim(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            owner_username_hint="two",
+            created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+            claim_token="tok-1", claim_token_expires_at=_future_expiry(),
+        )
+        other_task_sub = repo.create(
+            monitoring_task_id=other_task_id, car_number="OTHER01",
+            telegram_user_id=4, telegram_chat_id=4, telegram_username="four",
             start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
         )
 
-        found = repo.get_active_ownerless_for_creator_and_task(task_id, 999999)
+        affected = repo.stop_all_for_task(task_id)
 
-        assert found is None
+        assert affected == 2
+        assert repo.get(active_sub.id).status == "stopped"
+        assert repo.get(active_sub.id).stopped_at is not None
+        assert repo.get(pending_sub.id).status == "stopped"
+        # Другая задача не затронута.
+        assert repo.get(other_task_sub.id).status == "active"
     finally:
         repo.close()
 
 
-def test_duplicate_active_ownerless_subscription_for_same_task_and_creator_is_rejected(tmp_path):
-    """См. idx_fine_subscriptions_active_ownerless_creator_task — защита на
-    уровне БД (defense-in-depth), не только на уровне сервиса."""
+def test_stop_all_for_task_is_noop_when_no_subscriptions(tmp_path):
     db_path = tmp_path / "users.db"
     task_id = _make_task(db_path)
 
     repo = FineSubscriptionRepository(db_path)
     try:
-        repo.create_without_owner(
-            monitoring_task_id=task_id, car_number="B957MA09",
-            created_by_telegram_user_id=_TRUSTED_ID,
-            created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
-        )
+        affected = repo.stop_all_for_task(task_id)
 
-        with pytest.raises(DuplicateActiveOwnerlessSubscriptionError):
-            repo.create_without_owner(
-                monitoring_task_id=task_id, car_number="B957MA09",
-                created_by_telegram_user_id=_TRUSTED_ID,
-                created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-                start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
-            )
+        assert affected == 0
     finally:
         repo.close()
 
 
-def test_different_creators_can_each_have_own_ownerless_subscription_for_same_task(tmp_path):
+def test_stop_all_for_task_does_not_touch_already_stopped_or_expired(tmp_path):
     db_path = tmp_path / "users.db"
     task_id = _make_task(db_path)
 
     repo = FineSubscriptionRepository(db_path)
     try:
-        first = repo.create_without_owner(
+        stopped_sub = repo.create(
             monitoring_task_id=task_id, car_number="B957MA09",
-            created_by_telegram_user_id=_TRUSTED_ID,
-            created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+            telegram_user_id=1, telegram_chat_id=1, telegram_username="one",
+            start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
         )
-        second = repo.create_without_owner(
-            monitoring_task_id=task_id, car_number="B957MA09",
-            created_by_telegram_user_id=410811386,
-            created_by_telegram_chat_id=410811386,
-            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
-        )
+        repo.stop_by_owner_or_creator(stopped_sub.id, telegram_user_id=1)
+        before_stopped_at = repo.get(stopped_sub.id).stopped_at
 
-        assert first.id != second.id
-    finally:
-        repo.close()
+        affected = repo.stop_all_for_task(task_id)
 
-
-def test_ownerless_subscription_can_be_stopped_by_its_creator(tmp_path):
-    db_path = tmp_path / "users.db"
-    task_id = _make_task(db_path)
-
-    repo = FineSubscriptionRepository(db_path)
-    try:
-        sub = repo.create_without_owner(
-            monitoring_task_id=task_id, car_number="B957MA09",
-            created_by_telegram_user_id=_TRUSTED_ID,
-            created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
-        )
-
-        stopped = repo.stop_by_owner_or_creator(sub.id, telegram_user_id=_TRUSTED_ID)
-
-        assert stopped is True
-        assert repo.get(sub.id).status == "stopped"
+        assert affected == 0
+        assert repo.get(stopped_sub.id).stopped_at == before_stopped_at
     finally:
         repo.close()
 

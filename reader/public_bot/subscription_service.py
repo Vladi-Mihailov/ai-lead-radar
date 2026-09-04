@@ -20,7 +20,6 @@ from reader.public_bot.owner_resolution import (
     resolve_owner_username,
 )
 from reader.public_bot.subscription_repository import (
-    DuplicateActiveOwnerlessSubscriptionError,
     DuplicateActiveSubscriptionError,
     DuplicatePendingClaimError,
     FineSubscriptionRepository,
@@ -74,6 +73,23 @@ class CheckNowOutcome:
     отдельной системы штрафов здесь нет."""
 
     car_number: str
+    check_ok: bool
+    new_fines_count: int
+
+
+@dataclass(frozen=True)
+class AddCarWithoutClientOutcome:
+    """Результат trusted-operator Add Car БЕЗ клиента ("Отмена" на "👤
+    Добавить Telegram клиента?", см. design report: "без фиктивного
+    owner/subscription"). Никакой fine_monitoring_subscriptions строки НЕ
+    создаётся — операторская видимость/действия идут через task-level
+    admin API (см. list_all_active_tasks/check_now_task/
+    stop_task_for_trusted_admin ниже), а уведомление о найденных штрафах —
+    ИСКЛЮЧИТЕЛЬНО через уже существующий operator notification mechanism
+    (FineNotificationCoordinator, который не зависит от subscriptions
+    вовсе и срабатывает для ЛЮБОЙ задачи независимо от scope)."""
+
+    task: FineMonitoringTask
     check_ok: bool
     new_fines_count: int
 
@@ -313,24 +329,27 @@ class SubscriptionService:
         car_number: str,
         period_days: int,
         today: date,
-    ) -> DelegatedAddCarOutcome:
+    ) -> AddCarWithoutClientOutcome:
         """Trusted-оператор ставит машину на мониторинг БЕЗ указания
         клиента (см. design: "👤 Добавить Telegram клиента?" → "Отмена" —
-        username клиента НЕ обязателен для постановки на мониторинг).
-        Уведомления получают ТОЛЬКО сам trusted-оператор
-        (recipient_role='trusted_operator', см.
-        reader/public_bot/delivery_service.py::_applicable_roles —
-        telegram_user_id подписки остаётся NULL навсегда, роль 'owner'
-        для неё в принципе недостижима) и существующий операторский чат
-        (FineNotificationCoordinator — не зависит от subscriptions вовсе).
-        Фиктивный owner telegram_user_id НЕ создаётся.
+        username клиента НЕ обязателен для постановки на мониторинг). НЕ
+        создаёт НИКАКОЙ fine_monitoring_subscriptions строки — "без
+        фиктивного owner/subscription" (см. design report про пересмотр
+        архитектуры: fine_monitoring_tasks = source of truth, subscriptions
+        = ТОЛЬКО access/delivery для реальных клиентов). Уведомление о
+        найденных штрафах идёт ИСКЛЮЧИТЕЛЬНО через уже существующий
+        operator notification mechanism (FineNotificationCoordinator,
+        который срабатывает для ЛЮБОЙ задачи независимо от scope/
+        subscriptions) — та же видимость, что и у обычной операторской
+        машины, поставленной через "fine add". Видимость/действия самого
+        trusted-оператора над этой задачей — через task-level admin API
+        (list_all_active_tasks/check_now_task/stop_task_for_trusted_admin
+        ниже), не через "Мои авто" по подписке.
 
-        Если позже потребуется привязать клиента — это ОТДЕЛЬНАЯ,
-        независимая подписка на ту же задачу мониторинга через обычный
+        Если позже потребуется привязать реального клиента — это ОТДЕЛЬНАЯ
+        независимая подписка на ТУ ЖЕ задачу мониторинга через обычный
         add_delegated_car() (архитектура уже поддерживает несколько
-        подписок на одну машину, см. design report) — эта безвладельческая
-        строка при этом никуда не девается и продолжает получать
-        уведомления как раньше."""
+        подписок на одну машину) — никакой связи/миграции не требуется."""
         start_date = today
         end_date = today + timedelta(days=period_days)
 
@@ -342,24 +361,12 @@ class SubscriptionService:
             end_date=end_date,
         )
 
-        subscription = self._create_or_update_ownerless_subscription(
-            task_id=task.id,
-            car_number=car_number,
-            created_by_telegram_user_id=created_by_telegram_user_id,
-            created_by_telegram_chat_id=created_by_telegram_chat_id,
-            start_date=start_date,
-            end_date=end_date,
-        )
-
         check_result = await self._check_service.check_task(task)
 
-        return DelegatedAddCarOutcome(
+        return AddCarWithoutClientOutcome(
             task=task,
-            subscription=subscription,
-            pending_claim=False,
             check_ok=check_result.status == "ok",
             new_fines_count=len(check_result.new_fines) if check_result.status == "ok" else 0,
-            claim_link=None,
         )
 
     def claim(
@@ -547,48 +554,6 @@ class SubscriptionService:
                 refreshed.id, start_date=start_date, end_date=end_date,
             )
 
-    def _create_or_update_ownerless_subscription(
-        self,
-        *,
-        task_id: int,
-        car_number: str,
-        created_by_telegram_user_id: int,
-        created_by_telegram_chat_id: int,
-        start_date: date,
-        end_date: date,
-    ) -> FineMonitoringSubscription:
-        """См. add_delegated_car_without_client — тот же приём
-        get-then-create-with-race-fallback, что и
-        _create_or_update_subscription/_create_or_refresh_pending_claim,
-        только ключ дедупликации здесь — (task, creator), а не (task,
-        owner): у безвладельческой подписки нет owner вовсе."""
-        existing = self._subscription_repository.get_active_ownerless_for_creator_and_task(
-            task_id, created_by_telegram_user_id,
-        )
-        if existing is not None:
-            return self._subscription_repository.update_period(
-                existing.id, start_date=start_date, end_date=end_date,
-            )
-
-        try:
-            return self._subscription_repository.create_without_owner(
-                monitoring_task_id=task_id,
-                car_number=car_number,
-                created_by_telegram_user_id=created_by_telegram_user_id,
-                created_by_telegram_chat_id=created_by_telegram_chat_id,
-                start_date=start_date,
-                end_date=end_date,
-            )
-        except DuplicateActiveOwnerlessSubscriptionError:
-            refreshed = self._subscription_repository.get_active_ownerless_for_creator_and_task(
-                task_id, created_by_telegram_user_id,
-            )
-            if refreshed is None:
-                raise
-            return self._subscription_repository.update_period(
-                refreshed.id, start_date=start_date, end_date=end_date,
-            )
-
     def list_my_cars(self, telegram_user_id: int) -> list[FineMonitoringSubscription]:
         """ВСЕ подписки этого telegram_user_id, любого статуса — "Мои авто"
         (см. reader/public_bot/texts.py::format_my_cars). Никогда не
@@ -681,3 +646,91 @@ class SubscriptionService:
             check_ok=check_result.status == "ok",
             new_fines_count=len(check_result.new_fines) if check_result.status == "ok" else 0,
         )
+
+    # ---- trusted-operator task-level admin (см. design report: пересмотр
+    # архитектуры — fine_monitoring_tasks = source of truth автомобилей/
+    # monitoring jobs, subscriptions = ТОЛЬКО access/delivery для реальных
+    # клиентов). Авторизация ("is_trusted") — ИСКЛЮЧИТЕЛЬНО ответственность
+    # вызывающего кода (ConversationController._is_trusted(), сверяет
+    # numeric event.sender_id с config public_bot.trusted_operator_user_ids
+    # заново на КАЖДОМ вызове) — ни один метод здесь сам эту проверку не
+    # делает и не имеет доступа к конфигу trusted-списка. task_id,
+    # приходящий из callback_data, — публичный идентификатор, НЕ
+    # доказательство авторизации сам по себе (тот же принцип, что и у
+    # subscription_id для 🔎/⛔ выше) — get_active_task_for_trusted_admin()
+    # обязателен перед любым действием. ----
+
+    def list_all_active_tasks(self) -> list[FineMonitoringTask]:
+        """ВСЕ активные задачи мониторинга — операторские И клиентские,
+        с subscription и без неё (см. design report) — полный аналог уже
+        существующего reader/commands/fine.py::_handle_list
+        (FineMonitoringTaskRepository.list_active(), тот же метод, никакой
+        второй реализации). reader/commands/fine.py/FineJob/monitoring
+        scopes/dedup этим не затрагиваются — только чтение."""
+        return self._task_repository.list_active()
+
+    def get_active_task_for_trusted_admin(self, task_id: int) -> FineMonitoringTask | None:
+        """None — задача не существует ИЛИ уже не 'active' (завершена/
+        остановлена) — единственная server-side проверка СУЩЕСТВОВАНИЯ и
+        АКТУАЛЬНОСТИ задачи перед task-level 🔎/⛔ (см. design report:
+        "task_id считать только идентификатором, не authorization").
+        Проверку самого is_trusted() этот метод НЕ делает — она уже должна
+        быть сделана вызывающим кодом ДО обращения сюда (см. докстрок
+        класса выше)."""
+        task = self._task_repository.get(task_id)
+        if task is None or task.status != "active":
+            return None
+        return task
+
+    def count_active_or_pending_subscribers_for_task(self, task_id: int) -> int:
+        """Сколько ещё actionable (active/pending_claim) client-подписок у
+        этой задачи — используется ПЕРЕД показом подтверждения ⛔, чтобы
+        честно предупредить trusted-оператора, что остановка затронет
+        клиента(ов), а не только его самого (см. design report)."""
+        return self._subscription_repository.count_active_or_pending_for_task(task_id)
+
+    async def check_now_task(self, task_id: int) -> CheckNowOutcome | None:
+        """Task-level 🔎 Проверить сейчас для trusted-оператора — БЕЗ
+        привязки к subscription вовсе (см. design report: "наличие
+        fine_monitoring_subscription для trusted operator НЕ требуется").
+        None — задача не существует/не активна (см.
+        get_active_task_for_trusted_admin). Иначе — ТОТ ЖЕ
+        FineCheckService.check_task()/дедуп, что и везде — никакой
+        отдельной реализации проверки."""
+        task = self.get_active_task_for_trusted_admin(task_id)
+        if task is None:
+            return None
+
+        check_result = await self._check_service.check_task(task)
+
+        return CheckNowOutcome(
+            car_number=task.car_number,
+            check_ok=check_result.status == "ok",
+            new_fines_count=len(check_result.new_fines) if check_result.status == "ok" else 0,
+        )
+
+    def stop_task_for_trusted_admin(self, task_id: int) -> bool:
+        """Task-level ⛔ Остановить мониторинг для trusted-оператора —
+        останавливает саму задачу (тот же task_repository.set_status(...,
+        "stopped"), что и у reader/commands/fine.py::_handle_stop — не
+        новая семантика lifecycle), а НЕ отдельную subscription.
+
+        Одновременно останавливает ВСЕ ещё actionable (active/
+        pending_claim) client-подписки этой задачи (см.
+        FineSubscriptionRepository.stop_all_for_task) — см. design report:
+        "не оставляй после этого misleading active subscriptions" — клиент
+        не должен продолжать видеть "✅ Активен" в "Мои авто" для задачи,
+        которую только что остановил trusted-оператор. Переиспользует уже
+        существующий статус 'stopped' (тот же путь отображения, что и при
+        обычном user-initiated Stop) — новой колонки/статуса не требуется.
+
+        False — задача не существует/уже не активна (см.
+        get_active_task_for_trusted_admin) — вызывающий код не должен
+        показывать "остановлено" в этом случае."""
+        task = self.get_active_task_for_trusted_admin(task_id)
+        if task is None:
+            return False
+
+        self._task_repository.set_status(task_id, "stopped")
+        self._subscription_repository.stop_all_for_task(task_id)
+        return True

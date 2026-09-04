@@ -7,6 +7,7 @@ reader/public_bot/keyboards.py (Telethon-кнопки), чтобы формул�
 
 from datetime import date
 
+from reader.fines.models import FineMonitoringTask
 from reader.public_bot.models import FineMonitoringSubscription
 
 MAIN_MENU_TEXT = "🚗 Штрафы Грузии 🇬🇪"
@@ -40,6 +41,26 @@ STOP_PICK_PROMPT = "⛔ Выберите автомобиль для остан�
 STOP_CONFIRM_PROMPT = "Остановить мониторинг для {car_number}?"
 STOP_FAILED_TEXT = "⚠️ Не удалось остановить — попробуйте ещё раз через «⛔ Остановить мониторинг»."
 CALLBACK_NOT_AUTHORIZED_TEXT = "Это действие недоступно — начните заново через меню."
+
+# Trusted-operator task-level admin (см. design report: пересмотр
+# архитектуры — fine_monitoring_tasks остаётся source of truth, subscription
+# для этих трёх пунктов меню НЕ требуется вовсе).
+NO_ACTIVE_TASKS_TEXT = "Активных задач мониторинга нет."
+TRUSTED_TASKS_HEADER = "📋 Все активные автомобили под мониторингом:"
+TRUSTED_CHECK_NOW_PICK_PROMPT = "🔎 Выберите автомобиль для проверки:"
+TRUSTED_STOP_PICK_PROMPT = "⛔ Выберите автомобиль для остановки мониторинга:"
+TRUSTED_STOP_FAILED_TEXT = "⚠️ Не удалось остановить — попробуйте ещё раз через «⛔ Остановить мониторинг»."
+_TRUSTED_STOP_CONFIRM_PROMPT_NO_CLIENTS = "Остановить мониторинг для {car_number}?"
+_TRUSTED_STOP_CONFIRM_PROMPT_ONE_CLIENT = (
+    "⚠️ Автомобиль {car_number} также отслеживается клиентом.\n"
+    "Остановка прекратит мониторинг автомобиля для всех."
+)
+_TRUSTED_STOP_CONFIRM_PROMPT_MANY_CLIENTS = (
+    "⚠️ Автомобиль {car_number} также отслеживается клиентами.\n"
+    "Остановка прекратит мониторинг автомобиля для всех."
+)
+_TRUSTED_STOP_CONFIRM_BUTTON_NO_CLIENTS = "⛔ Остановить"
+_TRUSTED_STOP_CONFIRM_BUTTON_WITH_CLIENTS = "⛔ Остановить для всех"
 
 
 def format_check_now_result(outcome) -> str:
@@ -261,3 +282,51 @@ def format_managed_cars(subscriptions: list[FineMonitoringSubscription], today: 
             ])
         )
     return "\n\n".join(blocks)
+
+
+def _format_trusted_task_line(task: FineMonitoringTask) -> str:
+    lines = [f"🚗 {task.car_number}" + (f" ({task.label})" if task.label else "")]
+    lines.append(f"📅 {_fmt_date(task.start_date)} — {_fmt_date(task.end_date)}")
+    if task.last_checked_at is not None:
+        lines.append(f"🔎 Последняя проверка: {_fmt_date(task.last_checked_at.date())}")
+    else:
+        lines.append("🔎 Ещё не проверялась")
+    return "\n".join(lines)
+
+
+def format_trusted_tasks_list(tasks: list[FineMonitoringTask], *, limit: int) -> str:
+    """"📋 Мои авто" для trusted-оператора — ВСЕ активные
+    fine_monitoring_tasks (см. design report), не только те, у которых
+    есть fine_monitoring_subscription. limit — защита от превышения лимита
+    длины Telegram-сообщения на production-масштабе (250+ активных задач,
+    см. design report про известное упрощение) — НЕ бизнес-правило."""
+    if not tasks:
+        return NO_ACTIVE_TASKS_TEXT
+
+    shown = tasks[:limit]
+    blocks = [_format_trusted_task_line(task) for task in shown]
+    text = TRUSTED_TASKS_HEADER + "\n\n" + "\n\n".join(blocks)
+    if len(tasks) > limit:
+        text += f"\n\n… показаны первые {limit} из {len(tasks)}."
+    return text
+
+
+def format_trusted_stop_confirm_prompt(car_number: str, subscriber_count: int) -> str:
+    """Текст подтверждения ⛔ для trusted-оператора — честно предупреждает,
+    если у задачи есть ещё actionable (active/pending_claim) client-
+    подписки (см. design report): формулировка корректно отражает
+    единственное/множественное число получателей."""
+    if subscriber_count == 0:
+        return _TRUSTED_STOP_CONFIRM_PROMPT_NO_CLIENTS.format(car_number=car_number)
+    template = (
+        _TRUSTED_STOP_CONFIRM_PROMPT_ONE_CLIENT if subscriber_count == 1
+        else _TRUSTED_STOP_CONFIRM_PROMPT_MANY_CLIENTS
+    )
+    return template.format(car_number=car_number)
+
+
+def trusted_stop_confirm_button_label(subscriber_count: int) -> str:
+    return (
+        _TRUSTED_STOP_CONFIRM_BUTTON_NO_CLIENTS if subscriber_count == 0
+        else _TRUSTED_STOP_CONFIRM_BUTTON_WITH_CLIENTS
+    )

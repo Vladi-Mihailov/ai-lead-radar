@@ -23,10 +23,16 @@ from reader.public_bot.keyboards import (
     decode_period_callback,
     decode_stop_confirm_callback,
     decode_stop_pick_callback,
+    decode_trusted_check_now_callback,
+    decode_trusted_stop_confirm_callback,
+    decode_trusted_stop_pick_callback,
     main_menu_keyboard,
     period_choice_keyboard,
     stop_confirm_keyboard,
     stop_options_keyboard,
+    trusted_check_now_options_keyboard,
+    trusted_stop_confirm_keyboard,
+    trusted_stop_options_keyboard,
 )
 from reader.public_bot.known_users_repository import BotKnownUsersRepository
 from reader.public_bot.texts import CALLBACK_NOT_AUTHORIZED_TEXT
@@ -143,6 +149,31 @@ def register(
             await _send_reply(event, reply, prefer_edit=True)
             return
 
+        trusted_check_now_id = decode_trusted_check_now_callback(data)
+        if trusted_check_now_id is not None:
+            reply = await controller.handle_trusted_check_now_choice(
+                trusted_check_now_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply)
+            return
+
+        trusted_stop_pick_id = decode_trusted_stop_pick_callback(data)
+        if trusted_stop_pick_id is not None:
+            reply = controller.handle_trusted_stop_pick(
+                trusted_stop_pick_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply)
+            return
+
+        trusted_stop_confirm_id = decode_trusted_stop_confirm_callback(data)
+        if trusted_stop_confirm_id is not None:
+            reply = controller.handle_trusted_stop_confirm(
+                trusted_stop_confirm_id, telegram_user_id=event.sender_id,
+            )
+            await event.answer()
+            await _send_reply(event, reply, prefer_edit=True)
+            return
+
         if data == STOP_NO:
             reply = controller.handle_stop_cancel()
             await event.answer()
@@ -181,6 +212,14 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False) -> None:
         buttons = stop_options_keyboard(reply.stop_options)
     elif reply.stop_confirm_subscription_id is not None:
         buttons = stop_confirm_keyboard(reply.stop_confirm_subscription_id)
+    elif reply.trusted_check_now_options:
+        buttons = trusted_check_now_options_keyboard(reply.trusted_check_now_options)
+    elif reply.trusted_stop_options:
+        buttons = trusted_stop_options_keyboard(reply.trusted_stop_options)
+    elif reply.trusted_stop_confirm_task_id is not None:
+        buttons = trusted_stop_confirm_keyboard(
+            reply.trusted_stop_confirm_task_id, label=reply.trusted_stop_confirm_button_label,
+        )
 
     if prefer_edit:
         try:

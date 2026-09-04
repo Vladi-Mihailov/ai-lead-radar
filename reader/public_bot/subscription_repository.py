@@ -72,23 +72,6 @@ CREATE INDEX IF NOT EXISTS idx_fine_subscriptions_car_status
     ON fine_monitoring_subscriptions (car_number, status)
 """
 
-# Не более одной "безвладельческой" (без клиента, см. design про Add Car
-# для trusted-оператора без указания @username) активной подписки на
-# (задачу, создавшего её trusted-оператора) одновременно — повторное
-# "Добавить авто" тем же оператором для той же машины БЕЗ клиента должно
-# продлить существующую строку (см. update_period), а не плодить дубли.
-# telegram_user_id IS NULL — то же условие, что и в idx_fine_subscriptions_
-# active_user_task выше, но по (task, creator) вместо (task, user): без
-# него этот индекс не отличил бы "безвладельческую" строку от обычной
-# claimed-подписки того же trusted-оператора на СВОЙ ЖЕ автомобиль
-# (у той telegram_user_id тоже может совпадать с created_by_telegram_user_id,
-# но она НЕ NULL).
-_UNIQUE_ACTIVE_OWNERLESS_INDEX = """
-CREATE UNIQUE INDEX IF NOT EXISTS idx_fine_subscriptions_active_ownerless_creator_task
-    ON fine_monitoring_subscriptions (monitoring_task_id, created_by_telegram_user_id)
-    WHERE status = 'active' AND telegram_user_id IS NULL
-"""
-
 _USER_STATUS_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_fine_subscriptions_user_status
     ON fine_monitoring_subscriptions (telegram_user_id, status)
@@ -120,16 +103,6 @@ INSERT INTO fine_monitoring_subscriptions (
     :monitoring_task_id, :car_number, :telegram_user_id, :telegram_chat_id,
     :telegram_username, :start_date, :end_date, :source,
     :owner_username_hint, :created_by_telegram_user_id, :created_by_telegram_chat_id
-)
-"""
-
-_INSERT_WITHOUT_OWNER = """
-INSERT INTO fine_monitoring_subscriptions (
-    monitoring_task_id, car_number, start_date, end_date, source,
-    created_by_telegram_user_id, created_by_telegram_chat_id
-) VALUES (
-    :monitoring_task_id, :car_number, :start_date, :end_date, :source,
-    :created_by_telegram_user_id, :created_by_telegram_chat_id
 )
 """
 
@@ -172,14 +145,6 @@ _SELECT_ACTIVE_FOR_USER_AND_CAR = f"""
       AND car_number = :car_number
       AND status = 'active'
       AND end_date >= :today
-"""
-
-_SELECT_ACTIVE_OWNERLESS_FOR_CREATOR_AND_TASK = f"""
-    SELECT {_SELECT_FIELDS} FROM fine_monitoring_subscriptions
-    WHERE monitoring_task_id = :monitoring_task_id
-      AND created_by_telegram_user_id = :created_by_telegram_user_id
-      AND telegram_user_id IS NULL
-      AND status = 'active'
 """
 
 _SELECT_BY_USER = f"""
@@ -240,6 +205,25 @@ SET status = 'expired', updated_at = CURRENT_TIMESTAMP
 WHERE status = 'active' AND end_date < :today
 """
 
+_COUNT_ACTIVE_OR_PENDING_FOR_TASK = """
+    SELECT COUNT(*) FROM fine_monitoring_subscriptions
+    WHERE monitoring_task_id = :monitoring_task_id
+      AND status IN ('active', 'pending_claim')
+"""
+
+# Trusted-оператор принудительно остановил TASK целиком (см. design report
+# про task-level admin) — переиспользует уже существующий статус 'stopped'
+# (тот же смысл/то же отображение — "⛔ Остановлен" — что и у обычного
+# user-initiated stop_by_owner_or_creator), никакой новой колонки/статуса
+# не требуется, чтобы клиент не видел ложное "мониторинг активен" после
+# того, как сама задача уже остановлена.
+_STOP_ALL_FOR_TASK = """
+UPDATE fine_monitoring_subscriptions
+SET status = 'stopped', stopped_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+WHERE monitoring_task_id = :monitoring_task_id
+  AND status IN ('active', 'pending_claim')
+"""
+
 # Все подписки, которым машина ЕЩЁ нужна прямо сейчас — либо у неё уже
 # есть подтверждённый владелец (status='active'), либо она ждёт claim
 # (status='pending_claim', см. design report) — и при этом есть хоть один
@@ -291,13 +275,6 @@ class DuplicatePendingClaimError(Exception):
     owner_username_hint для этой же задачи мониторинга (см.
     idx_fine_subscriptions_pending_claim_task_hint). Вызывающий код должен
     продлить существующее (refresh_pending_claim), а не создавать второе."""
-
-
-class DuplicateActiveOwnerlessSubscriptionError(Exception):
-    """У этого trusted-оператора уже есть активная "безвладельческая"
-    (без клиента) подписка на эту же задачу мониторинга (см.
-    idx_fine_subscriptions_active_ownerless_creator_task). Вызывающий код
-    должен продлить существующую (update_period), а не создавать вторую."""
 
 
 def generate_claim_token() -> str:
@@ -378,7 +355,6 @@ class FineSubscriptionRepository:
         self._conn.execute(_USER_STATUS_INDEX)
         self._conn.execute(_PENDING_CLAIM_UNIQUE_INDEX)
         self._conn.execute(_CLAIM_TOKEN_UNIQUE_INDEX)
-        self._conn.execute(_UNIQUE_ACTIVE_OWNERLESS_INDEX)
         self._conn.commit()
 
     def _migrate_nullable_owner_columns_if_needed(self) -> None:
@@ -570,77 +546,6 @@ class FineSubscriptionRepository:
             raise RuntimeError("Не удалось прочитать только что созданный pending_claim")
         return subscription
 
-    def create_without_owner(
-        self,
-        *,
-        monitoring_task_id: int,
-        car_number: str,
-        created_by_telegram_user_id: int,
-        created_by_telegram_chat_id: int,
-        start_date: date,
-        end_date: date,
-        source: str = "geshtrafbot",
-    ) -> FineMonitoringSubscription:
-        """Trusted-оператор ставит машину на мониторинг БЕЗ указания
-        клиента (см. design: "👤 Добавить Telegram клиента?" → "Отмена") —
-        telegram_user_id/telegram_chat_id/telegram_username/
-        owner_username_hint остаются NULL, status сразу 'active' (в
-        отличие от create_pending_claim — здесь никого не ждём, клиента
-        просто нет и, возможно, не будет никогда). Доставка штрафов такой
-        подписке (см. reader/public_bot/delivery_service.py::
-        _applicable_roles) получает роль ТОЛЬКО 'trusted_operator' —
-        'owner' невозможна без telegram_user_id.
-
-        Не более одной такой строки на (monitoring_task_id,
-        created_by_telegram_user_id) одновременно — см.
-        idx_fine_subscriptions_active_ownerless_creator_task; повторное
-        "Добавить авто" без клиента для той же машины тем же оператором
-        должно продлить эту же строку (см.
-        SubscriptionService._create_or_update_ownerless_subscription), а
-        не создать вторую."""
-        try:
-            cursor = self._conn.execute(
-                _INSERT_WITHOUT_OWNER,
-                {
-                    "monitoring_task_id": monitoring_task_id,
-                    "car_number": car_number,
-                    "start_date": start_date.isoformat(),
-                    "end_date": end_date.isoformat(),
-                    "source": source,
-                    "created_by_telegram_user_id": created_by_telegram_user_id,
-                    "created_by_telegram_chat_id": created_by_telegram_chat_id,
-                },
-            )
-        except sqlite3.IntegrityError as exc:
-            self._conn.rollback()
-            raise DuplicateActiveOwnerlessSubscriptionError(
-                f"У оператора {created_by_telegram_user_id} уже есть активная "
-                f"безвладельческая подписка на задачу мониторинга {monitoring_task_id}"
-            ) from exc
-
-        self._conn.commit()
-
-        subscription = self.get(cursor.lastrowid)
-        if subscription is None:
-            raise RuntimeError("Не удалось прочитать только что созданную подписку")
-        return subscription
-
-    def get_active_ownerless_for_creator_and_task(
-        self, monitoring_task_id: int, created_by_telegram_user_id: int,
-    ) -> FineMonitoringSubscription | None:
-        """Существующая активная "безвладельческая" подписка ЭТОГО
-        trusted-оператора на ЭТУ задачу мониторинга, если есть — см.
-        create_without_owner про то, зачем нужна дедупликация повторного
-        "Добавить авто без клиента"."""
-        row = self._conn.execute(
-            _SELECT_ACTIVE_OWNERLESS_FOR_CREATOR_AND_TASK,
-            {
-                "monitoring_task_id": monitoring_task_id,
-                "created_by_telegram_user_id": created_by_telegram_user_id,
-            },
-        ).fetchone()
-        return _row_to_subscription(row) if row else None
-
     def get_pending_claim_for_task_and_hint(
         self, monitoring_task_id: int, owner_username_hint: str,
     ) -> FineMonitoringSubscription | None:
@@ -821,6 +726,33 @@ class FineSubscriptionRepository:
         )
         self._conn.commit()
         return cursor.rowcount > 0
+
+    def count_active_or_pending_for_task(self, monitoring_task_id: int) -> int:
+        """Сколько ещё actionable (active/pending_claim) client-подписок у
+        этой задачи — используется trusted-operator task-level ⛔ Остановить
+        мониторинг ПЕРЕД подтверждением, чтобы честно предупредить, что
+        остановка затронет клиента(ов) (см. design report), а НЕ как
+        источник истины для чего-либо ещё."""
+        row = self._conn.execute(
+            _COUNT_ACTIVE_OR_PENDING_FOR_TASK, {"monitoring_task_id": monitoring_task_id},
+        ).fetchone()
+        return row[0]
+
+    def stop_all_for_task(self, monitoring_task_id: int) -> int:
+        """Останавливает ВСЕ active/pending_claim подписки этой задачи —
+        вызывается ТОЛЬКО после того, как trusted-статус звонящего и
+        активность самой задачи уже проверены вызывающим кодом (см.
+        SubscriptionService.stop_task_for_trusted_admin) — сам этот метод
+        НЕ проверяет владение/авторизацию (в отличие от
+        stop_by_owner_or_creator), поскольку админ имеет право остановить
+        подписку кого угодно на этой задаче. Возвращает число
+        остановленных строк (0 — у задачи и не было ни одной actionable
+        подписки, это нормальный, ожидаемый исход, а не ошибка)."""
+        cursor = self._conn.execute(
+            _STOP_ALL_FOR_TASK, {"monitoring_task_id": monitoring_task_id},
+        )
+        self._conn.commit()
+        return cursor.rowcount
 
     def list_all_deliverable(self, *, today: date) -> list[FineMonitoringSubscription]:
         """Все подписки, которым машина ещё нужна и у которых есть хоть

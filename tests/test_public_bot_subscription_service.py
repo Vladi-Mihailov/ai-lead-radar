@@ -463,23 +463,19 @@ async def test_add_delegated_car_propagates_owner_resolution_error(tmp_path):
 # Telegram клиента?", см. design report) ----
 
 
-async def test_add_delegated_car_without_client_creates_active_subscription_with_no_owner(fx):
+async def test_add_delegated_car_without_client_creates_no_subscription(fx):
+    """Явное требование задачи: "без фиктивного owner/subscription" —
+    НИ ОДНОЙ строки fine_monitoring_subscriptions для этого flow, ни
+    активной, ни pending_claim."""
     outcome = await fx.service.add_delegated_car_without_client(
         created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
         car_number="M295YB196", period_days=90, today=date(2026, 9, 3),
     )
 
-    assert outcome.pending_claim is False
-    assert outcome.claim_link is None
-    assert outcome.subscription.status == "active"
-    assert outcome.subscription.telegram_user_id is None
-    assert outcome.subscription.telegram_chat_id is None
-    assert outcome.subscription.telegram_username is None
-    assert outcome.subscription.owner_username_hint is None
-    assert outcome.subscription.created_by_telegram_user_id == _TRUSTED_ID
-    assert outcome.subscription.created_by_telegram_chat_id == _TRUSTED_CHAT_ID
-    assert outcome.subscription.is_delegated() is True
     assert outcome.task.monitoring_scope == "client_bot"
+    assert outcome.task.status == "active"
+    assert fx.subscription_repository.list_managed_by_creator(_TRUSTED_ID) == []
+    assert fx.subscription_repository.list_by_user(_TRUSTED_ID) == []
 
 
 async def test_add_delegated_car_without_client_starts_monitoring_immediately(fx):
@@ -509,10 +505,11 @@ async def test_add_delegated_car_without_client_does_not_sync_fictitious_owner_t
     assert fx.user_repository.find_by_car_number("M295YB196") == []
 
 
-async def test_add_delegated_car_without_client_repeat_extends_same_subscription(fx):
+async def test_add_delegated_car_without_client_repeat_extends_same_task(fx):
     """Повторное "Добавить авто без клиента" тем же оператором на ту же
-    машину — продлевает существующую строку, а не плодит вторую (см.
-    idx_fine_subscriptions_active_ownerless_creator_task)."""
+    машину — продлевает ТУ ЖЕ задачу (обычный _create_or_extend_task,
+    extend_period_if_shorter), а не создаёт вторую задачу или какую-либо
+    подписку."""
     first = await fx.service.add_delegated_car_without_client(
         created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
         car_number="M295YB196", period_days=30, today=date(2026, 9, 3),
@@ -523,10 +520,9 @@ async def test_add_delegated_car_without_client_repeat_extends_same_subscription
         car_number="M295YB196", period_days=90, today=date(2026, 9, 3),
     )
 
-    assert second.subscription.id == first.subscription.id
-    assert second.subscription.end_date == date(2026, 9, 3) + timedelta(days=90)
-    managed = fx.subscription_repository.list_managed_by_creator(_TRUSTED_ID)
-    assert len(managed) == 1
+    assert second.task.id == first.task.id
+    assert second.task.end_date == date(2026, 9, 3) + timedelta(days=90)
+    assert fx.subscription_repository.list_managed_by_creator(_TRUSTED_ID) == []
 
 
 async def test_add_delegated_car_without_client_reuses_operator_task_without_changing_scope(fx):
@@ -545,11 +541,12 @@ async def test_add_delegated_car_without_client_reuses_operator_task_without_cha
     assert outcome.task.monitoring_scope == "operator"  # НЕ изменился
 
 
-async def test_add_delegated_car_without_client_then_with_client_creates_separate_subscription(fx):
+async def test_add_delegated_car_without_client_then_with_client_attaches_to_same_task(fx):
     """Явное требование задачи: "если позже понадобится привязать клиента —
     архитектура не должна этому препятствовать" — обычный delegated-с-
-    клиентом flow на ту же машину создаёт ОТДЕЛЬНУЮ подписку, безвладельческая
-    строка никуда не девается и продолжает существовать независимо."""
+    клиентом flow на ту же машину переиспользует ТУ ЖЕ задачу и создаёт
+    для неё первую (и единственную) подписку — никакой миграции/связывания
+    не требуется, т.к. до этого не было подписки вовсе."""
     fx.user_repository.upsert(
         TelegramUserInfo(user_id=777, username="real_owner", first_name="Real", last_name="Owner")
     )
@@ -564,12 +561,9 @@ async def test_add_delegated_car_without_client_then_with_client_creates_separat
         today=date(2026, 9, 3),
     )
 
-    assert with_client.subscription.id != without_client.subscription.id
     assert with_client.task.id == without_client.task.id
-    still_there = fx.subscription_repository.get(without_client.subscription.id)
-    assert still_there is not None
-    assert still_there.status == "active"
-    assert still_there.telegram_user_id is None
+    [subscription] = fx.subscription_repository.list_by_user(777)
+    assert subscription.monitoring_task_id == without_client.task.id
 
 
 async def test_claim_binds_owner_and_syncs_user_repository(fx):
@@ -738,6 +732,142 @@ async def test_check_now_reports_new_fines_found(tmp_path):
         assert result.new_fines_count == 1
     finally:
         fixture.close()
+
+
+# ==== trusted-operator task-level admin (см. design report: пересмотр
+# архитектуры — fine_monitoring_tasks = source of truth, subscription НЕ
+# требуется). is_trusted() — ответственность ConversationController, эти
+# методы сами авторизацию не проверяют (см. их докстроки). ====
+
+
+async def test_list_all_active_tasks_returns_tasks_without_any_subscription(fx):
+    task = fx.task_repository.create(
+        car_number="E911EE95", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    fx.task_repository.create(
+        car_number="COMPLETED1", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    ).id
+    completed = fx.task_repository.get_active_by_car_number("COMPLETED1")[0]
+    fx.task_repository.set_status(completed.id, "completed")
+
+    tasks = fx.service.list_all_active_tasks()
+
+    assert [t.id for t in tasks] == [task.id]
+
+
+def test_get_active_task_for_trusted_admin_returns_none_for_missing_task(fx):
+    assert fx.service.get_active_task_for_trusted_admin(999999) is None
+
+
+def test_get_active_task_for_trusted_admin_returns_none_for_inactive_task(fx):
+    task = fx.task_repository.create(
+        car_number="E911EE95", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    fx.task_repository.set_status(task.id, "stopped")
+
+    assert fx.service.get_active_task_for_trusted_admin(task.id) is None
+
+
+def test_get_active_task_for_trusted_admin_returns_active_task(fx):
+    task = fx.task_repository.create(
+        car_number="E911EE95", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+
+    found = fx.service.get_active_task_for_trusted_admin(task.id)
+
+    assert found is not None
+    assert found.id == task.id
+
+
+async def test_check_now_task_works_without_any_subscription(fx):
+    task = fx.task_repository.create(
+        car_number="E911EE95", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+
+    result = await fx.service.check_now_task(task.id)
+
+    assert result is not None
+    assert result.car_number == "E911EE95"
+    assert result.check_ok is True
+    assert fx.subscription_repository.list_by_user(_OPERATOR_USER_ID) == []
+
+
+async def test_check_now_task_returns_none_for_inactive_task(fx):
+    task = fx.task_repository.create(
+        car_number="E911EE95", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    fx.task_repository.set_status(task.id, "completed")
+
+    result = await fx.service.check_now_task(task.id)
+
+    assert result is None
+
+
+def test_count_active_or_pending_subscribers_for_task(fx):
+    task = fx.task_repository.create(
+        car_number="M398YK763", label=None, start_date=date(2026, 9, 1), end_date=date(2027, 9, 1),
+        telegram_chat_id=_TRUSTED_ID, created_by_user_id=_TRUSTED_ID, monitoring_scope="client_bot",
+    )
+    assert fx.service.count_active_or_pending_subscribers_for_task(task.id) == 0
+
+    fx.subscription_repository.create(
+        monitoring_task_id=task.id, car_number="M398YK763",
+        telegram_user_id=777, telegram_chat_id=777, telegram_username="client",
+        start_date=date(2026, 9, 1), end_date=date(2027, 9, 1),
+    )
+
+    assert fx.service.count_active_or_pending_subscribers_for_task(task.id) == 1
+
+
+def test_stop_task_for_trusted_admin_stops_task_and_returns_true(fx):
+    task = fx.task_repository.create(
+        car_number="E911EE95", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+
+    stopped = fx.service.stop_task_for_trusted_admin(task.id)
+
+    assert stopped is True
+    assert fx.task_repository.get(task.id).status == "stopped"
+
+
+def test_stop_task_for_trusted_admin_returns_false_for_already_inactive_task(fx):
+    task = fx.task_repository.create(
+        car_number="E911EE95", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    fx.task_repository.set_status(task.id, "stopped")
+
+    stopped = fx.service.stop_task_for_trusted_admin(task.id)
+
+    assert stopped is False
+
+
+def test_stop_task_for_trusted_admin_stops_related_subscriptions_too(fx):
+    """Явное требование задачи: не оставлять клиенту ложное "мониторинг
+    активен" после forced task-level Stop — реальный переход
+    active/pending_claim -> stopped на уровне подписок, тот же статус,
+    что и у обычного user-initiated Stop."""
+    task = fx.task_repository.create(
+        car_number="M398YK763", label=None, start_date=date(2026, 9, 1), end_date=date(2027, 9, 1),
+        telegram_chat_id=_TRUSTED_ID, created_by_user_id=_TRUSTED_ID, monitoring_scope="client_bot",
+    )
+    subscription = fx.subscription_repository.create(
+        monitoring_task_id=task.id, car_number="M398YK763",
+        telegram_user_id=777, telegram_chat_id=777, telegram_username="client",
+        start_date=date(2026, 9, 1), end_date=date(2027, 9, 1),
+    )
+
+    stopped = fx.service.stop_task_for_trusted_admin(task.id)
+
+    assert stopped is True
+    assert fx.subscription_repository.get(subscription.id).status == "stopped"
 
 
 # ==== extend_client_bot_task_if_still_needed (см. design report Stage 4,

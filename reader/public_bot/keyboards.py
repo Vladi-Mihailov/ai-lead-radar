@@ -42,6 +42,13 @@ _STOP_YES_PREFIX = b"stopyes:"
 STOP_NO = b"stopno"
 _ADD_CLIENT_YES = b"addclient:yes"
 _ADD_CLIENT_NO = b"addclient:no"
+# Trusted-operator task-level admin (см. design report: пересмотр
+# архитектуры) — task_id вместо subscription_id, отдельные префиксы, чтобы
+# НИКОГДА не перепутать с subscription-based callback'ами выше (см.
+# _decode_id — startswith конкретного префикса, коллизий по префиксу нет).
+_TRUSTED_CHECK_NOW_PREFIX = b"tcheck:"
+_TRUSTED_STOP_PICK_PREFIX = b"tstoppick:"
+_TRUSTED_STOP_YES_PREFIX = b"tstopyes:"
 
 
 def main_menu_keyboard() -> list[list[Button]]:
@@ -138,6 +145,37 @@ def check_now_options_keyboard(options: list[tuple[int, str]]) -> list[list[Butt
 
 def stop_options_keyboard(options: list[tuple[int, str]]) -> list[list[Button]]:
     return options_keyboard(options, prefix=_STOP_PICK_PREFIX)
+
+
+def decode_trusted_check_now_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _TRUSTED_CHECK_NOW_PREFIX)
+
+
+def decode_trusted_stop_pick_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _TRUSTED_STOP_PICK_PREFIX)
+
+
+def decode_trusted_stop_confirm_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _TRUSTED_STOP_YES_PREFIX)
+
+
+def trusted_check_now_options_keyboard(options: list[tuple[int, str]]) -> list[list[Button]]:
+    return options_keyboard(options, prefix=_TRUSTED_CHECK_NOW_PREFIX)
+
+
+def trusted_stop_options_keyboard(options: list[tuple[int, str]]) -> list[list[Button]]:
+    return options_keyboard(options, prefix=_TRUSTED_STOP_PICK_PREFIX)
+
+
+def trusted_stop_confirm_keyboard(task_id: int, *, label: str) -> list[list[Button]]:
+    """label — "⛔ Остановить" или "⛔ Остановить для всех" в зависимости
+    от того, есть ли у задачи ещё actionable client-подписки (см.
+    reader/public_bot/texts.py::trusted_stop_confirm_button_label) —
+    вычисляется вызывающим кодом (ConversationController), не здесь."""
+    return [[
+        Button.inline(label, _TRUSTED_STOP_YES_PREFIX + str(task_id).encode("ascii")),
+        Button.inline("Отмена", STOP_NO),
+    ]]
 
 
 _PAYMENT_HELP_BUTTON_LABEL = "💳 Оплатить в рублях"
