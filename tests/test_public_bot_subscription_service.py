@@ -14,12 +14,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import pytest  # noqa: E402
+from telethon.errors import UsernameNotOccupiedError  # noqa: E402
+from telethon.tl.types import User as TelethonUser  # noqa: E402
 
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
 from reader.fines.models import ParsedFineRecord  # noqa: E402
 from reader.fines.provider import FineProvider, FineProviderError  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
+from reader.public_bot.owner_resolution import OwnerResolutionError  # noqa: E402
 from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
 from reader.public_bot.subscription_service import SubscriptionService  # noqa: E402
 from reader.users.models import TelegramUserInfo  # noqa: E402
@@ -27,6 +30,8 @@ from reader.users.repository import UserRepository  # noqa: E402
 
 _CHAT_ID = -100999
 _OPERATOR_USER_ID = 111
+_TRUSTED_ID = 5712994689
+_TRUSTED_CHAT_ID = 5712994689
 
 
 class _FakeProvider(FineProvider):
@@ -42,6 +47,39 @@ class _FakeProvider(FineProvider):
         return self._records_by_car.get(plate, [])
 
 
+class _FakeTelegramClient:
+    """Ровно то, что нужно от Telethon-клиента для owner_resolution.py —
+    тот же приём, что и в tests/test_owner_resolution.py/test_fine_command.py."""
+
+    def __init__(self, *, entities=None, errors=None):
+        self._entities = {k.lower(): v for k, v in (entities or {}).items()}
+        self._errors = {k.lower(): v for k, v in (errors or {}).items()}
+        self.get_entity_calls: list[str] = []
+
+    async def get_entity(self, entity):
+        username = str(entity).lstrip("@").lower()
+        self.get_entity_calls.append(username)
+        if username in self._errors:
+            raise self._errors[username]
+        if username in self._entities:
+            return self._entities[username]
+        raise UsernameNotOccupiedError(request=None)
+
+
+def _telethon_user(user_id: int, username: str) -> TelethonUser:
+    return TelethonUser(
+        id=user_id, is_self=False, contact=False, mutual_contact=False, deleted=False,
+        bot=False, bot_chat_history=False, bot_nochats=False, verified=False, restricted=False,
+        min=False, bot_inline_geo=False, support=False, scam=False, apply_min_photo=False,
+        fake=False, bot_attach_menu=False, premium=False, attach_menu_enabled=False,
+        bot_can_edit=False, close_friend=False, stories_hidden=False, stories_unavailable=False,
+        access_hash=999,
+        first_name="Real", last_name="Owner", username=username, phone=None, photo=None,
+        status=None, bot_info_version=None, restriction_reason=None, bot_inline_placeholder=None,
+        lang_code=None,
+    )
+
+
 def _record(car_number="M295YB196", fingerprint="fp-1") -> ParsedFineRecord:
     return ParsedFineRecord(
         car_number=car_number,
@@ -55,7 +93,7 @@ def _record(car_number="M295YB196", fingerprint="fp-1") -> ParsedFineRecord:
 
 
 class _Fixture:
-    def __init__(self, tmp_path, records_by_car=None, provider_error=None):
+    def __init__(self, tmp_path, records_by_car=None, provider_error=None, owner_resolver_client=None):
         db_path = tmp_path / "users.db"
         self.task_repository = FineMonitoringTaskRepository(db_path)
         self.detected_fine_repository = DetectedFineRepository(db_path)
@@ -68,6 +106,7 @@ class _Fixture:
         self.service = SubscriptionService(
             self.task_repository, self.subscription_repository,
             self.user_repository, self.check_service,
+            owner_resolver_client=owner_resolver_client,
         )
 
     def close(self):
@@ -301,3 +340,182 @@ def test_list_my_cars_returns_only_this_users_subscriptions(fx):
     result = fx.service.list_my_cars(10)
 
     assert [s.car_number for s in result] == ["AA001AA"]
+
+
+# ==== trusted-operator delegated flow (см. design report) ====
+
+
+async def test_add_delegated_car_resolves_immediately_via_local_user_repository(fx):
+    fx.user_repository.upsert(
+        TelegramUserInfo(user_id=777, username="real_owner", first_name="Real", last_name="Owner")
+    )
+
+    outcome = await fx.service.add_delegated_car(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        owner_username="real_owner", car_number="M295YB196", period_days=90,
+        today=date(2026, 9, 3),
+    )
+
+    assert outcome.pending_claim is False
+    assert outcome.claim_link is None
+    assert outcome.subscription.status == "active"
+    assert outcome.subscription.telegram_user_id == 777
+    assert outcome.subscription.telegram_chat_id == 777
+    assert outcome.subscription.created_by_telegram_user_id == _TRUSTED_ID
+    assert outcome.subscription.owner_username_hint == "real_owner"
+    assert outcome.task.monitoring_scope == "client_bot"
+
+    # UserRepository синхронизирован — оператор увидит владельца в fine list/check.
+    owners = fx.user_repository.find_by_car_number("M295YB196")
+    assert [o.user_id for o in owners] == [777]
+
+
+async def test_add_delegated_car_resolves_via_live_telegram_lookup(tmp_path):
+    client = _FakeTelegramClient(entities={"newcomer": _telethon_user(888, "newcomer")})
+    fixture = _Fixture(tmp_path, owner_resolver_client=client)
+    try:
+        outcome = await fixture.service.add_delegated_car(
+            created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+            owner_username="newcomer", car_number="M295YB196", period_days=30,
+            today=date(2026, 9, 3),
+        )
+
+        assert outcome.pending_claim is False
+        assert outcome.subscription.telegram_user_id == 888
+        assert client.get_entity_calls == ["newcomer"]
+    finally:
+        fixture.close()
+
+
+async def test_add_delegated_car_creates_pending_claim_when_owner_cannot_be_resolved(fx):
+    outcome = await fx.service.add_delegated_car(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        owner_username="unknown_person", car_number="M295YB196", period_days=30,
+        today=date(2026, 9, 3),
+    )
+
+    assert outcome.pending_claim is True
+    assert outcome.subscription.status == "pending_claim"
+    assert outcome.subscription.telegram_user_id is None
+    assert outcome.subscription.telegram_chat_id is None
+    assert outcome.subscription.owner_username_hint == "unknown_person"
+    assert outcome.claim_link is not None
+    assert outcome.claim_link.startswith("https://t.me/GEShtrafbot?start=claim_")
+
+    # Мониторинг УЖЕ идёт — задача создана/проверена, несмотря на то, что
+    # владелец ещё не резолвлен (см. design report).
+    assert outcome.task.status == "active"
+    assert outcome.check_ok is True
+
+
+async def test_add_delegated_car_monitoring_starts_even_when_owner_unresolved(fx):
+    """Явная регрессия на "monitoring task запускается сразу, claim
+    владельца не блокирует мониторинг"."""
+    outcome = await fx.service.add_delegated_car(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        owner_username="unknown_person", car_number="M295YB196", period_days=30,
+        today=date(2026, 9, 3),
+    )
+
+    [task] = fx.task_repository.list_active()
+    assert task.id == outcome.task.id
+    assert task.monitoring_scope == "client_bot"
+
+
+async def test_add_delegated_car_reuses_operator_task_without_changing_scope(fx):
+    operator_task = fx.task_repository.create(
+        car_number="M295YB196", label=None,
+        start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+
+    outcome = await fx.service.add_delegated_car(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        owner_username="unknown_person", car_number="M295YB196", period_days=30,
+        today=date(2026, 9, 3),
+    )
+
+    assert outcome.task.id == operator_task.id
+    assert outcome.task.monitoring_scope == "operator"  # НЕ изменился
+
+
+async def test_add_delegated_car_propagates_owner_resolution_error(tmp_path):
+    client = _FakeTelegramClient(errors={"flaky": RuntimeError("network down")})
+    fixture = _Fixture(tmp_path, owner_resolver_client=client)
+    try:
+        with pytest.raises(OwnerResolutionError):
+            await fixture.service.add_delegated_car(
+                created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+                owner_username="flaky", car_number="M295YB196", period_days=30,
+                today=date(2026, 9, 3),
+            )
+
+        # Ничего не создано — ни задачи, ни подписки.
+        assert fixture.task_repository.list_active() == []
+    finally:
+        fixture.close()
+
+
+async def test_claim_binds_owner_and_syncs_user_repository(fx):
+    outcome = await fx.service.add_delegated_car(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        owner_username="unknown_person", car_number="M295YB196", period_days=30,
+        today=date(2026, 9, 3),
+    )
+    token = outcome.claim_link.rsplit("claim_", 1)[1]
+
+    claim_outcome = fx.service.claim(
+        token, telegram_user_id=777, telegram_chat_id=777, telegram_username="unknown_person",
+        first_name="Real", last_name="Owner",
+    )
+
+    assert claim_outcome is not None
+    assert claim_outcome.subscription.status == "active"
+    assert claim_outcome.subscription.telegram_user_id == 777
+
+    stored = fx.user_repository.get(777)
+    assert stored is not None
+    assert stored.username == "unknown_person"
+    owners = fx.user_repository.find_by_car_number("M295YB196")
+    assert [o.user_id for o in owners] == [777]
+
+
+def test_claim_returns_none_for_unknown_token(fx):
+    assert fx.service.claim(
+        "bogus", telegram_user_id=1, telegram_chat_id=1, telegram_username="x",
+        first_name=None, last_name=None,
+    ) is None
+
+
+async def test_list_managed_cars_returns_only_delegated_by_this_trusted_operator(fx):
+    await fx.service.add_delegated_car(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        owner_username="owner_one", car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+    )
+    other_trusted_id = 410811386
+    await fx.service.add_delegated_car(
+        created_by_telegram_user_id=other_trusted_id, created_by_telegram_chat_id=other_trusted_id,
+        owner_username="owner_two", car_number="BB002BB", period_days=30, today=date(2026, 9, 3),
+    )
+    await fx.service.add_car(
+        telegram_user_id=_TRUSTED_ID, telegram_chat_id=_TRUSTED_CHAT_ID, username="trusted_self",
+        first_name=None, last_name=None, car_number="CC003CC", period_days=30, today=date(2026, 9, 3),
+    )
+
+    managed = fx.service.list_managed_cars(_TRUSTED_ID)
+
+    assert [s.car_number for s in managed] == ["AA001AA"]
+
+
+async def test_stop_subscription_allows_creator_and_rejects_stranger(fx):
+    fx.user_repository.upsert(
+        TelegramUserInfo(user_id=777, username="real_owner", first_name=None, last_name=None)
+    )
+    outcome = await fx.service.add_delegated_car(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        owner_username="real_owner", car_number="M295YB196", period_days=30, today=date(2026, 9, 3),
+    )
+    assert outcome.pending_claim is False  # резолвлено сразу — подписка active
+
+    assert fx.service.stop_subscription(outcome.subscription.id, telegram_user_id=999999) is False
+    assert fx.service.stop_subscription(outcome.subscription.id, telegram_user_id=_TRUSTED_ID) is True

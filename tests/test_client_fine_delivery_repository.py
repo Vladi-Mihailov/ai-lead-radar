@@ -4,6 +4,7 @@
 design report). Только сама таблица/репозиторий.
 """
 
+import sqlite3
 import sys
 from datetime import date
 from pathlib import Path
@@ -217,3 +218,105 @@ def test_data_persists_across_repository_reopen(tmp_path):
         assert repo2.is_delivered(fine_id, sub_id) is True
     finally:
         repo2.close()
+
+
+# ==== recipient_role: 'owner' vs 'trusted_operator' (см. design report про
+# trusted-operator delegated flow — один detected_fine может требовать до
+# ДВУХ независимых доставок в рамках одной delegated-подписки) ====
+
+
+def test_owner_and_trusted_operator_roles_are_independent_for_same_subscription(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(db_path)
+    fine_id = _make_detected_fine(db_path, task_id)
+    sub_id = _make_subscription(db_path, task_id)
+
+    repo = ClientFineDeliveryRepository(db_path)
+    try:
+        repo.record_attempt(fine_id, sub_id, "owner")
+        repo.mark_delivered(fine_id, sub_id, "owner")
+
+        repo.record_attempt(fine_id, sub_id, "trusted_operator")
+
+        assert repo.is_delivered(fine_id, sub_id, "owner") is True
+        assert repo.is_delivered(fine_id, sub_id, "trusted_operator") is False
+
+        # Провал доставки владельцу (пока не claimed) НЕ блокирует и не
+        # засчитывает доставку trusted-оператору — независимый retry.
+        repo.record_attempt(fine_id, sub_id, "owner")
+        assert repo.get(fine_id, sub_id, "owner").attempt_count == 2
+        assert repo.get(fine_id, sub_id, "trusted_operator").attempt_count == 1
+    finally:
+        repo.close()
+
+
+def test_default_recipient_role_is_owner_for_backward_compatibility(tmp_path):
+    """Существующие (Stage 1) вызовы без recipient_role должны продолжать
+    работать бит в бит как раньше — role по умолчанию 'owner'."""
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(db_path)
+    fine_id = _make_detected_fine(db_path, task_id)
+    sub_id = _make_subscription(db_path, task_id)
+
+    repo = ClientFineDeliveryRepository(db_path)
+    try:
+        repo.record_attempt(fine_id, sub_id)
+        repo.mark_delivered(fine_id, sub_id)
+
+        assert repo.is_delivered(fine_id, sub_id) is True
+        assert repo.is_delivered(fine_id, sub_id, "owner") is True
+        assert repo.is_delivered(fine_id, sub_id, "trusted_operator") is False
+    finally:
+        repo.close()
+
+
+def test_migration_from_legacy_schema_without_recipient_role_preserves_rows_as_owner(tmp_path):
+    """Legacy (Stage 1) схема — UNIQUE(detected_fine_id, subscription_id)
+    без recipient_role вовсе. SQLite не может добавить его в существующий
+    UNIQUE-constraint через ALTER TABLE — та же "12-step" процедура
+    пересоздания таблицы, что и у FineSubscriptionRepository. Существующие
+    (гипотетические — production ни разу не писал в эту таблицу) строки
+    должны стать recipient_role='owner', с сохранением id."""
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(db_path)
+    fine_id = _make_detected_fine(db_path, task_id)
+    sub_id = _make_subscription(db_path, task_id)
+
+    legacy_conn = sqlite3.connect(db_path)
+    legacy_conn.execute(
+        """
+        CREATE TABLE client_fine_deliveries (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            detected_fine_id  INTEGER NOT NULL REFERENCES detected_fines(id),
+            subscription_id   INTEGER NOT NULL REFERENCES fine_monitoring_subscriptions(id),
+            delivered_at      TIMESTAMP,
+            last_attempt_at   TIMESTAMP,
+            attempt_count     INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(detected_fine_id, subscription_id)
+        )
+        """
+    )
+    legacy_conn.execute(
+        "INSERT INTO client_fine_deliveries "
+        "(id, detected_fine_id, subscription_id, delivered_at, last_attempt_at, attempt_count) "
+        "VALUES (1, ?, ?, '2026-09-01 00:00:00', '2026-09-01 00:00:00', 3)",
+        (fine_id, sub_id),
+    )
+    legacy_conn.commit()
+    legacy_conn.close()
+
+    repo = ClientFineDeliveryRepository(db_path)
+    try:
+        delivery = repo.get(fine_id, sub_id, "owner")
+        assert delivery is not None
+        assert delivery.id == 1  # id сохранён
+        assert delivery.recipient_role == "owner"
+        assert delivery.attempt_count == 3
+        assert delivery.delivered_at is not None
+
+        # AUTOINCREMENT продолжается корректно после миграции.
+        second_fine_id = _make_detected_fine(db_path, task_id, fingerprint="fp-2")
+        new_delivery = repo.record_attempt(second_fine_id, sub_id, "trusted_operator")
+        assert new_delivery.id > 1
+    finally:
+        repo.close()

@@ -889,3 +889,33 @@ def test_resolve_telegram_sink_recipients_is_noop_when_recipient_not_in_list():
     )
 
     assert result == ["ali_na_l_i", "alenaogir"]
+
+
+# ---- public_bot (см. reader/public_bot/, design report про trusted-operator) ----
+
+
+def test_load_settings_defaults_public_bot_section(tmp_path, monkeypatch):
+    """Без секции public_bot в config.yaml — пустой trusted_operator_user_ids
+    (см. reader/settings.py::PublicBotSettings) — trusted-режим никому не
+    доступен, обычный self-service flow не меняется."""
+    _set_required_env(monkeypatch)
+    config_path = _write_config(tmp_path, _CONFIG_YAML)
+
+    settings = load_settings(config_path)
+
+    assert settings.public_bot.trusted_operator_user_ids == []
+
+
+def test_load_settings_parses_explicit_public_bot_section(tmp_path, monkeypatch):
+    _set_required_env(monkeypatch)
+    config_with_public_bot = _CONFIG_YAML + (
+        "\npublic_bot:\n"
+        "  trusted_operator_user_ids:\n"
+        "    - 5712994689\n"
+        "    - 410811386\n"
+    )
+    config_path = _write_config(tmp_path, config_with_public_bot)
+
+    settings = load_settings(config_path)
+
+    assert settings.public_bot.trusted_operator_user_ids == [5712994689, 410811386]

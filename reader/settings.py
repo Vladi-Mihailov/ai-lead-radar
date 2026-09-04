@@ -250,6 +250,22 @@ class LeadAiSettings(BaseModel):
     model: str = "gpt-5-mini"
 
 
+class PublicBotSettings(BaseModel):
+    """@GEShtrafbot (reader/public_bot/, отдельный процесс от main.py) —
+    авторизация trusted-operator delegated flow (см. design report:
+    "authorization trusted mode только по numeric Telegram user_id из
+    config" — НИКОГДА по username). Токен самого бота (GESHTRAFBOT_TOKEN)
+    сюда намеренно не входит — читается отдельно, напрямую из окружения
+    (см. reader/public_bot/main.py::read_bot_token), не через Settings, и
+    никогда не логируется.
+
+    trusted_operator_user_ids пуст по умолчанию — без явной настройки в
+    config.yaml никто не получает доступ к delegated-режиму, обычный
+    self-service flow при этом не меняется ни для кого."""
+
+    trusted_operator_user_ids: list[int] = Field(default_factory=list)
+
+
 class Settings(BaseModel):
     telegram: TelegramSettings
     app: AppSettings
@@ -258,6 +274,7 @@ class Settings(BaseModel):
     ocr: OcrSettings = Field(default_factory=OcrSettings)
     checkout: CheckoutSettings = Field(default_factory=CheckoutSettings)
     lead_ai: LeadAiSettings = Field(default_factory=LeadAiSettings)
+    public_bot: PublicBotSettings = Field(default_factory=PublicBotSettings)
 
 
 def load_settings(config_path: Path) -> Settings:
@@ -303,6 +320,7 @@ def load_settings(config_path: Path) -> Settings:
     ocr_raw = raw.get("ocr", {})
     checkout_raw = raw.get("checkout", {})
     lead_ai_raw = raw.get("lead_ai", {})
+    public_bot_raw = raw.get("public_bot", {})
 
     # payment_bank/policy_period — LEGACY (см. reader/settings.py::
     # CheckoutSettings): формат по-прежнему валидируется, чтобы не молча
@@ -477,6 +495,11 @@ def load_settings(config_path: Path) -> Settings:
                     if lead_ai_raw.get("recipient") else None
                 ),
                 model=lead_ai_raw.get("model", "gpt-5-mini"),
+            ),
+            public_bot=PublicBotSettings(
+                trusted_operator_user_ids=list(
+                    public_bot_raw.get("trusted_operator_user_ids", [])
+                ),
             ),
         )
     except (KeyError, ValueError) as exc:

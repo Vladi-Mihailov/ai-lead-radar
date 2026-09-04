@@ -35,10 +35,13 @@ from reader.public_bot.conversation_state_repository import (  # noqa: E402
     BotConversationStateRepository,
 )
 from reader.public_bot.handlers import register  # noqa: E402
+from reader.public_bot.known_users_repository import BotKnownUsersRepository  # noqa: E402
 from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
 from reader.public_bot.subscription_service import SubscriptionService  # noqa: E402
 from reader.settings import ConfigError, load_settings  # noqa: E402
 from reader.users.repository import UserRepository  # noqa: E402
+
+_BOT_USERNAME = "GEShtrafbot"
 
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 # Отдельный .session-файл — своя, третья Telethon-сессия проекта (см.
@@ -97,6 +100,7 @@ async def run() -> None:
     user_repository = UserRepository(db_path)
     subscription_repository = FineSubscriptionRepository(db_path)
     conversation_state_repository = BotConversationStateRepository(db_path)
+    known_users_repository = BotKnownUsersRepository(db_path)
 
     http_client = httpx.AsyncClient(
         base_url="https://police.ge/protocol/",
@@ -117,17 +121,27 @@ async def run() -> None:
         fine_provider = PoliceGeProvider(police_ge_session)
         check_service = FineCheckService(fine_provider, task_repository, detected_fine_repository)
 
+        # client конструируется ДО SubscriptionService — тот же самый бот-
+        # клиент передаётся туда как owner_resolver_client (см.
+        # reader/public_bot/owner_resolution.py): резолв @username
+        # trusted-operator delegated flow использует бота, а не отдельное
+        # подключение. client.start(bot_token=...) вызывается позже — на
+        # момент конструирования достаточно самого объекта (тот же приём,
+        # что и register(client, ...) ниже, которое тоже происходит до start()).
+        client = TelegramClient(str(_SESSION_PATH), api_id, api_hash)
+
         subscription_service = SubscriptionService(
             task_repository, subscription_repository, user_repository, check_service,
+            owner_resolver_client=client, bot_username=_BOT_USERNAME,
         )
         controller = ConversationController(
             conversation_state_repository,
             subscription_service,
             tz=ZoneInfo(settings.fine_monitor.timezone),
+            trusted_operator_user_ids=frozenset(settings.public_bot.trusted_operator_user_ids),
         )
 
-        client = TelegramClient(str(_SESSION_PATH), api_id, api_hash)
-        register(client, controller)
+        register(client, controller, known_users_repository)
 
         # token передаётся ЗДЕСЬ и только здесь.
         await client.start(bot_token=token)
@@ -141,6 +155,7 @@ async def run() -> None:
         user_repository.close()
         subscription_repository.close()
         conversation_state_repository.close()
+        known_users_repository.close()
 
 
 def main() -> None:

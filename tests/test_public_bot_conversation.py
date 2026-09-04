@@ -16,6 +16,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import pytest  # noqa: E402
 
+from telethon.errors import UsernameNotOccupiedError  # noqa: E402
+from telethon.tl.types import User as TelethonUser  # noqa: E402
+
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
 from reader.fines.models import ParsedFineRecord  # noqa: E402
@@ -24,6 +27,7 @@ from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E
 from reader.public_bot import texts  # noqa: E402
 from reader.public_bot.conversation import (  # noqa: E402
     STEP_AWAITING_CAR_NUMBER,
+    STEP_AWAITING_OWNER_USERNAME,
     STEP_AWAITING_PERIOD,
     STEP_AWAITING_USERNAME,
     ConversationController,
@@ -31,9 +35,12 @@ from reader.public_bot.conversation import (  # noqa: E402
 from reader.public_bot.conversation_state_repository import BotConversationStateRepository  # noqa: E402
 from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
 from reader.public_bot.subscription_service import SubscriptionService  # noqa: E402
+from reader.users.models import TelegramUserInfo  # noqa: E402
 from reader.users.repository import UserRepository  # noqa: E402
 
 _TBILISI = ZoneInfo("Asia/Tbilisi")
+_TRUSTED_ID = 5712994689
+_TRUSTED_CHAT_ID = 5712994689
 
 
 class _FakeProvider(FineProvider):
@@ -42,6 +49,33 @@ class _FakeProvider(FineProvider):
 
     async def search_by_plate(self, plate: str):
         return self._records_by_car.get(plate, [])
+
+
+class _FakeTelegramClient:
+    def __init__(self, *, entities=None):
+        self._entities = {k.lower(): v for k, v in (entities or {}).items()}
+        self.get_entity_calls: list[str] = []
+
+    async def get_entity(self, entity):
+        username = str(entity).lstrip("@").lower()
+        self.get_entity_calls.append(username)
+        if username in self._entities:
+            return self._entities[username]
+        raise UsernameNotOccupiedError(request=None)
+
+
+def _telethon_user(user_id: int, username: str) -> TelethonUser:
+    return TelethonUser(
+        id=user_id, is_self=False, contact=False, mutual_contact=False, deleted=False,
+        bot=False, bot_chat_history=False, bot_nochats=False, verified=False, restricted=False,
+        min=False, bot_inline_geo=False, support=False, scam=False, apply_min_photo=False,
+        fake=False, bot_attach_menu=False, premium=False, attach_menu_enabled=False,
+        bot_can_edit=False, close_friend=False, stories_hidden=False, stories_unavailable=False,
+        access_hash=999,
+        first_name="Real", last_name="Owner", username=username, phone=None, photo=None,
+        status=None, bot_info_version=None, restriction_reason=None, bot_inline_placeholder=None,
+        lang_code=None,
+    )
 
 
 def _record(car_number="M295YB196", fingerprint="fp-1") -> ParsedFineRecord:
@@ -58,7 +92,10 @@ def _today() -> date:
 
 
 class _Fixture:
-    def __init__(self, tmp_path, records_by_car=None):
+    def __init__(
+        self, tmp_path, records_by_car=None,
+        trusted_operator_user_ids=frozenset(), owner_resolver_client=None,
+    ):
         self.db_path = tmp_path / "users.db"
         self.task_repository = FineMonitoringTaskRepository(self.db_path)
         self.detected_fine_repository = DetectedFineRepository(self.db_path)
@@ -71,9 +108,11 @@ class _Fixture:
         self.service = SubscriptionService(
             self.task_repository, self.subscription_repository,
             self.user_repository, self.check_service,
+            owner_resolver_client=owner_resolver_client,
         )
         self.controller = ConversationController(
             self.conversation_state_repository, self.service, tz=_TBILISI,
+            trusted_operator_user_ids=frozenset(trusted_operator_user_ids),
         )
 
     def close(self):
@@ -87,6 +126,13 @@ class _Fixture:
 @pytest.fixture
 def fx(tmp_path):
     fixture = _Fixture(tmp_path)
+    yield fixture
+    fixture.close()
+
+
+@pytest.fixture
+def trusted_fx(tmp_path):
+    fixture = _Fixture(tmp_path, trusted_operator_user_ids={_TRUSTED_ID})
     yield fixture
     fixture.close()
 
@@ -330,3 +376,151 @@ def test_conversation_state_survives_restart_simulated_reopen(tmp_path):
         assert fixture2.conversation_state_repository.get(7).step == STEP_AWAITING_PERIOD
     finally:
         fixture2.close()
+
+
+# ==== trusted-operator delegated flow (см. design report) ====
+
+
+def test_ordinary_user_never_sees_owner_username_prompt(fx):
+    """Регресс: обычный пользователь (не в trusted_operator_user_ids) —
+    поведение self-service flow не должно отличаться от Stage 2, даже
+    если у него самого нет username (авто-детект/обычный USERNAME_PROMPT)."""
+    fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username=None)
+
+    reply = fx.controller.handle_text("M295YB196", chat_id=1, telegram_user_id=1, username=None)
+
+    assert reply.text == texts.USERNAME_PROMPT
+    assert fx.conversation_state_repository.get(1).step == STEP_AWAITING_USERNAME
+
+
+def test_trusted_user_always_sees_owner_username_prompt_even_with_own_username(trusted_fx):
+    """Trusted-оператор — ВСЕГДА запрашивается владелец, даже если у самого
+    trusted-пользователя есть свой Telegram username (авто-детект self-
+    service здесь не применяется, см. design report об упрощении: нет
+    отдельного экрана "Для себя/Для другого")."""
+    trusted_fx.controller.handle_text(
+        texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username="trusted_own_username",
+    )
+
+    reply = trusted_fx.controller.handle_text(
+        "M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username="trusted_own_username",
+    )
+
+    assert reply.text == texts.OWNER_USERNAME_PROMPT
+    state = trusted_fx.conversation_state_repository.get(_TRUSTED_ID)
+    assert state.step == STEP_AWAITING_OWNER_USERNAME
+    assert state.payload == {"car_number": "M295YB196"}
+
+
+def test_trusted_user_invalid_owner_username_stays_on_same_step(trusted_fx):
+    trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+
+    reply = trusted_fx.controller.handle_text("!!", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+
+    assert "❌" in reply.text
+    assert trusted_fx.conversation_state_repository.get(_TRUSTED_ID).step == STEP_AWAITING_OWNER_USERNAME
+
+
+async def test_trusted_delegate_flow_resolves_immediately_via_local_db(trusted_fx):
+    trusted_fx.user_repository.upsert(
+        TelegramUserInfo(
+            user_id=777, username="real_owner", first_name="Real", last_name="Owner",
+        )
+    )
+    trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    trusted_fx.controller.handle_text("@real_owner", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+
+    reply = await trusted_fx.controller.handle_period_choice(
+        90, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, first_name=None, last_name=None,
+    )
+
+    assert reply is not None
+    assert "✅ Автомобиль добавлен на мониторинг" in reply.text
+    assert "👤 Владелец: @real_owner" in reply.text
+    assert "https://t.me/" not in reply.text  # резолвлено сразу — ссылка не нужна
+
+    [subscription] = trusted_fx.subscription_repository.list_by_user(777)
+    assert subscription.status == "active"
+    assert subscription.created_by_telegram_user_id == _TRUSTED_ID
+    assert trusted_fx.conversation_state_repository.get(_TRUSTED_ID) is None
+
+
+async def test_trusted_delegate_flow_pending_claim_when_owner_unresolved(trusted_fx):
+    trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    trusted_fx.controller.handle_text("@unknown_person", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+
+    reply = await trusted_fx.controller.handle_period_choice(
+        30, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, first_name=None, last_name=None,
+    )
+
+    assert reply is not None
+    assert "✅ Автомобиль добавлен на мониторинг" in reply.text
+    assert "👤 Владелец: @unknown_person" in reply.text
+    assert "https://t.me/GEShtrafbot?start=claim_" in reply.text
+
+    [subscription] = trusted_fx.subscription_repository.list_managed_by_creator(_TRUSTED_ID)
+    assert subscription.status == "pending_claim"
+    assert subscription.telegram_user_id is None
+    # Мониторинг уже идёт, несмотря на pending_claim.
+    [task] = trusted_fx.task_repository.list_active()
+    assert task.car_number == "M295YB196"
+
+
+async def test_claim_deep_link_start_binds_owner_and_confirms(trusted_fx):
+    trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    trusted_fx.controller.handle_text("@unknown_person", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    reply = await trusted_fx.controller.handle_period_choice(
+        30, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, first_name=None, last_name=None,
+    )
+    link = [line for line in reply.text.splitlines() if line.startswith("https://t.me/")][0]
+    token = link.rsplit("claim_", 1)[1]
+
+    claim_reply = trusted_fx.controller.handle_text(
+        f"/start claim_{token}", chat_id=777, telegram_user_id=777,
+        username="unknown_person", first_name="Real", last_name="Owner",
+    )
+
+    assert "✅" in claim_reply.text
+    assert claim_reply.show_main_menu is True
+
+    [subscription] = trusted_fx.subscription_repository.list_by_user(777)
+    assert subscription.status == "active"
+    assert subscription.telegram_user_id == 777
+
+
+def test_claim_deep_link_start_rejects_unknown_token(fx):
+    reply = fx.controller.handle_text(
+        "/start claim_does-not-exist", chat_id=42, telegram_user_id=42, username="someone",
+    )
+
+    assert reply.text == texts.CLAIM_INVALID_TEXT
+
+
+async def test_trusted_my_cars_shows_managed_section_separately(trusted_fx):
+    trusted_fx.user_repository.upsert(
+        TelegramUserInfo(
+            user_id=777, username="real_owner", first_name=None, last_name=None,
+        )
+    )
+    await trusted_fx.service.add_delegated_car(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        owner_username="real_owner", car_number="M295YB196", period_days=30, today=_today(),
+    )
+
+    reply = trusted_fx.controller.handle_text(
+        texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert texts.MANAGED_CARS_HEADER in reply.text
+    assert "M295YB196" in reply.text
+    assert "Владелец: @real_owner" in reply.text
+
+
+def test_ordinary_user_my_cars_has_no_managed_section(fx):
+    reply = fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=1, telegram_user_id=1, username=None)
+
+    assert texts.MANAGED_CARS_HEADER not in reply.text

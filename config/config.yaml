@@ -166,3 +166,19 @@ lead_ai:
   # ДОПОЛНЕНИЕ к обычной пересылке, не замена).
   recipient: "@alena_ogi"
   model: gpt-5-mini
+
+# Публичный клиентский бот @GEShtrafbot (reader/public_bot/, отдельный
+# процесс от main.py — см. deploy/ai-lead-radar-geshtrafbot.service).
+# Токен самого бота (GESHTRAFBOT_TOKEN) сюда НЕ входит — только в .env,
+# см. .env.example.
+public_bot:
+  # Telegram User ID доверенных операторов (сотрудников), которым в
+  # @GEShtrafbot доступен trusted-режим — при "➕ Добавить авто" они
+  # указывают Telegram-владельца автомобиля (ставят машину клиента на
+  # мониторинг), а не только свою собственную (см. design report).
+  # ТОЛЬКО numeric id — авторизация НИКОГДА не проверяется по username.
+  # Для обычных пользователей (не из этого списка) поведение бота не
+  # меняется.
+  trusted_operator_user_ids:
+    - 5712994689
+    - 410811386

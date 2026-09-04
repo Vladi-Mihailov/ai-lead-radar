@@ -19,6 +19,7 @@ from reader.public_bot.keyboards import (
     main_menu_keyboard,
     period_choice_keyboard,
 )
+from reader.public_bot.known_users_repository import BotKnownUsersRepository
 
 logger = logging.getLogger(__name__)
 
@@ -38,13 +39,29 @@ async def _sender_names(event) -> tuple[str | None, str | None, str | None]:
     )
 
 
-def register(client: TelegramClient, controller: ConversationController) -> None:
+def register(
+    client: TelegramClient,
+    controller: ConversationController,
+    known_users_repository: BotKnownUsersRepository | None = None,
+) -> None:
     """Регистрирует NewMessage/CallbackQuery handlers на уже
     сконфигурированном bot-mode TelegramClient (см. reader/public_bot/
     main.py). incoming=True + e.is_private — тот же принцип, что и у
     CommandDispatcher (реагировать только на реальные входящие сообщения
     пользователя в приватном чате с ботом, не на служебные апдейты/группы —
-    @GEShtrafbot не предназначен для групповых чатов)."""
+    @GEShtrafbot не предназначен для групповых чатов).
+
+    known_users_repository — если передан, ЛЮБОЕ входящее событие (текст
+    или callback), независимо от содержимого, обновляет bot_known_users
+    (см. design report: единственный способ узнать, что боту можно
+    что-либо доставить этому numeric id, — он уже хоть раз ему написал)."""
+
+    def _record_known_user(telegram_user_id: int, telegram_chat_id: int, username: str | None) -> None:
+        if known_users_repository is not None:
+            known_users_repository.record_seen(
+                telegram_user_id=telegram_user_id, telegram_chat_id=telegram_chat_id,
+                telegram_username=username,
+            )
 
     @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def _on_message(event: events.NewMessage.Event) -> None:
@@ -52,13 +69,16 @@ def register(client: TelegramClient, controller: ConversationController) -> None
         if not text or not text.strip():
             return
 
-        username, _first_name, _last_name = await _sender_names(event)
+        username, first_name, last_name = await _sender_names(event)
+        _record_known_user(event.sender_id, event.chat_id, username)
 
         reply = controller.handle_text(
             text,
             chat_id=event.chat_id,
             telegram_user_id=event.sender_id,
             username=username,
+            first_name=first_name,
+            last_name=last_name,
         )
 
         await _send_reply(event, reply)
@@ -70,7 +90,8 @@ def register(client: TelegramClient, controller: ConversationController) -> None
             await event.answer("Неизвестная или устаревшая кнопка", alert=True)
             return
 
-        _username, first_name, last_name = await _sender_names(event)
+        username, first_name, last_name = await _sender_names(event)
+        _record_known_user(event.sender_id, event.chat_id, username)
 
         reply = await controller.handle_period_choice(
             days,

@@ -136,7 +136,7 @@ def test_new_subscription_allowed_after_previous_one_stopped(tmp_path):
             telegram_user_id=42, telegram_chat_id=42, telegram_username="client",
             start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
         )
-        assert repo.stop_own_subscription(first.id, telegram_user_id=42) is True
+        assert repo.stop_by_owner_or_creator(first.id, telegram_user_id=42) is True
 
         second = repo.create(
             monitoring_task_id=task_id, car_number="B957MA09",
@@ -207,7 +207,7 @@ def test_one_client_on_multiple_cars(tmp_path):
 # ---- stop не затрагивает чужую подписку ----
 
 
-def test_stop_own_subscription_does_not_affect_another_users_subscription(tmp_path):
+def test_stop_by_owner_or_creator_does_not_affect_another_users_subscription(tmp_path):
     db_path = tmp_path / "users.db"
     task_id = _make_task(db_path, car_number="B957MA09")
 
@@ -224,7 +224,7 @@ def test_stop_own_subscription_does_not_affect_another_users_subscription(tmp_pa
             start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
         )
 
-        stopped = repo.stop_own_subscription(alice.id, telegram_user_id=1)
+        stopped = repo.stop_by_owner_or_creator(alice.id, telegram_user_id=1)
 
         assert stopped is True
         assert repo.get(alice.id).status == "stopped"
@@ -237,7 +237,7 @@ def test_stop_own_subscription_does_not_affect_another_users_subscription(tmp_pa
         repo.close()
 
 
-def test_stop_own_subscription_rejects_wrong_owner(tmp_path):
+def test_stop_by_owner_or_creator_rejects_wrong_owner(tmp_path):
     """Ключевая защита от "чужого авто через подделанный id" (см. design
     про forwarded-кнопки/callback_data) — repository-уровень отказывает,
     даже если вызывающий код (будущие bot-хендлеры) ошибся бы с
@@ -253,7 +253,7 @@ def test_stop_own_subscription_rejects_wrong_owner(tmp_path):
             start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
         )
 
-        stopped = repo.stop_own_subscription(alice.id, telegram_user_id=999)
+        stopped = repo.stop_by_owner_or_creator(alice.id, telegram_user_id=999)
 
         assert stopped is False
         assert repo.get(alice.id).status == "active"  # не изменилась
@@ -261,10 +261,10 @@ def test_stop_own_subscription_rejects_wrong_owner(tmp_path):
         repo.close()
 
 
-def test_stop_own_subscription_returns_false_for_unknown_id(tmp_path):
+def test_stop_by_owner_or_creator_returns_false_for_unknown_id(tmp_path):
     repo = _make_repo(tmp_path)
     try:
-        assert repo.stop_own_subscription(999999, telegram_user_id=1) is False
+        assert repo.stop_by_owner_or_creator(999999, telegram_user_id=1) is False
     finally:
         repo.close()
 
@@ -332,7 +332,7 @@ def test_expire_elapsed_does_not_touch_already_stopped_subscriptions(tmp_path):
             telegram_user_id=1, telegram_chat_id=1, telegram_username="alice",
             start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
         )
-        repo.stop_own_subscription(sub.id, telegram_user_id=1)
+        repo.stop_by_owner_or_creator(sub.id, telegram_user_id=1)
 
         updated_count = repo.expire_elapsed(today=date(2026, 9, 1))
 
