@@ -32,7 +32,11 @@ def _format_date(value: date | None) -> str | None:
     return value.strftime("%d.%m.%Y") if value else None
 
 
-def _format_fine_block(event: NewFineEvent) -> str:
+def format_fine_block(event: NewFineEvent) -> str:
+    """Публичная (без ведущего "_") — переиспользуется
+    reader/public_bot/delivery_texts.py для клиентских уведомлений (см.
+    design report Stage 4), чтобы не заводить вторую реализацию
+    форматирования тех же полей штрафа для другого канала доставки."""
     lines = []
 
     penalty_date = _format_date(event.penalty_date)
@@ -73,10 +77,10 @@ def _format_message(car_number: str, events: list[NewFineEvent], source_url: str
 
     if len(events) == 1:
         header = "🚨 Обнаружен новый опубликованный штраф"
-        body = f"{car_line}\n" + _format_fine_block(events[0])
+        body = f"{car_line}\n" + format_fine_block(events[0])
     else:
         header = f"🚨 Обнаружены новые опубликованные штрафы ({len(events)})"
-        blocks = "\n\n".join(_format_fine_block(event) for event in events)
+        blocks = "\n\n".join(format_fine_block(event) for event in events)
         body = f"{car_line}\n\n{blocks}"
 
     lines = [header, "", body, "", f"🔗 [Открыть источник]({source_url})"]

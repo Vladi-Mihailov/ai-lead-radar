@@ -40,6 +40,15 @@ fine_monitor:
     - "09:00"
     - "15:00"
     - "21:00"
+  # Расписание ВТОРОГО, независимого FineJob-инстанса — только для машин,
+  # поставленных на мониторинг через @GEShtrafbot (monitoring_scope=
+  # 'client_bot', см. reader/public_bot/), 2 раза в сутки вместо 3 — см.
+  # design report Stage 4. Машина никогда не проверяется по обоим
+  # расписаниям сразу: monitoring_scope партиционирует задачи
+  # взаимоисключающе.
+  client_check_times:
+    - "08:00"
+    - "20:00"
   source_url: https://police.ge/protocol/index.php?lang=en
   request_timeout: 30
 

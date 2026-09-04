@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import sys
+from functools import partial
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -36,6 +37,7 @@ from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E
 from reader.groups import GroupLoadError, load_groups  # noqa: E402
 from reader.jobs.archive_fine_job import ArchiveFineJob  # noqa: E402
 from reader.jobs.fine_job import FineJob  # noqa: E402
+from reader.jobs.notification_flush_job import NotificationFlushJob  # noqa: E402
 from reader.jobs.scheduler import Scheduler  # noqa: E402
 from reader.lead_ai.service import LeadAiService  # noqa: E402
 from reader.logging_setup import setup_logging  # noqa: E402
@@ -43,6 +45,10 @@ from reader.notifications.telegram_notification_service import (  # noqa: E402
     TelegramNotificationService,
 )
 from reader.ocr.service import OcrService  # noqa: E402
+from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
+from reader.public_bot.subscription_service import (  # noqa: E402
+    extend_client_bot_task_if_still_needed,
+)
 from reader.scenarios import KeywordMatcher, ScenarioLoadError, load_scenarios  # noqa: E402
 from reader.settings import ConfigError, Settings, load_settings  # noqa: E402
 from reader.sinks.console_sink import ConsoleSink  # noqa: E402
@@ -85,6 +91,7 @@ def build_fine_monitor_components(
     notification_chat_ids: list[int | str],
     allowed_user_ids: list[int],
     user_repository: UserRepository | None = None,
+    client_subscription_repository: FineSubscriptionRepository | None = None,
 ) -> tuple[FineJob, Scheduler, TelegramNotificationService, CommandDispatcher, FineCommand]:
     """Чистая сборка зависимостей мониторинга штрафов — без единого await,
     без обращения к сети/Telegram (конструкторы ничего не подключают, только
@@ -97,7 +104,14 @@ def build_fine_monitor_components(
     соединение с users.db не открывается. Нужен только для того, чтобы
     уведомление о новом штрафе показывало Telegram-пользователя, добавившего
     машину в мониторинг (см. FineNotificationCoordinator); None — тоже
-    рабочий вариант (уведомление тогда покажет "Telegram: ID N")."""
+    рабочий вариант (уведомление тогда покажет "Telegram: ID N").
+
+    client_subscription_repository (см. design report Stage 4) — тот же
+    приём: реальный экземпляр включает pre_complete_hook для client_bot-
+    scope FineJob (см. extend_client_bot_task_if_still_needed), None —
+    хук просто не подключается (client_bot-задачи заканчиваются как
+    раньше, без пересчёта под ещё действующие подписки) — как и с
+    user_repository=None, отсутствие не должно ронять запуск."""
     fine_monitor = settings.fine_monitor
     tz = ZoneInfo(fine_monitor.timezone)
 
@@ -116,6 +130,15 @@ def build_fine_monitor_components(
     fine_provider = PoliceGeProvider(police_ge_session)
     check_service = FineCheckService(fine_provider, task_repository, detected_fine_repository)
 
+    # scope="operator" — явно (не None/list_active()): партиционирование
+    # по monitoring_scope (см. reader/fines/models.py, Stage 1) требует,
+    # чтобы ОБА FineJob-инстанса фильтровали, иначе client_bot-задачи
+    # проверялись бы и здесь, и в client_fine_job ниже одновременно (см.
+    # design report Stage 4, раздел "как исключается двойная проверка").
+    # Для существующих production-данных это не меняет НИ ОДНОГО результата:
+    # все сегодняшние задачи уже monitoring_scope='operator' по умолчанию
+    # (см. Stage 1 миграцию) — меняется только код, не поведение для уже
+    # существующих строк.
     fine_job = FineJob(
         task_repository=task_repository,
         check_service=check_service,
@@ -125,12 +148,47 @@ def build_fine_monitor_components(
         archive_check_enabled=fine_monitor.archive_check_enabled,
         archive_check_hour=fine_monitor.archive_check_hour,
         archive_interval_days=fine_monitor.archive_interval_days,
+        scope="operator",
     )
-    # Второй, независимый job — архивные проверки (см. докстрок
-    # ArchiveFineJob) для задач, у которых обычный период уже закончился.
-    # Тот же task_repository/check_service/notification_coordinator, что и
-    # у fine_job — ни второго обращения к police.ge, ни второго notification
-    # flow не создаётся.
+
+    # Второй, независимый job — та же логика (тот же класс FineJob), но
+    # только для задач, поставленных на мониторинг через @GEShtrafbot (см.
+    # reader/public_bot/) — 2 раза в сутки (fine_monitor.client_check_times)
+    # вместо 3, и с pre_complete_hook, который продлевает задачу вместо
+    # завершения, пока у неё остаются действующие подписки (см. design
+    # report Stage 4, раздел "Task lifecycle"). Тот же
+    # task_repository/check_service/notification_coordinator, что и у
+    # fine_job/archive_fine_job — ни второго обращения к police.ge, ни
+    # второго notification flow не создаётся.
+    client_pre_complete_hook = (
+        partial(
+            extend_client_bot_task_if_still_needed,
+            task_repository=task_repository,
+            subscription_repository=client_subscription_repository,
+        )
+        if client_subscription_repository is not None
+        else None
+    )
+    client_fine_job = FineJob(
+        task_repository=task_repository,
+        check_service=check_service,
+        notification_coordinator=notification_coordinator,
+        run_times=fine_monitor.client_check_times,
+        tz=tz,
+        archive_check_enabled=fine_monitor.archive_check_enabled,
+        archive_check_hour=fine_monitor.archive_check_hour,
+        archive_interval_days=fine_monitor.archive_interval_days,
+        scope="client_bot",
+        name="fine_monitoring_client_bot",
+        pre_complete_hook=client_pre_complete_hook,
+    )
+
+    # Третий, независимый job — архивные проверки (см. докстрок
+    # ArchiveFineJob) для задач, у которых обычный период уже закончился
+    # (не различает scope — та же логика для операторских и client_bot
+    # задач, см. design report). Тот же task_repository/check_service/
+    # notification_coordinator, что и у fine_job — ни второго обращения к
+    # police.ge, ни второго notification flow не создаётся.
     archive_fine_job = ArchiveFineJob(
         task_repository=task_repository,
         check_service=check_service,
@@ -141,8 +199,24 @@ def build_fine_monitor_components(
         daily_limit=fine_monitor.archive_daily_limit,
         tz=tz,
     )
+
+    # Четвёртый job — НЕ проверяет штрафы, только максимально часто (на
+    # каждом тике Scheduler'а) доставляет оператору уже накопленные, но ещё
+    # не отправленные штрафы (см. reader/jobs/notification_flush_job.py) —
+    # чтобы immediate-check из @GEShtrafbot (Add Car / 🔎 Проверить сейчас)
+    # не ждал следующего планового запуска fine_job/client_fine_job (см.
+    # design report Stage 4, раздел "Immediate-check race handling").
+    # flush_pending() ВСЕГДА вызывается только отсюда и из конца run() у
+    # fine_job/client_fine_job/archive_fine_job — все четыре живут в ОДНОМ
+    # Scheduler'е, который выполняет job'ы строго последовательно (см.
+    # Scheduler.tick()), поэтому конкурирующего вызова не бывает даже
+    # внутри одного процесса, не говоря уже о бот-процессе (который вообще
+    # не имеет доступа к notification_coordinator).
+    notification_flush_job = NotificationFlushJob(notification_coordinator)
+
     scheduler = Scheduler(
-        [fine_job, archive_fine_job], poll_interval_seconds=_SCHEDULER_POLL_INTERVAL_SECONDS
+        [fine_job, client_fine_job, archive_fine_job, notification_flush_job],
+        poll_interval_seconds=_SCHEDULER_POLL_INTERVAL_SECONDS,
     )
 
     command_dispatcher = CommandDispatcher(
@@ -188,6 +262,7 @@ async def _run_fine_monitor(
     task_repository: FineMonitoringTaskRepository,
     detected_fine_repository: DetectedFineRepository,
     user_repository: UserRepository | None = None,
+    client_subscription_repository: FineSubscriptionRepository | None = None,
 ) -> None:
     """Композиция мониторинга штрафов: PoliceGeSession/Provider →
     FineCheckService → FineJob → Scheduler, плюс TelegramNotificationService
@@ -210,6 +285,7 @@ async def _run_fine_monitor(
                 settings, source, task_repository, detected_fine_repository,
                 http_client, notification_chat_ids, allowed_user_ids,
                 user_repository=user_repository,
+                client_subscription_repository=client_subscription_repository,
             )
         )
 
@@ -222,8 +298,12 @@ async def _run_fine_monitor(
         logger.info("Fine monitor enabled")
         logger.info("Scheduler started")
         logger.info(
-            "Configured run times: %s",
+            "Configured run times (operator scope): %s",
             ", ".join(t.strftime("%H:%M") for t in fine_monitor.check_times),
+        )
+        logger.info(
+            "Configured run times (client_bot scope, @GEShtrafbot): %s",
+            ", ".join(t.strftime("%H:%M") for t in fine_monitor.client_check_times),
         )
         logger.info("Timezone: %s", fine_monitor.timezone)
         logger.info(
@@ -529,13 +609,24 @@ async def run() -> None:
 
     fine_task_repository = None
     detected_fine_repository = None
+    fine_subscription_repository = None
     if settings.fine_monitor.enabled:
         fine_task_repository = FineMonitoringTaskRepository(settings.app.users_db_file)
         detected_fine_repository = DetectedFineRepository(settings.app.users_db_file)
+        # Та же БД, что и у остальных репозиториев (settings.app.users_db_file) —
+        # третий писатель в fine_monitoring_subscriptions наряду с
+        # ai-lead-radar-geshtrafbot.service (см. design report Stage 4:
+        # SQLite WAL уже безопасно обслуживает несколько процессов, тот же
+        # принцип, что и main.py/sync_users.py/inviter worker). Нужен
+        # ТОЛЬКО для pre_complete_hook client_bot-scope FineJob (см.
+        # build_fine_monitor_components) — сам main-процесс ничего в эту
+        # таблицу не пишет, только читает.
+        fine_subscription_repository = FineSubscriptionRepository(settings.app.users_db_file)
         background.append(
             _run_fine_monitor(
                 settings, source, fine_task_repository, detected_fine_repository,
                 user_repository,
+                client_subscription_repository=fine_subscription_repository,
             )
         )
     else:
@@ -563,6 +654,8 @@ async def run() -> None:
             fine_task_repository.close()
         if detected_fine_repository is not None:
             detected_fine_repository.close()
+        if fine_subscription_repository is not None:
+            fine_subscription_repository.close()
 
 
 def main() -> None:

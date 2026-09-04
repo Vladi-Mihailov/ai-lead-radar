@@ -351,3 +351,33 @@ def test_data_persists_across_repository_reopen(tmp_path):
         assert fetched == fine
     finally:
         reopened.close()
+
+
+# ---- list_by_car_number (client delivery poller, см. design report Stage 4) ----
+
+
+def test_list_by_car_number_returns_all_fines_for_that_car(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(tmp_path, db_path)
+
+    repo = DetectedFineRepository(db_path)
+    try:
+        first = repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            external_fine_id="AB1", fingerprint="fp-1",
+            penalty_date=date(2026, 8, 6), due_date=date(2026, 8, 20),
+            delivered_status=None, raw_data="{}",
+        )
+        second = repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            external_fine_id="AB2", fingerprint="fp-2",
+            penalty_date=date(2026, 8, 7), due_date=date(2026, 8, 21),
+            delivered_status=None, raw_data="{}",
+        )
+
+        found = repo.list_by_car_number("B957MA09")
+
+        assert {f.id for f in found} == {first.id, second.id}
+        assert repo.list_by_car_number("ZZ999ZZ") == []
+    finally:
+        repo.close()

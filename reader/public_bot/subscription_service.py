@@ -66,7 +66,61 @@ class ClaimOutcome:
     subscription: FineMonitoringSubscription
 
 
+@dataclass(frozen=True)
+class CheckNowOutcome:
+    """Результат 🔎 Проверить сейчас — ТОТ ЖЕ FineCheckService/дедуп, что и
+    у фонового мониторинга (см. SubscriptionService.check_now); никакой
+    отдельной системы штрафов здесь нет."""
+
+    car_number: str
+    check_ok: bool
+    new_fines_count: int
+
+
 _CLAIM_TOKEN_TTL = timedelta(days=7)
+
+# Подписки, с которыми пользователь ещё может что-то сделать через
+# 🔎 Проверить сейчас / ⛔ Остановить мониторинг (см. design report Stage 4,
+# раздел "UI completion") — активные ИЛИ ожидающие claim, но не
+# остановленные/истёкшие (те уже неактуальны для действия).
+_ACTIONABLE_STATUSES = ("active", "pending_claim")
+
+
+async def extend_client_bot_task_if_still_needed(
+    task: FineMonitoringTask,
+    today: date,
+    *,
+    task_repository: FineMonitoringTaskRepository,
+    subscription_repository: FineSubscriptionRepository,
+) -> FineMonitoringTask:
+    """pre_complete_hook для client_bot-scope FineJob (см.
+    reader/jobs/fine_job.py, design report Stage 4, раздел "Task
+    lifecycle") — вызывается ТОЛЬКО когда FineJob уже решил, что
+    today > task.end_date, ПЕРЕД тем как пометить задачу completed.
+
+    Пересчитывает максимальный end_date среди ещё действующих (active ИЛИ
+    pending_claim) подписок этой машины — если он всё ещё >= today,
+    продлевает задачу (extend_period_if_shorter — никогда не сокращает)
+    вместо завершения; иначе возвращает задачу без изменений, и FineJob
+    завершает её как обычно ("если больше нет действующих client
+    subscriptions и task не operator scope — его можно завершить").
+
+    Каждый существующий путь создания/claim/продления подписки уже вызывает
+    extend_period_if_shorter() сам по себе (см. _create_or_extend_task/
+    add_delegated_car) — этот хук существует как defense-in-depth
+    подстраховка, а не как единственный механизм продления."""
+    if task.monitoring_scope != "client_bot":
+        # Операторские задачи эту логику не используют вовсе (см. design
+        # report: "operator task semantics не менять") — wiring
+        # (reader/main.py) подключает этот хук только к client_bot-scope
+        # FineJob-инстансу, но проверка здесь — на случай ошибки wiring.
+        return task
+
+    needed_until = subscription_repository.max_relevant_end_date_for_car(task.car_number, today=today)
+    if needed_until is None or needed_until <= task.end_date:
+        return task
+
+    return task_repository.extend_period_if_shorter(task.id, needed_until)
 
 
 class SubscriptionService:
@@ -456,4 +510,74 @@ class SubscriptionService:
         FineSubscriptionRepository.stop_by_owner_or_creator)."""
         return self._subscription_repository.stop_by_owner_or_creator(
             subscription_id, telegram_user_id=telegram_user_id,
+        )
+
+    # ---- 🔎 Проверить сейчас / ⛔ Остановить мониторинг (см. design report
+    # Stage 4, раздел "UI completion") ----
+
+    def list_actionable_subscriptions(
+        self, telegram_user_id: int, *, today: date,
+    ) -> list[FineMonitoringSubscription]:
+        """Подписки, с которыми этот пользователь может действовать через
+        🔎/⛔ — свои (owner) плюс delegated, которые он создал (creator),
+        в статусе active/pending_claim и ещё не истёкшие. Дедуп по id — та
+        же строка МОЖЕТ оказаться и "своей", и "созданной им" одновременно
+        (trusted-оператор поставил машину на мониторинг для самого себя)."""
+        own = self._subscription_repository.list_by_user(telegram_user_id)
+        managed = self._subscription_repository.list_managed_by_creator(telegram_user_id)
+
+        seen_ids = {s.id for s in own}
+        combined = own + [s for s in managed if s.id not in seen_ids]
+
+        return [
+            s for s in combined
+            if s.status in _ACTIONABLE_STATUSES and s.end_date >= today
+        ]
+
+    def get_actionable_subscription(
+        self, subscription_id: int, *, telegram_user_id: int,
+    ) -> FineMonitoringSubscription | None:
+        """None, если подписка не существует ИЛИ telegram_user_id не её
+        владелец и не создавший её trusted-оператор — единственная
+        server-side проверка владения перед 🔎/⛔ (см. design report:
+        "никаких действий с чужими subscriptions по callback payload").
+        callback_data несёт только subscription_id (публичный, не секрет) —
+        доказательством авторизации служит ИСКЛЮЧИТЕЛЬНО этот запрос к БД,
+        а не сам факт, что id пришёл в правильном формате."""
+        subscription = self._subscription_repository.get(subscription_id)
+        if subscription is None:
+            return None
+        if telegram_user_id in (subscription.telegram_user_id, subscription.created_by_telegram_user_id):
+            return subscription
+        return None
+
+    async def check_now(
+        self, subscription_id: int, *, telegram_user_id: int,
+    ) -> CheckNowOutcome | None:
+        """None — подписка не найдена/не принадлежит/не создана этим
+        пользователем (см. get_actionable_subscription) — вызывающий код
+        должен показать "недоступно", ничего не проверяя.
+
+        Иначе — ТОТ ЖЕ FineCheckService.check_task(), что и у фонового
+        FineJob/ClientFineJob и у self-service/delegated add_car — никакой
+        отдельной реализации проверки/обхода дедупа (см. явное требование
+        задачи). flush_pending() здесь намеренно НЕ вызывается — та же
+        причина, что и в add_car()/add_delegated_car(): NotificationFlushJob
+        (см. reader/jobs/notification_flush_job.py) в main-процессе
+        подхватит результат в течение ~30 секунд, без риска double-send
+        между процессами."""
+        subscription = self.get_actionable_subscription(subscription_id, telegram_user_id=telegram_user_id)
+        if subscription is None:
+            return None
+
+        task = self._task_repository.get(subscription.monitoring_task_id)
+        if task is None:
+            return None
+
+        check_result = await self._check_service.check_task(task)
+
+        return CheckNowOutcome(
+            car_number=subscription.car_number,
+            check_ok=check_result.status == "ok",
+            new_fines_count=len(check_result.new_fines) if check_result.status == "ok" else 0,
         )

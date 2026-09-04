@@ -26,6 +26,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_detected_fines_dedup
     ON detected_fines (monitoring_task_id, fingerprint)
 """
 
+# Поддерживает client delivery poller (см. reader/public_bot/delivery_service.py) —
+# ему нужно эффективно находить все detected_fines конкретного car_number,
+# не сканируя всю таблицу целиком (см. list_by_car_number ниже). Чисто
+# аддитивный индекс — не меняет форму данных, миграция не нужна.
+_CAR_NUMBER_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_detected_fines_car_number
+    ON detected_fines (car_number)
+"""
+
 _INSERT = """
 INSERT INTO detected_fines (
     monitoring_task_id, car_number, external_fine_id, fingerprint,
@@ -47,6 +56,10 @@ _SELECT_BY_ID = f"SELECT {_SELECT_FIELDS} FROM detected_fines WHERE id = ?"
 _SELECT_BY_FINGERPRINT = f"""
     SELECT {_SELECT_FIELDS} FROM detected_fines
     WHERE monitoring_task_id = ? AND fingerprint = ?
+"""
+
+_SELECT_BY_CAR_NUMBER = f"""
+    SELECT {_SELECT_FIELDS} FROM detected_fines WHERE car_number = ?
 """
 
 _SELECT_PENDING_NOTIFICATIONS = f"""
@@ -124,6 +137,7 @@ class DetectedFineRepository:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute(_SCHEMA)
         self._conn.execute(_UNIQUE_INDEX)
+        self._conn.execute(_CAR_NUMBER_INDEX)
         self._conn.commit()
 
     def get_by_fingerprint(self, monitoring_task_id: int, fingerprint: str) -> DetectedFine | None:
@@ -131,6 +145,15 @@ class DetectedFineRepository:
             _SELECT_BY_FINGERPRINT, (monitoring_task_id, fingerprint)
         ).fetchone()
         return _row_to_fine(row) if row else None
+
+    def list_by_car_number(self, car_number: str) -> list[DetectedFine]:
+        """Все обнаруженные штрафы конкретного номера — используется client
+        delivery poller'ом (см. reader/public_bot/delivery_service.py) для
+        поиска штрафов, которые нужно доставить подписчикам этой машины.
+        Не заменяет и не трогает дедуп (monitoring_task_id, fingerprint) —
+        это чтение уже сохранённых, задедупленных записей."""
+        rows = self._conn.execute(_SELECT_BY_CAR_NUMBER, (car_number,)).fetchall()
+        return [_row_to_fine(row) for row in rows]
 
     def list_pending_notifications(self) -> list[DetectedFine]:
         """Штрафы, о которых оператор ещё не был уведомлён — свежесозданные

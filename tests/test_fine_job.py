@@ -646,3 +646,244 @@ async def test_grouped_message_marks_all_events_in_group_as_delivered(tmp_path):
     finally:
         task_repo.close()
         fine_repo.close()
+
+
+# ---- scope/name/pre_complete_hook (см. design report Stage 4, раздел
+# "как исключается двойная проверка одной машины") ----
+
+
+def test_default_name_is_unchanged_when_not_overridden():
+    job = FineJob(
+        task_repository=None, check_service=None, notification_coordinator=None,
+        run_times=_RUN_TIMES, tz=_TBILISI,
+    )
+    assert job.name == "fine_monitoring"
+
+
+def test_custom_name_overrides_class_default():
+    job = FineJob(
+        task_repository=None, check_service=None, notification_coordinator=None,
+        run_times=_RUN_TIMES, tz=_TBILISI, name="fine_monitoring_client_bot",
+    )
+    assert job.name == "fine_monitoring_client_bot"
+
+
+async def test_scope_none_uses_list_active_unfiltered(tmp_path):
+    """scope=None (по умолчанию) — БИТ В БИТ то же поведение, что и раньше:
+    list_active(), без учёта monitoring_scope."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    try:
+        task_repo.create(
+            car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID, monitoring_scope="operator",
+        )
+        task_repo.create(
+            car_number="BB002BB", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID, monitoring_scope="client_bot",
+        )
+
+        provider = _FakeProvider()
+        job = _make_job(task_repo, fine_repo, provider, _FakeNotificationService())
+
+        await job.run(_MID_PERIOD)
+
+        assert sorted(provider.requested_plates) == ["AA001AA", "BB002BB"]
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_scope_operator_only_checks_operator_tasks(tmp_path):
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    try:
+        task_repo.create(
+            car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID, monitoring_scope="operator",
+        )
+        task_repo.create(
+            car_number="BB002BB", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID, monitoring_scope="client_bot",
+        )
+
+        provider = _FakeProvider()
+        check_service = FineCheckService(provider, task_repo, fine_repo)
+        coordinator = FineNotificationCoordinator(fine_repo, task_repo, _FakeNotificationService())
+        job = FineJob(
+            task_repository=task_repo, check_service=check_service, notification_coordinator=coordinator,
+            run_times=_RUN_TIMES, tz=_TBILISI, scope="operator",
+        )
+
+        await job.run(_MID_PERIOD)
+
+        assert provider.requested_plates == ["AA001AA"]
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_scope_client_bot_only_checks_client_bot_tasks(tmp_path):
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    try:
+        task_repo.create(
+            car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID, monitoring_scope="operator",
+        )
+        task_repo.create(
+            car_number="BB002BB", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID, monitoring_scope="client_bot",
+        )
+
+        provider = _FakeProvider()
+        check_service = FineCheckService(provider, task_repo, fine_repo)
+        coordinator = FineNotificationCoordinator(fine_repo, task_repo, _FakeNotificationService())
+        job = FineJob(
+            task_repository=task_repo, check_service=check_service, notification_coordinator=coordinator,
+            run_times=_RUN_TIMES, tz=_TBILISI, scope="client_bot",
+        )
+
+        await job.run(_MID_PERIOD)
+
+        assert provider.requested_plates == ["BB002BB"]
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_operator_and_client_bot_scoped_jobs_never_double_check_same_task(tmp_path):
+    """Интеграционная проверка "двойной проверки не бывает" — ДВА
+    FineJob-инстанса (операторский и client_bot) в одном "тике" ни разу не
+    запрашивают один и тот же номер (см. design report Stage 4)."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    try:
+        task_repo.create(
+            car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID, monitoring_scope="operator",
+        )
+        task_repo.create(
+            car_number="BB002BB", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID, monitoring_scope="client_bot",
+        )
+        # "Общая" машина оператора+клиента — должна остаться operator scope
+        # (см. Stage 1: monitoring_scope только upgrade, никогда downgrade)
+        # и попасть РОВНО в одну из двух проверок.
+        shared_task = task_repo.create(
+            car_number="CC003CC", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID, monitoring_scope="operator",
+        )
+
+        provider = _FakeProvider()
+        check_service = FineCheckService(provider, task_repo, fine_repo)
+        coordinator = FineNotificationCoordinator(fine_repo, task_repo, _FakeNotificationService())
+        operator_job = FineJob(
+            task_repository=task_repo, check_service=check_service, notification_coordinator=coordinator,
+            run_times=_RUN_TIMES, tz=_TBILISI, scope="operator",
+        )
+        client_job = FineJob(
+            task_repository=task_repo, check_service=check_service, notification_coordinator=coordinator,
+            run_times=_RUN_TIMES, tz=_TBILISI, scope="client_bot",
+        )
+
+        await operator_job.run(_MID_PERIOD)
+        await client_job.run(_MID_PERIOD)
+
+        # Каждый номер запрошен РОВНО один раз суммарно между двумя job'ами.
+        assert sorted(provider.requested_plates) == ["AA001AA", "BB002BB", "CC003CC"]
+        assert task_repo.get(shared_task.id).monitoring_scope == "operator"
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_pre_complete_hook_extends_task_and_checks_it_in_same_run(tmp_path):
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    try:
+        task = task_repo.create(
+            car_number="AA001AA", label=None,
+            start_date=date(2026, 8, 1), end_date=date(2026, 8, 20),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID, monitoring_scope="client_bot",
+        )
+
+        async def _extend_hook(task, today):
+            return task_repo.extend_period_if_shorter(task.id, date(2026, 9, 30))
+
+        provider = _FakeProvider()
+        check_service = FineCheckService(provider, task_repo, fine_repo)
+        coordinator = FineNotificationCoordinator(fine_repo, task_repo, _FakeNotificationService())
+        job = FineJob(
+            task_repository=task_repo, check_service=check_service, notification_coordinator=coordinator,
+            run_times=_RUN_TIMES, tz=_TBILISI, scope="client_bot", pre_complete_hook=_extend_hook,
+        )
+
+        after_end = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
+        await job.run(after_end)
+
+        # Задача продлена и ПРОВЕРЕНА в этом же проходе — не завершена.
+        updated = task_repo.get(task.id)
+        assert updated.status == "active"
+        assert updated.end_date == date(2026, 9, 30)
+        assert provider.requested_plates == ["AA001AA"]
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_pre_complete_hook_returning_unchanged_task_completes_as_usual(tmp_path):
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    try:
+        task = task_repo.create(
+            car_number="AA001AA", label=None,
+            start_date=date(2026, 8, 1), end_date=date(2026, 8, 20),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID, monitoring_scope="client_bot",
+        )
+
+        async def _noop_hook(task, today):
+            return task  # ничего не продлевает — как будто подписчиков не осталось
+
+        provider = _FakeProvider()
+        check_service = FineCheckService(provider, task_repo, fine_repo)
+        coordinator = FineNotificationCoordinator(fine_repo, task_repo, _FakeNotificationService())
+        job = FineJob(
+            task_repository=task_repo, check_service=check_service, notification_coordinator=coordinator,
+            run_times=_RUN_TIMES, tz=_TBILISI, scope="client_bot", pre_complete_hook=_noop_hook,
+        )
+
+        after_end = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
+        await job.run(after_end)
+
+        updated = task_repo.get(task.id)
+        assert updated.status == "completed"
+        assert provider.requested_plates == []
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_pre_complete_hook_not_called_when_none(tmp_path):
+    """Регресс: hook=None (по умолчанию, единственный существующий вызов
+    в reader/main.py для операторского FineJob) — завершение задачи ведёт
+    себя БИТ В БИТ как раньше."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    try:
+        task = task_repo.create(
+            car_number="AA001AA", label=None,
+            start_date=date(2026, 8, 1), end_date=date(2026, 8, 20),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+
+        provider = _FakeProvider()
+        job = _make_job(task_repo, fine_repo, provider, _FakeNotificationService())
+
+        await job.run(datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc))
+
+        assert task_repo.get(task.id).status == "completed"
+        assert provider.requested_plates == []
+    finally:
+        task_repo.close()
+        fine_repo.close()

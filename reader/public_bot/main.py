@@ -3,11 +3,14 @@
 вручную: `python -m reader.public_bot.main`, ни один существующий процесс
 его не импортирует и не запускает автоматически.
 
-Stage 2: сам бот + полный Add Car flow + "Мои авто". Никакого ClientFineJob,
-delivery poller или фоновых клиентских уведомлений здесь нет (см. Stage 2
-report) — только на запрос пользователя (Add Car flow) и immediate check
-сразу после него, тем же самым FineCheckService, что и у операторского
-Fine Monitor.
+Stage 4: бот + Add Car flow + "Мои авто" + 🔎 Проверить сейчас/⛔ Остановить
+мониторинг + client delivery poller (owner/trusted_operator, см.
+reader/public_bot/delivery_service.py). Этот процесс НИКОГДА не вызывает
+FineNotificationCoordinator.flush_pending() — операторские уведомления
+остаются исключительно в ai-lead-radar.service (см.
+reader/jobs/notification_flush_job.py и design report Stage 4, раздел
+"Immediate-check race handling") — здесь нет и не может быть операторской
+Telegram-сессии для этого.
 """
 
 import asyncio
@@ -34,6 +37,8 @@ from reader.public_bot.conversation import ConversationController  # noqa: E402
 from reader.public_bot.conversation_state_repository import (  # noqa: E402
     BotConversationStateRepository,
 )
+from reader.public_bot.delivery_repository import ClientFineDeliveryRepository  # noqa: E402
+from reader.public_bot.delivery_service import ClientDeliveryService  # noqa: E402
 from reader.public_bot.handlers import register  # noqa: E402
 from reader.public_bot.known_users_repository import BotKnownUsersRepository  # noqa: E402
 from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
@@ -42,6 +47,12 @@ from reader.settings import ConfigError, load_settings  # noqa: E402
 from reader.users.repository import UserRepository  # noqa: E402
 
 _BOT_USERNAME = "GEShtrafbot"
+# Как часто client delivery poller проверяет, есть ли что доставить —
+# независимо от bounded backoff отдельных доставок (см.
+# reader/public_bot/delivery_service.py::RETRY_BACKOFF) — это просто как
+# часто вообще опрашивать, не то же самое, что интервал повтора одной
+# доставки.
+_DELIVERY_POLL_INTERVAL_SECONDS = 180.0
 
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 # Отдельный .session-файл — своя, третья Telethon-сессия проекта (см.
@@ -55,6 +66,18 @@ _POLICE_GE_USER_AGENT = (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _TelethonBotSender:
+    """Адаптер reader.public_bot.delivery_service.BotMessageSenderLike
+    поверх уже подключённого bot-mode TelegramClient — второе подключение
+    не создаётся."""
+
+    def __init__(self, client: TelegramClient):
+        self._client = client
+
+    async def send_message(self, chat_id: int, text: str) -> None:
+        await self._client.send_message(chat_id, text)
 
 
 def read_bot_token() -> str:
@@ -71,6 +94,45 @@ def read_bot_token() -> str:
             "См. .env.example."
         )
     return token
+
+
+async def _run_delivery_poller(delivery_service: ClientDeliveryService) -> None:
+    """Бесконечный цикл — тикает раз в _DELIVERY_POLL_INTERVAL_SECONDS,
+    независимо от результата предыдущего тика (ошибка одного тика не
+    останавливает поллер, см. design report: "failure одного recipient не
+    блокирует другого" — то же самое верно и для тика целиком)."""
+    while True:
+        try:
+            result = await delivery_service.run_once()
+            if result.delivered or result.failed or result.flood_wait_hit:
+                logger.info(
+                    "Client delivery tick: delivered=%d, failed=%d, flood_wait=%s",
+                    result.delivered, result.failed, result.flood_wait_hit,
+                )
+        except Exception:
+            logger.exception("Client delivery poller: тик завершился с ошибкой")
+
+        await asyncio.sleep(_DELIVERY_POLL_INTERVAL_SECONDS)
+
+
+async def _run_concurrently(coroutines: list) -> None:
+    """Как asyncio.gather, но при ошибке в одной корутине отменяет
+    остальные — тот же приём, что и reader/main.py::_run_concurrently (не
+    импортируется оттуда напрямую: это отдельный, самостоятельный процесс/
+    entrypoint, а не библиотека)."""
+    tasks = [asyncio.create_task(coro) for coro in coroutines]
+    try:
+        done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    for task in done:
+        exc = task.exception()
+        if exc is not None:
+            raise exc
 
 
 async def run() -> None:
@@ -101,6 +163,7 @@ async def run() -> None:
     subscription_repository = FineSubscriptionRepository(db_path)
     conversation_state_repository = BotConversationStateRepository(db_path)
     known_users_repository = BotKnownUsersRepository(db_path)
+    delivery_repository = ClientFineDeliveryRepository(db_path)
 
     http_client = httpx.AsyncClient(
         base_url="https://police.ge/protocol/",
@@ -113,6 +176,9 @@ async def run() -> None:
         # build_fine_monitor_components) — второй независимый провайдер
         # реализация не заводится, второй экземпляр нужен только потому, что
         # это отдельный ПРОЦЕСС, а не потому, что логика проверки другая.
+        # Используется и для immediate-check в Add Car flow, и для
+        # 🔎 Проверить сейчас — ни то, ни другое не обходит
+        # FineCheckService/дедуп (см. design report Stage 4).
         police_ge_session = PoliceGeSession(
             http_client,
             page_url=settings.fine_monitor.source_url,
@@ -123,11 +189,11 @@ async def run() -> None:
 
         # client конструируется ДО SubscriptionService — тот же самый бот-
         # клиент передаётся туда как owner_resolver_client (см.
-        # reader/public_bot/owner_resolution.py): резолв @username
-        # trusted-operator delegated flow использует бота, а не отдельное
-        # подключение. client.start(bot_token=...) вызывается позже — на
-        # момент конструирования достаточно самого объекта (тот же приём,
-        # что и register(client, ...) ниже, которое тоже происходит до start()).
+        # reader/public_bot/owner_resolution.py) и как отправитель для
+        # client delivery poller'а (см. _TelethonBotSender ниже) —
+        # client.start(bot_token=...) вызывается позже — на момент
+        # конструирования достаточно самого объекта (тот же приём, что и
+        # register(client, ...) ниже, тоже до start()).
         client = TelegramClient(str(_SESSION_PATH), api_id, api_hash)
 
         subscription_service = SubscriptionService(
@@ -143,11 +209,25 @@ async def run() -> None:
 
         register(client, controller, known_users_repository)
 
+        delivery_service = ClientDeliveryService(
+            detected_fine_repository, subscription_repository, delivery_repository,
+            _TelethonBotSender(client),
+            tz=ZoneInfo(settings.fine_monitor.timezone),
+        )
+
         # token передаётся ЗДЕСЬ и только здесь.
         await client.start(bot_token=token)
         logger.info("✔ @GEShtrafbot подключён")
 
-        await client.run_until_disconnected()
+        # Бот и client delivery poller работают в одном event loop'е,
+        # параллельно, без второго Telegram-подключения (poller использует
+        # ТОТ ЖЕ уже подключённый client через _TelethonBotSender). Ошибка
+        # одного не должна тихо остановить другой незамеченной — тот же
+        # принцип, что и в reader/main.py::run().
+        await _run_concurrently([
+            client.run_until_disconnected(),
+            _run_delivery_poller(delivery_service),
+        ])
     finally:
         await http_client.aclose()
         task_repository.close()
@@ -156,6 +236,7 @@ async def run() -> None:
         subscription_repository.close()
         conversation_state_repository.close()
         known_users_repository.close()
+        delivery_repository.close()
 
 
 def main() -> None:

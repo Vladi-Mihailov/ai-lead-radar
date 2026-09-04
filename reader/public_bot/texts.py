@@ -25,13 +25,32 @@ USERNAME_PROMPT = "👤 Введите ваш Telegram-логин\n\nНапри�
 OWNER_USERNAME_PROMPT = "👤 Укажите Telegram владельца автомобиля\n\nНапример: @VeronaWarm"
 PERIOD_PROMPT = "📅 Выберите срок мониторинга"
 
-# "Проверить сейчас"/"Остановить мониторинг" реализуются в следующем этапе
-# (см. Stage 2 report) — сейчас это единственная реакция на нажатие,
-# без выбора конкретного авто и без callback вообще.
-COMING_SOON_TEXT = "🚧 Функция скоро будет доступна"
-
 STALE_DIALOG_TEXT = "⚠️ Диалог устарел, начните заново."
 NO_CARS_TEXT = "У вас пока нет добавленных автомобилей."
+
+# 🔎 Проверить сейчас / ⛔ Остановить мониторинг (см. design report Stage 4).
+NO_ACTIONABLE_CARS_TEXT = "У вас нет автомобилей, с которыми можно выполнить это действие."
+CHECK_NOW_PICK_PROMPT = "🔎 Выберите автомобиль для проверки:"
+STOP_PICK_PROMPT = "⛔ Выберите автомобиль для остановки мониторинга:"
+STOP_CONFIRM_PROMPT = "Остановить мониторинг для {car_number}?"
+STOP_FAILED_TEXT = "⚠️ Не удалось остановить — попробуйте ещё раз через «⛔ Остановить мониторинг»."
+CALLBACK_NOT_AUTHORIZED_TEXT = "Это действие недоступно — начните заново через меню."
+
+
+def format_check_now_result(outcome) -> str:
+    """outcome: reader.public_bot.subscription_service.CheckNowOutcome.
+    Без технической детали ошибки в тексте клиенту (см. design: та же
+    осторожность, что и в format_add_car_summary/
+    format_delegated_add_car_summary)."""
+    if not outcome.check_ok:
+        return f"⚠️ Проверить штрафы для {outcome.car_number} сейчас не удалось. Попробуйте позже."
+    if outcome.new_fines_count:
+        return f"🔎 {outcome.car_number}: найдено новых штрафов — {outcome.new_fines_count}"
+    return f"🔎 {outcome.car_number}: новых штрафов нет"
+
+
+def format_stop_success(car_number: str) -> str:
+    return f"✅ Мониторинг для {car_number} остановлен."
 
 _DATE_FORMAT = "%d.%m.%Y"
 

@@ -105,6 +105,13 @@ class FineMonitorSettings(BaseModel):
     enabled: bool = False
     timezone: str = "Asia/Tbilisi"
     check_times: list[time] = Field(default_factory=lambda: [time(9, 0), time(15, 0), time(21, 0)])
+    # Расписание ВТОРОГО, независимого FineJob-инстанса — только для задач
+    # monitoring_scope='client_bot' (см. reader/fines/models.py, design
+    # report Stage 4про "минимальную и чистую scheduling-модель"). Не
+    # пересекается с check_times выше: monitoring_scope партиционирует
+    # задачи взаимоисключающе, поэтому ни одна задача не проверяется по
+    # обоим расписаниям сразу.
+    client_check_times: list[time] = Field(default_factory=lambda: [time(8, 0), time(20, 0)])
     source_url: str = "https://police.ge/protocol/index.php?lang=en"
     request_timeout: float = 30.0
     notification_chat_ids: list[int | str] = Field(default_factory=list)
@@ -446,6 +453,12 @@ def load_settings(config_path: Path) -> Settings:
                     _parse_check_time(value)
                     for value in fine_monitor_raw.get(
                         "check_times", ["09:00", "15:00", "21:00"]
+                    )
+                ],
+                client_check_times=[
+                    _parse_check_time(value)
+                    for value in fine_monitor_raw.get(
+                        "client_check_times", ["08:00", "20:00"]
                     )
                 ],
                 source_url=fine_monitor_raw.get(

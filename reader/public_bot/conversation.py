@@ -51,11 +51,23 @@ _CLAIM_PAYLOAD_PREFIX = "claim_"
 @dataclass(frozen=True)
 class BotReply:
     """Что показать пользователю — Telethon-адаптер (handlers.py) решает,
-    какую клавиатуру приложить к тексту, исходя из этих двух флагов."""
+    какую клавиатуру приложить к тексту, исходя из этих полей.
+
+    check_now_options/stop_options — (subscription_id, car_number) для
+    построения списка выбора (см. reader/public_bot/keyboards.py::
+    options_keyboard) — subscription_id в callback_data ПУБЛИЧЕН и НЕ
+    является доказательством авторизации сам по себе: владение всегда
+    перепроверяется server-side при нажатии (см.
+    SubscriptionService.get_actionable_subscription), а не на этапе
+    показа списка (см. design report Stage 4: "никаких действий с чужими
+    subscriptions по callback payload")."""
 
     text: str
     show_main_menu: bool = False
     show_period_buttons: bool = False
+    check_now_options: list[tuple[int, str]] | None = None
+    stop_options: list[tuple[int, str]] | None = None
+    stop_confirm_subscription_id: int | None = None
 
 
 class ConversationController:
@@ -170,14 +182,32 @@ class ConversationController:
             self._states.clear(chat_id)
             return self._format_my_cars_reply(telegram_user_id)
 
-        if stripped_text in (texts.CHECK_NOW_LABEL, texts.STOP_LABEL):
-            # Реализуется в следующем этапе — сейчас только временный
-            # ответ, без выбора конкретного авто и без callback вообще (не
-            # вводим небезопасный payload заранее).
+        if stripped_text == texts.CHECK_NOW_LABEL:
             self._states.clear(chat_id)
-            return BotReply(text=texts.COMING_SOON_TEXT)
+            return self._build_picker_reply(telegram_user_id, kind="checknow")
+
+        if stripped_text == texts.STOP_LABEL:
+            self._states.clear(chat_id)
+            return self._build_picker_reply(telegram_user_id, kind="stop")
 
         return None
+
+    def _build_picker_reply(self, telegram_user_id: int, *, kind: str) -> BotReply:
+        """Список авто, с которыми telegram_user_id может действовать
+        через 🔎/⛔ (свои + delegated, которые он создал, см.
+        SubscriptionService.list_actionable_subscriptions) — subscription_id
+        в кнопках, не car_number, чтобы не полагаться на уникальность
+        номера при последующей server-side проверке владения."""
+        subscriptions = self._subscriptions.list_actionable_subscriptions(
+            telegram_user_id, today=self._today(),
+        )
+        if not subscriptions:
+            return BotReply(text=texts.NO_ACTIONABLE_CARS_TEXT)
+
+        options = [(s.id, s.car_number) for s in subscriptions]
+        if kind == "checknow":
+            return BotReply(text=texts.CHECK_NOW_PICK_PROMPT, check_now_options=options)
+        return BotReply(text=texts.STOP_PICK_PROMPT, stop_options=options)
 
     def _format_my_cars_reply(self, telegram_user_id: int) -> BotReply:
         today = self._today()
@@ -433,3 +463,58 @@ class ConversationController:
                 claim_link=outcome.claim_link,
             )
         )
+
+    # ---- 🔎 Проверить сейчас (inline-кнопки, без conversation_state) ----
+
+    async def handle_check_now_choice(
+        self, subscription_id: int, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """None — подписка не найдена/не принадлежит/не создана этим
+        telegram_user_id (см. SubscriptionService.get_actionable_subscription,
+        вызывается внутри check_now()) — Telethon-адаптер (handlers.py)
+        в этом случае отвечает алертом и ничего не проверяет. subscription_id
+        пришёл из callback_data (см. reader/public_bot/keyboards.py) —
+        публичный, не секрет; авторизация — ИСКЛЮЧИТЕЛЬНО через запрос к
+        БД по РЕАЛЬНОМУ event.sender_id, а не через факт валидности id."""
+        outcome = await self._subscriptions.check_now(subscription_id, telegram_user_id=telegram_user_id)
+        if outcome is None:
+            return None
+        return BotReply(text=texts.format_check_now_result(outcome))
+
+    # ---- ⛔ Остановить мониторинг (pick -> confirm, без conversation_state) ----
+
+    def handle_stop_pick(self, subscription_id: int, *, telegram_user_id: int) -> BotReply | None:
+        """Первый шаг — показывает подтверждение, ЕЩЁ НИЧЕГО не
+        останавливает. None — та же server-side проверка владения, что и
+        у check-now (см. SubscriptionService.get_actionable_subscription)."""
+        subscription = self._subscriptions.get_actionable_subscription(
+            subscription_id, telegram_user_id=telegram_user_id,
+        )
+        if subscription is None:
+            return None
+
+        return BotReply(
+            text=texts.STOP_CONFIRM_PROMPT.format(car_number=subscription.car_number),
+            stop_confirm_subscription_id=subscription.id,
+        )
+
+    def handle_stop_confirm(self, subscription_id: int, *, telegram_user_id: int) -> BotReply:
+        """Финальный шаг — владение перепроверяется ЗАНОВО здесь (а не
+        только доверяется тому, что пользователь дошёл до этого экрана,
+        см. design report: "нельзя подменить owner/user_id через callback
+        payload") — SubscriptionService.stop_subscription() сам делает эту
+        проверку через FineSubscriptionRepository.stop_by_owner_or_creator."""
+        subscription = self._subscriptions.get_actionable_subscription(
+            subscription_id, telegram_user_id=telegram_user_id,
+        )
+        if subscription is None:
+            return BotReply(text=texts.STOP_FAILED_TEXT, show_main_menu=True)
+
+        stopped = self._subscriptions.stop_subscription(subscription_id, telegram_user_id=telegram_user_id)
+        if not stopped:
+            return BotReply(text=texts.STOP_FAILED_TEXT, show_main_menu=True)
+
+        return BotReply(text=texts.format_stop_success(subscription.car_number), show_main_menu=True)
+
+    def handle_stop_cancel(self) -> BotReply:
+        return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)

@@ -2,20 +2,27 @@
 
 Security-инвариант (см. design report и reader/public_bot/conversation.py):
 callback_data периода несёт ТОЛЬКО выбранное значение (b"period:30" и
-т.п.) — никакого telegram_user_id/subscription_id/task_id. Владение и
-идентичность проверяются ИСКЛЮЧИТЕЛЬНО через event.sender_id +
-conversation_state (см. ConversationController.handle_period_choice) —
-callback_data сам по себе не является доказательством ничего, кроме "какая
-кнопка была нажата" (пользователь может переслать сообщение с кнопкой в
-свой собственный чат с ботом или его callback_data теоретически может быть
-воспроизведён — но это не даёт доступа ни к чьей чужой записи, потому что
-никакая чужая запись в payload не упоминается).
+т.п.) — никакого telegram_user_id/task_id. Владение и идентичность
+проверяются ИСКЛЮЧИТЕЛЬНО через event.sender_id + conversation_state (см.
+ConversationController.handle_period_choice) — callback_data сам по себе
+не является доказательством ничего, кроме "какая кнопка была нажата"
+(пользователь может переслать сообщение с кнопкой в свой собственный чат с
+ботом или его callback_data теоретически может быть воспроизведён — но это
+не даёт доступа ни к чьей чужой записи, потому что никакая чужая запись в
+payload не упоминается).
 
-Тот же принцип ОБЯЗАТЕЛЕН для любого будущего callback (например, "выбрать
-машину" для 🔎 Проверить сейчас/⛔ Остановить мониторинг — ещё не
-реализовано в этом этапе, см. reader/public_bot/texts.py::COMING_SOON_TEXT):
-payload не должен нести идентификатор чужой записи, который потом
-используется без повторной серверной проверки владения по event.sender_id.
+🔎 Проверить сейчас / ⛔ Остановить мониторинг (см. design report Stage 4)
+устроены немного иначе: их callback_data ДЕЙСТВИТЕЛЬНО несёт
+subscription_id (иначе "выбрать одно из НЕСКОЛЬКИХ авто" невозможно
+закодировать без идентификатора вообще) — но тот же инвариант сохраняется
+на СЛЕДУЮЩЕМ уровне: subscription_id сам по себе публичен и НЕ является
+доказательством владения — ConversationController.handle_check_now_choice/
+handle_stop_pick/handle_stop_confirm вызывают
+SubscriptionService.get_actionable_subscription()/check_now()/
+stop_subscription(), которые ВСЕГДА заново проверяют владение по
+РЕАЛЬНОМУ event.sender_id перед тем, как что-либо показать/сделать — то
+есть подделанный/чужой subscription_id просто не пройдёт эту проверку,
+независимо от того, насколько "правильно" он выглядит в callback_data.
 """
 
 from telethon import Button
@@ -29,6 +36,10 @@ from reader.public_bot.texts import (
 )
 
 _PERIOD_PREFIX = b"period:"
+_CHECK_NOW_PREFIX = b"checknow:"
+_STOP_PICK_PREFIX = b"stoppick:"
+_STOP_YES_PREFIX = b"stopyes:"
+STOP_NO = b"stopno"
 
 
 def main_menu_keyboard() -> list[list[Button]]:
@@ -54,12 +65,52 @@ def decode_period_callback(data: bytes | None) -> int | None:
     """None для чего угодно, кроме РОВНО одного значения из PERIOD_CHOICES —
     намеренно не парсит произвольные числа из чужого/подделанного
     callback_data (allowlist, а не "любое целое число")."""
-    if not data or not data.startswith(_PERIOD_PREFIX):
-        return None
+    return _decode_id(data, _PERIOD_PREFIX, allowlist=PERIOD_CHOICES)
 
+
+def _decode_id(data: bytes | None, prefix: bytes, *, allowlist: tuple[int, ...] | None = None) -> int | None:
+    if not data or not data.startswith(prefix):
+        return None
     try:
-        value = int(data[len(_PERIOD_PREFIX):])
+        value = int(data[len(prefix):])
     except ValueError:
         return None
+    if allowlist is not None and value not in allowlist:
+        return None
+    return value
 
-    return value if value in PERIOD_CHOICES else None
+
+def decode_check_now_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _CHECK_NOW_PREFIX)
+
+
+def decode_stop_pick_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _STOP_PICK_PREFIX)
+
+
+def decode_stop_confirm_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _STOP_YES_PREFIX)
+
+
+def options_keyboard(options: list[tuple[int, str]], *, prefix: bytes) -> list[list[Button]]:
+    """Один subscription_id на кнопку — см. модуль docstring про то, почему
+    это безопасно (owner-check происходит при нажатии, не здесь)."""
+    return [
+        [Button.inline(f"🚗 {label}", prefix + str(subscription_id).encode("ascii"))]
+        for subscription_id, label in options
+    ]
+
+
+def stop_confirm_keyboard(subscription_id: int) -> list[list[Button]]:
+    return [[
+        Button.inline("Да", _STOP_YES_PREFIX + str(subscription_id).encode("ascii")),
+        Button.inline("Отмена", STOP_NO),
+    ]]
+
+
+def check_now_options_keyboard(options: list[tuple[int, str]]) -> list[list[Button]]:
+    return options_keyboard(options, prefix=_CHECK_NOW_PREFIX)
+
+
+def stop_options_keyboard(options: list[tuple[int, str]]) -> list[list[Button]]:
+    return options_keyboard(options, prefix=_STOP_PICK_PREFIX)

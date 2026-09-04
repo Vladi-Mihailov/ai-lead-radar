@@ -40,6 +40,7 @@ from reader.fines.police_ge_provider import PoliceGeProvider  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
 from reader.jobs.archive_fine_job import ArchiveFineJob  # noqa: E402
 from reader.jobs.fine_job import FineJob  # noqa: E402
+from reader.jobs.notification_flush_job import NotificationFlushJob  # noqa: E402
 from reader.jobs.scheduler import Scheduler  # noqa: E402
 from reader.main import (  # noqa: E402
     build_checkout_components,
@@ -56,6 +57,7 @@ from reader.notifications.telegram_notification_service import (  # noqa: E402
     TelegramNotificationService,
 )
 from reader.ocr.service import OcrService  # noqa: E402
+from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
 from reader.settings import ConfigError, load_settings  # noqa: E402
 from reader.sinks.lead_ai_sink import LeadAiSink  # noqa: E402
 from reader.sources.telegram_source import TelegramSource  # noqa: E402
@@ -209,6 +211,7 @@ async def test_build_fine_monitor_components_wires_dependencies_correctly(tmp_pa
 
     task_repository = FineMonitoringTaskRepository(tmp_path / "users.db")
     detected_fine_repository = DetectedFineRepository(tmp_path / "users.db")
+    client_subscription_repository = FineSubscriptionRepository(tmp_path / "users.db")
 
     # Реальный httpx.AsyncClient — конструктор ничего не подключает, ни
     # одного запроса в этом тесте не выполняется.
@@ -222,6 +225,7 @@ async def test_build_fine_monitor_components_wires_dependencies_correctly(tmp_pa
                 settings, source, task_repository, detected_fine_repository,
                 http_client, notification_chat_ids, settings.fine_monitor.allowed_user_ids,
                 user_repository=user_repository,
+                client_subscription_repository=client_subscription_repository,
             )
         )
 
@@ -261,19 +265,53 @@ async def test_build_fine_monitor_components_wires_dependencies_correctly(tmp_pa
         # ещё нет в локальной БД (см. задачу про баг "не найден в базе").
         assert fine_command._telegram_client is source.client
 
-        # Scheduler получил оба job'а — FineJob и ArchiveFineJob, тот же
-        # task_repository/check_service/notification_coordinator у обоих
-        # (ни второго обращения к police.ge, ни второго notification flow).
-        assert len(scheduler._jobs) == 2
+        # Scheduler получил ЧЕТЫРЕ job'а (см. design report Stage 4):
+        # операторский FineJob, client_bot FineJob, ArchiveFineJob,
+        # NotificationFlushJob — все делят один и тот же task_repository/
+        # check_service/notification_coordinator (ни второго обращения к
+        # police.ge, ни второго notification flow).
+        assert len(scheduler._jobs) == 4
         assert scheduler._jobs[0] is fine_job
-        archive_fine_job = scheduler._jobs[1]
+        client_fine_job = scheduler._jobs[1]
+        archive_fine_job = scheduler._jobs[2]
+        notification_flush_job = scheduler._jobs[3]
+
         assert isinstance(archive_fine_job, ArchiveFineJob)
         assert archive_fine_job._task_repository is task_repository
         assert archive_fine_job._check_service is fine_job._check_service
         assert archive_fine_job._notification_coordinator is fine_job._notification_coordinator
 
-        # Расписание/таймзона взяты из конфига, а не захардкожены.
+        # Партиционирование по monitoring_scope (см. design report Stage 4,
+        # раздел "как исключается двойная проверка") — явно "operator" для
+        # существующего инстанса (а не None/list_active()), иначе он бы
+        # проверял и client_bot-задачи тоже, дублируя client_fine_job.
+        assert fine_job._scope == "operator"
+        assert fine_job.name == "fine_monitoring"
+
+        assert isinstance(client_fine_job, FineJob)
+        assert client_fine_job is not fine_job
+        assert client_fine_job._scope == "client_bot"
+        assert client_fine_job.name == "fine_monitoring_client_bot"
+        # Тот же task_repository/check_service/notification_coordinator —
+        # ни второго обращения к police.ge, ни второго notification flow.
+        assert client_fine_job._task_repository is task_repository
+        assert client_fine_job._check_service is fine_job._check_service
+        assert client_fine_job._notification_coordinator is fine_job._notification_coordinator
+        # pre_complete_hook подключён (client_subscription_repository передан) —
+        # см. reader/public_bot/subscription_service.py::
+        # extend_client_bot_task_if_still_needed.
+        assert client_fine_job._pre_complete_hook is not None
+        # Операторский инстанс НЕ получает хук — "operator task semantics
+        # не менять" (см. design report).
+        assert fine_job._pre_complete_hook is None
+
+        assert isinstance(notification_flush_job, NotificationFlushJob)
+        assert notification_flush_job._notification_coordinator is fine_job._notification_coordinator
+
+        # Расписание/таймзона взяты из конфига, а не захардкожены —
+        # операторское и client_bot расписания независимы.
         assert [t.strftime("%H:%M") for t in fine_job._run_times] == ["09:00", "15:00", "21:00"]
+        assert [t.strftime("%H:%M") for t in client_fine_job._run_times] == ["08:00", "20:00"]
         assert str(fine_job._tz) == "Asia/Tbilisi"
 
         # Настройки архивного режима — тоже из конфига (см. FineMonitorSettings
@@ -306,6 +344,7 @@ async def test_build_fine_monitor_components_wires_dependencies_correctly(tmp_pa
         user_repository.close()
         task_repository.close()
         detected_fine_repository.close()
+        client_subscription_repository.close()
         await http_client.aclose()
 
 

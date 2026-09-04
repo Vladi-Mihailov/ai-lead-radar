@@ -24,7 +24,10 @@ from reader.fines.provider import FineProvider, FineProviderError  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
 from reader.public_bot.owner_resolution import OwnerResolutionError  # noqa: E402
 from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
-from reader.public_bot.subscription_service import SubscriptionService  # noqa: E402
+from reader.public_bot.subscription_service import (  # noqa: E402
+    SubscriptionService,
+    extend_client_bot_task_if_still_needed,
+)
 from reader.users.models import TelegramUserInfo  # noqa: E402
 from reader.users.repository import UserRepository  # noqa: E402
 
@@ -519,3 +522,166 @@ async def test_stop_subscription_allows_creator_and_rejects_stranger(fx):
 
     assert fx.service.stop_subscription(outcome.subscription.id, telegram_user_id=999999) is False
     assert fx.service.stop_subscription(outcome.subscription.id, telegram_user_id=_TRUSTED_ID) is True
+
+
+# ==== 🔎 Проверить сейчас / ⛔ Остановить мониторинг (см. design report Stage 4) ====
+
+
+async def test_list_actionable_subscriptions_combines_own_and_managed_without_duplicates(fx):
+    fx.user_repository.upsert(
+        TelegramUserInfo(user_id=777, username="real_owner", first_name=None, last_name=None)
+    )
+    own = await fx.service.add_car(
+        telegram_user_id=42, telegram_chat_id=42, username="client",
+        first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+    )
+    delegated = await fx.service.add_delegated_car(
+        created_by_telegram_user_id=42, created_by_telegram_chat_id=42,
+        owner_username="real_owner", car_number="BB002BB", period_days=30, today=date(2026, 9, 3),
+    )
+
+    actionable = fx.service.list_actionable_subscriptions(42, today=date(2026, 9, 3))
+
+    assert {s.id for s in actionable} == {own.subscription.id, delegated.subscription.id}
+
+
+def test_list_actionable_subscriptions_excludes_stopped_and_expired(fx):
+    task = fx.task_repository.create(
+        car_number="AA001AA", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        telegram_chat_id=1, created_by_user_id=1, monitoring_scope="client_bot",
+    )
+    expired = fx.subscription_repository.create(
+        monitoring_task_id=task.id, car_number="AA001AA", telegram_user_id=1,
+        telegram_chat_id=1, telegram_username="alice",
+        start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+    )
+    active = fx.subscription_repository.create(
+        monitoring_task_id=task.id, car_number="AA001AA", telegram_user_id=2,
+        telegram_chat_id=2, telegram_username="bob",
+        start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+    )
+    fx.subscription_repository.stop_by_owner_or_creator(expired.id, telegram_user_id=1)  # не влияет — уже expired по дате
+
+    actionable_for_expired_owner = fx.service.list_actionable_subscriptions(1, today=date(2026, 9, 3))
+    actionable_for_active_owner = fx.service.list_actionable_subscriptions(2, today=date(2026, 9, 3))
+
+    assert actionable_for_expired_owner == []
+    assert [s.id for s in actionable_for_active_owner] == [active.id]
+
+
+async def test_get_actionable_subscription_rejects_stranger(fx):
+    outcome = await fx.service.add_car(
+        telegram_user_id=42, telegram_chat_id=42, username="client",
+        first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+    )
+
+    assert fx.service.get_actionable_subscription(outcome.subscription.id, telegram_user_id=42) is not None
+    assert fx.service.get_actionable_subscription(outcome.subscription.id, telegram_user_id=999) is None
+    assert fx.service.get_actionable_subscription(999999, telegram_user_id=42) is None
+
+
+async def test_check_now_uses_existing_check_service_and_dedup(fx):
+    """Явное требование задачи: 🔎 Проверить сейчас не должен создавать
+    отдельную систему штрафов/обходить дедуп."""
+    outcome = await fx.service.add_car(
+        telegram_user_id=42, telegram_chat_id=42, username="client",
+        first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+    )
+    assert fx.provider.requested_plates == ["AA001AA"]  # уже проверено внутри add_car
+
+    result = await fx.service.check_now(outcome.subscription.id, telegram_user_id=42)
+
+    assert result is not None
+    assert result.car_number == "AA001AA"
+    assert result.check_ok is True
+    assert result.new_fines_count == 0
+    # Тот же provider/FineCheckService — второй запрос, не отдельная система.
+    assert fx.provider.requested_plates == ["AA001AA", "AA001AA"]
+
+
+async def test_check_now_returns_none_for_unauthorized_user(fx):
+    outcome = await fx.service.add_car(
+        telegram_user_id=42, telegram_chat_id=42, username="client",
+        first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+    )
+
+    result = await fx.service.check_now(outcome.subscription.id, telegram_user_id=999)
+
+    assert result is None
+
+
+async def test_check_now_reports_new_fines_found(tmp_path):
+    fixture = _Fixture(tmp_path)
+    try:
+        outcome = await fixture.service.add_car(
+            telegram_user_id=42, telegram_chat_id=42, username="client",
+            first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+        )
+        # Провайдер теперь "находит" штраф для следующей проверки.
+        fixture.provider._records_by_car["AA001AA"] = [_record(car_number="AA001AA", fingerprint="fp-new")]
+
+        result = await fixture.service.check_now(outcome.subscription.id, telegram_user_id=42)
+
+        assert result.new_fines_count == 1
+    finally:
+        fixture.close()
+
+
+# ==== extend_client_bot_task_if_still_needed (см. design report Stage 4,
+# раздел "Task lifecycle") ====
+
+
+async def test_extend_hook_extends_task_when_subscription_still_needs_it(fx):
+    task = fx.task_repository.create(
+        car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+        telegram_chat_id=1, created_by_user_id=1, monitoring_scope="client_bot",
+    )
+    fx.subscription_repository.create(
+        monitoring_task_id=task.id, car_number="AA001AA", telegram_user_id=1,
+        telegram_chat_id=1, telegram_username="alice",
+        start_date=date(2026, 8, 1), end_date=date(2026, 12, 1),  # дольше, чем сама задача
+    )
+
+    updated = await extend_client_bot_task_if_still_needed(
+        task, date(2026, 9, 1),
+        task_repository=fx.task_repository, subscription_repository=fx.subscription_repository,
+    )
+
+    assert updated.end_date == date(2026, 12, 1)
+
+
+async def test_extend_hook_returns_unchanged_when_no_subscribers_remain(fx):
+    task = fx.task_repository.create(
+        car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+        telegram_chat_id=1, created_by_user_id=1, monitoring_scope="client_bot",
+    )
+
+    updated = await extend_client_bot_task_if_still_needed(
+        task, date(2026, 9, 1),
+        task_repository=fx.task_repository, subscription_repository=fx.subscription_repository,
+    )
+
+    assert updated.end_date == task.end_date
+    assert updated.id == task.id
+
+
+async def test_extend_hook_is_noop_for_operator_scope_task(fx):
+    task = fx.task_repository.create(
+        car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+        telegram_chat_id=1, created_by_user_id=1,
+    )
+    assert task.monitoring_scope == "operator"
+    fx.subscription_repository.create(
+        monitoring_task_id=task.id, car_number="AA001AA", telegram_user_id=1,
+        telegram_chat_id=1, telegram_username="alice",
+        start_date=date(2026, 8, 1), end_date=date(2026, 12, 1),
+    )
+
+    updated = await extend_client_bot_task_if_still_needed(
+        task, date(2026, 9, 1),
+        task_repository=fx.task_repository, subscription_repository=fx.subscription_repository,
+    )
+
+    # "operator task semantics не менять" — хук не должен трогать
+    # операторскую задачу, даже если формально нашёл более позднюю подписку.
+    assert updated.end_date == task.end_date

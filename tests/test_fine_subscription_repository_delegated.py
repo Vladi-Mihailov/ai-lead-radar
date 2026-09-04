@@ -466,3 +466,165 @@ def test_self_service_subscription_still_only_stoppable_by_its_owner(tmp_path):
         assert stopped_by_owner is True
     finally:
         repo.close()
+
+
+def test_creator_can_stop_own_pending_claim_invitation(tmp_path):
+    """См. design report Stage 4 — trusted-оператор должен уметь отменить
+    ещё НЕ claimed приглашение через ⛔ Остановить мониторинг."""
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(db_path)
+
+    repo = FineSubscriptionRepository(db_path)
+    try:
+        pending = repo.create_pending_claim(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            owner_username_hint="unknown_person",
+            created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+            claim_token="tok-1", claim_token_expires_at=_future_expiry(),
+        )
+
+        stopped = repo.stop_by_owner_or_creator(pending.id, telegram_user_id=_TRUSTED_ID)
+
+        assert stopped is True
+        assert repo.get(pending.id).status == "stopped"
+    finally:
+        repo.close()
+
+
+def test_stranger_cannot_stop_pending_claim_invitation(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(db_path)
+
+    repo = FineSubscriptionRepository(db_path)
+    try:
+        pending = repo.create_pending_claim(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            owner_username_hint="unknown_person",
+            created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+            claim_token="tok-1", claim_token_expires_at=_future_expiry(),
+        )
+
+        stopped = repo.stop_by_owner_or_creator(pending.id, telegram_user_id=999999)
+
+        assert stopped is False
+        assert repo.get(pending.id).status == "pending_claim"
+    finally:
+        repo.close()
+
+
+# ---- list_all_deliverable / max_relevant_end_date_for_car (client delivery
+# poller + task lifecycle, см. design report Stage 4) ----
+
+
+def test_list_all_deliverable_includes_active_and_pending_claim(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(db_path, car_number="B957MA09")
+
+    repo = FineSubscriptionRepository(db_path)
+    try:
+        active = repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            telegram_user_id=1, telegram_chat_id=1, telegram_username="alice",
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+        )
+        pending = repo.create_pending_claim(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            owner_username_hint="unknown_person",
+            created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+            claim_token="tok-1", claim_token_expires_at=_future_expiry(),
+        )
+
+        deliverable = repo.list_all_deliverable(today=date(2026, 9, 15))
+
+        assert {s.id for s in deliverable} == {active.id, pending.id}
+    finally:
+        repo.close()
+
+
+def test_list_all_deliverable_excludes_expired_and_stopped(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(db_path, car_number="B957MA09")
+
+    repo = FineSubscriptionRepository(db_path)
+    try:
+        expired = repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            telegram_user_id=1, telegram_chat_id=1, telegram_username="alice",
+            start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        )
+        stopped = repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            telegram_user_id=2, telegram_chat_id=2, telegram_username="bob",
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+        )
+        repo.stop_by_owner_or_creator(stopped.id, telegram_user_id=2)
+
+        deliverable = repo.list_all_deliverable(today=date(2026, 9, 15))
+
+        assert expired.id not in {s.id for s in deliverable}
+        assert stopped.id not in {s.id for s in deliverable}
+    finally:
+        repo.close()
+
+
+def test_max_relevant_end_date_for_car_returns_max_across_active_and_pending(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(db_path, car_number="B957MA09")
+
+    repo = FineSubscriptionRepository(db_path)
+    try:
+        repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            telegram_user_id=1, telegram_chat_id=1, telegram_username="alice",
+            start_date=date(2026, 9, 1), end_date=date(2026, 10, 1),
+        )
+        repo.create_pending_claim(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            owner_username_hint="unknown_person",
+            created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+            start_date=date(2026, 9, 1), end_date=date(2027, 3, 1),  # самый долгий
+            claim_token="tok-1", claim_token_expires_at=_future_expiry(),
+        )
+
+        result = repo.max_relevant_end_date_for_car("B957MA09", today=date(2026, 9, 15))
+
+        assert result == date(2027, 3, 1)
+    finally:
+        repo.close()
+
+
+def test_max_relevant_end_date_for_car_ignores_stopped_and_expired(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(db_path, car_number="B957MA09")
+
+    repo = FineSubscriptionRepository(db_path)
+    try:
+        old = repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            telegram_user_id=1, telegram_chat_id=1, telegram_username="alice",
+            start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        )
+        stopped = repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            telegram_user_id=2, telegram_chat_id=2, telegram_username="bob",
+            start_date=date(2026, 9, 1), end_date=date(2027, 1, 1),
+        )
+        repo.stop_by_owner_or_creator(stopped.id, telegram_user_id=2)
+
+        result = repo.max_relevant_end_date_for_car("B957MA09", today=date(2026, 9, 15))
+
+        assert result is None
+        assert old.end_date == date(2026, 1, 31)  # sanity: подписка реально просрочена
+    finally:
+        repo.close()
+
+
+def test_max_relevant_end_date_for_car_returns_none_when_no_subscriptions(tmp_path):
+    repo = _make_repo(tmp_path)
+    try:
+        assert repo.max_relevant_end_date_for_car("ZZ999ZZ", today=date(2026, 9, 15)) is None
+    finally:
+        repo.close()

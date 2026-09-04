@@ -15,11 +15,19 @@ from telethon import TelegramClient, events
 
 from reader.public_bot.conversation import ConversationController
 from reader.public_bot.keyboards import (
+    STOP_NO,
+    check_now_options_keyboard,
+    decode_check_now_callback,
     decode_period_callback,
+    decode_stop_confirm_callback,
+    decode_stop_pick_callback,
     main_menu_keyboard,
     period_choice_keyboard,
+    stop_confirm_keyboard,
+    stop_options_keyboard,
 )
 from reader.public_bot.known_users_repository import BotKnownUsersRepository
+from reader.public_bot.texts import CALLBACK_NOT_AUTHORIZED_TEXT
 
 logger = logging.getLogger(__name__)
 
@@ -85,34 +93,65 @@ def register(
 
     @client.on(events.CallbackQuery(func=lambda e: e.is_private))
     async def _on_callback(event: events.CallbackQuery.Event) -> None:
-        days = decode_period_callback(event.data)
-        if days is None:
-            await event.answer("Неизвестная или устаревшая кнопка", alert=True)
-            return
-
+        data = event.data
         username, first_name, last_name = await _sender_names(event)
         _record_known_user(event.sender_id, event.chat_id, username)
 
-        reply = await controller.handle_period_choice(
-            days,
-            chat_id=event.chat_id,
-            telegram_user_id=event.sender_id,
-            first_name=first_name,
-            last_name=last_name,
-        )
-
-        if reply is None:
-            # Диалог этого chat_id не в шаге "выбор периода", либо
-            # принадлежит другому telegram_user_id (см. security-инвариант
-            # в reader/public_bot/keyboards.py) — ничего не создаём/не
-            # меняем, только уведомляем нажавшего.
-            await event.answer("Эта кнопка недоступна — начните заново через «➕ Добавить авто»", alert=True)
+        days = decode_period_callback(data)
+        if days is not None:
+            reply = await controller.handle_period_choice(
+                days,
+                chat_id=event.chat_id,
+                telegram_user_id=event.sender_id,
+                first_name=first_name,
+                last_name=last_name,
+            )
+            await _answer_and_send(event, reply)
             return
 
-        await event.answer()
-        await _send_reply(event, reply, prefer_edit=True)
+        check_now_id = decode_check_now_callback(data)
+        if check_now_id is not None:
+            reply = await controller.handle_check_now_choice(
+                check_now_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply)
+            return
+
+        stop_pick_id = decode_stop_pick_callback(data)
+        if stop_pick_id is not None:
+            reply = controller.handle_stop_pick(stop_pick_id, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply)
+            return
+
+        stop_confirm_id = decode_stop_confirm_callback(data)
+        if stop_confirm_id is not None:
+            reply = controller.handle_stop_confirm(stop_confirm_id, telegram_user_id=event.sender_id)
+            await event.answer()
+            await _send_reply(event, reply, prefer_edit=True)
+            return
+
+        if data == STOP_NO:
+            reply = controller.handle_stop_cancel()
+            await event.answer()
+            await _send_reply(event, reply, prefer_edit=True)
+            return
+
+        await event.answer("Неизвестная или устаревшая кнопка", alert=True)
 
     logger.info("✔ @GEShtrafbot handlers зарегистрированы")
+
+
+async def _answer_and_send(event, reply) -> None:
+    """Общий хвост для callback'ов, которые могут вернуть None (=
+    подписка не найдена/не принадлежит этому пользователю, см.
+    reader/public_bot/keyboards.py про то, почему сам факт валидного
+    subscription_id в callback_data ничего не доказывает) — в этом случае
+    показываем короткий alert и ничего не создаём/не меняем."""
+    if reply is None:
+        await event.answer(CALLBACK_NOT_AUTHORIZED_TEXT, alert=True)
+        return
+    await event.answer()
+    await _send_reply(event, reply, prefer_edit=True)
 
 
 async def _send_reply(event, reply, *, prefer_edit: bool = False) -> None:
@@ -121,6 +160,12 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False) -> None:
         buttons = main_menu_keyboard()
     elif reply.show_period_buttons:
         buttons = period_choice_keyboard()
+    elif reply.check_now_options:
+        buttons = check_now_options_keyboard(reply.check_now_options)
+    elif reply.stop_options:
+        buttons = stop_options_keyboard(reply.stop_options)
+    elif reply.stop_confirm_subscription_id is not None:
+        buttons = stop_confirm_keyboard(reply.stop_confirm_subscription_id)
 
     if prefer_edit:
         try:
@@ -129,7 +174,7 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False) -> None:
         except Exception:
             # Сообщение с кнопками могло стать недоступным для редактирования
             # (например, Telegram ограничивает срок редактирования) —
-            # результат Add Car flow всё равно должен дойти до пользователя.
+            # результат всё равно должен дойти до пользователя.
             logger.warning(
                 "Не удалось отредактировать сообщение @GEShtrafbot, отправляю новое",
                 exc_info=True,

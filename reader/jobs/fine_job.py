@@ -10,6 +10,7 @@ FineMonitoringTaskRepository остаётся простым хранилище�
 """
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as dt_time
@@ -17,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 from reader.fines.archive_scheduling import local_time_to_utc
 from reader.fines.check_service import FineCheckService
+from reader.fines.models import FineMonitoringScope, FineMonitoringTask
 from reader.fines.notification_coordinator import FineNotificationCoordinator
 from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.jobs.base import Job
@@ -37,6 +39,11 @@ class FineJobStatus:
 
 
 class FineJob(Job):
+    """name — теперь атрибут ЭКЗЕМПЛЯРА (а не класса, как раньше), потому
+    что этот же класс переиспользуется для ДВУХ инстансов в одном процессе
+    (операторский и client_bot, см. design report Stage 4) — Scheduler
+    логирует ошибки по job.name, и они должны различаться."""
+
     name = "fine_monitoring"
 
     def __init__(
@@ -50,6 +57,11 @@ class FineJob(Job):
         archive_check_enabled: bool = False,
         archive_check_hour: int = 4,
         archive_interval_days: int = 30,
+        scope: FineMonitoringScope | None = None,
+        name: str | None = None,
+        pre_complete_hook: (
+            Callable[[FineMonitoringTask, date], Awaitable[FineMonitoringTask]] | None
+        ) = None,
     ):
         self._task_repository = task_repository
         self._check_service = check_service
@@ -63,6 +75,27 @@ class FineJob(Job):
         self._archive_check_enabled = archive_check_enabled
         self._archive_check_hour = archive_check_hour
         self._archive_interval_days = archive_interval_days
+        # None (по умолчанию) — list_active() без фильтра, ТО ЖЕ САМОЕ
+        # поведение, что и раньше, для единственного существующего
+        # (операторского) инстанса. Заданный scope — list_active_by_scope()
+        # (см. reader/fines/task_repository.py, Stage 1) — используется
+        # ВТОРЫМ, client_bot-инстансом (см. reader/main.py), чтобы одна
+        # задача никогда не проверялась обоими инстансами сразу (design
+        # report Stage 4, раздел "как исключается двойная проверка").
+        self._scope = scope
+        # None (по умолчанию) сохраняет класс-атрибут "fine_monitoring" —
+        # существующее поведение/логи не меняются для единственного
+        # существующего вызова.
+        if name is not None:
+            self.name = name
+        # Вызывается ТОЛЬКО когда задача просрочена (today > end_date),
+        # ПЕРЕД тем как пометить её completed — см. design report, раздел
+        # "Task lifecycle". None (по умолчанию) — поведение завершения
+        # задачи не меняется вообще (используется только для client_bot-
+        # инстанса, см. reader/main.py и
+        # reader/public_bot/subscription_service.py::
+        # extend_client_bot_task_if_still_needed).
+        self._pre_complete_hook = pre_complete_hook
         self._last_run_slot: tuple[date, dt_time] | None = None
         self.status = FineJobStatus()
 
@@ -108,7 +141,11 @@ class FineJob(Job):
         self.status.last_run_at = run_at
         today = run_at.astimezone(self._tz).date()
 
-        tasks = self._task_repository.list_active()
+        tasks = (
+            self._task_repository.list_active_by_scope(self._scope)
+            if self._scope is not None
+            else self._task_repository.list_active()
+        )
 
         for task in tasks:
             try:
@@ -117,6 +154,18 @@ class FineJob(Job):
                     continue
 
                 if today > task.end_date:
+                    if self._pre_complete_hook is not None:
+                        # См. design report, раздел "Task lifecycle": для
+                        # client_bot-задачи хук пересчитывает, нужен ли ей
+                        # ещё более поздний end_date (активные/pending_claim
+                        # подписки) и, если да, продлевает её вместо
+                        # завершения — та же задача проверяется в ЭТОМ ЖЕ
+                        # проходе, без ожидания следующего запуска.
+                        task = await self._pre_complete_hook(task, today)
+                        if today <= task.end_date:
+                            await self._check_service.check_task(task)
+                            continue
+
                     # Период закончился — завершаем задачу, к FineCheckService
                     # не обращаемся вовсе.
                     self._task_repository.set_status(task.id, "completed")

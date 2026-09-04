@@ -188,18 +188,47 @@ WHERE id = :id AND status = 'pending_claim'
 # в SQL никогда не истинно при NULL слева, поэтому это условие безвредно
 # (никогда не срабатывает) для не-delegated строк, и старое поведение
 # "может остановить только владелец" для них сохраняется бит в бит.
+# status IN ('active', 'pending_claim') — см. design report Stage 4: trusted-
+# оператор должен уметь отменить ещё НЕ claimed приглашение через ⛔
+# Остановить мониторинг, а не только уже активную подписку.
 _STOP_BY_OWNER_OR_CREATOR = """
 UPDATE fine_monitoring_subscriptions
 SET status = 'stopped', stopped_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
 WHERE id = :id
   AND (telegram_user_id = :telegram_user_id OR created_by_telegram_user_id = :telegram_user_id)
-  AND status = 'active'
+  AND status IN ('active', 'pending_claim')
 """
 
 _EXPIRE_ELAPSED = """
 UPDATE fine_monitoring_subscriptions
 SET status = 'expired', updated_at = CURRENT_TIMESTAMP
 WHERE status = 'active' AND end_date < :today
+"""
+
+# Все подписки, которым машина ЕЩЁ нужна прямо сейчас — либо у неё уже
+# есть подтверждённый владелец (status='active'), либо она ждёт claim
+# (status='pending_claim', см. design report) — и при этом есть хоть один
+# получатель для доставки (owner ИЛИ trusted-оператор). Используется client
+# delivery poller'ом (см. reader/public_bot/delivery_service.py) как
+# основной, БОЛЕЕ ДЕШЁВЫЙ вход в join с detected_fines (число подписок
+# заведомо меньше и ограниченнее числа исторических штрафов).
+_SELECT_ALL_DELIVERABLE = f"""
+    SELECT {_SELECT_FIELDS} FROM fine_monitoring_subscriptions
+    WHERE status IN ('active', 'pending_claim')
+      AND end_date >= :today
+      AND (telegram_user_id IS NOT NULL OR created_by_telegram_user_id IS NOT NULL)
+    ORDER BY id ASC
+"""
+
+# См. design report Stage 4, раздел "Task lifecycle" —
+# extend_client_bot_task_if_still_needed() пересчитывает, до какого
+# end_date задача ВСЁ ЕЩЁ нужна кому-то из активных/pending_claim
+# подписчиков, прежде чем FineJob пометит её completed.
+_SELECT_MAX_RELEVANT_END_DATE_FOR_CAR = """
+    SELECT MAX(end_date) FROM fine_monitoring_subscriptions
+    WHERE car_number = :car_number
+      AND status IN ('active', 'pending_claim')
+      AND end_date >= :today
 """
 
 _CLAIM = """
@@ -666,16 +695,45 @@ class FineSubscriptionRepository:
         как delegated (см. design report) — защита на уровне репозитория
         (defense-in-depth), а не только будущих bot-хендлеров: ни чужую
         обычную, ни чужую delegated-подписку остановить нельзя, даже
-        подобрав/подделав subscription_id. Возвращает False, если ничего
-        не остановлено (подписка не найдена, принадлежит/создана другим
-        пользователем, либо уже не 'active') — вызывающий код не должен
-        показывать "остановлено" в этом случае."""
+        подобрав/подделав subscription_id. Работает и для ещё НЕ claimed
+        pending_claim (trusted-оператор отменяет своё приглашение), и для
+        обычной активной подписки. Возвращает False, если ничего не
+        остановлено (подписка не найдена, принадлежит/создана другим
+        пользователем, либо уже не active/pending_claim) — вызывающий код
+        не должен показывать "остановлено" в этом случае."""
         cursor = self._conn.execute(
             _STOP_BY_OWNER_OR_CREATOR,
             {"id": subscription_id, "telegram_user_id": telegram_user_id},
         )
         self._conn.commit()
         return cursor.rowcount > 0
+
+    def list_all_deliverable(self, *, today: date) -> list[FineMonitoringSubscription]:
+        """Все подписки, которым машина ещё нужна и у которых есть хоть
+        один потенциальный получатель (owner и/или trusted-оператор) —
+        точка входа client delivery poller'а (см. design report Stage 4:
+        "точную последовательность check → detected_fines → client
+        delivery"). Не решает, КАКАЯ именно роль применима к конкретной
+        подписке — это решает вызывающий код (см.
+        reader/public_bot/delivery_service.py) по её собственным полям
+        (status/telegram_user_id/created_by_telegram_user_id)."""
+        rows = self._conn.execute(_SELECT_ALL_DELIVERABLE, {"today": today.isoformat()}).fetchall()
+        return [_row_to_subscription(row) for row in rows]
+
+    def max_relevant_end_date_for_car(self, car_number: str, *, today: date) -> date | None:
+        """Максимальный end_date среди ещё действующих (active ИЛИ
+        pending_claim, см. design report) подписок этой машины — None,
+        если таких не осталось вовсе. Используется ТОЛЬКО для client_bot-
+        scope задач (см. reader/public_bot/subscription_service.py::
+        extend_client_bot_task_if_still_needed) — операторские задачи эту
+        логику не используют."""
+        row = self._conn.execute(
+            _SELECT_MAX_RELEVANT_END_DATE_FOR_CAR,
+            {"car_number": car_number, "today": today.isoformat()},
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return date.fromisoformat(row[0])
 
     def expire_elapsed(self, *, today: date) -> int:
         """Массово переводит в status='expired' все ещё 'active' подписки

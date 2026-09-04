@@ -156,16 +156,14 @@ def test_my_cars_button_with_no_subscriptions(fx):
     assert reply.text == texts.NO_CARS_TEXT
 
 
-def test_check_now_and_stop_return_coming_soon_placeholder(fx):
-    check_reply = fx.controller.handle_text(
-        texts.CHECK_NOW_LABEL, chat_id=1, telegram_user_id=1, username=None,
-    )
-    stop_reply = fx.controller.handle_text(
-        texts.STOP_LABEL, chat_id=1, telegram_user_id=1, username=None,
-    )
+def test_check_now_with_no_cars_shows_empty_message(fx):
+    reply = fx.controller.handle_text(texts.CHECK_NOW_LABEL, chat_id=1, telegram_user_id=1, username=None)
+    assert reply.text == texts.NO_ACTIONABLE_CARS_TEXT
 
-    assert check_reply.text == texts.COMING_SOON_TEXT
-    assert stop_reply.text == texts.COMING_SOON_TEXT
+
+def test_stop_with_no_cars_shows_empty_message(fx):
+    reply = fx.controller.handle_text(texts.STOP_LABEL, chat_id=1, telegram_user_id=1, username=None)
+    assert reply.text == texts.NO_ACTIONABLE_CARS_TEXT
 
 
 # ---- Add Car: username уже известен Telegram'у ----
@@ -524,3 +522,145 @@ def test_ordinary_user_my_cars_has_no_managed_section(fx):
     reply = fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=1, telegram_user_id=1, username=None)
 
     assert texts.MANAGED_CARS_HEADER not in reply.text
+
+
+# ==== 🔎 Проверить сейчас / ⛔ Остановить мониторинг (см. design report Stage 4) ====
+
+
+async def test_check_now_lists_own_car_and_returns_result(fx):
+    await fx.service.add_car(
+        telegram_user_id=1, telegram_chat_id=1, username="alice",
+        first_name=None, last_name=None, car_number="M295YB196", period_days=30, today=_today(),
+    )
+
+    pick_reply = fx.controller.handle_text(texts.CHECK_NOW_LABEL, chat_id=1, telegram_user_id=1, username="alice")
+    assert pick_reply.text == texts.CHECK_NOW_PICK_PROMPT
+    assert pick_reply.check_now_options is not None
+    [(subscription_id, car_number)] = pick_reply.check_now_options
+    assert car_number == "M295YB196"
+
+    result_reply = await fx.controller.handle_check_now_choice(subscription_id, telegram_user_id=1)
+    assert result_reply is not None
+    assert "M295YB196" in result_reply.text
+    assert "новых штрафов нет" in result_reply.text
+
+
+async def test_check_now_rejects_subscription_belonging_to_another_user(fx):
+    await fx.service.add_car(
+        telegram_user_id=1, telegram_chat_id=1, username="alice",
+        first_name=None, last_name=None, car_number="M295YB196", period_days=30, today=_today(),
+    )
+    [subscription] = fx.subscription_repository.list_by_user(1)
+
+    # Пользователь 999 подделывает/подбирает чужой subscription_id.
+    result_reply = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=999)
+
+    assert result_reply is None
+
+
+async def test_check_now_reports_new_fines(tmp_path):
+    fixture = _Fixture(tmp_path, records_by_car={"M295YB196": [_record()]})
+    try:
+        await fixture.service.add_car(
+            telegram_user_id=1, telegram_chat_id=1, username="alice",
+            first_name=None, last_name=None, car_number="M295YB196", period_days=30, today=_today(),
+        )
+        [subscription] = fixture.subscription_repository.list_by_user(1)
+        # Первая проверка (внутри add_car) уже нашла штраф — второй ручной
+        # запуск не должен найти его СНОВА как новый (дедуп общий).
+        reply = await fixture.controller.handle_check_now_choice(subscription.id, telegram_user_id=1)
+        assert "новых штрафов нет" in reply.text
+    finally:
+        fixture.close()
+
+
+async def test_stop_flow_pick_confirm_and_cancel(fx):
+    fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username="alice")
+    fx.controller.handle_text("M295YB196", chat_id=1, telegram_user_id=1, username="alice")
+    await fx.controller.handle_period_choice(
+        30, chat_id=1, telegram_user_id=1, first_name=None, last_name=None,
+    )
+
+    pick_reply = fx.controller.handle_text(texts.STOP_LABEL, chat_id=1, telegram_user_id=1, username="alice")
+    assert pick_reply.stop_options is not None
+    [(subscription_id, car_number)] = pick_reply.stop_options
+    assert car_number == "M295YB196"
+
+    confirm_reply = fx.controller.handle_stop_pick(subscription_id, telegram_user_id=1)
+    assert confirm_reply is not None
+    assert confirm_reply.stop_confirm_subscription_id == subscription_id
+    assert "M295YB196" in confirm_reply.text
+
+    # Подписка ещё активна — отмена ничего не останавливает.
+    cancel_reply = fx.controller.handle_stop_cancel()
+    assert cancel_reply.show_main_menu is True
+    assert fx.subscription_repository.get(subscription_id).status == "active"
+
+    final_reply = fx.controller.handle_stop_confirm(subscription_id, telegram_user_id=1)
+    assert texts.format_stop_success("M295YB196") == final_reply.text
+    assert fx.subscription_repository.get(subscription_id).status == "stopped"
+
+
+async def test_stop_pick_rejects_subscription_belonging_to_another_user(fx):
+    await fx.service.add_car(
+        telegram_user_id=1, telegram_chat_id=1, username="alice",
+        first_name=None, last_name=None, car_number="M295YB196", period_days=30, today=_today(),
+    )
+    [subscription] = fx.subscription_repository.list_by_user(1)
+
+    reply = fx.controller.handle_stop_pick(subscription.id, telegram_user_id=999)
+
+    assert reply is None
+    assert fx.subscription_repository.get(subscription.id).status == "active"
+
+
+async def test_stop_confirm_rechecks_ownership_even_if_pick_step_was_skipped(fx):
+    """Финальный шаг ЗАНОВО проверяет владение, а не доверяет тому, что
+    пользователь как-то дошёл до этого экрана (см. security-инвариант)."""
+    await fx.service.add_car(
+        telegram_user_id=1, telegram_chat_id=1, username="alice",
+        first_name=None, last_name=None, car_number="M295YB196", period_days=30, today=_today(),
+    )
+    [subscription] = fx.subscription_repository.list_by_user(1)
+
+    reply = fx.controller.handle_stop_confirm(subscription.id, telegram_user_id=999)
+
+    assert reply.text == texts.STOP_FAILED_TEXT
+    assert fx.subscription_repository.get(subscription.id).status == "active"
+
+
+async def test_trusted_creator_can_check_and_stop_delegated_subscription(trusted_fx):
+    trusted_fx.user_repository.upsert(
+        TelegramUserInfo(user_id=777, username="real_owner", first_name=None, last_name=None)
+    )
+    await trusted_fx.service.add_delegated_car(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        owner_username="real_owner", car_number="M295YB196", period_days=30, today=_today(),
+    )
+    [subscription] = trusted_fx.subscription_repository.list_managed_by_creator(_TRUSTED_ID)
+
+    check_reply = await trusted_fx.controller.handle_check_now_choice(
+        subscription.id, telegram_user_id=_TRUSTED_ID,
+    )
+    assert check_reply is not None
+
+    stop_reply = trusted_fx.controller.handle_stop_confirm(subscription.id, telegram_user_id=_TRUSTED_ID)
+    assert "остановлен" in stop_reply.text
+    assert trusted_fx.subscription_repository.get(subscription.id).status == "stopped"
+
+
+async def test_unrelated_user_cannot_check_or_stop_delegated_subscription(trusted_fx):
+    trusted_fx.user_repository.upsert(
+        TelegramUserInfo(user_id=777, username="real_owner", first_name=None, last_name=None)
+    )
+    await trusted_fx.service.add_delegated_car(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        owner_username="real_owner", car_number="M295YB196", period_days=30, today=_today(),
+    )
+    [subscription] = trusted_fx.subscription_repository.list_managed_by_creator(_TRUSTED_ID)
+
+    check_reply = await trusted_fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=999999)
+    assert check_reply is None
+
+    stop_reply = trusted_fx.controller.handle_stop_pick(subscription.id, telegram_user_id=999999)
+    assert stop_reply is None
