@@ -28,6 +28,7 @@ from reader.public_bot.delivery_texts import (
     format_owner_fine_message,
     format_trusted_operator_fine_message,
 )
+from reader.public_bot.keyboards import owner_fine_cta_buttons
 from reader.public_bot.models import ClientFineDelivery, FineMonitoringSubscription
 from reader.public_bot.subscription_repository import FineSubscriptionRepository
 
@@ -53,9 +54,13 @@ MAX_DELIVERY_ATTEMPTS = len(RETRY_BACKOFF)
 class BotMessageSenderLike(Protocol):
     """Ровно то, что нужно отсюда от Telethon bot-mode клиента — тот же
     приём Protocol, что и везде в проекте (см.
-    reader/public_bot/owner_resolution.py::OwnerUsernameResolverLike)."""
+    reader/public_bot/owner_resolution.py::OwnerUsernameResolverLike).
 
-    async def send_message(self, chat_id: int, text: str) -> None: ...
+    buttons — опционально, ТОЛЬКО для owner-CTA (см.
+    reader/public_bot/keyboards.py::owner_fine_cta_buttons); None для всех
+    остальных уведомлений (trusted_operator, любые другие)."""
+
+    async def send_message(self, chat_id: int, text: str, *, buttons: list[list] | None = None) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -116,12 +121,19 @@ class ClientDeliveryService:
         sender: BotMessageSenderLike,
         *,
         tz: ZoneInfo,
+        payment_help_contact_username: str = "tplgee",
     ):
         self._detected_fine_repository = detected_fine_repository
         self._subscription_repository = subscription_repository
         self._delivery_repository = delivery_repository
         self._sender = sender
         self._tz = tz
+        # Destination CTA-кнопок owner-уведомления — из config (см.
+        # settings.public_bot.payment_help_contact_username), не hardcoded
+        # (значение по умолчанию здесь — тот же fallback, что и в
+        # reader/settings.py::PublicBotSettings, а не самостоятельный
+        # источник истины).
+        self._payment_help_contact_username = payment_help_contact_username
 
     async def run_once(self, *, now: datetime | None = None) -> DeliveryTickResult:
         now = now or datetime.now(timezone.utc)
@@ -182,14 +194,17 @@ class ClientDeliveryService:
             # пытаемся отправить в никуда, если данные всё же неполные.
             return "not_due"
 
-        text = (
-            format_owner_fine_message(car_number=subscription.car_number, fine=fine)
-            if role == "owner"
-            else format_trusted_operator_fine_message(
+        if role == "owner":
+            text = format_owner_fine_message(car_number=subscription.car_number, fine=fine)
+            # CTA-кнопки — ТОЛЬКО owner (см. design report: trusted_operator
+            # и операторский чат коммерческий блок не получают).
+            buttons = owner_fine_cta_buttons(self._payment_help_contact_username)
+        else:
+            text = format_trusted_operator_fine_message(
                 car_number=subscription.car_number, fine=fine,
                 owner_display=subscription.telegram_username or subscription.owner_username_hint,
             )
-        )
+            buttons = None
 
         # Фиксируем попытку ДО отправки (см. ClientFineDeliveryRepository.
         # record_attempt) — attempt_count/last_attempt_at отражают попытку
@@ -197,7 +212,7 @@ class ClientDeliveryService:
         self._delivery_repository.record_attempt(fine.id, subscription.id, role)
 
         try:
-            await self._sender.send_message(chat_id, text)
+            await self._sender.send_message(chat_id, text, buttons=buttons)
         except FloodWaitError as exc:
             logger.warning(
                 "FloodWaitError (%ss) при доставке штрафа id=%s получателю "

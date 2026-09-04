@@ -23,6 +23,11 @@ USERNAME_PROMPT = "👤 Введите ваш Telegram-логин\n\nНапри�
 # USERNAME_PROMPT выше. Может быть указан и собственный username trusted-
 # оператора, если он ставит на мониторинг свой же автомобиль.
 OWNER_USERNAME_PROMPT = "👤 Укажите Telegram владельца автомобиля\n\nНапример: @VeronaWarm"
+# Trusted-operator flow — ПЕРЕД OWNER_USERNAME_PROMPT (см. design: username
+# клиента больше не обязателен для постановки машины на мониторинг). "OK" →
+# OWNER_USERNAME_PROMPT; "Отмена" → мониторинг без клиента (см.
+# reader/public_bot/subscription_service.py::add_delegated_car_without_client).
+ADD_CLIENT_DECISION_PROMPT = "👤 Добавить Telegram клиента?"
 PERIOD_PROMPT = "📅 Выберите срок мониторинга"
 
 STALE_DIALOG_TEXT = "⚠️ Диалог устарел, начните заново."
@@ -152,6 +157,43 @@ def format_delegated_add_car_summary(
         ]
 
     return "\n".join(lines)
+
+
+def format_delegated_add_car_without_client_summary(
+    *,
+    car_number: str,
+    start_date: date,
+    end_date: date,
+    check_ok: bool,
+    new_fines_count: int,
+) -> str:
+    """Итог trusted-operator delegated Add Car БЕЗ клиента ("Отмена" на
+    ADD_CLIENT_DECISION_PROMPT) — как format_delegated_add_car_summary, но
+    без строки "👤 Владелец: ..." — клиента нет и, возможно, не будет
+    никогда (см. design report: username клиента не обязателен)."""
+    period = f"{_fmt_date(start_date)} — {_fmt_date(end_date)}"
+
+    if not check_ok:
+        return "\n".join([
+            "⚠️ Автомобиль добавлен на мониторинг,",
+            "но проверить штрафы сейчас не удалось",
+            "",
+            f"🚗 {car_number}",
+            f"📅 Мониторинг: {period}",
+        ])
+
+    check_line = (
+        f"🔎 Штрафы проверены: найдено новых — {new_fines_count}"
+        if new_fines_count
+        else "🔎 Штрафы проверены: новых штрафов нет"
+    )
+    return "\n".join([
+        "✅ Автомобиль добавлен на мониторинг",
+        "",
+        f"🚗 {car_number}",
+        f"📅 Мониторинг: {period}",
+        check_line,
+    ])
 
 
 CLAIM_SUCCESS_TEXT = (

@@ -76,8 +76,8 @@ class _TelethonBotSender:
     def __init__(self, client: TelegramClient):
         self._client = client
 
-    async def send_message(self, chat_id: int, text: str) -> None:
-        await self._client.send_message(chat_id, text)
+    async def send_message(self, chat_id: int, text: str, *, buttons: list[list] | None = None) -> None:
+        await self._client.send_message(chat_id, text, buttons=buttons)
 
 
 def read_bot_token() -> str:
@@ -213,6 +213,7 @@ async def run() -> None:
             detected_fine_repository, subscription_repository, delivery_repository,
             _TelethonBotSender(client),
             tz=ZoneInfo(settings.fine_monitor.timezone),
+            payment_help_contact_username=settings.public_bot.payment_help_contact_username,
         )
 
         # token передаётся ЗДЕСЬ и только здесь.

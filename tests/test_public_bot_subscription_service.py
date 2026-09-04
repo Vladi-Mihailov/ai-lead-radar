@@ -7,7 +7,7 @@ FineCheckService, что использует и операторский FineJo
 """
 
 import sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -457,6 +457,119 @@ async def test_add_delegated_car_propagates_owner_resolution_error(tmp_path):
         assert fixture.task_repository.list_active() == []
     finally:
         fixture.close()
+
+
+# ---- trusted-operator delegated flow БЕЗ клиента ("Отмена" на "Добавить
+# Telegram клиента?", см. design report) ----
+
+
+async def test_add_delegated_car_without_client_creates_active_subscription_with_no_owner(fx):
+    outcome = await fx.service.add_delegated_car_without_client(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        car_number="M295YB196", period_days=90, today=date(2026, 9, 3),
+    )
+
+    assert outcome.pending_claim is False
+    assert outcome.claim_link is None
+    assert outcome.subscription.status == "active"
+    assert outcome.subscription.telegram_user_id is None
+    assert outcome.subscription.telegram_chat_id is None
+    assert outcome.subscription.telegram_username is None
+    assert outcome.subscription.owner_username_hint is None
+    assert outcome.subscription.created_by_telegram_user_id == _TRUSTED_ID
+    assert outcome.subscription.created_by_telegram_chat_id == _TRUSTED_CHAT_ID
+    assert outcome.subscription.is_delegated() is True
+    assert outcome.task.monitoring_scope == "client_bot"
+
+
+async def test_add_delegated_car_without_client_starts_monitoring_immediately(fx):
+    """Мониторинг стартует сразу — тот же принцип, что и у delegated-с-
+    клиентом (см. test_add_delegated_car_monitoring_starts_even_when_owner_
+    unresolved) — отсутствие клиента не блокирует мониторинг."""
+    outcome = await fx.service.add_delegated_car_without_client(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        car_number="M295YB196", period_days=30, today=date(2026, 9, 3),
+    )
+
+    [task] = fx.task_repository.list_active()
+    assert task.id == outcome.task.id
+    assert task.monitoring_scope == "client_bot"
+    assert outcome.check_ok is True
+
+
+async def test_add_delegated_car_without_client_does_not_sync_fictitious_owner_to_user_repository(fx):
+    """Явное требование задачи: "Не создавать фиктивный owner
+    telegram_user_id" — UserRepository не должен получить ни одной записи
+    из этого flow."""
+    await fx.service.add_delegated_car_without_client(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        car_number="M295YB196", period_days=30, today=date(2026, 9, 3),
+    )
+
+    assert fx.user_repository.find_by_car_number("M295YB196") == []
+
+
+async def test_add_delegated_car_without_client_repeat_extends_same_subscription(fx):
+    """Повторное "Добавить авто без клиента" тем же оператором на ту же
+    машину — продлевает существующую строку, а не плодит вторую (см.
+    idx_fine_subscriptions_active_ownerless_creator_task)."""
+    first = await fx.service.add_delegated_car_without_client(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        car_number="M295YB196", period_days=30, today=date(2026, 9, 3),
+    )
+
+    second = await fx.service.add_delegated_car_without_client(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        car_number="M295YB196", period_days=90, today=date(2026, 9, 3),
+    )
+
+    assert second.subscription.id == first.subscription.id
+    assert second.subscription.end_date == date(2026, 9, 3) + timedelta(days=90)
+    managed = fx.subscription_repository.list_managed_by_creator(_TRUSTED_ID)
+    assert len(managed) == 1
+
+
+async def test_add_delegated_car_without_client_reuses_operator_task_without_changing_scope(fx):
+    operator_task = fx.task_repository.create(
+        car_number="M295YB196", label=None,
+        start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+
+    outcome = await fx.service.add_delegated_car_without_client(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        car_number="M295YB196", period_days=30, today=date(2026, 9, 3),
+    )
+
+    assert outcome.task.id == operator_task.id
+    assert outcome.task.monitoring_scope == "operator"  # НЕ изменился
+
+
+async def test_add_delegated_car_without_client_then_with_client_creates_separate_subscription(fx):
+    """Явное требование задачи: "если позже понадобится привязать клиента —
+    архитектура не должна этому препятствовать" — обычный delegated-с-
+    клиентом flow на ту же машину создаёт ОТДЕЛЬНУЮ подписку, безвладельческая
+    строка никуда не девается и продолжает существовать независимо."""
+    fx.user_repository.upsert(
+        TelegramUserInfo(user_id=777, username="real_owner", first_name="Real", last_name="Owner")
+    )
+    without_client = await fx.service.add_delegated_car_without_client(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        car_number="M295YB196", period_days=30, today=date(2026, 9, 3),
+    )
+
+    with_client = await fx.service.add_delegated_car(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        owner_username="real_owner", car_number="M295YB196", period_days=30,
+        today=date(2026, 9, 3),
+    )
+
+    assert with_client.subscription.id != without_client.subscription.id
+    assert with_client.task.id == without_client.task.id
+    still_there = fx.subscription_repository.get(without_client.subscription.id)
+    assert still_there is not None
+    assert still_there.status == "active"
+    assert still_there.telegram_user_id is None
 
 
 async def test_claim_binds_owner_and_syncs_user_repository(fx):

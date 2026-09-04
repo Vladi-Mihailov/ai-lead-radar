@@ -40,6 +40,8 @@ _CHECK_NOW_PREFIX = b"checknow:"
 _STOP_PICK_PREFIX = b"stoppick:"
 _STOP_YES_PREFIX = b"stopyes:"
 STOP_NO = b"stopno"
+_ADD_CLIENT_YES = b"addclient:yes"
+_ADD_CLIENT_NO = b"addclient:no"
 
 
 def main_menu_keyboard() -> list[list[Button]]:
@@ -47,6 +49,28 @@ def main_menu_keyboard() -> list[list[Button]]:
         [Button.text(ADD_CAR_LABEL, resize=True), Button.text(MY_CARS_LABEL, resize=True)],
         [Button.text(CHECK_NOW_LABEL, resize=True), Button.text(STOP_LABEL, resize=True)],
     ]
+
+
+def add_client_decision_keyboard() -> list[list[Button]]:
+    """"👤 Добавить Telegram клиента?" — trusted-оператор, сразу после
+    ввода номера авто (см. design report: username клиента больше НЕ
+    обязателен для постановки на мониторинг)."""
+    return [[
+        Button.inline("OK", _ADD_CLIENT_YES),
+        Button.inline("Отмена", _ADD_CLIENT_NO),
+    ]]
+
+
+def decode_add_client_decision_callback(data: bytes | None) -> bool | None:
+    """True — оператор нажал OK (хочет указать клиента), False — Отмена
+    (мониторинг без клиента). None — этот callback_data не про этот шаг
+    вовсе (вызывающий код должен пробовать следующий decode_*, а не
+    трактовать None как "Отмена")."""
+    if data == _ADD_CLIENT_YES:
+        return True
+    if data == _ADD_CLIENT_NO:
+        return False
+    return None
 
 
 def period_choice_keyboard() -> list[list[Button]]:
@@ -114,3 +138,24 @@ def check_now_options_keyboard(options: list[tuple[int, str]]) -> list[list[Butt
 
 def stop_options_keyboard(options: list[tuple[int, str]]) -> list[list[Button]]:
     return options_keyboard(options, prefix=_STOP_PICK_PREFIX)
+
+
+_PAYMENT_HELP_BUTTON_LABEL = "💳 Оплатить в рублях"
+_INSURANCE_BUTTON_LABEL = "🛡 Оформить страховку"
+
+
+def owner_fine_cta_buttons(contact_username: str) -> list[list[Button]]:
+    """Коммерческий CTA под owner-уведомлением о новом штрафе (см.
+    reader/public_bot/delivery_texts.py::CTA_TEXT_BLOCK) — ТОЛЬКО owner,
+    trusted_operator и операторский чат этих кнопок не получают. Обе
+    кнопки — один ряд (утверждённый макет), обе ведут на одну и ту же
+    destination.
+
+    contact_username — БЕЗ ведущего "@" (см. settings.public_bot.
+    payment_help_contact_username) — destination задаётся конфигом, не
+    hardcoded здесь, только шаблон ссылки t.me/<username>."""
+    url = f"https://t.me/{contact_username}"
+    return [[
+        Button.url(_PAYMENT_HELP_BUTTON_LABEL, url),
+        Button.url(_INSURANCE_BUTTON_LABEL, url),
+    ]]

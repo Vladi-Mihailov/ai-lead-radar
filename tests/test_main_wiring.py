@@ -943,6 +943,7 @@ def test_load_settings_defaults_public_bot_section(tmp_path, monkeypatch):
     settings = load_settings(config_path)
 
     assert settings.public_bot.trusted_operator_user_ids == []
+    assert settings.public_bot.payment_help_contact_username == "tplgee"
 
 
 def test_load_settings_parses_explicit_public_bot_section(tmp_path, monkeypatch):
@@ -958,3 +959,19 @@ def test_load_settings_parses_explicit_public_bot_section(tmp_path, monkeypatch)
     settings = load_settings(config_path)
 
     assert settings.public_bot.trusted_operator_user_ids == [5712994689, 410811386]
+
+
+def test_load_settings_parses_payment_help_contact_username_override(tmp_path, monkeypatch):
+    """Destination коммерческого CTA-блока — из config, не hardcoded (см.
+    reader/settings.py::PublicBotSettings.payment_help_contact_username и
+    reader/public_bot/keyboards.py::owner_fine_cta_buttons)."""
+    _set_required_env(monkeypatch)
+    config_with_public_bot = _CONFIG_YAML + (
+        "\npublic_bot:\n"
+        "  payment_help_contact_username: \"another_contact\"\n"
+    )
+    config_path = _write_config(tmp_path, config_with_public_bot)
+
+    settings = load_settings(config_path)
+
+    assert settings.public_bot.payment_help_contact_username == "another_contact"

@@ -10,6 +10,17 @@ format_fine_block() — те же поля (дата штрафа/срок оп�
 from reader.fines.models import DetectedFine, NewFineEvent
 from reader.notifications.telegram_notification_service import format_fine_block
 
+# Коммерческий CTA-блок — ТОЛЬКО в owner-уведомлении (не в trusted_operator
+# и не в существующем операторском чате, см. design report). Кнопки под
+# этим текстом строит reader/public_bot/keyboards.py::owner_fine_cta_buttons
+# — destination берётся из config (settings.public_bot.
+# payment_help_contact_username), сюда не передаётся: сам текст CTA не
+# зависит от destination.
+CTA_TEXT_BLOCK = (
+    "💳 Нужна помощь с оплатой штрафа?\n"
+    "Поможем оплатить штраф в Грузии, в том числе в рублях."
+)
+
 
 def format_owner_fine_message(*, car_number: str, fine: DetectedFine) -> str:
     event = NewFineEvent.from_detected_fine(fine, label=None)
@@ -18,6 +29,8 @@ def format_owner_fine_message(*, car_number: str, fine: DetectedFine) -> str:
         "",
         f"🚗 {car_number}",
         format_fine_block(event),
+        "",
+        CTA_TEXT_BLOCK,
     ]
     return "\n".join(lines)
 

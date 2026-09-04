@@ -91,6 +91,40 @@ async def test_notify_single_event_produces_expected_message_format():
     assert kwargs["parse_mode"] == "md"
 
 
+async def test_notify_operator_message_unaffected_by_client_bot_cta_block():
+    """Регрессия: коммерческий CTA-блок ("💬 Помощь с оплатой"/
+    "🛡 Оформить страховку", см. reader/public_bot/delivery_texts.py::
+    CTA_TEXT_BLOCK) существует ТОЛЬКО в owner-уведомлении @GEShtrafbot —
+    существующее уведомление в операторский чат
+    (TelegramNotificationService/FineNotificationCoordinator) им не
+    затрагивается и продолжает формироваться ровно как раньше."""
+    from reader.public_bot.delivery_texts import CTA_TEXT_BLOCK
+
+    client = _FakeClient()
+    service = await _started_service(client)
+
+    await service.notify([_event()])
+
+    assert len(client.sent_messages) == 1
+    _, text, kwargs = client.sent_messages[0]
+    assert CTA_TEXT_BLOCK not in text
+    assert "💳" not in text
+    # Тот же самый эталонный текст, что и в
+    # test_notify_single_event_produces_expected_message_format — ничего
+    # не добавилось и не изменилось.
+    assert text == (
+        "🚨 Обнаружен новый опубликованный штраф\n"
+        "\n"
+        "Автомобиль: B957MA09\n"
+        "Дата штрафа: 06.08.2026\n"
+        "Срок оплаты: 20.08.2026\n"
+        "Статус вручения: Не вручено\n"
+        "\n"
+        f"🔗 [Открыть источник]({_SOURCE_URL})"
+    )
+    assert kwargs["parse_mode"] == "md"
+
+
 async def test_notify_omits_missing_optional_fields():
     client = _FakeClient()
     service = await _started_service(client)

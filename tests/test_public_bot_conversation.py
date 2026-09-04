@@ -27,6 +27,7 @@ from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E
 from reader.public_bot import texts  # noqa: E402
 from reader.public_bot.conversation import (  # noqa: E402
     STEP_AWAITING_CAR_NUMBER,
+    STEP_AWAITING_CLIENT_DECISION,
     STEP_AWAITING_OWNER_USERNAME,
     STEP_AWAITING_PERIOD,
     STEP_AWAITING_USERNAME,
@@ -391,11 +392,10 @@ def test_ordinary_user_never_sees_owner_username_prompt(fx):
     assert fx.conversation_state_repository.get(1).step == STEP_AWAITING_USERNAME
 
 
-def test_trusted_user_always_sees_owner_username_prompt_even_with_own_username(trusted_fx):
-    """Trusted-оператор — ВСЕГДА запрашивается владелец, даже если у самого
-    trusted-пользователя есть свой Telegram username (авто-детект self-
-    service здесь не применяется, см. design report об упрощении: нет
-    отдельного экрана "Для себя/Для другого")."""
+def test_trusted_user_car_number_shows_add_client_decision_first(trusted_fx):
+    """Trusted-оператор — ПЕРВЫМ делом видит "Добавить клиента?", а не
+    сразу OWNER_USERNAME_PROMPT (см. design: username клиента больше не
+    обязателен для постановки на мониторинг)."""
     trusted_fx.controller.handle_text(
         texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username="trusted_own_username",
     )
@@ -404,15 +404,71 @@ def test_trusted_user_always_sees_owner_username_prompt_even_with_own_username(t
         "M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username="trusted_own_username",
     )
 
+    assert reply.text == texts.ADD_CLIENT_DECISION_PROMPT
+    assert reply.show_add_client_decision_buttons is True
+    state = trusted_fx.conversation_state_repository.get(_TRUSTED_ID)
+    assert state.step == STEP_AWAITING_CLIENT_DECISION
+    assert state.payload == {"car_number": "M295YB196"}
+
+
+def test_trusted_user_ok_on_client_decision_shows_owner_username_prompt(trusted_fx):
+    """"OK" на "Добавить клиента?" — ВСЕГДА OWNER_USERNAME_PROMPT, даже
+    если у самого trusted-пользователя есть свой Telegram username (авто-
+    детект self-service здесь не применяется, см. design report об
+    упрощении: нет отдельного экрана "Для себя/Для другого")."""
+    trusted_fx.controller.handle_text(
+        texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username="trusted_own_username",
+    )
+    trusted_fx.controller.handle_text(
+        "M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username="trusted_own_username",
+    )
+
+    reply = trusted_fx.controller.handle_add_client_decision(
+        True, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID,
+    )
+
     assert reply.text == texts.OWNER_USERNAME_PROMPT
     state = trusted_fx.conversation_state_repository.get(_TRUSTED_ID)
     assert state.step == STEP_AWAITING_OWNER_USERNAME
     assert state.payload == {"car_number": "M295YB196"}
 
 
+def test_trusted_user_cancel_on_client_decision_skips_straight_to_period(trusted_fx):
+    """"Отмена" — НЕ запрашивает username вовсе, сразу период (см. design:
+    "username НЕ должен быть обязательным условием постановки машины на
+    мониторинг")."""
+    trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+
+    reply = trusted_fx.controller.handle_add_client_decision(
+        False, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID,
+    )
+
+    assert reply.text == texts.PERIOD_PROMPT
+    assert reply.show_period_buttons is True
+    state = trusted_fx.conversation_state_repository.get(_TRUSTED_ID)
+    assert state.step == STEP_AWAITING_PERIOD
+    assert state.payload == {"car_number": "M295YB196", "no_client": True}
+
+
+def test_client_decision_rejects_stranger_in_this_chat(trusted_fx):
+    """None — server-side проверка владения диалогом: тот же chat_id, но
+    ДРУГОЙ telegram_user_id — ничего не должно произойти (тот же принцип,
+    что и у handle_period_choice)."""
+    trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+
+    reply = trusted_fx.controller.handle_add_client_decision(
+        True, chat_id=_TRUSTED_ID, telegram_user_id=999999,
+    )
+
+    assert reply is None
+
+
 def test_trusted_user_invalid_owner_username_stays_on_same_step(trusted_fx):
     trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
     trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    trusted_fx.controller.handle_add_client_decision(True, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
 
     reply = trusted_fx.controller.handle_text("!!", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
 
@@ -428,6 +484,7 @@ async def test_trusted_delegate_flow_resolves_immediately_via_local_db(trusted_f
     )
     trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
     trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    trusted_fx.controller.handle_add_client_decision(True, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
     trusted_fx.controller.handle_text("@real_owner", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
 
     reply = await trusted_fx.controller.handle_period_choice(
@@ -448,6 +505,7 @@ async def test_trusted_delegate_flow_resolves_immediately_via_local_db(trusted_f
 async def test_trusted_delegate_flow_pending_claim_when_owner_unresolved(trusted_fx):
     trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
     trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    trusted_fx.controller.handle_add_client_decision(True, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
     trusted_fx.controller.handle_text("@unknown_person", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
 
     reply = await trusted_fx.controller.handle_period_choice(
@@ -470,6 +528,7 @@ async def test_trusted_delegate_flow_pending_claim_when_owner_unresolved(trusted
 async def test_claim_deep_link_start_binds_owner_and_confirms(trusted_fx):
     trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
     trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    trusted_fx.controller.handle_add_client_decision(True, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
     trusted_fx.controller.handle_text("@unknown_person", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
     reply = await trusted_fx.controller.handle_period_choice(
         30, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, first_name=None, last_name=None,

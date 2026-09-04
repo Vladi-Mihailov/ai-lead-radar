@@ -191,3 +191,9 @@ public_bot:
   trusted_operator_user_ids:
     - 5712994689
     - 410811386
+
+  # Destination коммерческого CTA-блока ("💳 Оплатить в рублях"/"🛡 Оформить
+  # страховку") в owner-уведомлении о новом штрафе — БЕЗ ведущего "@".
+  # trusted_operator и операторский чат этот блок не получают (см.
+  # reader/public_bot/delivery_texts.py).
+  payment_help_contact_username: "tplgee"

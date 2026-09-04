@@ -22,9 +22,12 @@ Trusted-operator delegated flow (см. design report): пользователь 
 trusted_operator_user_ids — единственная авторизация ТОЛЬКО по numeric
 telegram_user_id из конфига (reader/settings.py::PublicBotSettings,
 никогда по username) — после ввода номера авто ВСЕГДА видит
-OWNER_USERNAME_PROMPT вместо обычного (self-service) USERNAME_PROMPT/
-авто-детекта; никакого отдельного экрана "Для себя/Для другого" нет
-(упрощение — см. design report)."""
+ADD_CLIENT_DECISION_PROMPT ("👤 Добавить Telegram клиента?"): "OK" ведёт к
+OWNER_USERNAME_PROMPT (как раньше), "Отмена" ставит машину на мониторинг
+БЕЗ клиента вовсе (см. SubscriptionService.add_delegated_car_without_client) —
+username клиента НЕ обязателен, у клиента он может отсутствовать. Никакого
+отдельного экрана "Для себя/Для другого" по-прежнему нет (упрощение — см.
+design report)."""
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -39,6 +42,7 @@ from reader.public_bot.validation import UsernameValidationError, normalize_tele
 
 STEP_AWAITING_CAR_NUMBER = "awaiting_car_number"
 STEP_AWAITING_USERNAME = "awaiting_username"
+STEP_AWAITING_CLIENT_DECISION = "awaiting_client_decision"
 STEP_AWAITING_OWNER_USERNAME = "awaiting_owner_username"
 STEP_AWAITING_PERIOD = "awaiting_period"
 
@@ -65,6 +69,7 @@ class BotReply:
     text: str
     show_main_menu: bool = False
     show_period_buttons: bool = False
+    show_add_client_decision_buttons: bool = False
     check_now_options: list[tuple[int, str]] | None = None
     stop_options: list[tuple[int, str]] | None = None
     stop_confirm_subscription_id: int | None = None
@@ -262,6 +267,14 @@ class ConversationController:
                 stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, state_payload=state.payload,
             )
 
+        if state.step == STEP_AWAITING_CLIENT_DECISION:
+            # Тот же приём, что и у STEP_AWAITING_PERIOD ниже — выбор
+            # только inline-кнопкой, текст на этом шаге просто повторно
+            # показывает вопрос+кнопки.
+            return BotReply(
+                text=texts.ADD_CLIENT_DECISION_PROMPT, show_add_client_decision_buttons=True,
+            )
+
         if state.step == STEP_AWAITING_OWNER_USERNAME:
             return self._handle_owner_username_input(
                 stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, state_payload=state.payload,
@@ -285,16 +298,17 @@ class ConversationController:
             return BotReply(text=f"❌ {exc.message}\n\n{texts.CAR_NUMBER_PROMPT}")
 
         if self._is_trusted(telegram_user_id):
-            # Trusted-оператор — ВСЕГДА указывает Telegram владельца
-            # (может быть и его собственный username, если ставит на
-            # мониторинг свой же автомобиль, см. design report) — никакого
-            # авто-детекта отправителя здесь нет, в отличие от self-service
-            # ниже.
+            # Trusted-оператор — сначала явно спрашиваем, есть ли клиент
+            # вообще (см. design report: username клиента не обязателен —
+            # у клиента он может отсутствовать) — никакого авто-детекта
+            # отправителя здесь нет, в отличие от self-service ниже.
             self._states.set(
-                chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_OWNER_USERNAME,
+                chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_CLIENT_DECISION,
                 payload={"car_number": car_number},
             )
-            return BotReply(text=texts.OWNER_USERNAME_PROMPT)
+            return BotReply(
+                text=texts.ADD_CLIENT_DECISION_PROMPT, show_add_client_decision_buttons=True,
+            )
 
         if username:
             # Telegram уже отдал username — шаг "Введите Telegram-логин"
@@ -341,6 +355,44 @@ class ConversationController:
         )
         return BotReply(text=texts.PERIOD_PROMPT, show_period_buttons=True)
 
+    # ---- "👤 Добавить Telegram клиента?" (inline-кнопки, trusted-flow) ----
+
+    def handle_add_client_decision(
+        self, wants_client: bool, *, chat_id: int, telegram_user_id: int,
+    ) -> BotReply | None:
+        """None — та же server-side проверка, что и у handle_period_choice:
+        нет активного диалога ИМЕННО на этом шаге у ИМЕННО этого
+        telegram_user_id в этом chat_id (chat_id+conversation_state — а не
+        что-либо из самого callback_data). wants_client=True (OK) → тот же
+        OWNER_USERNAME_PROMPT, что и раньше; False (Отмена) → сразу период,
+        БЕЗ username вовсе (см. handle_period_choice про payload["no_client"])."""
+        state = self._states.get(chat_id)
+        if (
+            state is None
+            or state.step != STEP_AWAITING_CLIENT_DECISION
+            or state.telegram_user_id != telegram_user_id
+        ):
+            return None
+
+        payload = state.payload or {}
+        car_number = payload.get("car_number")
+        if not car_number:
+            self._states.clear(chat_id)
+            return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
+
+        if wants_client:
+            self._states.set(
+                chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_OWNER_USERNAME,
+                payload={"car_number": car_number},
+            )
+            return BotReply(text=texts.OWNER_USERNAME_PROMPT)
+
+        self._states.set(
+            chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_PERIOD,
+            payload={"car_number": car_number, "no_client": True},
+        )
+        return BotReply(text=texts.PERIOD_PROMPT, show_period_buttons=True)
+
     # ---- выбор периода (inline-кнопки) ----
 
     async def handle_period_choice(
@@ -364,12 +416,14 @@ class ConversationController:
         что мог бы нести сам callback_data, если бы там был чей-то id —
         его там нет и не должно быть, см. reader/public_bot/keyboards.py).
 
-        Ветвится на self-service/delegated ИСКЛЮЧИТЕЛЬНО по наличию ключа
-        "owner_username" в payload (см. _handle_owner_username_input) —
+        Ветвится на self-service/delegated-с-клиентом/delegated-без-клиента
+        по содержимому payload (owner_username / no_client — см.
+        _handle_owner_username_input и handle_add_client_decision) —
         никогда повторно не проверяет trusted-статус здесь: раз payload
         уже сформирован верным путём (единственный способ попасть в
-        STEP_AWAITING_OWNER_USERNAME — быть trusted, см.
-        _handle_car_number_input), этого достаточно."""
+        STEP_AWAITING_OWNER_USERNAME или payload["no_client"] — быть
+        trusted, см. _handle_car_number_input/handle_add_client_decision),
+        этого достаточно."""
         if days not in PERIOD_CHOICES:
             return None
 
@@ -385,8 +439,9 @@ class ConversationController:
         car_number = payload.get("car_number")
         owner_username = payload.get("owner_username")
         username = payload.get("username")
+        no_client = bool(payload.get("no_client"))
 
-        if not car_number or not (owner_username or username):
+        if not car_number or not (owner_username or username or no_client):
             # Не должно происходить штатно (payload всегда заполняется к
             # моменту STEP_AWAITING_PERIOD) — но не падаем молча, если
             # состояние всё же оказалось повреждено/устарело.
@@ -394,6 +449,12 @@ class ConversationController:
             return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
 
         today = self._today()
+
+        if no_client:
+            return await self._complete_delegated_add_car_without_client(
+                car_number=car_number, days=days, today=today,
+                chat_id=chat_id, telegram_user_id=telegram_user_id,
+            )
 
         if owner_username:
             return await self._complete_delegated_add_car(
@@ -461,6 +522,28 @@ class ConversationController:
                 new_fines_count=outcome.new_fines_count,
                 pending_claim=outcome.pending_claim,
                 claim_link=outcome.claim_link,
+            )
+        )
+
+    async def _complete_delegated_add_car_without_client(
+        self, *, car_number, days, today, chat_id, telegram_user_id,
+    ) -> BotReply:
+        outcome = await self._subscriptions.add_delegated_car_without_client(
+            created_by_telegram_user_id=telegram_user_id,
+            created_by_telegram_chat_id=chat_id,
+            car_number=car_number,
+            period_days=days,
+            today=today,
+        )
+        self._states.clear(chat_id)
+
+        return BotReply(
+            text=texts.format_delegated_add_car_without_client_summary(
+                car_number=car_number,
+                start_date=outcome.subscription.start_date,
+                end_date=outcome.subscription.end_date,
+                check_ok=outcome.check_ok,
+                new_fines_count=outcome.new_fines_count,
             )
         )
 

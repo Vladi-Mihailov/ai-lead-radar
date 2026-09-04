@@ -16,7 +16,9 @@ from telethon import TelegramClient, events
 from reader.public_bot.conversation import ConversationController
 from reader.public_bot.keyboards import (
     STOP_NO,
+    add_client_decision_keyboard,
     check_now_options_keyboard,
+    decode_add_client_decision_callback,
     decode_check_now_callback,
     decode_period_callback,
     decode_stop_confirm_callback,
@@ -97,6 +99,17 @@ def register(
         username, first_name, last_name = await _sender_names(event)
         _record_known_user(event.sender_id, event.chat_id, username)
 
+        wants_client = decode_add_client_decision_callback(data)
+        if wants_client is not None:
+            # bool, а не truthy-проверка: False (Отмена) — тоже валидный,
+            # обрабатываемый выбор, а не "это не тот callback" (см.
+            # keyboards.py::decode_add_client_decision_callback).
+            reply = controller.handle_add_client_decision(
+                wants_client, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply)
+            return
+
         days = decode_period_callback(data)
         if days is not None:
             reply = await controller.handle_period_choice(
@@ -160,6 +173,8 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False) -> None:
         buttons = main_menu_keyboard()
     elif reply.show_period_buttons:
         buttons = period_choice_keyboard()
+    elif reply.show_add_client_decision_buttons:
+        buttons = add_client_decision_keyboard()
     elif reply.check_now_options:
         buttons = check_now_options_keyboard(reply.check_now_options)
     elif reply.stop_options:

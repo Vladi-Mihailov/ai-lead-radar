@@ -24,7 +24,10 @@ from reader.public_bot.delivery_service import (  # noqa: E402
     RETRY_BACKOFF,
     ClientDeliveryService,
 )
+from reader.public_bot.delivery_texts import CTA_TEXT_BLOCK  # noqa: E402
 from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
+
+_CTA_CONTACT_USERNAME = "tplgee"
 
 _CHAT_ID = -100999
 _USER_ID = 111
@@ -50,15 +53,20 @@ def _now() -> datetime:
 class _FakeSender:
     def __init__(self, *, fail_for=(), flood_wait_for=()):
         self.sent: list[tuple[int, str]] = []
+        # Параллельно self.sent — (chat_id, text, buttons) для тестов,
+        # которым нужно проверить именно CTA-кнопки (см. ниже), без
+        # переписывания всех существующих 2-tuple-присваиваний выше.
+        self.sent_full: list[tuple[int, str, list | None]] = []
         self._fail_for = set(fail_for)
         self._flood_wait_for = set(flood_wait_for)
 
-    async def send_message(self, chat_id: int, text: str) -> None:
+    async def send_message(self, chat_id: int, text: str, *, buttons: list | None = None) -> None:
         if chat_id in self._flood_wait_for:
             raise FloodWaitError(request=None, capture=30)
         if chat_id in self._fail_for:
             raise RuntimeError("send failed")
         self.sent.append((chat_id, text))
+        self.sent_full.append((chat_id, text, buttons))
 
 
 class _Fixture:
@@ -72,6 +80,7 @@ class _Fixture:
         self.service = ClientDeliveryService(
             self.detected_fine_repository, self.subscription_repository,
             self.delivery_repository, self.sender, tz=_TBILISI,
+            payment_help_contact_username=_CTA_CONTACT_USERNAME,
         )
 
     def make_task(self, car_number, *, scope="client_bot") -> int:
@@ -189,6 +198,36 @@ async def test_delegated_active_subscription_delivers_to_both_recipients(tmp_pat
         assert sent_chat_ids == {777, 555}
         assert fx.delivery_repository.is_delivered(fine_id, sub.id, "owner") is True
         assert fx.delivery_repository.is_delivered(fine_id, sub.id, "trusted_operator") is True
+    finally:
+        fx.close()
+
+
+async def test_ownerless_delegated_subscription_delivers_only_to_trusted_operator(tmp_path):
+    """Trusted Add Car без клиента ("Отмена" на "Добавить Telegram
+    клиента?", см. design report) — telegram_user_id остаётся NULL
+    НАВСЕГДА (не pending_claim — никто не ждётся), доставка идёт ТОЛЬКО
+    создавшему trusted-оператору, роль 'owner' в принципе недостижима."""
+    now = _now()
+    fx = _Fixture(tmp_path)
+    try:
+        task_id = fx.make_task("AA001AA")
+        fine_id = fx.make_fine(task_id, "AA001AA")
+        sub = fx.subscription_repository.create_without_owner(
+            monitoring_task_id=task_id, car_number="AA001AA",
+            created_by_telegram_user_id=555, created_by_telegram_chat_id=555,
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+        )
+
+        result = await fx.service.run_once(now=now)
+
+        assert result.delivered == 1
+        assert fx.sender.sent == [(555, fx.sender.sent[0][1])]
+        assert fx.delivery_repository.is_delivered(fine_id, sub.id, "trusted_operator") is True
+        assert fx.delivery_repository.get(fine_id, sub.id, "owner") is None  # даже не пытались
+        # Без CTA — та же логика, что и у обычного trusted_operator (не owner).
+        _, text, buttons = fx.sender.sent_full[0]
+        assert CTA_TEXT_BLOCK not in text
+        assert buttons is None
     finally:
         fx.close()
 
@@ -422,6 +461,159 @@ async def test_flood_wait_recipient_is_retried_on_next_tick_respecting_backoff(t
 
         assert result.delivered == 1
         assert fx.delivery_repository.is_delivered(fine_id, sub.id, "owner") is True
+    finally:
+        fx.close()
+
+
+# ---- коммерческий CTA-блок: ТОЛЬКО owner, destination из config ----
+
+
+async def test_owner_notification_includes_cta_block(tmp_path):
+    now = _now()
+    fx = _Fixture(tmp_path)
+    try:
+        task_id = fx.make_task("AA001AA")
+        fx.make_fine(task_id, "AA001AA")
+        fx.subscription_repository.create(
+            monitoring_task_id=task_id, car_number="AA001AA",
+            telegram_user_id=777, telegram_chat_id=777, telegram_username="owner",
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+        )
+
+        await fx.service.run_once(now=now)
+
+        assert len(fx.sender.sent_full) == 1
+        _, text, buttons = fx.sender.sent_full[0]
+        assert CTA_TEXT_BLOCK in text
+        assert buttons is not None
+    finally:
+        fx.close()
+
+
+async def test_owner_cta_buttons_both_point_to_configured_contact(tmp_path):
+    now = _now()
+    fx = _Fixture(tmp_path)
+    try:
+        task_id = fx.make_task("AA001AA")
+        fx.make_fine(task_id, "AA001AA")
+        fx.subscription_repository.create(
+            monitoring_task_id=task_id, car_number="AA001AA",
+            telegram_user_id=777, telegram_chat_id=777, telegram_username="owner",
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+        )
+
+        await fx.service.run_once(now=now)
+
+        _, _, buttons = fx.sender.sent_full[0]
+        # Один ряд, обе кнопки рядом — утверждённый макет
+        # ([💳 Оплатить в рублях] [🛡 Оформить страховку]).
+        assert len(buttons) == 1
+        assert len(buttons[0]) == 2
+        expected_url = f"https://t.me/{_CTA_CONTACT_USERNAME}"
+        for button in buttons[0]:
+            assert button.url == expected_url
+        labels = [button.text for button in buttons[0]]
+        assert labels == ["💳 Оплатить в рублях", "🛡 Оформить страховку"]
+    finally:
+        fx.close()
+
+
+async def test_owner_cta_destination_follows_config_not_hardcoded(tmp_path):
+    """Destination — параметр конструктора (из settings.public_bot.
+    payment_help_contact_username в реальном wiring, см.
+    reader/public_bot/main.py), а не константа в коде: другой username в
+    config должен дать другую ссылку без изменения Python."""
+    now = _now()
+    db_path = tmp_path / "users.db"
+    task_repository = FineMonitoringTaskRepository(db_path)
+    detected_fine_repository = DetectedFineRepository(db_path)
+    subscription_repository = FineSubscriptionRepository(db_path)
+    delivery_repository = ClientFineDeliveryRepository(db_path)
+    sender = _FakeSender()
+    service = ClientDeliveryService(
+        detected_fine_repository, subscription_repository, delivery_repository,
+        sender, tz=_TBILISI, payment_help_contact_username="another_contact",
+    )
+    try:
+        task = task_repository.create(
+            car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 12, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID, monitoring_scope="client_bot",
+        )
+        detected_fine_repository.create(
+            monitoring_task_id=task.id, car_number="AA001AA",
+            external_fine_id="AB1", fingerprint="fp-1",
+            penalty_date=date(2026, 8, 6), due_date=date(2026, 8, 20),
+            delivered_status="Не вручено", raw_data="{}",
+        )
+        subscription_repository.create(
+            monitoring_task_id=task.id, car_number="AA001AA",
+            telegram_user_id=777, telegram_chat_id=777, telegram_username="owner",
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+        )
+
+        await service.run_once(now=now)
+
+        _, _, buttons = sender.sent_full[0]
+        flat = [button for row in buttons for button in row]
+        assert all(button.url == "https://t.me/another_contact" for button in flat)
+    finally:
+        task_repository.close()
+        detected_fine_repository.close()
+        subscription_repository.close()
+        delivery_repository.close()
+
+
+async def test_trusted_operator_notification_has_no_cta_block(tmp_path):
+    now = _now()
+    fx = _Fixture(tmp_path)
+    try:
+        task_id = fx.make_task("AA001AA")
+        fx.make_fine(task_id, "AA001AA")
+        fx.subscription_repository.create_pending_claim(
+            monitoring_task_id=task_id, car_number="AA001AA",
+            owner_username_hint="unknown_person",
+            created_by_telegram_user_id=555, created_by_telegram_chat_id=555,
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+            claim_token="tok-1", claim_token_expires_at=now + timedelta(days=7),
+        )
+
+        await fx.service.run_once(now=now)
+
+        assert len(fx.sender.sent_full) == 1
+        _, text, buttons = fx.sender.sent_full[0]
+        assert CTA_TEXT_BLOCK not in text
+        assert buttons is None
+    finally:
+        fx.close()
+
+
+async def test_delegated_active_subscription_cta_only_on_owner_recipient(tmp_path):
+    """owner И trusted_operator получают уведомление об одном и том же
+    штрафе (delegated, status='active') — CTA должен быть строго у одного
+    из двух, независимо от порядка/группировки доставки."""
+    now = _now()
+    fx = _Fixture(tmp_path)
+    try:
+        task_id = fx.make_task("AA001AA")
+        fx.make_fine(task_id, "AA001AA")
+        fx.subscription_repository.create(
+            monitoring_task_id=task_id, car_number="AA001AA",
+            telegram_user_id=777, telegram_chat_id=777, telegram_username="owner",
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+            owner_username_hint="owner",
+            created_by_telegram_user_id=555, created_by_telegram_chat_id=555,
+        )
+
+        await fx.service.run_once(now=now)
+
+        assert len(fx.sender.sent_full) == 2
+        by_chat_id = {chat_id: (text, buttons) for chat_id, text, buttons in fx.sender.sent_full}
+        owner_text, owner_buttons = by_chat_id[777]
+        trusted_text, trusted_buttons = by_chat_id[555]
+        assert CTA_TEXT_BLOCK in owner_text
+        assert owner_buttons is not None
+        assert CTA_TEXT_BLOCK not in trusted_text
+        assert trusted_buttons is None
     finally:
         fx.close()
 

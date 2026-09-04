@@ -268,9 +268,19 @@ class PublicBotSettings(BaseModel):
 
     trusted_operator_user_ids пуст по умолчанию — без явной настройки в
     config.yaml никто не получает доступ к delegated-режиму, обычный
-    self-service flow при этом не меняется ни для кого."""
+    self-service flow при этом не меняется ни для кого.
+
+    payment_help_contact_username — destination коммерческого CTA-блока
+    ("💳 Оплатить в рублях"/"🛡 Оформить страховку") в owner-уведомлении о
+    новом штрафе (см. reader/public_bot/delivery_texts.py,
+    reader/public_bot/keyboards.py::owner_fine_cta_buttons) — БЕЗ ведущего
+    "@" (тот же приём, что и bot_username в
+    reader/public_bot/subscription_service.py). Намеренно не hardcoded в
+    Python — только здесь, чтобы сменить destination можно было правкой
+    config.yaml, без изменения кода."""
 
     trusted_operator_user_ids: list[int] = Field(default_factory=list)
+    payment_help_contact_username: str = "tplgee"
 
 
 class Settings(BaseModel):
@@ -512,6 +522,9 @@ def load_settings(config_path: Path) -> Settings:
             public_bot=PublicBotSettings(
                 trusted_operator_user_ids=list(
                     public_bot_raw.get("trusted_operator_user_ids", [])
+                ),
+                payment_help_contact_username=public_bot_raw.get(
+                    "payment_help_contact_username", "tplgee"
                 ),
             ),
         )

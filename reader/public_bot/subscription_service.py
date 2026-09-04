@@ -20,6 +20,7 @@ from reader.public_bot.owner_resolution import (
     resolve_owner_username,
 )
 from reader.public_bot.subscription_repository import (
+    DuplicateActiveOwnerlessSubscriptionError,
     DuplicateActiveSubscriptionError,
     DuplicatePendingClaimError,
     FineSubscriptionRepository,
@@ -304,6 +305,63 @@ class SubscriptionService:
             claim_link=claim_link,
         )
 
+    async def add_delegated_car_without_client(
+        self,
+        *,
+        created_by_telegram_user_id: int,
+        created_by_telegram_chat_id: int,
+        car_number: str,
+        period_days: int,
+        today: date,
+    ) -> DelegatedAddCarOutcome:
+        """Trusted-оператор ставит машину на мониторинг БЕЗ указания
+        клиента (см. design: "👤 Добавить Telegram клиента?" → "Отмена" —
+        username клиента НЕ обязателен для постановки на мониторинг).
+        Уведомления получают ТОЛЬКО сам trusted-оператор
+        (recipient_role='trusted_operator', см.
+        reader/public_bot/delivery_service.py::_applicable_roles —
+        telegram_user_id подписки остаётся NULL навсегда, роль 'owner'
+        для неё в принципе недостижима) и существующий операторский чат
+        (FineNotificationCoordinator — не зависит от subscriptions вовсе).
+        Фиктивный owner telegram_user_id НЕ создаётся.
+
+        Если позже потребуется привязать клиента — это ОТДЕЛЬНАЯ,
+        независимая подписка на ту же задачу мониторинга через обычный
+        add_delegated_car() (архитектура уже поддерживает несколько
+        подписок на одну машину, см. design report) — эта безвладельческая
+        строка при этом никуда не девается и продолжает получать
+        уведомления как раньше."""
+        start_date = today
+        end_date = today + timedelta(days=period_days)
+
+        task = self._create_or_extend_task(
+            car_number=car_number,
+            telegram_user_id=created_by_telegram_user_id,
+            telegram_chat_id=created_by_telegram_chat_id,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+        subscription = self._create_or_update_ownerless_subscription(
+            task_id=task.id,
+            car_number=car_number,
+            created_by_telegram_user_id=created_by_telegram_user_id,
+            created_by_telegram_chat_id=created_by_telegram_chat_id,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+        check_result = await self._check_service.check_task(task)
+
+        return DelegatedAddCarOutcome(
+            task=task,
+            subscription=subscription,
+            pending_claim=False,
+            check_ok=check_result.status == "ok",
+            new_fines_count=len(check_result.new_fines) if check_result.status == "ok" else 0,
+            claim_link=None,
+        )
+
     def claim(
         self,
         claim_token: str,
@@ -482,6 +540,48 @@ class SubscriptionService:
             # для этой же пары — обновляем её, а не падаем.
             refreshed = self._subscription_repository.get_active_for_user_and_car(
                 telegram_user_id, car_number, today=start_date,
+            )
+            if refreshed is None:
+                raise
+            return self._subscription_repository.update_period(
+                refreshed.id, start_date=start_date, end_date=end_date,
+            )
+
+    def _create_or_update_ownerless_subscription(
+        self,
+        *,
+        task_id: int,
+        car_number: str,
+        created_by_telegram_user_id: int,
+        created_by_telegram_chat_id: int,
+        start_date: date,
+        end_date: date,
+    ) -> FineMonitoringSubscription:
+        """См. add_delegated_car_without_client — тот же приём
+        get-then-create-with-race-fallback, что и
+        _create_or_update_subscription/_create_or_refresh_pending_claim,
+        только ключ дедупликации здесь — (task, creator), а не (task,
+        owner): у безвладельческой подписки нет owner вовсе."""
+        existing = self._subscription_repository.get_active_ownerless_for_creator_and_task(
+            task_id, created_by_telegram_user_id,
+        )
+        if existing is not None:
+            return self._subscription_repository.update_period(
+                existing.id, start_date=start_date, end_date=end_date,
+            )
+
+        try:
+            return self._subscription_repository.create_without_owner(
+                monitoring_task_id=task_id,
+                car_number=car_number,
+                created_by_telegram_user_id=created_by_telegram_user_id,
+                created_by_telegram_chat_id=created_by_telegram_chat_id,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        except DuplicateActiveOwnerlessSubscriptionError:
+            refreshed = self._subscription_repository.get_active_ownerless_for_creator_and_task(
+                task_id, created_by_telegram_user_id,
             )
             if refreshed is None:
                 raise
