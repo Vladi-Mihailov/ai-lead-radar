@@ -666,8 +666,31 @@ class SubscriptionService:
         существующего reader/commands/fine.py::_handle_list
         (FineMonitoringTaskRepository.list_active(), тот же метод, никакой
         второй реализации). reader/commands/fine.py/FineJob/monitoring
-        scopes/dedup этим не затрагиваются — только чтение."""
+        scopes/dedup этим не затрагиваются — только чтение.
+
+        Используется ТОЛЬКО ⛔ Остановить мониторинг (picker, см. design
+        report: "пока существующую реализацию не переделывай") — 📋 Мои
+        авто теперь пагинирован (см. count_active_tasks/
+        list_active_tasks_page ниже), полный список без limit ей больше не
+        нужен."""
         return self._task_repository.list_active()
+
+    def count_active_tasks(self) -> int:
+        """Общее число активных задач — используется ТОЛЬКО для вычисления
+        числа страниц 📋 Мои авто (см. design report: пагинация вместо
+        hard cap "первые 50 из N")."""
+        return self._task_repository.count_active()
+
+    def list_active_tasks_page(self, *, page: int, page_size: int) -> list[FineMonitoringTask]:
+        """Одна страница активных задач (0-indexed page) — см. design
+        report: "по 10 машин на страницу", "стабильная сортировка"
+        (FineMonitoringTaskRepository.list_active_page() — ORDER BY id ASC).
+        Границы page (отрицательный/за пределами общего числа страниц) —
+        ответственность вызывающего кода (ConversationController), не
+        проверяются здесь: этот метод просто возвращает то, что просят,
+        пустой список для заведомо невалидного offset."""
+        offset = page * page_size
+        return self._task_repository.list_active_page(offset=offset, limit=page_size)
 
     def get_active_task_for_trusted_admin(self, task_id: int) -> FineMonitoringTask | None:
         """None — задача не существует ИЛИ уже не 'active' (завершена/
@@ -690,13 +713,19 @@ class SubscriptionService:
         return self._subscription_repository.count_active_or_pending_for_task(task_id)
 
     async def check_now_task(self, task_id: int) -> CheckNowOutcome | None:
-        """Task-level 🔎 Проверить сейчас для trusted-оператора — БЕЗ
-        привязки к subscription вовсе (см. design report: "наличие
+        """Task-level 🔎 Проверить сейчас для trusted-оператора ПО task_id —
+        БЕЗ привязки к subscription вовсе (см. design report: "наличие
         fine_monitoring_subscription для trusted operator НЕ требуется").
         None — задача не существует/не активна (см.
         get_active_task_for_trusted_admin). Иначе — ТОТ ЖЕ
         FineCheckService.check_task()/дедуп, что и везде — никакой
-        отдельной реализации проверки."""
+        отдельной реализации проверки.
+
+        Переиспользуется check_now_task_by_car_number() ниже — единственный
+        UI-путь к 🔎 для trusted-оператора теперь ввод номера (см. design
+        report: "искать автомобиль в списке неудобно"), но сам примитив
+        "проверить конкретную активную задачу по id" остаётся отдельным,
+        независимо тестируемым методом."""
         task = self.get_active_task_for_trusted_admin(task_id)
         if task is None:
             return None
@@ -708,6 +737,20 @@ class SubscriptionService:
             check_ok=check_result.status == "ok",
             new_fines_count=len(check_result.new_fines) if check_result.status == "ok" else 0,
         )
+
+    async def check_now_task_by_car_number(self, car_number: str) -> CheckNowOutcome | None:
+        """Trusted-operator task-level 🔎 Проверить сейчас ПО НОМЕРУ (см.
+        design report: ввод номера вместо списка — "искать автомобиль в
+        списке неудобно") — ищет active fine_monitoring_task напрямую по
+        car_number, subscription не требуется вовсе. None — такой активной
+        задачи нет (car_number НЕ добавляется автоматически — вызывающий
+        код должен показать "не найден", а не молча создать мониторинг)."""
+        tasks = self._task_repository.get_active_by_car_number(car_number)
+        if not tasks:
+            return None
+        # Обычно у номера ровно одна активная задача — то же допущение,
+        # что и в reader/commands/fine.py::_handle_check/_handle_stop.
+        return await self.check_now_task(tasks[0].id)
 
     def stop_task_for_trusted_admin(self, task_id: int) -> bool:
         """Task-level ⛔ Остановить мониторинг для trusted-оператора —

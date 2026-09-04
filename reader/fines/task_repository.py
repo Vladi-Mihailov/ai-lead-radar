@@ -94,6 +94,16 @@ _SELECT_ACTIVE_BY_SCOPE = f"""
     WHERE status = 'active' AND monitoring_scope = ?
 """
 
+# Trusted-operator task-level "📋 Мои авто" pagination (см. design report) —
+# ORDER BY id ASC даёт стабильную сортировку между запросами (list_active()
+# выше её не гарантирует вовсе — не полагаться на неё для пагинации).
+_SELECT_ACTIVE_PAGE = f"""
+    SELECT {_SELECT_FIELDS} FROM fine_monitoring_tasks
+    WHERE status = 'active'
+    ORDER BY id ASC
+    LIMIT :limit OFFSET :offset
+"""
+
 _SELECT_DUE_FOR_ARCHIVE_CHECK = f"""
     SELECT {_SELECT_FIELDS} FROM fine_monitoring_tasks
     WHERE archive_check_enabled = 1
@@ -310,6 +320,17 @@ class FineMonitoringTaskRepository:
 
     def get_active_by_car_number(self, car_number: str) -> list[FineMonitoringTask]:
         rows = self._conn.execute(_SELECT_ACTIVE_BY_CAR, (car_number,)).fetchall()
+        return [_row_to_task(row) for row in rows]
+
+    def list_active_page(self, *, offset: int, limit: int) -> list[FineMonitoringTask]:
+        """Одна страница активных задач, ORDER BY id ASC (стабильная
+        сортировка между запросами — см. design report про trusted-operator
+        task-level "📋 Мои авто" pagination). count_active() (см. ниже)
+        даёт общее число для вычисления числа страниц вызывающим кодом —
+        сам этот метод ничего не знает про размер страницы/её номер."""
+        rows = self._conn.execute(
+            _SELECT_ACTIVE_PAGE, {"offset": offset, "limit": limit},
+        ).fetchall()
         return [_row_to_task(row) for row in rows]
 
     def set_status(self, task_id: int, status: FineTaskStatus) -> None:

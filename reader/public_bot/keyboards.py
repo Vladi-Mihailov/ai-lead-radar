@@ -46,9 +46,14 @@ _ADD_CLIENT_NO = b"addclient:no"
 # архитектуры) — task_id вместо subscription_id, отдельные префиксы, чтобы
 # НИКОГДА не перепутать с subscription-based callback'ами выше (см.
 # _decode_id — startswith конкретного префикса, коллизий по префиксу нет).
-_TRUSTED_CHECK_NOW_PREFIX = b"tcheck:"
 _TRUSTED_STOP_PICK_PREFIX = b"tstoppick:"
 _TRUSTED_STOP_YES_PREFIX = b"tstopyes:"
+# 📋 Мои авто пагинация (см. design report) — page (0-indexed), НЕ
+# task_id — сам по себе не даёт никаких привилегий: is_trusted()
+# перепроверяется на каждом callback заново, а page вне диапазона просто
+# кламп(ится) до ближайшей валидной страницы (см.
+# ConversationController._format_trusted_tasks_page_reply).
+_TRUSTED_TASKS_PAGE_PREFIX = b"ttaskspage:"
 
 
 def main_menu_keyboard() -> list[list[Button]]:
@@ -147,10 +152,6 @@ def stop_options_keyboard(options: list[tuple[int, str]]) -> list[list[Button]]:
     return options_keyboard(options, prefix=_STOP_PICK_PREFIX)
 
 
-def decode_trusted_check_now_callback(data: bytes | None) -> int | None:
-    return _decode_id(data, _TRUSTED_CHECK_NOW_PREFIX)
-
-
 def decode_trusted_stop_pick_callback(data: bytes | None) -> int | None:
     return _decode_id(data, _TRUSTED_STOP_PICK_PREFIX)
 
@@ -159,12 +160,32 @@ def decode_trusted_stop_confirm_callback(data: bytes | None) -> int | None:
     return _decode_id(data, _TRUSTED_STOP_YES_PREFIX)
 
 
-def trusted_check_now_options_keyboard(options: list[tuple[int, str]]) -> list[list[Button]]:
-    return options_keyboard(options, prefix=_TRUSTED_CHECK_NOW_PREFIX)
-
-
 def trusted_stop_options_keyboard(options: list[tuple[int, str]]) -> list[list[Button]]:
     return options_keyboard(options, prefix=_TRUSTED_STOP_PICK_PREFIX)
+
+
+def encode_trusted_tasks_page_callback(page: int) -> bytes:
+    return _TRUSTED_TASKS_PAGE_PREFIX + str(page).encode("ascii")
+
+
+def decode_trusted_tasks_page_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _TRUSTED_TASKS_PAGE_PREFIX)
+
+
+def trusted_tasks_page_keyboard(*, page: int, total_pages: int) -> list[list[Button]]:
+    """[◀️ Назад] [N / M] [Вперёд ▶️] — один ряд (см. design report). Back
+    на первой странице и Next на последней — no-op (кламп к той же
+    странице, см. design report: "первая страница — Back disabled/no-op";
+    "последняя — Next disabled/no-op"), а не отсутствующая кнопка: нажатие
+    просто заново показывает ту же страницу. Средняя кнопка-индикатор —
+    тоже no-op (кодирует текущую page)."""
+    back_page = max(page - 1, 0)
+    next_page = min(page + 1, total_pages - 1)
+    return [[
+        Button.inline("◀️ Назад", encode_trusted_tasks_page_callback(back_page)),
+        Button.inline(f"{page + 1} / {total_pages}", encode_trusted_tasks_page_callback(page)),
+        Button.inline("Вперёд ▶️", encode_trusted_tasks_page_callback(next_page)),
+    ]]
 
 
 def trusted_stop_confirm_keyboard(task_id: int, *, label: str) -> list[list[Button]]:

@@ -809,6 +809,97 @@ async def test_check_now_task_returns_none_for_inactive_task(fx):
     assert result is None
 
 
+# ---- count_active_tasks / list_active_tasks_page (📋 Мои авто pagination,
+# см. design report) ----
+
+
+def test_count_active_tasks_counts_only_active(fx):
+    active = fx.task_repository.create(
+        car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    completed = fx.task_repository.create(
+        car_number="BB002BB", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    fx.task_repository.set_status(completed.id, "completed")
+
+    assert fx.service.count_active_tasks() == 1
+    assert active.status == "active"
+
+
+def test_list_active_tasks_page_computes_offset_from_page_and_size(fx):
+    ids = []
+    for i in range(25):
+        task = fx.task_repository.create(
+            car_number=f"CAR{i:04d}", label=None,
+            start_date=date(2026, 8, 1), end_date=date(2026, 12, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+        )
+        ids.append(task.id)
+
+    page0 = fx.service.list_active_tasks_page(page=0, page_size=10)
+    page1 = fx.service.list_active_tasks_page(page=1, page_size=10)
+    page2 = fx.service.list_active_tasks_page(page=2, page_size=10)
+
+    assert [t.id for t in page0] == ids[0:10]
+    assert [t.id for t in page1] == ids[10:20]
+    assert [t.id for t in page2] == ids[20:25]
+
+
+# ---- check_now_task_by_car_number (trusted 🔎 Проверить сейчас по
+# номеру, см. design report: "искать автомобиль в списке неудобно") ----
+
+
+async def test_check_now_task_by_car_number_finds_active_task_without_subscription(fx):
+    fx.task_repository.create(
+        car_number="E911EE95", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+
+    result = await fx.service.check_now_task_by_car_number("E911EE95")
+
+    assert result is not None
+    assert result.car_number == "E911EE95"
+    assert result.check_ok is True
+    assert fx.subscription_repository.list_by_user(_OPERATOR_USER_ID) == []
+
+
+async def test_check_now_task_by_car_number_returns_none_for_unknown_plate(fx):
+    result = await fx.service.check_now_task_by_car_number("E911EE95")
+
+    assert result is None
+
+
+async def test_check_now_task_by_car_number_returns_none_for_inactive_task(fx):
+    task = fx.task_repository.create(
+        car_number="E911EE95", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    fx.task_repository.set_status(task.id, "completed")
+
+    result = await fx.service.check_now_task_by_car_number("E911EE95")
+
+    assert result is None
+
+
+async def test_check_now_task_by_car_number_uses_existing_dedup(tmp_path):
+    fixture = _Fixture(tmp_path, records_by_car={"E911EE95": [_record(car_number="E911EE95")]})
+    try:
+        fixture.task_repository.create(
+            car_number="E911EE95", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 12, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+        )
+
+        first = await fixture.service.check_now_task_by_car_number("E911EE95")
+        assert first.new_fines_count == 1
+
+        second = await fixture.service.check_now_task_by_car_number("E911EE95")
+        assert second.new_fines_count == 0
+    finally:
+        fixture.close()
+
+
 def test_count_active_or_pending_subscribers_for_task(fx):
     task = fx.task_repository.create(
         car_number="M398YK763", label=None, start_date=date(2026, 9, 1), end_date=date(2027, 9, 1),

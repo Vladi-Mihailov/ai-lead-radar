@@ -162,6 +162,79 @@ def test_get_active_by_car_number_filters_correctly(tmp_path):
         repo.close()
 
 
+# ---- list_active_page (trusted-operator task-level "📋 Мои авто"
+# pagination, см. design report) ----
+
+
+def _make_active_tasks(repo, count: int) -> list[int]:
+    ids = []
+    for i in range(count):
+        task = repo.create(
+            car_number=f"CAR{i:04d}", label=None,
+            start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+        ids.append(task.id)
+    return ids
+
+
+def test_list_active_page_returns_stable_ordered_slice(tmp_path):
+    repo = _make_repo(tmp_path)
+    try:
+        ids = _make_active_tasks(repo, 25)
+
+        page0 = repo.list_active_page(offset=0, limit=10)
+        page1 = repo.list_active_page(offset=10, limit=10)
+        page2 = repo.list_active_page(offset=20, limit=10)
+
+        assert [t.id for t in page0] == ids[0:10]
+        assert [t.id for t in page1] == ids[10:20]
+        assert [t.id for t in page2] == ids[20:25]  # неполная последняя страница
+    finally:
+        repo.close()
+
+
+def test_list_active_page_excludes_inactive_tasks(tmp_path):
+    repo = _make_repo(tmp_path)
+    try:
+        ids = _make_active_tasks(repo, 5)
+        repo.set_status(ids[2], "completed")
+
+        page = repo.list_active_page(offset=0, limit=10)
+
+        assert ids[2] not in [t.id for t in page]
+        assert len(page) == 4
+    finally:
+        repo.close()
+
+
+def test_list_active_page_ordering_is_stable_across_calls(tmp_path):
+    """Стабильная сортировка (см. design report) — повторный запрос той
+    же страницы возвращает те же id в том же порядке."""
+    repo = _make_repo(tmp_path)
+    try:
+        _make_active_tasks(repo, 15)
+
+        first_call = [t.id for t in repo.list_active_page(offset=0, limit=10)]
+        second_call = [t.id for t in repo.list_active_page(offset=0, limit=10)]
+
+        assert first_call == second_call
+    finally:
+        repo.close()
+
+
+def test_list_active_page_offset_beyond_total_returns_empty(tmp_path):
+    repo = _make_repo(tmp_path)
+    try:
+        _make_active_tasks(repo, 5)
+
+        page = repo.list_active_page(offset=100, limit=10)
+
+        assert page == []
+    finally:
+        repo.close()
+
+
 def test_set_status_updates_status_and_updated_at(tmp_path):
     repo = _make_repo(tmp_path)
     try:

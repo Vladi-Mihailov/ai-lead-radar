@@ -30,6 +30,7 @@ from reader.public_bot.conversation import (  # noqa: E402
     STEP_AWAITING_CLIENT_DECISION,
     STEP_AWAITING_OWNER_USERNAME,
     STEP_AWAITING_PERIOD,
+    STEP_AWAITING_TRUSTED_CHECK_NOW_CAR_NUMBER,
     STEP_AWAITING_USERNAME,
     ConversationController,
 )
@@ -141,40 +142,40 @@ def trusted_fx(tmp_path):
 # ---- /start / главное меню ----
 
 
-def test_start_shows_main_menu_and_clears_state(fx):
+async def test_start_shows_main_menu_and_clears_state(fx):
     fx.conversation_state_repository.set(chat_id=1, telegram_user_id=1, step=STEP_AWAITING_CAR_NUMBER)
 
-    reply = fx.controller.handle_text("/start", chat_id=1, telegram_user_id=1, username=None)
+    reply = await fx.controller.handle_text("/start", chat_id=1, telegram_user_id=1, username=None)
 
     assert reply.text == texts.MAIN_MENU_TEXT
     assert reply.show_main_menu is True
     assert fx.conversation_state_repository.get(1) is None
 
 
-def test_my_cars_button_with_no_subscriptions(fx):
-    reply = fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=1, telegram_user_id=1, username=None)
+async def test_my_cars_button_with_no_subscriptions(fx):
+    reply = await fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=1, telegram_user_id=1, username=None)
 
     assert reply.text == texts.NO_CARS_TEXT
 
 
-def test_check_now_with_no_cars_shows_empty_message(fx):
-    reply = fx.controller.handle_text(texts.CHECK_NOW_LABEL, chat_id=1, telegram_user_id=1, username=None)
+async def test_check_now_with_no_cars_shows_empty_message(fx):
+    reply = await fx.controller.handle_text(texts.CHECK_NOW_LABEL, chat_id=1, telegram_user_id=1, username=None)
     assert reply.text == texts.NO_ACTIONABLE_CARS_TEXT
 
 
-def test_stop_with_no_cars_shows_empty_message(fx):
-    reply = fx.controller.handle_text(texts.STOP_LABEL, chat_id=1, telegram_user_id=1, username=None)
+async def test_stop_with_no_cars_shows_empty_message(fx):
+    reply = await fx.controller.handle_text(texts.STOP_LABEL, chat_id=1, telegram_user_id=1, username=None)
     assert reply.text == texts.NO_ACTIONABLE_CARS_TEXT
 
 
 # ---- Add Car: username уже известен Telegram'у ----
 
 
-def test_add_car_with_known_username_skips_username_step(fx):
-    reply = fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username="alice")
+async def test_add_car_with_known_username_skips_username_step(fx):
+    reply = await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username="alice")
     assert reply.text == texts.CAR_NUMBER_PROMPT
 
-    reply = fx.controller.handle_text("M295YB196", chat_id=1, telegram_user_id=1, username="alice")
+    reply = await fx.controller.handle_text("M295YB196", chat_id=1, telegram_user_id=1, username="alice")
 
     assert reply.show_period_buttons is True
     assert reply.text == texts.PERIOD_PROMPT
@@ -184,10 +185,10 @@ def test_add_car_with_known_username_skips_username_step(fx):
     assert state.payload == {"car_number": "M295YB196", "username": "alice"}
 
 
-def test_add_car_invalid_car_number_stays_on_same_step(fx):
-    fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username="alice")
+async def test_add_car_invalid_car_number_stays_on_same_step(fx):
+    await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username="alice")
 
-    reply = fx.controller.handle_text("!!!", chat_id=1, telegram_user_id=1, username="alice")
+    reply = await fx.controller.handle_text("!!!", chat_id=1, telegram_user_id=1, username="alice")
 
     assert "❌" in reply.text
     state = fx.conversation_state_repository.get(1)
@@ -197,10 +198,10 @@ def test_add_car_invalid_car_number_stays_on_same_step(fx):
 # ---- Add Car: username отсутствует ----
 
 
-def test_add_car_without_username_asks_for_it(fx):
-    fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=2, telegram_user_id=2, username=None)
+async def test_add_car_without_username_asks_for_it(fx):
+    await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=2, telegram_user_id=2, username=None)
 
-    reply = fx.controller.handle_text("M295YB196", chat_id=2, telegram_user_id=2, username=None)
+    reply = await fx.controller.handle_text("M295YB196", chat_id=2, telegram_user_id=2, username=None)
 
     assert reply.text == texts.USERNAME_PROMPT
     state = fx.conversation_state_repository.get(2)
@@ -208,11 +209,11 @@ def test_add_car_without_username_asks_for_it(fx):
     assert state.payload == {"car_number": "M295YB196"}
 
 
-def test_add_car_valid_username_after_missing_proceeds_to_period(fx):
-    fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=2, telegram_user_id=2, username=None)
-    fx.controller.handle_text("M295YB196", chat_id=2, telegram_user_id=2, username=None)
+async def test_add_car_valid_username_after_missing_proceeds_to_period(fx):
+    await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=2, telegram_user_id=2, username=None)
+    await fx.controller.handle_text("M295YB196", chat_id=2, telegram_user_id=2, username=None)
 
-    reply = fx.controller.handle_text("@VeronaWarm", chat_id=2, telegram_user_id=2, username=None)
+    reply = await fx.controller.handle_text("@VeronaWarm", chat_id=2, telegram_user_id=2, username=None)
 
     assert reply.show_period_buttons is True
     state = fx.conversation_state_repository.get(2)
@@ -220,11 +221,11 @@ def test_add_car_valid_username_after_missing_proceeds_to_period(fx):
     assert state.payload == {"car_number": "M295YB196", "username": "VeronaWarm"}
 
 
-def test_add_car_invalid_username_stays_on_same_step(fx):
-    fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=2, telegram_user_id=2, username=None)
-    fx.controller.handle_text("M295YB196", chat_id=2, telegram_user_id=2, username=None)
+async def test_add_car_invalid_username_stays_on_same_step(fx):
+    await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=2, telegram_user_id=2, username=None)
+    await fx.controller.handle_text("M295YB196", chat_id=2, telegram_user_id=2, username=None)
 
-    reply = fx.controller.handle_text("!!", chat_id=2, telegram_user_id=2, username=None)
+    reply = await fx.controller.handle_text("!!", chat_id=2, telegram_user_id=2, username=None)
 
     assert "❌" in reply.text
     state = fx.conversation_state_repository.get(2)
@@ -236,8 +237,8 @@ def test_add_car_invalid_username_stays_on_same_step(fx):
 
 @pytest.mark.parametrize("days", [30, 90, 180, 365])
 async def test_period_choice_creates_subscription_with_expected_dates(fx, days):
-    fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=3, telegram_user_id=3, username="driver3")
-    fx.controller.handle_text("M295YB196", chat_id=3, telegram_user_id=3, username="driver3")
+    await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=3, telegram_user_id=3, username="driver3")
+    await fx.controller.handle_text("M295YB196", chat_id=3, telegram_user_id=3, username="driver3")
 
     reply = await fx.controller.handle_period_choice(
         days, chat_id=3, telegram_user_id=3, first_name="Driver", last_name=None,
@@ -262,10 +263,10 @@ async def test_period_choice_creates_subscription_with_expected_dates(fx, days):
 async def test_period_choice_reports_new_fines_count(tmp_path):
     fixture = _Fixture(tmp_path, records_by_car={"M295YB196": [_record()]})
     try:
-        fixture.controller.handle_text(
+        await fixture.controller.handle_text(
             texts.ADD_CAR_LABEL, chat_id=4, telegram_user_id=4, username="driver4",
         )
-        fixture.controller.handle_text("M295YB196", chat_id=4, telegram_user_id=4, username="driver4")
+        await fixture.controller.handle_text("M295YB196", chat_id=4, telegram_user_id=4, username="driver4")
 
         reply = await fixture.controller.handle_period_choice(
             30, chat_id=4, telegram_user_id=4, first_name=None, last_name=None,
@@ -281,8 +282,8 @@ async def test_period_choice_rejects_wrong_sender(fx):
     проверяется по conversation_state (chat_id -> telegram_user_id) — чужой
     sender_id (например, из пересланного сообщения с кнопкой) не должен
     иметь никакого эффекта."""
-    fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=5, telegram_user_id=5, username="owner5")
-    fx.controller.handle_text("M295YB196", chat_id=5, telegram_user_id=5, username="owner5")
+    await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=5, telegram_user_id=5, username="owner5")
+    await fx.controller.handle_text("M295YB196", chat_id=5, telegram_user_id=5, username="owner5")
 
     reply = await fx.controller.handle_period_choice(
         30, chat_id=5, telegram_user_id=999, first_name=None, last_name=None,
@@ -304,8 +305,8 @@ async def test_period_choice_without_active_dialog_returns_none(fx):
 
 
 async def test_period_choice_with_unknown_value_returns_none(fx):
-    fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username="alice")
-    fx.controller.handle_text("M295YB196", chat_id=1, telegram_user_id=1, username="alice")
+    await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username="alice")
+    await fx.controller.handle_text("M295YB196", chat_id=1, telegram_user_id=1, username="alice")
 
     reply = await fx.controller.handle_period_choice(
         999, chat_id=1, telegram_user_id=1, first_name=None, last_name=None,
@@ -328,14 +329,14 @@ async def test_my_cars_shows_only_own_subscriptions(fx):
         period_days=30, today=_today(),
     )
 
-    reply = fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=10, telegram_user_id=10, username=None)
+    reply = await fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=10, telegram_user_id=10, username=None)
 
     assert "AA001AA" in reply.text
     assert "BB002BB" not in reply.text
     assert "✅ Активен" in reply.text
 
 
-def test_my_cars_shows_expired_label_for_past_end_date(fx):
+async def test_my_cars_shows_expired_label_for_past_end_date(fx):
     task = fx.task_repository.create(
         car_number="AA001AA", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
         telegram_chat_id=10, created_by_user_id=10, monitoring_scope="client_bot",
@@ -346,7 +347,7 @@ def test_my_cars_shows_expired_label_for_past_end_date(fx):
         start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
     )
 
-    reply = fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=10, telegram_user_id=10, username=None)
+    reply = await fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=10, telegram_user_id=10, username=None)
 
     assert "⏱ Истёк" in reply.text
 
@@ -354,11 +355,11 @@ def test_my_cars_shows_expired_label_for_past_end_date(fx):
 # ---- переживание рестарта (переоткрытие БД) ----
 
 
-def test_conversation_state_survives_restart_simulated_reopen(tmp_path):
+async def test_conversation_state_survives_restart_simulated_reopen(tmp_path):
     fixture1 = _Fixture(tmp_path)
     try:
-        fixture1.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=7, telegram_user_id=7, username=None)
-        fixture1.controller.handle_text("M295YB196", chat_id=7, telegram_user_id=7, username=None)
+        await fixture1.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=7, telegram_user_id=7, username=None)
+        await fixture1.controller.handle_text("M295YB196", chat_id=7, telegram_user_id=7, username=None)
         # состояние теперь STEP_AWAITING_USERNAME — "процесс" останавливается.
     finally:
         fixture1.close()
@@ -369,7 +370,7 @@ def test_conversation_state_survives_restart_simulated_reopen(tmp_path):
         assert state.step == STEP_AWAITING_USERNAME
         assert state.payload == {"car_number": "M295YB196"}
 
-        reply = fixture2.controller.handle_text("@VeronaWarm", chat_id=7, telegram_user_id=7, username=None)
+        reply = await fixture2.controller.handle_text("@VeronaWarm", chat_id=7, telegram_user_id=7, username=None)
 
         assert reply.show_period_buttons is True
         assert fixture2.conversation_state_repository.get(7).step == STEP_AWAITING_PERIOD
@@ -380,27 +381,27 @@ def test_conversation_state_survives_restart_simulated_reopen(tmp_path):
 # ==== trusted-operator delegated flow (см. design report) ====
 
 
-def test_ordinary_user_never_sees_owner_username_prompt(fx):
+async def test_ordinary_user_never_sees_owner_username_prompt(fx):
     """Регресс: обычный пользователь (не в trusted_operator_user_ids) —
     поведение self-service flow не должно отличаться от Stage 2, даже
     если у него самого нет username (авто-детект/обычный USERNAME_PROMPT)."""
-    fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username=None)
+    await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username=None)
 
-    reply = fx.controller.handle_text("M295YB196", chat_id=1, telegram_user_id=1, username=None)
+    reply = await fx.controller.handle_text("M295YB196", chat_id=1, telegram_user_id=1, username=None)
 
     assert reply.text == texts.USERNAME_PROMPT
     assert fx.conversation_state_repository.get(1).step == STEP_AWAITING_USERNAME
 
 
-def test_trusted_user_car_number_shows_add_client_decision_first(trusted_fx):
+async def test_trusted_user_car_number_shows_add_client_decision_first(trusted_fx):
     """Trusted-оператор — ПЕРВЫМ делом видит "Добавить клиента?", а не
     сразу OWNER_USERNAME_PROMPT (см. design: username клиента больше не
     обязателен для постановки на мониторинг)."""
-    trusted_fx.controller.handle_text(
+    await trusted_fx.controller.handle_text(
         texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username="trusted_own_username",
     )
 
-    reply = trusted_fx.controller.handle_text(
+    reply = await trusted_fx.controller.handle_text(
         "M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username="trusted_own_username",
     )
 
@@ -411,15 +412,15 @@ def test_trusted_user_car_number_shows_add_client_decision_first(trusted_fx):
     assert state.payload == {"car_number": "M295YB196"}
 
 
-def test_trusted_user_ok_on_client_decision_shows_owner_username_prompt(trusted_fx):
+async def test_trusted_user_ok_on_client_decision_shows_owner_username_prompt(trusted_fx):
     """"OK" на "Добавить клиента?" — ВСЕГДА OWNER_USERNAME_PROMPT, даже
     если у самого trusted-пользователя есть свой Telegram username (авто-
     детект self-service здесь не применяется, см. design report об
     упрощении: нет отдельного экрана "Для себя/Для другого")."""
-    trusted_fx.controller.handle_text(
+    await trusted_fx.controller.handle_text(
         texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username="trusted_own_username",
     )
-    trusted_fx.controller.handle_text(
+    await trusted_fx.controller.handle_text(
         "M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username="trusted_own_username",
     )
 
@@ -433,12 +434,12 @@ def test_trusted_user_ok_on_client_decision_shows_owner_username_prompt(trusted_
     assert state.payload == {"car_number": "M295YB196"}
 
 
-def test_trusted_user_cancel_on_client_decision_skips_straight_to_period(trusted_fx):
+async def test_trusted_user_cancel_on_client_decision_skips_straight_to_period(trusted_fx):
     """"Отмена" — НЕ запрашивает username вовсе, сразу период (см. design:
     "username НЕ должен быть обязательным условием постановки машины на
     мониторинг")."""
-    trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
-    trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    await trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    await trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
 
     reply = trusted_fx.controller.handle_add_client_decision(
         False, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID,
@@ -451,12 +452,12 @@ def test_trusted_user_cancel_on_client_decision_skips_straight_to_period(trusted
     assert state.payload == {"car_number": "M295YB196", "no_client": True}
 
 
-def test_client_decision_rejects_stranger_in_this_chat(trusted_fx):
+async def test_client_decision_rejects_stranger_in_this_chat(trusted_fx):
     """None — server-side проверка владения диалогом: тот же chat_id, но
     ДРУГОЙ telegram_user_id — ничего не должно произойти (тот же принцип,
     что и у handle_period_choice)."""
-    trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
-    trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    await trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    await trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
 
     reply = trusted_fx.controller.handle_add_client_decision(
         True, chat_id=_TRUSTED_ID, telegram_user_id=999999,
@@ -465,12 +466,12 @@ def test_client_decision_rejects_stranger_in_this_chat(trusted_fx):
     assert reply is None
 
 
-def test_trusted_user_invalid_owner_username_stays_on_same_step(trusted_fx):
-    trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
-    trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+async def test_trusted_user_invalid_owner_username_stays_on_same_step(trusted_fx):
+    await trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    await trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
     trusted_fx.controller.handle_add_client_decision(True, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
 
-    reply = trusted_fx.controller.handle_text("!!", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    reply = await trusted_fx.controller.handle_text("!!", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
 
     assert "❌" in reply.text
     assert trusted_fx.conversation_state_repository.get(_TRUSTED_ID).step == STEP_AWAITING_OWNER_USERNAME
@@ -482,10 +483,10 @@ async def test_trusted_delegate_flow_resolves_immediately_via_local_db(trusted_f
             user_id=777, username="real_owner", first_name="Real", last_name="Owner",
         )
     )
-    trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
-    trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    await trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    await trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
     trusted_fx.controller.handle_add_client_decision(True, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
-    trusted_fx.controller.handle_text("@real_owner", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    await trusted_fx.controller.handle_text("@real_owner", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
 
     reply = await trusted_fx.controller.handle_period_choice(
         90, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, first_name=None, last_name=None,
@@ -503,10 +504,10 @@ async def test_trusted_delegate_flow_resolves_immediately_via_local_db(trusted_f
 
 
 async def test_trusted_delegate_flow_pending_claim_when_owner_unresolved(trusted_fx):
-    trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
-    trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    await trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    await trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
     trusted_fx.controller.handle_add_client_decision(True, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
-    trusted_fx.controller.handle_text("@unknown_person", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    await trusted_fx.controller.handle_text("@unknown_person", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
 
     reply = await trusted_fx.controller.handle_period_choice(
         30, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, first_name=None, last_name=None,
@@ -526,17 +527,17 @@ async def test_trusted_delegate_flow_pending_claim_when_owner_unresolved(trusted
 
 
 async def test_claim_deep_link_start_binds_owner_and_confirms(trusted_fx):
-    trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
-    trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    await trusted_fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    await trusted_fx.controller.handle_text("M295YB196", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
     trusted_fx.controller.handle_add_client_decision(True, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
-    trusted_fx.controller.handle_text("@unknown_person", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
+    await trusted_fx.controller.handle_text("@unknown_person", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None)
     reply = await trusted_fx.controller.handle_period_choice(
         30, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, first_name=None, last_name=None,
     )
     link = [line for line in reply.text.splitlines() if line.startswith("https://t.me/")][0]
     token = link.rsplit("claim_", 1)[1]
 
-    claim_reply = trusted_fx.controller.handle_text(
+    claim_reply = await trusted_fx.controller.handle_text(
         f"/start claim_{token}", chat_id=777, telegram_user_id=777,
         username="unknown_person", first_name="Real", last_name="Owner",
     )
@@ -549,8 +550,8 @@ async def test_claim_deep_link_start_binds_owner_and_confirms(trusted_fx):
     assert subscription.telegram_user_id == 777
 
 
-def test_claim_deep_link_start_rejects_unknown_token(fx):
-    reply = fx.controller.handle_text(
+async def test_claim_deep_link_start_rejects_unknown_token(fx):
+    reply = await fx.controller.handle_text(
         "/start claim_does-not-exist", chat_id=42, telegram_user_id=42, username="someone",
     )
 
@@ -572,7 +573,7 @@ async def test_trusted_my_cars_shows_all_active_tasks_not_subscriptions(trusted_
         owner_username="real_owner", car_number="M295YB196", period_days=30, today=_today(),
     )
 
-    reply = trusted_fx.controller.handle_text(
+    reply = await trusted_fx.controller.handle_text(
         texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
@@ -581,8 +582,8 @@ async def test_trusted_my_cars_shows_all_active_tasks_not_subscriptions(trusted_
     assert texts.MANAGED_CARS_HEADER not in reply.text
 
 
-def test_ordinary_user_my_cars_has_no_managed_section(fx):
-    reply = fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=1, telegram_user_id=1, username=None)
+async def test_ordinary_user_my_cars_has_no_managed_section(fx):
+    reply = await fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=1, telegram_user_id=1, username=None)
 
     assert texts.MANAGED_CARS_HEADER not in reply.text
 
@@ -596,7 +597,7 @@ async def test_check_now_lists_own_car_and_returns_result(fx):
         first_name=None, last_name=None, car_number="M295YB196", period_days=30, today=_today(),
     )
 
-    pick_reply = fx.controller.handle_text(texts.CHECK_NOW_LABEL, chat_id=1, telegram_user_id=1, username="alice")
+    pick_reply = await fx.controller.handle_text(texts.CHECK_NOW_LABEL, chat_id=1, telegram_user_id=1, username="alice")
     assert pick_reply.text == texts.CHECK_NOW_PICK_PROMPT
     assert pick_reply.check_now_options is not None
     [(subscription_id, car_number)] = pick_reply.check_now_options
@@ -638,13 +639,13 @@ async def test_check_now_reports_new_fines(tmp_path):
 
 
 async def test_stop_flow_pick_confirm_and_cancel(fx):
-    fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username="alice")
-    fx.controller.handle_text("M295YB196", chat_id=1, telegram_user_id=1, username="alice")
+    await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username="alice")
+    await fx.controller.handle_text("M295YB196", chat_id=1, telegram_user_id=1, username="alice")
     await fx.controller.handle_period_choice(
         30, chat_id=1, telegram_user_id=1, first_name=None, last_name=None,
     )
 
-    pick_reply = fx.controller.handle_text(texts.STOP_LABEL, chat_id=1, telegram_user_id=1, username="alice")
+    pick_reply = await fx.controller.handle_text(texts.STOP_LABEL, chat_id=1, telegram_user_id=1, username="alice")
     assert pick_reply.stop_options is not None
     [(subscription_id, car_number)] = pick_reply.stop_options
     assert car_number == "M295YB196"
@@ -754,7 +755,7 @@ async def test_trusted_my_cars_shows_task_without_any_subscription(trusted_fx):
     требуется вовсе."""
     _make_operator_task(trusted_fx, "E911EE95")
 
-    reply = trusted_fx.controller.handle_text(
+    reply = await trusted_fx.controller.handle_text(
         texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
@@ -774,7 +775,7 @@ async def test_trusted_my_cars_shows_all_active_tasks_operator_and_client_bot(tr
     )
     _make_operator_task(trusted_fx, "COMPLETED1", status="completed")
 
-    reply = trusted_fx.controller.handle_text(
+    reply = await trusted_fx.controller.handle_text(
         texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
@@ -783,13 +784,13 @@ async def test_trusted_my_cars_shows_all_active_tasks_operator_and_client_bot(tr
     assert "COMPLETED1" not in reply.text  # completed — не активна, не должна попасть в список
 
 
-def test_ordinary_user_my_cars_never_shows_task_only_cars(fx):
+async def test_ordinary_user_my_cars_never_shows_task_only_cars(fx):
     """Явное требование: ordinary user НЕ видит чужие/task-only cars —
     "Мои авто" для обычного пользователя остаётся строго
     subscription-based, задачи без подписки на него в принципе не влияют."""
     _make_operator_task(fx, "E911EE95")
 
-    reply = fx.controller.handle_text(
+    reply = await fx.controller.handle_text(
         texts.MY_CARS_LABEL, chat_id=1, telegram_user_id=1, username=None,
     )
 
@@ -797,63 +798,366 @@ def test_ordinary_user_my_cars_never_shows_task_only_cars(fx):
     assert reply.text == texts.NO_CARS_TEXT
 
 
-async def test_trusted_check_now_works_for_task_without_subscription(trusted_fx):
-    """Явное требование: trusted Check Now работает для task без
-    subscription — реальный FineCheckService.check_task()."""
-    task_id = _make_operator_task(trusted_fx, "E911EE95")
+# ==== 📋 Мои авто — trusted-operator pagination (см. design report:
+# hard cap "первые 50 из N" убран, доступны ВСЕ active tasks, 10 на
+# страницу) ====
 
-    pick_reply = trusted_fx.controller.handle_text(
+
+def _make_many_tasks(fx, count: int) -> list[str]:
+    """count последовательных активных задач с уникальными номерами —
+    порядок car_number соответствует порядку создания (и id ASC, см.
+    design report: "стабильная сортировка")."""
+    car_numbers = [f"CAR{i:04d}" for i in range(count)]
+    for car_number in car_numbers:
+        _make_operator_task(fx, car_number)
+    return car_numbers
+
+
+async def test_trusted_my_cars_paginates_250_active_tasks_into_25_pages(trusted_fx):
+    """Явное требование: 250 active tasks → 25 страниц; hard cap "первые
+    50" убран — доступны ВСЕ 250."""
+    _make_many_tasks(trusted_fx, 250)
+
+    reply = await trusted_fx.controller.handle_text(
+        texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert reply.trusted_tasks_page == 0
+    assert reply.trusted_tasks_total_pages == 25
+    assert "Страница 1 из 25" in reply.text
+
+
+def test_trusted_my_cars_shows_10_tasks_per_page(trusted_fx):
+    car_numbers = _make_many_tasks(trusted_fx, 250)
+
+    reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
+
+    shown = [c for c in car_numbers if c in reply.text]
+    assert len(shown) == 10
+    assert shown == car_numbers[:10]
+
+
+def test_trusted_my_cars_first_page_content(trusted_fx):
+    car_numbers = _make_many_tasks(trusted_fx, 250)
+
+    reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
+
+    assert "Страница 1 из 25" in reply.text
+    for c in car_numbers[:10]:
+        assert c in reply.text
+    assert car_numbers[10] not in reply.text
+
+
+def test_trusted_my_cars_middle_page_content(trusted_fx):
+    car_numbers = _make_many_tasks(trusted_fx, 250)
+
+    reply = trusted_fx.controller.handle_trusted_tasks_page(12, telegram_user_id=_TRUSTED_ID)
+
+    assert "Страница 13 из 25" in reply.text
+    for c in car_numbers[120:130]:
+        assert c in reply.text
+    assert car_numbers[119] not in reply.text
+    assert car_numbers[130] not in reply.text
+
+
+def test_trusted_my_cars_last_page_content_exact_multiple(trusted_fx):
+    """250 = 25 * 10 — последняя страница ровно полная (проверяется
+    отдельно от неполной последней страницы ниже)."""
+    car_numbers = _make_many_tasks(trusted_fx, 250)
+
+    reply = trusted_fx.controller.handle_trusted_tasks_page(24, telegram_user_id=_TRUSTED_ID)
+
+    assert "Страница 25 из 25" in reply.text
+    for c in car_numbers[240:250]:
+        assert c in reply.text
+
+
+def test_trusted_my_cars_last_incomplete_page_content(trusted_fx):
+    """205 задач, 10 на страницу — 21 страница, последняя неполная (5)."""
+    car_numbers = _make_many_tasks(trusted_fx, 205)
+
+    reply = trusted_fx.controller.handle_trusted_tasks_page(20, telegram_user_id=_TRUSTED_ID)
+
+    assert reply.trusted_tasks_total_pages == 21
+    assert "Страница 21 из 21" in reply.text
+    for c in car_numbers[200:205]:
+        assert c in reply.text
+
+
+def test_trusted_my_cars_next_moves_forward_one_page(trusted_fx):
+    _make_many_tasks(trusted_fx, 250)
+
+    reply = trusted_fx.controller.handle_trusted_tasks_page(3, telegram_user_id=_TRUSTED_ID)
+
+    assert reply.trusted_tasks_page == 3
+    # Кнопка "Вперёд" в keyboards.trusted_tasks_page_keyboard кодирует page+1 —
+    # здесь проверяем через сам ConversationController, что page+1 валиден.
+    next_reply = trusted_fx.controller.handle_trusted_tasks_page(4, telegram_user_id=_TRUSTED_ID)
+    assert next_reply.trusted_tasks_page == 4
+
+
+def test_trusted_my_cars_back_moves_to_previous_page(trusted_fx):
+    _make_many_tasks(trusted_fx, 250)
+
+    reply = trusted_fx.controller.handle_trusted_tasks_page(3, telegram_user_id=_TRUSTED_ID)
+    assert reply.trusted_tasks_page == 3
+
+    back_reply = trusted_fx.controller.handle_trusted_tasks_page(2, telegram_user_id=_TRUSTED_ID)
+    assert back_reply.trusted_tasks_page == 2
+
+
+def test_trusted_my_cars_back_on_first_page_is_noop(trusted_fx):
+    """Явное требование: первая страница — Back disabled/no-op (кламп к
+    той же странице, а не отрицательная страница/ошибка)."""
+    _make_many_tasks(trusted_fx, 250)
+
+    reply = trusted_fx.controller.handle_trusted_tasks_page(-1, telegram_user_id=_TRUSTED_ID)
+
+    assert reply.trusted_tasks_page == 0
+    assert "Страница 1 из 25" in reply.text
+
+
+def test_trusted_my_cars_next_on_last_page_is_noop(trusted_fx):
+    """Явное требование: последняя страница — Next disabled/no-op (кламп
+    к той же последней странице, а не IndexError/пустой список)."""
+    _make_many_tasks(trusted_fx, 250)
+
+    reply = trusted_fx.controller.handle_trusted_tasks_page(24, telegram_user_id=_TRUSTED_ID)
+    next_reply = trusted_fx.controller.handle_trusted_tasks_page(25, telegram_user_id=_TRUSTED_ID)
+
+    assert reply.trusted_tasks_page == next_reply.trusted_tasks_page == 24
+    assert next_reply.text == reply.text
+
+
+def test_trusted_my_cars_forged_wildly_out_of_range_page_clamps_safely(trusted_fx):
+    """forged/out-of-range page — не ошибка, не пустая страница, просто
+    ближайшая валидная (см. design report: "page из callback нельзя
+    считать authorization")."""
+    _make_many_tasks(trusted_fx, 250)
+
+    huge = trusted_fx.controller.handle_trusted_tasks_page(999999, telegram_user_id=_TRUSTED_ID)
+    very_negative = trusted_fx.controller.handle_trusted_tasks_page(-999999, telegram_user_id=_TRUSTED_ID)
+
+    assert huge.trusted_tasks_page == 24
+    assert very_negative.trusted_tasks_page == 0
+
+
+def test_trusted_my_cars_single_page_when_few_tasks(trusted_fx):
+    """Явное требование: корректно работать при количестве страниц 1."""
+    _make_many_tasks(trusted_fx, 3)
+
+    reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
+
+    assert reply.trusted_tasks_total_pages == 1
+    assert "Страница 1 из 1" in reply.text
+
+    # Back и Next на единственной странице — оба no-op.
+    back = trusted_fx.controller.handle_trusted_tasks_page(-1, telegram_user_id=_TRUSTED_ID)
+    forward = trusted_fx.controller.handle_trusted_tasks_page(1, telegram_user_id=_TRUSTED_ID)
+    assert back.trusted_tasks_page == forward.trusted_tasks_page == 0
+
+
+def test_ordinary_user_does_not_get_trusted_tasks_pagination(fx):
+    """Явное требование: ordinary users этот task-level список не
+    получают — forged page callback с их telegram_user_id отклоняется."""
+    _make_many_tasks(fx, 250)
+
+    reply = fx.controller.handle_trusted_tasks_page(0, telegram_user_id=1)
+
+    assert reply is None
+
+
+async def test_ordinary_user_my_cars_menu_label_never_paginates(fx):
+    """Регрессия: обычный пользователь при нажатии "Мои авто" не получает
+    ни одного из trusted-полей ответа."""
+    reply = await fx.controller.handle_text(
+        texts.MY_CARS_LABEL, chat_id=1, telegram_user_id=1, username=None,
+    )
+
+    assert reply.trusted_tasks_page is None
+    assert reply.trusted_tasks_total_pages is None
+
+
+async def test_trusted_check_now_asks_for_car_number_not_a_list(trusted_fx):
+    """Явное требование: trusted 🔎 Проверить сейчас сразу просит ввести
+    номер — НИКАКОГО списка автомобилей вообще, даже если активные задачи
+    существуют."""
+    _make_operator_task(trusted_fx, "E911EE95")
+
+    reply = await trusted_fx.controller.handle_text(
         texts.CHECK_NOW_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
-    assert pick_reply.trusted_check_now_options is not None
-    [(picked_task_id, car_number)] = [
-        (tid, car) for tid, car in pick_reply.trusted_check_now_options if car == "E911EE95"
-    ]
-    assert picked_task_id == task_id
 
-    check_reply = await trusted_fx.controller.handle_trusted_check_now_choice(
-        task_id, telegram_user_id=_TRUSTED_ID,
+    assert reply.text == texts.CAR_NUMBER_PROMPT
+    assert reply.trusted_stop_options is None
+    assert reply.check_now_options is None
+    state = trusted_fx.conversation_state_repository.get(_TRUSTED_ID)
+    assert state.step == STEP_AWAITING_TRUSTED_CHECK_NOW_CAR_NUMBER
+
+
+async def test_trusted_check_now_works_for_task_without_subscription(trusted_fx):
+    """Явное требование: trusted Check Now по номеру работает для task
+    без subscription — реальный FineCheckService.check_task()."""
+    _make_operator_task(trusted_fx, "E911EE95")
+
+    await trusted_fx.controller.handle_text(
+        texts.CHECK_NOW_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+    check_reply = await trusted_fx.controller.handle_text(
+        "E911EE95", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert check_reply is not None
     assert "E911EE95" in check_reply.text
     assert "новых штрафов нет" in check_reply.text
+    assert trusted_fx.subscription_repository.list_by_user(_TRUSTED_ID) == []
+    # Диалог завершён — state очищен.
+    assert trusted_fx.conversation_state_repository.get(_TRUSTED_ID) is None
+
+
+async def test_trusted_check_now_normalizes_car_number_input(trusted_fx):
+    """Явное требование: номер нормализуется существующим механизмом —
+    разные написания одного и того же номера находят ту же задачу."""
+    _make_operator_task(trusted_fx, "E911EE95")
+
+    await trusted_fx.controller.handle_text(
+        texts.CHECK_NOW_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+    check_reply = await trusted_fx.controller.handle_text(
+        "e911ee95", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert "E911EE95" in check_reply.text
+
+
+async def test_trusted_check_now_can_find_car_beyond_old_first_50_limit(trusted_fx):
+    """Регрессия на прежний hard cap "первые 50" — Check Now по номеру
+    находит машину независимо от её позиции/id среди активных задач
+    (60-я созданная задача — заведомо за пределами прежнего лимита в 50)."""
+    for i in range(59):
+        _make_operator_task(trusted_fx, f"CAR{i:04d}")
+    _make_operator_task(trusted_fx, "E911EE95")  # 60-я по счёту задача
+
+    await trusted_fx.controller.handle_text(
+        texts.CHECK_NOW_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+    check_reply = await trusted_fx.controller.handle_text(
+        "E911EE95", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert "E911EE95" in check_reply.text
+    assert "не найден" not in check_reply.text
+
+
+async def test_trusted_check_now_rejects_unknown_plate_without_creating_anything(trusted_fx):
+    """Явное требование: если машины нет среди active tasks — явная
+    ошибка, ничего автоматически не добавляется."""
+    await trusted_fx.controller.handle_text(
+        texts.CHECK_NOW_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    reply = await trusted_fx.controller.handle_text(
+        "E911EE95", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert reply.text == "❌ Автомобиль E911EE95 не найден в активном мониторинге."
+    assert trusted_fx.task_repository.get_active_by_car_number("E911EE95") == []
+
+
+async def test_trusted_check_now_rejects_inactive_task_plate(trusted_fx):
+    """Машина существовала, но задача уже completed/stopped — та же
+    ошибка "не найден", а не случайная проверка неактивной задачи."""
+    _make_operator_task(trusted_fx, "E911EE95", status="completed")
+
+    await trusted_fx.controller.handle_text(
+        texts.CHECK_NOW_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+    reply = await trusted_fx.controller.handle_text(
+        "E911EE95", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert reply.text == "❌ Автомобиль E911EE95 не найден в активном мониторинге."
 
 
 async def test_trusted_check_now_uses_existing_dedup(tmp_path):
     """Тот же дедуп/detected_fines, что и везде — второй "Проверить
-    сейчас" на ту же задачу без новых штрафов от провайдера не находит
+    сейчас" по тому же номеру без новых штрафов от провайдера не находит
     уже виденный штраф повторно как новый."""
     fixture = _Fixture(
         tmp_path, records_by_car={"E911EE95": [_record(car_number="E911EE95")]},
         trusted_operator_user_ids={_TRUSTED_ID},
     )
     try:
-        task_id = _make_operator_task(fixture, "E911EE95")
+        _make_operator_task(fixture, "E911EE95")
 
-        first = await fixture.controller.handle_trusted_check_now_choice(
-            task_id, telegram_user_id=_TRUSTED_ID,
+        await fixture.controller.handle_text(
+            texts.CHECK_NOW_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+        )
+        first = await fixture.controller.handle_text(
+            "E911EE95", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
         )
         assert "найдено новых штрафов — 1" in first.text
 
-        second = await fixture.controller.handle_trusted_check_now_choice(
-            task_id, telegram_user_id=_TRUSTED_ID,
+        await fixture.controller.handle_text(
+            texts.CHECK_NOW_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+        )
+        second = await fixture.controller.handle_text(
+            "E911EE95", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
         )
         assert "новых штрафов нет" in second.text
     finally:
         fixture.close()
 
 
-async def test_ordinary_user_cannot_forge_trusted_check_now_callback(fx):
-    """Явное требование: ordinary user не может вызвать task-level Check
-    Now forged callback — even зная реальный task_id, не-trusted
-    telegram_user_id получает None (та же server-side проверка, что и
-    у любого другого callback)."""
-    task_id = _make_operator_task(fx, "E911EE95")
+async def test_trusted_check_now_invalid_format_stays_on_same_step(trusted_fx):
+    """Невалидный формат номера — остаёмся на этом же шаге (тот же UX,
+    что и у self-service Add Car), не показывается "не найден"."""
+    await trusted_fx.controller.handle_text(
+        texts.CHECK_NOW_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
 
-    reply = await fx.controller.handle_trusted_check_now_choice(task_id, telegram_user_id=1)
+    reply = await trusted_fx.controller.handle_text(
+        "!!", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
 
-    assert reply is None
+    assert "❌" in reply.text
+    assert "не найден" not in reply.text
+    state = trusted_fx.conversation_state_repository.get(_TRUSTED_ID)
+    assert state.step == STEP_AWAITING_TRUSTED_CHECK_NOW_CAR_NUMBER
+
+
+async def test_ordinary_user_check_now_still_subscription_scoped(fx):
+    """Регрессия: обычный пользователь при 🔎 Проверить сейчас по-прежнему
+    видит список СВОИХ подписок (а не просьбу ввести номер) — Check Now
+    для ordinary user не менялся вовсе."""
+    await fx.service.add_car(
+        telegram_user_id=1, telegram_chat_id=1, username="alice",
+        first_name=None, last_name=None, car_number="M295YB196", period_days=30, today=_today(),
+    )
+
+    reply = await fx.controller.handle_text(
+        texts.CHECK_NOW_LABEL, chat_id=1, telegram_user_id=1, username="alice",
+    )
+
+    assert reply.text == texts.CHECK_NOW_PICK_PROMPT
+    assert reply.check_now_options is not None
+    [(subscription_id, car_number)] = reply.check_now_options
+    assert car_number == "M295YB196"
+
+
+async def test_ordinary_user_cannot_reach_trusted_check_now_step_by_forging_state(fx):
+    """Явное требование: ordinary user не может получить task-level Check
+    Now даже если бы каким-то образом оказался на этом шаге состояния —
+    is_trusted() перепроверяется по РЕАЛЬНОМУ telegram_user_id независимо
+    от того, что записано в conversation_state."""
+    _make_operator_task(fx, "E911EE95")
+    fx.conversation_state_repository.set(
+        chat_id=1, telegram_user_id=1, step=STEP_AWAITING_TRUSTED_CHECK_NOW_CAR_NUMBER,
+    )
+
+    reply = await fx.controller.handle_text("E911EE95", chat_id=1, telegram_user_id=1, username=None)
+
+    assert reply.text == texts.CALLBACK_NOT_AUTHORIZED_TEXT
+    assert reply.show_main_menu is True
 
 
 async def test_trusted_stop_task_without_subscribers_shows_plain_confirm(trusted_fx):
@@ -949,7 +1253,7 @@ def test_trusted_stop_confirm_rejects_already_inactive_task(trusted_fx):
     assert reply.text == texts.TRUSTED_STOP_FAILED_TEXT
 
 
-def test_forced_stop_does_not_leave_client_with_misleading_active_state(trusted_fx):
+async def test_forced_stop_does_not_leave_client_with_misleading_active_state(trusted_fx):
     """Явное требование: forced Stop не оставляет клиенту ложное состояние
     "мониторинг активен" — client-подписка, привязанная к принудительно
     остановленной задаче, должна перестать показываться клиенту как
@@ -968,7 +1272,7 @@ def test_forced_stop_does_not_leave_client_with_misleading_active_state(trusted_
 
     trusted_fx.controller.handle_trusted_stop_confirm(task.id, telegram_user_id=_TRUSTED_ID)
 
-    client_reply = trusted_fx.controller.handle_text(
+    client_reply = await trusted_fx.controller.handle_text(
         texts.MY_CARS_LABEL, chat_id=777, telegram_user_id=777, username="client_one",
     )
     assert "✅ Активен" not in client_reply.text

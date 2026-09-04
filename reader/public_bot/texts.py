@@ -46,8 +46,9 @@ CALLBACK_NOT_AUTHORIZED_TEXT = "Это действие недоступно —
 # архитектуры — fine_monitoring_tasks остаётся source of truth, subscription
 # для этих трёх пунктов меню НЕ требуется вовсе).
 NO_ACTIVE_TASKS_TEXT = "Активных задач мониторинга нет."
-TRUSTED_TASKS_HEADER = "📋 Все активные автомобили под мониторингом:"
-TRUSTED_CHECK_NOW_PICK_PROMPT = "🔎 Выберите автомобиль для проверки:"
+# 📋 Мои авто — пагинирован (см. design report: hard cap "первые 50 из N"
+# убран, доступны ВСЕ активные задачи по 10 на страницу).
+TRUSTED_TASKS_HEADER = "📋 Все активные автомобили"
 TRUSTED_STOP_PICK_PROMPT = "⛔ Выберите автомобиль для остановки мониторинга:"
 TRUSTED_STOP_FAILED_TEXT = "⚠️ Не удалось остановить — попробуйте ещё раз через «⛔ Остановить мониторинг»."
 _TRUSTED_STOP_CONFIRM_PROMPT_NO_CLIENTS = "Остановить мониторинг для {car_number}?"
@@ -294,21 +295,25 @@ def _format_trusted_task_line(task: FineMonitoringTask) -> str:
     return "\n".join(lines)
 
 
-def format_trusted_tasks_list(tasks: list[FineMonitoringTask], *, limit: int) -> str:
-    """"📋 Мои авто" для trusted-оператора — ВСЕ активные
-    fine_monitoring_tasks (см. design report), не только те, у которых
-    есть fine_monitoring_subscription. limit — защита от превышения лимита
-    длины Telegram-сообщения на production-масштабе (250+ активных задач,
-    см. design report про известное упрощение) — НЕ бизнес-правило."""
+def format_trusted_tasks_page(tasks: list[FineMonitoringTask], *, page: int, total_pages: int) -> str:
+    """"📋 Мои авто" для trusted-оператора — ОДНА страница (0-indexed page)
+    из ВСЕХ активных fine_monitoring_tasks (см. design report: hard cap
+    "первые 50 из N" убран — все задачи доступны через пагинацию, 10 на
+    страницу). Показ "Страница N из M" — 1-indexed для человека."""
     if not tasks:
         return NO_ACTIVE_TASKS_TEXT
 
-    shown = tasks[:limit]
-    blocks = [_format_trusted_task_line(task) for task in shown]
-    text = TRUSTED_TASKS_HEADER + "\n\n" + "\n\n".join(blocks)
-    if len(tasks) > limit:
-        text += f"\n\n… показаны первые {limit} из {len(tasks)}."
-    return text
+    blocks = [_format_trusted_task_line(task) for task in tasks]
+    header = f"{TRUSTED_TASKS_HEADER}\nСтраница {page + 1} из {total_pages}"
+    return header + "\n\n" + "\n\n".join(blocks)
+
+
+def format_trusted_check_now_not_found(car_number: str) -> str:
+    """Trusted-operator task-level 🔎 Проверить сейчас ПО НОМЕРУ (см.
+    design report) — номер не найден среди активных fine_monitoring_tasks.
+    Явное требование: ничего не добавляется автоматически, только эта
+    ошибка."""
+    return f"❌ Автомобиль {car_number} не найден в активном мониторинге."
 
 
 def format_trusted_stop_confirm_prompt(car_number: str, subscriber_count: int) -> str:
