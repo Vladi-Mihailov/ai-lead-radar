@@ -516,7 +516,7 @@ async def test_trusted_delegate_flow_pending_claim_when_owner_unresolved(trusted
     assert reply is not None
     assert "✅ Автомобиль добавлен на мониторинг" in reply.text
     assert "👤 Владелец: @unknown_person" in reply.text
-    assert "https://t.me/GEShtrafbot?start=claim_" in reply.text
+    assert "https://t.me/ProtocolGEbot?start=claim_" in reply.text
 
     [subscription] = trusted_fx.subscription_repository.list_managed_by_creator(_TRUSTED_ID)
     assert subscription.status == "pending_claim"

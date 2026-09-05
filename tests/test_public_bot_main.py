@@ -45,3 +45,23 @@ def test_read_bot_token_returns_value_without_logging(monkeypatch, caplog, tmp_p
 
     assert token == "test-token-value"
     assert "test-token-value" not in caplog.text
+
+
+# ---- bot identity switch: @GEShtrafbot -> @ProtocolGEbot (см. audit
+# report) — новый, отдельно зарегистрированный bot, не переименование.
+# env var GESHTRAFBOT_TOKEN намеренно НЕ переименована (см. requirements) —
+# read_bot_token()'s тесты выше это уже покрывают без изменений. ----
+
+
+def test_bot_username_switched_to_protocolgebot():
+    assert public_bot_main._BOT_USERNAME == "ProtocolGEbot"
+
+
+def test_session_path_uses_new_protocolgebot_file_not_old_geshtrafbot():
+    """Явное требование: новая отдельная Telethon session
+    data/sessions/protocolgebot — переиспользование старого
+    geshtrafbot.session рискует тем, что Telethon сочтёт себя уже
+    авторизованным под старой identity и молча проигнорирует новый
+    token (см. audit report)."""
+    assert public_bot_main._SESSION_PATH.name == "protocolgebot"
+    assert public_bot_main._SESSION_PATH.name != "geshtrafbot"

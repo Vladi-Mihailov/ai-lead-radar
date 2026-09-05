@@ -149,7 +149,14 @@ class SubscriptionService:
         check_service: FineCheckService,
         *,
         owner_resolver_client: OwnerUsernameResolverLike | None = None,
-        bot_username: str = "GEShtrafbot",
+        # Bot identity switch (см. audit report) — реальное production-
+        # значение всегда передаётся явно вызывающим кодом
+        # (reader/public_bot/main.py::_BOT_USERNAME); этот default — только
+        # fallback для кода, который создаёт SubscriptionService без явного
+        # bot_username (тесты и т.п.) — держим его синхронным с
+        # _BOT_USERNAME, чтобы не оставлять устаревшую identity ни в одном
+        # hardcode.
+        bot_username: str = "ProtocolGEbot",
     ):
         self._task_repository = task_repository
         self._subscription_repository = subscription_repository

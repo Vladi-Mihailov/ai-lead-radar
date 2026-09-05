@@ -403,7 +403,7 @@ async def test_add_delegated_car_creates_pending_claim_when_owner_cannot_be_reso
     assert outcome.subscription.telegram_chat_id is None
     assert outcome.subscription.owner_username_hint == "unknown_person"
     assert outcome.claim_link is not None
-    assert outcome.claim_link.startswith("https://t.me/GEShtrafbot?start=claim_")
+    assert outcome.claim_link.startswith("https://t.me/ProtocolGEbot?start=claim_")
 
     # Мониторинг УЖЕ идёт — задача создана/проверена, несмотря на то, что
     # владелец ещё не резолвлен (см. design report).

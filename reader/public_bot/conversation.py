@@ -207,7 +207,12 @@ class ConversationController:
 
             return BotReply(
                 text=texts.CLAIM_SUCCESS_TEXT.format(
-                    car_number=outcome.subscription.car_number, bot_username="GEShtrafbot",
+                    # Bot identity switch (см. audit report): @ProtocolGEbot —
+                    # НЕ через _BOT_USERNAME/SubscriptionService (та же
+                    # значение, но отдельный hardcode здесь, т.к. этот текст
+                    # формируется в conversation.py, а не в
+                    # subscription_service.py::_build_claim_link).
+                    car_number=outcome.subscription.car_number, bot_username="ProtocolGEbot",
                 ),
                 show_main_menu=True,
             )

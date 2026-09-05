@@ -182,7 +182,8 @@ def register(
 
         await event.answer("Неизвестная или устаревшая кнопка", alert=True)
 
-    logger.info("✔ @GEShtrafbot handlers зарегистрированы")
+    # Bot identity switch (см. audit report) — @ProtocolGEbot.
+    logger.info("✔ @ProtocolGEbot handlers зарегистрированы")
 
 
 async def _answer_and_send(event, reply) -> None:
@@ -232,7 +233,7 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False) -> None:
             # (например, Telegram ограничивает срок редактирования) —
             # результат всё равно должен дойти до пользователя.
             logger.warning(
-                "Не удалось отредактировать сообщение @GEShtrafbot, отправляю новое",
+                "Не удалось отредактировать сообщение @ProtocolGEbot, отправляю новое",
                 exc_info=True,
             )
 

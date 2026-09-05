@@ -1,21 +1,29 @@
 [Unit]
-Description=AI Lead Radar - @GEShtrafbot (public client bot)
+Description=AI Lead Radar ProtocolGE Bot
 After=network-online.target
 Wants=network-online.target
 
-# ИСХОДНЫЙ АРТЕФАКТ — НЕ установлен и не запущен (см. Stage 2 report).
-# Не копировать в /etc/systemd/system и не enable/start без отдельного,
+# ИСХОДНЫЙ АРТЕФАКТ — уже установлен и запущен на production под ЭТИМ
+# именем юнита (ai-lead-radar-geshtrafbot.service) — имя файла/юнита НЕ
+# переименовывается при переключении bot identity @GEShtrafbot ->
+# @ProtocolGEbot (см. audit report), меняется только Description (косметика)
+# и содержимое .env/сессия, которые этот юнит запускает. Не копировать в
+# /etc/systemd/system повторно и не enable/start заново без отдельного,
 # явного решения — это отдельный процесс от ai-lead-radar.service, и его
-# включение означает, что @GEShtrafbot реально начнёт принимать сообщения
-# от публики.
+# включение означает, что @ProtocolGEbot реально начнёт принимать
+# сообщения от публики.
 #
 # User/Group/WorkingDirectory — те же, что и у ai-lead-radar.service и
 # ai-lead-radar-inviter.service (см. `systemctl cat ai-lead-radar.service`
 # на сервере) — тот же venv/аккаунт, отдельный процесс, отдельная
-# .session (data/sessions/geshtrafbot.session, см.
-# reader/public_bot/main.py) и отдельные логи. .env — тот же файл, что и у
-# остальных процессов (WorkingDirectory совпадает, load_dotenv() ищет .env
-# в cwd) — GESHTRAFBOT_TOKEN должен быть заполнен там ДО первого запуска.
+# .session (data/sessions/protocolgebot.session, см.
+# reader/public_bot/main.py — старый data/sessions/geshtrafbot.session*
+# сохраняется на диске нетронутым ради rollback) и отдельные логи. .env —
+# тот же файл, что и у остальных процессов (WorkingDirectory совпадает,
+# load_dotenv() ищет .env в cwd) — переменная называется по-прежнему
+# GESHTRAFBOT_TOKEN (см. audit report: имя переменной не переименовывается,
+# меняется только её значение), должна быть заполнена НОВЫМ token'ом ДО
+# первого запуска под новой identity.
 [Service]
 Type=simple
 User=leadradar

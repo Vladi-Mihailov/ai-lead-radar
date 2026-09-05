@@ -46,7 +46,16 @@ from reader.public_bot.subscription_service import SubscriptionService  # noqa: 
 from reader.settings import ConfigError, load_settings  # noqa: E402
 from reader.users.repository import UserRepository  # noqa: E402
 
-_BOT_USERNAME = "GEShtrafbot"
+# Bot identity switch (см. audit report): @GEShtrafbot -> @ProtocolGEbot —
+# НОВЫЙ, отдельно зарегистрированный bot (новый token, новый bot ID), а не
+# переименование существующего. Существующие клиенты/подписки в БД этим не
+# затрагиваются (ничто в схеме не хранит identity бота вовсе), но Telegram
+# не позволяет боту писать первым тем, кто ни разу не написал ЕМУ — после
+# переключения каждому, включая уже claimed-владельцев и trusted-
+# операторов, потребуется самостоятельно открыть @ProtocolGEbot и нажать
+# /start заново. Искусственных миграций/переноса identity здесь нет и не
+# должно быть.
+_BOT_USERNAME = "ProtocolGEbot"
 # Как часто client delivery poller проверяет, есть ли что доставить —
 # независимо от bounded backoff отдельных доставок (см.
 # reader/public_bot/delivery_service.py::RETRY_BACKOFF) — это просто как
@@ -57,9 +66,14 @@ _DELIVERY_POLL_INTERVAL_SECONDS = 180.0
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 # Отдельный .session-файл — своя, третья Telethon-сессия проекта (см.
 # data/sessions/reader_live.session, reader_sync.session, reader_notifier.
-# session): bot-mode-подключение @GEShtrafbot не делит ни credential, ни
-# файл сессии ни с одним из них.
-_SESSION_PATH = PROJECT_ROOT / "data" / "sessions" / "geshtrafbot"
+# session): bot-mode-подключение @ProtocolGEbot не делит ни credential, ни
+# файл сессии ни с одним из них. НОВЫЙ путь (protocolgebot, не geshtrafbot) —
+# ОБЯЗАТЕЛЬНО, не косметика: переиспользование старого geshtrafbot.session
+# рискует тем, что Telethon сочтёт себя уже авторизованным под СТАРОЙ
+# identity и молча проигнорирует новый token (см. audit report). Старые
+# data/sessions/geshtrafbot.session* НЕ удаляются и не трогаются этим
+# изменением — они остаются на диске нетронутыми ради rollback.
+_SESSION_PATH = PROJECT_ROOT / "data" / "sessions" / "protocolgebot"
 _POLICE_GE_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
@@ -90,7 +104,7 @@ def read_bot_token() -> str:
     token = os.getenv("GESHTRAFBOT_TOKEN")
     if not token:
         raise ConfigError(
-            "GESHTRAFBOT_TOKEN не задан в .env — @GEShtrafbot не может быть запущен. "
+            "GESHTRAFBOT_TOKEN не задан в .env — @ProtocolGEbot не может быть запущен. "
             "См. .env.example."
         )
     return token
@@ -218,7 +232,10 @@ async def run() -> None:
 
         # token передаётся ЗДЕСЬ и только здесь.
         await client.start(bot_token=token)
-        logger.info("✔ @GEShtrafbot подключён")
+        # f-string от _BOT_USERNAME, а не отдельный hardcode — так лог
+        # всегда отражает реально сконфигурированную identity (см. audit
+        # report: используется как сигнал верификации при переключении бота).
+        logger.info(f"✔ @{_BOT_USERNAME} подключён")
 
         # Бот и client delivery poller работают в одном event loop'е,
         # параллельно, без второго Telegram-подключения (poller использует
