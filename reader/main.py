@@ -34,6 +34,7 @@ from reader.fines.notification_coordinator import FineNotificationCoordinator  #
 from reader.fines.police_ge_provider import PoliceGeProvider  # noqa: E402
 from reader.fines.police_ge_session import PoliceGeSession  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
+from reader.fines.translation import FineTranslationService  # noqa: E402
 from reader.groups import GroupLoadError, load_groups  # noqa: E402
 from reader.jobs.archive_fine_job import ArchiveFineJob  # noqa: E402
 from reader.jobs.fine_job import FineJob  # noqa: E402
@@ -128,7 +129,21 @@ def build_fine_monitor_components(
         request_timeout=fine_monitor.request_timeout,
     )
     fine_provider = PoliceGeProvider(police_ge_session)
-    check_service = FineCheckService(fine_provider, task_repository, detected_fine_repository)
+    # Тот же общий OPENAI_API_KEY, что и у OCR/lead_ai (settings.ocr.
+    # openai_api_key, см. reader/fines/translation.py) — второй ключ не
+    # заводится. None ключа -> translator=None -> клиент/оператор видят
+    # оригинальный грузинский текст вместо перевода (см. задачу: config
+    # gap, а не ошибка запуска — тот же приём, что и с "insurance ocr").
+    translator = (
+        FineTranslationService(
+            api_key=settings.ocr.openai_api_key, model=fine_monitor.translation_model,
+        )
+        if settings.ocr.openai_api_key
+        else None
+    )
+    check_service = FineCheckService(
+        fine_provider, task_repository, detected_fine_repository, translator,
+    )
 
     # scope="operator" — явно (не None/list_active()): партиционирование
     # по monitoring_scope (см. reader/fines/models.py, Stage 1) требует,

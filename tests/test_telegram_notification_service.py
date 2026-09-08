@@ -54,6 +54,8 @@ def _event(
     amount=None,
     place=None,
     violation_description=None,
+    place_ru=None,
+    violation_description_ru=None,
 ) -> NewFineEvent:
     return NewFineEvent(
         detected_fine_id=detected_fine_id,
@@ -69,6 +71,8 @@ def _event(
         amount=amount,
         place=place,
         violation_description=violation_description,
+        place_ru=place_ru,
+        violation_description_ru=violation_description_ru,
     )
 
 
@@ -216,6 +220,70 @@ def test_format_fine_block_omits_amount_when_absent():
     text = format_fine_block(event)
 
     assert "Сумма" not in text
+
+
+# ---- перевод грузинского place/violation_description на русский (см.
+# задачу про перевод текста штрафов) — format_fine_block ЕДИНСТВЕННОЕ
+# место, где применяется fallback place_ru/violation_description_ru ->
+# place/violation_description, и его переиспользуют оператор/клиент/
+# trusted/manual-check без второй реализации (операторский чат — прямой
+# потребитель этой же функции, см. TelegramNotificationService.notify). ----
+
+_GEORGIAN_PLACE = "სამტრედია-გრიგოლეთი 26კმ"
+_GEORGIAN_DESCRIPTION = "ასკ 125-ე მუხლის პირველის პრიმა ნაწილი"
+_RUSSIAN_PLACE = "Самтредиа-Григолети 26км"
+_RUSSIAN_DESCRIPTION = "Статья 125-1-1, часть первая прима"
+
+
+def test_format_fine_block_uses_russian_translation_when_present():
+    event = _event(place=_GEORGIAN_PLACE, place_ru=_RUSSIAN_PLACE)
+
+    text = format_fine_block(event)
+
+    assert f"📍 Место: {_RUSSIAN_PLACE}" in text
+    assert _GEORGIAN_PLACE not in text
+
+
+def test_format_fine_block_falls_back_to_original_georgian_when_translation_missing():
+    """Safe fallback (см. задачу: "Ошибка translation API никогда не
+    должна ломать мониторинг") — place_ru отсутствует (временно
+    недоступен перевод/ещё не переведён) -> показываем оригинал, а не
+    пустую строку."""
+    event = _event(place=_GEORGIAN_PLACE, place_ru=None)
+
+    text = format_fine_block(event)
+
+    assert f"📍 Место: {_GEORGIAN_PLACE}" in text
+
+
+def test_format_fine_block_uses_russian_violation_description_translation():
+    event = _event(violation_description=_GEORGIAN_DESCRIPTION, violation_description_ru=_RUSSIAN_DESCRIPTION)
+
+    text = format_fine_block(event)
+
+    assert f"📝 Нарушение: {_RUSSIAN_DESCRIPTION}" in text
+    assert _GEORGIAN_DESCRIPTION not in text
+
+
+def test_format_fine_block_falls_back_to_original_georgian_violation_description():
+    event = _event(violation_description=_GEORGIAN_DESCRIPTION, violation_description_ru=None)
+
+    text = format_fine_block(event)
+
+    assert f"📝 Нарушение: {_GEORGIAN_DESCRIPTION}" in text
+
+
+async def test_operator_notification_shows_russian_translation():
+    """Operator receives Russian — операторский чат использует format_fine_block
+    напрямую (см. TelegramNotificationService._format_message)."""
+    client = _FakeClient()
+    service = await _started_service(client)
+
+    await service.notify([_event(place=_GEORGIAN_PLACE, place_ru=_RUSSIAN_PLACE)])
+
+    _, text, _ = client.sent_messages[0]
+    assert _RUSSIAN_PLACE in text
+    assert _GEORGIAN_PLACE not in text
 
 
 async def test_notify_omits_telegram_line_when_car_owner_display_is_none():

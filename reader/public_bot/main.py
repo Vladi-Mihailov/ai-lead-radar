@@ -32,6 +32,7 @@ from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa
 from reader.fines.police_ge_provider import PoliceGeProvider  # noqa: E402
 from reader.fines.police_ge_session import PoliceGeSession  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
+from reader.fines.translation import FineTranslationService  # noqa: E402
 from reader.logging_setup import setup_logging  # noqa: E402
 from reader.public_bot.conversation import ConversationController  # noqa: E402
 from reader.public_bot.conversation_state_repository import (  # noqa: E402
@@ -199,7 +200,19 @@ async def run() -> None:
             request_timeout=settings.fine_monitor.request_timeout,
         )
         fine_provider = PoliceGeProvider(police_ge_session)
-        check_service = FineCheckService(fine_provider, task_repository, detected_fine_repository)
+        # Тот же общий OPENAI_API_KEY/приём, что и в reader/main.py::
+        # build_fine_monitor_components — второй ключ/клиент не заводится.
+        translator = (
+            FineTranslationService(
+                api_key=settings.ocr.openai_api_key,
+                model=settings.fine_monitor.translation_model,
+            )
+            if settings.ocr.openai_api_key
+            else None
+        )
+        check_service = FineCheckService(
+            fine_provider, task_repository, detected_fine_repository, translator,
+        )
 
         # client конструируется ДО SubscriptionService — тот же самый бот-
         # клиент передаётся туда как owner_resolver_client (см.

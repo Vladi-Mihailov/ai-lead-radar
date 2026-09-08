@@ -21,7 +21,9 @@ CREATE TABLE IF NOT EXISTS detected_fines (
     violation_date        TEXT,
     amount                REAL,
     place                 TEXT,
-    violation_description TEXT
+    violation_description TEXT,
+    place_ru              TEXT,
+    violation_description_ru TEXT
 )
 """
 
@@ -39,6 +41,12 @@ _COLUMN_MIGRATIONS = {
     "amount": "ALTER TABLE detected_fines ADD COLUMN amount REAL",
     "place": "ALTER TABLE detected_fines ADD COLUMN place TEXT",
     "violation_description": "ALTER TABLE detected_fines ADD COLUMN violation_description TEXT",
+    # Русский перевод place/violation_description (см. reader/fines/
+    # translation.py) — отдельные колонки, оригиналы (place/
+    # violation_description/raw_data) этой миграцией не затрагиваются и
+    # не перезаписываются нигде в коде (source-of-truth, см. задачу).
+    "place_ru": "ALTER TABLE detected_fines ADD COLUMN place_ru TEXT",
+    "violation_description_ru": "ALTER TABLE detected_fines ADD COLUMN violation_description_ru TEXT",
 }
 
 _UNIQUE_INDEX = """
@@ -59,11 +67,13 @@ _INSERT = """
 INSERT INTO detected_fines (
     monitoring_task_id, car_number, external_fine_id, fingerprint,
     penalty_date, due_date, delivered_status, raw_data,
-    violation_date, amount, place, violation_description
+    violation_date, amount, place, violation_description,
+    place_ru, violation_description_ru
 ) VALUES (
     :monitoring_task_id, :car_number, :external_fine_id, :fingerprint,
     :penalty_date, :due_date, :delivered_status, :raw_data,
-    :violation_date, :amount, :place, :violation_description
+    :violation_date, :amount, :place, :violation_description,
+    :place_ru, :violation_description_ru
 )
 """
 
@@ -71,7 +81,8 @@ _SELECT_FIELDS = """
     id, monitoring_task_id, car_number, external_fine_id, fingerprint,
     penalty_date, due_date, delivered_status, raw_data,
     first_detected_at, last_seen_at, notification_sent_at,
-    violation_date, amount, place, violation_description
+    violation_date, amount, place, violation_description,
+    place_ru, violation_description_ru
 """
 
 _SELECT_BY_ID = f"SELECT {_SELECT_FIELDS} FROM detected_fines WHERE id = ?"
@@ -109,13 +120,23 @@ _SELECT_STATS_BY_CAR = """
 # пока fingerprint совпадает (см. compute_fingerprint) — COALESCE здесь
 # защищает именно place/violation_description на случай, если ответ
 # police.ge когда-либо перестанет их отдавать для уже известного штрафа.
+# place_ru/violation_description_ru — тот же COALESCE backfill (см. выше),
+# но источник значения другой: не сырой police.ge response, а результат
+# FineTranslationService (см. reader/fines/check_service.py) — уже
+# посчитанный ДО вызова mark_seen() (перевод — асинхронный вызов, внутри
+# SQL UPDATE его не сделать). None здесь означает "нечего обновлять"
+# (перевод не нужен — текст не грузинский, уже переведён раньше, или
+# временно недоступен — см. FineTranslationError) — COALESCE тогда просто
+# сохраняет прежнее значение (для новых строк — NULL, как и раньше).
 _MARK_SEEN = """
 UPDATE detected_fines
 SET last_seen_at = CURRENT_TIMESTAMP,
     violation_date = COALESCE(:violation_date, violation_date),
     amount = COALESCE(:amount, amount),
     place = COALESCE(:place, place),
-    violation_description = COALESCE(:violation_description, violation_description)
+    violation_description = COALESCE(:violation_description, violation_description),
+    place_ru = COALESCE(:place_ru, place_ru),
+    violation_description_ru = COALESCE(:violation_description_ru, violation_description_ru)
 WHERE id = :id
 """
 
@@ -142,6 +163,8 @@ def _row_to_fine(row) -> DetectedFine:
         amount,
         place,
         violation_description,
+        place_ru,
+        violation_description_ru,
     ) = row
 
     return DetectedFine(
@@ -163,6 +186,8 @@ def _row_to_fine(row) -> DetectedFine:
         amount=amount,
         place=place,
         violation_description=violation_description,
+        place_ru=place_ru,
+        violation_description_ru=violation_description_ru,
     )
 
 
@@ -250,6 +275,8 @@ class DetectedFineRepository:
         amount: float | None = None,
         place: str | None = None,
         violation_description: str | None = None,
+        place_ru: str | None = None,
+        violation_description_ru: str | None = None,
     ) -> DetectedFine:
         try:
             cursor = self._conn.execute(
@@ -267,6 +294,8 @@ class DetectedFineRepository:
                     "amount": amount,
                     "place": place,
                     "violation_description": violation_description,
+                    "place_ru": place_ru,
+                    "violation_description_ru": violation_description_ru,
                 },
             )
         except sqlite3.IntegrityError:
@@ -294,6 +323,8 @@ class DetectedFineRepository:
         amount: float | None = None,
         place: str | None = None,
         violation_description: str | None = None,
+        place_ru: str | None = None,
+        violation_description_ru: str | None = None,
     ) -> None:
         self._conn.execute(
             _MARK_SEEN,
@@ -303,6 +334,8 @@ class DetectedFineRepository:
                 "amount": amount,
                 "place": place,
                 "violation_description": violation_description,
+                "place_ru": place_ru,
+                "violation_description_ru": violation_description_ru,
             },
         )
         self._conn.commit()

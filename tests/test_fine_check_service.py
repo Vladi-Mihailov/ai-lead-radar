@@ -18,6 +18,7 @@ from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa
 from reader.fines.models import ParsedFineRecord  # noqa: E402
 from reader.fines.provider import FineProvider, FineProviderError  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
+from reader.fines.translation import FineTranslationError, TranslatedFineText  # noqa: E402
 
 _CHAT_ID = -100999
 _USER_ID = 111
@@ -643,6 +644,305 @@ async def test_fine_without_stable_fields_is_still_handled(tmp_path):
         assert len(first.new_fines) == 1
         assert first.new_fines[0].external_fine_id is None
         assert len(second.new_fines) == 0
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+# ---- перевод грузинского place/violation_description на русский (см.
+# задачу про перевод текста штрафов) — единственная точка (check_task()),
+# переиспользуемая background/manual check/Add Car flow одинаково.
+# translate() здесь ВСЕГДА mocked (Protocol FineTranslatorLike) — ни
+# один тест не обращается к настоящему OpenAI API. ----
+
+_GEORGIAN_PLACE = "სამტრედია-გრიგოლეთი 26კმ"
+_GEORGIAN_DESCRIPTION = "ასკ 125-ე მუხლის პირველის პრიმა ნაწილი"
+_RUSSIAN_PLACE = "Самтредиа-Григолети 26км"
+_RUSSIAN_DESCRIPTION = "Статья 125-1-1, часть первая прима"
+
+
+class _FakeTranslator:
+    def __init__(self, *, result: TranslatedFineText | None = None, error: Exception | None = None):
+        self._result = result or TranslatedFineText(
+            place_ru=_RUSSIAN_PLACE, violation_description_ru=_RUSSIAN_DESCRIPTION,
+        )
+        self._error = error
+        self.calls: list[dict] = []
+
+    async def translate(self, *, place, violation_description):
+        self.calls.append({"place": place, "violation_description": violation_description})
+        if self._error is not None:
+            raise self._error
+        return self._result
+
+
+async def test_georgian_place_is_translated_and_stored(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        translator = _FakeTranslator(result=TranslatedFineText(place_ru=_RUSSIAN_PLACE))
+        provider = _FakeProvider(records=[_record(fingerprint="fp-1", place=_GEORGIAN_PLACE)])
+        service = FineCheckService(provider, task_repo, fine_repo, translator)
+
+        result = await service.check_task(task)
+
+        assert result.new_fines[0].place_ru == _RUSSIAN_PLACE
+        stored = fine_repo.get_by_fingerprint(task.id, "fp-1")
+        assert stored.place_ru == _RUSSIAN_PLACE
+        assert stored.place == _GEORGIAN_PLACE  # оригинал не тронут
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_georgian_violation_description_is_translated_and_stored(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        translator = _FakeTranslator(
+            result=TranslatedFineText(violation_description_ru=_RUSSIAN_DESCRIPTION)
+        )
+        provider = _FakeProvider(
+            records=[_record(fingerprint="fp-1", violation_description=_GEORGIAN_DESCRIPTION)]
+        )
+        service = FineCheckService(provider, task_repo, fine_repo, translator)
+
+        result = await service.check_task(task)
+
+        assert result.new_fines[0].violation_description_ru == _RUSSIAN_DESCRIPTION
+        stored = fine_repo.get_by_fingerprint(task.id, "fp-1")
+        assert stored.violation_description_ru == _RUSSIAN_DESCRIPTION
+        assert stored.violation_description == _GEORGIAN_DESCRIPTION  # оригинал не тронут
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_both_georgian_fields_translated_in_one_call(tmp_path):
+    """"Для одного штрафа желательно переводить place + violation_description
+    одним запросом" — ровно один вызов translate(), несущий оба поля."""
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        translator = _FakeTranslator()
+        provider = _FakeProvider(
+            records=[
+                _record(
+                    fingerprint="fp-1", place=_GEORGIAN_PLACE, violation_description=_GEORGIAN_DESCRIPTION,
+                )
+            ]
+        )
+        service = FineCheckService(provider, task_repo, fine_repo, translator)
+
+        result = await service.check_task(task)
+
+        assert len(translator.calls) == 1
+        assert translator.calls[0] == {
+            "place": _GEORGIAN_PLACE, "violation_description": _GEORGIAN_DESCRIPTION,
+        }
+        assert result.new_fines[0].place_ru == _RUSSIAN_PLACE
+        assert result.new_fines[0].violation_description_ru == _RUSSIAN_DESCRIPTION
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_already_russian_place_is_not_sent_for_translation(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        translator = _FakeTranslator()
+        provider = _FakeProvider(
+            records=[_record(fingerprint="fp-1", place="Тбилиси, проспект Руставели")]
+        )
+        service = FineCheckService(provider, task_repo, fine_repo, translator)
+
+        result = await service.check_task(task)
+
+        assert translator.calls == []  # ни одного вызова API
+        assert result.new_fines[0].place_ru is None
+        assert result.new_fines[0].place == "Тбилиси, проспект Руставели"
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_empty_place_and_description_make_no_translation_call(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        translator = _FakeTranslator()
+        provider = _FakeProvider(
+            records=[_record(fingerprint="fp-1", place=None, violation_description=None)]
+        )
+        service = FineCheckService(provider, task_repo, fine_repo, translator)
+
+        result = await service.check_task(task)
+
+        assert translator.calls == []
+        assert result.new_fines[0].place_ru is None
+        assert result.new_fines[0].violation_description_ru is None
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_no_translator_configured_leaves_ru_fields_none(tmp_path):
+    """translator=None (см. задачу: config gap, а не ошибка запуска) —
+    detection/сохранение/уведомление продолжаются как обычно, просто без
+    перевода — format_fine_block() покажет оригинальный грузинский текст."""
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        provider = _FakeProvider(records=[_record(fingerprint="fp-1", place=_GEORGIAN_PLACE)])
+        service = FineCheckService(provider, task_repo, fine_repo, translator=None)
+
+        result = await service.check_task(task)
+
+        assert result.status == "ok"
+        assert result.new_fines[0].place_ru is None
+        assert result.new_fines[0].place == _GEORGIAN_PLACE
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_repeated_scheduled_check_does_not_translate_again(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        translator = _FakeTranslator()
+        provider = _FakeProvider(records=[_record(fingerprint="fp-1", place=_GEORGIAN_PLACE)])
+        service = FineCheckService(provider, task_repo, fine_repo, translator)
+
+        await service.check_task(task)
+        assert len(translator.calls) == 1
+
+        # Тот же штраф, тот же провайдер (police.ge на каждой проверке
+        # снова отдаёт полные данные) — повторная (background) проверка
+        # не должна переводить его снова.
+        second = await service.check_task(task)
+
+        assert len(translator.calls) == 1  # без изменений
+        assert len(second.current_fines) == 1
+        assert second.current_fines[0].place_ru == _RUSSIAN_PLACE
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_repeated_manual_check_does_not_translate_again(tmp_path):
+    """Manual "Проверить сейчас" использует ТОТ ЖЕ check_task() — тот же
+    кеш применяется независимо от того, кто инициировал проверку."""
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        translator = _FakeTranslator()
+        provider = _FakeProvider(records=[_record(fingerprint="fp-1", place=_GEORGIAN_PLACE)])
+        service = FineCheckService(provider, task_repo, fine_repo, translator)
+
+        await service.check_task(task)  # "фоновая" проверка нашла и перевела штраф
+        assert len(translator.calls) == 1
+
+        manual_result = await service.check_task(task)  # "Проверить сейчас"
+
+        assert len(translator.calls) == 1
+        assert manual_result.current_fines[0].place_ru == _RUSSIAN_PLACE
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_legacy_row_without_translation_receives_it_on_recheck(tmp_path):
+    """Self-heal (см. задачу): legacy-штраф, у которого place_ru/
+    violation_description_ru ещё NULL, получает перевод при следующей
+    обычной проверке (тот же принцип, что и backfill violation_date/
+    amount/place/violation_description из предыдущей задачи)."""
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        legacy = fine_repo.create(
+            monitoring_task_id=task.id, car_number="B957MA09",
+            external_fine_id="A1", fingerprint="fp-legacy",
+            penalty_date=date(2026, 8, 6), due_date=date(2026, 8, 20),
+            delivered_status="Не вручено", raw_data="{}",
+            place=_GEORGIAN_PLACE, violation_description=_GEORGIAN_DESCRIPTION,
+        )
+        assert legacy.place_ru is None
+
+        translator = _FakeTranslator()
+        provider = _FakeProvider(
+            records=[
+                _record(
+                    fingerprint="fp-legacy", external_fine_id="A1",
+                    place=_GEORGIAN_PLACE, violation_description=_GEORGIAN_DESCRIPTION,
+                )
+            ]
+        )
+        service = FineCheckService(provider, task_repo, fine_repo, translator)
+
+        result = await service.check_task(task)
+
+        assert result.new_fines == []  # не новое обнаружение
+        assert len(translator.calls) == 1
+        healed = fine_repo.get_by_fingerprint(task.id, "fp-legacy")
+        assert healed.place_ru == _RUSSIAN_PLACE
+        assert healed.violation_description_ru == _RUSSIAN_DESCRIPTION
+        assert healed.id == legacy.id  # та же строка, не дубликат
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_translation_api_failure_does_not_break_fine_detection(tmp_path):
+    """Ключевое требование: сбой перевода никогда не должен ронять
+    check_task() — detection/сохранение/уведомление продолжаются, просто
+    place_ru/violation_description_ru остаются None (safe fallback —
+    оригинальный грузинский текст в format_fine_block)."""
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        translator = _FakeTranslator(error=FineTranslationError("provider error"))
+        provider = _FakeProvider(
+            records=[
+                _record(
+                    fingerprint="fp-1", external_fine_id="A1",
+                    place=_GEORGIAN_PLACE, violation_description=_GEORGIAN_DESCRIPTION,
+                )
+            ]
+        )
+        service = FineCheckService(provider, task_repo, fine_repo, translator)
+
+        result = await service.check_task(task)
+
+        assert result.status == "ok"
+        assert len(result.new_fines) == 1
+        assert result.new_fines[0].place_ru is None
+        assert result.new_fines[0].place == _GEORGIAN_PLACE  # оригинал доступен как fallback
+        stored = fine_repo.get_by_fingerprint(task.id, "fp-1")
+        assert stored is not None
+        assert stored.place_ru is None
+        assert stored.place == _GEORGIAN_PLACE
     finally:
         task_repo.close()
         fine_repo.close()

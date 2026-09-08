@@ -142,6 +142,20 @@ def test_load_settings_parses_fine_monitor_section(tmp_path, monkeypatch):
     assert settings.fine_monitor.archive_check_hour == 4
     assert settings.fine_monitor.archive_interval_days == 30
     assert settings.fine_monitor.archive_daily_limit == 200
+    # Перевод грузинского place/violation_description (см. reader/fines/
+    # translation.py) — default модель, ключ отдельно не хранится
+    # (settings.ocr.openai_api_key, тот же общий OPENAI_API_KEY).
+    assert settings.fine_monitor.translation_model == "gpt-5-mini"
+
+
+def test_load_settings_parses_explicit_translation_model(tmp_path, monkeypatch):
+    _set_required_env(monkeypatch)
+    config_with_translation = _CONFIG_YAML + "  translation_model: \"gpt-5\"\n"
+    config_path = _write_config(tmp_path, config_with_translation)
+
+    settings = load_settings(config_path)
+
+    assert settings.fine_monitor.translation_model == "gpt-5"
 
 
 def test_load_settings_parses_explicit_archive_settings(tmp_path, monkeypatch):

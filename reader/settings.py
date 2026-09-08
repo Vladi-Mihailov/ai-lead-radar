@@ -134,6 +134,15 @@ class FineMonitorSettings(BaseModel):
     # неограниченный проход.
     archive_daily_limit: int = 200
 
+    # Перевод грузинского protocolPlace/protocolLawDescription на русский
+    # (см. reader/fines/translation.py::FineTranslationService) — тот же
+    # общий OPENAI_API_KEY (settings.ocr.openai_api_key), второй ключ не
+    # заводится. Функция включается автоматически, когда этот ключ задан
+    # (см. reader/main.py/reader/public_bot/main.py — тот же приём, что и
+    # "insurance ocr": отсутствие ключа не ошибка запуска, просто клиенты
+    # видят оригинальный грузинский текст вместо перевода).
+    translation_model: str = "gpt-5-mini"
+
 
 class InviterWorkerSettings(BaseModel):
     """Постоянный фоновый режим инвайтера (см. reader/inviter/worker.py,
@@ -499,6 +508,7 @@ def load_settings(config_path: Path) -> Settings:
                 archive_check_hour=int(fine_monitor_raw.get("archive_check_hour", 4)),
                 archive_interval_days=int(fine_monitor_raw.get("archive_interval_days", 30)),
                 archive_daily_limit=int(fine_monitor_raw.get("archive_daily_limit", 200)),
+                translation_model=fine_monitor_raw.get("translation_model", "gpt-5-mini"),
             ),
             inviter=InviterSettings(
                 worker=InviterWorkerSettings(

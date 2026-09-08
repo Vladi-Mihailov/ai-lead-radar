@@ -92,6 +92,7 @@ class _Fixture:
     def make_fine(
         self, task_id, car_number, *, fingerprint="fp-1",
         violation_date=None, amount=None, place=None, violation_description=None,
+        place_ru=None, violation_description_ru=None,
     ) -> int:
         fine = self.detected_fine_repository.create(
             monitoring_task_id=task_id, car_number=car_number,
@@ -100,6 +101,7 @@ class _Fixture:
             delivered_status="Не вручено", raw_data="{}",
             violation_date=violation_date, amount=amount,
             place=place, violation_description=violation_description,
+            place_ru=place_ru, violation_description_ru=violation_description_ru,
         )
         return fine.id
 
@@ -738,6 +740,74 @@ async def test_trusted_operator_message_has_expanded_fine_block(tmp_path):
         assert "⏳ Оплатить до: 20.08.2026" in text
         assert "📬 Статус вручения: Не вручено" in text
         assert buttons is None  # никаких коммерческих кнопок trusted_operator
+    finally:
+        fx.close()
+
+
+# ---- перевод грузинского place/violation_description на русский (см.
+# задачу про перевод текста штрафов) — client/trusted_operator видят
+# УЖЕ переведённое значение (place_ru/violation_description_ru),
+# сохранённое FineCheckService; format_owner_fine_message/
+# format_trusted_operator_fine_message ничего сами не переводят. ----
+
+_RUSSIAN_PLACE = "Самтредиа-Григолети 26км"
+_RUSSIAN_DESCRIPTION = "Статья 125-1-1, часть первая прима"
+_GEORGIAN_PLACE = "სამტრედია-გრიგოლეთი 26კმ"
+_GEORGIAN_DESCRIPTION = "ასკ 125-ე მუხლის პირველის პრიმა ნაწილი"
+
+
+async def test_owner_message_shows_russian_translation_not_georgian(tmp_path):
+    now = _now()
+    fx = _Fixture(tmp_path)
+    try:
+        task_id = fx.make_task("AA001AA")
+        fx.make_fine(
+            task_id, "AA001AA",
+            place=_GEORGIAN_PLACE, violation_description=_GEORGIAN_DESCRIPTION,
+            place_ru=_RUSSIAN_PLACE, violation_description_ru=_RUSSIAN_DESCRIPTION,
+        )
+        fx.subscription_repository.create(
+            monitoring_task_id=task_id, car_number="AA001AA",
+            telegram_user_id=777, telegram_chat_id=777, telegram_username="owner",
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+        )
+
+        await fx.service.run_once(now=now)
+
+        _, text, _ = fx.sender.sent_full[0]
+        assert _RUSSIAN_PLACE in text
+        assert _RUSSIAN_DESCRIPTION in text
+        assert _GEORGIAN_PLACE not in text
+        assert _GEORGIAN_DESCRIPTION not in text
+    finally:
+        fx.close()
+
+
+async def test_trusted_operator_message_shows_russian_translation_not_georgian(tmp_path):
+    now = _now()
+    fx = _Fixture(tmp_path)
+    try:
+        task_id = fx.make_task("AA001AA")
+        fx.make_fine(
+            task_id, "AA001AA",
+            place=_GEORGIAN_PLACE, violation_description=_GEORGIAN_DESCRIPTION,
+            place_ru=_RUSSIAN_PLACE, violation_description_ru=_RUSSIAN_DESCRIPTION,
+        )
+        fx.subscription_repository.create_pending_claim(
+            monitoring_task_id=task_id, car_number="AA001AA",
+            owner_username_hint="unknown_person",
+            created_by_telegram_user_id=555, created_by_telegram_chat_id=555,
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+            claim_token="tok-1", claim_token_expires_at=now + timedelta(days=7),
+        )
+
+        await fx.service.run_once(now=now)
+
+        _, text, _ = fx.sender.sent_full[0]
+        assert _RUSSIAN_PLACE in text
+        assert _RUSSIAN_DESCRIPTION in text
+        assert _GEORGIAN_PLACE not in text
+        assert _GEORGIAN_DESCRIPTION not in text
     finally:
         fx.close()
 

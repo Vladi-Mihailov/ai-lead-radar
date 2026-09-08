@@ -69,6 +69,15 @@ class DetectedFine:
     amount: float | None = None
     place: str | None = None
     violation_description: str | None = None
+    # Русский перевод place/violation_description (см. design report про
+    # перевод грузинского текста, reader/fines/translation.py) —
+    # ОТДЕЛЬНЫЕ колонки, а не перезапись place/violation_description:
+    # оригинал остаётся source-of-truth (см. задачу). None — перевод ещё
+    # не выполнен (временно недоступен API или сам штраф ещё не
+    # переведён, legacy-строка) — format_fine_block показывает оригинал
+    # как safe fallback, а не пустую строку/ошибку.
+    place_ru: str | None = None
+    violation_description_ru: str | None = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +141,12 @@ class NewFineEvent:
     amount: float | None = None
     place: str | None = None
     violation_description: str | None = None
+    # Русский перевод (см. DetectedFine.place_ru/violation_description_ru
+    # и reader/fines/translation.py) — None означает "перевода ещё нет",
+    # format_fine_block() тогда показывает оригинал (place/
+    # violation_description) как safe fallback, а не пустую строку.
+    place_ru: str | None = None
+    violation_description_ru: str | None = None
     # Готовая для показа строка вида "@ivan_petrov"/"Иван Петров (@ivan_petrov)"/
     # "не найден"/"@ivan_petrov, @another_user" (несколько владельцев одного
     # car_number — валидное состояние, см. format_car_owner_display) —
@@ -162,6 +177,8 @@ class NewFineEvent:
             amount=fine.amount,
             place=fine.place,
             violation_description=fine.violation_description,
+            place_ru=fine.place_ru,
+            violation_description_ru=fine.violation_description_ru,
             car_owner_display=car_owner_display,
         )
 
@@ -173,6 +190,8 @@ class NewFineEvent:
         detected_fine_id: int,
         task_id: int,
         label: str | None,
+        place_ru: str | None = None,
+        violation_description_ru: str | None = None,
         car_owner_display: str | None = None,
     ) -> "NewFineEvent":
         """Для manual "Проверить сейчас" (см. CheckResult.current_fines) —
@@ -181,7 +200,13 @@ class NewFineEvent:
         отставать от свежего ответа police.ge до COALESCE-backfill'а в
         DetectedFineRepository.mark_seen), а напрямую из только что
         распарсенного record — это ровно то, что реально вернул police.ge
-        В ЭТОТ раз, без риска показать клиенту устаревшее null-значение."""
+        В ЭТОТ раз, без риска показать клиенту устаревшее null-значение.
+
+        place_ru/violation_description_ru — ПЕРЕДАЮТСЯ явно, а не читаются
+        из record: ParsedFineRecord никогда их не содержит (перевод — не
+        часть парсинга police.ge, см. reader/fines/translation.py) —
+        вызывающий код (FineCheckService) вычисляет итоговое значение
+        (из кеша БД и/или свежего перевода) и передаёт сюда готовым."""
         return cls(
             detected_fine_id=detected_fine_id,
             task_id=task_id,
@@ -195,6 +220,8 @@ class NewFineEvent:
             amount=record.amount,
             place=record.place,
             violation_description=record.violation_description,
+            place_ru=place_ru,
+            violation_description_ru=violation_description_ru,
             car_owner_display=car_owner_display,
         )
 

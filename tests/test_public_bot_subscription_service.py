@@ -83,7 +83,9 @@ def _telethon_user(user_id: int, username: str) -> TelethonUser:
     )
 
 
-def _record(car_number="M295YB196", fingerprint="fp-1") -> ParsedFineRecord:
+def _record(
+    car_number="M295YB196", fingerprint="fp-1", place=None, violation_description=None,
+) -> ParsedFineRecord:
     return ParsedFineRecord(
         car_number=car_number,
         external_fine_id="AB123456",
@@ -92,6 +94,8 @@ def _record(car_number="M295YB196", fingerprint="fp-1") -> ParsedFineRecord:
         delivered_status="Не вручено",
         fingerprint=fingerprint,
         raw_data={"protocolNo": "AB123456"},
+        place=place,
+        violation_description=violation_description,
     )
 
 
@@ -929,6 +933,51 @@ async def test_check_now_task_by_car_number_returns_none_for_inactive_task(fx):
     result = await fx.service.check_now_task_by_car_number("E911EE95")
 
     assert result is None
+
+
+# ---- перевод грузинского place/violation_description на русский (см.
+# задачу про перевод текста штрафов) — "manual check receives Russian" ----
+
+_GEORGIAN_PLACE = "სამტრედია-გრიგოლეთი 26კმ"
+_GEORGIAN_DESCRIPTION = "ასკ 125-ე მუხლის პირველის პრიმა ნაწილი"
+_RUSSIAN_PLACE = "Самтредиа-Григолети 26км"
+_RUSSIAN_DESCRIPTION = "Статья 125-1-1, часть первая прима"
+
+
+async def test_check_now_task_by_car_number_shows_russian_translation(tmp_path):
+    """Manual "🔎 Проверить сейчас" (task-level, trusted-оператор) должен
+    показывать уже переведённый (кешированный) русский текст — тот же
+    format_fine_block, что и у client/operator/trusted notification."""
+    fixture = _Fixture(tmp_path)
+    try:
+        task = fixture.task_repository.create(
+            car_number="E911EE95", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 12, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+        )
+        # Строка уже была переведена ранее (например, фоновой проверкой) —
+        # place_ru/violation_description_ru закешированы в detected_fines.
+        fixture.detected_fine_repository.create(
+            monitoring_task_id=task.id, car_number="E911EE95",
+            external_fine_id="AB123456", fingerprint="fp-1",
+            penalty_date=date(2026, 8, 6), due_date=date(2026, 8, 20),
+            delivered_status="Не вручено", raw_data="{}",
+            place=_GEORGIAN_PLACE, violation_description=_GEORGIAN_DESCRIPTION,
+            place_ru=_RUSSIAN_PLACE, violation_description_ru=_RUSSIAN_DESCRIPTION,
+        )
+        fixture.provider._records_by_car["E911EE95"] = [
+            _record(
+                car_number="E911EE95", fingerprint="fp-1",
+                place=_GEORGIAN_PLACE, violation_description=_GEORGIAN_DESCRIPTION,
+            )
+        ]
+
+        result = await fixture.service.check_now_task_by_car_number("E911EE95")
+
+        assert len(result.fines) == 1
+        assert result.fines[0].place_ru == _RUSSIAN_PLACE
+        assert result.fines[0].violation_description_ru == _RUSSIAN_DESCRIPTION
+    finally:
+        fixture.close()
 
 
 async def test_check_now_task_by_car_number_uses_existing_dedup(tmp_path):

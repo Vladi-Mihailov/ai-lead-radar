@@ -72,11 +72,18 @@ def format_fine_block(event: NewFineEvent) -> str:
     if amount:
         lines.append(f"💰 Сумма: {amount}")
 
-    if event.place:
-        lines.append(f"📍 Место: {event.place}")
+    # Русский перевод (place_ru/violation_description_ru, см. reader/
+    # fines/translation.py) — приоритет; если перевода ещё нет (temporary
+    # translation outage ИЛИ штраф ещё не переведён) — safe fallback,
+    # оригинальный грузинский текст, а не пустая строка (см. задачу:
+    # "Ошибка translation API никогда не должна ломать мониторинг").
+    place = event.place_ru or event.place
+    if place:
+        lines.append(f"📍 Место: {place}")
 
-    if event.violation_description:
-        lines.append(f"📝 Нарушение: {event.violation_description}")
+    violation_description = event.violation_description_ru or event.violation_description
+    if violation_description:
+        lines.append(f"📝 Нарушение: {violation_description}")
 
     due_date = _format_date(event.due_date)
     if due_date:
