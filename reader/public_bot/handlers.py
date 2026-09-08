@@ -87,6 +87,7 @@ def register(
 
         username, first_name, last_name = await _sender_names(event)
         _record_known_user(event.sender_id, event.chat_id, username)
+        is_trusted = controller.is_trusted(event.sender_id)
 
         reply = await controller.handle_text(
             text,
@@ -97,13 +98,14 @@ def register(
             last_name=last_name,
         )
 
-        await _send_reply(event, reply)
+        await _send_reply(event, reply, is_trusted=is_trusted)
 
     @client.on(events.CallbackQuery(func=lambda e: e.is_private))
     async def _on_callback(event: events.CallbackQuery.Event) -> None:
         data = event.data
         username, first_name, last_name = await _sender_names(event)
         _record_known_user(event.sender_id, event.chat_id, username)
+        is_trusted = controller.is_trusted(event.sender_id)
 
         wants_client = decode_add_client_decision_callback(data)
         if wants_client is not None:
@@ -113,7 +115,7 @@ def register(
             reply = controller.handle_add_client_decision(
                 wants_client, chat_id=event.chat_id, telegram_user_id=event.sender_id,
             )
-            await _answer_and_send(event, reply)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
         days = decode_period_callback(data)
@@ -125,7 +127,7 @@ def register(
                 first_name=first_name,
                 last_name=last_name,
             )
-            await _answer_and_send(event, reply)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
         check_now_id = decode_check_now_callback(data)
@@ -133,20 +135,20 @@ def register(
             reply = await controller.handle_check_now_choice(
                 check_now_id, telegram_user_id=event.sender_id,
             )
-            await _answer_and_send(event, reply)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
         stop_pick_id = decode_stop_pick_callback(data)
         if stop_pick_id is not None:
             reply = controller.handle_stop_pick(stop_pick_id, telegram_user_id=event.sender_id)
-            await _answer_and_send(event, reply)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
         stop_confirm_id = decode_stop_confirm_callback(data)
         if stop_confirm_id is not None:
             reply = controller.handle_stop_confirm(stop_confirm_id, telegram_user_id=event.sender_id)
             await event.answer()
-            await _send_reply(event, reply, prefer_edit=True)
+            await _send_reply(event, reply, prefer_edit=True, is_trusted=is_trusted)
             return
 
         trusted_tasks_page = decode_trusted_tasks_page_callback(data)
@@ -154,7 +156,7 @@ def register(
             reply = controller.handle_trusted_tasks_page(
                 trusted_tasks_page, telegram_user_id=event.sender_id,
             )
-            await _answer_and_send(event, reply)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
         trusted_stop_pick_id = decode_trusted_stop_pick_callback(data)
@@ -162,7 +164,7 @@ def register(
             reply = controller.handle_trusted_stop_pick(
                 trusted_stop_pick_id, telegram_user_id=event.sender_id,
             )
-            await _answer_and_send(event, reply)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
         trusted_stop_confirm_id = decode_trusted_stop_confirm_callback(data)
@@ -171,13 +173,13 @@ def register(
                 trusted_stop_confirm_id, telegram_user_id=event.sender_id,
             )
             await event.answer()
-            await _send_reply(event, reply, prefer_edit=True)
+            await _send_reply(event, reply, prefer_edit=True, is_trusted=is_trusted)
             return
 
         if data == STOP_NO:
             reply = controller.handle_stop_cancel()
             await event.answer()
-            await _send_reply(event, reply, prefer_edit=True)
+            await _send_reply(event, reply, prefer_edit=True, is_trusted=is_trusted)
             return
 
         await event.answer("Неизвестная или устаревшая кнопка", alert=True)
@@ -186,7 +188,7 @@ def register(
     logger.info("✔ @ProtocolGEbot handlers зарегистрированы")
 
 
-async def _answer_and_send(event, reply) -> None:
+async def _answer_and_send(event, reply, *, is_trusted: bool = False) -> None:
     """Общий хвост для callback'ов, которые могут вернуть None (=
     подписка не найдена/не принадлежит этому пользователю, см.
     reader/public_bot/keyboards.py про то, почему сам факт валидного
@@ -196,13 +198,18 @@ async def _answer_and_send(event, reply) -> None:
         await event.answer(CALLBACK_NOT_AUTHORIZED_TEXT, alert=True)
         return
     await event.answer()
-    await _send_reply(event, reply, prefer_edit=True)
+    await _send_reply(event, reply, prefer_edit=True, is_trusted=is_trusted)
 
 
-async def _send_reply(event, reply, *, prefer_edit: bool = False) -> None:
+async def _send_reply(event, reply, *, prefer_edit: bool = False, is_trusted: bool = False) -> None:
+    """is_trusted — ТОЛЬКО для main_menu_keyboard(include_statistics=...)
+    (см. "📊 Статистика"): единственное место, решающее, показывать ли
+    кнопку статистики в персистентной reply-клавиатуре — вычисляется
+    caller'ом (_on_message/_on_callback) через controller.is_trusted(
+    event.sender_id) один раз на событие."""
     buttons = None
     if reply.show_main_menu:
-        buttons = main_menu_keyboard()
+        buttons = main_menu_keyboard(include_statistics=is_trusted)
     elif reply.show_period_buttons:
         buttons = period_choice_keyboard()
     elif reply.show_add_client_decision_buttons:

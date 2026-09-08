@@ -32,6 +32,7 @@ from reader.public_bot.texts import (
     ADD_CAR_LABEL,
     CHECK_NOW_LABEL,
     MY_CARS_LABEL,
+    STATISTICS_LABEL,
     STOP_LABEL,
 )
 
@@ -56,11 +57,17 @@ _TRUSTED_STOP_YES_PREFIX = b"tstopyes:"
 _TRUSTED_TASKS_PAGE_PREFIX = b"ttaskspage:"
 
 
-def main_menu_keyboard() -> list[list[Button]]:
-    return [
+def main_menu_keyboard(*, include_statistics: bool = False) -> list[list[Button]]:
+    """include_statistics — ТОЛЬКО для trusted_operator_user_ids (см.
+    reader/public_bot/handlers.py — единственное место, откуда сюда
+    приходит True); обычный клиент никогда не видит "📊 Статистика"."""
+    rows = [
         [Button.text(ADD_CAR_LABEL, resize=True), Button.text(MY_CARS_LABEL, resize=True)],
         [Button.text(CHECK_NOW_LABEL, resize=True), Button.text(STOP_LABEL, resize=True)],
     ]
+    if include_statistics:
+        rows.append([Button.text(STATISTICS_LABEL, resize=True)])
+    return rows
 
 
 def add_client_decision_keyboard() -> list[list[Button]]:

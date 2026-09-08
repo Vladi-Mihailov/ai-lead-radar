@@ -10,6 +10,7 @@ from datetime import date
 from reader.fines.models import FineMonitoringTask
 from reader.public_bot.delivery_texts import format_check_now_fines_message
 from reader.public_bot.models import FineMonitoringSubscription
+from reader.public_bot.statistics_service import BotStatistics
 
 MAIN_MENU_TEXT = "🚗 Штрафы Грузии 🇬🇪"
 
@@ -17,6 +18,11 @@ ADD_CAR_LABEL = "➕ Добавить авто"
 MY_CARS_LABEL = "📋 Мои авто"
 CHECK_NOW_LABEL = "🔎 Проверить сейчас"
 STOP_LABEL = "⛔ Остановить мониторинг"
+# Trusted-operator-only (см. design report про "📊 Статистика") — кнопка
+# добавляется в главное меню ТОЛЬКО для trusted_operator_user_ids (см.
+# reader/public_bot/keyboards.py::main_menu_keyboard(include_statistics=...)
+# и reader/public_bot/handlers.py) — обычный клиент её никогда не видит.
+STATISTICS_LABEL = "📊 Статистика"
 
 CAR_NUMBER_PROMPT = "🚗 Введите госномер автомобиля\n\nНапример: M295YB196"
 USERNAME_PROMPT = "👤 Введите ваш Telegram-логин\n\nНапример: @VeronaWarm"
@@ -342,3 +348,22 @@ def trusted_stop_confirm_button_label(subscriber_count: int) -> str:
         _TRUSTED_STOP_CONFIRM_BUTTON_NO_CLIENTS if subscriber_count == 0
         else _TRUSTED_STOP_CONFIRM_BUTTON_WITH_CLIENTS
     )
+
+
+def format_statistics(stats: BotStatistics) -> str:
+    """Trusted-operator-only "📊 Статистика" (см. design report) — все
+    значения уже посчитаны BotStatisticsService.get_statistics(), здесь
+    только форматирование."""
+    return "\n".join([
+        "📊 Статистика бота",
+        "",
+        f"👥 Всего пользователей: {stats.total_users}",
+        f"🆕 Новых сегодня: {stats.new_users_today}",
+        f"🆕 Новых за 7 дней: {stats.new_users_7d}",
+        f"🆕 Новых за 30 дней: {stats.new_users_30d}",
+        "",
+        f"🚗 Активных подписок: {stats.active_subscriptions}",
+        f"⏸ Остановленных подписок: {stats.stopped_subscriptions}",
+        "",
+        f"🚨 Новых штрафов найдено сегодня: {stats.new_fines_today}",
+    ])

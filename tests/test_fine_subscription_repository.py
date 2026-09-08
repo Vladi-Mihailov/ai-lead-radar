@@ -5,7 +5,7 @@
 """
 
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -386,3 +386,72 @@ def test_data_persists_across_repository_reopen(tmp_path):
         assert repo2.get(sub.id) == sub
     finally:
         repo2.close()
+
+
+# ---- count_by_status() — "📊 Статистика" (см.
+# reader/public_bot/statistics_service.py) ----
+
+
+def test_count_by_status_zero_for_empty_database(tmp_path):
+    repo = _make_repo(tmp_path)
+    try:
+        assert repo.count_by_status("active") == 0
+        assert repo.count_by_status("stopped") == 0
+    finally:
+        repo.close()
+
+
+def test_count_by_status_counts_active_and_stopped_separately(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(db_path, car_number="B957MA09")
+
+    repo = FineSubscriptionRepository(db_path)
+    try:
+        alice = repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            telegram_user_id=1, telegram_chat_id=1, telegram_username="alice",
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+        )
+        repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            telegram_user_id=2, telegram_chat_id=2, telegram_username="bob",
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+        )
+        repo.stop_by_owner_or_creator(alice.id, telegram_user_id=1)
+
+        assert repo.count_by_status("active") == 1
+        assert repo.count_by_status("stopped") == 1
+    finally:
+        repo.close()
+
+
+def test_count_by_status_ignores_pending_claim_and_expired(tmp_path):
+    """Явное требование задачи: active/stopped считаются по фактическому
+    status — pending_claim/expired НЕ попадают ни в одну из этих двух
+    метрик (это отдельные состояния, не "активная" и не "остановленная")."""
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(db_path, car_number="B957MA09")
+
+    repo = FineSubscriptionRepository(db_path)
+    try:
+        repo.create_pending_claim(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            owner_username_hint="unknown_person",
+            created_by_telegram_user_id=5, created_by_telegram_chat_id=5,
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+            claim_token="tok-1", claim_token_expires_at=datetime(2026, 9, 10, tzinfo=timezone.utc),
+        )
+        expired = repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            telegram_user_id=1, telegram_chat_id=1, telegram_username="alice",
+            start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        )
+        repo.expire_elapsed(today=date(2026, 9, 3))
+        assert repo.get(expired.id).status == "expired"
+
+        assert repo.count_by_status("active") == 0
+        assert repo.count_by_status("stopped") == 0
+        assert repo.count_by_status("pending_claim") == 1
+        assert repo.count_by_status("expired") == 1
+    finally:
+        repo.close()

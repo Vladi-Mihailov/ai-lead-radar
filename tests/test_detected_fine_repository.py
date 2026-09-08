@@ -5,7 +5,7 @@
 
 import sqlite3
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -592,5 +592,70 @@ def test_list_by_car_number_returns_all_fines_for_that_car(tmp_path):
 
         assert {f.id for f in found} == {first.id, second.id}
         assert repo.list_by_car_number("ZZ999ZZ") == []
+    finally:
+        repo.close()
+
+
+# ---- count_first_detected_since() — "📊 Статистика" (см.
+# reader/public_bot/statistics_service.py) ----
+
+
+def test_count_first_detected_since_zero_for_empty_database(tmp_path):
+    db_path = tmp_path / "users.db"
+    _make_task(tmp_path, db_path)
+
+    repo = DetectedFineRepository(db_path)
+    try:
+        assert repo.count_first_detected_since(datetime.now(timezone.utc) - timedelta(days=1)) == 0
+    finally:
+        repo.close()
+
+
+def test_count_first_detected_since_counts_only_fines_at_or_after_boundary(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(tmp_path, db_path)
+
+    repo = DetectedFineRepository(db_path)
+    try:
+        repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            external_fine_id="AB1", fingerprint="fp-1",
+            penalty_date=date(2026, 8, 6), due_date=date(2026, 8, 20),
+            delivered_status=None, raw_data="{}",
+        )
+
+        past_boundary = datetime.now(timezone.utc) - timedelta(hours=1)
+        future_boundary = datetime.now(timezone.utc) + timedelta(hours=1)
+
+        assert repo.count_first_detected_since(past_boundary) == 1
+        assert repo.count_first_detected_since(future_boundary) == 0
+    finally:
+        repo.close()
+
+
+def test_count_first_detected_since_does_not_count_backfilled_mark_seen(tmp_path):
+    """mark_seen() (уже известный штраф) не создаёт новую строку и не
+    трогает first_detected_at — count_first_detected_since() должен
+    отражать ТОЛЬКО реально новые штрафы (create()), не повторные
+    "увиденные снова" (см. задачу: "не придумывать метрики из
+    косвенных данных")."""
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(tmp_path, db_path)
+
+    repo = DetectedFineRepository(db_path)
+    try:
+        fine = repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            external_fine_id="AB1", fingerprint="fp-1",
+            penalty_date=date(2026, 8, 6), due_date=date(2026, 8, 20),
+            delivered_status=None, raw_data="{}",
+        )
+
+        boundary = datetime.now(timezone.utc) - timedelta(hours=1)
+        assert repo.count_first_detected_since(boundary) == 1
+
+        repo.mark_seen(fine.id)  # "повторно увиден" — НЕ новое обнаружение
+
+        assert repo.count_first_detected_since(boundary) == 1  # без изменений
     finally:
         repo.close()

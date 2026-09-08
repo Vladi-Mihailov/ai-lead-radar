@@ -83,5 +83,29 @@ class BotKnownUsersRepository:
         row = self._conn.execute(_SELECT, (telegram_user_id,)).fetchone()
         return _row_to_known_user(row) if row else None
 
+    def count_total(self) -> int:
+        """Всего уникальных Telegram user id, когда-либо написавших боту —
+        telegram_user_id уже PRIMARY KEY (см. _SCHEMA), COUNT(*) сам по
+        себе не может посчитать дубликаты (см. "📊 Статистика", задача:
+        "считать по уникальным Telegram user IDs")."""
+        return self._conn.execute("SELECT COUNT(*) FROM bot_known_users").fetchone()[0]
+
+    def count_first_seen_since(self, since: datetime) -> int:
+        """Сколько пользователей появились ВПЕРВЫЕ, начиная с since —
+        по first_seen_at (выставляется один раз при INSERT и НИКОГДА не
+        обновляется, см. _UPSERT выше), а не last_seen_at/updated_at (см.
+        "📊 Статистика", задача: "новые" по реальной дате первого
+        появления, не по последней активности — иначе давно известный
+        пользователь, просто снова написавший боту, ложно считался бы
+        "новым"). since — aware datetime (обычно UTC), сравнивается как
+        текстовая ISO-строка того же формата, что и SQLite
+        CURRENT_TIMESTAMP (naive "YYYY-MM-DD HH:MM:SS", см.
+        reader/time_display.py про этот же приём)."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM bot_known_users WHERE first_seen_at >= ?",
+            (since.strftime("%Y-%m-%d %H:%M:%S"),),
+        ).fetchone()
+        return row[0]
+
     def close(self) -> None:
         self._conn.close()

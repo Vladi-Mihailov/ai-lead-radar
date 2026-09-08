@@ -42,6 +42,7 @@ from reader.public_bot.delivery_repository import ClientFineDeliveryRepository  
 from reader.public_bot.delivery_service import ClientDeliveryService  # noqa: E402
 from reader.public_bot.handlers import register  # noqa: E402
 from reader.public_bot.known_users_repository import BotKnownUsersRepository  # noqa: E402
+from reader.public_bot.statistics_service import BotStatisticsService  # noqa: E402
 from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
 from reader.public_bot.subscription_service import SubscriptionService  # noqa: E402
 from reader.settings import ConfigError, load_settings  # noqa: E402
@@ -227,9 +228,16 @@ async def run() -> None:
             task_repository, subscription_repository, user_repository, check_service,
             owner_resolver_client=client, bot_username=_BOT_USERNAME,
         )
+        # "📊 Статистика" (trusted-operator-only) — поверх уже открытых
+        # known_users_repository/subscription_repository/
+        # detected_fine_repository, без отдельной БД/tracking-таблицы.
+        statistics_service = BotStatisticsService(
+            known_users_repository, subscription_repository, detected_fine_repository,
+        )
         controller = ConversationController(
             conversation_state_repository,
             subscription_service,
+            statistics_service,
             tz=ZoneInfo(settings.fine_monitor.timezone),
             trusted_operator_user_ids=frozenset(settings.public_bot.trusted_operator_user_ids),
             payment_help_contact_username=settings.public_bot.payment_help_contact_username,

@@ -66,6 +66,7 @@ from reader.fines.validation import FineValidationError, normalize_car_number
 from reader.public_bot import texts
 from reader.public_bot.conversation_state_repository import BotConversationStateRepository
 from reader.public_bot.owner_resolution import OwnerResolutionError
+from reader.public_bot.statistics_service import BotStatisticsService
 from reader.public_bot.subscription_service import SubscriptionService
 from reader.public_bot.validation import UsernameValidationError, normalize_telegram_username
 
@@ -149,6 +150,7 @@ class ConversationController:
         self,
         conversation_state_repository: BotConversationStateRepository,
         subscription_service: SubscriptionService,
+        statistics_service: BotStatisticsService,
         *,
         tz: ZoneInfo,
         trusted_operator_user_ids: frozenset[int] = frozenset(),
@@ -156,6 +158,7 @@ class ConversationController:
     ):
         self._states = conversation_state_repository
         self._subscriptions = subscription_service
+        self._statistics = statistics_service
         self._tz = tz
         # frozenset(...) на входе — на случай, если вызывающий код (см.
         # reader/public_bot/main.py) передал обычный list из config.yaml.
@@ -178,6 +181,14 @@ class ConversationController:
         trusted mode только по numeric Telegram user_id из config"),
         никогда по username."""
         return telegram_user_id in self._trusted_operator_user_ids
+
+    def is_trusted(self, telegram_user_id: int) -> bool:
+        """Публичная обёртка над _is_trusted() — нужна reader/public_bot/
+        handlers.py (см. "📊 Статистика"), чтобы решить, добавлять ли
+        кнопку статистики в главное меню (main_menu_keyboard(
+        include_statistics=...)), НЕ дублируя саму проверку trusted-
+        статуса вне ConversationController."""
+        return self._is_trusted(telegram_user_id)
 
     # ---- /start, главное меню, claim deep-link ----
 
@@ -291,7 +302,23 @@ class ConversationController:
                 return self._build_trusted_stop_picker_reply()
             return self._build_picker_reply(telegram_user_id, kind="stop")
 
+        if stripped_text == texts.STATISTICS_LABEL:
+            self._states.clear(chat_id)
+            if not self._is_trusted(telegram_user_id):
+                # Кнопка обычному пользователю никогда не показывается
+                # (см. main_menu_keyboard(include_statistics=...)), но
+                # текст с тем же содержимым можно отправить вручную — та
+                # же защита, что и у task-level admin API (см. модуль
+                # docstring): безопасный отказ, статистика не раскрывается,
+                # ничего не падает и не логируется как ошибка.
+                return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
+            return self._format_statistics_reply()
+
         return None
+
+    def _format_statistics_reply(self) -> BotReply:
+        stats = self._statistics.get_statistics(now=datetime.now(timezone.utc), tz=self._tz)
+        return BotReply(text=texts.format_statistics(stats), show_main_menu=True)
 
     def _format_trusted_tasks_page_reply(self, page: int) -> BotReply:
         """"📋 Мои авто" для trusted-оператора — ОДНА страница ВСЕХ

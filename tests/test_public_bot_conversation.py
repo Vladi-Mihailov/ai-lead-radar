@@ -35,6 +35,8 @@ from reader.public_bot.conversation import (  # noqa: E402
     ConversationController,
 )
 from reader.public_bot.conversation_state_repository import BotConversationStateRepository  # noqa: E402
+from reader.public_bot.known_users_repository import BotKnownUsersRepository  # noqa: E402
+from reader.public_bot.statistics_service import BotStatisticsService  # noqa: E402
 from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
 from reader.public_bot.subscription_service import SubscriptionService  # noqa: E402
 from reader.users.models import TelegramUserInfo  # noqa: E402
@@ -104,6 +106,7 @@ class _Fixture:
         self.subscription_repository = FineSubscriptionRepository(self.db_path)
         self.user_repository = UserRepository(self.db_path)
         self.conversation_state_repository = BotConversationStateRepository(self.db_path)
+        self.known_users_repository = BotKnownUsersRepository(self.db_path)
         self.check_service = FineCheckService(
             _FakeProvider(records_by_car), self.task_repository, self.detected_fine_repository,
         )
@@ -112,8 +115,11 @@ class _Fixture:
             self.user_repository, self.check_service,
             owner_resolver_client=owner_resolver_client,
         )
+        self.statistics_service = BotStatisticsService(
+            self.known_users_repository, self.subscription_repository, self.detected_fine_repository,
+        )
         self.controller = ConversationController(
-            self.conversation_state_repository, self.service, tz=_TBILISI,
+            self.conversation_state_repository, self.service, self.statistics_service, tz=_TBILISI,
             trusted_operator_user_ids=frozenset(trusted_operator_user_ids),
         )
 
@@ -123,6 +129,7 @@ class _Fixture:
         self.subscription_repository.close()
         self.user_repository.close()
         self.conversation_state_repository.close()
+        self.known_users_repository.close()
 
 
 @pytest.fixture
@@ -1331,3 +1338,75 @@ def test_unrelated_user_forged_task_id_rejected_for_stop_pick(trusted_fx):
 
     assert reply is None
     assert trusted_fx.task_repository.get(task_id).status == "active"
+
+
+# ==== "📊 Статистика" — trusted-operator-only (см. design report) ====
+
+
+def test_conversation_controller_is_trusted_reflects_configured_ids(trusted_fx, fx):
+    """ConversationController.is_trusted() — публичная обёртка, которую
+    reader/public_bot/handlers.py использует для
+    main_menu_keyboard(include_statistics=...)."""
+    assert trusted_fx.controller.is_trusted(_TRUSTED_ID) is True
+    assert trusted_fx.controller.is_trusted(1) is False
+    assert fx.controller.is_trusted(_TRUSTED_ID) is False  # обычный fx без trusted-списка
+
+
+async def test_trusted_operator_sees_statistics(trusted_fx):
+    """Trusted operator sees statistics — "📊 Статистика" возвращает
+    реальную сводку, посчитанную BotStatisticsService."""
+    trusted_fx.known_users_repository.record_seen(
+        telegram_user_id=1, telegram_chat_id=1, telegram_username="alice",
+    )
+    trusted_fx.known_users_repository.record_seen(
+        telegram_user_id=2, telegram_chat_id=2, telegram_username="bob",
+    )
+    task_id = _make_operator_task(trusted_fx, "E911EE95")
+    sub = trusted_fx.subscription_repository.create(
+        monitoring_task_id=task_id, car_number="E911EE95",
+        telegram_user_id=3, telegram_chat_id=3, telegram_username="carol",
+        start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+    )
+    trusted_fx.subscription_repository.stop_by_owner_or_creator(sub.id, telegram_user_id=3)
+
+    reply = await trusted_fx.controller.handle_text(
+        texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert "📊 Статистика бота" in reply.text
+    assert "👥 Всего пользователей: 2" in reply.text
+    assert "🚗 Активных подписок: 0" in reply.text
+    assert "⏸ Остановленных подписок: 1" in reply.text
+    assert reply.show_main_menu is True
+
+
+async def test_normal_user_cannot_invoke_statistics_action_directly(fx):
+    """Явное требование задачи: "если обычный пользователь каким-то
+    образом вручную вызовет соответствующий callback/action — вернуть
+    безопасный отказ и ничего не показывать" — тот же текст, что и у
+    кнопки (Telegram неотличим от реального нажатия ЛЮБОЙ reply-кнопки от
+    пользователя, вручную напечатавшего тот же текст)."""
+    fx.known_users_repository.record_seen(telegram_user_id=1, telegram_chat_id=1, telegram_username="alice")
+
+    reply = await fx.controller.handle_text(
+        texts.STATISTICS_LABEL, chat_id=1, telegram_user_id=1, username="alice",
+    )
+
+    assert reply.text == texts.MAIN_MENU_TEXT
+    assert "Статистика" not in reply.text
+    assert "Всего пользователей" not in reply.text
+    assert reply.show_main_menu is True
+
+
+async def test_normal_user_statistics_attempt_does_not_leak_real_numbers(fx):
+    """Даже если реальные данные в БД существуют (пользователи/подписки),
+    обычный пользователь при попытке вызвать статистику не должен увидеть
+    ни одной цифры — полный отказ, а не urезанная/частичная сводка."""
+    fx.known_users_repository.record_seen(telegram_user_id=1, telegram_chat_id=1, telegram_username=None)
+    fx.known_users_repository.record_seen(telegram_user_id=2, telegram_chat_id=2, telegram_username=None)
+
+    reply = await fx.controller.handle_text(
+        texts.STATISTICS_LABEL, chat_id=1, telegram_user_id=1, username=None,
+    )
+
+    assert "2" not in reply.text

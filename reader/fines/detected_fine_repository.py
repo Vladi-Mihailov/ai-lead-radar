@@ -260,6 +260,20 @@ class DetectedFineRepository:
         rows = self._conn.execute(_SELECT_STATS_BY_CAR).fetchall()
         return [CarFineStats(car_number=row[0], fine_count=row[1]) for row in rows]
 
+    def count_first_detected_since(self, since: datetime) -> int:
+        """Сколько ГЕНУИННО новых штрафов обнаружено начиная с since — по
+        first_detected_at, который выставляется РОВНО один раз при
+        create() (см. FineCheckService.check_task — mark_seen() его
+        никогда не трогает) — надёжный source-of-truth для "🚨 Новых
+        штрафов найдено сегодня" (см. "📊 Статистика", задача: "не
+        придумывать метрики из логов/косвенных данных"). since — тот же
+        формат сравнения, что и BotKnownUsersRepository.count_first_seen_since."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM detected_fines WHERE first_detected_at >= ?",
+            (since.strftime("%Y-%m-%d %H:%M:%S"),),
+        ).fetchone()
+        return row[0]
+
     def create(
         self,
         *,

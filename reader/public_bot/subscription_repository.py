@@ -738,6 +738,16 @@ class FineSubscriptionRepository:
         ).fetchone()
         return row[0]
 
+    def count_by_status(self, status: str) -> int:
+        """Глобальный (по ВСЕМ задачам) счётчик подписок в конкретном
+        status — для "📊 Статистика" (см. BotStatisticsService):
+        'active'/'stopped' считаются по фактическому текущему status,
+        никакой отдельной агрегации/кеша не заводится."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM fine_monitoring_subscriptions WHERE status = ?", (status,),
+        ).fetchone()
+        return row[0]
+
     def stop_all_for_task(self, monitoring_task_id: int) -> int:
         """Останавливает ВСЕ active/pending_claim подписки этой задачи —
         вызывается ТОЛЬКО после того, как trusted-статус звонящего и
