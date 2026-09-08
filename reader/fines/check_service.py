@@ -45,12 +45,18 @@ class FineCheckService:
             return CheckResult(
                 status="error",
                 new_fines=[],
+                current_fines=[],
                 error_message=error_message,
                 total_fines_found=0,
                 duration_ms=_elapsed_ms(started_at),
             )
 
         new_fines: list[NewFineEvent] = []
+        # ВСЕ штрафы этой проверки (новые и уже известные) — для manual
+        # "Проверить сейчас" (см. CheckResult.current_fines). Фоновый
+        # пайплайн его не читает вовсе, поэтому существующий new_fines/
+        # notification-flow этим не затрагивается.
+        current_fines: list[NewFineEvent] = []
 
         for record in records:
             existing = self._detected_fine_repository.get_by_fingerprint(
@@ -68,6 +74,11 @@ class FineCheckService:
                     amount=record.amount,
                     place=record.place,
                     violation_description=record.violation_description,
+                )
+                current_fines.append(
+                    NewFineEvent.from_parsed_record(
+                        record, detected_fine_id=existing.id, task_id=task.id, label=task.label,
+                    )
                 )
                 continue
 
@@ -103,15 +114,23 @@ class FineCheckService:
                         place=record.place,
                         violation_description=record.violation_description,
                     )
+                    current_fines.append(
+                        NewFineEvent.from_parsed_record(
+                            record, detected_fine_id=existing.id, task_id=task.id, label=task.label,
+                        )
+                    )
                 continue
 
-            new_fines.append(NewFineEvent.from_detected_fine(created, label=task.label))
+            event = NewFineEvent.from_detected_fine(created, label=task.label)
+            new_fines.append(event)
+            current_fines.append(event)
 
         self._task_repository.record_check_result(task.id, last_check_status="ok", last_error=None)
 
         return CheckResult(
             status="ok",
             new_fines=new_fines,
+            current_fines=current_fines,
             error_message=None,
             total_fines_found=len(records),
             duration_ms=_elapsed_ms(started_at),

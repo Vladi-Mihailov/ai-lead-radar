@@ -701,7 +701,8 @@ async def test_check_now_uses_existing_check_service_and_dedup(fx):
     assert result is not None
     assert result.car_number == "AA001AA"
     assert result.check_ok is True
-    assert result.new_fines_count == 0
+    assert result.fines == []
+    assert result.is_owner is True
     # Тот же provider/FineCheckService — второй запрос, не отдельная система.
     assert fx.provider.requested_plates == ["AA001AA", "AA001AA"]
 
@@ -729,7 +730,53 @@ async def test_check_now_reports_new_fines_found(tmp_path):
 
         result = await fixture.service.check_now(outcome.subscription.id, telegram_user_id=42)
 
-        assert result.new_fines_count == 1
+        assert len(result.fines) == 1
+    finally:
+        fixture.close()
+
+
+async def test_check_now_shows_existing_fine_not_only_new(tmp_path):
+    """Явное требование задачи про UX manual check: 🔎 Проверить сейчас
+    должен показывать ВСЕ штрафы, которые police.ge вернул сейчас, а не
+    только новые с прошлой проверки — второй вызов check_now() с тем же
+    штрафом (уже существующим в detected_fines) должен по-прежнему
+    вернуть его в outcome.fines, не пустой список."""
+    fixture = _Fixture(tmp_path)
+    try:
+        fixture.provider._records_by_car["AA001AA"] = [_record(car_number="AA001AA", fingerprint="fp-existing")]
+        outcome = await fixture.service.add_car(
+            telegram_user_id=42, telegram_chat_id=42, username="client",
+            first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+        )
+
+        result = await fixture.service.check_now(outcome.subscription.id, telegram_user_id=42)
+
+        assert len(result.fines) == 1
+        assert result.fines[0].external_fine_id == "AB123456"
+    finally:
+        fixture.close()
+
+
+async def test_check_now_by_trusted_creator_is_not_owner(tmp_path):
+    """Явное требование задачи: CTA-кнопки — только реальному владельцу,
+    не trusted-оператору, управляющему чужой delegated-подпиской (см.
+    design report "CTA — только owner"). is_owner=False здесь — тот же
+    subscription_id, но telegram_user_id совпадает с created_by, не с
+    owner'ом."""
+    fixture = _Fixture(tmp_path)
+    try:
+        outcome = await fixture.service.add_delegated_car(
+            created_by_telegram_user_id=555, created_by_telegram_chat_id=555,
+            car_number="AA001AA", owner_username="unknown_person",
+            period_days=30, today=date(2026, 9, 3),
+        )
+
+        result = await fixture.service.check_now(
+            outcome.subscription.id, telegram_user_id=555,  # создатель, не владелец
+        )
+
+        assert result is not None
+        assert result.is_owner is False
     finally:
         fixture.close()
 
@@ -794,6 +841,7 @@ async def test_check_now_task_works_without_any_subscription(fx):
     assert result is not None
     assert result.car_number == "E911EE95"
     assert result.check_ok is True
+    assert result.is_owner is False  # task-level admin — всегда trusted-оператор
     assert fx.subscription_repository.list_by_user(_OPERATOR_USER_ID) == []
 
 
@@ -892,10 +940,14 @@ async def test_check_now_task_by_car_number_uses_existing_dedup(tmp_path):
         )
 
         first = await fixture.service.check_now_task_by_car_number("E911EE95")
-        assert first.new_fines_count == 1
+        assert len(first.fines) == 1  # genuinely new — становится detected_fines
 
         second = await fixture.service.check_now_task_by_car_number("E911EE95")
-        assert second.new_fines_count == 0
+        # Явное требование задачи про UX manual check: тот же (уже
+        # известный) штраф всё равно показывается — 🔎 показывает ТЕКУЩЕЕ
+        # состояние машины, а не только новые с прошлой проверки.
+        assert len(second.fines) == 1
+        assert second.fines[0].external_fine_id == first.fines[0].external_fine_id
     finally:
         fixture.close()
 

@@ -11,7 +11,7 @@ Identity — ВСЕГДА event.sender_id (numeric), никогда не usernam
 
 import logging
 
-from telethon import TelegramClient, events
+from telethon import Button, TelegramClient, events
 
 from reader.public_bot.conversation import ConversationController
 from reader.public_bot.keyboards import (
@@ -223,6 +223,14 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False) -> None:
         buttons = trusted_tasks_page_keyboard(
             page=reply.trusted_tasks_page, total_pages=reply.trusted_tasks_total_pages,
         )
+    elif reply.cta_buttons:
+        # Manual "🔎 Проверить сейчас" — коммерческие CTA (см.
+        # ConversationController._owner_cta_buttons); conversation.py
+        # намеренно передаёт их как (label, url), не Telethon Button —
+        # реальные кнопки строятся только здесь.
+        buttons = [
+            [Button.url(label, url) for label, url in row] for row in reply.cta_buttons
+        ]
 
     if prefer_edit:
         try:

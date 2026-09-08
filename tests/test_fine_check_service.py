@@ -345,6 +345,177 @@ async def test_mix_of_new_and_known_fines(tmp_path):
         assert result.new_fines[0].external_fine_id == "A3"
         # total_fines_found — все найденные провайдером записи, а не только новые.
         assert result.total_fines_found == 3
+        # current_fines — ВСЕ штрафы этой проверки (новые И уже известные,
+        # см. задачу про UX manual "Проверить сейчас") — genuinely new
+        # штраф по-прежнему корректно попадает в normal new-fine pipeline
+        # (new_fines) РОВНО один раз, current_fines его не заменяет и не
+        # дублирует.
+        assert len(result.current_fines) == 3
+        assert {e.external_fine_id for e in result.current_fines} == {"A1", "A2", "A3"}
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+# ---- production UX задача: manual "🔎 Проверить сейчас" должен показывать
+# ТЕКУЩЕЕ состояние машины (current_fines), а фоновый мониторинг —
+# по-прежнему ТОЛЬКО новые штрафы (new_fines). Оба списка строит один и
+# тот же check_task(), без отдельной реализации/костыля. ----
+
+
+async def test_manual_check_shows_all_three_existing_fines(tmp_path):
+    """"Если police.ge сейчас возвращает 4 штрафа → показать все 4" —
+    здесь 3, но тот же принцип: все уже известные штрафы попадают в
+    current_fines, не только новые (которых в этом проходе ноль)."""
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        records = [
+            _record(fingerprint="fp-1", external_fine_id="A1"),
+            _record(fingerprint="fp-2", external_fine_id="A2"),
+            _record(fingerprint="fp-3", external_fine_id="A3"),
+        ]
+
+        await FineCheckService(_FakeProvider(records=records), task_repo, fine_repo).check_task(task)
+        # Повторная (manual) проверка — те же 3 штрафа, уже все известны.
+        result = await FineCheckService(_FakeProvider(records=records), task_repo, fine_repo).check_task(task)
+
+        assert result.new_fines == []  # ни одного НОВОГО обнаружения
+        assert len(result.current_fines) == 3  # но клиент видит все 3
+        assert {e.external_fine_id for e in result.current_fines} == {"A1", "A2", "A3"}
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_manual_check_of_existing_fines_creates_no_duplicate_rows(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        records = [_record(fingerprint="fp-1", external_fine_id="A1")]
+        service = FineCheckService(_FakeProvider(records=records), task_repo, fine_repo)
+
+        await service.check_task(task)
+        await service.check_task(task)  # "manual" повтор
+        await service.check_task(task)
+
+        assert len(fine_repo.list_by_car_number("B957MA09")) == 1
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_manual_check_of_existing_fine_does_not_reopen_operator_notification(tmp_path):
+    """Ключевое требование задачи: показ штрафа в ответ на manual check
+    НЕ должен считаться новым detection event и не должен приводить к
+    повторной отправке оператору/trusted — notification_sent_at уже
+    существующей строки не должен сбрасываться в NULL повторной
+    проверкой (list_pending_notifications() — единственный источник
+    решения "кого ещё нужно уведомить", см. FineNotificationCoordinator)."""
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        records = [_record(fingerprint="fp-1", external_fine_id="A1")]
+        service = FineCheckService(_FakeProvider(records=records), task_repo, fine_repo)
+
+        await service.check_task(task)  # создаёт штраф, notification_sent_at = NULL
+        [fine] = fine_repo.list_by_car_number("B957MA09")
+        fine_repo.mark_notification_sent(fine.id)  # оператор уже уведомлён (как в реальном flush job)
+        assert fine_repo.list_pending_notifications() == []
+
+        # "Manual" повторная проверка того же штрафа.
+        result = await service.check_task(task)
+
+        assert result.new_fines == []
+        assert len(result.current_fines) == 1  # клиент всё равно видит штраф
+        assert fine_repo.list_pending_notifications() == []  # оператор НЕ уведомляется повторно
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_manual_check_extended_fields_backfill_reflected_in_current_fines(tmp_path):
+    """Продолжение production-инцидента (см. mark_seen backfill) —
+    current_fines для manual check должен показывать УЖЕ backfilled
+    (актуальные) значения, а не устаревшие NULL, даже для legacy-строки,
+    созданной до появления этих колонок."""
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        legacy = fine_repo.create(
+            monitoring_task_id=task.id, car_number="B957MA09",
+            external_fine_id="A1", fingerprint="fp-legacy",
+            penalty_date=date(2026, 8, 6), due_date=date(2026, 8, 20),
+            delivered_status="Не вручено", raw_data="{}",
+        )
+        assert legacy.violation_date is None
+
+        service = FineCheckService(
+            _FakeProvider(records=[
+                _record(
+                    fingerprint="fp-legacy", external_fine_id="A1",
+                    violation_date=date(2026, 8, 5), amount=100.0,
+                    place="Test place", violation_description="Test violation",
+                )
+            ]),
+            task_repo, fine_repo,
+        )
+
+        result = await service.check_task(task)
+
+        assert result.new_fines == []
+        [current] = result.current_fines
+        assert current.violation_date == date(2026, 8, 5)
+        assert current.amount == 100.0
+        assert current.place == "Test place"
+        assert current.violation_description == "Test violation"
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_scheduled_check_semantics_unaffected_only_new_fines_reported(tmp_path):
+    """Явное требование задачи: background monitoring (то, что реально
+    потребляет FineJob/NotificationFlushJob) должен продолжать видеть
+    ТОЛЬКО новые штрафы — current_fines существует ИСКЛЮЧИТЕЛЬНО для
+    manual check и не подменяет/не расширяет new_fines."""
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        records = [
+            _record(fingerprint="fp-1", external_fine_id="A1"),
+            _record(fingerprint="fp-2", external_fine_id="A2"),
+        ]
+        service = FineCheckService(_FakeProvider(records=records), task_repo, fine_repo)
+        await service.check_task(task)  # оба становятся known, notification_sent_at ещё NULL
+        # Симулируем реальный flush job (NotificationFlushJob), который
+        # выставляет notification_sent_at для реально доставленных штрафов —
+        # без этого шага pending и так был бы пуст только потому, что
+        # никто их ни разу не "отправлял", а не потому, что check_task()
+        # корректно себя ведёт при повторной проверке.
+        for fine in fine_repo.list_by_car_number("B957MA09"):
+            fine_repo.mark_notification_sent(fine.id)
+        assert fine_repo.list_pending_notifications() == []
+
+        # "Фоновая" (scheduled) проверка — те же штрафы, ничего нового.
+        scheduled_result = await service.check_task(task)
+
+        assert scheduled_result.new_fines == []
+        # Фоновый пайплайн (FineJob) не читает current_fines вовсе — сам
+        # факт его присутствия не должен создавать новых уведомлений:
+        # единственный источник истины для оператора — notification_sent_at
+        # (список ожидающих отправки штрафов), который здесь по-прежнему пуст.
+        assert fine_repo.list_pending_notifications() == []
     finally:
         task_repo.close()
         fine_repo.close()

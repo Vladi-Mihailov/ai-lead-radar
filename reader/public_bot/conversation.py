@@ -134,6 +134,14 @@ class BotReply:
     trusted_stop_confirm_button_label: str | None = None
     trusted_tasks_page: int | None = None
     trusted_tasks_total_pages: int | None = None
+    # Коммерческие CTA-кнопки под manual "🔎 Проверить сейчас" (см. design
+    # report про UX manual check) — ТОЛЬКО когда реальный владелец увидел
+    # хотя бы один штраф своей машины (см. handle_check_now_choice), той
+    # же формы (label, url), что и reader/public_bot/keyboards.py::
+    # owner_fine_cta_buttons, но БЕЗ импорта Telethon Button здесь —
+    # conversation.py намеренно ничего не знает о Telegram API, только
+    # handlers.py конвертирует эти пары в реальные Button.url(...).
+    cta_buttons: list[list[tuple[str, str]]] | None = None
 
 
 class ConversationController:
@@ -144,6 +152,7 @@ class ConversationController:
         *,
         tz: ZoneInfo,
         trusted_operator_user_ids: frozenset[int] = frozenset(),
+        payment_help_contact_username: str = "tplgee",
     ):
         self._states = conversation_state_repository
         self._subscriptions = subscription_service
@@ -151,6 +160,14 @@ class ConversationController:
         # frozenset(...) на входе — на случай, если вызывающий код (см.
         # reader/public_bot/main.py) передал обычный list из config.yaml.
         self._trusted_operator_user_ids = frozenset(trusted_operator_user_ids)
+        # Destination CTA-кнопок под manual "🔎 Проверить сейчас" — тот же
+        # config (settings.public_bot.payment_help_contact_username), что и
+        # у ClientDeliveryService/owner_fine_cta_buttons, не hardcoded.
+        self._payment_help_contact_username = payment_help_contact_username
+
+    def _owner_cta_buttons(self) -> list[list[tuple[str, str]]]:
+        url = f"https://t.me/{self._payment_help_contact_username}"
+        return [[("💳 Оплатить в рублях", url), ("🚗 ОСАГО Грузии", url)]]
 
     def _today(self) -> date:
         return datetime.now(timezone.utc).astimezone(self._tz).date()
@@ -728,7 +745,11 @@ class ConversationController:
         outcome = await self._subscriptions.check_now(subscription_id, telegram_user_id=telegram_user_id)
         if outcome is None:
             return None
-        return BotReply(text=texts.format_check_now_result(outcome))
+        # CTA — ТОЛЬКО реальному владельцу и только когда есть хотя бы один
+        # штраф (см. design report: "CTA — только owner", не trusted-
+        # оператору, управляющему чужой delegated-подпиской).
+        cta = self._owner_cta_buttons() if outcome.is_owner and outcome.fines else None
+        return BotReply(text=texts.format_check_now_result(outcome), cta_buttons=cta)
 
     # ---- ⛔ Остановить мониторинг (pick -> confirm, без conversation_state) ----
 

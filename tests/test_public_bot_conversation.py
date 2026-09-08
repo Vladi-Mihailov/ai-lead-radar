@@ -606,7 +606,9 @@ async def test_check_now_lists_own_car_and_returns_result(fx):
     result_reply = await fx.controller.handle_check_now_choice(subscription_id, telegram_user_id=1)
     assert result_reply is not None
     assert "M295YB196" in result_reply.text
-    assert "новых штрафов нет" in result_reply.text
+    assert "штрафов не найдено" in result_reply.text
+    assert "новых штрафов нет" not in result_reply.text
+    assert result_reply.cta_buttons is None  # штрафов нет — CTA нечего показывать
 
 
 async def test_check_now_rejects_subscription_belonging_to_another_user(fx):
@@ -622,7 +624,13 @@ async def test_check_now_rejects_subscription_belonging_to_another_user(fx):
     assert result_reply is None
 
 
-async def test_check_now_reports_new_fines(tmp_path):
+async def test_check_now_shows_existing_fine_found_by_earlier_check(tmp_path):
+    """Явное требование задачи про UX manual check: 🔎 Проверить сейчас
+    показывает ВСЕ штрафы текущего ответа police.ge, включая уже
+    известные — штраф, найденный первой проверкой (внутри add_car),
+    по-прежнему показывается ручным запуском, а не "новых штрафов нет"
+    (дедуп/detection semantics при этом не меняются — см. отдельный тест
+    на отсутствие повторного уведомления оператора)."""
     fixture = _Fixture(tmp_path, records_by_car={"M295YB196": [_record()]})
     try:
         await fixture.service.add_car(
@@ -630,10 +638,22 @@ async def test_check_now_reports_new_fines(tmp_path):
             first_name=None, last_name=None, car_number="M295YB196", period_days=30, today=_today(),
         )
         [subscription] = fixture.subscription_repository.list_by_user(1)
-        # Первая проверка (внутри add_car) уже нашла штраф — второй ручной
-        # запуск не должен найти его СНОВА как новый (дедуп общий).
+
         reply = await fixture.controller.handle_check_now_choice(subscription.id, telegram_user_id=1)
-        assert "новых штрафов нет" in reply.text
+
+        assert "новых штрафов нет" not in reply.text
+        assert "штрафов не найдено" not in reply.text
+        assert "🚨 Обнаружен штраф" in reply.text
+        assert "🚗 Автомобиль: M295YB196" in reply.text
+        assert "📄 Штраф №: AB123456" in reply.text
+        # Реальный владелец (не trusted-creator) — CTA-кнопки присутствуют.
+        assert reply.cta_buttons is not None
+        assert len(reply.cta_buttons) == 1
+        assert len(reply.cta_buttons[0]) == 2
+        labels = [label for label, _url in reply.cta_buttons[0]]
+        assert labels == ["💳 Оплатить в рублях", "🚗 ОСАГО Грузии"]
+        urls = {url for _label, url in reply.cta_buttons[0]}
+        assert urls == {"https://t.me/tplgee"}
     finally:
         fixture.close()
 
@@ -1008,7 +1028,7 @@ async def test_trusted_check_now_works_for_task_without_subscription(trusted_fx)
     )
 
     assert "E911EE95" in check_reply.text
-    assert "новых штрафов нет" in check_reply.text
+    assert "штрафов не найдено" in check_reply.text
     assert trusted_fx.subscription_repository.list_by_user(_TRUSTED_ID) == []
     # Диалог завершён — state очищен.
     assert trusted_fx.conversation_state_repository.get(_TRUSTED_ID) is None
@@ -1045,7 +1065,12 @@ async def test_trusted_check_now_can_find_car_beyond_old_first_50_limit(trusted_
     )
 
     assert "E911EE95" in check_reply.text
-    assert "не найден" not in check_reply.text
+    # "не найден в активном мониторинге" (task-level 404) — НЕ "штрафов не
+    # найдено" (0 fines, штатный manual-check результат для задачи,
+    # которая реально существует и была найдена) — эти два разных смысла
+    # умышленно похожи текстуально, поэтому сверяем маркер конкретной
+    # not-found ошибки ("❌"), а не расплывчатую подстроку "не найден".
+    assert "❌" not in check_reply.text
 
 
 async def test_trusted_check_now_rejects_unknown_plate_without_creating_anything(trusted_fx):
@@ -1080,8 +1105,10 @@ async def test_trusted_check_now_rejects_inactive_task_plate(trusted_fx):
 
 async def test_trusted_check_now_uses_existing_dedup(tmp_path):
     """Тот же дедуп/detected_fines, что и везде — второй "Проверить
-    сейчас" по тому же номеру без новых штрафов от провайдера не находит
-    уже виденный штраф повторно как новый."""
+    сейчас" по тому же номеру без новых штрафов от провайдера не создаёт
+    дубликат и не считает уже виденный штраф новым, но (см. задачу про
+    UX manual check) ВСЁ РАВНО показывает его trusted-оператору — 🔎
+    отражает текущее состояние машины, а не только delta."""
     fixture = _Fixture(
         tmp_path, records_by_car={"E911EE95": [_record(car_number="E911EE95")]},
         trusted_operator_user_ids={_TRUSTED_ID},
@@ -1095,7 +1122,9 @@ async def test_trusted_check_now_uses_existing_dedup(tmp_path):
         first = await fixture.controller.handle_text(
             "E911EE95", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
         )
-        assert "найдено новых штрафов — 1" in first.text
+        assert "🚨 Обнаружен штраф" in first.text
+        assert "📄 Штраф №: AB123456" in first.text
+        assert first.cta_buttons is None  # trusted-оператор — без коммерческих кнопок
 
         await fixture.controller.handle_text(
             texts.CHECK_NOW_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
@@ -1103,7 +1132,13 @@ async def test_trusted_check_now_uses_existing_dedup(tmp_path):
         second = await fixture.controller.handle_text(
             "E911EE95", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
         )
-        assert "новых штрафов нет" in second.text
+        assert "новых штрафов нет" not in second.text
+        assert "🚨 Обнаружен штраф" in second.text
+        assert "📄 Штраф №: AB123456" in second.text
+        assert second.cta_buttons is None
+
+        [only_row] = fixture.detected_fine_repository.list_by_car_number("E911EE95")
+        assert only_row is not None  # ни одной лишней строки не создано
     finally:
         fixture.close()
 

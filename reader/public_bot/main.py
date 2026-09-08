@@ -219,6 +219,7 @@ async def run() -> None:
             subscription_service,
             tz=ZoneInfo(settings.fine_monitor.timezone),
             trusted_operator_user_ids=frozenset(settings.public_bot.trusted_operator_user_ids),
+            payment_help_contact_username=settings.public_bot.payment_help_contact_username,
         )
 
         register(client, controller, known_users_repository)

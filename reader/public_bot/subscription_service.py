@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
 from reader.fines.check_service import FineCheckService
-from reader.fines.models import FineMonitoringTask
+from reader.fines.models import FineMonitoringTask, NewFineEvent
 from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.public_bot.car_owner_sync import sync_user_and_car
 from reader.public_bot.models import FineMonitoringSubscription
@@ -70,11 +70,30 @@ class ClaimOutcome:
 class CheckNowOutcome:
     """Результат 🔎 Проверить сейчас — ТОТ ЖЕ FineCheckService/дедуп, что и
     у фонового мониторинга (см. SubscriptionService.check_now); никакой
-    отдельной системы штрафов здесь нет."""
+    отдельной системы штрафов здесь нет.
+
+    fines — ВСЕ штрафы, которые police.ge вернул на этой проверке (см.
+    CheckResult.current_fines), а не только новые: явное нажатие "🔎
+    Проверить сейчас" — read/display запрос о ТЕКУЩЕМ состоянии машины, а
+    не о delta с прошлой проверки (см. задачу про UX manual check).
+    Показ существующих fines здесь НЕ создаёт повторного уведомления
+    оператору/trusted — check_task() решает, что уведомлять, ИСКЛЮЧИТЕЛЬНО
+    через notification_sent_at/new_fines, чего этот метод не трогает.
+
+    is_owner — True, если telegram_user_id, вызвавший check_now(), это
+    реальный владелец подписки (subscription.telegram_user_id), а не
+    trusted-оператор, управляющий чужой delegated-подпиской
+    (created_by_telegram_user_id) — коммерческие CTA-кнопки показываются
+    ТОЛЬКО владельцу (см. design report: "CTA — только owner"),
+    вызывающий код (ConversationController) решает по этому полю, строить
+    ли их. Для task-level check_now_task()/check_now_task_by_car_number()
+    (см. ниже) — ВСЕГДА False: это исключительно trusted-operator admin
+    путь, владелец через него никогда не действует."""
 
     car_number: str
     check_ok: bool
-    new_fines_count: int
+    fines: list[NewFineEvent]
+    is_owner: bool
 
 
 @dataclass(frozen=True)
@@ -651,7 +670,8 @@ class SubscriptionService:
         return CheckNowOutcome(
             car_number=subscription.car_number,
             check_ok=check_result.status == "ok",
-            new_fines_count=len(check_result.new_fines) if check_result.status == "ok" else 0,
+            fines=check_result.current_fines if check_result.status == "ok" else [],
+            is_owner=subscription.telegram_user_id == telegram_user_id,
         )
 
     # ---- trusted-operator task-level admin (см. design report: пересмотр
@@ -742,7 +762,8 @@ class SubscriptionService:
         return CheckNowOutcome(
             car_number=task.car_number,
             check_ok=check_result.status == "ok",
-            new_fines_count=len(check_result.new_fines) if check_result.status == "ok" else 0,
+            fines=check_result.current_fines if check_result.status == "ok" else [],
+            is_owner=False,  # task-level admin — всегда trusted-оператор, не владелец
         )
 
     async def check_now_task_by_car_number(self, car_number: str) -> CheckNowOutcome | None:

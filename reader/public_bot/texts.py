@@ -8,6 +8,7 @@ reader/public_bot/keyboards.py (Telethon-кнопки), чтобы формул�
 from datetime import date
 
 from reader.fines.models import FineMonitoringTask
+from reader.public_bot.delivery_texts import format_check_now_fines_message
 from reader.public_bot.models import FineMonitoringSubscription
 
 MAIN_MENU_TEXT = "🚗 Штрафы Грузии 🇬🇪"
@@ -68,12 +69,18 @@ def format_check_now_result(outcome) -> str:
     """outcome: reader.public_bot.subscription_service.CheckNowOutcome.
     Без технической детали ошибки в тексте клиенту (см. design: та же
     осторожность, что и в format_add_car_summary/
-    format_delegated_add_car_summary)."""
+    format_delegated_add_car_summary).
+
+    Manual "🔎 Проверить сейчас" — read/display семантика ТЕКУЩЕГО
+    состояния машины (см. задачу про UX manual check), а не delta с
+    прошлой проверки: "новых штрафов нет" здесь принципиально не
+    показывается — outcome.fines это ВСЕ штрафы из ответа police.ge на
+    этой проверке, новые и уже известные (см. CheckResult.current_fines)."""
     if not outcome.check_ok:
         return f"⚠️ Проверить штрафы для {outcome.car_number} сейчас не удалось. Попробуйте позже."
-    if outcome.new_fines_count:
-        return f"🔎 {outcome.car_number}: найдено новых штрафов — {outcome.new_fines_count}"
-    return f"🔎 {outcome.car_number}: новых штрафов нет"
+    if not outcome.fines:
+        return f"🔎 {outcome.car_number}: штрафов не найдено"
+    return format_check_now_fines_message(car_number=outcome.car_number, fines=outcome.fines)
 
 
 def format_stop_success(car_number: str) -> str:

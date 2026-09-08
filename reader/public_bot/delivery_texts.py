@@ -44,3 +44,28 @@ def format_trusted_operator_fine_message(
         lines.append(f"👤 Владелец: @{owner_display}")
     lines.append(format_fine_block(event))
     return "\n".join(lines)
+
+
+def format_check_now_fines_message(*, car_number: str, fines: list[NewFineEvent]) -> str:
+    """Manual "🔎 Проверить сейчас" (см. design report про UX manual
+    check) — показывает ВСЕ штрафы, которые police.ge вернул на этой
+    проверке (CheckNowOutcome.fines = CheckResult.current_fines), а не
+    только новые: пользователь явно спросил о текущем состоянии машины.
+
+    Каждый штраф — отдельным блоком в том же расширенном формате, что и
+    format_owner_fine_message ("🚨 Обнаружен штраф" + автомобиль + fine
+    block), а не одним общим заголовком со списком — так один и тот же
+    формат штрафа используется везде в проекте (фоновые уведомления и
+    manual check неотличимы по виду одного штрафа). Пустой fines сюда не
+    передаётся — вызывающий код (texts.format_check_now_result) обрабатывает
+    "штрафов не найдено" отдельно, до вызова этой функции."""
+    blocks = []
+    for fine in fines:
+        lines = [
+            "🚨 Обнаружен штраф",
+            "",
+            f"🚗 Автомобиль: {car_number}",
+            format_fine_block(fine),
+        ]
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)

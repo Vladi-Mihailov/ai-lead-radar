@@ -165,6 +165,39 @@ class NewFineEvent:
             car_owner_display=car_owner_display,
         )
 
+    @classmethod
+    def from_parsed_record(
+        cls,
+        record: ParsedFineRecord,
+        *,
+        detected_fine_id: int,
+        task_id: int,
+        label: str | None,
+        car_owner_display: str | None = None,
+    ) -> "NewFineEvent":
+        """Для manual "Проверить сейчас" (см. CheckResult.current_fines) —
+        в отличие от from_detected_fine(), строится НЕ из уже сохранённой
+        строки БД (которая для уже известных штрафов может на секунду
+        отставать от свежего ответа police.ge до COALESCE-backfill'а в
+        DetectedFineRepository.mark_seen), а напрямую из только что
+        распарсенного record — это ровно то, что реально вернул police.ge
+        В ЭТОТ раз, без риска показать клиенту устаревшее null-значение."""
+        return cls(
+            detected_fine_id=detected_fine_id,
+            task_id=task_id,
+            car_number=record.car_number,
+            label=label,
+            external_fine_id=record.external_fine_id,
+            penalty_date=record.penalty_date,
+            due_date=record.due_date,
+            delivered_status=record.delivered_status,
+            violation_date=record.violation_date,
+            amount=record.amount,
+            place=record.place,
+            violation_description=record.violation_description,
+            car_owner_display=car_owner_display,
+        )
+
 
 CheckStatus = Literal["ok", "error"]
 
@@ -173,6 +206,14 @@ CheckStatus = Literal["ok", "error"]
 class CheckResult:
     status: CheckStatus
     new_fines: list[NewFineEvent]
+    # ВСЕ штрафы, которые police.ge вернул на ЭТОЙ проверке — новые И уже
+    # существующие (см. задачу про manual "Проверить сейчас": пользователь,
+    # явно нажавший эту кнопку, хочет видеть текущее состояние машины, а не
+    # только delta с прошлой проверки). Фоновый пайплайн (FineJob/
+    # ClientFineJob/archive/NotificationFlushJob) продолжает использовать
+    # ИСКЛЮЧИТЕЛЬНО new_fines — current_fines НЕ должно приводить к
+    # повторному уведомлению оператора/trusted, см. check_service.py.
+    current_fines: list[NewFineEvent]
     error_message: str | None
     total_fines_found: int
     duration_ms: int
