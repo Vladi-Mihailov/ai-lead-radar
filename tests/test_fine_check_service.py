@@ -55,6 +55,10 @@ def _record(
     due_date=date(2026, 8, 20),
     delivered_status="Не вручено",
     raw_data=None,
+    violation_date=None,
+    amount=None,
+    place=None,
+    violation_description=None,
 ) -> ParsedFineRecord:
     return ParsedFineRecord(
         car_number=car_number,
@@ -64,6 +68,10 @@ def _record(
         delivered_status=delivered_status,
         fingerprint=fingerprint,
         raw_data=raw_data or {"protocolNo": external_fine_id},
+        violation_date=violation_date,
+        amount=amount,
+        place=place,
+        violation_description=violation_description,
     )
 
 
@@ -144,6 +152,122 @@ async def test_existing_fine_updates_last_seen_at(tmp_path):
 
         assert second_seen.last_seen_at >= first_seen.last_seen_at
         assert second_seen.first_detected_at == first_seen.first_detected_at
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+# ---- production incident regression: legacy detected_fines (созданные ДО
+# появления violation_date/amount/place/violation_description) должны
+# самостоятельно "самолечиться" при обычной повторной проверке, а не
+# оставаться с этими полями NULL навсегда — см. диагностику реального
+# случая (car E911EE95, штраф კვ000465186): protocolAmount/protocolPlace/
+# protocolLawDescription/violationDate police.ge отдавал каждый раз, но
+# check_task() при совпадении fingerprint просто вызывал mark_seen(id) без
+# аргументов и никогда не обновлял уже существующую строку ----
+
+
+async def test_existing_legacy_row_gets_extended_fields_backfilled_on_recheck(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+
+        # Шаг 1 — legacy-строка: создана ДО появления расширенных полей
+        # (ровно как реальные produciton-строки, созданные до деплоя
+        # 61db565) — violation_date/amount/place/violation_description не
+        # переданы вовсе, то есть NULL.
+        legacy = fine_repo.create(
+            monitoring_task_id=task.id,
+            car_number="E911EE95",
+            external_fine_id="X000465186",
+            fingerprint="fp-legacy-real-fine",
+            penalty_date=date(2026, 8, 7),
+            due_date=date(2026, 10, 6),
+            delivered_status="Не вручено",
+            raw_data="{}",
+        )
+        assert legacy.violation_date is None
+        assert legacy.amount is None
+        assert legacy.place is None
+        assert legacy.violation_description is None
+
+        # Шаг 2 — обычная повторная проверка того же штрафа (тот же
+        # fingerprint — police.ge возвращает тот же протокол с ПОЛНЫМИ
+        # данными, как и в реальном production raw_data).
+        provider = _FakeProvider(
+            records=[
+                _record(
+                    car_number="E911EE95",
+                    external_fine_id="X000465186",
+                    fingerprint="fp-legacy-real-fine",
+                    penalty_date=date(2026, 8, 7),
+                    due_date=date(2026, 10, 6),
+                    delivered_status="Не вручено",
+                    violation_date=date(2026, 8, 7),
+                    amount=100.0,
+                    place="სამტრედია-გრიგოლეთი 26კმ. ლანჩხუთი",
+                    violation_description="ასკ 125-ე მუხლის პირველის პრიმა ნაწილი",
+                )
+            ]
+        )
+        service = FineCheckService(provider, task_repo, fine_repo)
+
+        result = await service.check_task(task)
+
+        # Уже известный штраф — НЕ новое обнаружение (не повторная рассылка).
+        assert result.new_fines == []
+
+        backfilled = fine_repo.get_by_fingerprint(task.id, "fp-legacy-real-fine")
+        assert backfilled.id == legacy.id  # та же строка, не дубликат
+        assert backfilled.violation_date == date(2026, 8, 7)
+        assert backfilled.amount == 100.0
+        assert backfilled.place == "სამტრედია-გრიგოლეთი 26კმ. ლანჩხუთი"
+        assert backfilled.violation_description == "ასკ 125-ე მუხლის პირველის პრიმა ნაწილი"
+
+        all_rows = fine_repo.list_by_car_number("E911EE95")
+        assert len(all_rows) == 1  # ни одной лишней строки не создано
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_backfill_never_overwrites_existing_value_with_null(tmp_path):
+    """COALESCE — если police.ge на КАКОЙ-ТО из проверок вдруг не отдаст
+    protocolPlace/protocolLawDescription для уже известного штрафа, уже
+    сохранённое значение не должно затираться NULL."""
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        already_backfilled = fine_repo.create(
+            monitoring_task_id=task.id,
+            car_number="B957MA09",
+            external_fine_id="AB123456",
+            fingerprint="fp-already-full",
+            penalty_date=date(2026, 8, 6),
+            due_date=date(2026, 8, 20),
+            delivered_status="Не вручено",
+            raw_data="{}",
+            violation_date=date(2026, 8, 5),
+            amount=100.0,
+            place="Test place",
+            violation_description="Test violation",
+        )
+
+        provider = _FakeProvider(
+            records=[_record(fingerprint="fp-already-full")]  # place/violation_description = None
+        )
+        service = FineCheckService(provider, task_repo, fine_repo)
+
+        await service.check_task(task)
+
+        unchanged = fine_repo.get_by_fingerprint(task.id, "fp-already-full")
+        assert unchanged.id == already_backfilled.id
+        assert unchanged.place == "Test place"
+        assert unchanged.violation_description == "Test violation"
     finally:
         task_repo.close()
         fine_repo.close()

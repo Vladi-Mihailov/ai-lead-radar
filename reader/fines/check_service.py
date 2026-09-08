@@ -58,7 +58,17 @@ class FineCheckService:
             )
 
             if existing is not None:
-                self._detected_fine_repository.mark_seen(existing.id)
+                # Backfill расширенных полей для legacy-строк, созданных до
+                # появления violation_date/amount/place/violation_description
+                # (см. DetectedFineRepository.mark_seen — COALESCE не
+                # затирает уже сохранённое значение).
+                self._detected_fine_repository.mark_seen(
+                    existing.id,
+                    violation_date=record.violation_date,
+                    amount=record.amount,
+                    place=record.place,
+                    violation_description=record.violation_description,
+                )
                 continue
 
             try:
@@ -86,7 +96,13 @@ class FineCheckService:
                     task.id, record.fingerprint
                 )
                 if existing is not None:
-                    self._detected_fine_repository.mark_seen(existing.id)
+                    self._detected_fine_repository.mark_seen(
+                        existing.id,
+                        violation_date=record.violation_date,
+                        amount=record.amount,
+                        place=record.place,
+                        violation_description=record.violation_description,
+                    )
                 continue
 
             new_fines.append(NewFineEvent.from_detected_fine(created, label=task.label))

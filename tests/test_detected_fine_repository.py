@@ -211,6 +211,80 @@ def test_foreign_key_violation_rejected_for_unknown_task(tmp_path):
         repo.close()
 
 
+def test_mark_seen_backfills_extended_fields_when_previously_null(tmp_path):
+    """Production-инцидент: legacy detected_fines (созданные до появления
+    violation_date/amount/place/violation_description) оставались с этими
+    полями NULL навсегда, потому что mark_seen() их никогда не обновлял —
+    см. check_service.py."""
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(tmp_path, db_path)
+
+    repo = DetectedFineRepository(db_path)
+    try:
+        fine = repo.create(
+            monitoring_task_id=task_id,
+            car_number="B957MA09",
+            external_fine_id="AB123456",
+            fingerprint="fp-backfill",
+            penalty_date=date(2026, 8, 6),
+            due_date=date(2026, 8, 20),
+            delivered_status="Не вручено",
+            raw_data="{}",
+        )
+        assert fine.violation_date is None
+
+        repo.mark_seen(
+            fine.id,
+            violation_date=date(2026, 8, 5),
+            amount=100.0,
+            place="Test place",
+            violation_description="Test violation",
+        )
+
+        updated = repo.get_by_fingerprint(task_id, "fp-backfill")
+        assert updated.violation_date == date(2026, 8, 5)
+        assert updated.amount == 100.0
+        assert updated.place == "Test place"
+        assert updated.violation_description == "Test violation"
+    finally:
+        repo.close()
+
+
+def test_mark_seen_without_extended_fields_keeps_old_behavior(tmp_path):
+    """Существующие вызовы mark_seen(fine_id) без новых kwargs (например,
+    старый код/тесты) не должны ничего затирать — просто обновляют
+    last_seen_at, как и раньше."""
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(tmp_path, db_path)
+
+    repo = DetectedFineRepository(db_path)
+    try:
+        fine = repo.create(
+            monitoring_task_id=task_id,
+            car_number="B957MA09",
+            external_fine_id="AB123456",
+            fingerprint="fp-no-backfill",
+            penalty_date=date(2026, 8, 6),
+            due_date=date(2026, 8, 20),
+            delivered_status="Не вручено",
+            raw_data="{}",
+            violation_date=date(2026, 8, 5),
+            amount=100.0,
+            place="Test place",
+            violation_description="Test violation",
+        )
+
+        repo.mark_seen(fine.id)
+
+        unchanged = repo.get_by_fingerprint(task_id, "fp-no-backfill")
+        assert unchanged.violation_date == date(2026, 8, 5)
+        assert unchanged.amount == 100.0
+        assert unchanged.place == "Test place"
+        assert unchanged.violation_description == "Test violation"
+    finally:
+        repo.close()
+
+
 def test_mark_seen_updates_last_seen_at(tmp_path):
     db_path = tmp_path / "users.db"
     task_id = _make_task(tmp_path, db_path)

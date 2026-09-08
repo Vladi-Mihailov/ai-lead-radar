@@ -96,7 +96,28 @@ _SELECT_STATS_BY_CAR = """
     ORDER BY fine_count DESC
 """
 
-_MARK_SEEN = "UPDATE detected_fines SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?"
+# COALESCE(:new, old) — backfill, никогда не затирает уже сохранённое
+# значение NULL'ом (см. задачу про production-инцидент: mark_seen()
+# раньше вообще не обновлял violation_date/amount/place/
+# violation_description для уже существующих строк, поэтому detected_fines,
+# созданные ДО появления этих колонок, так и оставались с ними NULL
+# навсегда — даже когда police.ge на каждой следующей проверке продолжал
+# отдавать полные данные по тому же fingerprint). Теперь каждая обычная
+# проверка (FineJob/ClientFineJob/archive/"Проверить сейчас") сама
+# постепенно "самолечит" все такие legacy-строки, без ручной миграции
+# данных. violation_date/amount не могут отличаться от уже сохранённых,
+# пока fingerprint совпадает (см. compute_fingerprint) — COALESCE здесь
+# защищает именно place/violation_description на случай, если ответ
+# police.ge когда-либо перестанет их отдавать для уже известного штрафа.
+_MARK_SEEN = """
+UPDATE detected_fines
+SET last_seen_at = CURRENT_TIMESTAMP,
+    violation_date = COALESCE(:violation_date, violation_date),
+    amount = COALESCE(:amount, amount),
+    place = COALESCE(:place, place),
+    violation_description = COALESCE(:violation_description, violation_description)
+WHERE id = :id
+"""
 
 _MARK_NOTIFIED = """
 UPDATE detected_fines SET notification_sent_at = CURRENT_TIMESTAMP WHERE id = ?
@@ -265,8 +286,25 @@ class DetectedFineRepository:
             raise RuntimeError("Не удалось прочитать только что созданную запись о штрафе")
         return _row_to_fine(row)
 
-    def mark_seen(self, fine_id: int) -> None:
-        self._conn.execute(_MARK_SEEN, (fine_id,))
+    def mark_seen(
+        self,
+        fine_id: int,
+        *,
+        violation_date: date | None = None,
+        amount: float | None = None,
+        place: str | None = None,
+        violation_description: str | None = None,
+    ) -> None:
+        self._conn.execute(
+            _MARK_SEEN,
+            {
+                "id": fine_id,
+                "violation_date": violation_date.isoformat() if violation_date else None,
+                "amount": amount,
+                "place": place,
+                "violation_description": violation_description,
+            },
+        )
         self._conn.commit()
 
     def mark_notification_sent(self, fine_id: int) -> None:
