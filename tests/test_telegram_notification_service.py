@@ -16,6 +16,7 @@ from reader.fines.models import NewFineEvent  # noqa: E402
 from reader.notifications.base import NotificationResult  # noqa: E402
 from reader.notifications.telegram_notification_service import (  # noqa: E402
     TelegramNotificationService,
+    format_fine_block,
 )
 
 _SOURCE_URL = "https://police.ge/protocol/index.php?lang=en"
@@ -49,6 +50,10 @@ def _event(
     task_id=1,
     detected_fine_id=1,
     car_owner_display=None,
+    violation_date=None,
+    amount=None,
+    place=None,
+    violation_description=None,
 ) -> NewFineEvent:
     return NewFineEvent(
         detected_fine_id=detected_fine_id,
@@ -60,6 +65,10 @@ def _event(
         due_date=due_date,
         delivered_status=delivered_status,
         car_owner_display=car_owner_display,
+        violation_date=violation_date,
+        amount=amount,
+        place=place,
+        violation_description=violation_description,
     )
 
 
@@ -82,24 +91,23 @@ async def test_notify_single_event_produces_expected_message_format():
         "🚨 Обнаружен новый опубликованный штраф\n"
         "\n"
         "Автомобиль: B957MA09\n"
-        "Дата штрафа: 06.08.2026\n"
-        "Срок оплаты: 20.08.2026\n"
-        "Статус вручения: Не вручено\n"
+        "📄 Штраф №: AB123456\n"
+        "📅 Дата протокола: 06.08.2026\n"
+        "⏳ Оплатить до: 20.08.2026\n"
+        "📬 Статус вручения: Не вручено\n"
         "\n"
         f"🔗 [Открыть источник]({_SOURCE_URL})"
     )
     assert kwargs["parse_mode"] == "md"
 
 
-async def test_notify_operator_message_unaffected_by_client_bot_cta_block():
-    """Регрессия: коммерческий CTA-блок ("💬 Помощь с оплатой"/
-    "🛡 Оформить страховку", см. reader/public_bot/delivery_texts.py::
-    CTA_TEXT_BLOCK) существует ТОЛЬКО в owner-уведомлении @GEShtrafbot —
-    существующее уведомление в операторский чат
-    (TelegramNotificationService/FineNotificationCoordinator) им не
-    затрагивается и продолжает формироваться ровно как раньше."""
-    from reader.public_bot.delivery_texts import CTA_TEXT_BLOCK
-
+async def test_notify_operator_message_has_no_commercial_cta():
+    """Коммерческие CTA-кнопки ("💳 Оплатить в рублях"/"🚗 ОСАГО Грузии", см.
+    reader/public_bot/keyboards.py::owner_fine_cta_buttons) существуют
+    ТОЛЬКО в owner-уведомлении @GEShtrafbot — существующее уведомление в
+    операторский чат (TelegramNotificationService/
+    FineNotificationCoordinator) их не получает: _FakeClient.send_message
+    здесь даже не принимает buttons, а текст не содержит "💳"."""
     client = _FakeClient()
     service = await _started_service(client)
 
@@ -107,22 +115,8 @@ async def test_notify_operator_message_unaffected_by_client_bot_cta_block():
 
     assert len(client.sent_messages) == 1
     _, text, kwargs = client.sent_messages[0]
-    assert CTA_TEXT_BLOCK not in text
     assert "💳" not in text
-    # Тот же самый эталонный текст, что и в
-    # test_notify_single_event_produces_expected_message_format — ничего
-    # не добавилось и не изменилось.
-    assert text == (
-        "🚨 Обнаружен новый опубликованный штраф\n"
-        "\n"
-        "Автомобиль: B957MA09\n"
-        "Дата штрафа: 06.08.2026\n"
-        "Срок оплаты: 20.08.2026\n"
-        "Статус вручения: Не вручено\n"
-        "\n"
-        f"🔗 [Открыть источник]({_SOURCE_URL})"
-    )
-    assert kwargs["parse_mode"] == "md"
+    assert "buttons" not in kwargs
 
 
 async def test_notify_omits_missing_optional_fields():
@@ -132,8 +126,8 @@ async def test_notify_omits_missing_optional_fields():
     await service.notify([_event(due_date=None)])
 
     _, text, _ = client.sent_messages[0]
-    assert "Срок оплаты" not in text
-    assert "Дата штрафа: 06.08.2026" in text
+    assert "Оплатить до" not in text
+    assert "📅 Дата протокола: 06.08.2026" in text
 
 
 async def test_notify_includes_telegram_line_right_after_car_number():
@@ -148,12 +142,80 @@ async def test_notify_includes_telegram_line_right_after_car_number():
         "\n"
         "Автомобиль: B957MA09\n"
         "Telegram: @ivan_petrov\n"
-        "Дата штрафа: 06.08.2026\n"
-        "Срок оплаты: 20.08.2026\n"
-        "Статус вручения: Не вручено\n"
+        "📄 Штраф №: AB123456\n"
+        "📅 Дата протокола: 06.08.2026\n"
+        "⏳ Оплатить до: 20.08.2026\n"
+        "📬 Статус вручения: Не вручено\n"
         "\n"
         f"🔗 [Открыть источник]({_SOURCE_URL})"
     )
+
+
+# ---- format_fine_block: расширенные поля (см. задачу про новый формат
+# уведомлений) — общая точка для операторского и клиентских сообщений ----
+
+
+def test_format_fine_block_prefers_violation_date_over_penalty_date():
+    event = _event(violation_date=date(2026, 8, 5), penalty_date=date(2026, 8, 6))
+
+    text = format_fine_block(event)
+
+    assert "📅 Дата нарушения: 05.08.2026" in text
+    assert "Дата протокола" not in text  # protocolDate подавлен, когда есть violationDate
+
+
+def test_format_fine_block_falls_back_to_penalty_date_when_violation_date_missing():
+    """Старые detected_fines (миграция, violation_date ещё NULL) — не
+    остаются совсем без даты, но и не выдают protocolDate за дату
+    нарушения (см. "не смешивать")."""
+    event = _event(violation_date=None, penalty_date=date(2026, 8, 6))
+
+    text = format_fine_block(event)
+
+    assert "📅 Дата протокола: 06.08.2026" in text
+    assert "Дата нарушения" not in text
+
+
+def test_format_fine_block_includes_place_and_violation_description():
+    event = _event(place="Test place", violation_description="Test violation")
+
+    text = format_fine_block(event)
+
+    assert "📍 Место: Test place" in text
+    assert "📝 Нарушение: Test violation" in text
+
+
+def test_format_fine_block_omits_place_and_violation_description_when_absent():
+    event = _event(place=None, violation_description=None)
+
+    text = format_fine_block(event)
+
+    assert "📍 Место" not in text
+    assert "📝 Нарушение" not in text
+
+
+def test_format_fine_block_formats_whole_amount_without_trailing_zeros():
+    event = _event(amount=100.0)
+
+    text = format_fine_block(event)
+
+    assert "💰 Сумма: 100 GEL" in text
+
+
+def test_format_fine_block_formats_fractional_amount():
+    event = _event(amount=100.5)
+
+    text = format_fine_block(event)
+
+    assert "💰 Сумма: 100.5 GEL" in text
+
+
+def test_format_fine_block_omits_amount_when_absent():
+    event = _event(amount=None)
+
+    text = format_fine_block(event)
+
+    assert "Сумма" not in text
 
 
 async def test_notify_omits_telegram_line_when_car_owner_display_is_none():

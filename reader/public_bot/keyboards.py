@@ -200,13 +200,12 @@ def trusted_stop_confirm_keyboard(task_id: int, *, label: str) -> list[list[Butt
 
 
 _PAYMENT_HELP_BUTTON_LABEL = "💳 Оплатить в рублях"
-_INSURANCE_BUTTON_LABEL = "🛡 Оформить страховку"
+_INSURANCE_BUTTON_LABEL = "🚗 ОСАГО Грузии"
 
 
 def owner_fine_cta_buttons(contact_username: str) -> list[list[Button]]:
-    """Коммерческий CTA под owner-уведомлением о новом штрафе (см.
-    reader/public_bot/delivery_texts.py::CTA_TEXT_BLOCK) — ТОЛЬКО owner,
-    trusted_operator и операторский чат этих кнопок не получают. Обе
+    """Коммерческий CTA под owner-уведомлением о новом штрафе — ТОЛЬКО
+    owner, trusted_operator и операторский чат этих кнопок не получают. Обе
     кнопки — один ряд (утверждённый макет), обе ведут на одну и ту же
     destination.
 

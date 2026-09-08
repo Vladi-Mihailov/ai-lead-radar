@@ -41,10 +41,90 @@ def test_parses_successful_response_with_results():
     assert first.due_date == date(2026, 8, 20)
     assert first.delivered_status == "Вручено"  # activeDate заполнен
     assert first.raw_data["protocolNo"] == "AB123456"
+    assert first.violation_date == date(2026, 8, 5)
+    assert first.amount == 100.0
+    assert first.place == "Test place"
+    assert first.violation_description == "Test violation"
 
     second = records[1]
     assert second.external_fine_id == "AB999999"
     assert second.delivered_status == "Не вручено"  # activeDate = null
+
+
+# ---- расширенные поля (violationDate/protocolAmount/protocolPlace/
+# protocolLawDescription) — присутствуют в сыром ответе police.ge, но
+# раньше не сохранялись как typed fields (только внутри raw_data), см.
+# задачу про новый формат уведомлений. ----
+
+
+def test_parser_extracts_violation_date():
+    raw = _load("police_ge_success.json")
+
+    [record, _] = parse_search_response(raw, car_number="B957MA09")
+
+    assert record.violation_date == date(2026, 8, 5)
+
+
+def test_parser_extracts_amount():
+    raw = _load("police_ge_success.json")
+
+    [record, _] = parse_search_response(raw, car_number="B957MA09")
+
+    assert record.amount == 100.0
+
+
+def test_parser_extracts_place():
+    raw = _load("police_ge_success.json")
+
+    [record, _] = parse_search_response(raw, car_number="B957MA09")
+
+    assert record.place == "Test place"
+
+
+def test_parser_extracts_violation_description():
+    raw = _load("police_ge_success.json")
+
+    [record, _] = parse_search_response(raw, car_number="B957MA09")
+
+    assert record.violation_description == "Test violation"
+
+
+def test_extended_fields_are_none_when_absent_not_invented():
+    """"Ничего не придумывать, если поле отсутствует" — entry без
+    violationDate/protocolAmount/protocolPlace/protocolLawDescription
+    должен дать None, а не выдуманное значение."""
+    entry = {"protocolAuto": "AA001AA", "protocolNo": "X1"}
+    [record] = parse_search_response(
+        {"success": True, "data": {"results": [entry]}}, car_number="AA001AA"
+    )
+
+    assert record.violation_date is None
+    assert record.amount is None
+    assert record.place is None
+    assert record.violation_description is None
+
+
+def test_amount_extraction_does_not_change_fingerprint():
+    """Критично для backward compatibility (см. задачу про безопасную
+    миграцию): compute_fingerprint должен получать сырое protocolAmount
+    (как и раньше), а не преобразованное в float record.amount — иначе
+    fingerprint уже сохранённых detected_fines изменился бы, и все старые
+    штрафы "нашлись" бы заново при следующей проверке."""
+    entry = {
+        "protocolAuto": "AA001AA",
+        "protocolNo": "X1",
+        "violationDate": "2026-08-05",
+        "protocolAmount": 100,
+    }
+    [record] = parse_search_response(
+        {"success": True, "data": {"results": [entry]}}, car_number="AA001AA"
+    )
+
+    expected_fingerprint = compute_fingerprint(
+        external_fine_id="X1", violation_date=date(2026, 8, 5), amount=100,
+    )
+    assert record.fingerprint == expected_fingerprint
+    assert record.amount == 100.0  # typed field — float, но fingerprint не затронут
 
 
 def test_parses_empty_results_as_empty_list():

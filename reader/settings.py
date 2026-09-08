@@ -285,8 +285,8 @@ class PublicBotSettings(BaseModel):
     в config.yaml, синхронизировать их вручную обязан тот, кто редактирует
     config.
 
-    payment_help_contact_username — destination коммерческого CTA-блока
-    ("💳 Оплатить в рублях"/"🛡 Оформить страховку") в owner-уведомлении о
+    payment_help_contact_username — destination коммерческих CTA-кнопок
+    ("💳 Оплатить в рублях"/"🚗 ОСАГО Грузии") в owner-уведомлении о
     новом штрафе (см. reader/public_bot/delivery_texts.py,
     reader/public_bot/keyboards.py::owner_fine_cta_buttons) — БЕЗ ведущего
     "@" (тот же приём, что и bot_username в

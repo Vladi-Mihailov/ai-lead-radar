@@ -45,10 +45,25 @@ def compute_fingerprint(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _parse_amount(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _parse_entry(entry: dict[str, Any], *, fallback_car_number: str) -> ParsedFineRecord:
     external_fine_id = entry.get("protocolNo")
     violation_date = _parse_date(entry.get("violationDate"))
-    amount = entry.get("protocolAmount")
+    # raw_amount (не _parse_amount(raw_amount)!) идёт в compute_fingerprint —
+    # менять на что-либо, кроме сырого JSON-значения, нельзя: это изменило
+    # бы fingerprint уже сохранённых detected_fines и вызвало бы повторную
+    # "находку" всех старых штрафов при следующей проверке (см. задачу про
+    # безопасную миграцию/backward compatibility). amount (типизированное
+    # float-поле для показа клиенту) вычисляется отдельно, ниже.
+    raw_amount = entry.get("protocolAmount")
     delivered_date = _parse_date(entry.get("activeDate"))
 
     return ParsedFineRecord(
@@ -60,9 +75,13 @@ def _parse_entry(entry: dict[str, Any], *, fallback_car_number: str) -> ParsedFi
         fingerprint=compute_fingerprint(
             external_fine_id=external_fine_id,
             violation_date=violation_date,
-            amount=amount,
+            amount=raw_amount,
         ),
         raw_data=entry,
+        violation_date=violation_date,
+        amount=_parse_amount(raw_amount),
+        place=entry.get("protocolPlace") or None,
+        violation_description=entry.get("protocolLawDescription") or None,
     )
 
 

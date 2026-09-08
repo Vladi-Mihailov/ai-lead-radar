@@ -32,23 +32,58 @@ def _format_date(value: date | None) -> str | None:
     return value.strftime("%d.%m.%Y") if value else None
 
 
+def _format_amount(value: float | None) -> str | None:
+    """"100 GEL"/"100.5 GEL" — без лишних ".0" (см. задачу про форматирование
+    суммы), но не через "%g" (риск научной нотации для крупных сумм)."""
+    if value is None:
+        return None
+    text = f"{value:.2f}".rstrip("0").rstrip(".")
+    return f"{text} GEL"
+
+
 def format_fine_block(event: NewFineEvent) -> str:
     """Публичная (без ведущего "_") — переиспользуется
     reader/public_bot/delivery_texts.py для клиентских уведомлений (см.
-    design report Stage 4), чтобы не заводить вторую реализацию
-    форматирования тех же полей штрафа для другого канала доставки."""
+    design report Stage 4 и новый расширенный формат уведомлений), чтобы не
+    заводить вторую реализацию форматирования тех же полей штрафа для
+    другого канала доставки. Каждая строка — опциональна (пропускается,
+    если поле отсутствует, включая старые detected_fines без новых колонок,
+    см. миграцию DetectedFineRepository — доставка таких штрафов не должна
+    падать, просто эти строки не показываются)."""
     lines = []
 
-    penalty_date = _format_date(event.penalty_date)
-    if penalty_date:
-        lines.append(f"Дата штрафа: {penalty_date}")
+    if event.external_fine_id:
+        lines.append(f"📄 Штраф №: {event.external_fine_id}")
+
+    violation_date = _format_date(event.violation_date)
+    if violation_date:
+        lines.append(f"📅 Дата нарушения: {violation_date}")
+    else:
+        # violationDate/protocolDate — НЕ смешивать (см. задачу): пустой
+        # violation_date не подставляем сюда protocolDate под тем же
+        # лейблом. Но для старых detected_fines (миграция, violation_date
+        # ещё NULL) полностью скрывать дату тоже не нужно — показываем
+        # именно "дату протокола" под собственным честным лейблом.
+        penalty_date = _format_date(event.penalty_date)
+        if penalty_date:
+            lines.append(f"📅 Дата протокола: {penalty_date}")
+
+    amount = _format_amount(event.amount)
+    if amount:
+        lines.append(f"💰 Сумма: {amount}")
+
+    if event.place:
+        lines.append(f"📍 Место: {event.place}")
+
+    if event.violation_description:
+        lines.append(f"📝 Нарушение: {event.violation_description}")
 
     due_date = _format_date(event.due_date)
     if due_date:
-        lines.append(f"Срок оплаты: {due_date}")
+        lines.append(f"⏳ Оплатить до: {due_date}")
 
     if event.delivered_status:
-        lines.append(f"Статус вручения: {event.delivered_status}")
+        lines.append(f"📬 Статус вручения: {event.delivered_status}")
 
     return "\n".join(lines)
 

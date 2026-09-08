@@ -17,9 +17,29 @@ CREATE TABLE IF NOT EXISTS detected_fines (
     raw_data              TEXT NOT NULL,
     first_detected_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_seen_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    notification_sent_at  TIMESTAMP
+    notification_sent_at  TIMESTAMP,
+    violation_date        TEXT,
+    amount                REAL,
+    place                 TEXT,
+    violation_description TEXT
 )
 """
+
+# CREATE TABLE IF NOT EXISTS не добавляет колонки в уже существующую
+# таблицу — для БД, созданных до появления расширенного fine block (см.
+# design report про новый формат уведомлений), добавляем их явно при
+# открытии (тот же приём, что и FineMonitoringTaskRepository.
+# _migrate_missing_columns), без удаления/пересоздания БД. Все 4 — NULL по
+# умолчанию для уже существующих строк: ни fingerprint (см. parser.py —
+# считается по сырому protocolAmount, не по этому типизированному полю),
+# ни delivery idempotency (detected_fine_id/subscription/recipient_role)
+# этой миграцией не затрагиваются — старые штрафы не рассылаются повторно.
+_COLUMN_MIGRATIONS = {
+    "violation_date": "ALTER TABLE detected_fines ADD COLUMN violation_date TEXT",
+    "amount": "ALTER TABLE detected_fines ADD COLUMN amount REAL",
+    "place": "ALTER TABLE detected_fines ADD COLUMN place TEXT",
+    "violation_description": "ALTER TABLE detected_fines ADD COLUMN violation_description TEXT",
+}
 
 _UNIQUE_INDEX = """
 CREATE UNIQUE INDEX IF NOT EXISTS idx_detected_fines_dedup
@@ -38,17 +58,20 @@ CREATE INDEX IF NOT EXISTS idx_detected_fines_car_number
 _INSERT = """
 INSERT INTO detected_fines (
     monitoring_task_id, car_number, external_fine_id, fingerprint,
-    penalty_date, due_date, delivered_status, raw_data
+    penalty_date, due_date, delivered_status, raw_data,
+    violation_date, amount, place, violation_description
 ) VALUES (
     :monitoring_task_id, :car_number, :external_fine_id, :fingerprint,
-    :penalty_date, :due_date, :delivered_status, :raw_data
+    :penalty_date, :due_date, :delivered_status, :raw_data,
+    :violation_date, :amount, :place, :violation_description
 )
 """
 
 _SELECT_FIELDS = """
     id, monitoring_task_id, car_number, external_fine_id, fingerprint,
     penalty_date, due_date, delivered_status, raw_data,
-    first_detected_at, last_seen_at, notification_sent_at
+    first_detected_at, last_seen_at, notification_sent_at,
+    violation_date, amount, place, violation_description
 """
 
 _SELECT_BY_ID = f"SELECT {_SELECT_FIELDS} FROM detected_fines WHERE id = ?"
@@ -94,6 +117,10 @@ def _row_to_fine(row) -> DetectedFine:
         first_detected_at,
         last_seen_at,
         notification_sent_at,
+        violation_date,
+        amount,
+        place,
+        violation_description,
     ) = row
 
     return DetectedFine(
@@ -111,6 +138,10 @@ def _row_to_fine(row) -> DetectedFine:
         notification_sent_at=(
             datetime.fromisoformat(notification_sent_at) if notification_sent_at else None
         ),
+        violation_date=date.fromisoformat(violation_date) if violation_date else None,
+        amount=amount,
+        place=place,
+        violation_description=violation_description,
     )
 
 
@@ -136,9 +167,22 @@ class DetectedFineRepository:
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute(_SCHEMA)
+        self._migrate_missing_columns()
         self._conn.execute(_UNIQUE_INDEX)
         self._conn.execute(_CAR_NUMBER_INDEX)
         self._conn.commit()
+
+    def _migrate_missing_columns(self) -> None:
+        """CREATE TABLE IF NOT EXISTS не добавляет колонки в уже
+        существующую таблицу — для БД, созданных до появления расширенного
+        fine block, добавляем недостающие явно, без удаления/пересоздания БД
+        (тот же приём, что и FineMonitoringTaskRepository)."""
+        existing_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(detected_fines)")
+        }
+        for column, statement in _COLUMN_MIGRATIONS.items():
+            if column not in existing_columns:
+                self._conn.execute(statement)
 
     def get_by_fingerprint(self, monitoring_task_id: int, fingerprint: str) -> DetectedFine | None:
         row = self._conn.execute(
@@ -181,6 +225,10 @@ class DetectedFineRepository:
         due_date: date | None,
         delivered_status: str | None,
         raw_data: str,
+        violation_date: date | None = None,
+        amount: float | None = None,
+        place: str | None = None,
+        violation_description: str | None = None,
     ) -> DetectedFine:
         try:
             cursor = self._conn.execute(
@@ -194,6 +242,10 @@ class DetectedFineRepository:
                     "due_date": due_date.isoformat() if due_date else None,
                     "delivered_status": delivered_status,
                     "raw_data": raw_data,
+                    "violation_date": violation_date.isoformat() if violation_date else None,
+                    "amount": amount,
+                    "place": place,
+                    "violation_description": violation_description,
                 },
             )
         except sqlite3.IntegrityError:

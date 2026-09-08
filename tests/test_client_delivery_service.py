@@ -24,7 +24,6 @@ from reader.public_bot.delivery_service import (  # noqa: E402
     RETRY_BACKOFF,
     ClientDeliveryService,
 )
-from reader.public_bot.delivery_texts import CTA_TEXT_BLOCK  # noqa: E402
 from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
 
 _CTA_CONTACT_USERNAME = "tplgee"
@@ -90,12 +89,17 @@ class _Fixture:
         )
         return task.id
 
-    def make_fine(self, task_id, car_number, *, fingerprint="fp-1") -> int:
+    def make_fine(
+        self, task_id, car_number, *, fingerprint="fp-1",
+        violation_date=None, amount=None, place=None, violation_description=None,
+    ) -> int:
         fine = self.detected_fine_repository.create(
             monitoring_task_id=task_id, car_number=car_number,
             external_fine_id="AB1", fingerprint=fingerprint,
             penalty_date=date(2026, 8, 6), due_date=date(2026, 8, 20),
             delivered_status="Не вручено", raw_data="{}",
+            violation_date=violation_date, amount=amount,
+            place=place, violation_description=violation_description,
         )
         return fine.id
 
@@ -435,10 +439,12 @@ async def test_flood_wait_recipient_is_retried_on_next_tick_respecting_backoff(t
         fx.close()
 
 
-# ---- коммерческий CTA-блок: ТОЛЬКО owner, destination из config ----
+# ---- коммерческие CTA-кнопки: ТОЛЬКО owner, destination из config, БЕЗ
+# отдельного рекламного текста под ними (см. задачу про новый формат
+# уведомлений) ----
 
 
-async def test_owner_notification_includes_cta_block(tmp_path):
+async def test_owner_notification_has_exactly_two_cta_buttons_no_promo_text(tmp_path):
     now = _now()
     fx = _Fixture(tmp_path)
     try:
@@ -454,8 +460,13 @@ async def test_owner_notification_includes_cta_block(tmp_path):
 
         assert len(fx.sender.sent_full) == 1
         _, text, buttons = fx.sender.sent_full[0]
-        assert CTA_TEXT_BLOCK in text
         assert buttons is not None
+        assert len(buttons) == 1
+        assert len(buttons[0]) == 2
+        # Никакого отдельного рекламного текста под кнопками — только сам
+        # информационный блок (см. задачу "не добавлять отдельный
+        # рекламный текст под кнопками").
+        assert "Нужна помощь с оплатой" not in text
     finally:
         fx.close()
 
@@ -476,14 +487,15 @@ async def test_owner_cta_buttons_both_point_to_configured_contact(tmp_path):
 
         _, _, buttons = fx.sender.sent_full[0]
         # Один ряд, обе кнопки рядом — утверждённый макет
-        # ([💳 Оплатить в рублях] [🛡 Оформить страховку]).
+        # ([💳 Оплатить в рублях] [🚗 ОСАГО Грузии]).
         assert len(buttons) == 1
         assert len(buttons[0]) == 2
         expected_url = f"https://t.me/{_CTA_CONTACT_USERNAME}"
         for button in buttons[0]:
             assert button.url == expected_url
+        assert expected_url == "https://t.me/tplgee"
         labels = [button.text for button in buttons[0]]
-        assert labels == ["💳 Оплатить в рублях", "🛡 Оформить страховку"]
+        assert labels == ["💳 Оплатить в рублях", "🚗 ОСАГО Грузии"]
     finally:
         fx.close()
 
@@ -551,7 +563,7 @@ async def test_trusted_operator_notification_has_no_cta_block(tmp_path):
 
         assert len(fx.sender.sent_full) == 1
         _, text, buttons = fx.sender.sent_full[0]
-        assert CTA_TEXT_BLOCK not in text
+        assert "💳" not in text
         assert buttons is None
     finally:
         fx.close()
@@ -580,10 +592,152 @@ async def test_delegated_active_subscription_cta_only_on_owner_recipient(tmp_pat
         by_chat_id = {chat_id: (text, buttons) for chat_id, text, buttons in fx.sender.sent_full}
         owner_text, owner_buttons = by_chat_id[777]
         trusted_text, trusted_buttons = by_chat_id[555]
-        assert CTA_TEXT_BLOCK in owner_text
         assert owner_buttons is not None
-        assert CTA_TEXT_BLOCK not in trusted_text
         assert trusted_buttons is None
+    finally:
+        fx.close()
+
+
+# ---- расширенный fine block в клиентских сообщениях (штраф №/дата
+# нарушения/сумма/место/нарушение/срок оплаты/статус вручения) — см. задачу
+# про новый формат уведомлений ----
+
+
+async def test_owner_message_shows_all_extended_fields_when_present(tmp_path):
+    now = _now()
+    fx = _Fixture(tmp_path)
+    try:
+        task_id = fx.make_task("AA001AA")
+        fx.make_fine(
+            task_id, "AA001AA",
+            violation_date=date(2026, 8, 5), amount=100.0,
+            place="Test place", violation_description="Test violation",
+        )
+        fx.subscription_repository.create(
+            monitoring_task_id=task_id, car_number="AA001AA",
+            telegram_user_id=777, telegram_chat_id=777, telegram_username="owner",
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+        )
+
+        await fx.service.run_once(now=now)
+
+        _, text, _ = fx.sender.sent_full[0]
+        assert "🚨 Обнаружен новый штраф" in text
+        assert "🚗 Автомобиль: AA001AA" in text
+        assert "📄 Штраф №: AB1" in text
+        assert "📅 Дата нарушения: 05.08.2026" in text
+        assert "💰 Сумма: 100 GEL" in text
+        assert "📍 Место: Test place" in text
+        assert "📝 Нарушение: Test violation" in text
+        assert "⏳ Оплатить до: 20.08.2026" in text
+        assert "📬 Статус вручения: Не вручено" in text
+    finally:
+        fx.close()
+
+
+async def test_owner_message_omits_missing_optional_extended_fields(tmp_path):
+    """Ничего не выдумываем — если place/violation_description/amount
+    отсутствуют (например, старый detected_fines до миграции), строка
+    просто не показывается, доставка не падает."""
+    now = _now()
+    fx = _Fixture(tmp_path)
+    try:
+        task_id = fx.make_task("AA001AA")
+        fx.make_fine(task_id, "AA001AA")  # violation_date/amount/place/description = None
+        fx.subscription_repository.create(
+            monitoring_task_id=task_id, car_number="AA001AA",
+            telegram_user_id=777, telegram_chat_id=777, telegram_username="owner",
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+        )
+
+        await fx.service.run_once(now=now)
+
+        _, text, _ = fx.sender.sent_full[0]
+        assert "Дата нарушения" not in text
+        assert "Сумма" not in text
+        assert "Место" not in text
+        assert "Нарушение" not in text
+        # Штраф №/срок оплаты/статус вручения — обычные существующие поля,
+        # они всё равно есть у этого штрафа.
+        assert "📄 Штраф №: AB1" in text
+        assert "⏳ Оплатить до: 20.08.2026" in text
+    finally:
+        fx.close()
+
+
+async def test_owner_message_uses_violation_date_not_protocol_date(tmp_path):
+    now = _now()
+    fx = _Fixture(tmp_path)
+    try:
+        task_id = fx.make_task("AA001AA")
+        fx.make_fine(task_id, "AA001AA", violation_date=date(2026, 8, 5))
+        fx.subscription_repository.create(
+            monitoring_task_id=task_id, car_number="AA001AA",
+            telegram_user_id=777, telegram_chat_id=777, telegram_username="owner",
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+        )
+
+        await fx.service.run_once(now=now)
+
+        _, text, _ = fx.sender.sent_full[0]
+        # make_fine() всегда пишет penalty_date=06.08.2026 (см. _Fixture) —
+        # при наличии violation_date дата протокола не должна дублироваться.
+        assert "📅 Дата нарушения: 05.08.2026" in text
+        assert "06.08.2026" not in text
+    finally:
+        fx.close()
+
+
+async def test_owner_message_formats_amount_without_trailing_zeros(tmp_path):
+    now = _now()
+    fx = _Fixture(tmp_path)
+    try:
+        task_id = fx.make_task("AA001AA")
+        fx.make_fine(task_id, "AA001AA", amount=100.0)
+        fx.subscription_repository.create(
+            monitoring_task_id=task_id, car_number="AA001AA",
+            telegram_user_id=777, telegram_chat_id=777, telegram_username="owner",
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+        )
+
+        await fx.service.run_once(now=now)
+
+        _, text, _ = fx.sender.sent_full[0]
+        assert "💰 Сумма: 100 GEL" in text
+        assert "100.0 GEL" not in text
+    finally:
+        fx.close()
+
+
+async def test_trusted_operator_message_has_expanded_fine_block(tmp_path):
+    now = _now()
+    fx = _Fixture(tmp_path)
+    try:
+        task_id = fx.make_task("AA001AA")
+        fx.make_fine(
+            task_id, "AA001AA",
+            violation_date=date(2026, 8, 5), amount=100.0,
+            place="Test place", violation_description="Test violation",
+        )
+        fx.subscription_repository.create_pending_claim(
+            monitoring_task_id=task_id, car_number="AA001AA",
+            owner_username_hint="unknown_person",
+            created_by_telegram_user_id=555, created_by_telegram_chat_id=555,
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+            claim_token="tok-1", claim_token_expires_at=now + timedelta(days=7),
+        )
+
+        await fx.service.run_once(now=now)
+
+        _, text, buttons = fx.sender.sent_full[0]
+        assert "📄 Штраф №: AB1" in text
+        assert "📅 Дата нарушения: 05.08.2026" in text
+        assert "💰 Сумма: 100 GEL" in text
+        assert "📍 Место: Test place" in text
+        assert "📝 Нарушение: Test violation" in text
+        assert "⏳ Оплатить до: 20.08.2026" in text
+        assert "📬 Статус вручения: Не вручено" in text
+        assert buttons is None  # никаких коммерческих кнопок trusted_operator
     finally:
         fx.close()
 

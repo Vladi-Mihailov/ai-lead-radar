@@ -58,6 +58,17 @@ class DetectedFine:
     first_detected_at: datetime
     last_seen_at: datetime
     notification_sent_at: datetime | None
+    # Расширенный fine block (см. design report про новый формат
+    # уведомлений) — присутствуют в сыром ответе police.ge, но раньше не
+    # сохранялись отдельно (только внутри raw_data). Default None — и для
+    # существующих вызовов DetectedFine(...) без них, и для старых строк
+    # detected_fines, где новые колонки NULL (см. миграцию в
+    # DetectedFineRepository) — доставка таких штрафов не должна падать,
+    # просто эти строки в сообщении не показываются (см. format_fine_block).
+    violation_date: date | None = None
+    amount: float | None = None
+    place: str | None = None
+    violation_description: str | None = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +94,14 @@ class ParsedFineRecord:
     delivered_status: str
     fingerprint: str
     raw_data: dict[str, Any]
+    # Расширенные поля police.ge (violationDate/protocolAmount/protocolPlace/
+    # protocolLawDescription) — см. DetectedFine про то же самое. Default
+    # None сохраняет существующие вызовы ParsedFineRecord(...) в тестах без
+    # изменений.
+    violation_date: date | None = None
+    amount: float | None = None
+    place: str | None = None
+    violation_description: str | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +124,14 @@ class NewFineEvent:
     penalty_date: date | None
     due_date: date | None
     delivered_status: str | None
+    # Расширенный fine block (см. DetectedFine/ParsedFineRecord) — те же 4
+    # поля, прокинутые через from_detected_fine(), чтобы
+    # format_fine_block() могло их показать и оператору, и клиенту без
+    # второй реализации форматирования.
+    violation_date: date | None = None
+    amount: float | None = None
+    place: str | None = None
+    violation_description: str | None = None
     # Готовая для показа строка вида "@ivan_petrov"/"Иван Петров (@ivan_petrov)"/
     # "не найден"/"@ivan_petrov, @another_user" (несколько владельцев одного
     # car_number — валидное состояние, см. format_car_owner_display) —
@@ -131,6 +158,10 @@ class NewFineEvent:
             penalty_date=fine.penalty_date,
             due_date=fine.due_date,
             delivered_status=fine.delivered_status,
+            violation_date=fine.violation_date,
+            amount=fine.amount,
+            place=fine.place,
+            violation_description=fine.violation_description,
             car_owner_display=car_owner_display,
         )
 

@@ -356,6 +356,145 @@ def test_data_persists_across_repository_reopen(tmp_path):
 # ---- list_by_car_number (client delivery poller, см. design report Stage 4) ----
 
 
+# ---- расширенные поля (violation_date/amount/place/violation_description)
+# и безопасная additive-миграция — см. задачу про новый формат уведомлений ----
+
+
+def test_create_persists_extended_fields(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(tmp_path, db_path)
+
+    repo = DetectedFineRepository(db_path)
+    try:
+        fine = repo.create(
+            monitoring_task_id=task_id,
+            car_number="B957MA09",
+            external_fine_id="AB123456",
+            fingerprint="fp-ext",
+            penalty_date=date(2026, 8, 6),
+            due_date=date(2026, 8, 20),
+            delivered_status="Вручено",
+            raw_data="{}",
+            violation_date=date(2026, 8, 5),
+            amount=100.0,
+            place="Test place",
+            violation_description="Test violation",
+        )
+
+        assert fine.violation_date == date(2026, 8, 5)
+        assert fine.amount == 100.0
+        assert fine.place == "Test place"
+        assert fine.violation_description == "Test violation"
+
+        found = repo.get_by_fingerprint(task_id, "fp-ext")
+        assert found == fine
+    finally:
+        repo.close()
+
+
+def test_extended_fields_default_to_none_when_not_provided(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(tmp_path, db_path)
+
+    repo = DetectedFineRepository(db_path)
+    try:
+        fine = repo.create(
+            monitoring_task_id=task_id,
+            car_number="B957MA09",
+            external_fine_id="AB123456",
+            fingerprint="fp-no-ext",
+            penalty_date=None,
+            due_date=None,
+            delivered_status=None,
+            raw_data="{}",
+        )
+
+        assert fine.violation_date is None
+        assert fine.amount is None
+        assert fine.place is None
+        assert fine.violation_description is None
+    finally:
+        repo.close()
+
+
+def test_migration_adds_extended_columns_to_legacy_table_preserving_rows(tmp_path):
+    """Legacy (до появления расширенного fine block) detected_fines — без
+    violation_date/amount/place/violation_description вовсе. Открытие
+    репозитория должно добавить эти колонки (ALTER TABLE ADD COLUMN,
+    NULL по умолчанию) БЕЗ потери уже существующих строк — см. задачу
+    "безопасная additive DB migration без потери существующих
+    detected_fines"."""
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(tmp_path, db_path)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE detected_fines (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                monitoring_task_id    INTEGER NOT NULL REFERENCES fine_monitoring_tasks(id),
+                car_number            TEXT NOT NULL,
+                external_fine_id      TEXT,
+                fingerprint           TEXT NOT NULL,
+                penalty_date          TEXT,
+                due_date              TEXT,
+                delivered_status      TEXT,
+                raw_data              TEXT NOT NULL,
+                first_detected_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                notification_sent_at  TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO detected_fines "
+            "(monitoring_task_id, car_number, external_fine_id, fingerprint, "
+            " penalty_date, due_date, delivered_status, raw_data) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, "B957MA09", "AB123456", "legacy-fp",
+             "2026-08-06", "2026-08-20", "Вручено", '{"protocolNo": "AB123456"}'),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    repo = DetectedFineRepository(db_path)
+    try:
+        legacy = repo.get_by_fingerprint(task_id, "legacy-fp")
+
+        assert legacy is not None  # старая строка не потеряна
+        assert legacy.external_fine_id == "AB123456"
+        assert legacy.penalty_date == date(2026, 8, 6)
+        assert legacy.delivered_status == "Вручено"
+        # Новые колонки — NULL для старой строки, а не выдуманное значение.
+        assert legacy.violation_date is None
+        assert legacy.amount is None
+        assert legacy.place is None
+        assert legacy.violation_description is None
+
+        # Репозиторий по-прежнему может создавать НОВЫЕ строки с новыми
+        # полями после миграции существующей таблицы.
+        fresh = repo.create(
+            monitoring_task_id=task_id,
+            car_number="B957MA09",
+            external_fine_id="AB999999",
+            fingerprint="fresh-fp",
+            penalty_date=date(2026, 9, 1),
+            due_date=date(2026, 9, 20),
+            delivered_status="Не вручено",
+            raw_data="{}",
+            violation_date=date(2026, 8, 31),
+            amount=50.0,
+            place="Another place",
+            violation_description="Another violation",
+        )
+        assert fresh.violation_date == date(2026, 8, 31)
+        assert fresh.amount == 50.0
+    finally:
+        repo.close()
+
+
 def test_list_by_car_number_returns_all_fines_for_that_car(tmp_path):
     db_path = tmp_path / "users.db"
     task_id = _make_task(tmp_path, db_path)

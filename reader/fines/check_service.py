@@ -71,6 +71,10 @@ class FineCheckService:
                     due_date=record.due_date,
                     delivered_status=record.delivered_status,
                     raw_data=json.dumps(record.raw_data, ensure_ascii=False),
+                    violation_date=record.violation_date,
+                    amount=record.amount,
+                    place=record.place,
+                    violation_description=record.violation_description,
                 )
             except sqlite3.IntegrityError:
                 # Конкурентная вставка между get_by_fingerprint() и create() —
