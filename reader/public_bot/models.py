@@ -26,7 +26,17 @@ from typing import Literal
 # user_id (см. design report про trusted-flow) — telegram_user_id/
 # telegram_chat_id у такой строки НЕ заполнены (см. ниже), сама FineMonitoringTask
 # при этом уже создана/продлена и проверяется — ждём только owner claim.
-SubscriptionStatus = Literal["active", "stopped", "expired", "pending_claim"]
+# 'archived' — пользователь явно удалил автомобиль из "Мои авто" (см.
+# design report про car-centric ON/OFF UX: "🗑 Удалить автомобиль") — SOFT
+# delete, а не physical DELETE: client_fine_deliveries ссылается на эту
+# строку по id (см. reader/public_bot/delivery_repository.py), и историю
+# доставок/detected_fines терять нельзя. В отличие от 'stopped' (мониторинг
+# временно выключен, автомобиль ОСТАЁТСЯ в "Мои авто" как OFF) — 'archived'
+# полностью убирает автомобиль из списка; повторное "➕ Добавить авто" на
+# тот же номер создаёт НОВУЮ подписку (см. SubscriptionService._create_or_
+# update_subscription — ищет активную подписку, archived под это не
+# попадает, как и stopped/expired).
+SubscriptionStatus = Literal["active", "stopped", "expired", "pending_claim", "archived"]
 
 
 @dataclass(frozen=True)

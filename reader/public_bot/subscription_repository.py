@@ -199,6 +199,33 @@ WHERE id = :id
   AND status IN ('active', 'pending_claim')
 """
 
+# Реактивация OFF -> ON (см. design report про car-centric "📋 Мои авто" —
+# "▶️ Включить мониторинг"): ТОЛЬКО из status='stopped' — попытка
+# реактивировать что-либо ещё (active/expired/pending_claim/archived) не
+# должна тихо "получиться" через этот путь (expired требует НОВОГО периода
+# через "➕ Добавить авто", а не одностороннего flip статуса, см. design:
+# "не отображать expired как OFF автоматически"). stopped_at = NULL — та
+# же логика, что и у первого создания (NULL, пока не остановлена).
+# start_date/end_date вычисляет вызывающий код (SubscriptionService.
+# turn_on_car) — свежий период, если старый end_date уже прошёл, иначе
+# оставшееся время без изменений.
+_REACTIVATE = """
+UPDATE fine_monitoring_subscriptions
+SET status = 'active', start_date = :start_date, end_date = :end_date,
+    stopped_at = NULL, updated_at = CURRENT_TIMESTAMP
+WHERE id = :id AND status = 'stopped'
+"""
+
+# Soft delete (см. SubscriptionStatus.archived) — разрешено из ЛЮБОГО
+# статуса, кроме уже archived (идемпотентно: повторное удаление не должно
+# считаться ошибкой, но и не должно сбрасывать updated_at повторно без
+# необходимости).
+_ARCHIVE = """
+UPDATE fine_monitoring_subscriptions
+SET status = 'archived', updated_at = CURRENT_TIMESTAMP
+WHERE id = :id AND status != 'archived'
+"""
+
 _EXPIRE_ELAPSED = """
 UPDATE fine_monitoring_subscriptions
 SET status = 'expired', updated_at = CURRENT_TIMESTAMP
@@ -790,6 +817,39 @@ class FineSubscriptionRepository:
         if row is None or row[0] is None:
             return None
         return date.fromisoformat(row[0])
+
+    def reactivate(self, subscription_id: int, *, start_date: date, end_date: date) -> bool:
+        """OFF -> ON (см. _REACTIVATE) — False, если подписка не найдена
+        или уже не 'stopped' (не тот же гоночный сценарий, что и у
+        create(): если у этого (monitoring_task_id, telegram_user_id) уже
+        каким-то образом существует ДРУГАЯ активная строка — например,
+        пользователь заново прошёл "➕ Добавить авто" на тот же номер, пока
+        эта была stopped, — партиционный unique-индекс (см.
+        idx_fine_subscriptions_active_user_task) отклонит UPDATE
+        IntegrityError'ом; ловим и возвращаем False, а не роняем вызывающий
+        код — reactivation просто "не удалась", как и любой другой отказ."""
+        try:
+            cursor = self._conn.execute(
+                _REACTIVATE,
+                {
+                    "id": subscription_id,
+                    "start_date": start_date.isoformat(),
+                    "end_date": end_date.isoformat(),
+                },
+            )
+        except sqlite3.IntegrityError:
+            self._conn.rollback()
+            return False
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def archive(self, subscription_id: int) -> bool:
+        """Soft delete (см. SubscriptionStatus.archived) — historical
+        detected_fines/client_fine_deliveries НЕ трогаются, только
+        status этой строки. False — подписка не найдена или уже archived."""
+        cursor = self._conn.execute(_ARCHIVE, {"id": subscription_id})
+        self._conn.commit()
+        return cursor.rowcount > 0
 
     def expire_elapsed(self, *, today: date) -> int:
         """Массово переводит в status='expired' все ещё 'active' подписки

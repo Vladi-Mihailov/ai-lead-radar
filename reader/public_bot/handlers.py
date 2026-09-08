@@ -17,19 +17,25 @@ from reader.public_bot.conversation import ConversationController
 from reader.public_bot.keyboards import (
     STOP_NO,
     add_client_decision_keyboard,
+    car_delete_confirm_keyboard,
+    car_detail_keyboard,
     check_now_options_keyboard,
     decode_add_client_decision_callback,
     decode_check_now_callback,
+    decode_my_car_delete_callback,
+    decode_my_car_delete_cancel_callback,
+    decode_my_car_delete_confirm_callback,
+    decode_my_car_open_callback,
+    decode_my_car_turn_off_callback,
+    decode_my_car_turn_on_callback,
+    decode_my_cars_page_callback,
     decode_period_callback,
-    decode_stop_confirm_callback,
-    decode_stop_pick_callback,
     decode_trusted_stop_confirm_callback,
     decode_trusted_stop_pick_callback,
     decode_trusted_tasks_page_callback,
     main_menu_keyboard,
+    my_cars_page_keyboard,
     period_choice_keyboard,
-    stop_confirm_keyboard,
-    stop_options_keyboard,
     trusted_stop_confirm_keyboard,
     trusted_stop_options_keyboard,
     trusted_tasks_page_keyboard,
@@ -138,17 +144,57 @@ def register(
             await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
-        stop_pick_id = decode_stop_pick_callback(data)
-        if stop_pick_id is not None:
-            reply = controller.handle_stop_pick(stop_pick_id, telegram_user_id=event.sender_id)
+        my_cars_page = decode_my_cars_page_callback(data)
+        if my_cars_page is not None:
+            reply = controller.handle_my_cars_page(my_cars_page, telegram_user_id=event.sender_id)
             await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
-        stop_confirm_id = decode_stop_confirm_callback(data)
-        if stop_confirm_id is not None:
-            reply = controller.handle_stop_confirm(stop_confirm_id, telegram_user_id=event.sender_id)
+        my_car_open = decode_my_car_open_callback(data)
+        if my_car_open is not None:
+            subscription_id, page = my_car_open
+            reply = controller.handle_my_car_open(subscription_id, page, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        my_car_turn_off = decode_my_car_turn_off_callback(data)
+        if my_car_turn_off is not None:
+            subscription_id, page = my_car_turn_off
+            reply = controller.handle_my_car_turn_off(subscription_id, page, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        my_car_turn_on = decode_my_car_turn_on_callback(data)
+        if my_car_turn_on is not None:
+            subscription_id, page = my_car_turn_on
+            reply = controller.handle_my_car_turn_on(subscription_id, page, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        my_car_delete = decode_my_car_delete_callback(data)
+        if my_car_delete is not None:
+            subscription_id, page = my_car_delete
+            reply = controller.handle_my_car_delete_prompt(subscription_id, page, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        my_car_delete_confirm = decode_my_car_delete_confirm_callback(data)
+        if my_car_delete_confirm is not None:
+            subscription_id, page = my_car_delete_confirm
+            reply = controller.handle_my_car_delete_confirm(
+                subscription_id, page, telegram_user_id=event.sender_id,
+            )
             await event.answer()
             await _send_reply(event, reply, prefer_edit=True, is_trusted=is_trusted)
+            return
+
+        my_car_delete_cancel = decode_my_car_delete_cancel_callback(data)
+        if my_car_delete_cancel is not None:
+            subscription_id, page = my_car_delete_cancel
+            reply = controller.handle_my_car_delete_cancel(
+                subscription_id, page, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
         trusted_tasks_page = decode_trusted_tasks_page_callback(data)
@@ -202,24 +248,20 @@ async def _answer_and_send(event, reply, *, is_trusted: bool = False) -> None:
 
 
 async def _send_reply(event, reply, *, prefer_edit: bool = False, is_trusted: bool = False) -> None:
-    """is_trusted — ТОЛЬКО для main_menu_keyboard(include_statistics=...)
-    (см. "📊 Статистика"): единственное место, решающее, показывать ли
-    кнопку статистики в персистентной reply-клавиатуре — вычисляется
-    caller'ом (_on_message/_on_callback) через controller.is_trusted(
-    event.sender_id) один раз на событие."""
+    """is_trusted — ТОЛЬКО для main_menu_keyboard(is_trusted=...) (см.
+    "⛔ Остановить мониторинг"/"📊 Статистика"): единственное место,
+    решающее, показывать ли эти две кнопки в персистентной reply-
+    клавиатуре — вычисляется caller'ом (_on_message/_on_callback) через
+    controller.is_trusted(event.sender_id) один раз на событие."""
     buttons = None
     if reply.show_main_menu:
-        buttons = main_menu_keyboard(include_statistics=is_trusted)
+        buttons = main_menu_keyboard(is_trusted=is_trusted)
     elif reply.show_period_buttons:
         buttons = period_choice_keyboard()
     elif reply.show_add_client_decision_buttons:
         buttons = add_client_decision_keyboard()
     elif reply.check_now_options:
         buttons = check_now_options_keyboard(reply.check_now_options)
-    elif reply.stop_options:
-        buttons = stop_options_keyboard(reply.stop_options)
-    elif reply.stop_confirm_subscription_id is not None:
-        buttons = stop_confirm_keyboard(reply.stop_confirm_subscription_id)
     elif reply.trusted_stop_options:
         buttons = trusted_stop_options_keyboard(reply.trusted_stop_options)
     elif reply.trusted_stop_confirm_task_id is not None:
@@ -229,6 +271,25 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False, is_trusted: bo
     elif reply.trusted_tasks_page is not None:
         buttons = trusted_tasks_page_keyboard(
             page=reply.trusted_tasks_page, total_pages=reply.trusted_tasks_total_pages,
+        )
+    elif reply.my_cars_page_options is not None:
+        # car-centric "📋 Мои авто" (см. design report про переработку
+        # UX) — пустой список ([]) — валидный (см. design: "показать 0 из
+        # N" в принципе не бывает; пустая страница отфильтрована в
+        # ConversationController), но is not None различает "список
+        # автомобилей" от "его вовсе не было в этом ответе".
+        buttons = my_cars_page_keyboard(
+            reply.my_cars_page_options, page=reply.my_cars_page, total_pages=reply.my_cars_total_pages,
+        )
+    elif reply.car_delete_confirm_subscription_id is not None:
+        buttons = car_delete_confirm_keyboard(
+            reply.car_delete_confirm_subscription_id, page=reply.car_delete_confirm_page,
+        )
+    elif reply.car_detail_subscription_id is not None:
+        buttons = car_detail_keyboard(
+            reply.car_detail_subscription_id,
+            monitoring_state=reply.car_detail_monitoring_state,
+            page=reply.car_detail_page,
         )
     elif reply.cta_buttons:
         # Manual "🔎 Проверить сейчас" — коммерческие CTA (см.

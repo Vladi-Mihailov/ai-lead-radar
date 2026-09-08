@@ -170,9 +170,14 @@ async def test_check_now_with_no_cars_shows_empty_message(fx):
     assert reply.text == texts.NO_ACTIONABLE_CARS_TEXT
 
 
-async def test_stop_with_no_cars_shows_empty_message(fx):
+async def test_stop_label_for_ordinary_user_is_safe_fallback(fx):
+    """Старая кнопка "⛔ Остановить мониторинг" убрана из главного меню
+    ОБЫЧНОГО пользователя (см. design report п.8, car-centric ON/OFF её
+    заменяет) — текст, отправленный вручную (например, из старого чата),
+    получает безопасный отказ (главное меню), а не picker/ошибку."""
     reply = await fx.controller.handle_text(texts.STOP_LABEL, chat_id=1, telegram_user_id=1, username=None)
-    assert reply.text == texts.NO_ACTIONABLE_CARS_TEXT
+    assert reply.text == texts.MAIN_MENU_TEXT
+    assert reply.show_main_menu is True
 
 
 # ---- Add Car: username уже известен Telegram'у ----
@@ -338,12 +343,15 @@ async def test_my_cars_shows_only_own_subscriptions(fx):
 
     reply = await fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=10, telegram_user_id=10, username=None)
 
-    assert "AA001AA" in reply.text
-    assert "BB002BB" not in reply.text
-    assert "✅ Активен" in reply.text
+    assert reply.text == texts.MY_CARS_HEADER
+    [(_subscription_id, label)] = reply.my_cars_page_options
+    assert "AA001AA" in label
+    assert "BB002BB" not in label
+    assert "🟢" in label
+    assert "ON" in label
 
 
-async def test_my_cars_shows_expired_label_for_past_end_date(fx):
+async def test_my_cars_shows_expired_state_for_past_end_date(fx):
     task = fx.task_repository.create(
         car_number="AA001AA", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
         telegram_chat_id=10, created_by_user_id=10, monitoring_scope="client_bot",
@@ -356,7 +364,9 @@ async def test_my_cars_shows_expired_label_for_past_end_date(fx):
 
     reply = await fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=10, telegram_user_id=10, username=None)
 
-    assert "⏱ Истёк" in reply.text
+    [(_subscription_id, label)] = reply.my_cars_page_options
+    assert "⏱" in label
+    assert "ИСТЁК" in label
 
 
 # ---- переживание рестарта (переоткрытие БД) ----
@@ -586,13 +596,23 @@ async def test_trusted_my_cars_shows_all_active_tasks_not_subscriptions(trusted_
 
     assert reply.text.startswith(texts.TRUSTED_TASKS_HEADER)
     assert "M295YB196" in reply.text
-    assert texts.MANAGED_CARS_HEADER not in reply.text
+    assert reply.my_cars_page_options is None  # task-level, не car-centric
 
 
-async def test_ordinary_user_my_cars_has_no_managed_section(fx):
+async def test_ordinary_user_my_cars_uses_car_buttons_not_trusted_task_list(fx):
+    """Обычный (не-trusted) пользователь получает car-centric список (см.
+    design report про переработку UX), а не trusted task-level admin —
+    старый MANAGED_CARS_HEADER-раздел упразднён вместе с текстовым
+    "Мои авто" (см. п.8: он относился к УЖЕ неиспользуемой ветке)."""
+    await fx.service.add_car(
+        telegram_user_id=1, telegram_chat_id=1, username="alice",
+        first_name=None, last_name=None, car_number="M295YB196", period_days=30, today=_today(),
+    )
+
     reply = await fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=1, telegram_user_id=1, username=None)
 
-    assert texts.MANAGED_CARS_HEADER not in reply.text
+    assert reply.my_cars_page_options is not None
+    assert reply.trusted_tasks_page is None
 
 
 # ==== 🔎 Проверить сейчас / ⛔ Остановить мониторинг (см. design report Stage 4) ====
@@ -665,48 +685,71 @@ async def test_check_now_shows_existing_fine_found_by_earlier_check(tmp_path):
         fixture.close()
 
 
-async def test_stop_flow_pick_confirm_and_cancel(fx):
+async def test_my_car_turn_off_flow_open_toggle_and_back(fx):
     await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username="alice")
     await fx.controller.handle_text("M295YB196", chat_id=1, telegram_user_id=1, username="alice")
     await fx.controller.handle_period_choice(
         30, chat_id=1, telegram_user_id=1, first_name=None, last_name=None,
     )
 
-    pick_reply = await fx.controller.handle_text(texts.STOP_LABEL, chat_id=1, telegram_user_id=1, username="alice")
-    assert pick_reply.stop_options is not None
-    [(subscription_id, car_number)] = pick_reply.stop_options
-    assert car_number == "M295YB196"
+    list_reply = await fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=1, telegram_user_id=1, username="alice")
+    [(subscription_id, label)] = list_reply.my_cars_page_options
+    assert "ON" in label
 
-    confirm_reply = fx.controller.handle_stop_pick(subscription_id, telegram_user_id=1)
-    assert confirm_reply is not None
-    assert confirm_reply.stop_confirm_subscription_id == subscription_id
-    assert "M295YB196" in confirm_reply.text
+    detail_reply = fx.controller.handle_my_car_open(subscription_id, 0, telegram_user_id=1)
+    assert detail_reply is not None
+    assert detail_reply.car_detail_monitoring_state == "ON"
+    assert "M295YB196" in detail_reply.text
 
-    # Подписка ещё активна — отмена ничего не останавливает.
-    cancel_reply = fx.controller.handle_stop_cancel()
-    assert cancel_reply.show_main_menu is True
-    assert fx.subscription_repository.get(subscription_id).status == "active"
-
-    final_reply = fx.controller.handle_stop_confirm(subscription_id, telegram_user_id=1)
-    assert texts.format_stop_success("M295YB196") == final_reply.text
+    off_reply = fx.controller.handle_my_car_turn_off(subscription_id, 0, telegram_user_id=1)
+    assert off_reply is not None
+    assert "выключен" in off_reply.text
+    assert off_reply.car_detail_monitoring_state == "OFF"
     assert fx.subscription_repository.get(subscription_id).status == "stopped"
 
+    # "⬅️ Назад" — та же навигация, что и пагинация (см. handlers.py:
+    # decode_my_cars_page_callback реиспользуется для Back).
+    back_reply = fx.controller.handle_my_cars_page(0, telegram_user_id=1)
+    assert back_reply.text == texts.MY_CARS_HEADER
+    [(_id, back_label)] = back_reply.my_cars_page_options
+    assert "OFF" in back_label
 
-async def test_stop_pick_rejects_subscription_belonging_to_another_user(fx):
+
+async def test_my_car_turn_on_reactivates_without_duplicate(fx):
+    await fx.service.add_car(
+        telegram_user_id=1, telegram_chat_id=1, username="alice",
+        first_name=None, last_name=None, car_number="M295YB196", period_days=30, today=_today(),
+    )
+    [subscription] = fx.subscription_repository.list_by_user(1)
+    fx.controller.handle_my_car_turn_off(subscription.id, 0, telegram_user_id=1)
+    assert fx.subscription_repository.get(subscription.id).status == "stopped"
+
+    on_reply = fx.controller.handle_my_car_turn_on(subscription.id, 0, telegram_user_id=1)
+
+    assert on_reply is not None
+    assert "включён" in on_reply.text
+    assert on_reply.car_detail_monitoring_state == "ON"
+    reactivated = fx.subscription_repository.get(subscription.id)
+    assert reactivated.status == "active"
+    assert reactivated.id == subscription.id  # та же строка, не дубликат
+    assert len(fx.subscription_repository.list_by_user(1)) == 1
+
+
+async def test_my_car_open_rejects_subscription_belonging_to_another_user(fx):
     await fx.service.add_car(
         telegram_user_id=1, telegram_chat_id=1, username="alice",
         first_name=None, last_name=None, car_number="M295YB196", period_days=30, today=_today(),
     )
     [subscription] = fx.subscription_repository.list_by_user(1)
 
-    reply = fx.controller.handle_stop_pick(subscription.id, telegram_user_id=999)
+    reply = fx.controller.handle_my_car_open(subscription.id, 0, telegram_user_id=999)
 
     assert reply is None
     assert fx.subscription_repository.get(subscription.id).status == "active"
 
 
-async def test_stop_confirm_rechecks_ownership_even_if_pick_step_was_skipped(fx):
-    """Финальный шаг ЗАНОВО проверяет владение, а не доверяет тому, что
+async def test_my_car_turn_off_rechecks_ownership(fx):
+    """ON/OFF ЗАНОВО проверяет владение, а не доверяет тому, что
     пользователь как-то дошёл до этого экрана (см. security-инвариант)."""
     await fx.service.add_car(
         telegram_user_id=1, telegram_chat_id=1, username="alice",
@@ -714,13 +757,136 @@ async def test_stop_confirm_rechecks_ownership_even_if_pick_step_was_skipped(fx)
     )
     [subscription] = fx.subscription_repository.list_by_user(1)
 
-    reply = fx.controller.handle_stop_confirm(subscription.id, telegram_user_id=999)
+    reply = fx.controller.handle_my_car_turn_off(subscription.id, 0, telegram_user_id=999)
 
-    assert reply.text == texts.STOP_FAILED_TEXT
+    assert reply is None
     assert fx.subscription_repository.get(subscription.id).status == "active"
 
 
-async def test_trusted_creator_can_check_and_stop_delegated_subscription(trusted_fx):
+async def test_my_car_delete_requires_confirmation_and_cancel_preserves_car(fx):
+    await fx.service.add_car(
+        telegram_user_id=1, telegram_chat_id=1, username="alice",
+        first_name=None, last_name=None, car_number="M295YB196", period_days=30, today=_today(),
+    )
+    [subscription] = fx.subscription_repository.list_by_user(1)
+
+    prompt_reply = fx.controller.handle_my_car_delete_prompt(subscription.id, 0, telegram_user_id=1)
+    assert prompt_reply is not None
+    assert "M295YB196" in prompt_reply.text
+    assert prompt_reply.car_delete_confirm_subscription_id == subscription.id
+    # Ничего ещё не удалено (см. design report: "Сразу ничего не удалять").
+    assert fx.subscription_repository.get(subscription.id).status == "active"
+
+    cancel_reply = fx.controller.handle_my_car_delete_cancel(subscription.id, 0, telegram_user_id=1)
+    assert cancel_reply is not None
+    assert cancel_reply.car_detail_subscription_id == subscription.id
+    assert fx.subscription_repository.get(subscription.id).status == "active"  # Cancel preserves car
+
+
+async def test_my_car_delete_confirm_removes_car_from_my_cars(fx):
+    await fx.service.add_car(
+        telegram_user_id=1, telegram_chat_id=1, username="alice",
+        first_name=None, last_name=None, car_number="M295YB196", period_days=30, today=_today(),
+    )
+    [subscription] = fx.subscription_repository.list_by_user(1)
+
+    confirm_reply = fx.controller.handle_my_car_delete_confirm(subscription.id, 0, telegram_user_id=1)
+
+    # Единственный автомобиль удалён — "Мои авто" теперь пуст.
+    assert confirm_reply.text == texts.NO_CARS_TEXT
+    assert fx.subscription_repository.get(subscription.id).status == "archived"
+
+
+async def test_my_car_delete_confirm_rechecks_ownership(fx):
+    await fx.service.add_car(
+        telegram_user_id=1, telegram_chat_id=1, username="alice",
+        first_name=None, last_name=None, car_number="M295YB196", period_days=30, today=_today(),
+    )
+    [subscription] = fx.subscription_repository.list_by_user(1)
+
+    reply = fx.controller.handle_my_car_delete_confirm(subscription.id, 0, telegram_user_id=999)
+
+    assert reply.text == texts.CAR_ACTION_FAILED_TEXT
+    assert fx.subscription_repository.get(subscription.id).status == "active"
+
+
+async def test_my_car_delete_keeps_historical_detected_fines(tmp_path):
+    fixture = _Fixture(tmp_path, records_by_car={"M295YB196": [_record()]})
+    try:
+        await fixture.service.add_car(
+            telegram_user_id=1, telegram_chat_id=1, username="alice",
+            first_name=None, last_name=None, car_number="M295YB196", period_days=30, today=_today(),
+        )
+        [subscription] = fixture.subscription_repository.list_by_user(1)
+        [fine] = fixture.detected_fine_repository.list_by_car_number("M295YB196")
+
+        fixture.controller.handle_my_car_delete_confirm(subscription.id, 0, telegram_user_id=1)
+
+        still_there = fixture.detected_fine_repository.get_by_fingerprint(
+            subscription.monitoring_task_id, fine.fingerprint,
+        )
+        assert still_there is not None
+        assert still_there.id == fine.id
+    finally:
+        fixture.close()
+
+
+async def test_readd_car_after_delete_works_through_conversation(fx):
+    await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username="alice")
+    await fx.controller.handle_text("M295YB196", chat_id=1, telegram_user_id=1, username="alice")
+    await fx.controller.handle_period_choice(30, chat_id=1, telegram_user_id=1, first_name=None, last_name=None)
+    [old_subscription] = fx.subscription_repository.list_by_user(1)
+    fx.controller.handle_my_car_delete_confirm(old_subscription.id, 0, telegram_user_id=1)
+
+    await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username="alice")
+    await fx.controller.handle_text("M295YB196", chat_id=1, telegram_user_id=1, username="alice")
+    await fx.controller.handle_period_choice(30, chat_id=1, telegram_user_id=1, first_name=None, last_name=None)
+
+    list_reply = await fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=1, telegram_user_id=1, username="alice")
+    [(new_subscription_id, label)] = list_reply.my_cars_page_options
+    assert new_subscription_id != old_subscription.id
+    assert "ON" in label
+
+
+async def test_my_cars_pagination_mixes_on_and_off_cars(fx):
+    """Явное требование: "pagination still works with ON + OFF" — 12
+    автомобилей (>10, две страницы), часть ON, часть OFF после ручного
+    выключения — все видны, ни один не выпадает из списка."""
+    for i in range(12):
+        await fx.service.add_car(
+            telegram_user_id=1, telegram_chat_id=1, username="alice",
+            first_name=None, last_name=None, car_number=f"CAR{i:04d}",
+            period_days=30, today=_today(),
+        )
+    all_subs = fx.subscription_repository.list_by_user(1)
+    # Выключаем половину.
+    for sub in all_subs[:6]:
+        fx.controller.handle_my_car_turn_off(sub.id, 0, telegram_user_id=1)
+
+    page0 = await fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=1, telegram_user_id=1, username="alice")
+    assert page0.my_cars_page == 0
+    assert page0.my_cars_total_pages == 2
+    assert len(page0.my_cars_page_options) == 10
+
+    page1 = fx.controller.handle_my_cars_page(1, telegram_user_id=1)
+    assert page1.my_cars_page == 1
+    assert len(page1.my_cars_page_options) == 2
+
+    all_ids = {sid for sid, _label in page0.my_cars_page_options} | {
+        sid for sid, _label in page1.my_cars_page_options
+    }
+    assert all_ids == {s.id for s in all_subs}
+    on_count = sum(
+        1 for _sid, label in page0.my_cars_page_options + page1.my_cars_page_options if "ON" in label
+    )
+    off_count = sum(
+        1 for _sid, label in page0.my_cars_page_options + page1.my_cars_page_options if "OFF" in label
+    )
+    assert on_count == 6
+    assert off_count == 6
+
+
+async def test_trusted_creator_can_check_and_toggle_delegated_subscription(trusted_fx):
     trusted_fx.user_repository.upsert(
         TelegramUserInfo(user_id=777, username="real_owner", first_name=None, last_name=None)
     )
@@ -735,12 +901,12 @@ async def test_trusted_creator_can_check_and_stop_delegated_subscription(trusted
     )
     assert check_reply is not None
 
-    stop_reply = trusted_fx.controller.handle_stop_confirm(subscription.id, telegram_user_id=_TRUSTED_ID)
-    assert "остановлен" in stop_reply.text
+    off_reply = trusted_fx.controller.handle_my_car_turn_off(subscription.id, 0, telegram_user_id=_TRUSTED_ID)
+    assert "выключен" in off_reply.text
     assert trusted_fx.subscription_repository.get(subscription.id).status == "stopped"
 
 
-async def test_unrelated_user_cannot_check_or_stop_delegated_subscription(trusted_fx):
+async def test_unrelated_user_cannot_check_or_toggle_delegated_subscription(trusted_fx):
     trusted_fx.user_repository.upsert(
         TelegramUserInfo(user_id=777, username="real_owner", first_name=None, last_name=None)
     )
@@ -753,8 +919,8 @@ async def test_unrelated_user_cannot_check_or_stop_delegated_subscription(truste
     check_reply = await trusted_fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=999999)
     assert check_reply is None
 
-    stop_reply = trusted_fx.controller.handle_stop_pick(subscription.id, telegram_user_id=999999)
-    assert stop_reply is None
+    open_reply = trusted_fx.controller.handle_my_car_open(subscription.id, 0, telegram_user_id=999999)
+    assert open_reply is None
 
 
 # ==== trusted-operator task-level admin (см. design report: пересмотр
@@ -1317,9 +1483,10 @@ async def test_forced_stop_does_not_leave_client_with_misleading_active_state(tr
     client_reply = await trusted_fx.controller.handle_text(
         texts.MY_CARS_LABEL, chat_id=777, telegram_user_id=777, username="client_one",
     )
-    assert "✅ Активен" not in client_reply.text
-    assert "⛔ Остановлен" in client_reply.text
-    # Клиент также больше не может действовать через 🔎/⛔ этой подпиской.
+    [(_subscription_id, label)] = client_reply.my_cars_page_options
+    assert "ON" not in label
+    assert "OFF" in label
+    # Клиент также больше не может действовать через 🔎 этой подпиской.
     [subscription] = trusted_fx.subscription_repository.list_by_user(777)
     assert (
         trusted_fx.service.get_actionable_subscription(subscription.id, telegram_user_id=777) is not None

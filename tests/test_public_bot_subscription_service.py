@@ -349,6 +349,223 @@ def test_list_my_cars_returns_only_this_users_subscriptions(fx):
     assert [s.car_number for s in result] == ["AA001AA"]
 
 
+def test_list_my_cars_excludes_archived(fx):
+    task = fx.task_repository.create(
+        car_number="AA001AA", label=None, start_date=date(2026, 9, 1), end_date=date(2026, 10, 1),
+        telegram_chat_id=10, created_by_user_id=10, monitoring_scope="client_bot",
+    )
+    sub = fx.subscription_repository.create(
+        monitoring_task_id=task.id, car_number="AA001AA", telegram_user_id=10,
+        telegram_chat_id=10, telegram_username="user10",
+        start_date=date(2026, 9, 1), end_date=date(2026, 10, 1),
+    )
+    fx.subscription_repository.archive(sub.id)
+
+    assert fx.service.list_my_cars(10) == []
+    # Но строка сама по себе никуда не делась (soft delete).
+    assert fx.subscription_repository.get(sub.id).status == "archived"
+
+
+# ==== car-centric "📋 Мои авто" ON/OFF/Delete (см. design report про
+# переработку UX) — SubscriptionService.turn_off_car/turn_on_car/
+# delete_car, ownership через ту же get_actionable_subscription (владелец
+# ИЛИ trusted-создатель), что и у 🔎/⛔. ====
+
+
+def _make_client_car(fx, *, telegram_user_id=1, car_number="M295YB196", period_days=30, today=date(2026, 9, 3)):
+    task = fx.task_repository.create(
+        car_number=car_number, label=None, start_date=today, end_date=today + timedelta(days=period_days),
+        telegram_chat_id=telegram_user_id, created_by_user_id=telegram_user_id, monitoring_scope="client_bot",
+    )
+    sub = fx.subscription_repository.create(
+        monitoring_task_id=task.id, car_number=car_number, telegram_user_id=telegram_user_id,
+        telegram_chat_id=telegram_user_id, telegram_username="client",
+        start_date=today, end_date=today + timedelta(days=period_days),
+    )
+    return task, sub
+
+
+def test_turn_off_car_stops_active_subscription(fx):
+    _task, sub = _make_client_car(fx)
+
+    result = fx.service.turn_off_car(sub.id, telegram_user_id=1)
+
+    assert result is not None
+    assert result.status == "stopped"
+    assert fx.subscription_repository.get(sub.id).status == "stopped"
+
+
+def test_turn_off_car_excludes_it_from_actionable_and_deliverable(fx):
+    """Явное требование: OFF исключается из фонового мониторинга/доставки."""
+    _task, sub = _make_client_car(fx)
+    fx.service.turn_off_car(sub.id, telegram_user_id=1)
+
+    assert fx.service.list_actionable_subscriptions(1, today=date(2026, 9, 3)) == []
+    assert fx.subscription_repository.list_all_deliverable(today=date(2026, 9, 3)) == []
+
+
+def test_turn_off_car_rejects_wrong_user(fx):
+    _task, sub = _make_client_car(fx)
+
+    result = fx.service.turn_off_car(sub.id, telegram_user_id=999)
+
+    assert result is None
+    assert fx.subscription_repository.get(sub.id).status == "active"
+
+
+def test_turn_off_car_returns_none_for_already_stopped(fx):
+    """turn_off_car — ИСКЛЮЧИТЕЛЬНО ON -> OFF; повторный вызов на уже
+    stopped ничего не делает (защита от двойного нажатия/гонки)."""
+    _task, sub = _make_client_car(fx)
+    fx.service.turn_off_car(sub.id, telegram_user_id=1)
+
+    result = fx.service.turn_off_car(sub.id, telegram_user_id=1)
+
+    assert result is None
+
+
+def test_turn_on_car_reactivates_within_remaining_period(fx):
+    _task, sub = _make_client_car(fx, today=date(2026, 9, 3), period_days=30)
+    fx.service.turn_off_car(sub.id, telegram_user_id=1)
+
+    result = fx.service.turn_on_car(sub.id, telegram_user_id=1, today=date(2026, 9, 10))
+
+    assert result is not None
+    assert result.status == "active"
+    # end_date ещё не прошёл — период НЕ меняется (не дарим лишние дни).
+    assert result.start_date == date(2026, 9, 3)
+    assert result.end_date == date(2026, 10, 3)
+
+
+def test_turn_on_car_gives_fresh_period_when_old_one_elapsed(fx):
+    """Явное требование задачи: "корректно обработай reactivation", если
+    подписка простояла OFF дольше своего исходного периода — свежий
+    период ТОЙ ЖЕ длины (30 дней), начиная с today, а не оживший в прошлом
+    end_date (что было бы немедленно снова неактуально)."""
+    _task, sub = _make_client_car(fx, today=date(2026, 1, 1), period_days=30)
+    fx.service.turn_off_car(sub.id, telegram_user_id=1)
+
+    result = fx.service.turn_on_car(sub.id, telegram_user_id=1, today=date(2026, 9, 3))
+
+    assert result is not None
+    assert result.status == "active"
+    assert result.start_date == date(2026, 9, 3)
+    assert result.end_date == date(2026, 10, 3)  # те же 30 дней, от today
+
+
+def test_turn_on_car_does_not_create_duplicate_subscription(fx):
+    _task, sub = _make_client_car(fx)
+    fx.service.turn_off_car(sub.id, telegram_user_id=1)
+
+    fx.service.turn_on_car(sub.id, telegram_user_id=1, today=date(2026, 9, 10))
+
+    all_subs = fx.subscription_repository.list_by_user(1)
+    assert [s.id for s in all_subs] == [sub.id]
+
+
+def test_turn_on_car_returns_none_for_not_stopped(fx):
+    """turn_on_car — ИСКЛЮЧИТЕЛЬНО OFF -> ON; активную подписку "включить"
+    нельзя (нечего включать)."""
+    _task, sub = _make_client_car(fx)
+
+    result = fx.service.turn_on_car(sub.id, telegram_user_id=1, today=date(2026, 9, 10))
+
+    assert result is None
+
+
+def test_turn_on_car_rejects_wrong_user(fx):
+    _task, sub = _make_client_car(fx)
+    fx.service.turn_off_car(sub.id, telegram_user_id=1)
+
+    result = fx.service.turn_on_car(sub.id, telegram_user_id=999, today=date(2026, 9, 10))
+
+    assert result is None
+    assert fx.subscription_repository.get(sub.id).status == "stopped"
+
+
+def test_turn_on_car_reactivates_completed_task(fx):
+    """Если ПОКА подписка была stopped, сама FineMonitoringTask успела
+    стать completed (например, единственный подписчик перестал быть
+    actionable) — turn_on_car должен вернуть её в active, иначе
+    status='active' у подписки ничего бы не значил для фонового
+    FineJob (см. design report: "корректно обработай reactivation")."""
+    task, sub = _make_client_car(fx, today=date(2026, 1, 1), period_days=30)
+    fx.service.turn_off_car(sub.id, telegram_user_id=1)
+    fx.task_repository.set_status(task.id, "completed")
+
+    result = fx.service.turn_on_car(sub.id, telegram_user_id=1, today=date(2026, 9, 3))
+
+    assert result is not None
+    updated_task = fx.task_repository.get(task.id)
+    assert updated_task.status == "active"
+    assert updated_task.end_date >= result.end_date
+
+
+def test_delete_car_archives_active_subscription(fx):
+    _task, sub = _make_client_car(fx)
+
+    deleted = fx.service.delete_car(sub.id, telegram_user_id=1)
+
+    assert deleted is True
+    assert fx.subscription_repository.get(sub.id).status == "archived"
+    assert fx.service.list_my_cars(1) == []
+
+
+def test_delete_car_archives_stopped_subscription(fx):
+    """Удаление — ОТДЕЛЬНОЕ от OFF действие, разрешено из любого статуса,
+    не только 'active'."""
+    _task, sub = _make_client_car(fx)
+    fx.service.turn_off_car(sub.id, telegram_user_id=1)
+
+    deleted = fx.service.delete_car(sub.id, telegram_user_id=1)
+
+    assert deleted is True
+    assert fx.subscription_repository.get(sub.id).status == "archived"
+
+
+def test_delete_car_rejects_wrong_user(fx):
+    _task, sub = _make_client_car(fx)
+
+    deleted = fx.service.delete_car(sub.id, telegram_user_id=999)
+
+    assert deleted is False
+    assert fx.subscription_repository.get(sub.id).status == "active"
+
+
+def test_delete_car_does_not_remove_historical_detected_fines(fx):
+    task, sub = _make_client_car(fx)
+    fine = fx.detected_fine_repository.create(
+        monitoring_task_id=task.id, car_number=sub.car_number,
+        external_fine_id="AB1", fingerprint="fp-1",
+        penalty_date=date(2026, 9, 1), due_date=date(2026, 9, 20),
+        delivered_status="Не вручено", raw_data="{}",
+    )
+
+    fx.service.delete_car(sub.id, telegram_user_id=1)
+
+    assert fx.detected_fine_repository.get_by_fingerprint(task.id, "fp-1") is not None
+    assert fine.id is not None
+
+
+async def test_readd_car_after_delete_creates_new_subscription(fx):
+    """Явное требование: "повторно добавить этот автомобиль в будущем
+    можно" — ➕ Добавить авто на тот же номер после удаления создаёт
+    НОВУЮ подписку (archived не считается "уже есть активная")."""
+    _task, sub = _make_client_car(fx, telegram_user_id=1, car_number="M295YB196")
+    fx.service.delete_car(sub.id, telegram_user_id=1)
+
+    outcome = await fx.service.add_car(
+        telegram_user_id=1, telegram_chat_id=1, username="alice",
+        first_name=None, last_name=None, car_number="M295YB196",
+        period_days=30, today=date(2026, 9, 10),
+    )
+
+    assert outcome.subscription.id != sub.id
+    assert outcome.subscription.status == "active"
+    active_cars = [s for s in fx.service.list_my_cars(1) if s.status == "active"]
+    assert [s.car_number for s in active_cars] == ["M295YB196"]
+
+
 # ==== trusted-operator delegated flow (см. design report) ====
 
 

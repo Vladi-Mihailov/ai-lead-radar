@@ -455,3 +455,148 @@ def test_count_by_status_ignores_pending_claim_and_expired(tmp_path):
         assert repo.count_by_status("expired") == 1
     finally:
         repo.close()
+
+
+# ---- reactivate()/archive() — car-centric ON/OFF/Delete (см. design
+# report про переработку UX "📋 Мои авто") ----
+
+
+def test_reactivate_flips_stopped_to_active_with_given_period(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(db_path, car_number="B957MA09")
+
+    repo = FineSubscriptionRepository(db_path)
+    try:
+        sub = repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            telegram_user_id=1, telegram_chat_id=1, telegram_username="alice",
+            start_date=date(2026, 9, 1), end_date=date(2026, 10, 1),
+        )
+        repo.stop_by_owner_or_creator(sub.id, telegram_user_id=1)
+        assert repo.get(sub.id).status == "stopped"
+
+        reactivated = repo.reactivate(sub.id, start_date=date(2026, 9, 10), end_date=date(2026, 10, 10))
+
+        assert reactivated is True
+        updated = repo.get(sub.id)
+        assert updated.status == "active"
+        assert updated.start_date == date(2026, 9, 10)
+        assert updated.end_date == date(2026, 10, 10)
+        assert updated.stopped_at is None
+    finally:
+        repo.close()
+
+
+def test_reactivate_returns_false_for_non_stopped_subscription(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(db_path, car_number="B957MA09")
+
+    repo = FineSubscriptionRepository(db_path)
+    try:
+        sub = repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            telegram_user_id=1, telegram_chat_id=1, telegram_username="alice",
+            start_date=date(2026, 9, 1), end_date=date(2026, 10, 1),
+        )
+
+        reactivated = repo.reactivate(sub.id, start_date=date(2026, 9, 1), end_date=date(2026, 10, 1))
+
+        assert reactivated is False
+        assert repo.get(sub.id).status == "active"  # не тронуто
+    finally:
+        repo.close()
+
+
+def test_reactivate_returns_false_for_unknown_id(tmp_path):
+    repo = _make_repo(tmp_path)
+    try:
+        assert repo.reactivate(999999, start_date=date(2026, 9, 1), end_date=date(2026, 10, 1)) is False
+    finally:
+        repo.close()
+
+
+def test_reactivate_does_not_create_duplicate_when_another_active_row_exists(tmp_path):
+    """Гоночный сценарий (см. FineSubscriptionRepository.reactivate
+    докстрок): пока подписка была stopped, тот же пользователь заново
+    прошёл "➕ Добавить авто" на тот же номер — появилась ВТОРАЯ, уже
+    активная строка того же (task, user). reactivate() старой строки не
+    должен создать вторую active-строку (нарушив
+    idx_fine_subscriptions_active_user_task) — должен просто не удаться."""
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(db_path, car_number="B957MA09")
+
+    repo = FineSubscriptionRepository(db_path)
+    try:
+        stopped = repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            telegram_user_id=1, telegram_chat_id=1, telegram_username="alice",
+            start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        )
+        repo.stop_by_owner_or_creator(stopped.id, telegram_user_id=1)
+        # Новая активная строка того же (task, user) — например, через
+        # обычный "➕ Добавить авто", пока старая была OFF.
+        repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            telegram_user_id=1, telegram_chat_id=1, telegram_username="alice",
+            start_date=date(2026, 9, 1), end_date=date(2026, 10, 1),
+        )
+
+        reactivated = repo.reactivate(stopped.id, start_date=date(2026, 9, 1), end_date=date(2026, 10, 1))
+
+        assert reactivated is False
+        assert repo.get(stopped.id).status == "stopped"  # не тронуто
+    finally:
+        repo.close()
+
+
+def test_archive_marks_subscription_archived_from_any_status(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(db_path, car_number="B957MA09")
+
+    repo = FineSubscriptionRepository(db_path)
+    try:
+        active = repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            telegram_user_id=1, telegram_chat_id=1, telegram_username="alice",
+            start_date=date(2026, 9, 1), end_date=date(2026, 10, 1),
+        )
+        stopped = repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            telegram_user_id=2, telegram_chat_id=2, telegram_username="bob",
+            start_date=date(2026, 9, 1), end_date=date(2026, 10, 1),
+        )
+        repo.stop_by_owner_or_creator(stopped.id, telegram_user_id=2)
+
+        assert repo.archive(active.id) is True
+        assert repo.archive(stopped.id) is True
+
+        assert repo.get(active.id).status == "archived"
+        assert repo.get(stopped.id).status == "archived"
+    finally:
+        repo.close()
+
+
+def test_archive_returns_false_when_already_archived(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(db_path, car_number="B957MA09")
+
+    repo = FineSubscriptionRepository(db_path)
+    try:
+        sub = repo.create(
+            monitoring_task_id=task_id, car_number="B957MA09",
+            telegram_user_id=1, telegram_chat_id=1, telegram_username="alice",
+            start_date=date(2026, 9, 1), end_date=date(2026, 10, 1),
+        )
+        assert repo.archive(sub.id) is True
+
+        assert repo.archive(sub.id) is False
+    finally:
+        repo.close()
+
+
+def test_archive_returns_false_for_unknown_id(tmp_path):
+    repo = _make_repo(tmp_path)
+    try:
+        assert repo.archive(999999) is False
+    finally:
+        repo.close()

@@ -581,12 +581,19 @@ class SubscriptionService:
             )
 
     def list_my_cars(self, telegram_user_id: int) -> list[FineMonitoringSubscription]:
-        """ВСЕ подписки этого telegram_user_id, любого статуса — "Мои авто"
-        (см. reader/public_bot/texts.py::format_my_cars). Никогда не
-        возвращает чужие подписки: фильтр по telegram_user_id — на уровне
-        SQL (см. FineSubscriptionRepository.list_by_user), не постфильтром
-        в Python."""
-        return self._subscription_repository.list_by_user(telegram_user_id)
+        """Подписки этого telegram_user_id для car-centric "📋 Мои авто"
+        (см. design report про ON/OFF UX) — ЛЮБОЙ статус, КРОМЕ 'archived'
+        (см. SubscriptionStatus.archived — "🗑 Удалить автомобиль" должен
+        убрать его из этого списка, но не из БД). pending_claim сюда
+        никогда не попадает: telegram_user_id для такой строки всегда
+        NULL (см. FineSubscriptionRepository.list_by_user), поэтому он не
+        может совпасть ни с одним конкретным вызовом этого метода. Никогда
+        не возвращает чужие подписки: фильтр по telegram_user_id — на
+        уровне SQL (list_by_user), не постфильтром в Python."""
+        return [
+            subscription for subscription in self._subscription_repository.list_by_user(telegram_user_id)
+            if subscription.status != "archived"
+        ]
 
     def list_managed_cars(self, created_by_telegram_user_id: int) -> list[FineMonitoringSubscription]:
         """Delegated-подписки, заведённые ЭТИМ trusted-оператором для
@@ -602,6 +609,117 @@ class SubscriptionService:
         return self._subscription_repository.stop_by_owner_or_creator(
             subscription_id, telegram_user_id=telegram_user_id,
         )
+
+    # ---- car-centric "📋 Мои авто" ON/OFF/Delete (см. design report про
+    # переработку UX) — та же ownership-проверка (get_actionable_
+    # subscription: владелец ИЛИ trusted-создатель), что и у 🔎/⛔ выше, НЕ
+    # расширенная и НЕ суженная специально для этих трёх действий (см.
+    # задачу: "не расширять Delete permissions автоматически только потому
+    # что actor trusted"). ----
+
+    def turn_off_car(
+        self, subscription_id: int, *, telegram_user_id: int,
+    ) -> FineMonitoringSubscription | None:
+        """ON -> OFF (status='stopped', см. SubscriptionStatus). None —
+        подписка не найдена/не принадлежит telegram_user_id (ownership,
+        см. get_actionable_subscription), ИЛИ она не 'active' прямо
+        сейчас (уже stopped/expired/pending_claim/archived — этот вызов
+        предназначен ИСКЛЮЧИТЕЛЬНО для явного ON -> OFF, не для чего-либо
+        ещё). Автомобиль остаётся в БД и в "Мои авто" (см. list_my_cars) —
+        просто перестаёт быть actionable для фонового мониторинга (см.
+        FineMonitoringSubscription.is_effectively_active)."""
+        subscription = self.get_actionable_subscription(subscription_id, telegram_user_id=telegram_user_id)
+        if subscription is None or subscription.status != "active":
+            return None
+
+        stopped = self._subscription_repository.stop_by_owner_or_creator(
+            subscription_id, telegram_user_id=telegram_user_id,
+        )
+        if not stopped:
+            return None
+        return self._subscription_repository.get(subscription_id)
+
+    def turn_on_car(
+        self, subscription_id: int, *, telegram_user_id: int, today: date,
+    ) -> FineMonitoringSubscription | None:
+        """OFF -> ON — реактивирует СУЩЕСТВУЮЩУЮ подписку (см.
+        FineSubscriptionRepository.reactivate), никогда не создаёт вторую.
+        None — подписка не найдена/не принадлежит telegram_user_id, она не
+        'stopped' прямо сейчас, либо реактивация не удалась (см.
+        reactivate() — например, гоночный конфликт с уже активной другой
+        строкой того же (task, user)).
+
+        Период: если старый end_date ещё не прошёл — просто возобновляем
+        оставшееся оплаченное время без изменений (выключение/включение не
+        должно ни дарить, ни красть дни). Если end_date уже в прошлом
+        (подписка простояла OFF дольше своего исходного периода) — свежий
+        период ТОЙ ЖЕ длины, начиная с today (та же идея, что и у
+        FineMonitoringTaskRepository.return_to_active_monitoring для
+        архивных задач, см. design report: "корректно обработай
+        reactivation").
+
+        Также приводит саму FineMonitoringTask в активное состояние, если
+        она успела стать completed/archived, пока ВСЕ её подписчики были
+        stopped/expired (см. _ensure_task_active_for_period) — иначе
+        status='active' у подписки ничего бы не значил: фоновый FineJob
+        всё равно не проверял бы неактивную задачу."""
+        subscription = self.get_actionable_subscription(subscription_id, telegram_user_id=telegram_user_id)
+        if subscription is None or subscription.status != "stopped":
+            return None
+
+        if subscription.end_date >= today:
+            start_date, end_date = subscription.start_date, subscription.end_date
+        else:
+            period_length_days = (subscription.end_date - subscription.start_date).days
+            start_date = today
+            end_date = today + timedelta(days=period_length_days)
+
+        reactivated = self._subscription_repository.reactivate(
+            subscription_id, start_date=start_date, end_date=end_date,
+        )
+        if not reactivated:
+            return None
+
+        self._ensure_task_active_for_period(
+            subscription.monitoring_task_id, start_date=start_date, end_date=end_date,
+        )
+
+        return self._subscription_repository.get(subscription_id)
+
+    def _ensure_task_active_for_period(
+        self, task_id: int, *, start_date: date, end_date: date,
+    ) -> None:
+        """См. turn_on_car — та же пара операций, что и у _create_or_
+        extend_task() при обычном "➕ Добавить авто", но по УЖЕ известному
+        task_id (подписка всегда указывает на конкретную существующую
+        задачу), а не по car_number: если задача сейчас не 'active'
+        (completed/архивная), возвращаем её в активный режим с новым
+        периодом; если уже 'active' — только продлеваем end_date, если
+        новый период длиннее (никогда не сокращаем чужой/более длинный
+        период — см. extend_period_if_shorter)."""
+        task = self._task_repository.get(task_id)
+        if task is None:
+            return
+        if task.status != "active":
+            self._task_repository.return_to_active_monitoring(
+                task_id, start_date=start_date, end_date=end_date,
+            )
+        else:
+            self._task_repository.extend_period_if_shorter(task_id, end_date)
+
+    def delete_car(self, subscription_id: int, *, telegram_user_id: int) -> bool:
+        """🗑 Удалить автомобиль — soft delete (status='archived', см.
+        FineSubscriptionRepository.archive), ОТДЕЛЬНОЕ действие от OFF:
+        разрешено из любого текущего статуса (ON, OFF, истёкшего), не
+        только 'active'/'stopped'. historical detected_fines/client_fine_
+        deliveries не затрагиваются вовсе — soft delete трогает только эту
+        строку. Повторное "➕ Добавить авто" на тот же номер после этого
+        создаёт НОВУЮ подписку (archived не считается "уже есть активная",
+        см. _create_or_update_subscription)."""
+        subscription = self.get_actionable_subscription(subscription_id, telegram_user_id=telegram_user_id)
+        if subscription is None:
+            return False
+        return self._subscription_repository.archive(subscription_id)
 
     # ---- 🔎 Проверить сейчас / ⛔ Остановить мониторинг (см. design report
     # Stage 4, раздел "UI completion") ----

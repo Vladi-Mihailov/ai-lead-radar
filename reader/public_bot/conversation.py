@@ -48,15 +48,27 @@ CHECK_NOW_CAR_NUMBER → _handle_trusted_check_now_car_number_input(),
 
 "⛔ Остановить мониторинг" — БЕЗ ИЗМЕНЕНИЙ, всё ещё picker (см.
 _build_trusted_stop_picker_reply/handle_trusted_stop_pick/
-handle_trusted_stop_confirm) — не переделывался, в этой задаче
-технической необходимости не было.
+handle_trusted_stop_confirm) — единственный способ остановить ЛЮБУЮ
+задачу мониторинга (включая операторские, без единой client-подписки),
+которого car-centric ON/OFF (subscription-based, см. ниже) не заменяет.
 
-Для обычных пользователей поведение всех трёх пунктов меню НЕ меняется
-(см. _build_picker_reply/_format_my_cars_reply — subscription-based, как
-и раньше). is_trusted() перепроверяется на КАЖДОМ шаге этого flow заново
-по РЕАЛЬНОМУ event.sender_id — callback task_id/page публичны и НЕ
-являются доказательством авторизации сами по себе (тот же принцип, что и
-у subscription_id выше)."""
+Для обычных (не-trusted) пользователей "📋 Мои авто" (см. design report
+про переработку UX — car-centric ON/OFF) теперь показывает ВСЕ подписки
+(включая 'stopped') кнопками — сам автомобиль является кнопкой,
+открывающей карточку с управлением (🔎 Проверить сейчас/⏸ Выключить или
+▶️ Включить/🗑 Удалить/⬅️ Назад, см. _format_my_cars_page_reply/
+handle_my_car_open и далее). Старая отдельная кнопка "⛔ Остановить
+мониторинг" для обычных пользователей УБРАНА из главного меню (см.
+reader/public_bot/keyboards.py::main_menu_keyboard) — она стала
+полностью избыточной (её единственная функция, ON -> OFF, теперь через
+карточку конкретного автомобиля), а её subscription-based picker/confirm
+(handle_stop_pick/handle_stop_confirm) удалён вместе с ней: usage-аудит
+подтвердил, что ни один другой flow на них не полагался (trusted-оператор
+всегда использовал ОТДЕЛЬНый task-level picker выше, а не этот).
+
+is_trusted() перепроверяется на КАЖДОМ шаге обоих flow заново по
+РЕАЛЬНОМУ event.sender_id — callback task_id/subscription_id/page
+публичны и НЕ являются доказательством авторизации сами по себе."""
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -96,23 +108,27 @@ _TRUSTED_STOP_PICKER_LIMIT = 50
 # report: "по 10 машин на страницу").
 _TRUSTED_TASKS_PAGE_SIZE = 10
 
+# "📋 Мои авто" car-centric (обычный пользователь, см. design report про
+# переработку UX) — та же страница в 10 (см. задачу: "существующую
+# pagination 10/page сохранить").
+_MY_CARS_PAGE_SIZE = 10
+
 
 @dataclass(frozen=True)
 class BotReply:
     """Что показать пользователю — Telethon-адаптер (handlers.py) решает,
     какую клавиатуру приложить к тексту, исходя из этих полей.
 
-    check_now_options/stop_options — (subscription_id, car_number) для
-    построения списка выбора (см. reader/public_bot/keyboards.py::
-    options_keyboard) — subscription_id в callback_data ПУБЛИЧЕН и НЕ
-    является доказательством авторизации сам по себе: владение всегда
-    перепроверяется server-side при нажатии (см.
-    SubscriptionService.get_actionable_subscription), а не на этапе
-    показа списка (см. design report Stage 4: "никаких действий с чужими
-    subscriptions по callback payload").
+    check_now_options — (subscription_id, car_number) для построения
+    списка выбора (см. reader/public_bot/keyboards.py::options_keyboard) —
+    subscription_id в callback_data ПУБЛИЧЕН и НЕ является доказательством
+    авторизации сам по себе: владение всегда перепроверяется server-side
+    при нажатии (см. SubscriptionService.get_actionable_subscription), а
+    не на этапе показа списка (см. design report Stage 4: "никаких
+    действий с чужими subscriptions по callback payload").
 
-    trusted_stop_options/trusted_stop_confirm_task_id — task-level аналоги
-    ⛔ для trusted-оператора (см. design report про пересмотр архитектуры) —
+    trusted_stop_options/trusted_stop_confirm_task_id — task-level ⛔ для
+    trusted-оператора (см. design report про пересмотр архитектуры) —
     (task_id, car_number) вместо (subscription_id, car_number); тот же
     принцип: task_id публичен, авторизация — ИСКЛЮЧИТЕЛЬНО server-side
     повторная проверка (is_trusted + задача существует и активна, см.
@@ -121,27 +137,52 @@ class BotReply:
     trusted_tasks_page/trusted_tasks_total_pages — 📋 Мои авто пагинация
     для trusted-оператора (см. design report) — page (0-indexed) публичен
     и НЕ является доказательством авторизации: is_trusted() перепроверяется
-    на каждом callback заново, а page вне диапазона клампится сервером."""
+    на каждом callback заново, а page вне диапазона клампится сервером.
+
+    my_cars_page_options/my_cars_page/my_cars_total_pages — car-centric
+    "📋 Мои авто" для ОБЫЧНОГО (не-trusted) пользователя (см. design
+    report про переработку UX): (subscription_id, label) для списка
+    автомобилей-кнопок текущей страницы + сама страница/их общее число —
+    тот же принцип пагинации, что и у trusted_tasks_*, но subscription-
+    based и полностью отдельными callback'ами (см. keyboards.py).
+
+    car_detail_subscription_id/car_detail_monitoring_state/car_detail_page —
+    карточка конкретного автомобиля (см. handle_my_car_open/
+    handle_my_car_turn_on/handle_my_car_turn_off) — monitoring_state:
+    "ON"/"OFF"/"ИСТЁК" (см. texts.car_monitoring_state) решает, показать
+    ли ⏸/▶️-переключатель и какой именно; page — куда вернёт "⬅️ Назад".
+
+    car_delete_confirm_subscription_id/car_delete_confirm_page — "⚠️
+    Удалить {car} из списка?" (см. handle_my_car_delete_prompt) — ОТДЕЛЬНОЕ
+    промежуточное подтверждение перед soft delete, ничего ещё не удаляет.
+
+    cta_buttons — коммерческие CTA-кнопки под manual "🔎 Проверить сейчас"
+    (см. design report про UX manual check) — ТОЛЬКО когда реальный
+    владелец увидел хотя бы один штраф своей машины (см.
+    handle_check_now_choice), той же формы (label, url), что и
+    reader/public_bot/keyboards.py::owner_fine_cta_buttons, но БЕЗ импорта
+    Telethon Button здесь — conversation.py намеренно ничего не знает о
+    Telegram API, только handlers.py конвертирует эти пары в реальные
+    Button.url(...)."""
 
     text: str
     show_main_menu: bool = False
     show_period_buttons: bool = False
     show_add_client_decision_buttons: bool = False
     check_now_options: list[tuple[int, str]] | None = None
-    stop_options: list[tuple[int, str]] | None = None
-    stop_confirm_subscription_id: int | None = None
     trusted_stop_options: list[tuple[int, str]] | None = None
     trusted_stop_confirm_task_id: int | None = None
     trusted_stop_confirm_button_label: str | None = None
     trusted_tasks_page: int | None = None
     trusted_tasks_total_pages: int | None = None
-    # Коммерческие CTA-кнопки под manual "🔎 Проверить сейчас" (см. design
-    # report про UX manual check) — ТОЛЬКО когда реальный владелец увидел
-    # хотя бы один штраф своей машины (см. handle_check_now_choice), той
-    # же формы (label, url), что и reader/public_bot/keyboards.py::
-    # owner_fine_cta_buttons, но БЕЗ импорта Telethon Button здесь —
-    # conversation.py намеренно ничего не знает о Telegram API, только
-    # handlers.py конвертирует эти пары в реальные Button.url(...).
+    my_cars_page_options: list[tuple[int, str]] | None = None
+    my_cars_page: int | None = None
+    my_cars_total_pages: int | None = None
+    car_detail_subscription_id: int | None = None
+    car_detail_monitoring_state: str | None = None
+    car_detail_page: int | None = None
+    car_delete_confirm_subscription_id: int | None = None
+    car_delete_confirm_page: int | None = None
     cta_buttons: list[list[tuple[str, str]]] | None = None
 
 
@@ -281,7 +322,7 @@ class ConversationController:
             self._states.clear(chat_id)
             if self._is_trusted(telegram_user_id):
                 return self._format_trusted_tasks_page_reply(0)
-            return self._format_my_cars_reply(telegram_user_id)
+            return self._format_my_cars_page_reply(telegram_user_id, 0)
 
         if stripped_text == texts.CHECK_NOW_LABEL:
             self._states.clear(chat_id)
@@ -294,13 +335,21 @@ class ConversationController:
                     step=STEP_AWAITING_TRUSTED_CHECK_NOW_CAR_NUMBER,
                 )
                 return BotReply(text=texts.CAR_NUMBER_PROMPT)
-            return self._build_picker_reply(telegram_user_id, kind="checknow")
+            return self._build_check_now_picker_reply(telegram_user_id)
 
         if stripped_text == texts.STOP_LABEL:
             self._states.clear(chat_id)
-            if self._is_trusted(telegram_user_id):
-                return self._build_trusted_stop_picker_reply()
-            return self._build_picker_reply(telegram_user_id, kind="stop")
+            if not self._is_trusted(telegram_user_id):
+                # Для обычного пользователя эта кнопка больше не
+                # показывается в главном меню вовсе (см.
+                # reader/public_bot/keyboards.py::main_menu_keyboard) — car-
+                # centric ON/OFF в "📋 Мои авто" её полностью заменяет.
+                # Текст всё же можно отправить вручную (например, из
+                # старого чата) — безопасный отказ вместо падения/подсказки
+                # про несуществующий flow, та же защита, что и у
+                # "📊 Статистика" ниже.
+                return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
+            return self._build_trusted_stop_picker_reply()
 
         if stripped_text == texts.STATISTICS_LABEL:
             self._states.clear(chat_id)
@@ -369,12 +418,14 @@ class ConversationController:
         options = [(t.id, t.car_number) for t in tasks[:_TRUSTED_STOP_PICKER_LIMIT]]
         return BotReply(text=texts.TRUSTED_STOP_PICK_PROMPT, trusted_stop_options=options)
 
-    def _build_picker_reply(self, telegram_user_id: int, *, kind: str) -> BotReply:
+    def _build_check_now_picker_reply(self, telegram_user_id: int) -> BotReply:
         """Список авто, с которыми telegram_user_id может действовать
-        через 🔎/⛔ (свои + delegated, которые он создал, см.
+        через 🔎 (свои + delegated, которые он создал, см.
         SubscriptionService.list_actionable_subscriptions) — subscription_id
         в кнопках, не car_number, чтобы не полагаться на уникальность
-        номера при последующей server-side проверке владения."""
+        номера при последующей server-side проверке владения. Единственный
+        оставшийся потребитель этого picker'а (⛔ для обычного пользователя
+        заменена car-centric ON/OFF, см. design report п.8)."""
         subscriptions = self._subscriptions.list_actionable_subscriptions(
             telegram_user_id, today=self._today(),
         )
@@ -382,25 +433,43 @@ class ConversationController:
             return BotReply(text=texts.NO_ACTIONABLE_CARS_TEXT)
 
         options = [(s.id, s.car_number) for s in subscriptions]
-        if kind == "checknow":
-            return BotReply(text=texts.CHECK_NOW_PICK_PROMPT, check_now_options=options)
-        return BotReply(text=texts.STOP_PICK_PROMPT, stop_options=options)
+        return BotReply(text=texts.CHECK_NOW_PICK_PROMPT, check_now_options=options)
 
-    def _format_my_cars_reply(self, telegram_user_id: int) -> BotReply:
+    def _format_my_cars_page_reply(self, telegram_user_id: int, page: int) -> BotReply:
+        """Car-centric "📋 Мои авто" (см. design report про переработку
+        UX) — ОДНА страница ВСЕХ подписок этого пользователя (любого
+        статуса, кроме 'archived', см. SubscriptionService.list_my_cars),
+        каждая — отдельная кнопка (см. keyboards.py::my_cars_page_keyboard).
+        page клампится здесь же, как и у _format_trusted_tasks_page_reply —
+        forged/устаревший page просто показывает ближайшую валидную
+        страницу, а не ошибку."""
         today = self._today()
-        subscriptions = self._subscriptions.list_my_cars(telegram_user_id)
-        text = texts.format_my_cars(subscriptions, today)
+        cars = self._subscriptions.list_my_cars(telegram_user_id)
+        if not cars:
+            return BotReply(text=texts.NO_CARS_TEXT, show_main_menu=True)
 
-        if self._is_trusted(telegram_user_id):
-            managed = self._subscriptions.list_managed_cars(telegram_user_id)
-            text = "\n\n".join([
-                text,
-                "",
-                texts.MANAGED_CARS_HEADER,
-                texts.format_managed_cars(managed, today),
-            ])
+        total_pages = -(-len(cars) // _MY_CARS_PAGE_SIZE)  # ceil division
+        page = max(0, min(page, total_pages - 1))
+        start = page * _MY_CARS_PAGE_SIZE
+        page_cars = cars[start:start + _MY_CARS_PAGE_SIZE]
 
-        return BotReply(text=text)
+        options = [(car.id, texts.format_car_button_label(car, today)) for car in page_cars]
+        return BotReply(
+            text=texts.MY_CARS_HEADER,
+            my_cars_page_options=options,
+            my_cars_page=page,
+            my_cars_total_pages=total_pages,
+        )
+
+    def _format_car_detail_reply(self, subscription, page: int) -> BotReply:
+        today = self._today()
+        _, monitoring_state = texts.car_monitoring_state(subscription, today)
+        return BotReply(
+            text=texts.format_car_details(subscription, today),
+            car_detail_subscription_id=subscription.id,
+            car_detail_monitoring_state=monitoring_state,
+            car_detail_page=page,
+        )
 
     # ---- текстовые сообщения (меню + шаги диалога) ----
 
@@ -778,43 +847,155 @@ class ConversationController:
         cta = self._owner_cta_buttons() if outcome.is_owner and outcome.fines else None
         return BotReply(text=texts.format_check_now_result(outcome), cta_buttons=cta)
 
-    # ---- ⛔ Остановить мониторинг (pick -> confirm, без conversation_state) ----
+    def handle_stop_cancel(self) -> BotReply:
+        """"Отмена" на ⛔-подтверждении — ОБЩАЯ и для trusted task-level
+        stop (см. STOP_NO/handle_trusted_stop_confirm), единственный
+        оставшийся потребитель после удаления subscription-based ⛔ для
+        обычного пользователя (см. design report п.8)."""
+        return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
 
-    def handle_stop_pick(self, subscription_id: int, *, telegram_user_id: int) -> BotReply | None:
-        """Первый шаг — показывает подтверждение, ЕЩЁ НИЧЕГО не
-        останавливает. None — та же server-side проверка владения, что и
-        у check-now (см. SubscriptionService.get_actionable_subscription)."""
+    # ---- car-centric "📋 Мои авто": открыть карточку/ON/OFF/Delete (см.
+    # design report про переработку UX) — ОБЫЧНЫЙ (не-trusted) пользователь,
+    # subscription-based, без conversation_state (все шаги — inline-кнопки,
+    # владение перепроверяется на КАЖДОМ шаге заново через
+    # SubscriptionService.get_actionable_subscription — тот же принцип, что
+    # и у 🔎/⛔ выше: subscription_id/page в callback_data публичны и НЕ
+    # являются доказательством владения сами по себе). ----
+
+    def handle_my_cars_page(self, page: int, *, telegram_user_id: int) -> BotReply:
+        """Навигация ◀️/индикатор/▶️ — telegram_user_id сам определяет,
+        чьи автомобили показывать (list_my_cars уже скопирован по нему на
+        уровне SQL, см. SubscriptionService.list_my_cars), поэтому здесь
+        нечего "не авторизовать" отдельно — в отличие от открытия
+        КОНКРЕТНОГО автомобиля (см. handle_my_car_open), page сам по себе
+        не указывает ни на чей ресурс."""
+        return self._format_my_cars_page_reply(telegram_user_id, page)
+
+    def handle_my_car_open(
+        self, subscription_id: int, page: int, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """None — подписка не найдена/не принадлежит telegram_user_id (см.
+        SubscriptionService.get_actionable_subscription) — Telethon-адаптер
+        (handlers.py) отвечает алертом, ничего не открывает."""
+        subscription = self._subscriptions.get_actionable_subscription(
+            subscription_id, telegram_user_id=telegram_user_id,
+        )
+        if subscription is None:
+            return None
+        return self._format_car_detail_reply(subscription, page)
+
+    def handle_my_car_turn_off(
+        self, subscription_id: int, page: int, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """ON -> OFF (см. SubscriptionService.turn_off_car). None —
+        подписка не найдена/не принадлежит telegram_user_id — та же
+        server-side проверка, что и у открытия карточки. Отдельно от
+        None — CAR_ACTION_FAILED_TEXT, если подписка НАЙДЕНА (владение ОК),
+        но действие не удалось (например, она уже не 'active' — гонка с
+        другим действием/другим устройством того же пользователя)."""
         subscription = self._subscriptions.get_actionable_subscription(
             subscription_id, telegram_user_id=telegram_user_id,
         )
         if subscription is None:
             return None
 
+        updated = self._subscriptions.turn_off_car(subscription_id, telegram_user_id=telegram_user_id)
+        if updated is None:
+            return BotReply(text=texts.CAR_ACTION_FAILED_TEXT, show_main_menu=True)
+
+        # Подтверждение + сразу обновлённая карточка (см. design report:
+        # "после ON/OFF также обновить карточку/список так, чтобы
+        # пользователь сразу видел новое состояние") — один экран, не два
+        # последовательных сообщения.
+        today = self._today()
+        _, monitoring_state = texts.car_monitoring_state(updated, today)
+        text = texts.format_turn_off_success(updated.car_number) + "\n\n" + texts.format_car_details(updated, today)
         return BotReply(
-            text=texts.STOP_CONFIRM_PROMPT.format(car_number=subscription.car_number),
-            stop_confirm_subscription_id=subscription.id,
+            text=text,
+            car_detail_subscription_id=updated.id,
+            car_detail_monitoring_state=monitoring_state,
+            car_detail_page=page,
         )
 
-    def handle_stop_confirm(self, subscription_id: int, *, telegram_user_id: int) -> BotReply:
-        """Финальный шаг — владение перепроверяется ЗАНОВО здесь (а не
-        только доверяется тому, что пользователь дошёл до этого экрана,
-        см. design report: "нельзя подменить owner/user_id через callback
-        payload") — SubscriptionService.stop_subscription() сам делает эту
-        проверку через FineSubscriptionRepository.stop_by_owner_or_creator."""
+    def handle_my_car_turn_on(
+        self, subscription_id: int, page: int, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """OFF -> ON (см. SubscriptionService.turn_on_car — реактивирует
+        существующую подписку, никогда не создаёт вторую)."""
         subscription = self._subscriptions.get_actionable_subscription(
             subscription_id, telegram_user_id=telegram_user_id,
         )
         if subscription is None:
-            return BotReply(text=texts.STOP_FAILED_TEXT, show_main_menu=True)
+            return None
 
-        stopped = self._subscriptions.stop_subscription(subscription_id, telegram_user_id=telegram_user_id)
-        if not stopped:
-            return BotReply(text=texts.STOP_FAILED_TEXT, show_main_menu=True)
+        updated = self._subscriptions.turn_on_car(
+            subscription_id, telegram_user_id=telegram_user_id, today=self._today(),
+        )
+        if updated is None:
+            return BotReply(text=texts.CAR_ACTION_FAILED_TEXT, show_main_menu=True)
 
-        return BotReply(text=texts.format_stop_success(subscription.car_number), show_main_menu=True)
+        today = self._today()
+        _, monitoring_state = texts.car_monitoring_state(updated, today)
+        text = texts.format_turn_on_success(updated.car_number) + "\n\n" + texts.format_car_details(updated, today)
+        return BotReply(
+            text=text,
+            car_detail_subscription_id=updated.id,
+            car_detail_monitoring_state=monitoring_state,
+            car_detail_page=page,
+        )
 
-    def handle_stop_cancel(self) -> BotReply:
-        return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
+    def handle_my_car_delete_prompt(
+        self, subscription_id: int, page: int, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """Первый шаг — показывает подтверждение, ЕЩЁ НИЧЕГО не удаляет
+        (см. design report: "🗑 Удалить автомобиль — отдельное от OFF
+        действие. Сразу ничего не удалять")."""
+        subscription = self._subscriptions.get_actionable_subscription(
+            subscription_id, telegram_user_id=telegram_user_id,
+        )
+        if subscription is None:
+            return None
+        return BotReply(
+            text=texts.format_delete_confirm_prompt(subscription.car_number),
+            car_delete_confirm_subscription_id=subscription.id,
+            car_delete_confirm_page=page,
+        )
+
+    def handle_my_car_delete_confirm(
+        self, subscription_id: int, page: int, *, telegram_user_id: int,
+    ) -> BotReply:
+        """Финальный шаг — владение перепроверяется ЗАНОВО здесь (а не
+        только доверяется тому, что пользователь дошёл до этого экрана,
+        см. design report: "нельзя подменить owner/user_id через callback
+        payload") — SubscriptionService.delete_car() сам делает эту
+        проверку ещё раз через get_actionable_subscription. Возвращает
+        ОБНОВЛЁННЫЙ список "Мои авто" (см. design report: "после удаления
+        автомобиль исчезнет из «Мои авто»"), а не отдельное сообщение-
+        квитанцию — так пользователь сразу видит актуальный список."""
+        subscription = self._subscriptions.get_actionable_subscription(
+            subscription_id, telegram_user_id=telegram_user_id,
+        )
+        if subscription is None:
+            return BotReply(text=texts.CAR_ACTION_FAILED_TEXT, show_main_menu=True)
+
+        deleted = self._subscriptions.delete_car(subscription_id, telegram_user_id=telegram_user_id)
+        if not deleted:
+            return BotReply(text=texts.CAR_ACTION_FAILED_TEXT, show_main_menu=True)
+
+        return self._format_my_cars_page_reply(telegram_user_id, page)
+
+    def handle_my_car_delete_cancel(
+        self, subscription_id: int, page: int, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """"Отмена" на удалении — возвращает к карточке того же
+        автомобиля, БЕЗ каких-либо изменений (см. design report: "Cancel
+        preserves car")."""
+        subscription = self._subscriptions.get_actionable_subscription(
+            subscription_id, telegram_user_id=telegram_user_id,
+        )
+        if subscription is None:
+            return None
+        return self._format_car_detail_reply(subscription, page)
 
     # ---- trusted-operator task-level admin (см. design report: пересмотр
     # архитектуры) — 🔎/⛔ работают НАПРЯМУЮ с fine_monitoring_tasks, без

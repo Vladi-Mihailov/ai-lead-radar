@@ -41,12 +41,14 @@ PERIOD_PROMPT = "📅 Выберите срок мониторинга"
 STALE_DIALOG_TEXT = "⚠️ Диалог устарел, начните заново."
 NO_CARS_TEXT = "У вас пока нет добавленных автомобилей."
 
-# 🔎 Проверить сейчас / ⛔ Остановить мониторинг (см. design report Stage 4).
+# 🔎 Проверить сейчас (см. design report Stage 4) — единственный
+# оставшийся потребитель picker'а по subscription_id; "⛔ Остановить
+# мониторинг" для обычного пользователя заменена car-centric ON/OFF (см.
+# "📋 Мои авто" ниже) — STOP_PICK_PROMPT/STOP_CONFIRM_PROMPT/
+# STOP_FAILED_TEXT удалены вместе с handle_stop_pick/handle_stop_confirm
+# (см. design report про переработку UX, п.8 "старая кнопка Stop").
 NO_ACTIONABLE_CARS_TEXT = "У вас нет автомобилей, с которыми можно выполнить это действие."
 CHECK_NOW_PICK_PROMPT = "🔎 Выберите автомобиль для проверки:"
-STOP_PICK_PROMPT = "⛔ Выберите автомобиль для остановки мониторинга:"
-STOP_CONFIRM_PROMPT = "Остановить мониторинг для {car_number}?"
-STOP_FAILED_TEXT = "⚠️ Не удалось остановить — попробуйте ещё раз через «⛔ Остановить мониторинг»."
 CALLBACK_NOT_AUTHORIZED_TEXT = "Это действие недоступно — начните заново через меню."
 
 # Trusted-operator task-level admin (см. design report: пересмотр
@@ -242,60 +244,82 @@ OWNER_RESOLUTION_ERROR_TEXT = (
 )
 
 
-def _status_label(subscription: FineMonitoringSubscription, today: date) -> str:
-    """Вычисляется на лету из status+end_date, а НЕ только из status — та
-    же логика, что и FineMonitoringSubscription.is_effectively_active:
-    подписка с прошедшим end_date показывается как "Истёк", даже если
-    expire_elapsed() ещё ни разу не прошёлся по этой строке (см. Stage 1
-    design про lifecycle подписки)."""
-    if subscription.status == "pending_claim":
-        return "⏳ Ждём подтверждения владельцем"
+def car_monitoring_state(subscription: FineMonitoringSubscription, today: date) -> tuple[str, str]:
+    """(emoji, state) для car-centric "📋 Мои авто" (см. design report про
+    ON/OFF UX). status='pending_claim' сюда никогда не попадает — список
+    строится ИСКЛЮЧИТЕЛЬНО из SubscriptionService.list_my_cars(), где
+    telegram_user_id обязателен (pending_claim строки его не имеют, см.
+    FineSubscriptionRepository.list_by_user).
+
+    'stopped' — ВСЕГДА OFF, независимо от end_date: пользователь сам
+    выключил мониторинг, это осознанное состояние, которое явно можно
+    включить обратно одной кнопкой (см. SubscriptionService.turn_on_car).
+
+    "ИСТЁК" — ОТДЕЛЬНОЕ, третье состояние (не ON и не OFF) для status=
+    'expired' ИЛИ ещё 'active', но с уже прошедшим end_date (см.
+    FineMonitoringSubscription.is_effectively_active) — время истекло
+    само по себе, а не по решению пользователя, и "включить" его нельзя
+    одной кнопкой (реактивация требует НОВОГО периода, см. design report:
+    "не отображать expired как OFF автоматически")."""
     if subscription.status == "stopped":
-        return "⛔ Остановлен"
-    if subscription.end_date < today:
-        return "⏱ Истёк"
-    return "✅ Активен"
+        return "⚪", "OFF"
+    if subscription.status == "active" and subscription.end_date >= today:
+        return "🟢", "ON"
+    return "⏱", "ИСТЁК"
 
 
-def format_my_cars(subscriptions: list[FineMonitoringSubscription], today: date) -> str:
-    if not subscriptions:
-        return NO_CARS_TEXT
-
-    blocks = [
-        "\n".join([
-            f"🚗 {sub.car_number}",
-            f"📅 до {_fmt_date(sub.end_date)}",
-            _status_label(sub, today),
-        ])
-        for sub in subscriptions
-    ]
-    return "\n\n".join(blocks)
+def format_car_button_label(subscription: FineMonitoringSubscription, today: date) -> str:
+    emoji, state = car_monitoring_state(subscription, today)
+    return f"{emoji} {subscription.car_number} — {state}"
 
 
-MANAGED_CARS_HEADER = "📋 Добавлено вами для других пользователей:"
-NO_MANAGED_CARS_TEXT = "Вы пока не добавляли автомобили для других пользователей."
+MY_CARS_HEADER = "🚗 Мои автомобили"
 
 
-def format_managed_cars(subscriptions: list[FineMonitoringSubscription], today: date) -> str:
-    """"Мои авто" для trusted-оператора показывает delegated-подписки
-    ОТДЕЛЬНЫМ разделом (см. design report) — эта функция форматирует
-    только этот раздел; собственные подписки оператора — тот же
-    format_my_cars(), что и у обычного пользователя."""
-    if not subscriptions:
-        return NO_MANAGED_CARS_TEXT
+def format_car_details(subscription: FineMonitoringSubscription, today: date) -> str:
+    emoji, state = car_monitoring_state(subscription, today)
+    date_line = (
+        f"📅 Истёк {_fmt_date(subscription.end_date)}" if state == "ИСТЁК"
+        else f"📅 До {_fmt_date(subscription.end_date)}"
+    )
+    return "\n".join([
+        f"🚗 {subscription.car_number}",
+        f"Мониторинг: {emoji} {state}",
+        date_line,
+    ])
 
-    blocks = []
-    for sub in subscriptions:
-        owner_display = f"@{sub.telegram_username}" if sub.telegram_username else f"@{sub.owner_username_hint}"
-        blocks.append(
-            "\n".join([
-                f"🚗 {sub.car_number}",
-                f"👤 Владелец: {owner_display}",
-                f"📅 до {_fmt_date(sub.end_date)}",
-                _status_label(sub, today),
-            ])
-        )
-    return "\n\n".join(blocks)
+
+TURN_OFF_BUTTON_LABEL = "⏸ Выключить мониторинг"
+TURN_ON_BUTTON_LABEL = "▶️ Включить мониторинг"
+DELETE_CAR_BUTTON_LABEL = "🗑 Удалить автомобиль"
+BACK_BUTTON_LABEL = "⬅️ Назад"
+DELETE_CAR_CONFIRM_BUTTON_LABEL = "🗑 Да, удалить"
+CANCEL_BUTTON_LABEL = "Отмена"
+
+# Безопасный отказ для ON/OFF/Delete (см. design report: "все callback
+# actions должны повторно проверять authorization server-side") — общий
+# для "не найдено"/"не принадлежит"/"уже не в том состоянии"/гоночный
+# конфликт — намеренно НЕ различает эти случаи в тексте пользователю (та
+# же осторожность, что и у CALLBACK_NOT_AUTHORIZED_TEXT/STOP_FAILED_TEXT),
+# только предлагает начать заново через актуальный список.
+CAR_ACTION_FAILED_TEXT = (
+    "⚠️ Не удалось выполнить действие — откройте автомобиль заново через «📋 Мои авто»."
+)
+
+
+def format_turn_off_success(car_number: str) -> str:
+    return f"⏸ Мониторинг {car_number} выключен.\nАвтомобиль сохранён в «Мои авто»."
+
+
+def format_turn_on_success(car_number: str) -> str:
+    return f"▶️ Мониторинг {car_number} включён."
+
+
+def format_delete_confirm_prompt(car_number: str) -> str:
+    return (
+        f"⚠️ Удалить {car_number} из списка?\n"
+        "После удаления автомобиль исчезнет из «Мои авто»."
+    )
 
 
 def _format_trusted_task_line(task: FineMonitoringTask) -> str:
