@@ -16,6 +16,92 @@ groups:
     title: "Сарпи"
     enabled: true
 
+  - username: "verkhniy_lars_dariali"
+    title: "КПП Грузии Дариали"
+    enabled: true
+
+  - username: "geolars"
+    title: "Верхний Ларс Сегодня"
+    enabled: true
+
+  - username: "tbilisi14"
+    title: "Тбилиси чат"
+    enabled: true
+
+
+  - username: "mytbilisi_chat"
+    title: "ТБИЛИСИ ЧАТ | Грузия"
+    enabled: true
+
+  - username: "grusia1"
+    title: "Грузия"
+    enabled: true
+
+
+
+
+  - username: "expats_georgia"
+    title: "Expats Georgia"
+    enabled: true
+
+  - username: "saburtalo_tbi"
+    title: "Saburtalo Tbilisi"
+    enabled: true
+
+  - username: "vake_tbi"
+    title: "Vake Tbilisi"
+    enabled: true
+
+  - username: "svoi_tbilisi"
+    title: "Свои Тбилиси"
+    enabled: true
+
+  - username: "mybatumi_chat"
+    title: "Батуми чат"
+    enabled: true
+
+  - username: "batumi_people"
+    title: "Batumi People"
+    enabled: true
+
+  - username: "georgia_auto"
+    title: "Georgia Auto"
+    enabled: true
+
+  # Турция (см. задачу) — title не указан намеренно: резолвится сам при
+  # первом подключении (см. reader/sources/telegram_source.py::
+  # _resolve_groups — group.title or entity.title or entity.username or
+  # entity.id), а не выдуман здесь без реального обращения к Telegram.
+  - username: "turtsiab"
+    enabled: true
+
+  - username: "russiansinturkey_antalya"
+    enabled: true
+
+  - username: "russiansinturkey_stambul"
+    enabled: true
+
+  - username: "russiansinturkey_all"
+    enabled: true
+
+  - username: "istanbul_ru"
+    enabled: true
+
+  - username: "stambuli"
+    enabled: true
+
+  - username: "chat_istambul_help"
+    enabled: true
+
+  - username: "nedvizhkaalaniya"
+    enabled: true
+
+  - username: "russianturkiyeruss"
+    enabled: true
+
+  - username: "turkey_ourantalya"
+    enabled: true
+
   # Приватная группа — только по числовому id.
   # Аккаунт, под которым запущен Reader, должен уже состоять в этой группе.
 #  - id: -1001234567890
