@@ -12,23 +12,32 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import pytest  # noqa: E402
+import yaml  # noqa: E402
 
 from reader.groups import Group, GroupLoadError, load_groups  # noqa: E402
 
 _CONFIG_GROUPS_PATH = PROJECT_ROOT / "config" / "groups.yaml"
 
-_NEW_TURKEY_USERNAMES = {
+# 6 из 10 турецких групп остаются enabled (см. задачу-корректировку).
+_ENABLED_TURKEY_USERNAMES = {
     "turtsiab",
     "russiansinturkey_antalya",
     "russiansinturkey_stambul",
     "russiansinturkey_all",
     "istanbul_ru",
     "stambuli",
+}
+
+# Остальные 4 добавлены в конфиг, но намеренно enabled: false — не
+# удалены (см. задачу: "Не удаляй их из config/groups.yaml").
+_DISABLED_TURKEY_USERNAMES = {
     "chat_istambul_help",
     "nedvizhkaalaniya",
     "russianturkiyeruss",
     "turkey_ourantalya",
 }
+
+_NEW_TURKEY_USERNAMES = _ENABLED_TURKEY_USERNAMES | _DISABLED_TURKEY_USERNAMES
 
 _PRE_EXISTING_USERNAMES = {
     "VerhniyLars",
@@ -54,6 +63,15 @@ def _write_groups_yaml(tmp_path, content: str) -> Path:
     path = tmp_path / "groups.yaml"
     path.write_text(content, encoding="utf-8")
     return path
+
+
+def _load_raw_group_entries() -> list[dict]:
+    """Все записи groups: как есть, включая enabled=false — load_groups()
+    их отфильтровывает целиком (см. reader/groups.py), поэтому для
+    проверки "сколько всего настроено"/"какие именно disabled" читаем
+    YAML напрямую, а не через загрузчик."""
+    raw = yaml.safe_load(_CONFIG_GROUPS_PATH.read_text(encoding="utf-8")) or {}
+    return raw.get("groups") or []
 
 
 def test_load_groups_returns_only_enabled_entries(tmp_path):
@@ -175,24 +193,45 @@ def test_group_identifier_prefers_username_over_id():
 
 
 # ---- regression: реальный config/groups.yaml проекта (см. задачу про -----
-# ---- добавление 10 турецких групп/каналов) --------------------------------
+# ---- добавление 10 турецких групп/каналов и последующую корректировку: ---
+# ---- 4 из них должны остаться в конфиге, но enabled: false) --------------
 
 
-def test_project_groups_yaml_loads_without_errors():
+def test_project_groups_yaml_has_26_total_configured_groups():
+    """16 существующих + 10 турецких (6 enabled + 4 disabled) — ни одна
+    запись не удалена, только у части выставлен enabled: false."""
+    entries = _load_raw_group_entries()
+
+    assert len(entries) == 26
+
+
+def test_project_groups_yaml_has_22_enabled_groups():
     groups = load_groups(_CONFIG_GROUPS_PATH)
 
-    assert len(groups) >= len(_PRE_EXISTING_USERNAMES) + len(_NEW_TURKEY_USERNAMES)
+    assert len(groups) == 22
 
 
-def test_project_groups_yaml_contains_all_new_turkey_usernames():
+def test_project_groups_yaml_disables_exactly_the_four_specified_turkey_groups():
+    entries = _load_raw_group_entries()
+    disabled_usernames = {
+        entry.get("username") for entry in entries if entry.get("enabled", True) is False
+    }
+
+    assert disabled_usernames == _DISABLED_TURKEY_USERNAMES
+
+
+def test_project_groups_yaml_keeps_other_six_new_turkey_groups_enabled():
     groups = load_groups(_CONFIG_GROUPS_PATH)
     usernames = {g.username for g in groups if g.username}
 
-    assert _NEW_TURKEY_USERNAMES <= usernames
+    assert _ENABLED_TURKEY_USERNAMES <= usernames
+    # Отключённые не должны попадать в результат load_groups() вовсе.
+    assert not (_DISABLED_TURKEY_USERNAMES & usernames)
 
 
 def test_project_groups_yaml_preserves_pre_existing_usernames():
-    """Существующие группы не удалены и не переименованы (см. задачу)."""
+    """Существующие 16 групп не удалены, не переименованы и остаются
+    enabled (см. задачу: "Existing 16 groups не менять")."""
     groups = load_groups(_CONFIG_GROUPS_PATH)
     usernames = {g.username for g in groups if g.username}
 
@@ -200,7 +239,9 @@ def test_project_groups_yaml_preserves_pre_existing_usernames():
 
 
 def test_project_groups_yaml_has_no_duplicate_usernames():
-    groups = load_groups(_CONFIG_GROUPS_PATH)
-    usernames = [g.username for g in groups if g.username]
+    """Проверяем ВСЕ записи (включая disabled), а не только то, что вернул
+    load_groups() — дубль отключённой записи тоже был бы ошибкой конфига."""
+    entries = _load_raw_group_entries()
+    usernames = [entry.get("username") for entry in entries if entry.get("username")]
 
     assert len(usernames) == len(set(usernames))

@@ -91,16 +91,16 @@ groups:
     enabled: true
 
   - username: "chat_istambul_help"
-    enabled: true
+    enabled: false
 
   - username: "nedvizhkaalaniya"
-    enabled: true
+    enabled: false
 
   - username: "russianturkiyeruss"
-    enabled: true
+    enabled: false
 
   - username: "turkey_ourantalya"
-    enabled: true
+    enabled: false
 
   # Приватная группа — только по числовому id.
   # Аккаунт, под которым запущен Reader, должен уже состоять в этой группе.
