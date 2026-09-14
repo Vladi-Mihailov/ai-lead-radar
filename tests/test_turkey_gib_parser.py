@@ -254,6 +254,17 @@ def test_observed_has_debt_response_with_borclar_is_classified_as_has_debt():
     assert outcome.kind == "has_debt"
     assert outcome.messages == ()
     assert outcome.raw_data == payload
+    assert len(outcome.fines) == 1
+    assert outcome.fines[0].protocol_no == "XX00000000"
+    assert outcome.fines[0].amount == 1000
+
+
+def test_empty_borclar_gives_no_fines():
+    payload = _sanitized_borclar_response(borclar=[])
+
+    outcome = parse_submit_response(payload)
+
+    assert outcome.fines == ()
 
 
 def test_empty_borclar_is_classified_as_no_debt():

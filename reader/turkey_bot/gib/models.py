@@ -5,6 +5,8 @@ Stage 1/2. Никакого мониторинга/подписок здесь �
 """
 
 from dataclasses import dataclass
+from datetime import date
+from decimal import Decimal
 from typing import Literal
 
 
@@ -53,11 +55,12 @@ class GibSubmitOutcome:
       - "has_debt"    — либо "data" непуст (изначальное, недоказанное
         предположение об envelope апигейта — так и не подтверждено вживую),
         либо (реально увиденная, см. parser.py, третий live-запуск) плоская
-        форма с непустым "BORCLAR" — БЕЗ обёртки "data" вовсе. В обоих
-        случаях конкретные поля отдельного штрафа/долга (KK_ACIKLAMA/
-        KK_BORC/KK_TUTANAKNO/... для формы с "BORCLAR") сознательно НЕ
-        парсятся в отдельную модель (см. design report: "smallest rule
-        necessary") — raw_data отдаётся как есть вызывающему коду;
+        форма с непустым "BORCLAR" — БЕЗ обёртки "data" вовсе. Для формы с
+        "BORCLAR" отдельные записи ДОПОЛНИТЕЛЬНО парсятся в `fines` (см.
+        GibFineRecord ниже и reader/turkey_bot/gib/fine_parser.py) — только
+        поля с подтверждённой семантикой, см. докстрок fine_parser.py про
+        полный аудит; raw_data по-прежнему отдаёт ВЕСЬ payload как есть
+        (для формы "data" — только "data") для audit-хранения как раньше;
       - "rejected"    — GIB вернул конкретный, реально увиденный (второй
         live-запуск, заведомо неверный код, см. design report Stage 2)
         текст "Güvenlik kodunu yanlış girdiniz. Lütfen kontrol ederek
@@ -75,11 +78,59 @@ class GibSubmitOutcome:
         а не тихо предполагать что-либо о содержимом.
 
     raw_data — то, что реально лежало под "data" (или весь payload целиком
-    для "unexpected") — НЕ содержит cookies/captcha_code (см. задачу про
-    то, что нельзя логировать) и предназначено для точечной отладки через
-    manual_test.py, а не для показа конечному пользователю как есть.
+    для "unexpected"/формы с "BORCLAR") — НЕ содержит cookies/captcha_code
+    (см. задачу про то, что нельзя логировать), НО МОЖЕТ содержать
+    KK_HASH/KK_KIMLIK (платёжные токены GIB, см. fine_parser.py) — это
+    ok ТОЛЬКО для server-side audit-хранения (turkey_fine_checks.
+    raw_response, см. задачу: "may continue storing the complete server-
+    side GIB response"), raw_data НИКОГДА не должен попадать в
+    пользовательский текст/обычные логи приложения — см. conversation.py.
+
+    fines — типизированные записи из "BORCLAR" (см. GibFineRecord ниже),
+    непусто ТОЛЬКО когда kind == "has_debt" и форма ответа была "BORCLAR"
+    (форма "data" fines не заполняет — её реальная схема так и не была
+    увидена, см. выше). НИКОГДА не содержит KK_HASH/KK_KIMLIK — см.
+    fine_parser.py про то, какие поля вообще парсятся.
     """
 
     kind: GibSubmitKind
     messages: tuple[GibMessage, ...]
     raw_data: object | None
+    fines: tuple["GibFineRecord", ...] = ()
+
+
+@dataclass(frozen=True)
+class GibFineRecord:
+    """Одна запись из "BORCLAR" — см. fine_parser.py про парсинг и полный
+    аудит полей реального ответа GIB (design report). Только поля с
+    ПОДТВЕРЖДЁННОЙ семантикой:
+
+      - protocol_no    — KK_TUTANAKNO (номер протокола/штрафа);
+      - plate          — KK_PLAKA (в наблюдаемых данных совпадает с
+        запрошенным номером — хранится для сверки, не для показа рядом с
+        каждым штрафом, см. texts.py: он и так уже в заголовке сообщения);
+      - amount         — KK_BORC, сумма долга (Decimal, распарсено
+        безопасно — см. fine_parser._parse_amount);
+      - description    — KK_ACIKLAMA как есть, турецкий текст БЕЗ перевода
+        на этой итерации (см. задачу п.4 — не вводить внешнюю зависимость
+        перевода сейчас);
+      - violation_date — дата НАРУШЕНИЯ (не оплаты!), извлечена из
+        "Ceza Tarihi:YYYY-MM-DD" внутри description — см. fine_parser.py
+        про то, почему KK_ODEMETARIHI ("дата оплаты" буквально) СОЗНАТЕЛЬНО
+        не используется как срок оплаты (неподтверждённая, вероятно ложная
+        семантика — см. design report);
+      - authority      — KK_MYS_KURUM_ADI (орган, выдавший штраф);
+      - late_fee       — KK_GECIKMEZAMMI (пеня за просрочку), если > 0;
+      - discount       — KK_INDIRIM_MIKTARI (сумма скидки), если > 0.
+
+    НИКОГДА не содержит KK_HASH/KK_KIMLIK (платёжные токены) — этих полей
+    в этом dataclass нет вообще, не только "не заполнены"."""
+
+    protocol_no: str | None
+    plate: str | None
+    amount: Decimal | None
+    description: str | None
+    violation_date: date | None
+    authority: str | None
+    late_fee: Decimal | None
+    discount: Decimal | None

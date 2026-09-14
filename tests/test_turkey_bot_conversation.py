@@ -7,6 +7,8 @@ ConversationController.__init__) подменяется фейковым GibProv
 """
 
 import sys
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -20,6 +22,7 @@ from reader.turkey_bot.conversation_state_repository import (  # noqa: E402
 )
 from reader.turkey_bot.gib.models import (  # noqa: E402
     CaptchaChallenge,
+    GibFineRecord,
     GibMessage,
     GibSubmitOutcome,
 )
@@ -172,12 +175,29 @@ async def test_correct_code_no_debt_reports_success_and_clears_everything():
     ]
 
 
-async def test_has_debt_never_leaks_raw_data_to_user_text():
+async def test_has_debt_shows_parsed_fine_and_never_leaks_raw_data():
     """Явное требование задачи: "do not expose raw GIB raw_data directly
-    to Telegram users" - только безопасная заглушка в reply.text, полный
-    raw_data - только в TurkeyCheckRepository (server-side)."""
+    to Telegram users" - рендерится ТОЛЬКО из outcome.fines (уже
+    типизированные GibFineRecord), raw_data (который в реальности несёт
+    KK_HASH/KK_KIMLIK) остаётся ТОЛЬКО в TurkeyCheckRepository
+    (server-side audit), никогда в тексте, который видит пользователь."""
+    fine = GibFineRecord(
+        protocol_no="MC00000000",
+        plate="34ABC123",
+        amount=Decimal("1000.00"),
+        description="Example violation description",
+        violation_date=date(2026, 8, 8),
+        authority="EMNİYET GENEL MÜDÜRLÜĞÜ",
+        late_fee=None,
+        discount=None,
+    )
     outcome = GibSubmitOutcome(
-        kind="has_debt", messages=(), raw_data=[{"secretAmount": 12345, "secretField": "x"}],
+        kind="has_debt",
+        messages=(),
+        raw_data={
+            "BORCLAR": [{"KK_HASH": "SECRET-HASH-VALUE", "KK_KIMLIK": "SECRET-KIMLIK-VALUE"}]
+        },
+        fines=(fine,),
     )
     provider = _FakeProvider(start_challenge=_challenge(), submit_results=[outcome])
     factory = _FakeCheckFactory([provider])
@@ -186,16 +206,18 @@ async def test_has_debt_never_leaks_raw_data_to_user_text():
     await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     reply = await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
-    assert reply.text == texts.has_debt_text("34ABC123")
-    assert "secretAmount" not in reply.text
-    assert "secretField" not in reply.text
-    assert "12345" not in reply.text
+    assert "MC00000000" in reply.text
+    assert "1000" in reply.text
+    assert "08.08.2026" in reply.text
+    assert "SECRET-HASH-VALUE" not in reply.text
+    assert "SECRET-KIMLIK-VALUE" not in reply.text
+    assert reply.extra_texts == ()
 
     row = checks._conn.execute(
         "SELECT raw_response, status FROM turkey_fine_checks ORDER BY id DESC LIMIT 1"
     ).fetchone()
     assert row[1] == "has_debt"
-    assert "secretAmount" in row[0]  # сырой ответ по-прежнему хранится server-side
+    assert "SECRET-HASH-VALUE" in row[0]  # сырой ответ по-прежнему хранится server-side
 
 
 async def test_rejected_code_reuses_same_provider_for_refresh_and_asks_again():

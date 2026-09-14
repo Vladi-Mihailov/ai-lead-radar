@@ -59,11 +59,20 @@ class BotReply:
     всегда True одновременно с photo_png (пока идёт диалог, отмена должна
     быть доступна), но выражено отдельным полем, а не выведено из
     photo_png is not None, чтобы handlers.py не должен был знать про эту
-    связь."""
+    связь.
+
+    extra_texts — ДОПОЛНИТЕЛЬНЫЕ сообщения, отправляемые ПОСЛЕ text (без
+    фото/кнопок) — единственный источник: has_debt со многими штрафами,
+    когда единое сообщение превысило бы лимит Telegram (см.
+    reader/turkey_bot/texts.py::format_has_debt_messages — уже возвращает
+    готовый список сообщений с сохранёнными границами штрафов). Пусто во
+    всех остальных случаях (см. задачу: "CAPTCHA flow ... must remain
+    unchanged")."""
 
     text: str
     photo_png: bytes | None = None
     show_cancel_button: bool = False
+    extra_texts: tuple[str, ...] = ()
 
 
 class _AsyncCloseable(Protocol):
@@ -270,10 +279,14 @@ class ConversationController:
                 chat_id, telegram_user_id=telegram_user_id, check=check,
                 status="has_debt", gib_message_text=message_text, raw_response=raw_response,
             )
-            # См. reader/turkey_bot/texts.py::has_debt_text - НИКОГДА не
-            # показывает raw_data пользователю (схема неизвестна, см.
-            # design report Stage 2) - только безопасная заглушка.
-            return BotReply(text=texts.has_debt_text(check.plate))
+            # См. reader/turkey_bot/texts.py::format_has_debt_messages -
+            # строит текст ТОЛЬКО из outcome.fines (уже типизированные
+            # GibFineRecord, см. reader/turkey_bot/gib/fine_parser.py) -
+            # conversation.py здесь НЕ интерпретирует raw JSON вообще (см.
+            # задачу). Список сообщений (см. задачу про лимит Telegram) -
+            # первое идёт как основной ответ, остальные - extra_texts.
+            rendered_messages = texts.format_has_debt_messages(check.plate, outcome.fines)
+            return BotReply(text=rendered_messages[0], extra_texts=tuple(rendered_messages[1:]))
 
         # "unexpected"
         await self._finish(

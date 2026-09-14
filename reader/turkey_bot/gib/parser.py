@@ -63,12 +63,16 @@ envelope "messages": [...] (там "messages" — буквально null, не 
 Stage 1) предположения об едином envelope апигейта для ВСЕХ эндпоинтов.
 "BORCLAR" ("долги" по-турецки) — реальное, увиденное вживую имя поля;
 непустой список -> "has_debt", пустой -> "no_debt" (симметрично "data"
-ниже) — конкретные поля отдельной записи (KK_*) сознательно НЕ парсятся
-в отдельную модель здесь (см. design report: "smallest rule necessary") —
-raw_data отдаёт вызывающему коду весь payload целиком, как и у "data"-
-ветки ниже.
+ниже) — raw_data отдаёт вызывающему коду весь payload целиком, как и у
+"data"-ветки ниже. Отдельные записи ДОПОЛНИТЕЛЬНО парсятся в типизированные
+GibFineRecord (см. reader/turkey_bot/gib/fine_parser.py про полный аудит
+полей и то, какие из них подтверждены/неоднозначны/платёжные-и-никогда-
+не-парсятся) и кладутся в GibSubmitOutcome.fines — только для kind
+"has_debt", "data"-ветка ниже fines не заполняет (её реальная схема так
+и не была увидена).
 """
 
+from reader.turkey_bot.gib.fine_parser import parse_fine_records
 from reader.turkey_bot.gib.models import GibMessage, GibSubmitOutcome
 
 _BLOCKING_MESSAGE_TYPES = frozenset({"ERROR", "WARNING"})
@@ -138,7 +142,8 @@ def parse_submit_response(payload: object) -> GibSubmitOutcome:
         # признак именно этого случая.
         borclar = payload["BORCLAR"]
         kind = "no_debt" if _is_empty(borclar) else "has_debt"
-        return GibSubmitOutcome(kind=kind, messages=messages, raw_data=payload)
+        fines = parse_fine_records(borclar) if kind == "has_debt" else ()
+        return GibSubmitOutcome(kind=kind, messages=messages, raw_data=payload, fines=fines)
 
     if "data" not in payload:
         # Ни известного сообщения, ни "BORCLAR", ни "data" вовсе — форма,

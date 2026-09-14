@@ -76,13 +76,22 @@ async def _send_reply(event, reply: BotReply) -> None:
     reader/public_bot/handlers.py: отправляем CAPTCHA как фото с подписью,
     а не текстовым сообщением (см. design report Stage 3: "bot sends the
     CAPTCHA PNG directly in Telegram"). BytesIO с .name — так Telethon
-    определяет расширение/mime без временного файла на диске."""
+    определяет расширение/mime без временного файла на диске.
+
+    extra_texts — дополнительные сообщения ПОСЛЕ основного (см.
+    reader/turkey_bot/conversation.py::BotReply) — только has_debt со
+    многими штрафами (см. reader/turkey_bot/texts.py::
+    format_has_debt_messages про лимит Telegram и сохранение границ
+    штрафов) — отправляются как обычные текстовые сообщения, без
+    фото/кнопок (диалог к этому моменту уже завершён)."""
     buttons = cancel_keyboard() if reply.show_cancel_button else None
 
     if reply.photo_png is not None:
         buffer = io.BytesIO(reply.photo_png)
         buffer.name = _CAPTCHA_FILENAME
         await event.respond(reply.text, file=buffer, buttons=buttons)
-        return
+    else:
+        await event.respond(reply.text, buttons=buttons)
 
-    await event.respond(reply.text, buttons=buttons)
+    for extra_text in reply.extra_texts:
+        await event.respond(extra_text)
