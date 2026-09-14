@@ -42,6 +42,31 @@ type="ERROR":
 ERROR/WARNING по-прежнему остаётся "unexpected", а не обобщается ни в
 "rejected", ни в "no_debt" — см. задачу: "do not generalize other unknown
 ERROR messages to rejected".
+
+Третий live-запуск (см. design report Stage 4/live-test — принятая
+CAPTCHA, реальный штраф) показал, что УСПЕШНЫЙ ответ с найденным долгом
+использует СОВСЕМ ДРУГУЮ, плоскую форму — БЕЗ обёртки "data" вовсе и БЕЗ
+envelope "messages": [...] (там "messages" — буквально null, не список):
+
+    {"BORCLAR": [{"KK_ACIKLAMA": "...", "KK_BORC": "3000.00",
+                  "KK_TUTANAKNO": "MC03475903", "KK_PLAKA": "E911EE95",
+                  ...}, ...],
+     "BORC_SORGU_TARIHI": "20260914",
+     "SPOS_ISLEM_TIPI": "7",
+     "messages": null,
+     "pageDetail": null}
+
+До этого фикса такой ответ падал в "unexpected" ИМЕННО через ветку
+'"data" not in payload' (см. ниже) — не потому что форма была неопознана
+как ошибка, а потому что успешный ответ с долгом ПРОСТО не имеет "data"
+на верхнем уровне вовсе, в отличие от изначального (недоказанного, см.
+Stage 1) предположения об едином envelope апигейта для ВСЕХ эндпоинтов.
+"BORCLAR" ("долги" по-турецки) — реальное, увиденное вживую имя поля;
+непустой список -> "has_debt", пустой -> "no_debt" (симметрично "data"
+ниже) — конкретные поля отдельной записи (KK_*) сознательно НЕ парсятся
+в отдельную модель здесь (см. design report: "smallest rule necessary") —
+raw_data отдаёт вызывающему коду весь payload целиком, как и у "data"-
+ветки ниже.
 """
 
 from reader.turkey_bot.gib.models import GibMessage, GibSubmitOutcome
@@ -105,10 +130,20 @@ def parse_submit_response(payload: object) -> GibSubmitOutcome:
         # messages to rejected").
         return GibSubmitOutcome(kind="unexpected", messages=messages, raw_data=payload.get("data"))
 
+    if "BORCLAR" in payload:
+        # Реальная, плоская форма успешного ответа с результатом проверки
+        # долга (см. докстрок модуля, третий live-запуск) — БЕЗ обёртки
+        # "data". Проверяется ДО ветки "data" ниже: у этой формы "data"
+        # никогда нет, а "BORCLAR" — самый надёжный (реально увиденный)
+        # признак именно этого случая.
+        borclar = payload["BORCLAR"]
+        kind = "no_debt" if _is_empty(borclar) else "has_debt"
+        return GibSubmitOutcome(kind=kind, messages=messages, raw_data=payload)
+
     if "data" not in payload:
-        # Ни известного сообщения, ни "data" вовсе — форма, которую мы
-        # никогда не видели (см. докстрок модуля) — "unexpected", а не
-        # молчаливое предположение "штрафов нет".
+        # Ни известного сообщения, ни "BORCLAR", ни "data" вовсе — форма,
+        # которую мы никогда не видели (см. докстрок модуля) —
+        # "unexpected", а не молчаливое предположение "штрафов нет".
         return GibSubmitOutcome(kind="unexpected", messages=messages, raw_data=payload)
 
     data = payload["data"]
