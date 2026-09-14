@@ -63,6 +63,73 @@ def test_parses_all_confirmed_fields_from_one_record():
     assert "Örnek konum açıklaması" in fine.description
 
 
+def test_extracts_structured_location_article_and_violation_description():
+    """См. design report: полный аудит подтвердил 4-маркерный паттерн на
+    4/4 реальных записях - location/law_article/violation_description
+    извлекаются структурно, ДОПОЛНИТЕЛЬНО к сырому description."""
+    fines = parse_fine_records([_sanitized_item()])
+
+    fine = fines[0]
+    assert fine.location == "Örnek konum açıklaması"
+    assert fine.law_article == "51/2-B-2"
+    assert fine.violation_description == "Örnek ihlal açıklaması"
+    # description (сырой, полный KK_ACIKLAMA) сохраняется как есть -
+    # см. задачу: "do not destroy audit data".
+    assert "HarfSeriNo:" in fine.description
+    assert "Ceza Tarihi:" in fine.description
+
+
+def test_translated_fields_default_to_none_until_translation_runs():
+    fines = parse_fine_records([_sanitized_item()])
+
+    assert fines[0].location_ru is None
+    assert fines[0].violation_description_ru is None
+
+
+def test_missing_harfserino_marker_fails_safely_to_none_for_structured_fields():
+    item = _sanitized_item(
+        KK_ACIKLAMA="Some location text Ceza Tarihi:2026-08-08 Ceza Maddesi:51/2-B-2 "
+        "Madde Açıklaması:Some violation text"
+    )
+
+    fines = parse_fine_records([item])
+
+    fine = fines[0]
+    assert fine.location is None
+    assert fine.law_article is None
+    assert fine.violation_description is None
+    assert fine.description is not None  # raw description всё ещё доступен
+
+
+def test_reordered_markers_fail_safely_to_none():
+    """См. задачу: "parsing must fail safely if markers are missing or
+    reordered" - маркеры в НЕПРАВИЛЬНОМ порядке не должны частично
+    распарситься."""
+    item = _sanitized_item(
+        KK_ACIKLAMA="Madde Açıklaması:Some violation text HarfSeriNo:XX00000000 "
+        "Ceza Tarihi:2026-08-08 Ceza Maddesi:51/2-B-2 Some location text"
+    )
+
+    fines = parse_fine_records([item])
+
+    fine = fines[0]
+    assert fine.location is None
+    assert fine.law_article is None
+    assert fine.violation_description is None
+
+
+def test_malformed_description_missing_all_markers_fails_safely():
+    item = _sanitized_item(KK_ACIKLAMA="Just some plain text with no structured markers at all")
+
+    fines = parse_fine_records([item])
+
+    fine = fines[0]
+    assert fine.location is None
+    assert fine.law_article is None
+    assert fine.violation_description is None
+    assert fine.description == "Just some plain text with no structured markers at all"
+
+
 def test_parses_multiple_records_independently():
     fines = parse_fine_records([
         _sanitized_item(KK_TUTANAKNO="AA11111111", KK_BORC="500.00"),

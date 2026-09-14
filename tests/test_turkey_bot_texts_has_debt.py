@@ -34,6 +34,93 @@ def _fine(**overrides) -> GibFineRecord:
     return GibFineRecord(**defaults)
 
 
+def test_structured_fields_shown_separately_not_raw_combined_description():
+    """См. задачу: "do not display the raw combined KK_ACIKLAMA when
+    structured fields were parsed successfully"."""
+    fine = _fine(
+        description="RAW COMBINED Örnek konum HarfSeriNo:X Ceza Tarihi:2026-08-08 "
+        "Ceza Maddesi:51/2-B-2 Madde Açıklaması:Örnek ihlal",
+        location="Örnek konum",
+        law_article="51/2-B-2",
+        violation_description="Örnek ihlal",
+    )
+
+    text = texts.format_has_debt_messages("34ABC123", (fine,))[0]
+
+    assert "📍 Место: Örnek konum" in text
+    assert "📝 Нарушение: Örnek ihlal" in text
+    assert "📜 Статья: 51/2-B-2" in text
+    assert "RAW COMBINED" not in text
+    assert "HarfSeriNo:" not in text
+
+
+def test_translated_russian_text_shown_when_available():
+    fine = _fine(
+        location="Türkçe yer",
+        location_ru="Русское место",
+        violation_description="Türkçe ihlal",
+        violation_description_ru="Русское нарушение",
+    )
+
+    text = texts.format_has_debt_messages("34ABC123", (fine,))[0]
+
+    assert "📍 Место: Русское место" in text
+    assert "📝 Нарушение: Русское нарушение" in text
+    assert "Türkçe yer" not in text
+    assert "Türkçe ihlal" not in text
+
+
+def test_falls_back_to_turkish_when_translation_unavailable():
+    fine = _fine(
+        location="Türkçe yer", location_ru=None,
+        violation_description="Türkçe ihlal", violation_description_ru=None,
+    )
+
+    text = texts.format_has_debt_messages("34ABC123", (fine,))[0]
+
+    assert "📍 Место: Türkçe yer" in text
+    assert "📝 Нарушение: Türkçe ihlal" in text
+
+
+def test_missing_structured_fields_falls_back_to_raw_description():
+    """См. задачу: "If structured parsing fails, fall back gracefully to:
+    📍 Нарушение: <original KK_ACIKLAMA>"."""
+    fine = _fine(
+        description="Some raw unparsed KK_ACIKLAMA text",
+        location=None, law_article=None, violation_description=None,
+    )
+
+    text = texts.format_has_debt_messages("34ABC123", (fine,))[0]
+
+    assert "📍 Нарушение: Some raw unparsed KK_ACIKLAMA text" in text
+    assert "📍 Место" not in text
+    assert "📝 Нарушение" not in text
+    assert "📜 Статья" not in text
+
+
+def test_law_article_omitted_when_absent_even_if_location_present():
+    fine = _fine(location="Yer", violation_description="İhlal", law_article=None)
+
+    text = texts.format_has_debt_messages("34ABC123", (fine,))[0]
+
+    assert "📜 Статья" not in text
+
+
+def test_mixed_structured_and_fallback_fines_both_render_correctly():
+    structured = _fine(
+        protocol_no="AA00000000", location="Yer 1", violation_description="İhlal 1",
+    )
+    fallback = _fine(
+        protocol_no="BB00000000", description="Raw fallback text", location=None,
+        violation_description=None,
+    )
+
+    text = "\n\n".join(texts.format_has_debt_messages("34ABC123", (structured, fallback)))
+
+    assert "📍 Место: Yer 1" in text
+    assert "📍 Нарушение: Raw fallback text" in text
+
+
 def test_single_fine_renders_expected_fields():
     messages = texts.format_has_debt_messages("34ABC123", (_fine(),))
 

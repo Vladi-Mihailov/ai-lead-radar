@@ -7,7 +7,14 @@
 которые сами по себе никогда не содержат KK_HASH/KK_KIMLIK (платёжные
 токены GIB — этих полей нет в самом dataclass, не только "не показаны").
 raw_data/messages целиком уходят только в TurkeyCheckRepository
-(server-side), никогда в текст, который увидит пользователь."""
+(server-side), никогда в текст, который увидит пользователь.
+
+location_ru/violation_description_ru (см. reader/turkey_bot/gib/
+translation.py) показываются вместо турецкого оригинала, КОГДА они
+заполнены — `location_ru or location` (та же логика для violation_
+description) — тихий fallback на турецкий текст, если перевод недоступен/
+не выполнялся (не пустая строка, не ошибка, см. conversation.py::
+_translate_fines)."""
 
 from decimal import Decimal
 
@@ -104,8 +111,27 @@ def _format_fine_block(index: int, fine: GibFineRecord, *, show_authority: bool)
 
     if fine.amount is not None:
         lines.append(f"💰 Сумма: {_format_amount(fine.amount)}")
-    if fine.description:
+
+    # Структурные поля (см. reader/turkey_bot/gib/fine_parser.py) - ЕСЛИ
+    # хотя бы одно из двух распарсено, показываем их отдельно (с переводом
+    # на русский, если доступен, см. `_ru or original` fallback ниже) и
+    # НЕ дублируем сырой KK_ACIKLAMA целиком (см. задачу: "do not display
+    # the raw combined KK_ACIKLAMA when structured fields were parsed
+    # successfully"). Иначе - безопасный fallback на исходное поведение
+    # (сырое описание целиком), см. задачу: "If structured parsing fails,
+    # fall back gracefully to: 📍 Нарушение: <original KK_ACIKLAMA>".
+    if fine.location is not None or fine.violation_description is not None:
+        if fine.location:
+            lines.append(f"📍 Место: {fine.location_ru or fine.location}")
+        if fine.violation_description:
+            lines.append(
+                f"📝 Нарушение: {fine.violation_description_ru or fine.violation_description}"
+            )
+        if fine.law_article:
+            lines.append(f"📜 Статья: {fine.law_article}")
+    elif fine.description:
         lines.append(f"📍 Нарушение: {fine.description}")
+
     if fine.violation_date is not None:
         lines.append(f"📅 Дата нарушения: {_format_date_ru(fine.violation_date)}")
     if show_authority and fine.authority:

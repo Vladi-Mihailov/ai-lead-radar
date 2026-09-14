@@ -123,6 +123,31 @@ class GibFineRecord:
       - late_fee       — KK_GECIKMEZAMMI (пеня за просрочку), если > 0;
       - discount       — KK_INDIRIM_MIKTARI (сумма скидки), если > 0.
 
+    Структурные поля, извлечённые ИЗ description (см. fine_parser.py::
+    _parse_structured_aciklama — весь 4-маркерный паттерн подтверждён
+    вживую на 4/4 наблюдаемых записях, оба live-теста). Все три — None
+    одновременно, если паттерн не совпал целиком (маркеры отсутствуют/
+    переставлены/повреждены) — description при этом ВСЕГДА остаётся
+    полным исходным KK_ACIKLAMA (см. design report: "preserve the original
+    KK_ACIKLAMA internally as the existing description/fallback"):
+      - location                — текст ДО "HarfSeriNo:" (турецкий, БЕЗ
+        перевода — см. location_ru ниже);
+      - law_article              — значение "Ceza Maddesi:" (код статьи,
+        например "51/2-B-2") — НЕ переводится (не естественный язык);
+      - violation_description    — значение "Madde Açıklaması:" (турецкий,
+        БЕЗ перевода — см. violation_description_ru ниже).
+
+    Переведённые (на русский) варианты — заполняются ОТДЕЛЬНЫМ шагом (см.
+    reader/turkey_bot/gib/translation.py::TurkeyFineTranslationService),
+    НЕ во время парсинга самого BORCLAR (парсинг синхронный и не должен
+    знать о сети/OpenAI). None по умолчанию — означает "перевод не
+    выполнялся или не удался", вызывающий код (texts.py) должен
+    показывать `location_ru or location` (то же для violation_description)
+    — то есть тихий fallback на турецкий оригинал, НИКОГДА не пустую
+    строку/ошибку:
+      - location_ru;
+      - violation_description_ru.
+
     НИКОГДА не содержит KK_HASH/KK_KIMLIK (платёжные токены) — этих полей
     в этом dataclass нет вообще, не только "не заполнены"."""
 
@@ -134,3 +159,8 @@ class GibFineRecord:
     authority: str | None
     late_fee: Decimal | None
     discount: Decimal | None
+    location: str | None = None
+    law_article: str | None = None
+    violation_description: str | None = None
+    location_ru: str | None = None
+    violation_description_ru: str | None = None

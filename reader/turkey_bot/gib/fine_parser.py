@@ -17,11 +17,27 @@ live-ответ, 4 штрафа, 20 ключей на запись, все кл�
     KK_ACIKLAMA       — место/описание нарушения (турецкий текст,
                          "açıklama" = "описание") + встроенные
                          "HarfSeriNo:.../Ceza Tarihi:YYYY-MM-DD/
-                         Ceza Maddesi:.../Madde Açıklaması:..." — из
-                         этого встроенного текста извлекается ТОЛЬКО
-                         Ceza Tarihi (см. _parse_violation_date ниже) —
-                         остальное намеренно не парсится отдельно
-                         (не изобретать семантику сверх подтверждённой);
+                         Ceza Maddesi:.../Madde Açıklaması:..." — во ВСЕХ
+                         4 наблюдаемых записях (оба live-теста) эти 4
+                         маркера присутствуют в ЭТОМ ФИКСИРОВАННОМ порядке
+                         (см. design report: полный аудит перед парсингом),
+                         поэтому дополнительно извлекаются структурные поля
+                         (см. _parse_structured_aciklama ниже):
+                           - location (текст ДО "HarfSeriNo:");
+                           - law_article (значение "Ceza Maddesi:");
+                           - violation_description (значение
+                             "Madde Açıklaması:" — до конца строки);
+                         Ceza Tarihi по-прежнему парсится отдельно (см.
+                         _parse_violation_date, не тронуто) — HarfSeriNo
+                         не извлекается отдельно (дублирует KK_TUTANAKNO,
+                         только без дефиса). Если полный 4-маркерный
+                         паттерн не совпал (маркеры отсутствуют/переставлены
+                         местами/повреждены) — все три структурных поля
+                         остаются None, а исходный KK_ACIKLAMA целиком
+                         остаётся в description как безопасный fallback
+                         (см. design report: "fail safely", "do not
+                         destroy audit data") — ничего не парсится
+                         частично/приблизительно;
     KK_MYS_KURUM_ADI  — орган, выдавший штраф ("kurum adı" = "название
                          учреждения"), напр. "EMNİYET GENEL MÜDÜRLÜĞÜ";
     KK_GECIKMEZAMMI   — пеня за просрочку ("gecikme zammı"), "0.00" в
@@ -82,6 +98,21 @@ logger = logging.getLogger(__name__)
 # от неоднозначной KK_ODEMETARIHI).
 _VIOLATION_DATE_RE = re.compile(r"Ceza Tarihi:(\d{4})-(\d{2})-(\d{2})")
 
+# Полный, реально наблюдавшийся (см. design report: 4/4 записей, оба
+# live-теста) паттерн KK_ACIKLAMA — ВСЕ 4 маркера в этом фиксированном
+# порядке. re.DOTALL не нужен (турецкий текст без переносов строк в
+# наблюдаемых данных), но не вредит. Нежадный location (.+?) — чтобы
+# остановиться на ПЕРВОМ "HarfSeriNo:", а не на последнем вхождении чего-
+# либо похожего. Если этот паттерн НЕ совпадает целиком (любой маркер
+# отсутствует/переставлен/повреждён) — .match() вернёт None и все три
+# структурных поля останутся None (см. _parse_structured_aciklama).
+_STRUCTURED_ACIKLAMA_RE = re.compile(
+    r"^(?P<location>.+?)\s*HarfSeriNo:\S+\s*"
+    r"Ceza Tarihi:\d{4}-\d{2}-\d{2}\s*"
+    r"Ceza Maddesi:(?P<law_article>\S+)\s*"
+    r"Madde Açıklaması:(?P<violation_description>.+)$"
+)
+
 
 def _clean_str(value: object) -> str | None:
     if not isinstance(value, str):
@@ -119,8 +150,25 @@ def _parse_violation_date(description: str | None) -> date | None:
         return None
 
 
+def _parse_structured_aciklama(description: str | None) -> tuple[str | None, str | None, str | None]:
+    """(location, law_article, violation_description) — все три None, если
+    описание отсутствует или полный 4-маркерный паттерн не совпал целиком
+    (см. _STRUCTURED_ACIKLAMA_RE и модуль docstring про "fail safely, do
+    not invent partial parsing"). Никогда не бросает исключение наружу."""
+    if not description:
+        return None, None, None
+    match = _STRUCTURED_ACIKLAMA_RE.match(description)
+    if not match:
+        return None, None, None
+    location = _clean_str(match.group("location"))
+    law_article = _clean_str(match.group("law_article"))
+    violation_description = _clean_str(match.group("violation_description"))
+    return location, law_article, violation_description
+
+
 def _parse_one(item: dict) -> GibFineRecord:
     description = _clean_str(item.get("KK_ACIKLAMA"))
+    location, law_article, violation_description = _parse_structured_aciklama(description)
     return GibFineRecord(
         protocol_no=_clean_str(item.get("KK_TUTANAKNO")),
         plate=_clean_str(item.get("KK_PLAKA")),
@@ -130,6 +178,9 @@ def _parse_one(item: dict) -> GibFineRecord:
         authority=_clean_str(item.get("KK_MYS_KURUM_ADI")),
         late_fee=_parse_amount(item.get("KK_GECIKMEZAMMI")),
         discount=_parse_amount(item.get("KK_INDIRIM_MIKTARI")),
+        location=location,
+        law_article=law_article,
+        violation_description=violation_description,
     )
 
 

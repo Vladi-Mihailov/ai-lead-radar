@@ -32,9 +32,14 @@ from reader.turkey_bot.check_repository import TurkeyCheckRepository
 from reader.turkey_bot.conversation_state_repository import (
     TurkeyConversationStateRepository,
 )
-from reader.turkey_bot.gib.models import CaptchaChallenge, GibSubmitOutcome
+from reader.turkey_bot.gib.models import (
+    CaptchaChallenge,
+    GibFineRecord,
+    GibSubmitOutcome,
+)
 from reader.turkey_bot.gib.provider import GibProvider
 from reader.turkey_bot.gib.session import GibSession, GibTransportError
+from reader.turkey_bot.gib.translation import FineTranslationError
 from reader.turkey_bot.live_session_registry import LiveGibCheck, LiveGibSessionRegistry
 from reader.turkey_bot.models import ConversationState
 from reader.turkey_bot.validation import normalize_plate
@@ -88,6 +93,18 @@ class _AsyncCloseable(Protocol):
 CheckFactory = Callable[[], tuple[_AsyncCloseable, GibProvider]]
 
 
+class FineTranslatorLike(Protocol):
+    """Ровно то, что нужно отсюда от TurkeyFineTranslationService (см.
+    reader/turkey_bot/gib/translation.py) — тот же Protocol-приём, что и
+    FineTranslatorLike в reader/fines/check_service.py (грузинский
+    аналог), чтобы тесты могли подменить реальный OpenAI-клиент лёгким
+    фейком без сети."""
+
+    async def translate_fines(
+        self, fines: tuple[GibFineRecord, ...],
+    ) -> tuple[GibFineRecord, ...]: ...
+
+
 def _build_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS, headers={"User-Agent": _USER_AGENT})
 
@@ -126,11 +143,17 @@ class ConversationController:
         session_registry: LiveGibSessionRegistry,
         *,
         check_factory: CheckFactory = _default_check_factory,
+        translator: FineTranslatorLike | None = None,
     ):
         self._states = conversation_state_repository
         self._checks = check_repository
         self._registry = session_registry
         self._check_factory = check_factory
+        # None — как и everywhere в проекте (см. FineTranslatorLike в
+        # reader/fines/check_service.py) — означает "перевод недоступен"
+        # (нет OPENAI_API_KEY, см. main.py), не ошибку: клиент увидит
+        # оригинальный турецкий текст вместо перевода (см. _translate_fines).
+        self._translator = translator
 
     async def handle_text(self, text: str, *, chat_id: int, telegram_user_id: int) -> BotReply:
         stripped = text.strip()
@@ -275,17 +298,22 @@ class ConversationController:
             return BotReply(text=texts.no_debt_text(check.plate))
 
         if outcome.kind == "has_debt":
+            # Перевод location/violation_description на русский (см.
+            # reader/turkey_bot/gib/translation.py) - fail-open, см.
+            # _translate_fines: недоступный/сбойный перевод НИКОГДА не
+            # мешает показать результат (см. задачу).
+            fines = await self._translate_fines(outcome.fines)
             await self._finish(
                 chat_id, telegram_user_id=telegram_user_id, check=check,
                 status="has_debt", gib_message_text=message_text, raw_response=raw_response,
             )
             # См. reader/turkey_bot/texts.py::format_has_debt_messages -
-            # строит текст ТОЛЬКО из outcome.fines (уже типизированные
-            # GibFineRecord, см. reader/turkey_bot/gib/fine_parser.py) -
-            # conversation.py здесь НЕ интерпретирует raw JSON вообще (см.
-            # задачу). Список сообщений (см. задачу про лимит Telegram) -
-            # первое идёт как основной ответ, остальные - extra_texts.
-            rendered_messages = texts.format_has_debt_messages(check.plate, outcome.fines)
+            # строит текст ТОЛЬКО из уже типизированных GibFineRecord (см.
+            # reader/turkey_bot/gib/fine_parser.py) - conversation.py здесь
+            # НЕ интерпретирует raw JSON вообще (см. задачу). Список
+            # сообщений (см. задачу про лимит Telegram) - первое идёт как
+            # основной ответ, остальные - extra_texts.
+            rendered_messages = texts.format_has_debt_messages(check.plate, fines)
             return BotReply(text=rendered_messages[0], extra_texts=tuple(rendered_messages[1:]))
 
         # "unexpected"
@@ -298,6 +326,24 @@ class ConversationController:
             chat_id, [(m.type, m.text) for m in outcome.messages],
         )
         return BotReply(text=texts.UNEXPECTED_ERROR_TEXT)
+
+    async def _translate_fines(
+        self, fines: tuple[GibFineRecord, ...],
+    ) -> tuple[GibFineRecord, ...]:
+        """None translator (нет OPENAI_API_KEY, см. main.py), либо любой
+        сбой перевода (см. FineTranslationError) - fail-open: возвращает
+        fines БЕЗ ИЗМЕНЕНИЙ (турецкий текст остаётся, см.
+        reader/turkey_bot/texts.py: `location_ru or location`) - см.
+        задачу: "Translation must NEVER make a successful GIB check
+        fail". Логируется только факт сбоя (тип исключения), НИКОГДА
+        исходный/переведённый текст."""
+        if self._translator is None:
+            return fines
+        try:
+            return await self._translator.translate_fines(fines)
+        except FineTranslationError:
+            logger.warning("Turkey fine translation unavailable, showing original Turkish text")
+            return fines
 
     async def _finish(
         self,

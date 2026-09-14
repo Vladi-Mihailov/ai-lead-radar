@@ -27,6 +27,7 @@ from reader.turkey_bot.gib.models import (  # noqa: E402
     GibSubmitOutcome,
 )
 from reader.turkey_bot.gib.session import GibTransportError  # noqa: E402
+from reader.turkey_bot.gib.translation import FineTranslationError  # noqa: E402
 from reader.turkey_bot.live_session_registry import LiveGibSessionRegistry  # noqa: E402
 
 _CHAT_ID = 111
@@ -101,11 +102,13 @@ class _FakeCheckFactory:
         return client, provider
 
 
-def _make_controller(factory: _FakeCheckFactory):
+def _make_controller(factory: _FakeCheckFactory, *, translator=None):
     states = TurkeyConversationStateRepository(":memory:")
     checks = TurkeyCheckRepository(":memory:")
     registry = LiveGibSessionRegistry()
-    controller = ConversationController(states, checks, registry, check_factory=factory)
+    controller = ConversationController(
+        states, checks, registry, check_factory=factory, translator=translator,
+    )
     return controller, states, checks, registry
 
 
@@ -218,6 +221,84 @@ async def test_has_debt_shows_parsed_fine_and_never_leaks_raw_data():
     ).fetchone()
     assert row[1] == "has_debt"
     assert "SECRET-HASH-VALUE" in row[0]  # сырой ответ по-прежнему хранится server-side
+
+
+class _FakeTranslator:
+    def __init__(self, *, result=None, error=None):
+        self._result = result
+        self._error = error
+        self.calls: list[tuple] = []
+
+    async def translate_fines(self, fines):
+        self.calls.append(fines)
+        if self._error is not None:
+            raise self._error
+        return self._result if self._result is not None else fines
+
+
+def _structured_fine(**overrides) -> GibFineRecord:
+    defaults = {
+        "protocol_no": "MC00000000", "plate": "34ABC123", "amount": Decimal("1000.00"),
+        "description": "raw", "violation_date": date(2026, 8, 8), "authority": "ORG",
+        "late_fee": None, "discount": None, "location": "Türkçe yer",
+        "law_article": "51/2-B-2", "violation_description": "Türkçe ihlal",
+        "location_ru": None, "violation_description_ru": None,
+    }
+    defaults.update(overrides)
+    return GibFineRecord(**defaults)
+
+
+async def test_has_debt_uses_translator_result_when_available():
+    fine = _structured_fine()
+    outcome = GibSubmitOutcome(kind="has_debt", messages=(), raw_data={}, fines=(fine,))
+    provider = _FakeProvider(start_challenge=_challenge(), submit_results=[outcome])
+    factory = _FakeCheckFactory([provider])
+
+    translated_fine = _structured_fine(
+        location_ru="Русское место", violation_description_ru="Русское нарушение",
+    )
+    translator = _FakeTranslator(result=(translated_fine,))
+    controller, _states, _checks, _registry = _make_controller(factory, translator=translator)
+
+    await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    reply = await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert "Русское место" in reply.text
+    assert "Русское нарушение" in reply.text
+    assert len(translator.calls) == 1
+
+
+async def test_has_debt_falls_back_to_turkish_when_translator_fails():
+    """Явное требование задачи: "Translation must NEVER make a successful
+    GIB check fail" - сбой переводчика не должен ронять/портить ответ."""
+    fine = _structured_fine()
+    outcome = GibSubmitOutcome(kind="has_debt", messages=(), raw_data={}, fines=(fine,))
+    provider = _FakeProvider(start_challenge=_challenge(), submit_results=[outcome])
+    factory = _FakeCheckFactory([provider])
+
+    translator = _FakeTranslator(error=FineTranslationError("boom"))
+    controller, _states, checks, _registry = _make_controller(factory, translator=translator)
+
+    await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    reply = await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert "Türkçe yer" in reply.text
+    assert "Türkçe ihlal" in reply.text
+    assert checks.count_by_status("has_debt") == 1  # результат всё равно засчитан
+
+
+async def test_has_debt_without_translator_shows_turkish_text():
+    fine = _structured_fine()
+    outcome = GibSubmitOutcome(kind="has_debt", messages=(), raw_data={}, fines=(fine,))
+    provider = _FakeProvider(start_challenge=_challenge(), submit_results=[outcome])
+    factory = _FakeCheckFactory([provider])
+    controller, _states, _checks, _registry = _make_controller(factory)  # translator=None по умолчанию
+
+    await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    reply = await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert "Türkçe yer" in reply.text
+    assert "Türkçe ihlal" in reply.text
 
 
 async def test_rejected_code_reuses_same_provider_for_refresh_and_asks_again():

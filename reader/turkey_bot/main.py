@@ -36,6 +36,7 @@ from reader.turkey_bot.conversation import ConversationController  # noqa: E402
 from reader.turkey_bot.conversation_state_repository import (  # noqa: E402
     TurkeyConversationStateRepository,
 )
+from reader.turkey_bot.gib.translation import TurkeyFineTranslationService  # noqa: E402
 from reader.turkey_bot.handlers import register  # noqa: E402
 from reader.turkey_bot.known_users_repository import (
     TurkeyBotKnownUsersRepository,  # noqa: E402
@@ -96,8 +97,31 @@ async def run() -> None:
     session_registry = LiveGibSessionRegistry()
 
     try:
+        # Тот же общий OPENAI_API_KEY (settings.ocr.openai_api_key) и
+        # translation_model, что и у Георгии (reader/fines/translation.py) -
+        # второй ключ/секрет не заводится (см. задачу). None - как и там -
+        # означает "перевод недоступен" (нет ключа), не ошибку запуска:
+        # клиент увидит оригинальный турецкий текст (см. conversation.py::
+        # _translate_fines).
+        translator = (
+            TurkeyFineTranslationService(
+                api_key=settings.ocr.openai_api_key, model=settings.fine_monitor.translation_model,
+            )
+            if settings.ocr.openai_api_key
+            else None
+        )
+        # НЕ содержит и не может содержать сам ключ (см. выше) - только
+        # факт "сконструирован/нет" и имя модели (не секрет) - единственный
+        # способ подтвердить в логе, что перевод реально включён, без
+        # тестового запроса к OpenAI (см. задачу: "do not make a
+        # standalone test OpenAI request").
+        if translator is not None:
+            logger.info(f"✔ Turkey fine translator включён (model={settings.fine_monitor.translation_model})")
+        else:
+            logger.info("Turkey fine translator выключен (OPENAI_API_KEY не задан)")
         controller = ConversationController(
             conversation_state_repository, check_repository, session_registry,
+            translator=translator,
         )
 
         client = TelegramClient(str(_SESSION_PATH), api_id, api_hash)
