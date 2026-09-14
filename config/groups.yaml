@@ -68,27 +68,33 @@ groups:
     title: "Georgia Auto"
     enabled: true
 
+  # title не указан намеренно — резолвится сам при первом подключении
+  # (см. reader/sources/telegram_source.py::_resolve_groups), а не
+  # выдуман здесь без реального обращения к Telegram.
+  - username: "banks_ge"
+    enabled: true
+
   # Турция (см. задачу) — title не указан намеренно: резолвится сам при
   # первом подключении (см. reader/sources/telegram_source.py::
   # _resolve_groups — group.title or entity.title or entity.username or
   # entity.id), а не выдуман здесь без реального обращения к Telegram.
   - username: "turtsiab"
-    enabled: true
+    enabled: false
 
   - username: "russiansinturkey_antalya"
-    enabled: true
+    enabled: false
 
   - username: "russiansinturkey_stambul"
-    enabled: true
+    enabled: false
 
   - username: "russiansinturkey_all"
-    enabled: true
+    enabled: false
 
   - username: "istanbul_ru"
-    enabled: true
+    enabled: false
 
   - username: "stambuli"
-    enabled: true
+    enabled: false
 
   - username: "chat_istambul_help"
     enabled: false

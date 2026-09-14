@@ -18,26 +18,28 @@ from reader.groups import Group, GroupLoadError, load_groups  # noqa: E402
 
 _CONFIG_GROUPS_PATH = PROJECT_ROOT / "config" / "groups.yaml"
 
-# 6 из 10 турецких групп остаются enabled (см. задачу-корректировку).
-_ENABLED_TURKEY_USERNAMES = {
+# Все 10 турецких групп сейчас отключены: 4 были выключены задачей-
+# корректировкой, остальные 6 — вручную на DEV. Записи остаются в
+# config/groups.yaml для будущего использования (см. задачу: "Не удаляй
+# их из config/groups.yaml"), но ни одна не должна попадать в
+# load_groups().
+_DISABLED_TURKEY_USERNAMES = {
     "turtsiab",
     "russiansinturkey_antalya",
     "russiansinturkey_stambul",
     "russiansinturkey_all",
     "istanbul_ru",
     "stambuli",
-}
-
-# Остальные 4 добавлены в конфиг, но намеренно enabled: false — не
-# удалены (см. задачу: "Не удаляй их из config/groups.yaml").
-_DISABLED_TURKEY_USERNAMES = {
     "chat_istambul_help",
     "nedvizhkaalaniya",
     "russianturkiyeruss",
     "turkey_ourantalya",
 }
 
-_NEW_TURKEY_USERNAMES = _ENABLED_TURKEY_USERNAMES | _DISABLED_TURKEY_USERNAMES
+_NEW_TURKEY_USERNAMES = _DISABLED_TURKEY_USERNAMES
+
+# Грузинская группа про банки, добавлена отдельной задачей — enabled.
+_BANKS_GE_USERNAME = "banks_ge"
 
 _PRE_EXISTING_USERNAMES = {
     "VerhniyLars",
@@ -193,25 +195,25 @@ def test_group_identifier_prefers_username_over_id():
 
 
 # ---- regression: реальный config/groups.yaml проекта (см. задачу про -----
-# ---- добавление 10 турецких групп/каналов и последующую корректировку: ---
-# ---- 4 из них должны остаться в конфиге, но enabled: false) --------------
+# ---- добавление 10 турецких групп/каналов, их последующее отключение -----
+# ---- целиком и добавление banks_ge) --------------------------------------
 
 
-def test_project_groups_yaml_has_26_total_configured_groups():
-    """16 существующих + 10 турецких (6 enabled + 4 disabled) — ни одна
+def test_project_groups_yaml_has_27_total_configured_groups():
+    """16 существующих + 10 турецких (все disabled) + banks_ge — ни одна
     запись не удалена, только у части выставлен enabled: false."""
     entries = _load_raw_group_entries()
 
-    assert len(entries) == 26
+    assert len(entries) == 27
 
 
-def test_project_groups_yaml_has_22_enabled_groups():
+def test_project_groups_yaml_has_17_enabled_groups():
     groups = load_groups(_CONFIG_GROUPS_PATH)
 
-    assert len(groups) == 22
+    assert len(groups) == 17
 
 
-def test_project_groups_yaml_disables_exactly_the_four_specified_turkey_groups():
+def test_project_groups_yaml_disables_exactly_all_ten_turkey_groups():
     entries = _load_raw_group_entries()
     disabled_usernames = {
         entry.get("username") for entry in entries if entry.get("enabled", True) is False
@@ -220,13 +222,23 @@ def test_project_groups_yaml_disables_exactly_the_four_specified_turkey_groups()
     assert disabled_usernames == _DISABLED_TURKEY_USERNAMES
 
 
-def test_project_groups_yaml_keeps_other_six_new_turkey_groups_enabled():
+def test_project_groups_yaml_keeps_every_turkey_group_out_of_load_groups():
+    """Записи остаются в конфиге, но ни одна не активна."""
     groups = load_groups(_CONFIG_GROUPS_PATH)
     usernames = {g.username for g in groups if g.username}
 
-    assert _ENABLED_TURKEY_USERNAMES <= usernames
-    # Отключённые не должны попадать в результат load_groups() вовсе.
-    assert not (_DISABLED_TURKEY_USERNAMES & usernames)
+    assert not (_NEW_TURKEY_USERNAMES & usernames)
+
+    # ...и при этом physically присутствуют в файле.
+    configured = {entry.get("username") for entry in _load_raw_group_entries()}
+    assert _NEW_TURKEY_USERNAMES <= configured
+
+
+def test_project_groups_yaml_has_banks_ge_enabled():
+    groups = load_groups(_CONFIG_GROUPS_PATH)
+    usernames = {g.username for g in groups if g.username}
+
+    assert _BANKS_GE_USERNAME in usernames
 
 
 def test_project_groups_yaml_preserves_pre_existing_usernames():
