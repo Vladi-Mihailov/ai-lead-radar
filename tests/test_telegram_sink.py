@@ -36,10 +36,14 @@ class _FakeTelegramClient:
     reply_to задан; text — fallback send_message ПОСЛЕ неудачного forward,
     reply_to не задан)."""
 
-    def __init__(self, *, forward_errors=None, context_errors=None, text_errors=None):
+    def __init__(
+        self, *, forward_errors=None, context_errors=None, text_errors=None,
+        get_entity_errors=None,
+    ):
         self._forward_errors = forward_errors or {}
         self._context_errors = context_errors or {}
         self._text_errors = text_errors or {}
+        self._get_entity_errors = get_entity_errors or {}
         self.get_entity_calls: list = []
         self.forward_calls: list = []
         self.send_message_calls: list = []
@@ -47,6 +51,8 @@ class _FakeTelegramClient:
 
     async def get_entity(self, target):
         self.get_entity_calls.append(target)
+        if target in self._get_entity_errors:
+            raise self._get_entity_errors[target]
         # Регистр и "@"/без "@" — один и тот же аккаунт, как и в реальном
         # Telegram (см. TelegramSink.start() — дедупликация по entity.id).
         key = str(target).lstrip("@").lower()

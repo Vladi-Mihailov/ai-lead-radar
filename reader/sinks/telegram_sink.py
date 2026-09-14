@@ -29,9 +29,25 @@ class TelegramSink(BaseSink):
             label = resolve_label(target)
             try:
                 entity = await self._client.get_entity(target)
-            except Exception as exc:
-                logger.error("✖ Получатель %s не найден", label)
-                raise RuntimeError(f"Не найден получатель {label}") from exc
+            except Exception:
+                # Fail-soft, НЕ RuntimeError: LEAD_FORWARD_TO — избыточный,
+                # необязательный канал (лиды в любом случае уже пишутся в
+                # ConsoleSink/FileSink), а получатель, заданный username,
+                # может быть переименован на стороне Telegram в любой
+                # момент (см. задачу-инцидент: @ali_na_l_i переименован,
+                # уронил весь reader.main — fine monitor, OCR, checkout —
+                # хотя сломан был только один из нескольких lead-forward
+                # получателей). Резолв стабильным numeric id (см.
+                # telegram_accounts.telegram_user_id/reader/inviter/
+                # identity.py — тот же принцип для inviter-аккаунтов)
+                # такого разрыва не имеет; username здесь — display-only
+                # ярлык, а не обязательный для резолва идентификатор.
+                logger.warning(
+                    "✖ Получатель %s не найден (переименован/удалён?) — "
+                    "пропущен, доставка остальным получателям продолжится",
+                    label,
+                )
+                continue
 
             entity_id = getattr(entity, "id", None)
             if entity_id is not None and entity_id in seen_entity_ids:
@@ -44,6 +60,14 @@ class TelegramSink(BaseSink):
 
             self._resolved.append(ResolvedTarget(entity=entity, label=label))
             logger.info("✔ Получатель %s найден", label)
+
+        if self._forward_to and not self._resolved:
+            logger.error(
+                "✖ Ни один из %d получателей LEAD_FORWARD_TO не резолвился — "
+                "пересылка лидов в Telegram отключена для этого запуска "
+                "(лиды остаются в ConsoleSink/FileSink)",
+                len(self._forward_to),
+            )
 
     async def handle(self, event: LeadEvent) -> None:
         for target in self._resolved:
