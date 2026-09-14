@@ -58,6 +58,14 @@ class TelegramSink(BaseSink):
             if entity_id is not None:
                 seen_entity_ids.add(entity_id)
 
+            # target задан numeric id (стабильный, не ломается при
+            # переименовании — см. задачу-инцидент @ali_na_l_i/@a278ru) —
+            # username резолвнутой entity добавляем в label ТОЛЬКО как
+            # display-метку для логов/сообщений, не как способ резолва.
+            entity_username = getattr(entity, "username", None)
+            if isinstance(target, int) and entity_username:
+                label = f"{label} (@{entity_username})"
+
             self._resolved.append(ResolvedTarget(entity=entity, label=label))
             logger.info("✔ Получатель %s найден", label)
 

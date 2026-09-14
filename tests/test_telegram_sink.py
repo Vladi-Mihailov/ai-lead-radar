@@ -25,6 +25,7 @@ from reader.sinks.telegram_sink import TelegramSink  # noqa: E402
 class _FakeEntity:
     id: int
     source: Any
+    username: str | None = None
 
 
 class _FakeTelegramClient:
@@ -34,16 +35,20 @@ class _FakeTelegramClient:
     именно из трёх сетевых вызовов должен упасть для конкретного
     получателя (context — send_message ПОСЛЕ успешного forward,
     reply_to задан; text — fallback send_message ПОСЛЕ неудачного forward,
-    reply_to не задан)."""
+    reply_to не задан). entity_usernames — {исходное значение из
+    forward_to: username резолвнутой entity} — для проверки, что numeric
+    id получателя резолвится, а username из entity используется только как
+    display-метка в логах (см. задачу-инцидент про @ali_na_l_i/@a278ru)."""
 
     def __init__(
         self, *, forward_errors=None, context_errors=None, text_errors=None,
-        get_entity_errors=None,
+        get_entity_errors=None, entity_usernames=None,
     ):
         self._forward_errors = forward_errors or {}
         self._context_errors = context_errors or {}
         self._text_errors = text_errors or {}
         self._get_entity_errors = get_entity_errors or {}
+        self._entity_usernames = entity_usernames or {}
         self.get_entity_calls: list = []
         self.forward_calls: list = []
         self.send_message_calls: list = []
@@ -56,7 +61,11 @@ class _FakeTelegramClient:
         # Регистр и "@"/без "@" — один и тот же аккаунт, как и в реальном
         # Telegram (см. TelegramSink.start() — дедупликация по entity.id).
         key = str(target).lstrip("@").lower()
-        return _FakeEntity(id=hash(key) % 10_000_000, source=target)
+        return _FakeEntity(
+            id=hash(key) % 10_000_000,
+            source=target,
+            username=self._entity_usernames.get(target),
+        )
 
     async def forward_messages(self, entity, *, messages, from_peer):
         self.forward_calls.append(entity.source)
@@ -214,6 +223,64 @@ async def test_duplicate_numeric_and_username_form_does_not_send_twice():
     await sink.handle(_event())
 
     assert client.forward_calls == ["alena_ogi"]
+
+
+# ---- резолв получателя: fail-soft на переименованный/удалённый username,
+# numeric id предпочтительнее (см. задачу-инцидент @ali_na_l_i -> @a278ru) ----
+
+
+async def test_unresolvable_recipient_is_skipped_without_crashing_startup(caplog):
+    """Один из N получателей переименован/удалён (get_entity падает) — не
+    должно ронять start() исключением, остальные резолвятся и получают лид."""
+    client = _FakeTelegramClient(
+        get_entity_errors={"ali_na_l_i": ValueError('No user has "ali_na_l_i" as username')},
+    )
+    with caplog.at_level("WARNING", logger="reader.sinks.telegram_sink"):
+        sink = await _sink(client, ["ali_na_l_i", "alena_ogi", "vladimihailov"])
+
+    assert "ali_na_l_i" in caplog.text
+    assert "не найден" in caplog.text
+
+    await sink.handle(_event())
+
+    # Только 2 успешно резолвнутых получателя — форвард ушёл им, не третьему.
+    assert client.forward_calls == ["alena_ogi", "vladimihailov"]
+
+
+async def test_all_recipients_unresolvable_does_not_raise(caplog):
+    """Ни один из forward_to не резолвился — start() логирует ошибку, но
+    НЕ поднимает исключение (сервис должен продолжить запуск остальных
+    компонентов, пересылка лидов в Telegram в этом запуске просто отключена)."""
+    client = _FakeTelegramClient(
+        get_entity_errors={
+            "ali_na_l_i": ValueError("boom"),
+            "alena_ogi": ValueError("boom"),
+        },
+    )
+    with caplog.at_level("ERROR", logger="reader.sinks.telegram_sink"):
+        sink = await _sink(client, ["ali_na_l_i", "alena_ogi"])
+
+    assert "Ни один" in caplog.text
+
+    await sink.handle(_event())  # безопасный no-op, не падает
+
+    assert client.forward_calls == []
+
+
+async def test_numeric_recipient_uses_resolved_username_as_display_label_only(caplog):
+    """Получатель задан стабильным numeric id (переживает переименование
+    username) — резолв идёт по id, а username резолвнутой entity попадает в
+    лейбл ТОЛЬКО для читаемости логов, не как способ резолва."""
+    client = _FakeTelegramClient(entity_usernames={8779341985: "a278ru"})
+    with caplog.at_level("INFO", logger="reader.sinks.telegram_sink"):
+        sink = await _sink(client, [8779341985])
+
+    assert client.get_entity_calls == [8779341985]
+    assert "✔ Получатель 8779341985 (@a278ru) найден" in caplog.text
+
+    await sink.handle(_event())
+
+    assert client.forward_calls == [8779341985]
 
 
 # ---- пустой список получателей ----
