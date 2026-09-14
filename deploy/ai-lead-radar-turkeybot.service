@@ -1,0 +1,34 @@
+[Unit]
+Description=AI Lead Radar - Turkey GIB fines bot (standalone, one-time checks only)
+After=network-online.target
+Wants=network-online.target
+
+# ИСХОДНЫЙ АРТЕФАКТ - НЕ установлен и не запущен (см. design report Stage
+# 3). Не копировать в /etc/systemd/system и не enable/start без отдельного,
+# явного решения - это НЕЗАВИСИМЫЙ процесс от ai-lead-radar.service и от
+# ai-lead-radar-geshtrafbot.service, со своим TURKEYBOT_TOKEN (см.
+# .env.example) и своим Telethon-session-файлом
+# (data/sessions/turkeybot.session, см. reader/turkey_bot/main.py) - его
+# включение означает, что Turkey-бот реально начнёт принимать сообщения от
+# публики.
+#
+# User/Group/WorkingDirectory - те же, что и у остальных процессов проекта
+# (тот же venv/аккаунт, отдельный процесс, отдельные логи). .env - тот же
+# файл (WorkingDirectory совпадает, load_dotenv() ищет .env в cwd) -
+# TURKEYBOT_TOKEN должен быть заполнен там ДО первого запуска.
+[Service]
+Type=simple
+User=leadradar
+Group=leadradar
+WorkingDirectory=/home/leadradar/ai-lead-radar
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/leadradar/.venv/bin/python -m reader.turkey_bot.main
+
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
