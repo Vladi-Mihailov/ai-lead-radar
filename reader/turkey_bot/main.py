@@ -22,6 +22,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -42,6 +43,10 @@ from reader.turkey_bot.known_users_repository import (
     TurkeyBotKnownUsersRepository,  # noqa: E402
 )
 from reader.turkey_bot.live_session_registry import LiveGibSessionRegistry  # noqa: E402
+from reader.turkey_bot.statistics_service import TurkeyStatisticsService  # noqa: E402
+from reader.turkey_bot.user_cars_repository import (
+    TurkeyUserCarsRepository,  # noqa: E402
+)
 
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 # Отдельный .session-файл — своя, независимая Telethon-сессия (см.
@@ -89,6 +94,11 @@ async def run() -> None:
     conversation_state_repository = TurkeyConversationStateRepository(db_path)
     known_users_repository = TurkeyBotKnownUsersRepository(db_path)
     check_repository = TurkeyCheckRepository(db_path)
+    # "Гараж" (см. design report: НЕ мониторинг/подписка — только чтобы не
+    # заставлять пользователя вводить номер заново) — та же схема
+    # additive-таблицы, что и у остальных Turkey-репозиториев.
+    garage_repository = TurkeyUserCarsRepository(db_path)
+    statistics_service = TurkeyStatisticsService(known_users_repository, check_repository)
     # Один процесс - один реестр живых GIB-сессий, полностью in-memory (см.
     # reader/turkey_bot/live_session_registry.py и design report Stage 3:
     # "do not pretend that an in-memory client can be reconstructed from a
@@ -121,7 +131,19 @@ async def run() -> None:
             logger.info("Turkey fine translator выключен (OPENAI_API_KEY не задан)")
         controller = ConversationController(
             conversation_state_repository, check_repository, session_registry,
+            garage_repository, statistics_service,
             translator=translator,
+            # ТА ЖЕ настройка, что и у @ProtocolGEbot (см. design report:
+            # "reuse the same trusted manager IDs/configuration... do not
+            # duplicate/hardcode a second manager list") — trusted даёт
+            # доступ ТОЛЬКО к статистике (см. conversation.py::_is_trusted),
+            # НЕ к чужому гаражу.
+            trusted_operator_user_ids=frozenset(settings.public_bot.trusted_operator_user_ids),
+            # ТА ЖЕ business-timezone, что и у Георгии-статистики
+            # (settings.fine_monitor.timezone) — общий конфиг, не
+            # Turkey-специфичный (см. design report: не вводить отдельную
+            # настройку там, где общая уже есть).
+            tz=ZoneInfo(settings.fine_monitor.timezone),
         )
 
         client = TelegramClient(str(_SESSION_PATH), api_id, api_hash)
@@ -146,6 +168,7 @@ async def run() -> None:
         conversation_state_repository.close()
         known_users_repository.close()
         check_repository.close()
+        garage_repository.close()
 
 
 def main() -> None:

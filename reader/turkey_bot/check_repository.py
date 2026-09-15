@@ -13,6 +13,7 @@ GibSubmitOutcome: ТОЛЬКО messages/raw_data, НИКОГДА captcha_code (�
 (session.py их сюда и не передаёт)."""
 
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 _SCHEMA = """
@@ -81,6 +82,25 @@ class TurkeyCheckRepository:
     def count_by_status(self, status: str) -> int:
         row = self._conn.execute(
             "SELECT COUNT(*) FROM turkey_fine_checks WHERE status = ?", (status,),
+        ).fetchone()
+        return row[0]
+
+    def count_since(self, since: datetime) -> int:
+        """Сколько проверок ЗАВЕРШИЛОСЬ, начиная с since — по requested_at
+        (см. модуль docstring: несмотря на имя, эта колонка на самом деле
+        проставляется в момент ЗАВЕРШЕНИЯ проверки, см. conversation.py::
+        _finish/record_result — единственный вызывающий код, вызываемый
+        ТОЛЬКО для терминальных исходов no_debt/has_debt/unexpected/error,
+        никогда для CAPTCHA/rejected/незавершённых диалогов, см. задачу:
+        "Do not count CAPTCHA creation/refresh or incomplete conversations
+        as a completed check" — это уже так структурно, без специальной
+        фильтрации здесь). since — aware datetime, сравнивается как
+        текстовая ISO-строка того же формата, что и SQLite
+        CURRENT_TIMESTAMP (тот же приём, что и BotKnownUsersRepository::
+        count_first_seen_since)."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM turkey_fine_checks WHERE requested_at >= ?",
+            (since.strftime("%Y-%m-%d %H:%M:%S"),),
         ).fetchone()
         return row[0]
 

@@ -26,3 +26,20 @@ class ConversationState:
     step: str
     payload: dict | None
     updated_at: datetime
+
+
+@dataclass(frozen=True)
+class TurkeyUserCar:
+    """Одна запись "гаража" — см. reader/turkey_bot/user_cars_repository.py.
+    Появляется ТОЛЬКО после реально завершённой проверки с исходом
+    no_debt/has_debt (см. design report: "must not pollute the garage" —
+    CAPTCHA/rejected/unexpected/error никогда не создают и не обновляют
+    запись). car_number уже нормализован (см.
+    reader/turkey_bot/validation.py::normalize_plate) — тот же формат,
+    что и во всех остальных местах бота."""
+
+    id: int
+    telegram_user_id: int
+    car_number: str
+    created_at: datetime
+    last_checked_at: datetime

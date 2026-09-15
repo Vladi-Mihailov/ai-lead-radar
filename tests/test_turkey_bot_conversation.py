@@ -28,7 +28,14 @@ from reader.turkey_bot.gib.models import (  # noqa: E402
 )
 from reader.turkey_bot.gib.session import GibTransportError  # noqa: E402
 from reader.turkey_bot.gib.translation import FineTranslationError  # noqa: E402
+from reader.turkey_bot.known_users_repository import (
+    TurkeyBotKnownUsersRepository,  # noqa: E402
+)
 from reader.turkey_bot.live_session_registry import LiveGibSessionRegistry  # noqa: E402
+from reader.turkey_bot.statistics_service import TurkeyStatisticsService  # noqa: E402
+from reader.turkey_bot.user_cars_repository import (
+    TurkeyUserCarsRepository,  # noqa: E402
+)
 
 _CHAT_ID = 111
 _USER_ID = 222
@@ -102,14 +109,19 @@ class _FakeCheckFactory:
         return client, provider
 
 
-def _make_controller(factory: _FakeCheckFactory, *, translator=None):
+def _make_controller(factory: _FakeCheckFactory, *, translator=None, trusted_operator_user_ids=frozenset()):
     states = TurkeyConversationStateRepository(":memory:")
     checks = TurkeyCheckRepository(":memory:")
     registry = LiveGibSessionRegistry()
+    garage = TurkeyUserCarsRepository(":memory:")
+    known_users = TurkeyBotKnownUsersRepository(":memory:")
+    statistics = TurkeyStatisticsService(known_users, checks)
     controller = ConversationController(
-        states, checks, registry, check_factory=factory, translator=translator,
+        states, checks, registry, garage, statistics,
+        check_factory=factory, translator=translator,
+        trusted_operator_user_ids=frozenset(trusted_operator_user_ids),
     )
-    return controller, states, checks, registry
+    return controller, states, checks, registry, garage
 
 
 def _challenge(image_id: str = "cid-1", png: bytes = b"PNG-BYTES") -> CaptchaChallenge:
@@ -119,7 +131,7 @@ def _challenge(image_id: str = "cid-1", png: bytes = b"PNG-BYTES") -> CaptchaCha
 async def test_new_valid_plate_fetches_captcha_and_persists_state():
     provider = _FakeProvider(start_challenge=_challenge(image_id="cid-1", png=b"PNG1"))
     factory = _FakeCheckFactory([provider])
-    controller, states, _checks, registry = _make_controller(factory)
+    controller, states, _checks, registry, _garage = _make_controller(factory)
 
     reply = await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
@@ -134,7 +146,7 @@ async def test_new_valid_plate_fetches_captcha_and_persists_state():
 
 async def test_invalid_plate_does_not_start_a_check():
     factory = _FakeCheckFactory([])
-    controller, states, _checks, registry = _make_controller(factory)
+    controller, states, _checks, registry, _garage = _make_controller(factory)
 
     reply = await controller.handle_text("!!!", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
@@ -147,7 +159,7 @@ async def test_invalid_plate_does_not_start_a_check():
 async def test_captcha_fetch_transport_error_shows_safe_message_and_closes_client():
     provider = _FakeProvider(start_error=True)
     factory = _FakeCheckFactory([provider])
-    controller, states, _checks, registry = _make_controller(factory)
+    controller, states, _checks, registry, _garage = _make_controller(factory)
 
     reply = await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
@@ -161,7 +173,7 @@ async def test_correct_code_no_debt_reports_success_and_clears_everything():
     outcome = GibSubmitOutcome(kind="no_debt", messages=(), raw_data=None)
     provider = _FakeProvider(start_challenge=_challenge(), submit_results=[outcome])
     factory = _FakeCheckFactory([provider])
-    controller, states, checks, registry = _make_controller(factory)
+    controller, states, checks, registry, _garage = _make_controller(factory)
 
     await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     reply = await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -204,7 +216,7 @@ async def test_has_debt_shows_parsed_fine_and_never_leaks_raw_data():
     )
     provider = _FakeProvider(start_challenge=_challenge(), submit_results=[outcome])
     factory = _FakeCheckFactory([provider])
-    controller, _states, checks, _registry = _make_controller(factory)
+    controller, _states, checks, _registry, _garage = _make_controller(factory)
 
     await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     reply = await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -258,7 +270,7 @@ async def test_has_debt_uses_translator_result_when_available():
         location_ru="Русское место", violation_description_ru="Русское нарушение",
     )
     translator = _FakeTranslator(result=(translated_fine,))
-    controller, _states, _checks, _registry = _make_controller(factory, translator=translator)
+    controller, _states, _checks, _registry, _garage = _make_controller(factory, translator=translator)
 
     await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     reply = await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -277,7 +289,7 @@ async def test_has_debt_falls_back_to_turkish_when_translator_fails():
     factory = _FakeCheckFactory([provider])
 
     translator = _FakeTranslator(error=FineTranslationError("boom"))
-    controller, _states, checks, _registry = _make_controller(factory, translator=translator)
+    controller, _states, checks, _registry, _garage = _make_controller(factory, translator=translator)
 
     await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     reply = await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -292,7 +304,7 @@ async def test_has_debt_without_translator_shows_turkish_text():
     outcome = GibSubmitOutcome(kind="has_debt", messages=(), raw_data={}, fines=(fine,))
     provider = _FakeProvider(start_challenge=_challenge(), submit_results=[outcome])
     factory = _FakeCheckFactory([provider])
-    controller, _states, _checks, _registry = _make_controller(factory)  # translator=None по умолчанию
+    controller, _states, _checks, _registry, _garage = _make_controller(factory)  # translator=None по умолчанию
 
     await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     reply = await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -311,7 +323,7 @@ async def test_rejected_code_reuses_same_provider_for_refresh_and_asks_again():
         refresh_results=[_challenge(image_id="cid-2", png=b"PNG2")],
     )
     factory = _FakeCheckFactory([provider])
-    controller, states, _checks, registry = _make_controller(factory)
+    controller, states, _checks, registry, _garage = _make_controller(factory)
 
     await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     reply = await controller.handle_text("wrongcode", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -338,7 +350,7 @@ async def test_unexpected_outcome_shows_generic_error_and_records_it(caplog):
     )
     provider = _FakeProvider(start_challenge=_challenge(), submit_results=[outcome])
     factory = _FakeCheckFactory([provider])
-    controller, states, checks, _registry = _make_controller(factory)
+    controller, states, checks, _registry, _garage = _make_controller(factory)
 
     await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     with caplog.at_level("WARNING"):
@@ -355,7 +367,7 @@ async def test_unexpected_outcome_shows_generic_error_and_records_it(caplog):
 async def test_submit_transport_error_shows_generic_error_and_records_error_status():
     provider = _FakeProvider(start_challenge=_challenge(), submit_results=[GibTransportError("boom")])
     factory = _FakeCheckFactory([provider])
-    controller, states, checks, registry = _make_controller(factory)
+    controller, states, checks, registry, _garage = _make_controller(factory)
 
     await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     reply = await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -372,7 +384,7 @@ async def test_refresh_captcha_transport_error_after_rejected_shows_generic_erro
         start_challenge=_challenge(), submit_results=[rejected], refresh_error=True,
     )
     factory = _FakeCheckFactory([provider])
-    controller, states, checks, registry = _make_controller(factory)
+    controller, states, checks, registry, _garage = _make_controller(factory)
 
     await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     reply = await controller.handle_text("wrongcode", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -400,7 +412,11 @@ async def test_restart_recovery_issues_fresh_captcha_for_stored_plate():
 
     new_provider = _FakeProvider(start_challenge=_challenge(image_id="cid-new", png=b"FRESH"))
     factory = _FakeCheckFactory([new_provider])
-    controller = ConversationController(states, checks, registry, check_factory=factory)
+    garage = TurkeyUserCarsRepository(":memory:")
+    statistics = TurkeyStatisticsService(TurkeyBotKnownUsersRepository(":memory:"), checks)
+    controller = ConversationController(
+        states, checks, registry, garage, statistics, check_factory=factory,
+    )
 
     reply = await controller.handle_text("whatever-old-code", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
@@ -422,7 +438,11 @@ async def test_restart_recovery_with_missing_plate_in_payload_shows_session_lost
     registry = LiveGibSessionRegistry()
     states.set(_CHAT_ID, telegram_user_id=_USER_ID, step="awaiting_captcha_code", payload={})
     factory = _FakeCheckFactory([])
-    controller = ConversationController(states, checks, registry, check_factory=factory)
+    garage = TurkeyUserCarsRepository(":memory:")
+    statistics = TurkeyStatisticsService(TurkeyBotKnownUsersRepository(":memory:"), checks)
+    controller = ConversationController(
+        states, checks, registry, garage, statistics, check_factory=factory,
+    )
 
     reply = await controller.handle_text("somecode", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
@@ -439,7 +459,11 @@ async def test_restart_recovery_transport_error_shows_captcha_fetch_failed():
         payload={"plate": "34ABC123", "image_id": "old"},
     )
     factory = _FakeCheckFactory([_FakeProvider(start_error=True)])
-    controller = ConversationController(states, checks, registry, check_factory=factory)
+    garage = TurkeyUserCarsRepository(":memory:")
+    statistics = TurkeyStatisticsService(TurkeyBotKnownUsersRepository(":memory:"), checks)
+    controller = ConversationController(
+        states, checks, registry, garage, statistics, check_factory=factory,
+    )
 
     reply = await controller.handle_text("somecode", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
@@ -450,7 +474,7 @@ async def test_restart_recovery_transport_error_shows_captcha_fetch_failed():
 async def test_cancel_clears_active_check_and_closes_client():
     provider = _FakeProvider(start_challenge=_challenge())
     factory = _FakeCheckFactory([provider])
-    controller, states, _checks, registry = _make_controller(factory)
+    controller, states, _checks, registry, _garage = _make_controller(factory)
     await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     reply = await controller.handle_text("/cancel", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -467,7 +491,7 @@ async def test_cancel_via_dedicated_method_matches_text_command():
     ConversationController.handle_cancel()."""
     provider = _FakeProvider(start_challenge=_challenge())
     factory = _FakeCheckFactory([provider])
-    controller, states, _checks, _registry = _make_controller(factory)
+    controller, states, _checks, _registry, _garage = _make_controller(factory)
     await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     reply = await controller.handle_cancel(chat_id=_CHAT_ID)
@@ -478,7 +502,7 @@ async def test_cancel_via_dedicated_method_matches_text_command():
 
 async def test_cancel_with_nothing_active_says_so():
     factory = _FakeCheckFactory([])
-    controller, _states, _checks, _registry = _make_controller(factory)
+    controller, _states, _checks, _registry, _garage = _make_controller(factory)
 
     reply = await controller.handle_text("/cancel", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
@@ -488,7 +512,7 @@ async def test_cancel_with_nothing_active_says_so():
 async def test_start_command_resets_any_active_check():
     provider = _FakeProvider(start_challenge=_challenge())
     factory = _FakeCheckFactory([provider])
-    controller, states, _checks, registry = _make_controller(factory)
+    controller, states, _checks, registry, _garage = _make_controller(factory)
     await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     reply = await controller.handle_text("/start", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -508,7 +532,7 @@ async def test_captcha_attempts_counted_across_one_rejection_then_success():
         refresh_results=[_challenge(image_id="cid-2")],
     )
     factory = _FakeCheckFactory([provider])
-    controller, _states, checks, _registry = _make_controller(factory)
+    controller, _states, checks, _registry, _garage = _make_controller(factory)
 
     await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("wrong", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -524,7 +548,7 @@ async def test_different_chats_do_not_interfere_with_each_other():
     provider_a = _FakeProvider(start_challenge=_challenge(image_id="cid-a", png=b"A"))
     provider_b = _FakeProvider(start_challenge=_challenge(image_id="cid-b", png=b"B"))
     factory = _FakeCheckFactory([provider_a, provider_b])
-    controller, states, _checks, _registry = _make_controller(factory)
+    controller, states, _checks, _registry, _garage = _make_controller(factory)
 
     reply_a = await controller.handle_text("34ABC123", chat_id=1, telegram_user_id=10)
     reply_b = await controller.handle_text("06XYZ999", chat_id=2, telegram_user_id=20)
@@ -533,3 +557,242 @@ async def test_different_chats_do_not_interfere_with_each_other():
     assert reply_b.photo_png == b"B"
     assert states.get(1).payload["plate"] == "34ABC123"
     assert states.get(2).payload["plate"] == "06XYZ999"
+
+
+# ---- 📊 Статистика / 🚗 Мои авто (garage) ----
+
+
+def test_is_trusted_true_only_for_configured_ids():
+    factory = _FakeCheckFactory([])
+    controller, _states, _checks, _registry, _garage = _make_controller(
+        factory, trusted_operator_user_ids={5712994689, 410811386},
+    )
+
+    assert controller.is_trusted(5712994689) is True
+    assert controller.is_trusted(410811386) is True
+    assert controller.is_trusted(999) is False
+
+
+async def test_trusted_user_sees_statistics_when_typing_label():
+    factory = _FakeCheckFactory([])
+    controller, _states, checks, _registry, _garage = _make_controller(
+        factory, trusted_operator_user_ids={_USER_ID},
+    )
+    checks.record_result(
+        telegram_user_id=1, telegram_chat_id=1, plate="34ABC123", captcha_attempts=1,
+        status="no_debt", gib_message_text=None, raw_response=None,
+    )
+
+    reply = await controller.handle_text(
+        texts.STATISTICS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID,
+    )
+
+    assert "Статистика" in reply.text
+    assert reply.show_main_menu is True
+
+
+async def test_normal_user_typing_statistics_label_gets_invalid_plate_not_stats():
+    """Явное требование задачи: "normal user cannot retrieve statistics by
+    typing button text" - не trusted, поэтому текст трактуется как обычный
+    (невалидный) номер, а не как запрос статистики."""
+    factory = _FakeCheckFactory([])
+    controller, _states, _checks, _registry, _garage = _make_controller(
+        factory, trusted_operator_user_ids=set(),
+    )
+
+    reply = await controller.handle_text(
+        texts.STATISTICS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID,
+    )
+
+    assert reply.text == texts.INVALID_PLATE_TEXT
+    assert "Статистика" not in reply.text
+    assert reply.extra_texts == ()
+
+
+async def test_empty_garage_shows_empty_message_with_main_menu():
+    factory = _FakeCheckFactory([])
+    controller, _states, _checks, _registry, _garage = _make_controller(factory)
+
+    reply = await controller.handle_text(
+        texts.GARAGE_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID,
+    )
+
+    assert reply.text == texts.EMPTY_GARAGE_TEXT
+    assert reply.show_main_menu is True
+    assert reply.garage_cars is None
+
+
+async def test_garage_available_to_any_user_not_just_trusted():
+    factory = _FakeCheckFactory([])
+    controller, _states, _checks, _registry, _garage = _make_controller(
+        factory, trusted_operator_user_ids=set(),
+    )
+
+    reply = await controller.handle_text(
+        texts.GARAGE_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID,
+    )
+
+    assert reply.text == texts.EMPTY_GARAGE_TEXT
+
+
+async def test_no_debt_check_adds_car_to_garage():
+    outcome = GibSubmitOutcome(kind="no_debt", messages=(), raw_data=None)
+    provider = _FakeProvider(start_challenge=_challenge(), submit_results=[outcome])
+    factory = _FakeCheckFactory([provider])
+    controller, _states, _checks, _registry, garage = _make_controller(factory)
+
+    await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    cars = garage.list_cars(_USER_ID)
+    assert len(cars) == 1
+    assert cars[0].car_number == "34ABC123"
+
+
+async def test_has_debt_check_adds_car_to_garage():
+    fine = GibFineRecord(
+        protocol_no="MC00000000", plate="34ABC123", amount=Decimal("1000.00"),
+        description="raw", violation_date=date(2026, 8, 8), authority="ORG",
+        late_fee=None, discount=None,
+    )
+    outcome = GibSubmitOutcome(kind="has_debt", messages=(), raw_data={}, fines=(fine,))
+    provider = _FakeProvider(start_challenge=_challenge(), submit_results=[outcome])
+    factory = _FakeCheckFactory([provider])
+    controller, _states, _checks, _registry, garage = _make_controller(factory)
+
+    await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    cars = garage.list_cars(_USER_ID)
+    assert len(cars) == 1
+    assert cars[0].car_number == "34ABC123"
+
+
+async def test_rejected_captcha_does_not_add_car_to_garage():
+    rejected = GibSubmitOutcome(kind="rejected", messages=(), raw_data=None)
+    provider = _FakeProvider(
+        start_challenge=_challenge(), submit_results=[rejected],
+        refresh_results=[_challenge(image_id="cid-2")],
+    )
+    factory = _FakeCheckFactory([provider])
+    controller, _states, _checks, _registry, garage = _make_controller(factory)
+
+    await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_text("wrongcode", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert garage.list_cars(_USER_ID) == []
+
+
+async def test_unexpected_response_does_not_add_car_to_garage():
+    outcome = GibSubmitOutcome(kind="unexpected", messages=(), raw_data=None)
+    provider = _FakeProvider(start_challenge=_challenge(), submit_results=[outcome])
+    factory = _FakeCheckFactory([provider])
+    controller, _states, _checks, _registry, garage = _make_controller(factory)
+
+    await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert garage.list_cars(_USER_ID) == []
+
+
+async def test_transport_error_does_not_add_car_to_garage():
+    provider = _FakeProvider(start_challenge=_challenge(), submit_results=[GibTransportError("boom")])
+    factory = _FakeCheckFactory([provider])
+    controller, _states, _checks, _registry, garage = _make_controller(factory)
+
+    await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert garage.list_cars(_USER_ID) == []
+
+
+async def test_typing_a_plate_alone_without_finishing_does_not_add_car():
+    """Явное требование задачи: "Do not add a car merely because the user
+    typed it" - только реально ЗАВЕРШЁННая проверка добавляет машину."""
+    provider = _FakeProvider(start_challenge=_challenge())
+    factory = _FakeCheckFactory([provider])
+    controller, _states, _checks, _registry, garage = _make_controller(factory)
+
+    await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert garage.list_cars(_USER_ID) == []
+
+
+async def test_duplicate_successful_checks_do_not_duplicate_garage_entry():
+    outcome1 = GibSubmitOutcome(kind="no_debt", messages=(), raw_data=None)
+    outcome2 = GibSubmitOutcome(kind="no_debt", messages=(), raw_data=None)
+    provider1 = _FakeProvider(start_challenge=_challenge(), submit_results=[outcome1])
+    provider2 = _FakeProvider(start_challenge=_challenge(), submit_results=[outcome2])
+    factory = _FakeCheckFactory([provider1, provider2])
+    controller, _states, _checks, _registry, garage = _make_controller(factory)
+
+    await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert len(garage.list_cars(_USER_ID)) == 1
+
+
+async def test_garage_check_ownership_enforced():
+    """Явное требование задачи: "A normal user must not be able to
+    inspect another user's garage by forging callback data"."""
+    factory = _FakeCheckFactory([])
+    controller, _states, _checks, _registry, garage = _make_controller(factory)
+    garage.record_successful_check(telegram_user_id=999, car_number="34ABC123")
+    car_id = garage.list_cars(999)[0].id
+
+    reply = await controller.handle_garage_check(
+        car_id, chat_id=_CHAT_ID, telegram_user_id=_USER_ID,
+    )
+
+    assert reply is None
+
+
+async def test_garage_check_starts_captcha_flow_without_retyping_plate():
+    """Явное требование задачи: "The user must not have to type the plate
+    again" - клик по машине в гараже сразу запускает существующий
+    CAPTCHA-flow для сохранённого номера."""
+    provider = _FakeProvider(start_challenge=_challenge(image_id="cid-garage", png=b"GARAGE-PNG"))
+    factory = _FakeCheckFactory([provider])
+    controller, states, _checks, _registry, garage = _make_controller(factory)
+    garage.record_successful_check(telegram_user_id=_USER_ID, car_number="34ABC123")
+    car_id = garage.list_cars(_USER_ID)[0].id
+
+    reply = await controller.handle_garage_check(
+        car_id, chat_id=_CHAT_ID, telegram_user_id=_USER_ID,
+    )
+
+    assert reply is not None
+    assert reply.photo_png == b"GARAGE-PNG"
+    assert reply.show_cancel_button is True
+    assert states.get(_CHAT_ID).payload["plate"] == "34ABC123"
+
+
+async def test_garage_check_for_nonexistent_car_returns_none():
+    factory = _FakeCheckFactory([])
+    controller, _states, _checks, _registry, _garage = _make_controller(factory)
+
+    reply = await controller.handle_garage_check(
+        999999, chat_id=_CHAT_ID, telegram_user_id=_USER_ID,
+    )
+
+    assert reply is None
+
+
+async def test_menu_label_interrupts_an_in_flight_captcha_wait():
+    """Нажатие пункта меню - явная навигация, как и /cancel - имеет
+    приоритет над "любой текст = код CAPTCHA" (см. design report)."""
+    provider = _FakeProvider(start_challenge=_challenge())
+    factory = _FakeCheckFactory([provider])
+    controller, states, _checks, registry, _garage = _make_controller(factory)
+    await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    assert states.get(_CHAT_ID).step == "awaiting_captcha_code"
+
+    reply = await controller.handle_text(
+        texts.GARAGE_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID,
+    )
+
+    assert reply.text == texts.EMPTY_GARAGE_TEXT
+    assert states.get(_CHAT_ID) is None
+    assert await registry.get(_CHAT_ID) is None

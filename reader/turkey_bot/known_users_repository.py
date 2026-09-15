@@ -10,6 +10,7 @@ report Stage 1, аудит: "bot_known_users" Георгии НЕ переисп
 этой причине)."""
 
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 _SCHEMA = """
@@ -36,14 +37,26 @@ _SELECT = (
     "FROM turkey_bot_known_users WHERE telegram_user_id = ?"
 )
 
+_SELECT_ALL_ORDERED = (
+    "SELECT telegram_user_id, telegram_username FROM turkey_bot_known_users "
+    "ORDER BY first_seen_at ASC, telegram_user_id ASC"
+)
+
 
 class TurkeyBotKnownUsersRepository:
-    def __init__(self, db_path: Path):
-        self._path = Path(db_path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self._path)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
+    def __init__(self, db_path: Path | str):
+        # ":memory:" - тот же приём, что и у остальных Turkey-репозиториев
+        # (conversation_state_repository.py/check_repository.py/
+        # user_cars_repository.py) - используется тестами, в production
+        # всегда реальный путь (settings.app.users_db_file).
+        is_memory = db_path == ":memory:"
+        self._path = db_path if is_memory else Path(db_path)
+        if not is_memory:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(self._path))
+        if not is_memory:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute(_SCHEMA)
         self._conn.commit()
 
@@ -62,6 +75,37 @@ class TurkeyBotKnownUsersRepository:
 
     def is_known(self, telegram_user_id: int) -> bool:
         return self._conn.execute(_SELECT, (telegram_user_id,)).fetchone() is not None
+
+    def count_total(self) -> int:
+        """Всего уникальных Telegram user id, когда-либо написавших ЭТОМУ
+        боту — telegram_user_id уже PRIMARY KEY (см. _SCHEMA), тот же
+        приём, что и reader/public_bot/known_users_repository.py."""
+        return self._conn.execute("SELECT COUNT(*) FROM turkey_bot_known_users").fetchone()[0]
+
+    def count_first_seen_since(self, since: datetime) -> int:
+        """Сколько пользователей появились ВПЕРВЫЕ, начиная с since — по
+        first_seen_at (выставляется один раз при INSERT и НИКОГДА не
+        обновляется, см. _UPSERT выше), не по last_seen_at (тот же приём
+        и то же обоснование, что и reader/public_bot/
+        known_users_repository.py::count_first_seen_since). since —
+        aware datetime (обычно UTC), сравнивается как текстовая
+        ISO-строка того же формата, что и SQLite CURRENT_TIMESTAMP."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM turkey_bot_known_users WHERE first_seen_at >= ?",
+            (since.strftime("%Y-%m-%d %H:%M:%S"),),
+        ).fetchone()
+        return row[0]
+
+    def list_all(self) -> list[tuple[int, str | None]]:
+        """(telegram_user_id, telegram_username) для КАЖДОГО известного
+        пользователя, отсортировано по first_seen_at ASC, telegram_user_id
+        ASC (см. задачу: "deterministic ordering") — НИКОГДА не отдаёт
+        telegram_chat_id или что-либо ещё (см. задачу: "never expose
+        chat_id or other internal fields") — сама структура возврата
+        (двухэлементный tuple) делает это структурно невозможным, не
+        только "не показано"."""
+        rows = self._conn.execute(_SELECT_ALL_ORDERED).fetchall()
+        return [(telegram_user_id, telegram_username) for telegram_user_id, telegram_username in rows]
 
     def close(self) -> None:
         self._conn.close()

@@ -19,6 +19,7 @@ _translate_fines)."""
 from decimal import Decimal
 
 from reader.turkey_bot.gib.models import GibFineRecord
+from reader.turkey_bot.statistics_service import TurkeyStatistics
 
 # Telegram режет сообщение на границе 4096 символов — см. format_has_debt_
 # messages()/_split_into_telegram_messages() про то, как несколько штрафов
@@ -75,6 +76,29 @@ CANCEL_CONFIRM_TEXT = "Проверка отменена. Отправьте г�
 NOTHING_TO_CANCEL_TEXT = "Сейчас нет активной проверки для отмены."
 
 CANCEL_BUTTON_LABEL = "❌ Отмена"
+
+# Главное reply-меню (см. reader/turkey_bot/keyboards.py::main_menu_keyboard) -
+# GARAGE_LABEL виден ВСЕМ, STATISTICS_LABEL — ТОЛЬКО trusted-менеджерам (см.
+# design report: "reuse the same trusted manager IDs... already used by
+# ProtocolGEbot" — settings.public_bot.trusted_operator_user_ids).
+GARAGE_LABEL = "🚗 Мои авто"
+STATISTICS_LABEL = "📊 Статистика"
+
+GARAGE_CHECK_BUTTON_LABEL = "🔎 Проверить"
+
+GARAGE_HEADER = "🚗 Мои автомобили"
+EMPTY_GARAGE_TEXT = (
+    "🚗 У вас пока нет автомобилей.\n\n"
+    "Проверьте автомобиль по номеру — после успешной проверки он появится здесь."
+)
+
+# Общий, намеренно НЕИНФОРМАТИВНЫЙ текст — и для реально неизвестного
+# callback_data, и для garage-callback'а с чужим/несуществующим car_id (см.
+# design report: одинаковый ответ в обоих случаях — НЕ раскрывает,
+# существует ли машина вообще, просто принадлежит не этому пользователю,
+# см. задачу: "A normal user must not be able to inspect another user's
+# garage by forging callback data").
+UNKNOWN_BUTTON_TEXT = "Неизвестная или устаревшая кнопка"
 
 
 def no_debt_text(plate: str) -> str:
@@ -211,3 +235,74 @@ def format_has_debt_messages(plate: str, fines: tuple[GibFineRecord, ...]) -> li
     blocks.append("\n".join(footer_lines))
 
     return _split_into_telegram_messages(blocks)
+
+
+def format_statistics(stats: TurkeyStatistics) -> str:
+    """Только метрики, надёжно посчитанные reader/turkey_bot/
+    statistics_service.py::TurkeyStatisticsService (см. design report,
+    аудит) — никаких Георгия-специфичных полей (active/stopped
+    subscriptions, monitoring tasks) — у Turkey нет мониторинга (см.
+    задачу)."""
+    lines = [
+        STATISTICS_LABEL,
+        "",
+        "👥 Пользователи",
+        f"Всего: {stats.total_users}",
+        f"Новых сегодня: {stats.new_users_today}",
+        f"Новых за 7 дней: {stats.new_users_7d}",
+        f"Новых за 30 дней: {stats.new_users_30d}",
+        "",
+        "🔎 Проверки",
+        f"Всего: {stats.total_checks}",
+        f"Сегодня: {stats.checks_today}",
+        f"За 7 дней: {stats.checks_7d}",
+        f"За 30 дней: {stats.checks_30d}",
+        "",
+        f"🚨 С задолженностью: {stats.checks_has_debt}",
+        f"✅ Без задолженности: {stats.checks_no_debt}",
+    ]
+    return "\n".join(lines)
+
+
+def _format_user_line(index: int, telegram_user_id: int, telegram_username: str | None) -> str:
+    """@username, когда известен, иначе "ID: <telegram_user_id>" (см.
+    задачу) — НИКОГДА telegram_chat_id или что-либо ещё: сигнатура этой
+    функции физически не получает ничего, кроме этих двух значений."""
+    identity = f"@{telegram_username}" if telegram_username else f"ID: {telegram_user_id}"
+    return f"{index}. {identity}"
+
+
+def format_user_list_messages(users: list[tuple[int, str | None]]) -> list[str]:
+    """Список ВСЕХ известных пользователей (см. reader/turkey_bot/
+    known_users_repository.py::list_all — уже отсортирован
+    детерминированно). Возвращает СПИСОК сообщений (см. задачу: "Handle
+    Telegram's 4096-character limit safely... Do not truncate silently") -
+    заголовок только в первом сообщении, каждая строка — атомарная единица
+    (никогда не разрывается пополам), упаковка построчная (через "\\n", не
+    "\\n\\n" — список компактнее, чем блоки со штрафами)."""
+    header = f"👥 Пользователи ({len(users)}):"
+    if not users:
+        return [header]
+
+    lines = [
+        _format_user_line(index, telegram_user_id, telegram_username)
+        for index, (telegram_user_id, telegram_username) in enumerate(users, start=1)
+    ]
+
+    messages: list[str] = []
+    current: list[str] = [header]
+    current_len = len(header)
+    for line in lines:
+        addition = len(line) + 1  # +1 = "\n"
+        if current_len + addition > _TELEGRAM_MESSAGE_LIMIT:
+            messages.append("\n".join(current))
+            current = []
+            current_len = 0
+            addition = len(line)
+        current.append(line)
+        current_len += addition
+
+    if current:
+        messages.append("\n".join(current))
+
+    return messages
