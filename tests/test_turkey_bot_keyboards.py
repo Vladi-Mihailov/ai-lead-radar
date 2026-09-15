@@ -1,6 +1,7 @@
 """
 Тесты reader/turkey_bot/keyboards.py — inline "❌ Отмена", персистентное
-reply-меню (main_menu_keyboard) и inline-гараж (garage_keyboard).
+reply-меню (main_menu_keyboard) и inline-гараж (garage_keyboard, теперь с
+двумя действиями на автомобиль — GIB/Avrasya, см. design report Stage 2B).
 """
 
 import sys
@@ -21,7 +22,8 @@ from reader.turkey_bot.keyboards import (  # noqa: E402
 from reader.turkey_bot.models import TurkeyUserCar  # noqa: E402
 from reader.turkey_bot.texts import (  # noqa: E402
     CANCEL_BUTTON_LABEL,
-    GARAGE_CHECK_BUTTON_LABEL,
+    CHECK_FINES_LABEL,
+    CHECK_TOLLS_LABEL,
     GARAGE_LABEL,
     STATISTICS_LABEL,
 )
@@ -60,9 +62,11 @@ def test_cancel_callback_data_is_a_fixed_constant_without_dynamic_content():
     assert CANCEL_CALLBACK_DATA == b"turkeycancel"
 
 
-def test_main_menu_shows_garage_for_everyone():
+def test_main_menu_shows_fines_tolls_and_garage_for_everyone():
     labels = _text_labels(main_menu_keyboard(is_trusted=False))
 
+    assert CHECK_FINES_LABEL in labels
+    assert CHECK_TOLLS_LABEL in labels
     assert GARAGE_LABEL in labels
     assert STATISTICS_LABEL not in labels
 
@@ -72,43 +76,54 @@ def test_main_menu_shows_statistics_only_for_trusted():
     button"."""
     labels = _text_labels(main_menu_keyboard(is_trusted=True))
 
+    assert CHECK_FINES_LABEL in labels
+    assert CHECK_TOLLS_LABEL in labels
     assert GARAGE_LABEL in labels
     assert STATISTICS_LABEL in labels
 
 
-def test_garage_keyboard_has_two_buttons_per_car():
+def test_garage_keyboard_has_three_buttons_per_car():
+    """[НОМЕР] [🚔 Проверить штрафы] [🛣 Проверить платные дороги] (см.
+    design report Stage 2B: "Saved cars must show both actions")."""
     cars = [_car(1, "34ABC123"), _car(2, "06XYZ999")]
 
     keyboard = garage_keyboard(cars)
 
     assert len(keyboard) == 2
     for row in keyboard:
-        assert len(row) == 2
+        assert len(row) == 3
 
 
-def test_garage_keyboard_shows_plate_and_check_button_labels():
+def test_garage_keyboard_shows_plate_and_both_action_labels():
     keyboard = garage_keyboard([_car(1, "34ABC123")])
 
     row = keyboard[0]
     assert row[0].text == "34ABC123"
-    assert row[1].text == GARAGE_CHECK_BUTTON_LABEL
+    assert row[1].text == CHECK_FINES_LABEL
+    assert row[2].text == CHECK_TOLLS_LABEL
 
 
-def test_garage_keyboard_both_buttons_encode_same_car_id():
-    """См. design report: "Clicking the plate itself may either be a
-    no-op/info action or start the same check" - здесь обе кнопки ведут
-    на ОДИН и тот же callback."""
+def test_garage_keyboard_plate_and_fines_button_encode_the_same_gib_callback():
+    """См. design report Stage 1: "Clicking the plate itself may either
+    be a no-op/info action or start the same check" — здесь обе ведут на
+    ОДИН и тот же (gib, car_id) callback."""
     keyboard = garage_keyboard([_car(42, "34ABC123")])
 
     row = keyboard[0]
     assert row[0].data == row[1].data
-    assert decode_garage_check_callback(row[0].data) == 42
+    assert decode_garage_check_callback(row[0].data) == ("gib", 42)
 
 
-def test_encode_decode_garage_check_roundtrip():
-    data = encode_garage_check_callback(7)
+def test_garage_keyboard_tolls_button_encodes_avrasya_callback():
+    keyboard = garage_keyboard([_car(42, "34ABC123")])
 
-    assert decode_garage_check_callback(data) == 7
+    row = keyboard[0]
+    assert decode_garage_check_callback(row[2].data) == ("avrasya", 42)
+
+
+def test_encode_decode_garage_check_roundtrip_for_each_provider():
+    assert decode_garage_check_callback(encode_garage_check_callback("gib", 7)) == ("gib", 7)
+    assert decode_garage_check_callback(encode_garage_check_callback("avrasya", 7)) == ("avrasya", 7)
 
 
 def test_decode_garage_check_rejects_unrelated_callback_data():
@@ -118,4 +133,15 @@ def test_decode_garage_check_rejects_unrelated_callback_data():
 
 
 def test_decode_garage_check_rejects_non_numeric_payload():
-    assert decode_garage_check_callback(b"turkeygaragecheck:not-a-number") is None
+    assert decode_garage_check_callback(b"turkeygaragecheck:gib:not-a-number") is None
+
+
+def test_decode_garage_check_rejects_unknown_provider():
+    """См. design report: "design the internal architecture so
+    additional toll-road providers can be added later" — но НЕ принимает
+    произвольную строку как провайдер уже сейчас (только зарегистрированные)."""
+    assert decode_garage_check_callback(b"turkeygaragecheck:unknownprovider:7") is None
+
+
+def test_decode_garage_check_rejects_missing_car_id():
+    assert decode_garage_check_callback(b"turkeygaragecheck:gib:") is None

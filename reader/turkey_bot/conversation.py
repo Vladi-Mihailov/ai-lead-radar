@@ -1,5 +1,17 @@
 """ConversationController Turkey-бота — линейный, одноразовый цикл
-"номер -> CAPTCHA -> код -> результат" (см. design report Stage 3).
+"номер -> CAPTCHA -> код -> результат" (см. design report Stage 3), ТЕПЕРЬ
+с ДВУМЯ независимыми провайдерами (см. design report Stage 2B):
+  - GIB (🚔 Проверить штрафы) — штрафы/задолженность, dijital.gib.gov.tr;
+  - Avrasya Tüneli (🛣 Проверить платные дороги) — неоплаченные проезды,
+    avrasyatuneli.com (см. reader/turkey_bot/avrasya/*).
+Оба провайдера используют ОДИН И ТОТ ЖЕ линейный конечный автомат (номер
+-> CAPTCHA -> код -> результат) и ОДНУ И ТУ ЖЕ CAPTCHA-обязательность (см.
+задачу: "CAPTCHA remains mandatory... never bypassed/automated" — ни для
+одного провайдера) — конкретный провайдер выбирается ДО первого запроса
+(либо явной кнопкой меню, либо гаражом) и хранится в payload персистентного
+состояния (см. _STEP_AWAITING_PLATE/_STEP_AWAITING_CODE ниже), а не
+угадывается по содержимому сообщения.
+
 НИЧЕГО не знает про Telethon (та же граница, что и
 reader/public_bot/conversation.py) — reader/turkey_bot/handlers.py
 конвертирует BotReply в реальные Telegram-вызовы (в частности,
@@ -7,17 +19,25 @@ photo_png -> отправка фото, чего у Георгии нет вов
 
 Ключевой архитектурный принцип (см.
 reader/turkey_bot/live_session_registry.py и design report Stage 3):
-ЖИВАЯ GIB-сессия (httpx.AsyncClient/cookies) существует ТОЛЬКО в памяти
-этого процесса, никогда в БД. bot_conversation_state хранит только "какой
-номер проверяли и какой image_id был последним показан" — этого
-достаточно, чтобы после рестарта/протухания сессии молча запросить НОВУЮ
-CAPTCHA для того же номера, но НЕДОСТАТОЧНО и не может быть достаточно для
-восстановления самой сессии. Каждый обработчик, который может изменить
-состояние конкретного chat_id, серилизован через
-LiveGibSessionRegistry.lock_for(chat_id) (см. design report: "per-chat
-locking") — защита от гонки между двумя почти одновременными сообщениями
-одного и того же диалога.
-"""
+ЖИВАЯ сессия провайдера (httpx.AsyncClient/cookies) существует ТОЛЬКО в
+памяти этого процесса, никогда в БД — ЭТО ВЕРНО ДЛЯ ОБОИХ провайдеров (см.
+reader/turkey_bot/avrasya/live_session_registry.py — отдельный, но
+структурно идентичный реестр для Avrasya, см. design report Stage 2B: "do
+not force Avrasya into GIB-specific abstractions... never serialize a
+live HTTP session into SQLite"). bot_conversation_state хранит только
+"какой номер проверяли, у какого провайдера и какой image_id был
+последним показан" (image_id — ТОЛЬКО для GIB, у Avrasya его нет вовсе,
+см. avrasya/models.py) — этого достаточно, чтобы после рестарта/протухания
+сессии молча запросить НОВУЮ CAPTCHA для того же номера у ТОГО ЖЕ
+провайдера, но НЕДОСТАТОЧНО и не может быть достаточно для восстановления
+самой сессии.
+
+Единый per-chat lock (см. design report Stage 2B: "Use one common
+per-chat lock across GİB and Avrasya so the two flows cannot race") —
+LiveGibSessionRegistry.lock_for() (сам по себе провайдер-агностичный
+метод, не трогающий _checks/GibProvider) переиспользуется КАК ЕСТЬ и для
+Avrasya-веток — второй, отдельный lock здесь НЕ заводится (это создало бы
+ровно ту гонку, которую единый lock должен предотвращать)."""
 
 import json
 import logging
@@ -30,6 +50,20 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from reader.turkey_bot import texts
+from reader.turkey_bot.avrasya.live_session_registry import (
+    LiveAvrasyaCheck,
+    LiveAvrasyaSessionRegistry,
+)
+from reader.turkey_bot.avrasya.models import (
+    AvrasyaCaptchaChallenge,
+    AvrasyaSubmitOutcome,
+)
+from reader.turkey_bot.avrasya.provider import AvrasyaProvider
+from reader.turkey_bot.avrasya.session import (
+    AvrasyaRateLimitedError,
+    AvrasyaSession,
+    AvrasyaTransportError,
+)
 from reader.turkey_bot.check_repository import TurkeyCheckRepository
 from reader.turkey_bot.conversation_state_repository import (
     TurkeyConversationStateRepository,
@@ -45,6 +79,7 @@ from reader.turkey_bot.gib.translation import FineTranslationError
 from reader.turkey_bot.live_session_registry import LiveGibCheck, LiveGibSessionRegistry
 from reader.turkey_bot.models import ConversationState, TurkeyUserCar
 from reader.turkey_bot.statistics_service import TurkeyStatisticsService
+from reader.turkey_bot.toll_check_repository import TurkeyTollCheckRepository
 from reader.turkey_bot.user_cars_repository import TurkeyUserCarsRepository
 from reader.turkey_bot.validation import normalize_plate
 
@@ -56,6 +91,16 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TZ = ZoneInfo("UTC")
 
 _STEP_AWAITING_CODE = "awaiting_captcha_code"
+# Новый шаг (см. design report Stage 2B) — между нажатием CHECK_FINES_LABEL/
+# CHECK_TOLLS_LABEL в главном меню и вводом самого номера: payload несёт
+# ТОЛЬКО {"provider": "gib"|"avrasya"} - какой провайдер обслужит
+# СЛЕДУЮЩИЙ введённый текст как номер. Голый ввод номера без этого шага
+# (см. handle_text) по-прежнему трактуется как GIB напрямую — regression-
+# safe (см. design report: "bare plate still defaults to GİB").
+_STEP_AWAITING_PLATE = "awaiting_plate"
+
+_PROVIDER_GIB = "gib"
+_PROVIDER_AVRASYA = "avrasya"
 
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -108,16 +153,17 @@ class BotReply:
 
 
 class _AsyncCloseable(Protocol):
-    """Ровно то, что LiveGibSessionRegistry требует от .client (см.
-    reader/turkey_bot/live_session_registry.py::pop_and_close) — тот же
-    Protocol-приём, что и FineTranslatorLike в reader/fines/check_service.py,
-    чтобы тесты могли подменить httpx.AsyncClient лёгким фейком без
-    реальной сети."""
+    """Ровно то, что LiveGibSessionRegistry/LiveAvrasyaSessionRegistry
+    требуют от .client (см. reader/turkey_bot/live_session_registry.py::
+    pop_and_close) — тот же Protocol-приём, что и FineTranslatorLike в
+    reader/fines/check_service.py, чтобы тесты могли подменить
+    httpx.AsyncClient лёгким фейком без реальной сети."""
 
     async def aclose(self) -> None: ...
 
 
 CheckFactory = Callable[[], tuple[_AsyncCloseable, GibProvider]]
+AvrasyaCheckFactory = Callable[[], tuple[_AsyncCloseable, AvrasyaProvider]]
 
 
 class FineTranslatorLike(Protocol):
@@ -145,6 +191,14 @@ def _default_check_factory() -> tuple[httpx.AsyncClient, GibProvider]:
     return client, GibProvider(GibSession(client))
 
 
+def _default_avrasya_check_factory() -> tuple[httpx.AsyncClient, AvrasyaProvider]:
+    """Реальная Avrasya-сессия (см. design report Stage 2B) — тот же
+    общий _build_client() (одинаковый User-Agent/timeout), что и у GIB —
+    не отдельная настройка без причины."""
+    client = _build_client()
+    return client, AvrasyaProvider(AvrasyaSession(client))
+
+
 def _sanitize_outcome_for_storage(outcome: GibSubmitOutcome) -> str:
     """См. модуль docstring reader/turkey_bot/texts.py и задачу: то, что
     здесь сериализуется, идёт ТОЛЬКО в TurkeyCheckRepository (server-side),
@@ -162,6 +216,28 @@ def _sanitize_outcome_for_storage(outcome: GibSubmitOutcome) -> str:
     )
 
 
+def _sanitize_avrasya_outcome_for_storage(outcome: AvrasyaSubmitOutcome) -> str:
+    """Аналог _sanitize_outcome_for_storage() для Avrasya (см. design
+    report Stage 2B: "Store sanitized response server-side") — идёт
+    ТОЛЬКО в TurkeyTollCheckRepository, никогда пользователю (см.
+    conversation.py::_handle_avrasya_submit_outcome и texts.py::
+    AVRASYA_UNEXPECTED_TEXT). Никогда не содержит captcha_code/cookies —
+    AvrasyaSubmitOutcome их не несёт (см. avrasya/models.py)."""
+    return json.dumps(
+        {
+            "kind": outcome.kind,
+            "status_code": outcome.status_code,
+            "messages": [
+                {"property_name": m.property_name, "error_message": m.error_message}
+                for m in outcome.messages
+            ],
+            "raw_data": outcome.raw_data,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
 class ConversationController:
     def __init__(
         self,
@@ -170,8 +246,11 @@ class ConversationController:
         session_registry: LiveGibSessionRegistry,
         garage_repository: TurkeyUserCarsRepository,
         statistics_service: TurkeyStatisticsService,
+        avrasya_session_registry: LiveAvrasyaSessionRegistry,
+        toll_check_repository: TurkeyTollCheckRepository,
         *,
         check_factory: CheckFactory = _default_check_factory,
+        avrasya_check_factory: AvrasyaCheckFactory = _default_avrasya_check_factory,
         translator: FineTranslatorLike | None = None,
         trusted_operator_user_ids: frozenset[int] = frozenset(),
         tz: ZoneInfo = _DEFAULT_TZ,
@@ -181,7 +260,10 @@ class ConversationController:
         self._registry = session_registry
         self._garage = garage_repository
         self._statistics = statistics_service
+        self._avrasya_registry = avrasya_session_registry
+        self._toll_checks = toll_check_repository
         self._check_factory = check_factory
+        self._avrasya_check_factory = avrasya_check_factory
         # None — как и everywhere в проекте (см. FineTranslatorLike в
         # reader/fines/check_service.py) — означает "перевод недоступен"
         # (нет OPENAI_API_KEY, см. main.py), не ошибку: клиент увидит
@@ -204,8 +286,9 @@ class ConversationController:
         username. Trusted даёт доступ ТОЛЬКО к статистике (см. design
         report: "Trusted status grants access to statistics only — it
         does not grant managers access to another user's Turkey garage or
-        checks") — гараж всегда фильтруется по РЕАЛЬНОМУ telegram_user_id
-        вызывающего, независимо от trusted-статуса."""
+        checks") — гараж (для ОБОИХ провайдеров) всегда фильтруется по
+        РЕАЛЬНОМУ telegram_user_id вызывающего, независимо от
+        trusted-статуса."""
         return telegram_user_id in self._trusted_operator_user_ids
 
     def is_trusted(self, telegram_user_id: int) -> bool:
@@ -221,6 +304,7 @@ class ConversationController:
         if lowered == "/start":
             async with self._registry.lock_for(chat_id):
                 await self._registry.pop_and_close(chat_id)
+                await self._avrasya_registry.pop_and_close(chat_id)
                 self._states.clear(chat_id)
             return BotReply(text=texts.WELCOME_TEXT, show_main_menu=True)
 
@@ -239,8 +323,30 @@ class ConversationController:
         if stripped == texts.STATISTICS_LABEL and self._is_trusted(telegram_user_id):
             return await self._handle_statistics(chat_id=chat_id)
 
+        if stripped == texts.CHECK_FINES_LABEL:
+            return await self._handle_check_button(
+                chat_id=chat_id, telegram_user_id=telegram_user_id, provider=_PROVIDER_GIB,
+            )
+
+        if stripped == texts.CHECK_TOLLS_LABEL:
+            return await self._handle_check_button(
+                chat_id=chat_id, telegram_user_id=telegram_user_id, provider=_PROVIDER_AVRASYA,
+            )
+
         state = self._states.get(chat_id)
+
+        if state is not None and state.step == _STEP_AWAITING_PLATE:
+            provider = (state.payload or {}).get("provider", _PROVIDER_GIB)
+            return await self._handle_plate_for_provider(
+                stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, provider=provider,
+            )
+
         if state is not None and state.step == _STEP_AWAITING_CODE:
+            provider = (state.payload or {}).get("provider", _PROVIDER_GIB)
+            if provider == _PROVIDER_AVRASYA:
+                return await self._handle_avrasya_captcha_code(
+                    stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, state=state,
+                )
             return await self._handle_captcha_code(
                 stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, state=state,
             )
@@ -249,14 +355,21 @@ class ConversationController:
 
     async def handle_cancel(self, *, chat_id: int) -> BotReply:
         """Общий путь и для текстовой команды /cancel, и для inline
-        "❌ Отмена" (см. reader/turkey_bot/handlers.py) — оба ведут сюда."""
+        "❌ Отмена" (см. reader/turkey_bot/handlers.py) — оба ведут сюда.
+        Отменяет ЛЮБУЮ живую проверку — GIB и/или Avrasya (в норме активна
+        не больше одной сразу, см. design report: единый lock, но
+        pop_and_close на обеих — дешёвая защита от рассинхронизации)."""
         async with self._registry.lock_for(chat_id):
-            had_live_check = await self._registry.get(chat_id) is not None
+            had_live_check = (
+                await self._registry.get(chat_id) is not None
+                or await self._avrasya_registry.get(chat_id) is not None
+            )
             had_state = self._states.get(chat_id) is not None
             if not had_live_check and not had_state:
                 return BotReply(text=texts.NOTHING_TO_CANCEL_TEXT, show_main_menu=True)
 
             await self._registry.pop_and_close(chat_id)
+            await self._avrasya_registry.pop_and_close(chat_id)
             self._states.clear(chat_id)
             return BotReply(text=texts.CANCEL_CONFIRM_TEXT, show_main_menu=True)
 
@@ -265,13 +378,17 @@ class ConversationController:
         статистики. Список ВСЕГДА фильтруется по РЕАЛЬНОМУ telegram_user_id
         вызывающего (см. TurkeyUserCarsRepository.list_cars) — нет
         отдельного "trusted"-режима просмотра чужого гаража (см. design
-        report: "Trusted status grants access to statistics only")."""
+        report: "Trusted status grants access to statistics only"). ОДИН
+        и тот же гараж для ОБОИХ провайдеров (см. design report Stage 2B:
+        "Reuse the existing turkey_bot_user_cars; no separate Avrasya
+        garage")."""
         async with self._registry.lock_for(chat_id):
             # Открытие "🚗 Мои авто" - явная навигация, как и /cancel -
             # прошлый незавершённый диалог (если был) отбрасывается (тот
             # же принцип, что и у reader/public_bot/conversation.py про
             # пункты меню).
             await self._registry.pop_and_close(chat_id)
+            await self._avrasya_registry.pop_and_close(chat_id)
             self._states.clear(chat_id)
 
         cars = tuple(self._garage.list_cars(telegram_user_id))
@@ -282,9 +399,13 @@ class ConversationController:
     async def _handle_statistics(self, *, chat_id: int) -> BotReply:
         """Вызывающий код (handle_text) уже проверил is_trusted() —
         см. design report: единственная проверка авторизации для
-        статистики, здесь не повторяется."""
+        статистики, здесь не повторяется. Avrasya НЕ включена в
+        статистику (см. design report Stage 2B: "Do not add Avrasya to
+        Статистика yet") — TurkeyStatisticsService не тронут в этой
+        задаче."""
         async with self._registry.lock_for(chat_id):
             await self._registry.pop_and_close(chat_id)
+            await self._avrasya_registry.pop_and_close(chat_id)
             self._states.clear(chat_id)
 
         stats = self._statistics.get_statistics(now=datetime.now(timezone.utc), tz=self._tz)
@@ -295,8 +416,29 @@ class ConversationController:
             show_main_menu=True,
         )
 
+    async def _handle_check_button(
+        self, *, chat_id: int, telegram_user_id: int, provider: str,
+    ) -> BotReply:
+        """Нажатие CHECK_FINES_LABEL/CHECK_TOLLS_LABEL в главном меню —
+        armит provider для СЛЕДУЮЩЕГО введённого номера (см.
+        _STEP_AWAITING_PLATE) и, как и остальные пункты меню, отбрасывает
+        любой прошлый незавершённый диалог."""
+        async with self._registry.lock_for(chat_id):
+            await self._registry.pop_and_close(chat_id)
+            await self._avrasya_registry.pop_and_close(chat_id)
+            self._states.set(
+                chat_id, telegram_user_id=telegram_user_id, step=_STEP_AWAITING_PLATE,
+                payload={"provider": provider},
+            )
+        text = (
+            texts.ASK_PLATE_FOR_TOLLS_TEXT
+            if provider == _PROVIDER_AVRASYA
+            else texts.ASK_PLATE_FOR_FINES_TEXT
+        )
+        return BotReply(text=text, show_main_menu=True)
+
     async def handle_garage_check(
-        self, car_id: int, *, chat_id: int, telegram_user_id: int,
+        self, car_id: int, *, chat_id: int, telegram_user_id: int, provider: str,
     ) -> BotReply | None:
         """None — car_id не существует ИЛИ принадлежит другому
         пользователю (см. TurkeyUserCarsRepository.get_owned_car) —
@@ -304,53 +446,87 @@ class ConversationController:
         "неизвестная кнопка" alert и ничего не начинать (тот же принцип,
         что и у reader/public_bot про чужой subscription_id, см. design
         report: "A normal user must not be able to inspect another
-        user's garage by forging callback data")."""
+        user's garage by forging callback data"). provider выбирает,
+        какую из двух проверок начать для НАЙДЕННОГО и ПОДТВЕРЖДЁННОГО
+        своего автомобиля — сам по себе ничего не авторизует (см.
+        keyboards.py модуль docstring)."""
         car = self._garage.get_owned_car(car_id, telegram_user_id=telegram_user_id)
         if car is None:
             return None
         return await self._start_check_for_plate(
-            car.car_number, chat_id=chat_id, telegram_user_id=telegram_user_id,
+            car.car_number, chat_id=chat_id, telegram_user_id=telegram_user_id, provider=provider,
         )
 
     async def _handle_new_plate(
         self, raw_plate: str, *, chat_id: int, telegram_user_id: int,
     ) -> BotReply:
+        """Голый ввод номера БЕЗ предварительного нажатия CHECK_FINES_LABEL/
+        CHECK_TOLLS_LABEL — всегда GIB (см. design report: "bare plate
+        still defaults to GİB" — исходное, ещё Stage 3, поведение бота, не
+        новое)."""
+        return await self._handle_plate_for_provider(
+            raw_plate, chat_id=chat_id, telegram_user_id=telegram_user_id, provider=_PROVIDER_GIB,
+        )
+
+    async def _handle_plate_for_provider(
+        self, raw_plate: str, *, chat_id: int, telegram_user_id: int, provider: str,
+    ) -> BotReply:
         plate = normalize_plate(raw_plate)
         if plate is None:
             return BotReply(text=texts.INVALID_PLATE_TEXT, show_main_menu=True)
 
-        return await self._start_check_for_plate(plate, chat_id=chat_id, telegram_user_id=telegram_user_id)
+        return await self._start_check_for_plate(
+            plate, chat_id=chat_id, telegram_user_id=telegram_user_id, provider=provider,
+        )
 
     async def _start_check_for_plate(
-        self, plate: str, *, chat_id: int, telegram_user_id: int,
+        self, plate: str, *, chat_id: int, telegram_user_id: int, provider: str,
     ) -> BotReply:
-        """Общее ядро для "ввёл номер вручную" (см. _handle_new_plate) И
-        "нажал машину в гараже" (см. handle_garage_check) — CAPTCHA
-        обязательна в обоих случаях одинаково (см. design report: "CAPTCHA
-        remains mandatory. Do not bypass or automate it"), пользователю
-        никогда не нужно вводить номер повторно во втором случае, потому
-        что plate сюда приходит уже готовым (либо из ввода, либо из
+        """Общее ядро для "ввёл номер вручную"/"нажал кнопку меню" (см.
+        _handle_new_plate/_handle_plate_for_provider) И "нажал машину в
+        гараже" (см. handle_garage_check) — CAPTCHA обязательна во ВСЕХ
+        случаях одинаково, для ОБОИХ провайдеров (см. design report:
+        "CAPTCHA remains mandatory. Do not bypass or automate it"),
+        пользователю никогда не нужно вводить номер повторно, потому что
+        plate сюда приходит уже готовым (либо из ввода, либо из
         TurkeyUserCarsRepository), а не запрашивается заново."""
         async with self._registry.lock_for(chat_id):
-            # Этот путь достигается ТОЛЬКО из состояния IDLE (см.
-            # handle_text — пока step == awaiting_captcha_code, ЛЮБОЙ текст
-            # трактуется как код, а не как новый номер: коды CAPTCHA и
-            # номера визуально слишком похожи, чтобы угадывать намерение
+            # Этот путь достигается ТОЛЬКО из состояния IDLE/awaiting_plate
+            # (см. handle_text — пока step == awaiting_captcha_code, ЛЮБОЙ
+            # текст трактуется как код, а не как новый номер: коды CAPTCHA
+            # и номера визуально слишком похожи, чтобы угадывать намерение
             # пользователя, см. design report Stage 3 — новый номер вместо
             # кода НЕ поддерживается, вместо этого явный /cancel). Тем не
             # менее pop_and_close() здесь — дешёвая защита на случай, если
             # registry и persisted-состояние когда-либо разойдутся
             # (например, после ошибки в предыдущем цикле) — обычно no-op.
             await self._registry.pop_and_close(chat_id)
+            await self._avrasya_registry.pop_and_close(chat_id)
             self._states.clear(chat_id)
 
-            challenge = await self._open_new_check(chat_id, telegram_user_id, plate)
-            if challenge is None:
-                return BotReply(text=texts.CAPTCHA_FETCH_FAILED_TEXT, show_main_menu=True)
+            if provider == _PROVIDER_AVRASYA:
+                try:
+                    challenge = await self._open_new_avrasya_check(chat_id, telegram_user_id, plate)
+                except AvrasyaRateLimitedError:
+                    logger.warning(
+                        "Turkey Avrasya: rate limited while starting session (chat_id=%s)", chat_id,
+                    )
+                    return BotReply(text=texts.AVRASYA_RATE_LIMITED_TEXT, show_main_menu=True)
+                except AvrasyaTransportError:
+                    logger.warning(
+                        "Turkey Avrasya: failed to start session/captcha (chat_id=%s)", chat_id,
+                    )
+                    return BotReply(text=texts.AVRASYA_CAPTCHA_FETCH_FAILED_TEXT, show_main_menu=True)
+            else:
+                challenge = await self._open_new_check(chat_id, telegram_user_id, plate)
+                if challenge is None:
+                    return BotReply(text=texts.CAPTCHA_FETCH_FAILED_TEXT, show_main_menu=True)
 
             return BotReply(
                 text=texts.ASK_CAPTCHA_TEXT, photo_png=challenge.image_png, show_cancel_button=True,
             )
+
+    # ---- GIB (см. reader/turkey_bot/gib/*) — НЕИЗМЕНЁННАЯ логика Stage 3/4 ----
 
     async def _handle_captcha_code(
         self, code: str, *, chat_id: int, telegram_user_id: int, state: ConversationState,
@@ -415,7 +591,7 @@ class ConversationController:
             check.image_id = challenge.image_id
             self._states.set(
                 chat_id, telegram_user_id=telegram_user_id, step=_STEP_AWAITING_CODE,
-                payload={"plate": check.plate, "image_id": challenge.image_id},
+                payload={"plate": check.plate, "image_id": challenge.image_id, "provider": _PROVIDER_GIB},
             )
             return BotReply(
                 text=texts.CAPTCHA_REJECTED_RETRY_TEXT, photo_png=challenge.image_png,
@@ -432,7 +608,8 @@ class ConversationController:
             # no_debt... CAPTCHA/rejected/unexpected/abandoned checks must
             # not pollute the garage") — этот вызов и его аналог в ветке
             # has_debt ниже единственные места, где вообще пишется в
-            # turkey_bot_user_cars.
+            # turkey_bot_user_cars (ОБЩИЙ гараж и для Avrasya, см.
+            # _handle_avrasya_submit_outcome).
             self._garage.record_successful_check(
                 telegram_user_id=telegram_user_id, car_number=check.plate,
             )
@@ -549,6 +726,210 @@ class ConversationController:
         await self._registry.put(chat_id, check)
         self._states.set(
             chat_id, telegram_user_id=telegram_user_id, step=_STEP_AWAITING_CODE,
-            payload={"plate": plate, "image_id": challenge.image_id},
+            payload={"plate": plate, "image_id": challenge.image_id, "provider": _PROVIDER_GIB},
+        )
+        return challenge
+
+    # ---- Avrasya Tüneli (см. reader/turkey_bot/avrasya/*) — Stage 2B ----
+
+    async def _handle_avrasya_captcha_code(
+        self, code: str, *, chat_id: int, telegram_user_id: int, state: ConversationState,
+    ) -> BotReply:
+        """Структурная копия _handle_captcha_code() (см. выше) для
+        Avrasya — та же "restart recovery"/rejected-retry семантика, но
+        через LiveAvrasyaSessionRegistry/AvrasyaProvider и без image_id
+        (см. avrasya/models.py — Avrasya его не несёт)."""
+        async with self._registry.lock_for(chat_id):
+            check = await self._avrasya_registry.get(chat_id)
+
+            if check is None:
+                # Тот же принцип, что и у GIB-ветки: рестарт/idle-TTL/
+                # устаревшая сессия — не различаются, молча запрашиваем
+                # новую CAPTCHA для уже сохранённого номера (см. design
+                # report: "Missing/expired live Avrasya session → create a
+                # fresh session/CAPTCHA for the persisted plate").
+                plate = (state.payload or {}).get("plate")
+                if not plate:
+                    self._states.clear(chat_id)
+                    return BotReply(text=texts.SESSION_LOST_TEXT, show_main_menu=True)
+
+                try:
+                    challenge = await self._open_new_avrasya_check(chat_id, telegram_user_id, plate)
+                except AvrasyaRateLimitedError:
+                    self._states.clear(chat_id)
+                    logger.warning(
+                        "Turkey Avrasya: rate limited during restart recovery (chat_id=%s)", chat_id,
+                    )
+                    return BotReply(text=texts.AVRASYA_RATE_LIMITED_TEXT, show_main_menu=True)
+                except AvrasyaTransportError:
+                    self._states.clear(chat_id)
+                    logger.warning(
+                        "Turkey Avrasya: failed to start session/captcha (chat_id=%s)", chat_id,
+                    )
+                    return BotReply(text=texts.AVRASYA_CAPTCHA_FETCH_FAILED_TEXT, show_main_menu=True)
+
+                return BotReply(
+                    text=texts.SESSION_EXPIRED_RETRY_TEXT,
+                    photo_png=challenge.image_png,
+                    show_cancel_button=True,
+                )
+
+            check.submit_attempts += 1
+            try:
+                outcome = await check.provider.submit(plate=check.plate, captcha_code=code)
+            except AvrasyaRateLimitedError:
+                await self._finish_avrasya(
+                    chat_id, telegram_user_id=telegram_user_id, check=check,
+                    status="error", raw_response=None,
+                )
+                logger.warning("Turkey Avrasya submit: rate limited (chat_id=%s)", chat_id)
+                return BotReply(text=texts.AVRASYA_RATE_LIMITED_TEXT, show_main_menu=True)
+            except AvrasyaTransportError:
+                await self._finish_avrasya(
+                    chat_id, telegram_user_id=telegram_user_id, check=check,
+                    status="error", raw_response=None,
+                )
+                logger.warning("Turkey Avrasya submit: transport error (chat_id=%s)", chat_id)
+                return BotReply(text=texts.AVRASYA_TRANSPORT_ERROR_TEXT, show_main_menu=True)
+
+            return await self._handle_avrasya_submit_outcome(
+                outcome, chat_id=chat_id, telegram_user_id=telegram_user_id, check=check,
+            )
+
+    async def _handle_avrasya_submit_outcome(
+        self, outcome: AvrasyaSubmitOutcome, *, chat_id: int, telegram_user_id: int,
+        check: LiveAvrasyaCheck,
+    ) -> BotReply:
+        if outcome.kind == "rejected":
+            # См. design report Stage 2B: "Wrong Avrasya CAPTCHA → obtain
+            # a fresh CAPTCHA and remain in the Avrasya flow" — та же
+            # семантика, что и у GIB rejected (см. _handle_submit_outcome).
+            try:
+                challenge = await check.provider.refresh_captcha()
+            except AvrasyaRateLimitedError:
+                await self._finish_avrasya(
+                    chat_id, telegram_user_id=telegram_user_id, check=check,
+                    status="error", raw_response=None,
+                )
+                logger.warning(
+                    "Turkey Avrasya refresh_captcha: rate limited (chat_id=%s)", chat_id,
+                )
+                return BotReply(text=texts.AVRASYA_RATE_LIMITED_TEXT, show_main_menu=True)
+            except AvrasyaTransportError:
+                await self._finish_avrasya(
+                    chat_id, telegram_user_id=telegram_user_id, check=check,
+                    status="error", raw_response=None,
+                )
+                logger.warning(
+                    "Turkey Avrasya refresh_captcha: transport error (chat_id=%s)", chat_id,
+                )
+                return BotReply(text=texts.AVRASYA_TRANSPORT_ERROR_TEXT, show_main_menu=True)
+
+            self._states.set(
+                chat_id, telegram_user_id=telegram_user_id, step=_STEP_AWAITING_CODE,
+                payload={"plate": check.plate, "provider": _PROVIDER_AVRASYA},
+            )
+            return BotReply(
+                text=texts.CAPTCHA_REJECTED_RETRY_TEXT, photo_png=challenge.image_png,
+                show_cancel_button=True,
+            )
+
+        raw_response = _sanitize_avrasya_outcome_for_storage(outcome)
+
+        if outcome.kind in ("no_debt", "has_debt"):
+            # ОБЩИЙ гараж (см. reader/turkey_bot/user_cars_repository.py) —
+            # ТОЛЬКО для реально завершённых no_debt/has_debt, ТОЧНО ТАК
+            # ЖЕ, как и у GIB (см. _handle_submit_outcome выше) — ни
+            # rejected/unexpected/error сюда не попадают (см. design
+            # report: "successful Avrasya check adding/reusing the same
+            # saved vehicle").
+            self._garage.record_successful_check(
+                telegram_user_id=telegram_user_id, car_number=check.plate,
+            )
+
+        if outcome.kind == "no_debt":
+            await self._finish_avrasya(
+                chat_id, telegram_user_id=telegram_user_id, check=check,
+                status="no_debt", raw_response=raw_response,
+            )
+            return BotReply(text=texts.avrasya_no_debt_text(check.plate), show_main_menu=True)
+
+        if outcome.kind == "has_debt":
+            # Реальная форма has_debt ни разу не была увидена вживую (см.
+            # avrasya/parser.py) — НЕ угадывается и НЕ показывается сырым
+            # JSON (см. design report: "do not guess its schema or expose
+            # raw JSON to the user") — тот же безопасный текст, что и для
+            # "unexpected" ниже, полный ответ уходит ТОЛЬКО в
+            # TurkeyTollCheckRepository (raw_response выше).
+            await self._finish_avrasya(
+                chat_id, telegram_user_id=telegram_user_id, check=check,
+                status="has_debt", raw_response=raw_response,
+            )
+            logger.warning("Turkey Avrasya: has_debt response (chat_id=%s)", chat_id)
+            return BotReply(text=texts.AVRASYA_UNEXPECTED_TEXT, show_main_menu=True)
+
+        # "unexpected" — НЕ трогает гараж (см. design report: "unexpected
+        # response does not add car").
+        await self._finish_avrasya(
+            chat_id, telegram_user_id=telegram_user_id, check=check,
+            status="unexpected", raw_response=raw_response,
+        )
+        logger.warning(
+            "Turkey Avrasya: unexpected response shape (chat_id=%s, status_code=%s)",
+            chat_id, outcome.status_code,
+        )
+        return BotReply(text=texts.AVRASYA_UNEXPECTED_TEXT, show_main_menu=True)
+
+    async def _finish_avrasya(
+        self,
+        chat_id: int,
+        *,
+        telegram_user_id: int,
+        check: LiveAvrasyaCheck,
+        status: str,
+        raw_response: str | None,
+    ) -> None:
+        """Аналог _finish() (см. выше) для Avrasya — закрывает и убирает
+        живую Avrasya-сессию, очищает персистентное состояние диалога,
+        пишет запись в TurkeyTollCheckRepository (ОТДЕЛЬНАЯ таблица, см.
+        reader/turkey_bot/toll_check_repository.py — turkey_fine_checks
+        не трогается)."""
+        await self._avrasya_registry.pop_and_close(chat_id)
+        self._states.clear(chat_id)
+        self._toll_checks.record_result(
+            telegram_user_id=telegram_user_id,
+            telegram_chat_id=chat_id,
+            provider=_PROVIDER_AVRASYA,
+            plate=check.plate,
+            captcha_attempts=check.submit_attempts,
+            status=status,
+            message_text=None,
+            raw_response=raw_response,
+        )
+
+    async def _open_new_avrasya_check(
+        self, chat_id: int, telegram_user_id: int, plate: str,
+    ) -> AvrasyaCaptchaChallenge:
+        """Аналог _open_new_check() (см. выше) для Avrasya — В ОТЛИЧИЕ от
+        него, НЕ проглатывает AvrasyaRateLimitedError/AvrasyaTransportError
+        сама, а закрывает client и поднимает исключение дальше (см.
+        session.py: AvrasyaRateLimitedError — подкласс
+        AvrasyaTransportError) — вызывающий код (см. _start_check_for_plate/
+        _handle_avrasya_captcha_code) различает rate-limit от обычного
+        сбоя транспорта и показывает разный текст пользователю (см. design
+        report: у GIB такого различия нет, поэтому _open_new_check его и
+        не делает — не унифицируется искусственно)."""
+        client, provider = self._avrasya_check_factory()
+        try:
+            challenge = await provider.start()
+        except AvrasyaTransportError:
+            await client.aclose()
+            raise
+
+        check = LiveAvrasyaCheck(client=client, provider=provider, plate=plate)
+        await self._avrasya_registry.put(chat_id, check)
+        self._states.set(
+            chat_id, telegram_user_id=telegram_user_id, step=_STEP_AWAITING_CODE,
+            payload={"plate": plate, "provider": _PROVIDER_AVRASYA},
         )
         return challenge

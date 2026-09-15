@@ -47,6 +47,9 @@ INVALID_PLATE_TEXT = (
     "латиница) и цифрами, например: А123АА123."
 )
 
+# Провайдер-агностичный текст (см. design report Stage 2B) — одинаково
+# уместен и для GIB, и для Avrasya CAPTCHA: ни то, ни другое не упоминается
+# по имени, поэтому переиспользуется для обоих провайдеров без дублирования.
 ASK_CAPTCHA_TEXT = "Введите код с картинки (регистр — как на картинке)."
 
 CAPTCHA_FETCH_FAILED_TEXT = (
@@ -54,22 +57,52 @@ CAPTCHA_FETCH_FAILED_TEXT = (
     "Попробуйте ещё раз через минуту."
 )
 
+AVRASYA_CAPTCHA_FETCH_FAILED_TEXT = (
+    "Не удалось получить CAPTCHA с сайта Avrasya Tüneli (сбой соединения). "
+    "Попробуйте ещё раз через минуту."
+)
+
+AVRASYA_RATE_LIMITED_TEXT = (
+    "Сайт Avrasya Tüneli временно ограничивает частоту запросов. "
+    "Попробуйте ещё раз через минуту."
+)
+
+# Провайдер-агностичный (см. ASK_CAPTCHA_TEXT выше) — переиспользуется для
+# обоих провайдеров.
 CAPTCHA_REJECTED_RETRY_TEXT = "Код введён неверно. Вот новая CAPTCHA — попробуйте ещё раз."
 
+# Провайдер-агностичный (не упоминает GIB по имени) — переиспользуется для
+# обоих провайдеров, см. design report Stage 2B.
 SESSION_EXPIRED_RETRY_TEXT = (
     "Предыдущая CAPTCHA-сессия больше не действительна (бот перезапускался "
     "или сессия истекла). Вот новая CAPTCHA для того же номера — введите код."
 )
 
+# Провайдер-агностичный — переиспользуется для обоих провайдеров.
 SESSION_LOST_TEXT = (
     "Не удалось восстановить проверку. Отправьте гос. номер ещё раз, чтобы начать заново."
 )
 
 TRANSPORT_ERROR_TEXT = "Не удалось связаться с сайтом GIB. Попробуйте ещё раз через минуту."
 
+AVRASYA_TRANSPORT_ERROR_TEXT = (
+    "Не удалось связаться с сайтом Avrasya Tüneli. Попробуйте ещё раз через минуту."
+)
+
 UNEXPECTED_ERROR_TEXT = (
     "GIB вернул ответ в формате, который бот пока не понимает. Мы уже знаем "
     "об этом — попробуйте позже."
+)
+
+# Используется и для реально "unexpected", и для (пока никогда не
+# наблюдавшегося вживую) has_debt (см. design report Stage 2B: "do not
+# guess its schema or expose raw JSON to the user") — сырой ответ уходит
+# ТОЛЬКО в TurkeyTollCheckRepository (server-side), пользователь видит
+# одинаковое безопасное сообщение для обоих случаев, пока реальная форма
+# has_debt не будет захвачена вживую (см. avrasya/parser.py).
+AVRASYA_UNEXPECTED_TEXT = (
+    "Avrasya Tüneli вернул ответ, который бот пока не понимает. Мы уже "
+    "знаем об этом — попробуйте позже."
 )
 
 CANCEL_CONFIRM_TEXT = "Проверка отменена. Отправьте гос. номер, чтобы начать заново."
@@ -78,13 +111,32 @@ NOTHING_TO_CANCEL_TEXT = "Сейчас нет активной проверки 
 CANCEL_BUTTON_LABEL = "❌ Отмена"
 
 # Главное reply-меню (см. reader/turkey_bot/keyboards.py::main_menu_keyboard) -
-# GARAGE_LABEL виден ВСЕМ, STATISTICS_LABEL — ТОЛЬКО trusted-менеджерам (см.
-# design report: "reuse the same trusted manager IDs... already used by
-# ProtocolGEbot" — settings.public_bot.trusted_operator_user_ids).
+# GARAGE_LABEL/CHECK_FINES_LABEL/CHECK_TOLLS_LABEL видны ВСЕМ,
+# STATISTICS_LABEL — ТОЛЬКО trusted-менеджерам (см. design report: "reuse
+# the same trusted manager IDs... already used by ProtocolGEbot" —
+# settings.public_bot.trusted_operator_user_ids). CHECK_FINES_LABEL/
+# CHECK_TOLLS_LABEL ТАКЖЕ переиспользуются как текст inline-кнопок в
+# garage_keyboard() (см. design report Stage 2B: "Saved cars must show
+# both actions" — те же две подписи, одна константа на каждую, не
+# дублируются под другим именем).
 GARAGE_LABEL = "🚗 Мои авто"
 STATISTICS_LABEL = "📊 Статистика"
+CHECK_FINES_LABEL = "🚔 Проверить штрафы"
+CHECK_TOLLS_LABEL = "🛣 Проверить платные дороги"
 
-GARAGE_CHECK_BUTTON_LABEL = "🔎 Проверить"
+# Показывается сразу после нажатия CHECK_FINES_LABEL/CHECK_TOLLS_LABEL в
+# главном меню — armит соответствующего провайдера для СЛЕДУЮЩЕГО
+# введённого номера (см. conversation.py::_STEP_AWAITING_PLATE). Голое
+# ввод номера БЕЗ предварительного нажатия кнопки по-прежнему сразу
+# начинает GIB-проверку (см. design report: "bare plate still defaults to
+# GİB" — регрессия, не новое поведение).
+ASK_PLATE_FOR_FINES_TEXT = (
+    "Отправьте гос. номер автомобиля для проверки штрафов (например, А123АА123)."
+)
+ASK_PLATE_FOR_TOLLS_TEXT = (
+    "Отправьте гос. номер автомобиля для проверки платных дорог Avrasya "
+    "Tüneli (например, А123АА123)."
+)
 
 GARAGE_HEADER = "🚗 Мои автомобили"
 EMPTY_GARAGE_TEXT = (
@@ -103,6 +155,13 @@ UNKNOWN_BUTTON_TEXT = "Неизвестная или устаревшая кно
 
 def no_debt_text(plate: str) -> str:
     return f"✅ {plate}: штрафов и задолженности в GIB не найдено."
+
+
+def avrasya_no_debt_text(plate: str) -> str:
+    """См. design report Stage 2B: "clear user-facing success message
+    that no unpaid Avrasya passages were found" — HTTP 404 + пустое тело
+    (см. avrasya/parser.py — реально увиденная вживую форма)."""
+    return f"✅ {plate}: неоплаченных проездов по Avrasya Tüneli не найдено."
 
 
 HAS_DEBT_NO_PARSED_FINES_TEXT_TEMPLATE = (

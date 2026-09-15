@@ -77,10 +77,12 @@ def register(
             await _send_reply(event, reply, is_trusted=is_trusted)
             return
 
-        garage_car_id = decode_garage_check_callback(event.data)
-        if garage_car_id is not None:
+        decoded_garage_callback = decode_garage_check_callback(event.data)
+        if decoded_garage_callback is not None:
+            provider, garage_car_id = decoded_garage_callback
             reply = await controller.handle_garage_check(
                 garage_car_id, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+                provider=provider,
             )
             if reply is None:
                 # Машина не найдена ИЛИ принадлежит другому пользователю

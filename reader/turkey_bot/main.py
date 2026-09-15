@@ -32,6 +32,9 @@ from telethon import TelegramClient  # noqa: E402
 
 from reader.logging_setup import setup_logging  # noqa: E402
 from reader.settings import ConfigError, load_settings  # noqa: E402
+from reader.turkey_bot.avrasya.live_session_registry import (  # noqa: E402
+    LiveAvrasyaSessionRegistry,
+)
 from reader.turkey_bot.check_repository import TurkeyCheckRepository  # noqa: E402
 from reader.turkey_bot.conversation import ConversationController  # noqa: E402
 from reader.turkey_bot.conversation_state_repository import (  # noqa: E402
@@ -44,6 +47,9 @@ from reader.turkey_bot.known_users_repository import (
 )
 from reader.turkey_bot.live_session_registry import LiveGibSessionRegistry  # noqa: E402
 from reader.turkey_bot.statistics_service import TurkeyStatisticsService  # noqa: E402
+from reader.turkey_bot.toll_check_repository import (
+    TurkeyTollCheckRepository,  # noqa: E402
+)
 from reader.turkey_bot.user_cars_repository import (
     TurkeyUserCarsRepository,  # noqa: E402
 )
@@ -99,12 +105,19 @@ async def run() -> None:
     # additive-таблицы, что и у остальных Turkey-репозиториев.
     garage_repository = TurkeyUserCarsRepository(db_path)
     statistics_service = TurkeyStatisticsService(known_users_repository, check_repository)
+    # Avrasya Tüneli (см. design report Stage 2B) — ОТДЕЛЬНАЯ, additive
+    # таблица (НЕ trukey_fine_checks) и ОТДЕЛЬНЫЙ, но структурно
+    # идентичный in-memory реестр живых сессий (см.
+    # reader/turkey_bot/avrasya/live_session_registry.py) — тот же принцип
+    # "живая HTTP-сессия никогда не сериализуется в SQLite", что и у GIB.
+    toll_check_repository = TurkeyTollCheckRepository(db_path)
     # Один процесс - один реестр живых GIB-сессий, полностью in-memory (см.
     # reader/turkey_bot/live_session_registry.py и design report Stage 3:
     # "do not pretend that an in-memory client can be reconstructed from a
     # DB session_token") - создаётся здесь и закрывается здесь же (finally
     # ниже), ConversationController им не владеет.
     session_registry = LiveGibSessionRegistry()
+    avrasya_session_registry = LiveAvrasyaSessionRegistry()
 
     try:
         # Тот же общий OPENAI_API_KEY (settings.ocr.openai_api_key) и
@@ -132,6 +145,7 @@ async def run() -> None:
         controller = ConversationController(
             conversation_state_repository, check_repository, session_registry,
             garage_repository, statistics_service,
+            avrasya_session_registry, toll_check_repository,
             translator=translator,
             # ТА ЖЕ настройка, что и у @ProtocolGEbot (см. design report:
             # "reuse the same trusted manager IDs/configuration... do not
@@ -165,10 +179,12 @@ async def run() -> None:
         # живых проверок (см. задачу: "graceful shutdown of all live
         # sessions"), иначе они остались бы висящими TCP-соединениями.
         await session_registry.close_all()
+        await avrasya_session_registry.close_all()
         conversation_state_repository.close()
         known_users_repository.close()
         check_repository.close()
         garage_repository.close()
+        toll_check_repository.close()
 
 
 def main() -> None:
