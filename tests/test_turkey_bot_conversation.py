@@ -1543,3 +1543,130 @@ async def test_switching_menu_button_mid_avrasya_wait_closes_avrasya_session():
     state = states.get(_CHAT_ID)
     assert state.step == "awaiting_plate"
     assert state.payload == {"provider": "gib"}
+
+
+# ---- ℹ️ Справка (см. design report) ----
+
+
+async def test_help_label_opens_help_menu():
+    controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(_FakeCheckFactory([]))
+
+    reply = await controller.handle_text(texts.HELP_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert reply.text == texts.HELP_MENU_TEXT
+    assert reply.help_keyboard == "menu"
+
+
+async def test_help_label_interrupts_an_in_flight_captcha_wait():
+    """Тот же принцип, что и у test_menu_label_interrupts_an_in_flight_
+    captcha_wait выше — ℹ️ Справка тоже явная навигация."""
+    provider = _FakeProvider(start_challenge=_challenge())
+    factory = _FakeCheckFactory([provider])
+    controller, states, _checks, registry, _garage, _avr, _toll = _make_controller(factory)
+    await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    assert states.get(_CHAT_ID).step == "awaiting_captcha_code"
+
+    reply = await controller.handle_text(texts.HELP_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert reply.text == texts.HELP_MENU_TEXT
+    assert states.get(_CHAT_ID) is None
+    assert await registry.get(_CHAT_ID) is None
+
+
+async def test_help_callback_terms_section():
+    controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(_FakeCheckFactory([]))
+
+    reply = await controller.handle_help_callback("terms")
+
+    assert reply.text == texts.HELP_TERMS_TEXT
+    assert reply.help_keyboard == "section"
+    assert "🚔 Штрафы GİB" in reply.text
+    assert "🛣 Avrasya Tüneli" in reply.text
+    assert "Стоимость проездов" in reply.text
+    assert "Начисленные штрафы" in reply.text
+    assert "Итого к оплате" in reply.text
+
+
+async def test_help_callback_gib_section():
+    controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(_FakeCheckFactory([]))
+
+    reply = await controller.handle_help_callback("gib")
+
+    assert reply.text == texts.HELP_GIB_TEXT
+    assert reply.help_keyboard == "section"
+    assert texts.CHECK_FINES_LABEL in reply.text
+    # Исправление формулировки (см. задачу): шаг 2 — ввод номера, ссылка
+    # на "🚗 Мои авто" для сохранённого авто вынесена ОТДЕЛЬНОЙ строкой,
+    # а не объединена с шагом 2.
+    assert texts.GARAGE_LABEL in reply.text
+    assert "Выберите сохранённый автомобиль" not in reply.text
+
+
+async def test_help_callback_avrasya_section():
+    controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(_FakeCheckFactory([]))
+
+    reply = await controller.handle_help_callback("avrasya")
+
+    assert reply.text == texts.HELP_AVRASYA_TEXT
+    assert reply.help_keyboard == "section"
+    assert texts.CHECK_TOLLS_LABEL in reply.text
+    assert "Avrasya Tüneli" in reply.text
+    # Исправление формулировки (см. задачу): та же поправка, что и для
+    # HELP_GIB_TEXT выше.
+    assert texts.GARAGE_LABEL in reply.text
+    assert "Выберите сохранённый автомобиль" not in reply.text
+
+
+async def test_help_callback_payment_section():
+    controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(_FakeCheckFactory([]))
+
+    reply = await controller.handle_help_callback("payment")
+
+    assert reply.text == texts.HELP_PAYMENT_TEXT
+    assert reply.help_keyboard == "section"
+    assert "💳 Оплатить в рублях" in reply.text
+    # Явное требование задачи: не утверждать, что бот сам принимает оплату.
+    assert "сам не принимает оплату" in reply.text
+    # URL не должен повторяться текстом (см. задачу: "do not hardcode or
+    # invent another Telegram URL" — единственный источник — сама кнопка).
+    assert "t.me" not in reply.text
+    assert "tplgee" not in reply.text
+
+
+async def test_help_callback_menu_returns_to_help_menu():
+    """"⬅️ Назад" ИЗ раздела — в Help-меню (не в главное меню)."""
+    controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(_FakeCheckFactory([]))
+
+    reply = await controller.handle_help_callback("menu")
+
+    assert reply.text == texts.HELP_MENU_TEXT
+    assert reply.help_keyboard == "menu"
+
+
+async def test_help_back_to_main_returns_normal_main_menu():
+    controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(_FakeCheckFactory([]))
+
+    reply = await controller.handle_help_back_to_main()
+
+    assert reply.text == texts.WELCOME_TEXT
+    assert reply.show_main_menu is True
+    assert reply.help_keyboard is None
+
+
+async def test_avrasya_has_debt_message_uses_updated_terminology():
+    """Явное требование задачи: "Стоимость проездов"/"Начисленные штрафы"
+    вместо старых "Сумма проездов"/"Штрафы" — расчёты не изменились (см.
+    test_avrasya_has_debt_shows_real_summary_never_raw_json_and_records_
+    has_debt выше — "Итого к оплате: 2 580" там же)."""
+    message = texts.format_avrasya_has_debt_message("M295YB196", _real_debt_items())
+
+    assert message == (
+        "⚠️ M295YB196: найдены неоплаченные проезды по Avrasya Tüneli.\n"
+        "\n"
+        "Проездов: 3\n"
+        "Стоимость проездов: 780 ₺\n"
+        "Начисленные штрафы: 1 800 ₺\n"
+        "Итого к оплате: 2 580 ₺"
+    )
+    assert "Сумма проездов" not in message
+    assert "\nШтрафы:" not in message

@@ -156,7 +156,14 @@ class BotReply:
     reader/public_bot/* (см. reader/turkey_bot/main.py про эту границу).
     conversation.py намеренно НЕ импортирует Telethon Button здесь (тот же
     принцип, что и у Георгии) — только handlers.py конвертирует эти пары
-    в реальные Button.url(...)."""
+    в реальные Button.url(...).
+
+    help_keyboard — "menu" (5 строк: 4 раздела ℹ️ Справка + "⬅️ Назад" в
+    главное меню) или "section" (только "⬅️ Назад" в Help-меню) — см.
+    reader/turkey_bot/keyboards.py::help_menu_keyboard/
+    help_section_keyboard, None — это вообще не Help-экран. Отдельное
+    поле, а не часть cta_buttons/garage_cars — семантически независимая
+    навигация (см. design report: "ℹ️ Справка")."""
 
     text: str
     photo_png: bytes | None = None
@@ -165,6 +172,7 @@ class BotReply:
     show_main_menu: bool = False
     garage_cars: tuple[TurkeyUserCar, ...] | None = None
     cta_buttons: tuple[tuple[str, str], ...] | None = None
+    help_keyboard: str | None = None
 
 
 class _AsyncCloseable(Protocol):
@@ -363,6 +371,9 @@ class ConversationController:
                 chat_id=chat_id, telegram_user_id=telegram_user_id, provider=_PROVIDER_AVRASYA,
             )
 
+        if stripped == texts.HELP_LABEL:
+            return await self._handle_help(chat_id=chat_id)
+
         state = self._states.get(chat_id)
 
         if state is not None and state.step == _STEP_AWAITING_PLATE:
@@ -445,6 +456,50 @@ class ConversationController:
             extra_texts=tuple(user_messages),
             show_main_menu=True,
         )
+
+    async def _handle_help(self, *, chat_id: int) -> BotReply:
+        """ℹ️ Справка — доступна ВСЕМ (см. design report: "Do not change
+        permissions or visibility rules for existing buttons" — новая
+        кнопка без trusted-гейта, как GARAGE_LABEL/CHECK_FINES_LABEL/
+        CHECK_TOLLS_LABEL). Явная навигация — прошлый незавершённый
+        диалог (если был) отбрасывается, тот же принцип, что и у
+        _handle_garage/_handle_statistics выше. Никакого persisted
+        состояния для самого Help не заводится — переходы между разделами
+        (см. handle_help_callback ниже) чисто stateless, они не пишут ни
+        в conversation_state_repository, ни в какую-либо другую таблицу."""
+        async with self._registry.lock_for(chat_id):
+            await self._registry.pop_and_close(chat_id)
+            await self._avrasya_registry.pop_and_close(chat_id)
+            self._states.clear(chat_id)
+
+        return BotReply(text=texts.HELP_MENU_TEXT, help_keyboard="menu")
+
+    async def handle_help_callback(self, section: str) -> BotReply:
+        """Разделы ℹ️ Справка (см. reader/turkey_bot/keyboards.py::
+        decode_help_callback про допустимые значения section) — ЧИСТО
+        stateless: ни chat_id, ни telegram_user_id здесь не нужны (см.
+        _handle_help докстрок), потому что показ статического текста
+        никак не зависит от того, кто именно нажал кнопку, и ничего не
+        меняет в БД/живых сессиях."""
+        if section == "terms":
+            return BotReply(text=texts.HELP_TERMS_TEXT, help_keyboard="section")
+        if section == "gib":
+            return BotReply(text=texts.HELP_GIB_TEXT, help_keyboard="section")
+        if section == "avrasya":
+            return BotReply(text=texts.HELP_AVRASYA_TEXT, help_keyboard="section")
+        if section == "payment":
+            return BotReply(text=texts.HELP_PAYMENT_TEXT, help_keyboard="section")
+        # "menu" — "⬅️ Назад" ИЗ раздела ОБРАТНО в Help-меню (см.
+        # keyboards.py::help_section_keyboard) — тот же текст/клавиатура,
+        # что и при первом открытии ℹ️ Справка (см. _handle_help выше).
+        return BotReply(text=texts.HELP_MENU_TEXT, help_keyboard="menu")
+
+    async def handle_help_back_to_main(self) -> BotReply:
+        """"⬅️ Назад" ИЗ самого Help-меню — В обычное главное меню (см.
+        design report: "⬅️ Назад returns to the normal main menu") —
+        переиспользует WELCOME_TEXT (тот же текст, что и /start), а не
+        вводит отдельный "текст главного меню" без надобности."""
+        return BotReply(text=texts.WELCOME_TEXT, show_main_menu=True)
 
     async def _handle_check_button(
         self, *, chat_id: int, telegram_user_id: int, provider: str,

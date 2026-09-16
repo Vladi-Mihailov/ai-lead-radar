@@ -124,6 +124,18 @@ GARAGE_LABEL = "🚗 Мои авто"
 STATISTICS_LABEL = "📊 Статистика"
 CHECK_FINES_LABEL = "🚔 Проверить штрафы"
 CHECK_TOLLS_LABEL = "🛣 Проверить платные дороги"
+# ℹ️ Справка (см. design report) — видна ВСЕМ, как и CHECK_FINES_LABEL/
+# CHECK_TOLLS_LABEL/GARAGE_LABEL (НЕ trusted-gated, в отличие от
+# STATISTICS_LABEL).
+HELP_LABEL = "ℹ️ Справка"
+
+# Подписи 4 разделов ℹ️ Справка + общая "⬅️ Назад" (см.
+# reader/turkey_bot/keyboards.py::help_menu_keyboard/help_section_keyboard).
+HELP_TERMS_LABEL = "📖 Термины"
+HELP_GIB_LABEL = "❓ Как проверить штрафы"
+HELP_AVRASYA_LABEL = "🛣 Как проверить платные дороги"
+HELP_PAYMENT_LABEL = "💳 Как оплатить"
+HELP_BACK_LABEL = "⬅️ Назад"
 
 # Показывается сразу после нажатия CHECK_FINES_LABEL/CHECK_TOLLS_LABEL в
 # главном меню — armит соответствующего провайдера для СЛЕДУЮЩЕГО
@@ -143,6 +155,62 @@ GARAGE_HEADER = "🚗 Мои автомобили"
 EMPTY_GARAGE_TEXT = (
     "🚗 У вас пока нет автомобилей.\n\n"
     "Проверьте автомобиль по номеру — после успешной проверки он появится здесь."
+)
+
+HELP_MENU_TEXT = "ℹ️ Справка\n\nВыберите раздел:"
+
+HELP_TERMS_TEXT = (
+    "📖 Термины\n\n"
+    "🚔 Штрафы GİB — дорожные штрафы, найденные в государственной "
+    "системе Турции.\n\n"
+    "🛣 Avrasya Tüneli — платный автомобильный тоннель. Задолженность "
+    "за проезд через него проверяется отдельно от штрафов GİB.\n\n"
+    "🚗 Стоимость проездов — стоимость проезда по платной дороге или "
+    "тоннелю, которую необходимо было оплатить.\n\n"
+    "⚠️ Начисленные штрафы — дополнительная сумма, начисленная за "
+    "несвоевременную оплату проезда.\n\n"
+    "💰 Итого к оплате — стоимость неоплаченных проездов плюс "
+    "начисленные штрафы."
+)
+
+HELP_GIB_TEXT = (
+    "❓ Как проверить штрафы\n\n"
+    "1. Нажмите «🚔 Проверить штрафы».\n"
+    "2. Введите госномер автомобиля.\n"
+    "3. Бот пришлёт CAPTCHA.\n"
+    "4. Введите код с изображения.\n"
+    "5. Бот покажет результат проверки GİB.\n\n"
+    "Сохранённый автомобиль можно проверить через раздел «🚗 Мои авто»."
+)
+
+HELP_AVRASYA_TEXT = (
+    "🛣 Как проверить платные дороги\n\n"
+    "1. Нажмите «🛣 Проверить платные дороги».\n"
+    "2. Введите госномер автомобиля.\n"
+    "3. Бот пришлёт CAPTCHA.\n"
+    "4. Введите код с изображения.\n"
+    "5. Бот покажет найденную задолженность.\n\n"
+    "Сохранённый автомобиль можно проверить через раздел «🚗 Мои авто».\n\n"
+    "Сейчас проверяется Avrasya Tüneli."
+)
+
+# НЕ упоминает GIB — CTA-кнопка "💳 Оплатить в рублях" сейчас появляется
+# ТОЛЬКО после подтверждённого Avrasya has_debt (см.
+# reader/turkey_bot/conversation.py::_handle_avrasya_submit_outcome), а не
+# после GIB has_debt (см. задачу: "Do not claim that the bot itself
+# processes the payment if that is not how the current flow works" —
+# то же самое верно и для того, У КАКИХ ИМЕННО результатов кнопка реально
+# появляется). URL кнопки НЕ повторяется здесь текстом (settings.public_bot.
+# payment_help_contact_username остаётся единственным источником, см.
+# ConversationController._avrasya_debt_cta_buttons) — этот текст только
+# объясняет, что кнопка делает.
+HELP_PAYMENT_TEXT = (
+    "💳 Как оплатить\n\n"
+    "Бот сам не принимает оплату.\n\n"
+    "Если при проверке платных дорог Avrasya Tüneli будет найдена "
+    "задолженность, под результатом появится кнопка:\n\n"
+    "💳 Оплатить в рублях\n\n"
+    "Она откроет чат с оператором, который поможет с оплатой."
 )
 
 # Общий, намеренно НЕИНФОРМАТИВНЫЙ текст — и для реально неизвестного
@@ -185,10 +253,15 @@ def format_avrasya_has_debt_message(plate: str, debt_items: tuple[AvrasyaDebtIte
     models.py), НИКОГДА из raw_data напрямую (см. модуль docstring про тот
     же принцип у GIB). НИКОГДА не показывает ExitDate/ExitStation/
     DebtorContactFullName/UniqueId/сырой JSON — AvrasyaDebtItem их вообще
-    не несёt (не только "не показаны", см. models.py). "Штрафы" — строка
-    показывается, ТОЛЬКО когда суммарный штраф > 0 (см. задачу: "when
-    explicitly supplied") — тот же принцип "не показывать поле вовсе,
-    когда оно отсутствует/пусто", что и у GIB _format_fine_block."""
+    не несёt (не только "не показаны", см. models.py). "Начисленные
+    штрафы" — строка показывается, ТОЛЬКО когда суммарный штраф > 0 (см.
+    задачу: "when explicitly supplied") — тот же принцип "не показывать
+    поле вовсе, когда оно отсутствует/пусто", что и у GIB
+    _format_fine_block. Подписи "Стоимость проездов"/"Начисленные штрафы"
+    (см. design report: "Improve Avrasya result terminology" — те же
+    термины, что и в ℹ️ Справка -> 📖 Термины, см. HELP_TERMS_TEXT) —
+    ТОЛЬКО текст меток изменился, расчёты (_format_try_amount/суммы)
+    остались прежними."""
     total_principal = sum((item.principal_amount for item in debt_items), Decimal(0))
     total_penalty = sum(
         (item.penalty_amount for item in debt_items if item.penalty_amount is not None),
@@ -200,10 +273,10 @@ def format_avrasya_has_debt_message(plate: str, debt_items: tuple[AvrasyaDebtIte
         f"⚠️ {plate}: найдены неоплаченные проезды по Avrasya Tüneli.",
         "",
         f"Проездов: {len(debt_items)}",
-        f"Сумма проездов: {_format_try_amount(total_principal)}",
+        f"Стоимость проездов: {_format_try_amount(total_principal)}",
     ]
     if total_penalty > 0:
-        lines.append(f"Штрафы: {_format_try_amount(total_penalty)}")
+        lines.append(f"Начисленные штрафы: {_format_try_amount(total_penalty)}")
     lines.append(f"Итого к оплате: {_format_try_amount(total_payable)}")
     return "\n".join(lines)
 

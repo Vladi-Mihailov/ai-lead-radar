@@ -13,10 +13,15 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from reader.turkey_bot.keyboards import (  # noqa: E402
     CANCEL_CALLBACK_DATA,
+    HELP_BACK_TO_MAIN_CALLBACK_DATA,
     cancel_keyboard,
     decode_garage_check_callback,
+    decode_help_callback,
     encode_garage_check_callback,
+    encode_help_callback,
     garage_keyboard,
+    help_menu_keyboard,
+    help_section_keyboard,
     main_menu_keyboard,
 )
 from reader.turkey_bot.models import TurkeyUserCar  # noqa: E402
@@ -25,6 +30,12 @@ from reader.turkey_bot.texts import (  # noqa: E402
     CHECK_FINES_LABEL,
     CHECK_TOLLS_LABEL,
     GARAGE_LABEL,
+    HELP_AVRASYA_LABEL,
+    HELP_BACK_LABEL,
+    HELP_GIB_LABEL,
+    HELP_LABEL,
+    HELP_PAYMENT_LABEL,
+    HELP_TERMS_LABEL,
     STATISTICS_LABEL,
 )
 
@@ -62,12 +73,13 @@ def test_cancel_callback_data_is_a_fixed_constant_without_dynamic_content():
     assert CANCEL_CALLBACK_DATA == b"turkeycancel"
 
 
-def test_main_menu_shows_fines_tolls_and_garage_for_everyone():
+def test_main_menu_shows_fines_tolls_garage_and_help_for_everyone():
     labels = _text_labels(main_menu_keyboard(is_trusted=False))
 
     assert CHECK_FINES_LABEL in labels
     assert CHECK_TOLLS_LABEL in labels
     assert GARAGE_LABEL in labels
+    assert HELP_LABEL in labels
     assert STATISTICS_LABEL not in labels
 
 
@@ -79,6 +91,7 @@ def test_main_menu_shows_statistics_only_for_trusted():
     assert CHECK_FINES_LABEL in labels
     assert CHECK_TOLLS_LABEL in labels
     assert GARAGE_LABEL in labels
+    assert HELP_LABEL in labels
     assert STATISTICS_LABEL in labels
 
 
@@ -145,3 +158,59 @@ def test_decode_garage_check_rejects_unknown_provider():
 
 def test_decode_garage_check_rejects_missing_car_id():
     assert decode_garage_check_callback(b"turkeygaragecheck:gib:") is None
+
+
+# ---- ℹ️ Справка (см. design report) ----
+
+
+def test_help_menu_keyboard_has_four_sections_plus_back_to_main():
+    keyboard = help_menu_keyboard()
+
+    assert len(keyboard) == 5
+    for row in keyboard:
+        assert len(row) == 1
+    labels = [row[0].text for row in keyboard]
+    assert labels == [
+        HELP_TERMS_LABEL, HELP_GIB_LABEL, HELP_AVRASYA_LABEL, HELP_PAYMENT_LABEL, HELP_BACK_LABEL,
+    ]
+
+
+def test_help_menu_keyboard_back_button_uses_fixed_main_menu_callback():
+    keyboard = help_menu_keyboard()
+
+    back_button = keyboard[-1][0]
+    assert back_button.data == HELP_BACK_TO_MAIN_CALLBACK_DATA
+
+
+def test_help_menu_keyboard_section_buttons_encode_expected_callbacks():
+    keyboard = help_menu_keyboard()
+
+    assert decode_help_callback(keyboard[0][0].data) == "terms"
+    assert decode_help_callback(keyboard[1][0].data) == "gib"
+    assert decode_help_callback(keyboard[2][0].data) == "avrasya"
+    assert decode_help_callback(keyboard[3][0].data) == "payment"
+
+
+def test_help_section_keyboard_has_only_a_back_to_help_menu_button():
+    keyboard = help_section_keyboard()
+
+    assert len(keyboard) == 1
+    assert len(keyboard[0]) == 1
+    button = keyboard[0][0]
+    assert button.text == HELP_BACK_LABEL
+    assert decode_help_callback(button.data) == "menu"
+
+
+def test_encode_decode_help_callback_roundtrip_for_each_section():
+    for section in ("terms", "gib", "avrasya", "payment", "menu"):
+        assert decode_help_callback(encode_help_callback(section)) == section
+
+
+def test_decode_help_callback_rejects_unrelated_callback_data():
+    assert decode_help_callback(CANCEL_CALLBACK_DATA) is None
+    assert decode_help_callback(HELP_BACK_TO_MAIN_CALLBACK_DATA) is None
+    assert decode_help_callback(None) is None
+
+
+def test_decode_help_callback_rejects_unknown_section():
+    assert decode_help_callback(b"turkeyhelp:somethingelse") is None

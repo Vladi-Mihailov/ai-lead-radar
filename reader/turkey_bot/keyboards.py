@@ -39,12 +39,28 @@ from reader.turkey_bot.texts import (
     CHECK_FINES_LABEL,
     CHECK_TOLLS_LABEL,
     GARAGE_LABEL,
+    HELP_AVRASYA_LABEL,
+    HELP_BACK_LABEL,
+    HELP_GIB_LABEL,
+    HELP_LABEL,
+    HELP_PAYMENT_LABEL,
+    HELP_TERMS_LABEL,
     STATISTICS_LABEL,
 )
 
 CANCEL_CALLBACK_DATA = b"turkeycancel"
+# Фиксированная константа (тот же принцип, что и CANCEL_CALLBACK_DATA выше) —
+# "⬅️ Назад" из Help-меню в обычное главное меню: без какого-либо
+# пользовательского/сессионного значения внутри.
+HELP_BACK_TO_MAIN_CALLBACK_DATA = b"turkeyhelpmainmenu"
 
 _GARAGE_CHECK_PREFIX = b"turkeygaragecheck:"
+_HELP_CALLBACK_PREFIX = b"turkeyhelp:"
+
+# "menu" — служебное значение для "⬅️ Назад" ИЗ раздела Help ОБРАТНО в
+# Help-меню (см. help_section_keyboard) — не путать с
+# HELP_BACK_TO_MAIN_CALLBACK_DATA (Help-меню -> обычное главное меню).
+_HELP_SECTIONS = frozenset({"menu", "terms", "gib", "avrasya", "payment"})
 
 # Провайдеры, допустимые в garage callback_data (см. design report Stage
 # 1: "design the internal architecture so additional toll-road providers
@@ -71,6 +87,10 @@ def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
     ]
     if is_trusted:
         rows.append([Button.text(STATISTICS_LABEL, resize=True)])
+    # ℹ️ Справка видна ВСЕМ (см. design report: "Do not change permissions
+    # or visibility rules for existing buttons" — только добавляется,
+    # порядок последним совпадает с порядком в самой задаче).
+    rows.append([Button.text(HELP_LABEL, resize=True)])
     return rows
 
 
@@ -94,6 +114,43 @@ def decode_garage_check_callback(data: bytes | None) -> tuple[str, int] | None:
         return provider, int(car_id_text)
     except ValueError:
         return None
+
+
+def encode_help_callback(section: str) -> bytes:
+    return _HELP_CALLBACK_PREFIX + section.encode("ascii")
+
+
+def decode_help_callback(data: bytes | None) -> str | None:
+    """None — данные не относятся к Help-callback'ам вовсе (тот же generic
+    "неизвестная кнопка" ответ для неизвестного section, см. модуль
+    docstring про garage). Единственные допустимые значения —
+    _HELP_SECTIONS (см. выше)."""
+    if not data or not data.startswith(_HELP_CALLBACK_PREFIX):
+        return None
+    section = data[len(_HELP_CALLBACK_PREFIX):].decode("ascii", errors="strict")
+    if section not in _HELP_SECTIONS:
+        return None
+    return section
+
+
+def help_menu_keyboard() -> list[list[Button]]:
+    """Верхний уровень ℹ️ Справка (см. design report) — 4 раздела + "⬅️
+    Назад" в обычное главное меню (см. HELP_BACK_TO_MAIN_CALLBACK_DATA)."""
+    return [
+        [Button.inline(HELP_TERMS_LABEL, encode_help_callback("terms"))],
+        [Button.inline(HELP_GIB_LABEL, encode_help_callback("gib"))],
+        [Button.inline(HELP_AVRASYA_LABEL, encode_help_callback("avrasya"))],
+        [Button.inline(HELP_PAYMENT_LABEL, encode_help_callback("payment"))],
+        [Button.inline(HELP_BACK_LABEL, HELP_BACK_TO_MAIN_CALLBACK_DATA)],
+    ]
+
+
+def help_section_keyboard() -> list[list[Button]]:
+    """Один из 4 разделов Help — только "⬅️ Назад" В Help-меню (не в
+    главное меню, см. design report: "⬅️ Назад returns to the normal main
+    menu" относится ТОЛЬКО к самому Help-меню, разделы возвращают в
+    Help-меню, откуда уже есть свой "⬅️ Назад" в главное меню)."""
+    return [[Button.inline(HELP_BACK_LABEL, encode_help_callback("menu"))]]
 
 
 def garage_keyboard(cars: list[TurkeyUserCar]) -> list[list[Button]]:

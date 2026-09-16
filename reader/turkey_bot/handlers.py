@@ -17,9 +17,13 @@ from telethon import Button, TelegramClient, events
 from reader.turkey_bot.conversation import BotReply, ConversationController
 from reader.turkey_bot.keyboards import (
     CANCEL_CALLBACK_DATA,
+    HELP_BACK_TO_MAIN_CALLBACK_DATA,
     cancel_keyboard,
     decode_garage_check_callback,
+    decode_help_callback,
     garage_keyboard,
+    help_menu_keyboard,
+    help_section_keyboard,
     main_menu_keyboard,
 )
 from reader.turkey_bot.known_users_repository import TurkeyBotKnownUsersRepository
@@ -77,6 +81,19 @@ def register(
             await _send_reply(event, reply, is_trusted=is_trusted)
             return
 
+        if event.data == HELP_BACK_TO_MAIN_CALLBACK_DATA:
+            reply = await controller.handle_help_back_to_main()
+            await event.answer()
+            await _send_reply(event, reply, is_trusted=is_trusted)
+            return
+
+        help_section = decode_help_callback(event.data)
+        if help_section is not None:
+            reply = await controller.handle_help_callback(help_section)
+            await event.answer()
+            await _send_reply(event, reply, is_trusted=is_trusted)
+            return
+
         decoded_garage_callback = decode_garage_check_callback(event.data)
         if decoded_garage_callback is not None:
             provider, garage_car_id = decoded_garage_callback
@@ -111,9 +128,10 @@ async def _send_reply(event, reply: BotReply, *, is_trusted: bool = False) -> No
     Приоритет клавиатур на ОДНОМ сообщении (Telethon не может совместить
     несколько видов сразу): show_cancel_button (пока идёт диалог) >
     garage_cars (список гаража) > cta_buttons (коммерческие CTA после
-    подтверждённого Avrasya has_debt) > show_main_menu (персистентное
-    reply-меню, см. reader/turkey_bot/conversation.py::BotReply про то,
-    почему это именно в таком порядке).
+    подтверждённого Avrasya has_debt) > help_keyboard (ℹ️ Справка и её
+    разделы) > show_main_menu (персистентное reply-меню, см.
+    reader/turkey_bot/conversation.py::BotReply про то, почему это именно
+    в таком порядке).
 
     extra_texts — дополнительные сообщения ПОСЛЕ основного (см.
     reader/turkey_bot/conversation.py::BotReply) — has_debt со многими
@@ -134,6 +152,10 @@ async def _send_reply(event, reply: BotReply, *, is_trusted: bool = False) -> No
         # Георгии; conversation.py намеренно передаёт их как строки, не
         # Telethon Button — реальные кнопки строятся только здесь.
         first_buttons = [[Button.url(label, url) for label, url in reply.cta_buttons]]
+    elif reply.help_keyboard == "menu":
+        first_buttons = help_menu_keyboard()
+    elif reply.help_keyboard == "section":
+        first_buttons = help_section_keyboard()
     elif reply.show_main_menu and not has_extra:
         first_buttons = main_menu_keyboard(is_trusted=is_trusted)
     else:

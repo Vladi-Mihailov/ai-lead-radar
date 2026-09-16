@@ -36,8 +36,8 @@ def test_real_production_example_matches_expected_message_exactly():
         "⚠️ M295YB196: найдены неоплаченные проезды по Avrasya Tüneli.\n"
         "\n"
         "Проездов: 3\n"
-        "Сумма проездов: 780 ₺\n"
-        "Штрафы: 1 800 ₺\n"
+        "Стоимость проездов: 780 ₺\n"
+        "Начисленные штрафы: 1 800 ₺\n"
         "Итого к оплате: 2 580 ₺"
     )
 
@@ -58,7 +58,7 @@ def test_penalty_line_omitted_when_no_item_has_a_penalty():
 
     message = texts.format_avrasya_has_debt_message("A123AA123", items)
 
-    assert "Штрафы" not in message
+    assert "Начисленные штрафы" not in message
 
 
 def test_penalty_line_shown_when_at_least_one_item_has_a_penalty():
@@ -69,7 +69,7 @@ def test_penalty_line_shown_when_at_least_one_item_has_a_penalty():
 
     message = texts.format_avrasya_has_debt_message("A123AA123", items)
 
-    assert "Штрафы: 200 ₺" in message
+    assert "Начисленные штрафы: 200 ₺" in message
 
 
 def test_thousands_separator_uses_space_not_comma():
