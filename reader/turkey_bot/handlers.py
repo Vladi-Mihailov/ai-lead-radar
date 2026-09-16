@@ -12,7 +12,7 @@ handle_garage_check перепроверяет владение заново н�
 import io
 import logging
 
-from telethon import TelegramClient, events
+from telethon import Button, TelegramClient, events
 
 from reader.turkey_bot.conversation import BotReply, ConversationController
 from reader.turkey_bot.keyboards import (
@@ -110,9 +110,10 @@ async def _send_reply(event, reply: BotReply, *, is_trusted: bool = False) -> No
 
     Приоритет клавиатур на ОДНОМ сообщении (Telethon не может совместить
     несколько видов сразу): show_cancel_button (пока идёт диалог) >
-    garage_cars (список гаража) > show_main_menu (персистентное reply-меню,
-    см. reader/turkey_bot/conversation.py::BotReply про то, почему это
-    именно в таком порядке).
+    garage_cars (список гаража) > cta_buttons (коммерческие CTA после
+    подтверждённого Avrasya has_debt) > show_main_menu (персистентное
+    reply-меню, см. reader/turkey_bot/conversation.py::BotReply про то,
+    почему это именно в таком порядке).
 
     extra_texts — дополнительные сообщения ПОСЛЕ основного (см.
     reader/turkey_bot/conversation.py::BotReply) — has_debt со многими
@@ -126,6 +127,13 @@ async def _send_reply(event, reply: BotReply, *, is_trusted: bool = False) -> No
         first_buttons = cancel_keyboard()
     elif reply.garage_cars is not None:
         first_buttons = garage_keyboard(list(reply.garage_cars))
+    elif reply.cta_buttons:
+        # Avrasya has_debt CTA (см. reader/turkey_bot/conversation.py::
+        # ConversationController._avrasya_debt_cta_buttons) — те же
+        # (label, url) пары, что и у reader/public_bot/handlers.py для
+        # Георгии; conversation.py намеренно передаёт их как строки, не
+        # Telethon Button — реальные кнопки строятся только здесь.
+        first_buttons = [[Button.url(label, url) for label, url in reply.cta_buttons]]
     elif reply.show_main_menu and not has_extra:
         first_buttons = main_menu_keyboard(is_trusted=is_trusted)
     else:

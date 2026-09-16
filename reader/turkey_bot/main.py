@@ -158,6 +158,11 @@ async def run() -> None:
             # Turkey-специфичный (см. design report: не вводить отдельную
             # настройку там, где общая уже есть).
             tz=ZoneInfo(settings.fine_monitor.timezone),
+            # ТА ЖЕ destination коммерческих CTA-кнопок после Avrasya
+            # has_debt (см. design report: "reuse those exact production
+            # values"), что и у @ProtocolGEbot (settings.public_bot.
+            # payment_help_contact_username) — не отдельная настройка.
+            payment_help_contact_username=settings.public_bot.payment_help_contact_username,
         )
 
         client = TelegramClient(str(_SESSION_PATH), api_id, api_hash)

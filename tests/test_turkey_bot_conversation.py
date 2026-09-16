@@ -1205,6 +1205,15 @@ async def test_avrasya_has_debt_shows_real_summary_never_raw_json_and_records_ha
     assert "Итого к оплате: 2 580" in reply.text
     assert reply.show_main_menu is True
 
+    # Явное требование задачи: те же CTA-кнопки/URL, что и в Георгии-боте
+    # (см. tests/test_public_bot_conversation.py про идентичный ассерт).
+    assert reply.cta_buttons is not None
+    assert len(reply.cta_buttons) == 2
+    labels = [label for label, _url in reply.cta_buttons]
+    assert labels == ["💳 Оплатить в рублях", "🚗 ОСАГО Грузии"]
+    urls = {url for _label, url in reply.cta_buttons}
+    assert urls == {"https://t.me/tplgee"}
+
     # Замаскированные/внутренние поля НИКОГДА не должны попасть в текст
     # пользователю (см. задачу).
     for forbidden in ("ExitDate", "ExitStation", "DebtorContactFullName", "IsAuthenticate", "Subcriptions"):
@@ -1221,6 +1230,102 @@ async def test_avrasya_has_debt_shows_real_summary_never_raw_json_and_records_ha
     cars = garage.list_cars(_USER_ID)
     assert len(cars) == 1
     assert cars[0].car_number == "M295YB196"
+
+
+# ---- Avrasya has_debt CTA-кнопки (см. design report: "append these CTAs
+# only after a confirmed has_debt result" — те же кнопки/URL, что и у
+# Георгии-бота) ----
+
+
+async def test_avrasya_no_debt_does_not_include_cta_buttons():
+    outcome = AvrasyaSubmitOutcome(kind="no_debt", status_code=404, messages=(), raw_data="")
+    avrasya_provider = _FakeAvrasyaProvider(start_challenge=_avrasya_challenge(), submit_results=[outcome])
+    avrasya_factory = _FakeAvrasyaCheckFactory([avrasya_provider])
+    controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(
+        _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
+    )
+    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    reply = await controller.handle_text("123456", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert reply.text == texts.avrasya_no_debt_text("A123AA123")
+    assert reply.cta_buttons is None
+
+
+async def test_avrasya_unexpected_does_not_include_cta_buttons():
+    outcome = AvrasyaSubmitOutcome(kind="unexpected", status_code=200, messages=(), raw_data={"Foo": "bar"})
+    avrasya_provider = _FakeAvrasyaProvider(start_challenge=_avrasya_challenge(), submit_results=[outcome])
+    avrasya_factory = _FakeAvrasyaCheckFactory([avrasya_provider])
+    controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(
+        _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
+    )
+    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    reply = await controller.handle_text("123456", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert reply.text == texts.AVRASYA_UNEXPECTED_TEXT
+    assert reply.cta_buttons is None
+
+
+async def test_avrasya_rejected_captcha_does_not_include_cta_buttons():
+    rejected = AvrasyaSubmitOutcome(
+        kind="rejected", status_code=400,
+        messages=(AvrasyaMessage(property_name="Captcha", error_message="wrong"),), raw_data={},
+    )
+    avrasya_provider = _FakeAvrasyaProvider(
+        start_challenge=_avrasya_challenge(), submit_results=[rejected],
+        refresh_results=[_avrasya_challenge()],
+    )
+    avrasya_factory = _FakeAvrasyaCheckFactory([avrasya_provider])
+    controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(
+        _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
+    )
+    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    reply = await controller.handle_text("000000", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert reply.text == texts.CAPTCHA_REJECTED_RETRY_TEXT
+    assert reply.cta_buttons is None
+
+
+async def test_avrasya_transport_error_does_not_include_cta_buttons():
+    avrasya_provider = _FakeAvrasyaProvider(
+        start_challenge=_avrasya_challenge(), submit_results=[AvrasyaTransportError("boom")],
+    )
+    avrasya_factory = _FakeAvrasyaCheckFactory([avrasya_provider])
+    controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(
+        _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
+    )
+    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    reply = await controller.handle_text("000000", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert reply.text == texts.AVRASYA_TRANSPORT_ERROR_TEXT
+    assert reply.cta_buttons is None
+
+
+async def test_gib_has_debt_does_not_include_avrasya_cta_buttons():
+    """Регрессия: GIB has_debt никогда не получал и не должен получить
+    CTA-кнопки через это изменение (см. design report: изменение
+    затрагивает ТОЛЬКО подтверждённый Avrasya has_debt)."""
+    fine = GibFineRecord(
+        protocol_no="MC00000000", plate="34ABC123", amount=Decimal("1000.00"),
+        description="raw", violation_date=date(2026, 8, 8), authority="ORG",
+        late_fee=None, discount=None,
+    )
+    outcome = GibSubmitOutcome(kind="has_debt", messages=(), raw_data={}, fines=(fine,))
+    provider = _FakeProvider(start_challenge=_challenge(), submit_results=[outcome])
+    factory = _FakeCheckFactory([provider])
+    controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(factory)
+
+    await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    reply = await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert reply.cta_buttons is None
 
 
 async def test_avrasya_restart_recovery_issues_fresh_captcha_for_stored_plate():
