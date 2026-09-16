@@ -18,6 +18,7 @@ _translate_fines)."""
 
 from decimal import Decimal
 
+from reader.turkey_bot.avrasya.models import AvrasyaDebtItem
 from reader.turkey_bot.gib.models import GibFineRecord
 from reader.turkey_bot.statistics_service import TurkeyStatistics
 
@@ -162,6 +163,49 @@ def avrasya_no_debt_text(plate: str) -> str:
     that no unpaid Avrasya passages were found" — HTTP 404 + пустое тело
     (см. avrasya/parser.py — реально увиденная вживую форма)."""
     return f"✅ {plate}: неоплаченных проездов по Avrasya Tüneli не найдено."
+
+
+def _format_try_amount(amount: Decimal) -> str:
+    """Российский числовой формат (пробел — разделитель тысяч), суффикс
+    "₺" (см. design report Stage 2C, желаемый вывод: "780 ₺"/"1 800 ₺") —
+    БЕЗ дробной части, когда сумма целая (реально увиденные вживую суммы
+    все целые, см. parser.py), иначе — 2 знака после запятой (Decimal-safe,
+    см. avrasya/parser.py::_parse_decimal_amount про то, откуда приходит
+    Decimal без float-артефактов)."""
+    quantized = amount.quantize(Decimal("0.01"))
+    if quantized == quantized.to_integral_value():
+        return f"{int(quantized):,}".replace(",", " ") + " ₺"
+    formatted = f"{quantized:,.2f}".replace(",", " ").replace(".", ",")
+    return f"{formatted} ₺"
+
+
+def format_avrasya_has_debt_message(plate: str, debt_items: tuple[AvrasyaDebtItem, ...]) -> str:
+    """См. design report Stage 2C — строит текст ТОЛЬКО из уже
+    типизированных AvrasyaDebtItem (см. reader/turkey_bot/avrasya/
+    models.py), НИКОГДА из raw_data напрямую (см. модуль docstring про тот
+    же принцип у GIB). НИКОГДА не показывает ExitDate/ExitStation/
+    DebtorContactFullName/UniqueId/сырой JSON — AvrasyaDebtItem их вообще
+    не несёt (не только "не показаны", см. models.py). "Штрафы" — строка
+    показывается, ТОЛЬКО когда суммарный штраф > 0 (см. задачу: "when
+    explicitly supplied") — тот же принцип "не показывать поле вовсе,
+    когда оно отсутствует/пусто", что и у GIB _format_fine_block."""
+    total_principal = sum((item.principal_amount for item in debt_items), Decimal(0))
+    total_penalty = sum(
+        (item.penalty_amount for item in debt_items if item.penalty_amount is not None),
+        Decimal(0),
+    )
+    total_payable = sum((item.total_amount for item in debt_items), Decimal(0))
+
+    lines = [
+        f"⚠️ {plate}: найдены неоплаченные проезды по Avrasya Tüneli.",
+        "",
+        f"Проездов: {len(debt_items)}",
+        f"Сумма проездов: {_format_try_amount(total_principal)}",
+    ]
+    if total_penalty > 0:
+        lines.append(f"Штрафы: {_format_try_amount(total_penalty)}")
+    lines.append(f"Итого к оплате: {_format_try_amount(total_payable)}")
+    return "\n".join(lines)
 
 
 HAS_DEBT_NO_PARSED_FINES_TEXT_TEMPLATE = (

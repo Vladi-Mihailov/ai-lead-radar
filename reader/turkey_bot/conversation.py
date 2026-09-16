@@ -855,18 +855,21 @@ class ConversationController:
             return BotReply(text=texts.avrasya_no_debt_text(check.plate), show_main_menu=True)
 
         if outcome.kind == "has_debt":
-            # Реальная форма has_debt ни разу не была увидена вживую (см.
-            # avrasya/parser.py) — НЕ угадывается и НЕ показывается сырым
-            # JSON (см. design report: "do not guess its schema or expose
-            # raw JSON to the user") — тот же безопасный текст, что и для
-            # "unexpected" ниже, полный ответ уходит ТОЛЬКО в
-            # TurkeyTollCheckRepository (raw_response выше).
+            # См. reader/turkey_bot/texts.py::format_avrasya_has_debt_message
+            # (design report Stage 2C) — строит текст ТОЛЬКО из уже
+            # типизированных AvrasyaDebtItem (см. avrasya/models.py),
+            # conversation.py здесь НЕ интерпретирует raw JSON вообще (тот
+            # же принцип, что и у GIB has_debt выше). Полный сырой ответ
+            # по-прежнему уходит ТОЛЬКО в TurkeyTollCheckRepository
+            # (raw_response выше), никогда в текст пользователю.
             await self._finish_avrasya(
                 chat_id, telegram_user_id=telegram_user_id, check=check,
                 status="has_debt", raw_response=raw_response,
             )
-            logger.warning("Turkey Avrasya: has_debt response (chat_id=%s)", chat_id)
-            return BotReply(text=texts.AVRASYA_UNEXPECTED_TEXT, show_main_menu=True)
+            return BotReply(
+                text=texts.format_avrasya_has_debt_message(check.plate, outcome.debt_items),
+                show_main_menu=True,
+            )
 
         # "unexpected" — НЕ трогает гараж (см. design report: "unexpected
         # response does not add car").

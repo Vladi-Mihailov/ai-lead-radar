@@ -20,6 +20,7 @@ from reader.turkey_bot.avrasya.live_session_registry import (  # noqa: E402
 )
 from reader.turkey_bot.avrasya.models import (  # noqa: E402
     AvrasyaCaptchaChallenge,
+    AvrasyaDebtItem,
     AvrasyaMessage,
     AvrasyaSubmitOutcome,
 )
@@ -1126,13 +1127,69 @@ async def test_avrasya_unexpected_outcome_shows_safe_message_never_raw_json(capl
     assert "SECRET-LOOKING-DATA" in row[0]  # сырой ответ по-прежнему хранится server-side
 
 
-async def test_avrasya_has_debt_shows_safe_message_never_raw_json_and_records_has_debt():
-    """Реальная форма has_debt ни разу не была увидена вживую (см.
-    avrasya/parser.py) — но, если parser.py когда-либо всё же вернёт этот
-    kind, поведение не должно угадывать/показывать сырой JSON (см. задачу:
-    "including an as-yet-unobserved debt response")."""
+def _real_debt_raw_data() -> dict:
+    """Точная production-форма (Stage 2C, turkey_toll_checks.id=3,
+    2026-09-16, plate M295YB196) — используется как AvrasyaSubmitOutcome.
+    raw_data в тестах ниже (сырое хранение), НЕ как источник рендера (см.
+    conversation.py: рендер строится ТОЛЬКО из outcome.debt_items)."""
+    return {
+        "Response": "OK", "DcsResponse": "SUCCESSFUL",
+        "Subcriptions": [
+            {
+                "ClientSubscriptionCustomerReferenceValue": "M295YB196",
+                "DebtItems": [{
+                    "PrincipalTaxIncludedBalanceAmount": 330.0,
+                    "TotalTaxIncludedBalanceAmount": 330.0,
+                    "ExitDate": "2*************6", "ExitStation": "A*****A",
+                    "IsAuthenticate": False,
+                }],
+                "DebtorContactFullName": "*******", "ServiceFileTypeName": "EARLY_COLLECTION_FILE",
+            },
+            {
+                "DebtItems": [{
+                    "PrincipalTaxIncludedBalanceAmount": 225.0,
+                    "TotalFixedIncomeTaxIncludedBalanceAmount": 900.0,
+                    "TotalTaxIncludedBalanceAmount": 1125.0, "IsAuthenticate": False,
+                }],
+                "ServiceFileTypeName": "COLLECTION_FILE",
+            },
+            {
+                "DebtItems": [{
+                    "PrincipalTaxIncludedBalanceAmount": 225.0,
+                    "TotalFixedIncomeTaxIncludedBalanceAmount": 900.0,
+                    "TotalTaxIncludedBalanceAmount": 1125.0, "IsAuthenticate": False,
+                }],
+                "ServiceFileTypeName": "COLLECTION_FILE",
+            },
+        ],
+        "IsShowButton": False,
+    }
+
+
+def _real_debt_items() -> tuple[AvrasyaDebtItem, ...]:
+    return (
+        AvrasyaDebtItem(
+            principal_amount=Decimal("330.0"), total_amount=Decimal("330.0"),
+            service_file_type="EARLY_COLLECTION_FILE",
+        ),
+        AvrasyaDebtItem(
+            principal_amount=Decimal("225.0"), total_amount=Decimal("1125.0"),
+            service_file_type="COLLECTION_FILE", penalty_amount=Decimal("900.0"),
+        ),
+        AvrasyaDebtItem(
+            principal_amount=Decimal("225.0"), total_amount=Decimal("1125.0"),
+            service_file_type="COLLECTION_FILE", penalty_amount=Decimal("900.0"),
+        ),
+    )
+
+
+async def test_avrasya_has_debt_shows_real_summary_never_raw_json_and_records_has_debt():
+    """См. design report Stage 2C — точный production-пример (M295YB196,
+    turkey_toll_checks.id=3, 2026-09-16): confirmed has_debt теперь
+    рендерит реальную сумму, а не общий AVRASYA_UNEXPECTED_TEXT."""
     outcome = AvrasyaSubmitOutcome(
-        kind="has_debt", status_code=200, messages=(), raw_data={"Subcriptions": ["SECRET-LOOKING-DATA"]},
+        kind="has_debt", status_code=200, messages=(), raw_data=_real_debt_raw_data(),
+        debt_items=_real_debt_items(),
     )
     avrasya_provider = _FakeAvrasyaProvider(start_challenge=_avrasya_challenge(), submit_results=[outcome])
     avrasya_factory = _FakeAvrasyaCheckFactory([avrasya_provider])
@@ -1140,16 +1197,30 @@ async def test_avrasya_has_debt_shows_safe_message_never_raw_json_and_records_ha
         _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
     )
     await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
-    await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_text("M295YB196", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     reply = await controller.handle_text("123456", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
-    assert reply.text == texts.AVRASYA_UNEXPECTED_TEXT
-    assert "SECRET-LOOKING-DATA" not in reply.text
+    assert reply.text == texts.format_avrasya_has_debt_message("M295YB196", _real_debt_items())
+    assert "Итого к оплате: 2 580" in reply.text
+    assert reply.show_main_menu is True
+
+    # Замаскированные/внутренние поля НИКОГДА не должны попасть в текст
+    # пользователю (см. задачу).
+    for forbidden in ("ExitDate", "ExitStation", "DebtorContactFullName", "IsAuthenticate", "Subcriptions"):
+        assert forbidden not in reply.text
+
     assert toll.count_by_status("has_debt") == 1
+    row = toll._conn.execute(
+        "SELECT raw_response FROM turkey_toll_checks ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert "ExitStation" in row[0]  # сырой ответ по-прежнему хранится server-side (audit)
+
     # has_debt - тоже "успешная" завершённая проверка (см. design report:
     # "successful Avrasya check adding/reusing the same saved vehicle").
-    assert len(garage.list_cars(_USER_ID)) == 1
+    cars = garage.list_cars(_USER_ID)
+    assert len(cars) == 1
+    assert cars[0].car_number == "M295YB196"
 
 
 async def test_avrasya_restart_recovery_issues_fresh_captcha_for_stored_plate():

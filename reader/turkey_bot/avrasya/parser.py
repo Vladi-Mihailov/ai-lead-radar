@@ -19,11 +19,53 @@ _CAPTCHA_REJECTED_MESSAGE_TEXT) — НЕ по одному факту status_cod
 ErrorMessage под тем же PropertyName — это НЕ доказанный тот же случай,
 см. ниже).
 
-HTTP 200 (успех, вероятно "Subcriptions" с найденными проездами) НИ РАЗУ
-не был получен живым запросом — остаётся "unexpected" здесь до тех пор,
-пока reader/turkey_bot/avrasya/manual_test.py не захватит реальный пример
-(см. design report Stage 1, раздел "Manual live test(s) you need to
-perform").
+HTTP 200 С ПОДТВЕРЖДЁННЫМ ENVELOPE (design report Stage 2C, production
+turkey_toll_checks.id=3, 2026-09-16, plate M295YB196 — CAPTCHA принята,
+реальная задолженность) ТЕПЕРЬ классифицируется как "has_debt" — см.
+_is_confirmed_debt_envelope/_extract_debt_items ниже. РЕАЛЬНО увиденное
+тело (сокращено):
+
+    {"Response": "OK", "DcsResponse": "SUCCESSFUL",
+     "Subcriptions": [
+       {"ClientSubscriptionCustomerReferenceValue": "M295YB196",
+        "DebtItems": [{"PrincipalTaxIncludedBalanceAmount": 330.0,
+                        "TotalTaxIncludedBalanceAmount": 330.0,
+                        "ExitDate": "2*************6",
+                        "ExitStation": "A*****A",
+                        "IsAuthenticate": false, ...}],
+        "DebtorContactFullName": "*******",
+        "ServiceFileTypeName": "EARLY_COLLECTION_FILE"},
+       {"DebtItems": [{"PrincipalTaxIncludedBalanceAmount": 225.0,
+                        "TotalFixedIncomeTaxIncludedBalanceAmount": 900.0,
+                        "TotalTaxIncludedBalanceAmount": 1125.0, ...}],
+        "ServiceFileTypeName": "COLLECTION_FILE"},
+       {"DebtItems": [{"...": "тот же shape, тоже COLLECTION_FILE"}]}],
+     "IsShowButton": false}
+
+Классификация ТРЕБУЕТ ВСЕ пять условий (см. задачу: "Do not classify
+arbitrary HTTP 200 responses as has_debt"):
+  1. status_code == 200;
+  2. body — распарсенный JSON-объект (dict);
+  3. body["Response"] == "OK" (ТОЧНОЕ совпадение, реально увиденное значение);
+  4. body["DcsResponse"] == "SUCCESSFUL" (ТОЧНОЕ совпадение);
+  5. body["Subcriptions"] — НЕПУСТОЙ список (опечатка API — НЕ
+     "Subscriptions" — сохраняется как есть, см. models.py::AvrasyaDebtItem
+     докстрок и задачу: "do not silently assume Subscriptions is
+     equivalent unless separately observed").
+И ДОПОЛНИТЕЛЬНО должен найтись хотя бы один "usable" DebtItem (см.
+_extract_debt_items) — структурно валидный envelope БЕЗ единой пригодной
+записи (пустые/битые DebtItems везде) НЕ становится "has_debt" (см.
+задачу: "malformed debt items -> conservative behavior / unexpected") —
+это тоже "unexpected", а не тихое предположение о нулевой задолженности
+ИЛИ о валидной структуре, которой на самом деле нет.
+
+ExitDate/ExitStation/DebtorContactFullName/UniqueId — РЕАЛЬНО замаскированы
+самим Avrasya в этом ответе (например, "2*************6", "A*****A",
+"*******") для анонимного (неавторизованного) запроса — на КАЖДОЙ записи
+"IsAuthenticate": false. Эти поля СОЗНАТЕЛЬНО не извлекаются вообще (см.
+models.py::AvrasyaDebtItem) — показывать замаскированные значения как
+настоящие было бы неверно, размаскировать их мы не пытаемся и не можем
+(см. задачу).
 
 HTTP 404 С ПУСТЫМ ТЕЛОМ (Stage 2A live-тесты, 3 независимых успешных
 человеческих прохождения CAPTCHA — design report Stage 2A апдейт) ТЕПЕРЬ
@@ -66,7 +108,13 @@ HTTP 429 (rate limit) сюда вообще не попадает — session.py
 как AvrasyaRateLimitedError раньше, чем body/status_code доходят до этого
 модуля (см. session.py::submit)."""
 
-from reader.turkey_bot.avrasya.models import AvrasyaMessage, AvrasyaSubmitOutcome
+from decimal import Decimal
+
+from reader.turkey_bot.avrasya.models import (
+    AvrasyaDebtItem,
+    AvrasyaMessage,
+    AvrasyaSubmitOutcome,
+)
 
 # Реально увиденный вживую текст (см. докстрок модуля) — сравнение по
 # strip(), без изменения регистра (турецкий текст, регистр значим для
@@ -108,6 +156,83 @@ def _has_captcha_invalid_message(messages: tuple[AvrasyaMessage, ...]) -> bool:
     )
 
 
+def _is_confirmed_debt_envelope(body: dict) -> bool:
+    """См. докстрок модуля — ВСЕ ТРИ условия ниже реально увидены вживую
+    одновременно (Stage 2C); отдельно от наличия хотя бы одного usable
+    DebtItem (см. _extract_debt_items) — тот и другой признак ОБА
+    обязательны для kind == "has_debt" (см. parse_submit_response)."""
+    return (
+        body.get("Response") == "OK"
+        and body.get("DcsResponse") == "SUCCESSFUL"
+        and isinstance(body.get("Subcriptions"), list)
+        and len(body["Subcriptions"]) > 0
+    )
+
+
+def _parse_decimal_amount(value: object) -> Decimal | None:
+    """None для отсутствующего/неподходящего типа (см. задачу: "conservative
+    behavior" для битых записей) — str(value) ПЕРЕД Decimal(...) (не
+    Decimal(value) напрямую) намеренно: превращает float 330.0 в "330.0" ->
+    Decimal("330.0") БЕЗ артефактов двоичного float (см. задачу:
+    "decimal-safe monetary handling; do not introduce floating-point
+    display artifacts") — тот же приём был бы неверен для Decimal(330.0)
+    напрямую (даёт длинный неточный хвост для некоторых значений)."""
+    if isinstance(value, bool):  # bool — подкласс int, но не сумма денег.
+        return None
+    if isinstance(value, (int, float)):
+        return Decimal(str(value))
+    return None
+
+
+def _extract_debt_item(raw_item: object, *, service_file_type: str) -> AvrasyaDebtItem | None:
+    """None — запись НЕ usable (см. докстрок модуля: "malformed debt items
+    -> unexpected") — принципиально обязательны ТОЛЬКО
+    PrincipalTaxIncludedBalanceAmount и TotalTaxIncludedBalanceAmount
+    (реально присутствуют на КАЖДОЙ увиденной вживую записи);
+    TotalFixedIncomeTaxIncludedBalanceAmount опционален (см. задачу: "when
+    present") — отсутствие -> penalty_amount=None, НЕ 0 и НЕ
+    total-principal (см. models.py::AvrasyaDebtItem)."""
+    if not isinstance(raw_item, dict):
+        return None
+    principal = _parse_decimal_amount(raw_item.get("PrincipalTaxIncludedBalanceAmount"))
+    total = _parse_decimal_amount(raw_item.get("TotalTaxIncludedBalanceAmount"))
+    if principal is None or total is None:
+        return None
+    penalty = _parse_decimal_amount(raw_item.get("TotalFixedIncomeTaxIncludedBalanceAmount"))
+    return AvrasyaDebtItem(
+        principal_amount=principal, total_amount=total,
+        service_file_type=service_file_type, penalty_amount=penalty,
+    )
+
+
+def _extract_debt_items(body: dict) -> tuple[AvrasyaDebtItem, ...]:
+    """Проходит ВСЕ Subcriptions[].DebtItems[] (см. докстрок модуля про
+    опечатку "Subcriptions") — записи, не прошедшие _extract_debt_item
+    (см. выше), просто пропускаются (не прерывают разбор остальных) —
+    итоговый kind остаётся "has_debt", только если получилась хотя бы
+    ОДНА usable запись (см. parse_submit_response)."""
+    subscriptions = body.get("Subcriptions")
+    if not isinstance(subscriptions, list):
+        return ()
+
+    items: list[AvrasyaDebtItem] = []
+    for subscription in subscriptions:
+        if not isinstance(subscription, dict):
+            continue
+        service_file_type = subscription.get("ServiceFileTypeName")
+        if not isinstance(service_file_type, str):
+            continue
+        debt_items = subscription.get("DebtItems")
+        if not isinstance(debt_items, list):
+            continue
+        for raw_item in debt_items:
+            item = _extract_debt_item(raw_item, service_file_type=service_file_type)
+            if item is not None:
+                items.append(item)
+
+    return tuple(items)
+
+
 def parse_submit_response(status_code: int, body: object) -> AvrasyaSubmitOutcome:
     if status_code == 400 and isinstance(body, dict):
         messages = _extract_messages(body)
@@ -120,6 +245,19 @@ def parse_submit_response(status_code: int, body: object) -> AvrasyaSubmitOutcom
         # в gib/parser.py: "do not generalize other unknown ERROR messages").
         return AvrasyaSubmitOutcome(
             kind="unexpected", status_code=status_code, messages=messages, raw_data=body,
+        )
+
+    if status_code == 200 and isinstance(body, dict) and _is_confirmed_debt_envelope(body):
+        debt_items = _extract_debt_items(body)
+        if debt_items:
+            return AvrasyaSubmitOutcome(
+                kind="has_debt", status_code=status_code, messages=(), raw_data=body,
+                debt_items=debt_items,
+            )
+        # Envelope структурно подтверждён, но НИ ОДНОЙ usable записи (см.
+        # докстрок модуля) — не становится "has_debt" по одной догадке.
+        return AvrasyaSubmitOutcome(
+            kind="unexpected", status_code=status_code, messages=(), raw_data=body,
         )
 
     if status_code == 404 and _is_genuinely_empty_body(body):
