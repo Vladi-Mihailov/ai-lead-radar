@@ -1308,10 +1308,21 @@ async def test_avrasya_transport_error_does_not_include_cta_buttons():
     assert reply.cta_buttons is None
 
 
-async def test_gib_has_debt_does_not_include_avrasya_cta_buttons():
-    """Регрессия: GIB has_debt никогда не получал и не должен получить
-    CTA-кнопки через это изменение (см. design report: изменение
-    затрагивает ТОЛЬКО подтверждённый Avrasya has_debt)."""
+def _assert_has_the_commercial_cta_buttons(cta_buttons, *, expected_username="tplgee"):
+    assert cta_buttons is not None
+    assert len(cta_buttons) == 2
+    labels = [label for label, _url in cta_buttons]
+    assert labels == ["💳 Оплатить в рублях", "🚗 ОСАГО Грузии"]
+    urls = {url for _label, url in cta_buttons}
+    assert urls == {f"https://t.me/{expected_username}"}
+
+
+async def test_gib_has_debt_includes_commercial_cta_buttons_for_normal_user():
+    """Регрессия для реального production-бага (M295YB196, 2026-09-17,
+    2 штрафа по 40 TRY): GIB has_debt для ОБЫЧНОГО (не-trusted)
+    пользователя должен показывать те же коммерческие CTA-кнопки, что и
+    Avrasya has_debt — до фикса cta_buttons вообще не выставлялся в этой
+    ветке (см. design report "fix: show Turkey fine CTAs for all users")."""
     fine = GibFineRecord(
         protocol_no="MC00000000", plate="34ABC123", amount=Decimal("1000.00"),
         description="raw", violation_date=date(2026, 8, 8), authority="ORG",
@@ -1320,12 +1331,105 @@ async def test_gib_has_debt_does_not_include_avrasya_cta_buttons():
     outcome = GibSubmitOutcome(kind="has_debt", messages=(), raw_data={}, fines=(fine,))
     provider = _FakeProvider(start_challenge=_challenge(), submit_results=[outcome])
     factory = _FakeCheckFactory([provider])
-    controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(factory)
+    controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(
+        factory, trusted_operator_user_ids=set(),
+    )
 
     await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     reply = await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
-    assert reply.cta_buttons is None
+    assert controller.is_trusted(_USER_ID) is False
+    _assert_has_the_commercial_cta_buttons(reply.cta_buttons)
+
+
+async def test_gib_has_debt_includes_commercial_cta_buttons_for_trusted_user():
+    """Тот же результат для trusted/manager-пользователя — CTA-кнопки НЕ
+    зависят от is_trusted (см. design report: "Trusted/manager status
+    must not change whether these two CTA buttons exist")."""
+    fine = GibFineRecord(
+        protocol_no="MC00000000", plate="34ABC123", amount=Decimal("1000.00"),
+        description="raw", violation_date=date(2026, 8, 8), authority="ORG",
+        late_fee=None, discount=None,
+    )
+    outcome = GibSubmitOutcome(kind="has_debt", messages=(), raw_data={}, fines=(fine,))
+    provider = _FakeProvider(start_challenge=_challenge(), submit_results=[outcome])
+    factory = _FakeCheckFactory([provider])
+    controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(
+        factory, trusted_operator_user_ids={_USER_ID},
+    )
+
+    await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    reply = await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert controller.is_trusted(_USER_ID) is True
+    _assert_has_the_commercial_cta_buttons(reply.cta_buttons)
+
+
+async def test_gib_has_debt_cta_urls_use_the_configured_contact_username_not_hardcoded():
+    """Явное требование задачи: "URLs resolve through the configured
+    operator/contact mechanism... not hardcoded" — меняем конфиг и
+    проверяем, что URL меняется вместе с ним (не зафиксирован на
+    "tplgee" в коде)."""
+    fine = GibFineRecord(
+        protocol_no="MC00000000", plate="34ABC123", amount=Decimal("1000.00"),
+        description="raw", violation_date=date(2026, 8, 8), authority="ORG",
+        late_fee=None, discount=None,
+    )
+    outcome = GibSubmitOutcome(kind="has_debt", messages=(), raw_data={}, fines=(fine,))
+    provider = _FakeProvider(start_challenge=_challenge(), submit_results=[outcome])
+    factory = _FakeCheckFactory([provider])
+    states = TurkeyConversationStateRepository(":memory:")
+    checks = TurkeyCheckRepository(":memory:")
+    registry = LiveGibSessionRegistry()
+    garage = TurkeyUserCarsRepository(":memory:")
+    known_users = TurkeyBotKnownUsersRepository(":memory:")
+    statistics = TurkeyStatisticsService(known_users, checks)
+    avrasya_registry = LiveAvrasyaSessionRegistry()
+    toll_checks = TurkeyTollCheckRepository(":memory:")
+    controller = ConversationController(
+        states, checks, registry, garage, statistics, avrasya_registry, toll_checks,
+        check_factory=factory, payment_help_contact_username="some_other_contact",
+    )
+
+    await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    reply = await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    _assert_has_the_commercial_cta_buttons(reply.cta_buttons, expected_username="some_other_contact")
+
+
+async def test_gib_and_avrasya_has_debt_use_the_same_cta_buttons():
+    """Требование задачи: GIB и Avrasya используют ОДИН и тот же CTA
+    helper/architecture — не два независимых источника, которые могли бы
+    разойтись (см. design report про переименование
+    _avrasya_debt_cta_buttons -> _debt_cta_buttons)."""
+    gib_fine = GibFineRecord(
+        protocol_no="MC00000000", plate="34ABC123", amount=Decimal("1000.00"),
+        description="raw", violation_date=date(2026, 8, 8), authority="ORG",
+        late_fee=None, discount=None,
+    )
+    gib_outcome = GibSubmitOutcome(kind="has_debt", messages=(), raw_data={}, fines=(gib_fine,))
+    gib_provider = _FakeProvider(start_challenge=_challenge(), submit_results=[gib_outcome])
+    factory = _FakeCheckFactory([gib_provider])
+
+    avrasya_outcome = AvrasyaSubmitOutcome(
+        kind="has_debt", status_code=200, messages=(), raw_data=_real_debt_raw_data(),
+        debt_items=_real_debt_items(),
+    )
+    avrasya_provider = _FakeAvrasyaProvider(start_challenge=_avrasya_challenge(), submit_results=[avrasya_outcome])
+    avrasya_factory = _FakeAvrasyaCheckFactory([avrasya_provider])
+
+    controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(
+        factory, avrasya_factory=avrasya_factory,
+    )
+
+    await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    gib_reply = await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_text("M295YB196", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    avrasya_reply = await controller.handle_text("123456", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert gib_reply.cta_buttons == avrasya_reply.cta_buttons
 
 
 async def test_avrasya_restart_recovery_issues_fresh_captcha_for_stored_plate():

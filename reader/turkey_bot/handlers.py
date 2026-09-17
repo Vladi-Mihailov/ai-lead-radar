@@ -128,29 +128,34 @@ async def _send_reply(event, reply: BotReply, *, is_trusted: bool = False) -> No
     Приоритет клавиатур на ОДНОМ сообщении (Telethon не может совместить
     несколько видов сразу): show_cancel_button (пока идёт диалог) >
     garage_cars (список гаража) > cta_buttons (коммерческие CTA после
-    подтверждённого Avrasya has_debt) > help_keyboard (ℹ️ Справка и её
-    разделы) > show_main_menu (персистентное reply-меню, см.
-    reader/turkey_bot/conversation.py::BotReply про то, почему это именно
-    в таком порядке).
+    подтверждённого has_debt — GIB ИЛИ Avrasya, см.
+    reader/turkey_bot/conversation.py::ConversationController._debt_cta_buttons,
+    ОДИНАКОВО для trusted и не-trusted пользователей) > help_keyboard
+    (ℹ️ Справка и её разделы) > show_main_menu (персистентное reply-меню,
+    см. reader/turkey_bot/conversation.py::BotReply про то, почему это
+    именно в таком порядке).
 
     extra_texts — дополнительные сообщения ПОСЛЕ основного (см.
     reader/turkey_bot/conversation.py::BotReply) — has_debt со многими
     штрафами и список пользователей для 📊 Статистика — отправляются как
-    обычные текстовые сообщения; show_main_menu (если установлен)
-    прикрепляется к ПОСЛЕДНЕМУ из них, а не к первому - reply-меню должно
-    появиться там, где разговор действительно завершился."""
+    обычные текстовые сообщения; cta_buttons/show_main_menu (если
+    установлены) прикрепляются к ПОСЛЕДНЕМУ из них, а не к первому -
+    кнопки должны появиться там, где разговор действительно завершился
+    (тот же принцип для обоих полей, cta_buttons приоритетнее, см. выше)."""
     has_extra = bool(reply.extra_texts)
 
     if reply.show_cancel_button:
         first_buttons = cancel_keyboard()
     elif reply.garage_cars is not None:
         first_buttons = garage_keyboard(list(reply.garage_cars))
-    elif reply.cta_buttons:
-        # Avrasya has_debt CTA (см. reader/turkey_bot/conversation.py::
-        # ConversationController._avrasya_debt_cta_buttons) — те же
-        # (label, url) пары, что и у reader/public_bot/handlers.py для
-        # Георгии; conversation.py намеренно передаёт их как строки, не
-        # Telethon Button — реальные кнопки строятся только здесь.
+    elif reply.cta_buttons and not has_extra:
+        # has_debt CTA (см. reader/turkey_bot/conversation.py::
+        # ConversationController._debt_cta_buttons) — те же (label, url)
+        # пары, что и у reader/public_bot/handlers.py для Георгии;
+        # conversation.py намеренно передаёт их как строки, не Telethon
+        # Button — реальные кнопки строятся только здесь. При наличии
+        # extra_texts кнопки уходят на ПОСЛЕДНЕЕ сообщение (см. ниже), не
+        # на первое.
         first_buttons = [[Button.url(label, url) for label, url in reply.cta_buttons]]
     elif reply.help_keyboard == "menu":
         first_buttons = help_menu_keyboard()
@@ -170,5 +175,10 @@ async def _send_reply(event, reply: BotReply, *, is_trusted: bool = False) -> No
 
     for index, extra_text in enumerate(reply.extra_texts):
         is_last = index == len(reply.extra_texts) - 1
-        extra_buttons = main_menu_keyboard(is_trusted=is_trusted) if (is_last and reply.show_main_menu) else None
+        if is_last and reply.cta_buttons:
+            extra_buttons = [[Button.url(label, url) for label, url in reply.cta_buttons]]
+        elif is_last and reply.show_main_menu:
+            extra_buttons = main_menu_keyboard(is_trusted=is_trusted)
+        else:
+            extra_buttons = None
         await event.respond(extra_text, buttons=extra_buttons)

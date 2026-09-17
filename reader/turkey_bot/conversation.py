@@ -145,13 +145,18 @@ class BotReply:
     "гараж пуст" — пустой tuple — от "это вообще не гараж").
 
     cta_buttons — коммерческие CTA-кнопки (label, url), показываемые
-    ТОЛЬКО после подтверждённого Avrasya has_debt (см. design report:
-    "append these CTAs only after a confirmed has_debt result") — ТА ЖЕ
-    форма (label, url) и ТЕ ЖЕ реальные значения (метки/URL), что и у
+    ТОЛЬКО после подтверждённого has_debt — ЛЮБОГО провайдера (GIB И
+    Avrasya, см. design report: "these CTA buttons must NOT depend on
+    manager/trusted status" — ОБА провайдера показывают ОДНИ И ТЕ ЖЕ две
+    кнопки одинаково всем пользователям, независимо от is_trusted; баг,
+    из-за которого GIB has_debt их не показывал, был именно в том, что
+    _debt_cta_buttons() изначально вызывался ТОЛЬКО из ветки Avrasya, см.
+    design report "fix: show Turkey fine CTAs for all users"). ТА ЖЕ форма
+    (label, url) и ТЕ ЖЕ реальные значения (метки/URL), что и у
     reader/public_bot/conversation.py::BotReply.cta_buttons/
     ConversationController._owner_cta_buttons и reader/public_bot/
     keyboards.py::owner_fine_cta_buttons — воспроизведены здесь локально
-    (см. _avrasya_debt_cta_buttons ниже), а НЕ импортированы оттуда: Turkey
+    (см. _debt_cta_buttons ниже), а НЕ импортированы оттуда: Turkey
     остаётся полностью отдельным процессом, не зависящим от
     reader/public_bot/* (см. reader/turkey_bot/main.py про эту границу).
     conversation.py намеренно НЕ импортирует Telethon Button здесь (тот же
@@ -302,18 +307,22 @@ class ConversationController:
         # a second manager list".
         self._trusted_operator_user_ids = frozenset(trusted_operator_user_ids)
         self._tz = tz
-        # Destination Avrasya has_debt CTA-кнопок (см. BotReply.cta_buttons
-        # докстрок) — ТОТ ЖЕ config (settings.public_bot.
+        # Destination CTA-кнопок под ЛЮБЫМ has_debt (GIB и Avrasya, см.
+        # BotReply.cta_buttons докстрок) — ТОТ ЖЕ config (settings.public_bot.
         # payment_help_contact_username), что и у @ProtocolGEbot/
         # reader/public_bot/conversation.py::_owner_cta_buttons — не
         # hardcoded, не вводит новую настройку (default "tplgee" совпадает
         # с default'ом там же, см. reader/public_bot/conversation.py).
         self._payment_help_contact_username = payment_help_contact_username
 
-    def _avrasya_debt_cta_buttons(self) -> tuple[tuple[str, str], ...]:
+    def _debt_cta_buttons(self) -> tuple[tuple[str, str], ...]:
         """ТЕ ЖЕ метки и та же destination, что и у Георгии (см.
         BotReply.cta_buttons докстрок) — воспроизведены буквально, не
-        придуманы заново."""
+        придуманы заново. Используется ОБОИМИ провайдерами (см.
+        _handle_submit_outcome/_handle_avrasya_submit_outcome) — ОДИНАКОВО
+        для trusted и не-trusted пользователей: is_trusted здесь вообще не
+        участвует (см. design report: "these CTA buttons must NOT depend
+        on manager/trusted status")."""
         url = f"https://t.me/{self._payment_help_contact_username}"
         return (("💳 Оплатить в рублях", url), ("🚗 ОСАГО Грузии", url))
 
@@ -727,6 +736,11 @@ class ConversationController:
             return BotReply(
                 text=rendered_messages[0], extra_texts=tuple(rendered_messages[1:]),
                 show_main_menu=True,
+                # См. design report "fix: show Turkey fine CTAs for all
+                # users" — ОДИНАКОВЫЕ CTA-кнопки для GIB и Avrasya
+                # has_debt, независимо от is_trusted (см. BotReply.
+                # cta_buttons докстрок и _debt_cta_buttons выше).
+                cta_buttons=self._debt_cta_buttons(),
             )
 
         # "unexpected" — НЕ трогает гараж (см. design report: "unexpected
@@ -956,8 +970,9 @@ class ConversationController:
                 show_main_menu=True,
                 # См. design report: CTA-кнопки ТОЛЬКО после подтверждённого
                 # has_debt — никогда для no_debt/rejected/unexpected/error
-                # (см. BotReply.cta_buttons докстрок).
-                cta_buttons=self._avrasya_debt_cta_buttons(),
+                # (см. BotReply.cta_buttons докстрок), ОДИНАКОВО с GIB
+                # has_debt выше.
+                cta_buttons=self._debt_cta_buttons(),
             )
 
         # "unexpected" — НЕ трогает гараж (см. design report: "unexpected
