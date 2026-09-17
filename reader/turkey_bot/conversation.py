@@ -316,15 +316,16 @@ class ConversationController:
         self._payment_help_contact_username = payment_help_contact_username
 
     def _debt_cta_buttons(self) -> tuple[tuple[str, str], ...]:
-        """ТЕ ЖЕ метки и та же destination, что и у Георгии (см.
-        BotReply.cta_buttons докстрок) — воспроизведены буквально, не
-        придуманы заново. Используется ОБОИМИ провайдерами (см.
+        """Та же destination (payment_help_contact_username), что и у
+        Георгии (см. BotReply.cta_buttons докстрок) — вторая кнопка
+        намеренно называется "ОСАГО Турции" (не "...Грузии" — это Turkey
+        bot, а не @ProtocolGEbot). Используется ОБОИМИ провайдерами (см.
         _handle_submit_outcome/_handle_avrasya_submit_outcome) — ОДИНАКОВО
         для trusted и не-trusted пользователей: is_trusted здесь вообще не
         участвует (см. design report: "these CTA buttons must NOT depend
         on manager/trusted status")."""
         url = f"https://t.me/{self._payment_help_contact_username}"
-        return (("💳 Оплатить в рублях", url), ("🚗 ОСАГО Грузии", url))
+        return (("💳 Оплатить в рублях", url), ("🚗 ОСАГО Турции", url))
 
     def _is_trusted(self, telegram_user_id: int) -> bool:
         """Единственная проверка авторизации trusted-режима — ТОЛЬКО по

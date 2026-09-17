@@ -55,7 +55,7 @@ async def test_cta_buttons_attach_to_the_last_message_when_extra_texts_present()
     reply = BotReply(
         text="fine 1 of many",
         extra_texts=("fine 2", "fine 3 (last)"),
-        cta_buttons=(("💳 Оплатить в рублях", "https://t.me/tplgee"), ("🚗 ОСАГО Грузии", "https://t.me/tplgee")),
+        cta_buttons=(("💳 Оплатить в рублях", "https://t.me/tplgee"), ("🚗 ОСАГО Турции", "https://t.me/tplgee")),
     )
     event = _FakeEvent()
 
@@ -64,7 +64,7 @@ async def test_cta_buttons_attach_to_the_last_message_when_extra_texts_present()
     assert len(event.calls) == 3
     assert event.calls[0]["buttons"] is None
     assert event.calls[1]["buttons"] is None
-    assert _button_labels(event.calls[2]["buttons"]) == ["💳 Оплатить в рублях", "🚗 ОСАГО Грузии"]
+    assert _button_labels(event.calls[2]["buttons"]) == ["💳 Оплатить в рублях", "🚗 ОСАГО Турции"]
 
 
 async def test_cta_buttons_take_priority_over_show_main_menu_on_last_message():

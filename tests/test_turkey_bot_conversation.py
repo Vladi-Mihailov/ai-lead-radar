@@ -1210,7 +1210,7 @@ async def test_avrasya_has_debt_shows_real_summary_never_raw_json_and_records_ha
     assert reply.cta_buttons is not None
     assert len(reply.cta_buttons) == 2
     labels = [label for label, _url in reply.cta_buttons]
-    assert labels == ["💳 Оплатить в рублях", "🚗 ОСАГО Грузии"]
+    assert labels == ["💳 Оплатить в рублях", "🚗 ОСАГО Турции"]
     urls = {url for _label, url in reply.cta_buttons}
     assert urls == {"https://t.me/tplgee"}
 
@@ -1312,7 +1312,7 @@ def _assert_has_the_commercial_cta_buttons(cta_buttons, *, expected_username="tp
     assert cta_buttons is not None
     assert len(cta_buttons) == 2
     labels = [label for label, _url in cta_buttons]
-    assert labels == ["💳 Оплатить в рублях", "🚗 ОСАГО Грузии"]
+    assert labels == ["💳 Оплатить в рублях", "🚗 ОСАГО Турции"]
     urls = {url for _label, url in cta_buttons}
     assert urls == {f"https://t.me/{expected_username}"}
 
