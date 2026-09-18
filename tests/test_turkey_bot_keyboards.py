@@ -17,17 +17,22 @@ from reader.turkey_bot.keyboards import (  # noqa: E402
     cancel_keyboard,
     decode_garage_check_callback,
     decode_help_callback,
+    decode_toll_provider_callback,
     encode_garage_check_callback,
     encode_help_callback,
+    encode_toll_provider_callback,
     garage_keyboard,
     help_menu_keyboard,
     help_section_keyboard,
     main_menu_keyboard,
+    toll_provider_keyboard,
 )
 from reader.turkey_bot.models import TurkeyUserCar  # noqa: E402
 from reader.turkey_bot.texts import (  # noqa: E402
     CANCEL_BUTTON_LABEL,
     CHECK_FINES_LABEL,
+    CHECK_TOLLS_AVRASYA_LABEL,
+    CHECK_TOLLS_KGM_LABEL,
     CHECK_TOLLS_LABEL,
     GARAGE_LABEL,
     HELP_AVRASYA_LABEL,
@@ -95,25 +100,28 @@ def test_main_menu_shows_statistics_only_for_trusted():
     assert STATISTICS_LABEL in labels
 
 
-def test_garage_keyboard_has_three_buttons_per_car():
-    """[НОМЕР] [🚔 Проверить штрафы] [🛣 Проверить платные дороги] (см.
-    design report Stage 2B: "Saved cars must show both actions")."""
+def test_garage_keyboard_has_four_buttons_per_car():
+    """[НОМЕР] [🚔 Проверить штрафы] [🚇 Avrasya Tüneli] [🛣 KGM] (см.
+    design report Stage 2B: "Saved cars must show both actions", и
+    design report "Реализация KGM provider" п.10 — KGM добавлен как
+    третья кнопка)."""
     cars = [_car(1, "34ABC123"), _car(2, "06XYZ999")]
 
     keyboard = garage_keyboard(cars)
 
     assert len(keyboard) == 2
     for row in keyboard:
-        assert len(row) == 3
+        assert len(row) == 4
 
 
-def test_garage_keyboard_shows_plate_and_both_action_labels():
+def test_garage_keyboard_shows_plate_and_all_action_labels():
     keyboard = garage_keyboard([_car(1, "34ABC123")])
 
     row = keyboard[0]
     assert row[0].text == "34ABC123"
     assert row[1].text == CHECK_FINES_LABEL
-    assert row[2].text == CHECK_TOLLS_LABEL
+    assert row[2].text == CHECK_TOLLS_AVRASYA_LABEL
+    assert row[3].text == CHECK_TOLLS_KGM_LABEL
 
 
 def test_garage_keyboard_plate_and_fines_button_encode_the_same_gib_callback():
@@ -127,16 +135,18 @@ def test_garage_keyboard_plate_and_fines_button_encode_the_same_gib_callback():
     assert decode_garage_check_callback(row[0].data) == ("gib", 42)
 
 
-def test_garage_keyboard_tolls_button_encodes_avrasya_callback():
+def test_garage_keyboard_tolls_buttons_encode_avrasya_and_kgm_callbacks():
     keyboard = garage_keyboard([_car(42, "34ABC123")])
 
     row = keyboard[0]
     assert decode_garage_check_callback(row[2].data) == ("avrasya", 42)
+    assert decode_garage_check_callback(row[3].data) == ("kgm", 42)
 
 
 def test_encode_decode_garage_check_roundtrip_for_each_provider():
     assert decode_garage_check_callback(encode_garage_check_callback("gib", 7)) == ("gib", 7)
     assert decode_garage_check_callback(encode_garage_check_callback("avrasya", 7)) == ("avrasya", 7)
+    assert decode_garage_check_callback(encode_garage_check_callback("kgm", 7)) == ("kgm", 7)
 
 
 def test_decode_garage_check_rejects_unrelated_callback_data():
@@ -154,6 +164,32 @@ def test_decode_garage_check_rejects_unknown_provider():
     additional toll-road providers can be added later" — но НЕ принимает
     произвольную строку как провайдер уже сейчас (только зарегистрированные)."""
     assert decode_garage_check_callback(b"turkeygaragecheck:unknownprovider:7") is None
+
+
+def test_toll_provider_keyboard_has_avrasya_and_kgm_buttons():
+    """См. design report "Реализация KGM provider" п.10 — CHECK_TOLLS_LABEL
+    ведёт к явному выбору "🚇 Avrasya Tüneli" / "🛣 Все дороги и мосты
+    (KGM)", Avrasya не удалена."""
+    keyboard = toll_provider_keyboard()
+
+    assert len(keyboard) == 2
+    assert keyboard[0][0].text == CHECK_TOLLS_AVRASYA_LABEL
+    assert keyboard[1][0].text == CHECK_TOLLS_KGM_LABEL
+    assert decode_toll_provider_callback(keyboard[0][0].data) == "avrasya"
+    assert decode_toll_provider_callback(keyboard[1][0].data) == "kgm"
+
+
+def test_encode_decode_toll_provider_roundtrip():
+    assert decode_toll_provider_callback(encode_toll_provider_callback("avrasya")) == "avrasya"
+    assert decode_toll_provider_callback(encode_toll_provider_callback("kgm")) == "kgm"
+
+
+def test_decode_toll_provider_rejects_unrelated_or_unknown_data():
+    assert decode_toll_provider_callback(CANCEL_CALLBACK_DATA) is None
+    assert decode_toll_provider_callback(None) is None
+    # "gib" не входит в выбор платных дорог (см. модуль docstring
+    # keyboards.py про _TOLL_PROVIDERS) — штрафы не имеют подменю.
+    assert decode_toll_provider_callback(b"turkeytollprovider:gib") is None
 
 
 def test_decode_garage_check_rejects_missing_car_id():

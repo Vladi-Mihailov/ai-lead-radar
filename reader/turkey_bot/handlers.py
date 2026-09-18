@@ -21,10 +21,12 @@ from reader.turkey_bot.keyboards import (
     cancel_keyboard,
     decode_garage_check_callback,
     decode_help_callback,
+    decode_toll_provider_callback,
     garage_keyboard,
     help_menu_keyboard,
     help_section_keyboard,
     main_menu_keyboard,
+    toll_provider_keyboard,
 )
 from reader.turkey_bot.known_users_repository import TurkeyBotKnownUsersRepository
 from reader.turkey_bot.texts import UNKNOWN_BUTTON_TEXT
@@ -94,6 +96,15 @@ def register(
             await _send_reply(event, reply, is_trusted=is_trusted)
             return
 
+        toll_provider = decode_toll_provider_callback(event.data)
+        if toll_provider is not None:
+            reply = await controller.handle_toll_provider_callback(
+                toll_provider, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            await event.answer()
+            await _send_reply(event, reply, is_trusted=is_trusted)
+            return
+
         decoded_garage_callback = decode_garage_check_callback(event.data)
         if decoded_garage_callback is not None:
             provider, garage_car_id = decoded_garage_callback
@@ -128,9 +139,11 @@ async def _send_reply(event, reply: BotReply, *, is_trusted: bool = False) -> No
     Приоритет клавиатур на ОДНОМ сообщении (Telethon не может совместить
     несколько видов сразу): show_cancel_button (пока идёт диалог) >
     garage_cars (список гаража) > cta_buttons (коммерческие CTA после
-    подтверждённого has_debt — GIB ИЛИ Avrasya, см.
+    подтверждённого has_debt — GIB, Avrasya ИЛИ KGM, см.
     reader/turkey_bot/conversation.py::ConversationController._debt_cta_buttons,
-    ОДИНАКОВО для trusted и не-trusted пользователей) > help_keyboard
+    ОДИНАКОВО для trusted и не-trusted пользователей) > toll_provider_keyboard
+    (выбор Avrasya/KGM после CHECK_TOLLS_LABEL, см.
+    reader/turkey_bot/keyboards.py::toll_provider_keyboard) > help_keyboard
     (ℹ️ Справка и её разделы) > show_main_menu (персистентное reply-меню,
     см. reader/turkey_bot/conversation.py::BotReply про то, почему это
     именно в таком порядке).
@@ -157,6 +170,8 @@ async def _send_reply(event, reply: BotReply, *, is_trusted: bool = False) -> No
         # extra_texts кнопки уходят на ПОСЛЕДНЕЕ сообщение (см. ниже), не
         # на первое.
         first_buttons = [[Button.url(label, url) for label, url in reply.cta_buttons]]
+    elif reply.toll_provider_keyboard:
+        first_buttons = toll_provider_keyboard()
     elif reply.help_keyboard == "menu":
         first_buttons = help_menu_keyboard()
     elif reply.help_keyboard == "section":

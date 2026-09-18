@@ -76,6 +76,13 @@ from reader.turkey_bot.gib.models import (
 from reader.turkey_bot.gib.provider import GibProvider
 from reader.turkey_bot.gib.session import GibSession, GibTransportError
 from reader.turkey_bot.gib.translation import FineTranslationError
+from reader.turkey_bot.kgm.live_session_registry import (
+    LiveKgmCheck,
+    LiveKgmSessionRegistry,
+)
+from reader.turkey_bot.kgm.models import KgmCaptchaChallenge, KgmSubmitOutcome
+from reader.turkey_bot.kgm.provider import KgmProvider
+from reader.turkey_bot.kgm.session import KgmSession, KgmTransportError
 from reader.turkey_bot.live_session_registry import LiveGibCheck, LiveGibSessionRegistry
 from reader.turkey_bot.models import ConversationState, TurkeyUserCar
 from reader.turkey_bot.statistics_service import TurkeyStatisticsService
@@ -101,6 +108,7 @@ _STEP_AWAITING_PLATE = "awaiting_plate"
 
 _PROVIDER_GIB = "gib"
 _PROVIDER_AVRASYA = "avrasya"
+_PROVIDER_KGM = "kgm"
 
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -168,7 +176,13 @@ class BotReply:
     reader/turkey_bot/keyboards.py::help_menu_keyboard/
     help_section_keyboard, None — это вообще не Help-экран. Отдельное
     поле, а не часть cta_buttons/garage_cars — семантически независимая
-    навигация (см. design report: "ℹ️ Справка")."""
+    навигация (см. design report: "ℹ️ Справка").
+
+    toll_provider_keyboard — True ТОЛЬКО сразу после CHECK_TOLLS_LABEL
+    (см. _handle_check_tolls_menu) — inline-выбор "🚇 Avrasya Tüneli"/
+    "🛣 Все дороги и мосты (KGM)" (см. reader/turkey_bot/keyboards.py::
+    toll_provider_keyboard) ДО ввода номера (см. design report
+    "Реализация KGM provider" п.10)."""
 
     text: str
     photo_png: bytes | None = None
@@ -178,6 +192,7 @@ class BotReply:
     garage_cars: tuple[TurkeyUserCar, ...] | None = None
     cta_buttons: tuple[tuple[str, str], ...] | None = None
     help_keyboard: str | None = None
+    toll_provider_keyboard: bool = False
 
 
 class _AsyncCloseable(Protocol):
@@ -192,6 +207,7 @@ class _AsyncCloseable(Protocol):
 
 CheckFactory = Callable[[], tuple[_AsyncCloseable, GibProvider]]
 AvrasyaCheckFactory = Callable[[], tuple[_AsyncCloseable, AvrasyaProvider]]
+KgmCheckFactory = Callable[[], tuple[_AsyncCloseable, KgmProvider]]
 
 
 class FineTranslatorLike(Protocol):
@@ -225,6 +241,13 @@ def _default_avrasya_check_factory() -> tuple[httpx.AsyncClient, AvrasyaProvider
     не отдельная настройка без причины."""
     client = _build_client()
     return client, AvrasyaProvider(AvrasyaSession(client))
+
+
+def _default_kgm_check_factory() -> tuple[httpx.AsyncClient, KgmProvider]:
+    """Реальная KGM-сессия (см. design report "Реализация KGM provider") —
+    тот же общий _build_client(), что и у GIB/Avrasya."""
+    client = _build_client()
+    return client, KgmProvider(KgmSession(client))
 
 
 def _sanitize_outcome_for_storage(outcome: GibSubmitOutcome) -> str:
@@ -266,6 +289,35 @@ def _sanitize_avrasya_outcome_for_storage(outcome: AvrasyaSubmitOutcome) -> str:
     )
 
 
+def _sanitize_kgm_outcome_for_storage(outcome: KgmSubmitOutcome) -> str:
+    """Аналог _sanitize_avrasya_outcome_for_storage() для KGM — идёт
+    ТОЛЬКО в TurkeyTollCheckRepository, никогда пользователю напрямую (см.
+    reader/turkey_bot/texts.py::format_kgm_has_debt_messages — строит
+    пользовательский текст ОТДЕЛЬНО, из тех же типизированных полей).
+    KgmSubmitOutcome (см. reader/turkey_bot/kgm/models.py) НЕ несёт ни
+    сырого HTML/delta-ответа, ни captcha_code/cookies вовсе — сериализовать
+    здесь просто нечего, кроме уже типизированных операторов/сумм."""
+    return json.dumps(
+        {
+            "kind": outcome.kind,
+            "kgm_total": outcome.kgm_total,
+            "yid_total": outcome.yid_total,
+            "grand_total": outcome.grand_total,
+            "message": outcome.message,
+            "operators": [
+                {
+                    "operator_key": op.operator_key,
+                    "subtotal": op.subtotal,
+                    "items": len(op.items),
+                }
+                for op in outcome.operators
+            ],
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
 class ConversationController:
     def __init__(
         self,
@@ -276,9 +328,11 @@ class ConversationController:
         statistics_service: TurkeyStatisticsService,
         avrasya_session_registry: LiveAvrasyaSessionRegistry,
         toll_check_repository: TurkeyTollCheckRepository,
+        kgm_session_registry: LiveKgmSessionRegistry,
         *,
         check_factory: CheckFactory = _default_check_factory,
         avrasya_check_factory: AvrasyaCheckFactory = _default_avrasya_check_factory,
+        kgm_check_factory: KgmCheckFactory = _default_kgm_check_factory,
         translator: FineTranslatorLike | None = None,
         trusted_operator_user_ids: frozenset[int] = frozenset(),
         tz: ZoneInfo = _DEFAULT_TZ,
@@ -291,8 +345,15 @@ class ConversationController:
         self._statistics = statistics_service
         self._avrasya_registry = avrasya_session_registry
         self._toll_checks = toll_check_repository
+        # ОТДЕЛЬНЫЙ, структурно идентичный реестр (см.
+        # reader/turkey_bot/kgm/live_session_registry.py) — те же
+        # turkey_toll_checks (provider="kgm", см. _finish_kgm), НЕ отдельная
+        # таблица (см. design report "Реализация KGM provider" п.11:
+        # "Не создавать новую таблицу без необходимости").
+        self._kgm_registry = kgm_session_registry
         self._check_factory = check_factory
         self._avrasya_check_factory = avrasya_check_factory
+        self._kgm_check_factory = kgm_check_factory
         # None — как и everywhere в проекте (см. FineTranslatorLike в
         # reader/fines/check_service.py) — означает "перевод недоступен"
         # (нет OPENAI_API_KEY, см. main.py), не ошибку: клиент увидит
@@ -353,6 +414,7 @@ class ConversationController:
             async with self._registry.lock_for(chat_id):
                 await self._registry.pop_and_close(chat_id)
                 await self._avrasya_registry.pop_and_close(chat_id)
+                await self._kgm_registry.pop_and_close(chat_id)
                 self._states.clear(chat_id)
             return BotReply(text=texts.WELCOME_TEXT, show_main_menu=True)
 
@@ -377,9 +439,11 @@ class ConversationController:
             )
 
         if stripped == texts.CHECK_TOLLS_LABEL:
-            return await self._handle_check_button(
-                chat_id=chat_id, telegram_user_id=telegram_user_id, provider=_PROVIDER_AVRASYA,
-            )
+            # См. design report "Реализация KGM provider" п.10 — теперь
+            # ведёт к явному выбору провайдера (см.
+            # handle_toll_provider_callback), а не сразу армит Avrasya
+            # (см. reader/turkey_bot/keyboards.py::toll_provider_keyboard).
+            return await self._handle_check_tolls_menu(chat_id=chat_id)
 
         if stripped == texts.HELP_LABEL:
             return await self._handle_help(chat_id=chat_id)
@@ -398,6 +462,10 @@ class ConversationController:
                 return await self._handle_avrasya_captcha_code(
                     stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, state=state,
                 )
+            if provider == _PROVIDER_KGM:
+                return await self._handle_kgm_captcha_code(
+                    stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, state=state,
+                )
             return await self._handle_captcha_code(
                 stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, state=state,
             )
@@ -407,13 +475,15 @@ class ConversationController:
     async def handle_cancel(self, *, chat_id: int) -> BotReply:
         """Общий путь и для текстовой команды /cancel, и для inline
         "❌ Отмена" (см. reader/turkey_bot/handlers.py) — оба ведут сюда.
-        Отменяет ЛЮБУЮ живую проверку — GIB и/или Avrasya (в норме активна
-        не больше одной сразу, см. design report: единый lock, но
-        pop_and_close на обеих — дешёвая защита от рассинхронизации)."""
+        Отменяет ЛЮБУЮ живую проверку — GIB и/или Avrasya и/или KGM (в
+        норме активна не больше одной сразу, см. design report: единый
+        lock, но pop_and_close на всех трёх — дешёвая защита от
+        рассинхронизации)."""
         async with self._registry.lock_for(chat_id):
             had_live_check = (
                 await self._registry.get(chat_id) is not None
                 or await self._avrasya_registry.get(chat_id) is not None
+                or await self._kgm_registry.get(chat_id) is not None
             )
             had_state = self._states.get(chat_id) is not None
             if not had_live_check and not had_state:
@@ -421,6 +491,7 @@ class ConversationController:
 
             await self._registry.pop_and_close(chat_id)
             await self._avrasya_registry.pop_and_close(chat_id)
+            await self._kgm_registry.pop_and_close(chat_id)
             self._states.clear(chat_id)
             return BotReply(text=texts.CANCEL_CONFIRM_TEXT, show_main_menu=True)
 
@@ -440,6 +511,7 @@ class ConversationController:
             # пункты меню).
             await self._registry.pop_and_close(chat_id)
             await self._avrasya_registry.pop_and_close(chat_id)
+            await self._kgm_registry.pop_and_close(chat_id)
             self._states.clear(chat_id)
 
         cars = tuple(self._garage.list_cars(telegram_user_id))
@@ -457,6 +529,7 @@ class ConversationController:
         async with self._registry.lock_for(chat_id):
             await self._registry.pop_and_close(chat_id)
             await self._avrasya_registry.pop_and_close(chat_id)
+            await self._kgm_registry.pop_and_close(chat_id)
             self._states.clear(chat_id)
 
         stats = self._statistics.get_statistics(now=datetime.now(timezone.utc), tz=self._tz)
@@ -480,6 +553,7 @@ class ConversationController:
         async with self._registry.lock_for(chat_id):
             await self._registry.pop_and_close(chat_id)
             await self._avrasya_registry.pop_and_close(chat_id)
+            await self._kgm_registry.pop_and_close(chat_id)
             self._states.clear(chat_id)
 
         return BotReply(text=texts.HELP_MENU_TEXT, help_keyboard="menu")
@@ -511,25 +585,56 @@ class ConversationController:
         вводит отдельный "текст главного меню" без надобности."""
         return BotReply(text=texts.WELCOME_TEXT, show_main_menu=True)
 
-    async def _handle_check_button(
-        self, *, chat_id: int, telegram_user_id: int, provider: str,
-    ) -> BotReply:
-        """Нажатие CHECK_FINES_LABEL/CHECK_TOLLS_LABEL в главном меню —
-        armит provider для СЛЕДУЮЩЕГО введённого номера (см.
-        _STEP_AWAITING_PLATE) и, как и остальные пункты меню, отбрасывает
-        любой прошлый незавершённый диалог."""
+    async def _handle_check_tolls_menu(self, *, chat_id: int) -> BotReply:
+        """Нажатие CHECK_TOLLS_LABEL в главном меню (см. design report
+        "Реализация KGM provider" п.10) — показывает выбор конкретного
+        провайдера (см. reader/turkey_bot/keyboards.py::
+        toll_provider_keyboard), НЕ armит provider напрямую (в отличие от
+        CHECK_FINES_LABEL, см. handle_toll_provider_callback ниже) — как и
+        остальные пункты меню, отбрасывает любой прошлый незавершённый
+        диалог."""
         async with self._registry.lock_for(chat_id):
             await self._registry.pop_and_close(chat_id)
             await self._avrasya_registry.pop_and_close(chat_id)
+            await self._kgm_registry.pop_and_close(chat_id)
+            self._states.clear(chat_id)
+        return BotReply(text=texts.CHOOSE_TOLL_PROVIDER_TEXT, toll_provider_keyboard=True)
+
+    async def handle_toll_provider_callback(
+        self, provider: str, *, chat_id: int, telegram_user_id: int,
+    ) -> BotReply:
+        """Нажатие "🚇 Avrasya Tüneli"/"🛣 Все дороги и мосты (KGM)" (см.
+        reader/turkey_bot/keyboards.py::decode_toll_provider_callback —
+        provider уже проверен там на принадлежность _TOLL_PROVIDERS) —
+        отсюда та же логика, что и у CHECK_FINES_LABEL (см.
+        _handle_check_button), просто достигается через доп. шаг выбора."""
+        return await self._handle_check_button(
+            chat_id=chat_id, telegram_user_id=telegram_user_id, provider=provider,
+        )
+
+    async def _handle_check_button(
+        self, *, chat_id: int, telegram_user_id: int, provider: str,
+    ) -> BotReply:
+        """Нажатие CHECK_FINES_LABEL в главном меню ИЛИ выбора конкретного
+        provider из подменю CHECK_TOLLS_LABEL (см.
+        handle_toll_provider_callback выше) — armит provider для
+        СЛЕДУЮЩЕГО введённого номера (см. _STEP_AWAITING_PLATE) и, как и
+        остальные пункты меню, отбрасывает любой прошлый незавершённый
+        диалог."""
+        async with self._registry.lock_for(chat_id):
+            await self._registry.pop_and_close(chat_id)
+            await self._avrasya_registry.pop_and_close(chat_id)
+            await self._kgm_registry.pop_and_close(chat_id)
             self._states.set(
                 chat_id, telegram_user_id=telegram_user_id, step=_STEP_AWAITING_PLATE,
                 payload={"provider": provider},
             )
-        text = (
-            texts.ASK_PLATE_FOR_TOLLS_TEXT
-            if provider == _PROVIDER_AVRASYA
-            else texts.ASK_PLATE_FOR_FINES_TEXT
-        )
+        if provider == _PROVIDER_AVRASYA:
+            text = texts.ASK_PLATE_FOR_TOLLS_TEXT
+        elif provider == _PROVIDER_KGM:
+            text = texts.ASK_PLATE_FOR_KGM_TEXT
+        else:
+            text = texts.ASK_PLATE_FOR_FINES_TEXT
         return BotReply(text=text, show_main_menu=True)
 
     async def handle_garage_check(
@@ -597,6 +702,7 @@ class ConversationController:
             # (например, после ошибки в предыдущем цикле) — обычно no-op.
             await self._registry.pop_and_close(chat_id)
             await self._avrasya_registry.pop_and_close(chat_id)
+            await self._kgm_registry.pop_and_close(chat_id)
             self._states.clear(chat_id)
 
             if provider == _PROVIDER_AVRASYA:
@@ -612,6 +718,14 @@ class ConversationController:
                         "Turkey Avrasya: failed to start session/captcha (chat_id=%s)", chat_id,
                     )
                     return BotReply(text=texts.AVRASYA_CAPTCHA_FETCH_FAILED_TEXT, show_main_menu=True)
+            elif provider == _PROVIDER_KGM:
+                try:
+                    challenge = await self._open_new_kgm_check(chat_id, telegram_user_id, plate)
+                except KgmTransportError:
+                    logger.warning(
+                        "Turkey KGM: failed to start session/captcha (chat_id=%s)", chat_id,
+                    )
+                    return BotReply(text=texts.KGM_CAPTCHA_FETCH_FAILED_TEXT, show_main_menu=True)
             else:
                 challenge = await self._open_new_check(chat_id, telegram_user_id, plate)
                 if challenge is None:
@@ -1039,5 +1153,190 @@ class ConversationController:
         self._states.set(
             chat_id, telegram_user_id=telegram_user_id, step=_STEP_AWAITING_CODE,
             payload={"plate": plate, "provider": _PROVIDER_AVRASYA},
+        )
+        return challenge
+
+    # ---- KGM (см. reader/turkey_bot/kgm/*) — design report "Реализация
+    # KGM provider" — структурная копия ветки Avrasya выше, НЕ общий
+    # базовый класс (тот же принцип "do not force KGM into GIB/Avrasya-
+    # specific abstractions", уже применённый к Avrasya). ----
+
+    async def _handle_kgm_captcha_code(
+        self, code: str, *, chat_id: int, telegram_user_id: int, state: ConversationState,
+    ) -> BotReply:
+        """Структурная копия _handle_avrasya_captcha_code() (см. выше) для
+        KGM — та же "restart recovery"/rejected-retry семантика, но через
+        LiveKgmSessionRegistry/KgmProvider."""
+        async with self._registry.lock_for(chat_id):
+            check = await self._kgm_registry.get(chat_id)
+
+            if check is None:
+                plate = (state.payload or {}).get("plate")
+                if not plate:
+                    self._states.clear(chat_id)
+                    return BotReply(text=texts.SESSION_LOST_TEXT, show_main_menu=True)
+
+                try:
+                    challenge = await self._open_new_kgm_check(chat_id, telegram_user_id, plate)
+                except KgmTransportError:
+                    self._states.clear(chat_id)
+                    logger.warning(
+                        "Turkey KGM: failed to start session/captcha (chat_id=%s)", chat_id,
+                    )
+                    return BotReply(text=texts.KGM_CAPTCHA_FETCH_FAILED_TEXT, show_main_menu=True)
+
+                return BotReply(
+                    text=texts.SESSION_EXPIRED_RETRY_TEXT,
+                    photo_png=challenge.image_png,
+                    show_cancel_button=True,
+                )
+
+            check.submit_attempts += 1
+            try:
+                outcome = await check.provider.submit(plate=check.plate, captcha_code=code)
+            except KgmTransportError:
+                await self._finish_kgm(
+                    chat_id, telegram_user_id=telegram_user_id, check=check,
+                    status="error", raw_response=None,
+                )
+                logger.warning("Turkey KGM submit: transport error (chat_id=%s)", chat_id)
+                return BotReply(text=texts.KGM_TRANSPORT_ERROR_TEXT, show_main_menu=True)
+
+            return await self._handle_kgm_submit_outcome(
+                outcome, chat_id=chat_id, telegram_user_id=telegram_user_id, check=check,
+            )
+
+    async def _handle_kgm_submit_outcome(
+        self, outcome: KgmSubmitOutcome, *, chat_id: int, telegram_user_id: int,
+        check: LiveKgmCheck,
+    ) -> BotReply:
+        if outcome.kind == "rejected":
+            # См. design report: тот же принцип "wrong CAPTCHA -> fresh
+            # CAPTCHA, остаёмся в том же provider-флоу", что и у GIB/
+            # Avrasya rejected (см. выше).
+            try:
+                challenge = await check.provider.refresh_captcha()
+            except KgmTransportError:
+                await self._finish_kgm(
+                    chat_id, telegram_user_id=telegram_user_id, check=check,
+                    status="error", raw_response=None,
+                )
+                logger.warning(
+                    "Turkey KGM refresh_captcha: transport error (chat_id=%s)", chat_id,
+                )
+                return BotReply(text=texts.KGM_TRANSPORT_ERROR_TEXT, show_main_menu=True)
+
+            self._states.set(
+                chat_id, telegram_user_id=telegram_user_id, step=_STEP_AWAITING_CODE,
+                payload={"plate": check.plate, "provider": _PROVIDER_KGM},
+            )
+            return BotReply(
+                text=texts.CAPTCHA_REJECTED_RETRY_TEXT, photo_png=challenge.image_png,
+                show_cancel_button=True,
+            )
+
+        raw_response = _sanitize_kgm_outcome_for_storage(outcome)
+
+        if outcome.kind in ("no_debt", "has_debt"):
+            # ОБЩИЙ гараж — ТОЛЬКО для реально завершённых no_debt/
+            # has_debt, тот же принцип, что и у GIB/Avrasya выше.
+            self._garage.record_successful_check(
+                telegram_user_id=telegram_user_id, car_number=check.plate,
+            )
+
+        if outcome.kind == "no_debt":
+            await self._finish_kgm(
+                chat_id, telegram_user_id=telegram_user_id, check=check,
+                status="no_debt", raw_response=raw_response,
+            )
+            return BotReply(text=texts.kgm_no_debt_text(check.plate), show_main_menu=True)
+
+        if outcome.kind == "has_debt":
+            # См. reader/turkey_bot/texts.py::format_kgm_has_debt_messages —
+            # строит текст ТОЛЬКО из уже типизированных KgmOperatorResult/
+            # KgmDebtItem (см. kgm/models.py), conversation.py здесь НЕ
+            # интерпретирует HTML вообще. Список сообщений (см. GIB
+            # format_has_debt_messages выше про лимит Telegram) — первое
+            # идёт как основной ответ, остальные — extra_texts.
+            rendered_messages = texts.format_kgm_has_debt_messages(
+                check.plate, outcome.operators,
+                kgm_total=outcome.kgm_total, yid_total=outcome.yid_total,
+                grand_total=outcome.grand_total,
+            )
+            await self._finish_kgm(
+                chat_id, telegram_user_id=telegram_user_id, check=check,
+                status="has_debt", raw_response=raw_response,
+            )
+            return BotReply(
+                text=rendered_messages[0], extra_texts=tuple(rendered_messages[1:]),
+                show_main_menu=True,
+                # См. design report: ОДИНАКОВЫЕ CTA-кнопки для ЛЮБОГО
+                # провайдера has_debt (GIB/Avrasya/KGM), независимо от
+                # is_trusted (см. BotReply.cta_buttons докстрок и
+                # _debt_cta_buttons выше) — "для всех пользователей, не
+                # только manager/trusted, тем же способом, как сейчас
+                # сделано для GİB/Avrasya".
+                cta_buttons=self._debt_cta_buttons(),
+            )
+
+        # "unexpected" — НЕ трогает гараж (см. design report: "unexpected
+        # response does not add car").
+        await self._finish_kgm(
+            chat_id, telegram_user_id=telegram_user_id, check=check,
+            status="unexpected", raw_response=raw_response,
+        )
+        logger.warning(
+            "Turkey KGM: unexpected response shape (chat_id=%s, message=%r)",
+            chat_id, outcome.message,
+        )
+        return BotReply(text=texts.KGM_UNEXPECTED_TEXT, show_main_menu=True)
+
+    async def _finish_kgm(
+        self,
+        chat_id: int,
+        *,
+        telegram_user_id: int,
+        check: LiveKgmCheck,
+        status: str,
+        raw_response: str | None,
+    ) -> None:
+        """Аналог _finish_avrasya() (см. выше) для KGM — пишет в ТУ ЖЕ
+        turkey_toll_checks (provider="kgm", см. design report "Реализация
+        KGM provider" п.11: "Если schema уже позволяет provider='kgm' —
+        используй её без migration" — колонка уже свободный TEXT, миграция
+        не потребовалась)."""
+        await self._kgm_registry.pop_and_close(chat_id)
+        self._states.clear(chat_id)
+        self._toll_checks.record_result(
+            telegram_user_id=telegram_user_id,
+            telegram_chat_id=chat_id,
+            provider=_PROVIDER_KGM,
+            plate=check.plate,
+            captcha_attempts=check.submit_attempts,
+            status=status,
+            message_text=None,
+            raw_response=raw_response,
+        )
+
+    async def _open_new_kgm_check(
+        self, chat_id: int, telegram_user_id: int, plate: str,
+    ) -> KgmCaptchaChallenge:
+        """Аналог _open_new_avrasya_check() (см. выше) для KGM — та же
+        логика: НЕ проглатывает KgmTransportError сама, а закрывает client
+        и поднимает исключение дальше — вызывающий код (см.
+        _start_check_for_plate/_handle_kgm_captcha_code) решает, какой
+        текст показать пользователю."""
+        client, provider = self._kgm_check_factory()
+        try:
+            challenge = await provider.start()
+        except KgmTransportError:
+            await client.aclose()
+            raise
+
+        check = LiveKgmCheck(client=client, provider=provider, plate=plate)
+        await self._kgm_registry.put(chat_id, check)
+        self._states.set(
+            chat_id, telegram_user_id=telegram_user_id, step=_STEP_AWAITING_CODE,
+            payload={"plate": plate, "provider": _PROVIDER_KGM},
         )
         return challenge

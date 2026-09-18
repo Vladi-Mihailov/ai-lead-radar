@@ -1,0 +1,693 @@
+
+<div class="container">
+<div id="pnlUpdate">
+<div class="row">
+<div class="col-md-4 d-flex justify-content-start">
+<a href="http://www.kgm.gov.tr" id="kgmLogoId">
+<img id="kgmLogoImageId" src="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/Images/kgm_logo_k.png"/>
+</a>
+</div>
+<div class="col-md-4 d-flex justify-content-center align-self-center">
+<p class="h4">İHLALLİ GEÇİŞ SORGULAMA</p>
+</div>
+<div class="col-md-4 d-none d-sm-block d-xs-block text-right">
+<a href="http://www.ubak.gov.tr"><img src="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/Images/udh_logo.png"/></a>
+<img src="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/Images/ataturk.png"/>
+</div>
+</div>
+<div class="row justify-content-center">
+<div class="col-md-4 d-none d-sm-block d-xs-block">
+</div>
+<div class="col-md-4 d-flex justify-content-lg-center justify-content-md-center justify-content-sm-center justify-content-xs-center">
+<div class="plate-container">
+<div class="plaka-wrapper">
+<input class="plaka-input form-control input-lg" data-mode="latin" id="txtPlk" maxlength="20" name="txtPlk" placeholder="Plaka" style="text-transform: uppercase; direction: ltr !important; unicode-bidi: plaintext !important;" title="Plaka" type="text" value="M295YB196"/>
+</div>
+<div class="keyboard-toggle">
+<button onclick="toggleKeyboard('latin')" type="button">Latin</button>
+<button onclick="toggleKeyboard('cyrillic')" type="button">Кирил</button>
+<button onclick="toggleKeyboard('arabic')" type="button">عربي</button>
+</div>
+<div class="virtual-keyboard compact" id="vk">
+<div class="digit-switch" id="digitSwitch">
+<button id="btnArabic" onclick="setDigits('arabic')" title="Arabic digits" type="button">٠١٢</button>
+<button id="btnPersian" onclick="setDigits('persian')" title="Persian digits" type="button">۰۱۲</button>
+</div>
+</div>
+</div>
+</div>
+<div class="col-md-2 d-flex justify-content-start">
+<span class="vgRegEx" id="cvPlaka" style="visibility:hidden;">*</span>
+<span class="vgRegEx_bt" id="rfv1" style="visibility:hidden;">*</span>
+</div>
+<div class="col-md-2 d-none d-sm-block d-xs-block text-right">
+<a class="link-primary" href="Odeme/OdemeSorgulama.aspx" target="_parent">
+
+    Ödeme Sorgula
+
+</a>
+</div>
+</div>
+<div class="row">
+<div class="col-md-4 d-none d-sm-block d-xs-block"></div>
+<div class="col-md-4 d-flex justify-content-lg-center justify-content-md-center justify-content-sm-center justify-content-xs-center">
+<img id="Image1" src="../Captcha/CaptchaImage.aspx?r=12154417a41341be8d3faefe324b4f36"/>
+</div>
+<div class="col-md-4 d-none d-sm-block d-xs-block"></div>
+</div>
+<div class="row">
+<div class="col-md-4 d-none d-sm-block d-xs-block"></div>
+<div class="col-md-4 d-flex justify-content-lg-center justify-content-md-center justify-content-sm-center justify-content-xs-center">
+<textarea class="form-control input-lg mtTextBoxLarge" cols="20" id="txtimgcode" name="txtimgcode" placeholder="Matematiksel ifadenin sonucunu ve yanındaki sayıyı arada bir boşluk bırakarak giriniz." rows="2" style="height:85px;" title="Metni girin">
+
+</textarea>
+</div>
+<div class="col-md-4">
+<span class="control-label" id="Label7" style="display:inline-block;color:Red;width:70px;"></span>
+</div>
+</div>
+<div class="row">
+<div class="col-md-4 d-none d-sm-block d-xs-block"></div>
+<div class="col-md-4 d-flex justify-content-lg-center justify-content-md-end justify-content-sm-center justify-content-xs-center">
+<span class="control-label vgRegEx_bt" id="lblHata" style="color:Red;font-size:Small;"></span>
+</div>
+<div class="col-md-4 d-none d-sm-block d-xs-block"></div>
+</div>
+<div class="row">
+<div class="col-md-4 d-none d-sm-block d-xs-block"></div>
+<div class="col-md-4 d-flex justify-content-lg-center justify-content-md-center justify-content-sm-center justify-content-xs-center">
+<input class="btn btn-primary btn-lg btn-block" id="btnSorgula" name="btnSorgula" onclick='GuvenlikCheckFunc();WebForm_DoPostBackWithOptions(new WebForm_PostBackOptions("btnSorgula", "", true, "val1", "", false, false))' type="submit" value="Sorgula"/>
+</div>
+<div class="col-md-4 d-none d-sm-block d-xs-block"></div>
+</div>
+</div>
+<div id="pnlGuvenlik">
+<div class="row">
+<div class="col-md-4 d-none d-sm-block d-xs-block"></div>
+<div class="col-md-4 d-flex justify-content-lg-end justify-content-md-end justify-content-sm-center justify-content-xs-center">
+<span class="vgRegEx_bt" id="lblGuvenlikHata" style="color:Red;font-size:Small;"></span>
+</div>
+<div class="col-md-4 d-none d-sm-block d-xs-block"></div>
+</div>
+<div class="row">
+<div class="col-md-12 d-flex justify-content-center">
+<div style="font-size:16px; text-align: justify; text-justify: inter-word;">
+
+    KGM tarafından işletilen ücretli otoyol ve köprülerden yapılan son 15 güne ait  geçişler  henüz bu sayfaya yansımamış olabilir. <span style="font-weight: bold">Ücret Toplama Sistemlerimizin esas ödeme kanalı HGS hesaplarıdır. </span>Bu sebeple  cezalı duruma düşmemek için geçiş tarihini izleyen 15 gün içerisinde araç plakanıza ait bir HGS hesabının açılması, hesabı olan araçlar için ise HGS hesabına yeterli bakiye yüklenmesi gerekmektedir. <span style="font-weight: bold">Ödemeler kişinin seçimi ile doğrulama sistemleri onayladıktan sonra gerçekleştiği için yanlış plakaya veya eski araç sahibi adına yapılan ödemelere iade hakkı tanınmamaktadır.</span>
+</div>
+</div>
+</div>
+<div class="row">
+<div class="col-md-4 d-none d-sm-block d-xs-block"></div>
+<div class="col-md-4 d-flex justify-content-center">
+<input id="chkGuvenlikUyari" name="chkGuvenlikUyari" onclick="GuvenlikCheckFunc();" type="checkbox"/>
+<span style="font-weight: bold; color: red;">
+
+    OKUDUM ANLADIM
+
+ </span>
+<input id="txtGuvenlikCheck" name="txtGuvenlikCheck" style="display: none" type="text" value="Okay"/>
+<span class="vgRegEx_bt" id="RequiredFieldValidator1" style="visibility:hidden;">*</span>
+</div>
+<div class="col-md-4 d-none d-sm-block d-xs-block"></div>
+</div>
+</div>
+<div id="pnlTum">
+<div id="divTumPanel">
+<div class="row">
+<div class="col-md-4 d-none d-sm-block d-xs-block"></div>
+<div class="col-md-4 d-flex justify-content-center">
+<input id="lblPlakaText" name="lblPlakaText" type="hidden" value="M295YB196"/>
+<input id="lblPlakaText_show" name="lblPlakaText_show" type="hidden" value="M295YB196"/>
+<span class="mtLabelPlaka_bt" dir="ltr" style="unicode-bidi:plaintext;">M295YB196</span>
+</div>
+<div class="col-md-4 d-none d-sm-block d-xs-block"></div>
+</div>
+<div id="pnlKgm">
+<a name="”aspKgm“"></a>
+<div class="row align-items-center">
+<div class="col-2 d-flex justify-content-start d-none d-sm-block d-xs-block">
+<img src="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/Images/kgm.ico" style="height: 40px; width: 40px;"/>
+</div>
+<div class="col-8 d-flex justify-content-start">
+<span class="mtLabelHeader" id="lblKgm">KARAYOLLARI GENEL MÜDÜRLÜĞÜ: Kayıt yok.</span>
+</div>
+<div class="col-2 d-flex justify-content-end">
+<a class="detayliBilgiLink" data-target="#detayliBilgiKgmModalId" data-toggle="modal" href="#aspKgm">
+
+   Detaylı Bilgi
+
+ </a>
+</div>
+</div>
+<div class="row">
+<div class="col-md-12 d-flex justify-content-end">
+<span class="detayliBilgiLink" style="color: black;">
+
+    Tebligat sütunundaki işaretin (☍) üzerine tıklayarak tebligata bağlı bütün ihlalleri seçebilirsiniz.
+
+ </span>
+</div>
+</div>
+<div class="row">
+<div class="col-md-12 d-flex justify-content-end">
+</div>
+</div>
+<div>
+<table border="1" cellspacing="0" class="display" id="gvKgm" rules="all" style="background-color:#FFC266;font-size:Smaller;width:100%;border-collapse:collapse;">
+<thead>
+<tr class="tdHeader">
+<th scope="col">
+
+    Bilgi
+
+</th><th scope="col">Geçiş Ücreti</th><th scope="col">Ödenecek Tutar</th><th scope="col">
+<input id="cbHeader" name="gvKgm$ctl01$cbHeader" onclick="javascript:SelectHeaderCheckboxes(this);" type="checkbox"/>
+
+    Ödeme
+
+</th><th scope="col">Çıkış Tarih</th><th scope="col">Giriş İstasyon</th><th scope="col">Çıkış İstasyon</th><th scope="col">Araç Sınıf</th><th scope="col">Cezasız Son Ödeme Tarihi</th><th scope="col">
+
+    Tebligat
+
+</th>
+</tr>
+</thead>
+</table>
+</div>
+<div class="row">
+<div class="col-md-9 d-flex justify-content-start">
+<span class="mtLabel" id="lblDetayliBilgiIcin">Detaylı bilgi için: ALO 123 veya 0 850 460 60 60 / hgs@ptt.gov.tr / ukome@kgm.gov.tr</span>
+</div>
+<div class="col-md-1 d-flex justify-content-start">
+<span class="mtLabel" id="lblToplam">Toplam</span>
+</div>
+<div class="col-md-1 d-flex justify-content-start">
+<span class="mtLabel" id="lblKgmCezaToplam">0,00 ₺</span>
+</div>
+<div class="col-md-1 d-flex justify-content-center">
+<input class="aspNetDisabled btnTableOdemeLinkDisabled" disabled="disabled" id="btnKgmOdeme2" name="btnKgmOdeme2" style="height:25px;" type="submit" value="Ödeme"/>
+</div>
+</div>
+<div class="row">
+<div class="col-md-12 d-flex justify-content-end">
+<span class="detayliBilgiLink" id="lblKgmChkHata2" style="color:Red;">Ödeme için ihlal seçin.</span>
+</div>
+</div>
+<hr class="solid"/>
+</div>
+<div id="pnlAvrasya">
+<a name="”aspAvrasya“"></a>
+<div class="row align-items-center">
+<div class="col-2 d-flex justify-content-start d-none d-sm-block d-xs-block">
+<img src="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/Images/avrasyayenilogo.png" style="height: 20px; width: 40px;"/>
+</div>
+<div class="col-8 d-flex justify-content-start">
+<span class="mtLabelHeader" id="lblAvrasya">AVRASYA TÜNELİ İŞLETME İNŞAAT VE YATIRIM A.Ş. (AVRASYA TÜNELİ): Kayıt yok.</span>
+</div>
+<div class="col-2 d-flex justify-content-end">
+<a class="detayliBilgiLink" data-target="#detayliBilgiAvrasyaModalId" data-toggle="modal" href="#aspAvrasya">
+
+   Detaylı Bilgi
+
+ </a>
+</div>
+</div>
+<div class="row">
+<div class="col-md-12 d-flex justify-content-end">
+</div>
+</div>
+<div>
+<table border="1" cellspacing="0" class="display" id="gvAvrasya" rules="all" style="background-color:#FFFFB3;font-size:Smaller;width:100%;border-collapse:collapse;">
+<thead>
+<tr class="tdHeader">
+<th scope="col">
+
+Bilgi
+
+</th><th scope="col">Çıkış Tarih</th><th scope="col">Giriş İstasyon</th><th scope="col">Çıkış İstasyon</th><th scope="col">Araç Sınıf</th><th scope="col">Cezasız Son Ödeme Tarihi</th><th scope="col">Geçiş Ücreti</th><th scope="col">Ödenecek Tutar</th>
+</tr>
+</thead>
+</table>
+</div>
+<div class="row">
+<div class="col-md-5 d-flex justify-content-start">
+<span class="mtLabel" id="lblDetayliBilgiIcinAvrasya">Detaylı bilgi için: 0850 222 8020 / bilgi@avrasyatuneli.com</span>
+</div>
+<div class="col-md-5 d-flex justify-content-center">
+<a class="btn btn-info btn-xs btn-block" href="https://www.avrasyatuneli.com/ihlalli-gecis-odemesi/?customerType=9&amp;plate=M295YB196&amp;transactionDate=SANITIZED&amp;hash=SANITIZED" id="hypAvrasya" target="targetAvrasya" title="Kurumun ödeme sayfasına gitmek için tıklayın">Kurum Sayfasında Öde</a>
+</div>
+<div class="col-md-1 d-flex justify-content-start">
+<span class="mtLabel" id="lblAvrasyaToplam">Toplam</span>
+</div>
+<div class="col-md-1 d-flex justify-content-end">
+<span class="mtLabel" id="lblAvrasyaCezaToplam">0,00 ₺</span>
+</div>
+</div>
+<hr class="solid"/>
+</div>
+<div id="pnlOtoyol">
+<a name="”aspOtoyol“"></a>
+<div class="row align-items-center">
+<div class="col-2 d-flex justify-content-start d-none d-sm-block d-xs-block">
+<img src="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/Images/otoyolnew.png" style="height: 40px; width: 50px;"/>
+</div>
+<div class="col-8 d-flex justify-content-start">
+<span class="mtLabelHeader" id="lblOtoyol">OTOYOL YATIRIM VE İŞLETME A.Ş. (GEBZE-ORHANGAZİ-İZMİR OTOYOLU): Kayıt yok.</span>
+</div>
+<div class="col-2 d-flex justify-content-end">
+<a class="detayliBilgiLink" data-target="#detayliBilgiOtoyolModalId" data-toggle="modal" href="#aspOtoyol">
+
+Detaylı Bilgi
+
+</a>
+</div>
+</div>
+<div class="row">
+<div class="col-md-12 d-flex justify-content-end">
+</div>
+</div>
+<div>
+<table border="1" cellspacing="0" class="display" id="gvOtoyol" rules="all" style="background-color:#D1E0E0;font-size:Smaller;width:100%;border-collapse:collapse;">
+<thead>
+<tr class="tdHeader">
+<th scope="col">
+
+        Bilgi
+
+    </th><th scope="col">Çıkış Tarih</th><th scope="col">Giriş İstasyon</th><th scope="col">Çıkış İstasyon</th><th scope="col">Araç Sınıf</th><th scope="col">Cezasız Son Ödeme Tarihi</th><th scope="col">Geçiş Ücreti</th><th scope="col">Ödenecek Tutar</th>
+</tr>
+</thead>
+</table>
+</div>
+<div class="row">
+<div class="col-md-5 d-flex justify-content-start">
+<span class="mtLabel" id="lblDetayliBilgiIcinOtoyol">Detaylı bilgi için: 0850 399 35 05 / sorun@otoyolas.com.tr</span>
+</div>
+<div class="col-md-5 d-flex justify-content-center">
+<a class="btn btn-info btn-xs btn-block" href="https://sanalpos.otoyolas.com.tr/DebtInquiryResult?customerAccessType=9&amp;customerAccessNumber=M295YB196&amp;datetime=20260918093148&amp;hash=SANITIZED" id="hypOtoyol" target="targetOtoyol" title="Kurumun ödeme sayfasına gitmek için tıklayın">Kurum Sayfasında Öde</a>
+</div>
+<div class="col-md-1 d-flex justify-content-start">
+<span class="mtLabel" id="lblOtoyolToplam">Toplam</span>
+</div>
+<div class="col-md-1 d-flex justify-content-end">
+<span class="mtLabel" id="lblOtoyolCezaToplam"></span>
+</div>
+</div>
+<hr class="solid"/>
+</div>
+<div id="pnlYss">
+<a name="”aspYss“"></a>
+<div class="row align-items-center">
+<div class="col-2 d-flex justify-content-start d-none d-sm-block d-xs-block">
+<img src="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/Images/icyenilogoOrj.png" style="height: 10px; width: 50px;"/>
+</div>
+<div class="col-8 d-flex justify-content-start">
+<span class="mtLabelHeader" id="lblYss">ICA (YSS KÖPRÜSÜ VE KUZEY ÇEVRE OTOYOLU): Kayıt yok.</span>
+</div>
+<div class="col-2 d-flex justify-content-end">
+<a class="detayliBilgiLink" data-target="#detayliBilgiYssModalId" data-toggle="modal" href="#aspYss">
+
+Detaylı Bilgi</a>
+</div>
+</div>
+<div class="row">
+<div class="col-md-12 d-flex justify-content-end">
+</div>
+</div>
+<div>
+<table border="1" cellspacing="0" class="display" id="gvYss" rules="all" style="background-color:#CCFFCC;font-size:Smaller;width:100%;border-collapse:collapse;">
+<thead>
+<tr class="tdHeader">
+<th scope="col">
+
+        Bilgi
+
+    </th><th scope="col">Çıkış Tarih</th><th scope="col">Giriş İstasyon</th><th scope="col">Çıkış İstasyon</th><th scope="col">Araç Sınıf</th><th scope="col">Cezasız Son Ödeme Tarihi</th><th scope="col">Geçiş Ücreti</th><th scope="col">Ödenecek Tutar</th>
+</tr>
+</thead>
+</table>
+</div>
+<div class="row">
+<div class="col-md-5 d-flex justify-content-start">
+<span class="mtLabel" id="lblDetayliBilgiIcinYss">Detaylı bilgi için: 0850 502 7100 / bilgi@ysskoprusuveotoyolu.com.tr</span>
+</div>
+<div class="col-md-5 d-flex justify-content-center">
+<a class="btn btn-info btn-xs btn-block" href="https://www.ysskoprusuveotoyolu.com.tr/TR/ihlalli-gecis-sorgulama-ve-online-odeme" id="hypYss" target="targetYss" title="Kurumun ödeme sayfasına gitmek için tıklayın">Kurum Sayfasında Öde</a>
+</div>
+<div class="col-md-1 d-flex justify-content-start">
+<span class="mtLabel" id="lblYssToplam">Toplam</span>
+</div>
+<div class="col-md-1 d-flex justify-content-end">
+<span class="mtLabel" id="lblYssCezaToplam"></span>
+</div>
+</div>
+<hr class="solid"/>
+</div>
+<div id="pnlAvrupaOtoyolu">
+<a name="”aspAvrupaOtoyolu“"></a>
+<div class="row align-items-center">
+<div class="col-2 d-flex justify-content-start d-none d-sm-block d-xs-block">
+<img src="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/Images/avrupa_otoyolu.PNG" style="height: 40px; width: 90px;"/>
+</div>
+<div class="col-8 d-flex justify-content-start">
+<span class="mtLabelHeader" id="lblAvrupaOtoyolu">AVRUPA OTOYOLU YATIRIM VE İŞLETME A.Ş. Kayıt yok.</span>
+</div>
+<div class="col-2 d-flex justify-content-end">
+<a class="detayliBilgiLink" data-target="#detayliBilgiAvrupaModalId" data-toggle="modal" href="#aspAvrupaOtoyolu">
+
+Detaylı Bilgi</a>
+</div>
+</div>
+<div class="row">
+<div class="col-md-12 d-flex justify-content-end">
+</div>
+</div>
+<div>
+<table border="1" cellspacing="0" class="display" id="gvAvrupaOtoyolu" rules="all" style="background-color:#FFEEDB;font-size:Smaller;width:100%;border-collapse:collapse;">
+<thead>
+<tr class="tdHeader">
+<th scope="col">
+
+    Bilgi
+
+</th><th scope="col">Çıkış Tarih</th><th scope="col">Giriş İstasyon</th><th scope="col">Çıkış İstasyon</th><th scope="col">Araç Sınıf</th><th scope="col">Cezasız Son Ödeme Tarihi</th><th scope="col">Geçiş Ücreti</th><th scope="col">Ödenecek Tutar</th>
+</tr>
+</thead>
+</table>
+</div>
+<div class="row">
+<div class="col-md-5 d-flex justify-content-start">
+<span class="mtLabel" id="lblDetayliBilgiIcinAvrupaOtoyolu">Detaylı bilgi için: 0850 259 00 61 / bilgi@avrupaotoyolisletmesi.com</span>
+</div>
+<div class="col-md-5 d-flex justify-content-center">
+<a class="btn btn-info btn-xs btn-block" href="https://sanalpos.kuzeymarmaraotoyolu.com:3434/DebtInquiryResult?customerAccessType=9&amp;customerAccessNumber=M295YB196&amp;datetime=20260918093148&amp;institutionCode=2200&amp;siteCode=212&amp;hash=SANITIZED" id="hypAvrupaOtoyolu" target="targetAvrupaOtoyolu" title="Kurumun ödeme sayfasına gitmek için tıklayın">Kurum Sayfasında Öde</a>
+</div>
+<div class="col-md-1 d-flex justify-content-start">
+<span class="mtLabel" id="lblAvrupaOtoyoluToplam">Toplam</span>
+</div>
+<div class="col-md-1 d-flex justify-content-end">
+<span class="mtLabel" id="lblAvrupaOtoyoluCezaToplam"></span>
+</div>
+</div>
+<hr class="solid"/>
+</div>
+<div id="pnlAnadoluOtoyolu">
+<a name="”aspAnadoluOtoyolu“"></a>
+<div class="row align-items-center">
+<div class="col-2 d-flex justify-content-start d-none d-sm-block d-xs-block">
+<img src="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/Images/anadolu_otoyolu.PNG" style="height: 40px; width: 90px;"/>
+</div>
+<div class="col-8 d-flex justify-content-start">
+<span class="mtLabelHeader" id="lblAnadoluOtoyolu">KMO ANADOLU OTOYOL İŞLETMESİ A.Ş: Kayıt yok.</span>
+</div>
+<div class="col-2 d-flex justify-content-end">
+<a class="detayliBilgiLink" data-target="#detayliBilgiAnadoluModalId" data-toggle="modal" href="#aspAnadoluOtoyolu">
+
+Detaylı Bilgi</a>
+</div>
+</div>
+<div class="row">
+<div class="col-md-12 d-flex justify-content-end">
+</div>
+</div>
+<div>
+<table border="1" cellspacing="0" class="display" id="gvAnadoluOtoyolu" rules="all" style="background-color:#D6C9C9;font-size:Smaller;width:100%;border-collapse:collapse;">
+<thead>
+<tr class="tdHeader">
+<th scope="col">
+
+    Bilgi
+
+</th><th scope="col">Çıkış Tarih</th><th scope="col">Giriş İstasyon</th><th scope="col">Çıkış İstasyon</th><th scope="col">Araç Sınıf</th><th scope="col">Cezasız Son Ödeme Tarihi</th><th scope="col">Geçiş Ücreti</th><th scope="col">Ödenecek Tutar</th>
+</tr>
+</thead>
+</table>
+</div>
+<div class="row">
+<div class="col-md-5 d-flex justify-content-start">
+<span class="mtLabel" id="lblDetayliBilgiIcinAnadoluOtoyolu">Detaylı bilgi için: 0850 259 00 61 / bilgi@anadoluotoyolisletmesi.com</span>
+</div>
+<div class="col-md-5 d-flex justify-content-center">
+<a class="btn btn-info btn-xs btn-block" href="https://sanalpos.kuzeymarmaraotoyolu.com:3434/DebtInquiryResult?customerAccessType=9&amp;customerAccessNumber=M295YB196&amp;datetime=20260918093148&amp;institutionCode=2100&amp;siteCode=216&amp;hash=SANITIZED" id="hypAnadoluOtoyolu" target="targetAnadoluOtoyolu" title="Kurumun ödeme sayfasına gitmek için tıklayın">Kurum Sayfasında Öde</a>
+</div>
+<div class="col-md-1 d-flex justify-content-start">
+<span class="mtLabel" id="lblAnadoluOtoyoluToplam">Toplam</span>
+</div>
+<div class="col-md-1 d-flex justify-content-end">
+<span class="mtLabel" id="lblAnadoluOtoyoluCezaToplam"></span>
+</div>
+</div>
+<hr class="solid"/>
+</div>
+<div id="pnlIkaOtoyolu">
+<a name="”aspIkaOtoyolu“"></a>
+<div class="row align-items-center">
+<div class="col-2 d-flex justify-content-start d-none d-sm-block d-xs-block">
+<img src="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/Images/kuzey_ege.png" style="height: 22px; width: 72px;"/>
+</div>
+<div class="col-8 d-flex justify-content-start">
+<span class="mtLabelHeader" id="lblIkaOtoyolu">İKA İZMİR OTOYOL YATIRIM VE İŞLETME A.Ş. (KUZEY EGE OTOYOLU İŞLETMESİ): Kayıt yok.</span>
+</div>
+<div class="col-2 d-flex justify-content-end">
+<a class="detayliBilgiLink" data-target="#detayliBilgiIkaModalId" data-toggle="modal" href="#aspIkaOtoyolu">
+
+Detaylı Bilgi</a>
+</div>
+</div>
+<div class="row">
+<div class="col-md-12 d-flex justify-content-end">
+</div>
+</div>
+<div>
+<table border="1" cellspacing="0" class="display" id="gvIkaOtoyolu" rules="all" style="background-color:#D7F5E4;font-size:Smaller;width:100%;border-collapse:collapse;">
+<thead>
+<tr class="tdHeader">
+<th scope="col">
+
+        Bilgi
+
+    </th><th scope="col">Çıkış Tarih</th><th scope="col">Giriş İstasyon</th><th scope="col">Çıkış İstasyon</th><th scope="col">Araç Sınıf</th><th scope="col">Cezasız Son Ödeme Tarihi</th><th scope="col">Geçiş Ücreti</th><th scope="col">Ödenecek Tutar</th>
+</tr>
+</thead>
+</table>
+</div>
+<div class="row">
+<div class="col-md-5 d-flex justify-content-start">
+<span class="mtLabel" id="lblDetayliBilgiIcinIkaOtoyolu">Detaylı bilgi için: 0850 577 35 35 / yardim@kuzeyegeotoyolu.com</span>
+</div>
+<div class="col-md-5 d-flex justify-content-center">
+<a class="btn btn-info btn-xs btn-block" href="https://odeme.kuzeyegeotoyolu.com/DebtInquiryResult?customerAccessType=9&amp;customerAccessNumber=M295YB196&amp;datetime=20260918093148&amp;institutionCode=2100&amp;siteCode=212&amp;hash=SANITIZED" id="hypKuzeyEgeOtoyolu" target="targetKuzeyEgeOtoyolu" title="Kurumun ödeme sayfasına gitmek için tıklayın">Kurum Sayfasında Öde</a>
+</div>
+<div class="col-md-1 d-flex justify-content-start">
+<span class="mtLabel" id="lblIkaOtoyoluToplam">Toplam</span>
+</div>
+<div class="col-md-1 d-flex justify-content-end">
+<span class="mtLabel" id="lblIkaOtoyoluCezaToplam"></span>
+</div>
+</div>
+<hr class="solid"/>
+</div>
+<div id="pnlAnkaraNigdeOtoyolu">
+<a name="”aspAnkaraNigdeOtoyolu“"></a>
+<div class="row align-items-center">
+<div class="col-2 d-flex justify-content-start d-none d-sm-block d-xs-block">
+<img src="../Images/ergAnkaraNigde.png" style="height: 40px; width: 55px;"/>
+</div>
+<div class="col-8 d-flex justify-content-start">
+<span class="mtLabelHeader" id="lblAnkaraNigdeOtoyolu">ERG OTOYOL YATIRIM VE İŞLETME A.Ş. (ANKARA-NİĞDE OTOYOLU): Kayıt yok.</span>
+</div>
+<div class="col-2 d-flex justify-content-end">
+<a class="detayliBilgiLink" data-target="#detayliBilgiAnkaraNigdeModalId" data-toggle="modal" href="#aspAnkaraNigdeOtoyolu">
+
+Detaylı Bilgi</a>
+</div>
+</div>
+<div class="row">
+<div class="col-md-12 d-flex justify-content-end">
+</div>
+</div>
+<div>
+<table border="1" cellspacing="0" class="display" id="gvAnkaraNigdeOtoyolu" rules="all" style="background-color:#D7EEF5;font-size:Smaller;width:100%;border-collapse:collapse;">
+<thead>
+<tr class="tdHeader">
+<th scope="col">
+
+        Bilgi
+
+    </th><th scope="col">Çıkış Tarih</th><th scope="col">Giriş İstasyon</th><th scope="col">Çıkış İstasyon</th><th scope="col">Araç Sınıf</th><th scope="col">Cezasız Son Ödeme Tarihi</th><th scope="col">Geçiş Ücreti</th><th scope="col">Ödenecek Tutar</th>
+</tr>
+</thead>
+</table>
+</div>
+<div class="row">
+<div class="col-md-5 d-flex justify-content-start">
+<span class="mtLabel" id="lblDetayliBilgiIcinAnkaraNigdeOtoyolu">Detaylı bilgi için: 0850 460 50 80 / info@ankaranigdeotoyolu.com</span>
+</div>
+<div class="col-md-5 d-flex justify-content-center">
+<a class="btn btn-info btn-xs btn-block" href="https://odeme.ankaranigdeotoyolu.com/DebtInquiryResult?customerAccessType=9&amp;customerAccessNumber=M295YB196&amp;datetime=20260918093148&amp;institutionCode=2100&amp;siteCode=212&amp;hash=SANITIZED" id="hypAnkaraNigde" target="targetNigdeAnkara" title="Kurumun ödeme sayfasına gitmek için tıklayın">Kurum Sayfasında Öde</a>
+</div>
+<div class="col-md-1 d-flex justify-content-start">
+<span class="mtLabel" id="lblAnkaraNigdeOtoyoluToplam">Toplam</span>
+</div>
+<div class="col-md-1 d-flex justify-content-end">
+<span class="mtLabel" id="lblAnkaraNigdeOtoyoluCezaToplam"></span>
+</div>
+</div>
+<hr class="solid"/>
+</div>
+<div id="pnlCanakkaleKoprusu">
+<a name="”aspCanakkaleKoprusu“"></a>
+<div class="row align-items-center">
+<div class="col-2 d-flex justify-content-start d-none d-sm-block d-xs-block">
+<img src="../Images/1915Canakkale.png" style="height: 40px; width: 55px;"/>
+</div>
+<div class="col-8 d-flex justify-content-start">
+<span class="mtLabelHeader" id="lblCanakkaleKoprusu">ÇANAKKALE OTOYOL VE KÖPRÜSÜ İNŞAAT YATIRIM VE İŞLETME A.Ş.: Kayıt yok.</span>
+</div>
+<div class="col-2 d-flex justify-content-end">
+<a class="detayliBilgiLink" data-target="#detayliBilgiCanakkaleModalId" data-toggle="modal" href="#aspCanakkaleKoprusu">
+
+Detaylı Bilgi</a>
+</div>
+</div>
+<div class="row">
+<div class="col-md-12 d-flex justify-content-end">
+</div>
+</div>
+<div>
+<table border="1" cellspacing="0" class="display" id="gvCanakkaleKoprusu" rules="all" style="background-color:#FDF5E2;font-size:Smaller;width:100%;border-collapse:collapse;">
+<thead>
+<tr class="tdHeader">
+<th scope="col">
+
+Bilgi
+
+</th><th scope="col">Çıkış Tarih</th><th scope="col">Giriş İstasyon</th><th scope="col">Çıkış İstasyon</th><th scope="col">Araç Sınıf</th><th scope="col">Cezasız Son Ödeme Tarihi</th><th scope="col">Geçiş Ücreti</th><th scope="col">Ödenecek Tutar</th>
+</tr>
+</thead>
+</table>
+</div>
+<div class="row">
+<div class="col-md-5 d-flex justify-content-start">
+<span class="mtLabel" id="lblDetayliBilgiIcinCanakkale">Detaylı bilgi için: 0850 399 19 15 / info@1915canakkale.com</span>
+</div>
+<div class="col-md-5 d-flex justify-content-center">
+<a class="btn btn-info btn-xs btn-block" href="https://sanalpos.1915canakkale.com/DebtInquiryResult?customerAccessType=9&amp;customerAccessNumber=M295YB196&amp;datetime=20260918093148&amp;institutionCode=2100&amp;siteCode=286&amp;hash=SANITIZED" id="hypCanakkale" target="targetCanakkale" title="Kurumun ödeme sayfasına gitmek için tıklayın">Kurum Sayfasında Öde</a>
+</div>
+<div class="col-md-1 d-flex justify-content-start">
+<span class="mtLabel" id="lblCanakkaleToplam">Toplam</span>
+</div>
+<div class="col-md-1 d-flex justify-content-end">
+<span class="mtLabel" id="lblCanakkaleKoprusuCezaToplam"></span>
+</div>
+</div>
+<hr class="solid"/>
+</div>
+<div id="pnlAydinDenizli">
+<a name="”aspAydinDenizli“"></a>
+<div class="row align-items-center">
+<div class="col-2 d-flex justify-content-start d-none d-sm-block d-xs-block">
+<img src="../Images/fernas.png" style="height: 40px; width: 55px;"/>
+</div>
+<div class="col-8 d-flex justify-content-start">
+<span class="mtLabelHeader" id="lblAydinDenizli">FERNAS OTOYOL İŞLETMESİ A.Ş. (AYDIN-DENİZLİ OTOYOLU): Kayıt yok.</span>
+</div>
+<div class="col-2 d-flex justify-content-end">
+<a class="detayliBilgiLink" data-target="#detayliBilgiAydinDenizliModalId" data-toggle="modal" href="#aspAydinDenizli">
+
+Detaylı Bilgi</a>
+</div>
+</div>
+<div class="row">
+<div class="col-md-12 d-flex justify-content-end">
+</div>
+</div>
+<div>
+<table border="1" cellspacing="0" class="display" id="gvAydinDenizli" rules="all" style="background-color:#9BEDFF;font-size:Smaller;width:100%;border-collapse:collapse;">
+<thead>
+<tr class="tdHeader">
+<th scope="col">
+
+Bilgi
+
+</th><th scope="col">Çıkış Tarih</th><th scope="col">Giriş İstasyon</th><th scope="col">Çıkış İstasyon</th><th scope="col">Araç Sınıf</th><th scope="col">Cezasız Son Ödeme Tarihi</th><th scope="col">Geçiş Ücreti</th><th scope="col">Ödenecek Tutar</th>
+</tr>
+</thead>
+</table>
+</div>
+<div class="row">
+<div class="col-md-5 d-flex justify-content-start">
+<span class="mtLabel" id="lblDetayliBilgiIcinAydinDenizli">Detaylı bilgi için: 0850 75 75 236 / destek@aydindenizliotoyolu.com.tr</span>
+</div>
+<div class="col-md-5 d-flex justify-content-center">
+<a class="btn btn-info btn-xs btn-block" href="https://aydindenizliotoyolu.com.tr/ihlalli-gecis-sorgulama-ve-online-odeme?plaka=M295YB196&amp;hash=SANITIZED" id="hypAydinDenizli" target="targetAydinDenizli" title="Kurumun ödeme sayfasına gitmek için tıklayın">Kurum Sayfasında Öde</a>
+</div>
+<div class="col-md-1 d-flex justify-content-start">
+<span class="mtLabel" id="lblAydinDenizliToplam">Toplam</span>
+</div>
+<div class="col-md-1 d-flex justify-content-end">
+<span class="mtLabel" id="lblAydinDenizliCezaToplam"></span>
+</div>
+</div>
+<hr class="solid"/>
+<hr class="mt-0 solid"/>
+</div>
+
+
+<div id="UpdatePanel1">
+<div class="row">
+<div class="col-12">
+
+   
+
+</div>
+</div>
+<div class="row">
+<div class="col-12">
+
+   
+
+</div>
+</div>
+<div class="row">
+<div class="col-10 d-flex justify-content-end border_bt">  
+
+
+
+Ödenecek Tutar (KGM)
+
+</div>
+<div class="col-2 d-flex justify-content-start border_bt">
+<span class="mtLabel" id="lblKgmToplamParaCezasi">0,00 ₺</span>
+</div>
+</div>
+<div class="row">
+<div class="col-10 d-flex justify-content-end border_bt">  
+
+
+
+Ödenecek Tutar (YİD)
+
+</div>
+<div class="col-2 d-flex justify-content-start border_bt">
+<span class="mtLabel" id="lblYidToplamParaCezası">0,00 ₺</span>
+</div>
+</div>
+<div class="row">
+<div class="col-10 d-flex justify-content-end border_bt">  
+
+
+
+Genel Toplam
+</div>
+<div class="col-2 d-flex justify-content-start border_bt">
+<span class="mtLabel" id="lblGenelCezaToplam">0,00 ₺</span>
+</div>
+</div>
+<hr class="solid"/>
+</div>
+</div>
+</div>
+<input id="hdnx" name="hdnx" type="hidden" value="SANITIZED"/>
+</div>

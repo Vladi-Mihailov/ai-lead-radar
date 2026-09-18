@@ -41,6 +41,9 @@ from reader.turkey_bot.gib.models import (  # noqa: E402
 )
 from reader.turkey_bot.gib.session import GibTransportError  # noqa: E402
 from reader.turkey_bot.gib.translation import FineTranslationError  # noqa: E402
+from reader.turkey_bot.kgm.live_session_registry import (
+    LiveKgmSessionRegistry,  # noqa: E402
+)
 from reader.turkey_bot.known_users_repository import (
     TurkeyBotKnownUsersRepository,  # noqa: E402
 )
@@ -137,11 +140,18 @@ def _make_controller(
     statistics = TurkeyStatisticsService(known_users, checks)
     avrasya_registry = LiveAvrasyaSessionRegistry()
     toll_checks = TurkeyTollCheckRepository(":memory:")
+    # KGM (см. reader/turkey_bot/kgm/*) — ни один из существующих (GIB/
+    # Avrasya-focused) тестов ниже не использует его напрямую, поэтому
+    # достаточно default-реестра без фейковой фабрики (тот же принцип,
+    # что и у tests/test_turkey_bot_kgm_conversation.py, где заводится
+    # СВОЙ, отдельный helper с фейковым KgmProvider).
+    kgm_registry = LiveKgmSessionRegistry()
     kwargs = {}
     if avrasya_factory is not None:
         kwargs["avrasya_check_factory"] = avrasya_factory
     controller = ConversationController(
         states, checks, registry, garage, statistics, avrasya_registry, toll_checks,
+        kgm_registry,
         check_factory=factory, translator=translator,
         trusted_operator_user_ids=frozenset(trusted_operator_user_ids),
         **kwargs,
@@ -505,8 +515,10 @@ async def test_restart_recovery_issues_fresh_captcha_for_stored_plate():
     statistics = TurkeyStatisticsService(TurkeyBotKnownUsersRepository(":memory:"), checks)
     avrasya_registry = LiveAvrasyaSessionRegistry()
     toll_checks = TurkeyTollCheckRepository(":memory:")
+    kgm_registry = LiveKgmSessionRegistry()
     controller = ConversationController(
         states, checks, registry, garage, statistics, avrasya_registry, toll_checks,
+        kgm_registry,
         check_factory=factory,
     )
 
@@ -534,8 +546,10 @@ async def test_restart_recovery_with_missing_plate_in_payload_shows_session_lost
     statistics = TurkeyStatisticsService(TurkeyBotKnownUsersRepository(":memory:"), checks)
     avrasya_registry = LiveAvrasyaSessionRegistry()
     toll_checks = TurkeyTollCheckRepository(":memory:")
+    kgm_registry = LiveKgmSessionRegistry()
     controller = ConversationController(
         states, checks, registry, garage, statistics, avrasya_registry, toll_checks,
+        kgm_registry,
         check_factory=factory,
     )
 
@@ -558,8 +572,10 @@ async def test_restart_recovery_transport_error_shows_captcha_fetch_failed():
     statistics = TurkeyStatisticsService(TurkeyBotKnownUsersRepository(":memory:"), checks)
     avrasya_registry = LiveAvrasyaSessionRegistry()
     toll_checks = TurkeyTollCheckRepository(":memory:")
+    kgm_registry = LiveKgmSessionRegistry()
     controller = ConversationController(
         states, checks, registry, garage, statistics, avrasya_registry, toll_checks,
+        kgm_registry,
         check_factory=factory,
     )
 
@@ -929,12 +945,27 @@ async def test_check_fines_button_arms_gib_and_asks_for_plate():
     assert state.payload == {"provider": "gib"}
 
 
-async def test_check_tolls_button_arms_avrasya_and_asks_for_plate():
+async def test_check_tolls_button_shows_toll_provider_menu():
+    """См. design report "Реализация KGM provider" п.10 — CHECK_TOLLS_LABEL
+    больше НЕ armит Avrasya напрямую, а показывает выбор (Avrasya/KGM)."""
     factory = _FakeCheckFactory([])
     controller, states, _checks, _registry, _garage, _avr, _toll = _make_controller(factory)
 
     reply = await controller.handle_text(
         texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID,
+    )
+
+    assert reply.text == texts.CHOOSE_TOLL_PROVIDER_TEXT
+    assert reply.toll_provider_keyboard is True
+    assert states.get(_CHAT_ID) is None
+
+
+async def test_toll_provider_callback_avrasya_arms_avrasya_and_asks_for_plate():
+    factory = _FakeCheckFactory([])
+    controller, states, _checks, _registry, _garage, _avr, _toll = _make_controller(factory)
+
+    reply = await controller.handle_toll_provider_callback(
+        "avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID,
     )
 
     assert reply.text == texts.ASK_PLATE_FOR_TOLLS_TEXT
@@ -944,13 +975,28 @@ async def test_check_tolls_button_arms_avrasya_and_asks_for_plate():
     assert state.payload == {"provider": "avrasya"}
 
 
+async def test_toll_provider_callback_kgm_arms_kgm_and_asks_for_plate():
+    factory = _FakeCheckFactory([])
+    controller, states, _checks, _registry, _garage, _avr, _toll = _make_controller(factory)
+
+    reply = await controller.handle_toll_provider_callback(
+        "kgm", chat_id=_CHAT_ID, telegram_user_id=_USER_ID,
+    )
+
+    assert reply.text == texts.ASK_PLATE_FOR_KGM_TEXT
+    assert reply.show_main_menu is True
+    state = states.get(_CHAT_ID)
+    assert state.step == "awaiting_plate"
+    assert state.payload == {"provider": "kgm"}
+
+
 async def test_plate_after_tolls_button_starts_avrasya_captcha_flow():
     avrasya_provider = _FakeAvrasyaProvider(start_challenge=_avrasya_challenge(png=b"AVRASYA-PNG"))
     avrasya_factory = _FakeAvrasyaCheckFactory([avrasya_provider])
     controller, states, _checks, _registry, _garage, _avr, _toll = _make_controller(
         _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
     )
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     reply = await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
@@ -967,7 +1013,7 @@ async def test_invalid_plate_after_tolls_button_shows_invalid_plate_text():
     "armed" для Avrasya и может просто отправить номер ещё раз, не нажимая
     CHECK_TOLLS_LABEL заново."""
     controller, states, _checks, _registry, _garage, _avr, _toll = _make_controller(_FakeCheckFactory([]))
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     reply = await controller.handle_text("!!!", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
@@ -983,7 +1029,7 @@ async def test_avrasya_captcha_fetch_transport_error_shows_safe_message():
     controller, states, _checks, _registry, _garage, _avr, _toll = _make_controller(
         _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
     )
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     reply = await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
@@ -999,7 +1045,7 @@ async def test_avrasya_captcha_fetch_rate_limited_shows_rate_limit_message():
     controller, states, _checks, _registry, _garage, _avr, _toll = _make_controller(
         _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
     )
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     reply = await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
@@ -1014,7 +1060,7 @@ async def test_avrasya_no_debt_reports_success_and_clears_everything():
     controller, states, _checks, _registry, _garage, avr, toll = _make_controller(
         _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
     )
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     reply = await controller.handle_text("123456", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -1042,7 +1088,7 @@ async def test_avrasya_rejected_captcha_refreshes_and_stays_in_avrasya_flow():
     controller, states, _checks, _registry, _garage, avr, _toll = _make_controller(
         _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
     )
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     reply = await controller.handle_text("000000", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -1068,7 +1114,7 @@ async def test_avrasya_submit_rate_limited_shows_rate_limit_and_records_error():
     controller, states, _checks, _registry, _garage, avr, toll = _make_controller(
         _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
     )
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     reply = await controller.handle_text("000000", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -1087,7 +1133,7 @@ async def test_avrasya_submit_transport_error_shows_generic_error_and_records_er
     controller, states, _checks, _registry, _garage, avr, toll = _make_controller(
         _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
     )
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     reply = await controller.handle_text("000000", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -1110,7 +1156,7 @@ async def test_avrasya_unexpected_outcome_shows_safe_message_never_raw_json(capl
     controller, states, _checks, _registry, _garage, _avr, toll = _make_controller(
         _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
     )
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     with caplog.at_level("WARNING"):
@@ -1196,7 +1242,7 @@ async def test_avrasya_has_debt_shows_real_summary_never_raw_json_and_records_ha
     controller, _states, _checks, _registry, garage, _avr, toll = _make_controller(
         _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
     )
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("M295YB196", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     reply = await controller.handle_text("123456", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -1244,7 +1290,7 @@ async def test_avrasya_no_debt_does_not_include_cta_buttons():
     controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(
         _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
     )
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     reply = await controller.handle_text("123456", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -1260,7 +1306,7 @@ async def test_avrasya_unexpected_does_not_include_cta_buttons():
     controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(
         _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
     )
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     reply = await controller.handle_text("123456", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -1282,7 +1328,7 @@ async def test_avrasya_rejected_captcha_does_not_include_cta_buttons():
     controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(
         _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
     )
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     reply = await controller.handle_text("000000", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -1299,7 +1345,7 @@ async def test_avrasya_transport_error_does_not_include_cta_buttons():
     controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(
         _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
     )
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     reply = await controller.handle_text("000000", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -1386,8 +1432,10 @@ async def test_gib_has_debt_cta_urls_use_the_configured_contact_username_not_har
     statistics = TurkeyStatisticsService(known_users, checks)
     avrasya_registry = LiveAvrasyaSessionRegistry()
     toll_checks = TurkeyTollCheckRepository(":memory:")
+    kgm_registry = LiveKgmSessionRegistry()
     controller = ConversationController(
         states, checks, registry, garage, statistics, avrasya_registry, toll_checks,
+        kgm_registry,
         check_factory=factory, payment_help_contact_username="some_other_contact",
     )
 
@@ -1425,7 +1473,7 @@ async def test_gib_and_avrasya_has_debt_use_the_same_cta_buttons():
     await controller.handle_text("34ABC123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     gib_reply = await controller.handle_text("g8fyx", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("M295YB196", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     avrasya_reply = await controller.handle_text("123456", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
@@ -1450,8 +1498,10 @@ async def test_avrasya_restart_recovery_issues_fresh_captcha_for_stored_plate():
     )
     new_provider = _FakeAvrasyaProvider(start_challenge=_avrasya_challenge(png=b"FRESH"))
     avrasya_factory = _FakeAvrasyaCheckFactory([new_provider])
+    kgm_registry = LiveKgmSessionRegistry()
     controller = ConversationController(
         states, checks, registry, garage, statistics, avrasya_registry, toll_checks,
+        kgm_registry,
         check_factory=_FakeCheckFactory([]), avrasya_check_factory=avrasya_factory,
     )
 
@@ -1478,8 +1528,10 @@ async def test_avrasya_restart_recovery_with_missing_plate_shows_session_lost():
         _CHAT_ID, telegram_user_id=_USER_ID, step="awaiting_captcha_code",
         payload={"provider": "avrasya"},
     )
+    kgm_registry = LiveKgmSessionRegistry()
     controller = ConversationController(
         states, checks, registry, garage, statistics, avrasya_registry, toll_checks,
+        kgm_registry,
         check_factory=_FakeCheckFactory([]), avrasya_check_factory=_FakeAvrasyaCheckFactory([]),
     )
 
@@ -1495,7 +1547,7 @@ async def test_cancel_clears_active_avrasya_check_and_closes_client():
     controller, states, _checks, _registry, _garage, avr, _toll = _make_controller(
         _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
     )
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     reply = await controller.handle_text("/cancel", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -1517,7 +1569,7 @@ async def test_captcha_attempts_counted_across_one_avrasya_rejection_then_succes
     controller, _states, _checks, _registry, _garage, _avr, toll = _make_controller(
         _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
     )
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("wrong", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("right", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
@@ -1537,7 +1589,7 @@ async def test_avrasya_no_debt_adds_car_to_garage_shared_with_gib():
     controller, _states, _checks, _registry, garage, _avr, _toll = _make_controller(
         _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
     )
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("123456", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
@@ -1556,7 +1608,7 @@ async def test_avrasya_rejected_does_not_add_car_to_garage():
     controller, _states, _checks, _registry, garage, _avr, _toll = _make_controller(
         _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
     )
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("wrong", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
@@ -1632,7 +1684,7 @@ async def test_switching_menu_button_mid_avrasya_wait_closes_avrasya_session():
     controller, states, _checks, _registry, _garage, avr, _toll = _make_controller(
         _FakeCheckFactory([]), avrasya_factory=avrasya_factory,
     )
-    await controller.handle_text(texts.CHECK_TOLLS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_toll_provider_callback("avrasya", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
     assert states.get(_CHAT_ID).step == "awaiting_captcha_code"
     assert await avr.get(_CHAT_ID) is not None

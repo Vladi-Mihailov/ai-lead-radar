@@ -42,6 +42,9 @@ from reader.turkey_bot.conversation_state_repository import (  # noqa: E402
 )
 from reader.turkey_bot.gib.translation import TurkeyFineTranslationService  # noqa: E402
 from reader.turkey_bot.handlers import register  # noqa: E402
+from reader.turkey_bot.kgm.live_session_registry import (
+    LiveKgmSessionRegistry,  # noqa: E402
+)
 from reader.turkey_bot.known_users_repository import (
     TurkeyBotKnownUsersRepository,  # noqa: E402
 )
@@ -118,6 +121,11 @@ async def run() -> None:
     # ниже), ConversationController им не владеет.
     session_registry = LiveGibSessionRegistry()
     avrasya_session_registry = LiveAvrasyaSessionRegistry()
+    # KGM (webihlaltakip.kgm.gov.tr, см. design report "Реализация KGM
+    # provider") — ТРЕТИЙ, структурно идентичный in-memory реестр живых
+    # сессий, та же ОБЩАЯ turkey_toll_checks (provider="kgm"), НЕ отдельная
+    # таблица (см. reader/turkey_bot/kgm/live_session_registry.py).
+    kgm_session_registry = LiveKgmSessionRegistry()
 
     try:
         # Тот же общий OPENAI_API_KEY (settings.ocr.openai_api_key) и
@@ -145,7 +153,7 @@ async def run() -> None:
         controller = ConversationController(
             conversation_state_repository, check_repository, session_registry,
             garage_repository, statistics_service,
-            avrasya_session_registry, toll_check_repository,
+            avrasya_session_registry, toll_check_repository, kgm_session_registry,
             translator=translator,
             # ТА ЖЕ настройка, что и у @ProtocolGEbot (см. design report:
             # "reuse the same trusted manager IDs/configuration... do not
@@ -185,6 +193,7 @@ async def run() -> None:
         # sessions"), иначе они остались бы висящими TCP-соединениями.
         await session_registry.close_all()
         await avrasya_session_registry.close_all()
+        await kgm_session_registry.close_all()
         conversation_state_repository.close()
         known_users_repository.close()
         check_repository.close()

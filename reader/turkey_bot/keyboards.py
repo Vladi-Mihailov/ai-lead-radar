@@ -37,6 +37,8 @@ from reader.turkey_bot.models import TurkeyUserCar
 from reader.turkey_bot.texts import (
     CANCEL_BUTTON_LABEL,
     CHECK_FINES_LABEL,
+    CHECK_TOLLS_AVRASYA_LABEL,
+    CHECK_TOLLS_KGM_LABEL,
     CHECK_TOLLS_LABEL,
     GARAGE_LABEL,
     HELP_AVRASYA_LABEL,
@@ -56,6 +58,10 @@ HELP_BACK_TO_MAIN_CALLBACK_DATA = b"turkeyhelpmainmenu"
 
 _GARAGE_CHECK_PREFIX = b"turkeygaragecheck:"
 _HELP_CALLBACK_PREFIX = b"turkeyhelp:"
+# См. design report "Реализация KGM provider" п.10 — выбор конкретного
+# провайдера ПОСЛЕ нажатия CHECK_TOLLS_LABEL, ДО ввода номера (см.
+# toll_provider_keyboard/decode_toll_provider_callback ниже).
+_TOLL_PROVIDER_CALLBACK_PREFIX = b"turkeytollprovider:"
 
 # "menu" — служебное значение для "⬅️ Назад" ИЗ раздела Help ОБРАТНО в
 # Help-меню (см. help_section_keyboard) — не путать с
@@ -65,8 +71,14 @@ _HELP_SECTIONS = frozenset({"menu", "terms", "gib", "avrasya", "payment"})
 # Провайдеры, допустимые в garage callback_data (см. design report Stage
 # 1: "design the internal architecture so additional toll-road providers
 # can be added later" — decode_garage_check_callback уже готов принять
-# третий/четвёртый ключ здесь без изменения формата данных).
-_KNOWN_PROVIDERS = frozenset({"gib", "avrasya"})
+# третий/четвёртый ключ здесь без изменения формата данных) — "kgm"
+# добавлен по этому же заделу (см. design report "Реализация KGM
+# provider").
+_KNOWN_PROVIDERS = frozenset({"gib", "avrasya", "kgm"})
+# Допустимые значения в _TOLL_PROVIDER_CALLBACK_PREFIX — ТОЛЬКО два
+# провайдера платных дорог (см. toll_provider_keyboard ниже) — GIB сюда
+# не входит (штрафы — отдельная кнопка CHECK_FINES_LABEL, без подменю).
+_TOLL_PROVIDERS = frozenset({"avrasya", "kgm"})
 
 
 def cancel_keyboard() -> list[list[Button]]:
@@ -92,6 +104,36 @@ def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
     # порядок последним совпадает с порядком в самой задаче).
     rows.append([Button.text(HELP_LABEL, resize=True)])
     return rows
+
+
+def toll_provider_keyboard() -> list[list[Button]]:
+    """Показывается ПОСЛЕ нажатия CHECK_TOLLS_LABEL (см. design report
+    "Реализация KGM provider" п.10: "🚇 Avrasya Tüneli" / "🛣 Все дороги и
+    мосты (KGM)") — armит конкретного провайдера ТОЛЬКО после этого
+    выбора (см. conversation.py::handle_toll_provider_callback), Avrasya
+    не удалена и не изменена, просто больше не выбирается неявно одним
+    нажатием CHECK_TOLLS_LABEL."""
+    return [
+        [Button.inline(CHECK_TOLLS_AVRASYA_LABEL, encode_toll_provider_callback("avrasya"))],
+        [Button.inline(CHECK_TOLLS_KGM_LABEL, encode_toll_provider_callback("kgm"))],
+    ]
+
+
+def encode_toll_provider_callback(provider: str) -> bytes:
+    return _TOLL_PROVIDER_CALLBACK_PREFIX + provider.encode("ascii")
+
+
+def decode_toll_provider_callback(data: bytes | None) -> str | None:
+    """None — данные не относятся к этому callback'у вовсе, или значение
+    не входит в _TOLL_PROVIDERS (тот же generic "неизвестная кнопка"
+    fallback, см. handlers.py, что и у decode_garage_check_callback/
+    decode_help_callback)."""
+    if not data or not data.startswith(_TOLL_PROVIDER_CALLBACK_PREFIX):
+        return None
+    provider = data[len(_TOLL_PROVIDER_CALLBACK_PREFIX):].decode("ascii", errors="strict")
+    if provider not in _TOLL_PROVIDERS:
+        return None
+    return provider
 
 
 def encode_garage_check_callback(provider: str, car_id: int) -> bytes:
@@ -154,20 +196,23 @@ def help_section_keyboard() -> list[list[Button]]:
 
 
 def garage_keyboard(cars: list[TurkeyUserCar]) -> list[list[Button]]:
-    """[НОМЕР] [🚔 Проверить штрафы] [🛣 Проверить платные дороги] на
+    """[НОМЕР] [🚔 Проверить штрафы] [🚇 Avrasya Tüneli] [🛣 KGM] на
     строку (см. design report Stage 2B: "Saved cars must show both
-    actions"). Клик по самому номеру запускает ТУ ЖЕ проверку, что и
-    явная кнопка "🚔 Проверить штрафы" (см. design report Stage 1:
-    "Clicking the plate itself may either be a no-op/info action or start
-    the same check — choose the cleanest existing callback architecture")
-    — сохраняет прежнее поведение одиночной кнопки-номера, не вводя
-    отдельный no-op обработчик."""
+    actions", теперь — все три; см. design report "Реализация KGM
+    provider" п.10 — KGM добавлен как ТРЕТЬЯ кнопка, Avrasya не удалена).
+    Клик по самому номеру запускает ТУ ЖЕ проверку, что и явная кнопка
+    "🚔 Проверить штрафы" (см. design report Stage 1: "Clicking the plate
+    itself may either be a no-op/info action or start the same check —
+    choose the cleanest existing callback architecture") — сохраняет
+    прежнее поведение одиночной кнопки-номера, не вводя отдельный no-op
+    обработчик."""
     rows = []
     for car in cars:
         gib_callback = encode_garage_check_callback("gib", car.id)
         rows.append([
             Button.inline(car.car_number, gib_callback),
             Button.inline(CHECK_FINES_LABEL, gib_callback),
-            Button.inline(CHECK_TOLLS_LABEL, encode_garage_check_callback("avrasya", car.id)),
+            Button.inline(CHECK_TOLLS_AVRASYA_LABEL, encode_garage_check_callback("avrasya", car.id)),
+            Button.inline(CHECK_TOLLS_KGM_LABEL, encode_garage_check_callback("kgm", car.id)),
         ])
     return rows

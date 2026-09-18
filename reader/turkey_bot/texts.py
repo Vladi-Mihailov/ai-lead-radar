@@ -20,6 +20,7 @@ from decimal import Decimal
 
 from reader.turkey_bot.avrasya.models import AvrasyaDebtItem
 from reader.turkey_bot.gib.models import GibFineRecord
+from reader.turkey_bot.kgm.models import KgmOperatorResult
 from reader.turkey_bot.statistics_service import TurkeyStatistics
 
 # Telegram режет сообщение на границе 4096 символов — см. format_has_debt_
@@ -68,6 +69,11 @@ AVRASYA_RATE_LIMITED_TEXT = (
     "Попробуйте ещё раз через минуту."
 )
 
+KGM_CAPTCHA_FETCH_FAILED_TEXT = (
+    "Не удалось получить CAPTCHA с сайта KGM (сбой соединения). "
+    "Попробуйте ещё раз через минуту."
+)
+
 # Провайдер-агностичный (см. ASK_CAPTCHA_TEXT выше) — переиспользуется для
 # обоих провайдеров.
 CAPTCHA_REJECTED_RETRY_TEXT = "Код введён неверно. Вот новая CAPTCHA — попробуйте ещё раз."
@@ -90,6 +96,8 @@ AVRASYA_TRANSPORT_ERROR_TEXT = (
     "Не удалось связаться с сайтом Avrasya Tüneli. Попробуйте ещё раз через минуту."
 )
 
+KGM_TRANSPORT_ERROR_TEXT = "Не удалось связаться с сайтом KGM. Попробуйте ещё раз через минуту."
+
 UNEXPECTED_ERROR_TEXT = (
     "GIB вернул ответ в формате, который бот пока не понимает. Мы уже знаем "
     "об этом — попробуйте позже."
@@ -104,6 +112,15 @@ UNEXPECTED_ERROR_TEXT = (
 AVRASYA_UNEXPECTED_TEXT = (
     "Avrasya Tüneli вернул ответ, который бот пока не понимает. Мы уже "
     "знаем об этом — попробуйте позже."
+)
+
+# Тот же принцип, что и AVRASYA_UNEXPECTED_TEXT — покрывает и реально
+# "unexpected" (см. reader/turkey_bot/kgm/parser.py про fail-closed
+# правила), и (пока не подтверждённый вживую) has_debt без единой
+# распарсенной записи.
+KGM_UNEXPECTED_TEXT = (
+    "KGM вернул ответ, который бот пока не понимает. Мы уже знаем об "
+    "этом — попробуйте позже."
 )
 
 CANCEL_CONFIRM_TEXT = "Проверка отменена. Отправьте гос. номер, чтобы начать заново."
@@ -124,6 +141,14 @@ GARAGE_LABEL = "🚗 Мои авто"
 STATISTICS_LABEL = "📊 Статистика"
 CHECK_FINES_LABEL = "🚔 Проверить штрафы"
 CHECK_TOLLS_LABEL = "🛣 Проверить платные дороги"
+
+# Подменю CHECK_TOLLS_LABEL (см. design report "Реализация KGM provider"
+# п.10) — выбор конкретного провайдера платных дорог ДО ввода номера, а
+# не сразу Avrasya (см. reader/turkey_bot/keyboards.py::
+# toll_provider_keyboard). Avrasya НЕ удалена и НЕ изменена — только
+# появился явный выбор рядом.
+CHECK_TOLLS_AVRASYA_LABEL = "🚇 Avrasya Tüneli"
+CHECK_TOLLS_KGM_LABEL = "🛣 Все дороги и мосты (KGM)"
 # ℹ️ Справка (см. design report) — видна ВСЕМ, как и CHECK_FINES_LABEL/
 # CHECK_TOLLS_LABEL/GARAGE_LABEL (НЕ trusted-gated, в отличие от
 # STATISTICS_LABEL).
@@ -149,6 +174,15 @@ ASK_PLATE_FOR_FINES_TEXT = (
 ASK_PLATE_FOR_TOLLS_TEXT = (
     "Отправьте гос. номер автомобиля для проверки платных дорог Avrasya "
     "Tüneli (например, А123АА123)."
+)
+
+# Показывается после нажатия CHECK_TOLLS_LABEL — ДО выбора конкретного
+# провайдера (см. keyboards.py::toll_provider_keyboard).
+CHOOSE_TOLL_PROVIDER_TEXT = "🛣 Проверить платные дороги — выберите, что проверить:"
+
+ASK_PLATE_FOR_KGM_TEXT = (
+    "Отправьте гос. номер автомобиля для проверки всех платных дорог и "
+    "мостов Турции через KGM (например, А123АА123)."
 )
 
 GARAGE_HEADER = "🚗 Мои автомобили"
@@ -233,6 +267,16 @@ def avrasya_no_debt_text(plate: str) -> str:
     return f"✅ {plate}: неоплаченных проездов по Avrasya Tüneli не найдено."
 
 
+def kgm_no_debt_text(plate: str) -> str:
+    """См. reader/turkey_bot/kgm/parser.py::parse_result_panel — "общий
+    no_debt" требует, чтобы ВСЕ 10 операторов страницы явно сообщили
+    "Kayıt yok." (см. design report: "полный no_debt пока не был
+    подтверждён отдельным live fixture" — покрыт только
+    synthetic-фикстурой в тестах, само сообщение при этом одинаково
+    безопасно для обоих случаев)."""
+    return f"✅ {plate}: неоплаченных проездов по платным дорогам и мостам Турции (KGM) не найдено."
+
+
 def _format_try_amount(amount: Decimal) -> str:
     """Российский числовой формат (пробел — разделитель тысяч), суффикс
     "₺" (см. design report Stage 2C, желаемый вывод: "780 ₺"/"1 800 ₺") —
@@ -279,6 +323,70 @@ def format_avrasya_has_debt_message(plate: str, debt_items: tuple[AvrasyaDebtIte
         lines.append(f"Начисленные штрафы: {_format_try_amount(total_penalty)}")
     lines.append(f"Итого к оплате: {_format_try_amount(total_payable)}")
     return "\n".join(lines)
+
+
+# Эмодзи по operator_key (см. design report примера вывода: "🚧 KGM"/
+# "🚇 Avrasya Tüneli") — для остальных 8 приватных операторов один общий
+# 🛣 (см. задачу: конкретный emoji для них не был указан отдельно).
+_KGM_OPERATOR_EMOJI = {"kgm": "🚧", "avrasya": "🚇"}
+_KGM_DEFAULT_OPERATOR_EMOJI = "🛣"
+
+
+def _kgm_operator_emoji(operator_key: str) -> str:
+    return _KGM_OPERATOR_EMOJI.get(operator_key, _KGM_DEFAULT_OPERATOR_EMOJI)
+
+
+def _format_kgm_item_block(item) -> str:
+    """Одна запись ОДНОГО оператора (см. design report примера вывода) —
+    entry_station/exit_station/penalty_free_deadline пропускаются, если
+    их нет вовсе (см. reader/turkey_bot/kgm/models.py::KgmDebtItem — None
+    означает "буквально пусто на сайте", не ошибку разбора)."""
+    lines = [item.date_time.strftime("%d.%m.%Y %H:%M")]
+    if item.entry_station and item.exit_station:
+        lines.append(f"{item.entry_station} → {item.exit_station}")
+    elif item.exit_station:
+        lines.append(item.exit_station)
+    elif item.entry_station:
+        lines.append(item.entry_station)
+    lines.append(f"Стоимость: {_format_try_amount(item.base_toll)}")
+    lines.append(f"К оплате: {_format_try_amount(item.payable_amount)}")
+    if item.penalty_free_deadline is not None:
+        lines.append(f"Без штрафа до: {item.penalty_free_deadline.strftime('%d.%m.%Y')}")
+    return "\n".join(lines)
+
+
+def _format_kgm_operator_block(operator: KgmOperatorResult) -> str:
+    header = f"{_kgm_operator_emoji(operator.operator_key)} {operator.operator_name}"
+    item_blocks = [_format_kgm_item_block(item) for item in operator.items]
+    return header + "\n" + "\n\n".join(item_blocks)
+
+
+def format_kgm_has_debt_messages(
+    plate: str, operators: tuple[KgmOperatorResult, ...], *,
+    kgm_total: Decimal, yid_total: Decimal, grand_total: Decimal,
+) -> list[str]:
+    """См. design report примера вывода — строит текст ТОЛЬКО из уже
+    типизированных KgmOperatorResult/KgmDebtItem (см.
+    reader/turkey_bot/kgm/models.py), НИКОГДА из сырого HTML напрямую
+    (тот же принцип, что и у GIB/Avrasya, см. модуль docstring). Пустые
+    (без задолженности) операторы сюда вообще не попадают (см.
+    reader/turkey_bot/kgm/parser.py — outcome.operators уже содержит
+    ТОЛЬКО операторов с реальной задолженностью, "Не показывать пустые
+    operator sections"). Возвращает СПИСОК готовых Telegram-сообщений
+    (см. format_has_debt_messages выше — тот же _split_into_telegram_
+    messages, KGM может агрегировать записи сразу нескольких операторов,
+    потенциально больше, чем у одного GIB/Avrasya)."""
+    blocks = [f"🛣 {plate}: платные дороги Турции — найдена задолженность."]
+    blocks.extend(_format_kgm_operator_block(operator) for operator in operators)
+
+    footer_lines = [
+        f"Итого KGM: {_format_try_amount(kgm_total)}",
+        f"Итого YİD: {_format_try_amount(yid_total)}",
+        f"Всего: {_format_try_amount(grand_total)}",
+    ]
+    blocks.append("\n".join(footer_lines))
+
+    return _split_into_telegram_messages(blocks)
 
 
 HAS_DEBT_NO_PARSED_FINES_TEXT_TEMPLATE = (
