@@ -94,3 +94,29 @@ def test_unsupported_cyrillic_letter_is_rejected():
     assert normalize_plate("Б123АА123") is None
     assert normalize_plate("Ф123АА123") is None
     assert normalize_plate("Щ123АА123") is None
+
+
+# ---- Реальный production-номер (см. design report "fix: show Turkey fine
+# CTAs for all users" — тот же M295YB196, что и в реальном GIB/KGM
+# has_debt-кейсе) — все пять вариантов ввода, перечисленных в задаче,
+# ДОЛЖНЫ давать один и тот же нормализованный результат. ----
+
+
+def test_real_world_plate_latin_uppercase_is_unchanged():
+    assert normalize_plate("M295YB196") == "M295YB196"
+
+
+def test_real_world_plate_latin_lowercase_is_normalized():
+    assert normalize_plate("m295yb196") == "M295YB196"
+
+
+def test_real_world_plate_cyrillic_lowercase_is_normalized():
+    assert normalize_plate("м295ув196") == "M295YB196"
+
+
+def test_real_world_plate_cyrillic_uppercase_is_normalized():
+    assert normalize_plate("М295УВ196") == "M295YB196"
+
+
+def test_real_world_plate_cyrillic_with_spaces_is_normalized():
+    assert normalize_plate("м 295 ув 196") == "M295YB196"
