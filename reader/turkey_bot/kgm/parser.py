@@ -22,10 +22,15 @@ FAIL-CLOSED (см. design report п.5/п.6, задача "Реализация K
 расхождение label/таблица, расхождение контрольных сумм, неразбираемая
 сумма/дата) -> kind="unexpected", НИКОГДА не "no_debt"/частичный
 "has_debt" по догадке. "Общий no_debt" ТРЕБУЕТ, чтобы ВСЕ 10 секций были
-буквально "Kayıt yok." И три итоговых суммы были буквально нулевыми (см.
-design report: "полный no_debt пока не был подтверждён отдельным live
-fixture" — эта ветка покрыта только synthetic-фикстурой, см.
-tests/test_kgm_parser.py)."""
+буквально "Kayıt yok." И три итоговых суммы были буквально нулевыми —
+ПОДТВЕРЖДЕНО вживую (design report "KGM no_debt live confirmation": реальный
+ответ, plate A123AA180, все 10 секций "Kayıt yok.", все три суммы 0,00 ₺,
+см. tests/fixtures/kgm_sorgulama_a123aa180_no_debt.html/test_kgm_parser.py) —
+код классифицировал его как "no_debt" БЕЗ единой правки. Этот же live
+fixture заодно показал, что lblKgm/lblAvrasya сохраняют CSS-класс
+"mtLabelHeader_bt" (обычно означающий "есть записи") ДАЖЕ в состоянии
+"Kayıt yok." — сама реализация никогда не проверяла CSS-класс (только
+текст label), поэтому эта особенность сайта не требует исправления."""
 
 import re
 from datetime import date, datetime
@@ -356,10 +361,9 @@ def parse_result_panel(html: str) -> KgmSubmitOutcome:
 
     # Ни у одного оператора нет задолженности — "общий no_debt" ТОЛЬКО
     # если ВСЕ 10 секций буквально "Kayıt yok." (уже гарантировано выше —
-    # иначе была бы unexpected) И суммы буквально нулевые (см. модуль
-    # docstring: "полный no_debt пока не был подтверждён отдельным live
-    # fixture" — покрыт только synthetic-фикстурой, см.
-    # tests/test_kgm_parser.py).
+    # иначе была бы unexpected) И суммы буквально нулевые — ПОДТВЕРЖДЕНО
+    # вживую (см. модуль docstring и tests/fixtures/
+    # kgm_sorgulama_a123aa180_no_debt.html).
     if kgm_total == 0 and yid_total == 0 and grand_total == 0:
         return KgmSubmitOutcome(
             kind="no_debt", kgm_total=kgm_total, yid_total=yid_total, grand_total=grand_total,

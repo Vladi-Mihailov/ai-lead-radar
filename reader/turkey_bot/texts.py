@@ -270,10 +270,9 @@ def avrasya_no_debt_text(plate: str) -> str:
 def kgm_no_debt_text(plate: str) -> str:
     """См. reader/turkey_bot/kgm/parser.py::parse_result_panel — "общий
     no_debt" требует, чтобы ВСЕ 10 операторов страницы явно сообщили
-    "Kayıt yok." (см. design report: "полный no_debt пока не был
-    подтверждён отдельным live fixture" — покрыт только
-    synthetic-фикстурой в тестах, само сообщение при этом одинаково
-    безопасно для обоих случаев)."""
+    "Kayıt yok." — ПОДТВЕРЖДЕНО вживую (design report "KGM no_debt live
+    confirmation", plate A123AA180, см. tests/fixtures/
+    kgm_sorgulama_a123aa180_no_debt.html)."""
     return f"✅ {plate}: неоплаченных проездов по платным дорогам и мостам Турции (KGM) не найдено."
 
 

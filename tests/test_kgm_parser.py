@@ -1,11 +1,12 @@
 """
 Тесты reader/turkey_bot/kgm/parser.py — см. design report "KGM
-investigation"/"Реализация KGM provider". Используют САНИТИЗИРОВАННЫЕ
-фикстуры (tests/fixtures/kgm_*) — реальный успешный ответ (plate
-M295YB196, см. design report), с вырезанными cookies/ViewState/
-security-adjacent значениями (заменены на "SANITIZED"/фейковые
-плейсхолдеры) — сама структура результата (id/классы/данные) осталась
-подлинной. Никакой реальной сети/CAPTCHA здесь нет и не может быть.
+investigation"/"Реализация KGM provider"/"KGM no_debt live confirmation".
+Используют САНИТИЗИРОВАННЫЕ фикстуры (tests/fixtures/kgm_*) — реальные
+ответы (has_debt: plate M295YB196; no_debt: plate A123AA180, см. design
+report), с вырезанными cookies/ViewState/security-adjacent значениями
+(заменены на "SANITIZED"/фейковые плейсхолдеры) — сама структура
+результата (id/классы/данные) осталась подлинной. Никакой реальной
+сети/CAPTCHA здесь нет и не может быть.
 """
 
 import sys
@@ -31,6 +32,8 @@ def _read_fixture(name: str) -> str:
 _SUCCESS_HTML = _read_fixture("kgm_sorgulama_m295yb196_success.html")
 _SUCCESS_DELTA = _read_fixture("kgm_sorgulama_m295yb196_delta.txt")
 _NO_DEBT_SYNTHETIC_HTML = _read_fixture("kgm_sorgulama_no_debt_synthetic.html")
+_NO_DEBT_REAL_HTML = _read_fixture("kgm_sorgulama_a123aa180_no_debt.html")
+_NO_DEBT_REAL_DELTA = _read_fixture("kgm_sorgulama_a123aa180_no_debt_delta.txt")
 
 
 # ---- ASP.NET AJAX delta-конвертик (см. design report: формат
@@ -248,10 +251,41 @@ def test_checksum_mismatch_operator_subtotal_is_unexpected():
     assert outcome.kind == "unexpected"
 
 
-# ---- Общий no_debt (см. design report: "полный no_debt пока не был
-# подтверждён отдельным live fixture" — покрыт ТОЛЬКО synthetic-фикстурой,
-# построенной программно из реальной, с переворотом всех 10 секций в
-# "Kayıt yok." и обнулением сумм). ----
+# ---- Общий no_debt — ПОДТВЕРЖДЕНО вживую (см. design report "KGM
+# no_debt live confirmation": реальный ответ, plate A123AA180,
+# tests/fixtures/kgm_sorgulama_a123aa180_no_debt.html/*_delta.txt) — код
+# классифицировал его как "no_debt" БЕЗ единой правки. Synthetic-фикстура
+# (построенная программно из реального has_debt-ответа, переворотом всех
+# 10 секций в "Kayıt yok." и обнулением сумм) сохранена ниже как
+# дополнительный, независимый fail-closed тест. ----
+
+
+def test_real_no_debt_fixture_all_ten_operators_empty_and_zero_totals():
+    outcome = parse_result_panel(_NO_DEBT_REAL_HTML)
+    assert outcome.kind == "no_debt"
+    assert outcome.operators == ()
+    assert outcome.kgm_total == Decimal(0)
+    assert outcome.yid_total == Decimal(0)
+    assert outcome.grand_total == Decimal(0)
+
+
+def test_real_no_debt_fixture_via_full_pipeline():
+    outcome = parse_submit_response(_NO_DEBT_REAL_DELTA)
+    assert outcome.kind == "no_debt"
+
+
+def test_real_no_debt_fixture_kgm_and_avrasya_labels_keep_bt_class_but_still_no_debt():
+    """Реальный live-ответ (A123AA180) показал особенность сайта, не
+    увиденную в исходном (has_debt) фикстуре: lblKgm/lblAvrasya сохраняют
+    CSS-класс "mtLabelHeader_bt" (обычно означающий "есть записи") ДАЖЕ
+    когда текст говорит "Kayıt yok." — parser.py никогда не проверял
+    class (только текст label), поэтому классификация остаётся корректной
+    без единой правки кода (см. design report)."""
+    assert 'id="lblKgm" class="mtLabelHeader_bt">KARAYOLLARI GENEL MÜDÜRLÜĞÜ: Kayıt yok.' in (
+        _NO_DEBT_REAL_HTML
+    )
+    outcome = parse_result_panel(_NO_DEBT_REAL_HTML)
+    assert outcome.kind == "no_debt"
 
 
 def test_synthetic_overall_no_debt_all_ten_operators_empty_and_zero_totals():
@@ -268,6 +302,17 @@ def test_no_debt_requires_all_ten_sections_not_just_zero_totals():
     (некорректно) утверждает задолженность без соответствующих строк —
     unexpected, а не тихий no_debt."""
     inconsistent_html = _NO_DEBT_SYNTHETIC_HTML.replace(
+        "KARAYOLLARI GENEL MÜDÜRLÜĞÜ: Kayıt yok.", "KARAYOLLARI GENEL MÜDÜRLÜĞÜ: 1 kayıt",
+    )
+    outcome = parse_result_panel(inconsistent_html)
+    assert outcome.kind == "unexpected"
+
+
+def test_real_no_debt_requires_all_ten_sections_not_just_zero_totals():
+    """Тот же fail-closed тест, что и выше, но на РЕАЛЬНОМ (не synthetic)
+    fixture — доказывает, что fail-closed правило не было ослаблено при
+    добавлении реального fixture."""
+    inconsistent_html = _NO_DEBT_REAL_HTML.replace(
         "KARAYOLLARI GENEL MÜDÜRLÜĞÜ: Kayıt yok.", "KARAYOLLARI GENEL MÜDÜRLÜĞÜ: 1 kayıt",
     )
     outcome = parse_result_panel(inconsistent_html)
