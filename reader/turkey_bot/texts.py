@@ -147,7 +147,13 @@ CHECK_TOLLS_LABEL = "🛣 Проверить платные дороги"
 # не сразу Avrasya (см. reader/turkey_bot/keyboards.py::
 # toll_provider_keyboard). Avrasya НЕ удалена и НЕ изменена — только
 # появился явный выбор рядом.
-CHECK_TOLLS_AVRASYA_LABEL = "🚇 Avrasya Tüneli"
+# Отображаемый текст — "🚇 Туннели" (не "Avrasya Tüneli", см. задачу:
+# "изменить только отображаемый текст кнопки") — provider/callback
+# по-прежнему буквально "avrasya" везде (см. keyboards.py::
+# encode_toll_provider_callback/encode_garage_check_callback) — эта
+# константа НЕ участвует в кодировании callback_data, только в тексте
+# кнопки.
+CHECK_TOLLS_AVRASYA_LABEL = "🚇 Туннели"
 CHECK_TOLLS_KGM_LABEL = "🛣 Все дороги и мосты (KGM)"
 # ℹ️ Справка (см. design report) — видна ВСЕМ, как и CHECK_FINES_LABEL/
 # CHECK_TOLLS_LABEL/GARAGE_LABEL (НЕ trusted-gated, в отличие от
