@@ -84,8 +84,8 @@ def test_cancel_callback_data_is_a_fixed_constant_without_dynamic_content():
 
 
 def test_main_menu_ordinary_user_is_a_2x2_plus_help_layout():
-    """Явное требование задачи "унификация UI":
-    ROW 1: 🚔 Проверить штрафы | 🛣 Проверить платные дороги
+    """Явное требование задачи "маленький UI-fix":
+    ROW 1: 🚔 Штрафы | 🛣 Платные дороги
     ROW 2: 🚗 Мои авто | 🇬🇪 Штрафы Грузии
     ROW 3: ℹ️ Справка"""
     keyboard = main_menu_keyboard(is_trusted=False)
@@ -129,10 +129,9 @@ def test_georgian_bot_link_keyboard_has_the_expected_url_button():
 
 
 def test_garage_keyboard_has_four_buttons_per_car():
-    """[НОМЕР] [🚔 Проверить штрафы] [🚇 Avrasya Tüneli] [🛣 KGM] (см.
-    design report Stage 2B: "Saved cars must show both actions", и
-    design report "Реализация KGM provider" п.10 — KGM добавлен как
-    третья кнопка)."""
+    """[НОМЕР] [🚔 Штрафы] [🚇 Туннели] [🛣 Дороги] (см. design report
+    Stage 2B: "Saved cars must show both actions", и design report
+    "Реализация KGM provider" п.10 — KGM добавлен как третья кнопка)."""
     cars = [_car(1, "34ABC123"), _car(2, "06XYZ999")]
 
     keyboard = garage_keyboard(cars)

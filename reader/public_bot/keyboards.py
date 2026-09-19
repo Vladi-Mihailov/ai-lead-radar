@@ -93,11 +93,11 @@ def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
       ConversationController._build_trusted_stop_picker_reply/
       handle_trusted_stop_pick), который умеет останавливать ЛЮБУЮ задачу
       мониторинга (включая операторские, без единой client-подписки) — то,
-      что car-centric UX (subscription-based) заведомо не покрывает —
-      см. design report "унификация UI": вынесена в ОТДЕЛЬНУЮ последнюю
-      строку (не помещается в ROW 2 вместе с TURKEY_BOT_LINK_LABEL —
-      заданный макет ROW 2 строго 2 кнопки), а не удалена;
+      что car-centric UX (subscription-based) заведомо не покрывает;
     - "📊 Статистика" — как и раньше, обычный клиент её никогда не видит.
+
+    Обе trusted-only кнопки — ОДНА последняя строка (см. design report
+    "маленький UI-fix": "📊 Статистика | ⛔ Остановить мониторинг").
 
     "🇹🇷 Штрафы Турции" (TURKEY_BOT_LINK_LABEL) — ОБЫЧНАЯ reply-кнопка
     (Button.text, см. design report "унификация UI": переход в Turkey-бот
@@ -113,8 +113,7 @@ def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
         [Button.text(CHECK_NOW_LABEL, resize=True), Button.text(TURKEY_BOT_LINK_LABEL, resize=True)],
     ]
     if is_trusted:
-        rows.append([Button.text(STATISTICS_LABEL, resize=True)])
-        rows.append([Button.text(STOP_LABEL, resize=True)])
+        rows.append([Button.text(STATISTICS_LABEL, resize=True), Button.text(STOP_LABEL, resize=True)])
     return rows
 
 

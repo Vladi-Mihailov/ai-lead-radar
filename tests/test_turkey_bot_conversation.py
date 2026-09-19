@@ -1616,8 +1616,8 @@ async def test_avrasya_rejected_does_not_add_car_to_garage():
 
 
 async def test_garage_gib_button_uses_stored_plate_without_retyping():
-    """Явное требование задачи: гараж-кнопка "🚔 Проверить штрафы" —
-    существующая GIB CAPTCHA-flow для сохранённого номера."""
+    """Явное требование задачи: гараж-кнопка "🚔 Штрафы" — существующая
+    GIB CAPTCHA-flow для сохранённого номера."""
     provider = _FakeProvider(start_challenge=_challenge(image_id="cid-garage", png=b"GIB-GARAGE"))
     factory = _FakeCheckFactory([provider])
     controller, states, _checks, _registry, garage, _avr, _toll = _make_controller(factory)
@@ -1636,8 +1636,8 @@ async def test_garage_gib_button_uses_stored_plate_without_retyping():
 
 
 async def test_garage_avrasya_button_uses_stored_plate_without_retyping():
-    """Явное требование задачи: гараж-кнопка "🛣 Проверить платные дороги" —
-    Avrasya CAPTCHA-flow для СОХРАНЁННОГО номера, без повторного ввода."""
+    """Явное требование задачи: гараж-кнопка "🚇 Туннели" — Avrasya
+    CAPTCHA-flow для СОХРАНЁННОГО номера, без повторного ввода."""
     avrasya_provider = _FakeAvrasyaProvider(start_challenge=_avrasya_challenge(png=b"AVRASYA-GARAGE"))
     avrasya_factory = _FakeAvrasyaCheckFactory([avrasya_provider])
     controller, states, _checks, _registry, garage, avr, _toll = _make_controller(

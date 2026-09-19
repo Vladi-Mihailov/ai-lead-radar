@@ -1,8 +1,8 @@
 """ConversationController Turkey-бота — линейный, одноразовый цикл
 "номер -> CAPTCHA -> код -> результат" (см. design report Stage 3), ТЕПЕРЬ
 с ДВУМЯ независимыми провайдерами (см. design report Stage 2B):
-  - GIB (🚔 Проверить штрафы) — штрафы/задолженность, dijital.gib.gov.tr;
-  - Avrasya Tüneli (🛣 Проверить платные дороги) — неоплаченные проезды,
+  - GIB (🚔 Штрафы) — штрафы/задолженность, dijital.gib.gov.tr;
+  - Avrasya Tüneli (🛣 Платные дороги) — неоплаченные проезды,
     avrasyatuneli.com (см. reader/turkey_bot/avrasya/*).
 Оба провайдера используют ОДИН И ТОТ ЖЕ линейный конечный автомат (номер
 -> CAPTCHA -> код -> результат) и ОДНУ И ТУ ЖЕ CAPTCHA-обязательность (см.

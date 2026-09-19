@@ -60,18 +60,15 @@ def test_main_menu_keyboard_includes_trusted_buttons_for_trusted_operator():
     assert STOP_LABEL in labels
 
 
-def test_main_menu_keyboard_manager_adds_statistics_row_and_keeps_stop_row():
-    """Задача явно не указала "⛔ Остановить мониторинг" в новом макете —
-    по решению пользователя кнопка сохранена ОТДЕЛЬНОЙ строкой ПОСЛЕ
-    заданных 3 строк (task-level admin flow не должен стать недостижим
-    из главного меню, см. design report)."""
+def test_main_menu_keyboard_manager_puts_statistics_and_stop_in_one_row():
+    """Явное требование задачи "маленький UI-fix": ROW 3 = 📊 Статистика |
+    ⛔ Остановить мониторинг (одна строка, не две отдельные)."""
     keyboard = main_menu_keyboard(is_trusted=True)
 
-    assert len(keyboard) == 4
+    assert len(keyboard) == 3
     assert [b.button.text for b in keyboard[0]] == [ADD_CAR_LABEL, MY_CARS_LABEL]
     assert [b.button.text for b in keyboard[1]] == [CHECK_NOW_LABEL, TURKEY_BOT_LINK_LABEL]
-    assert [b.button.text for b in keyboard[2]] == [STATISTICS_LABEL]
-    assert [b.button.text for b in keyboard[3]] == [STOP_LABEL]
+    assert [b.button.text for b in keyboard[2]] == [STATISTICS_LABEL, STOP_LABEL]
 
 
 def test_main_menu_keyboard_does_not_change_ordinary_user_buttons():
