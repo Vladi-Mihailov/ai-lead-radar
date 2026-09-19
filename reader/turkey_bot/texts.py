@@ -160,6 +160,19 @@ CHECK_TOLLS_KGM_LABEL = "🛣 Все дороги и мосты (KGM)"
 # STATISTICS_LABEL).
 HELP_LABEL = "ℹ️ Справка"
 
+# Переход в Georgian-бот (см. design report "связать Georgian bot и
+# Turkey bot взаимными кнопками перехода") — отдельное сообщение сразу
+# ПОСЛЕ главного меню (см. reader/turkey_bot/keyboards.py::
+# georgian_bot_link_keyboard и её докстрок про то, почему это не может
+# быть частью main_menu_keyboard), видно ВСЕМ пользователям одинаково (не
+# trusted-gated). ProtocolGEbot — реальный username Georgian-бота, взят из
+# reader/public_bot/main.py::_BOT_USERNAME (тот же приём отдельного
+# hardcode на каждой стороне, что и там же — оба бота полностью
+# независимые процессы, не импортируют друг у друга).
+GEORGIAN_BOT_LINK_TEXT = "🇬🇪 Проверка штрафов в Грузии"
+GEORGIAN_BOT_LINK_LABEL = "🇬🇪 Штрафы Грузии →"
+GEORGIAN_BOT_URL = "https://t.me/ProtocolGEbot"
+
 # Подписи 4 разделов ℹ️ Справка + общая "⬅️ Назад" (см.
 # reader/turkey_bot/keyboards.py::help_menu_keyboard/help_section_keyboard).
 HELP_TERMS_LABEL = "📖 Термины"

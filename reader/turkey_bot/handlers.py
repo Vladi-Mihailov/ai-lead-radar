@@ -23,13 +23,18 @@ from reader.turkey_bot.keyboards import (
     decode_help_callback,
     decode_toll_provider_callback,
     garage_keyboard,
+    georgian_bot_link_keyboard,
     help_menu_keyboard,
     help_section_keyboard,
     main_menu_keyboard,
     toll_provider_keyboard,
 )
 from reader.turkey_bot.known_users_repository import TurkeyBotKnownUsersRepository
-from reader.turkey_bot.texts import UNKNOWN_BUTTON_TEXT
+from reader.turkey_bot.texts import (
+    GEORGIAN_BOT_LINK_TEXT,
+    UNKNOWN_BUTTON_TEXT,
+    WELCOME_TEXT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -197,3 +202,14 @@ async def _send_reply(event, reply: BotReply, *, is_trusted: bool = False) -> No
         else:
             extra_buttons = None
         await event.respond(extra_text, buttons=extra_buttons)
+
+    # См. design report "связать Georgian bot и Turkey bot взаимными
+    # кнопками перехода" — ОТДЕЛЬНОЕ сообщение с inline URL-кнопкой в
+    # Georgian-бот, ТОЛЬКО когда реально показан текст главного меню (см.
+    # reader/turkey_bot/keyboards.py::main_menu_keyboard докстрок про
+    # ValueError при смешивании reply/inline кнопок) — НЕ на каждом экране
+    # с show_main_menu=True (результаты проверок/действий тоже прикрепляют
+    # персистентную клавиатуру для удобства, но это не "открытие главного
+    # меню", см. задачу: "не добавлять переход в каждый экран").
+    if reply.show_main_menu and reply.text == WELCOME_TEXT:
+        await event.respond(GEORGIAN_BOT_LINK_TEXT, buttons=georgian_bot_link_keyboard())

@@ -13,13 +13,18 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from reader.public_bot.keyboards import main_menu_keyboard  # noqa: E402
+from reader.public_bot.keyboards import (  # noqa: E402
+    main_menu_keyboard,
+    turkey_bot_link_keyboard,
+)
 from reader.public_bot.texts import (  # noqa: E402
     ADD_CAR_LABEL,
     CHECK_NOW_LABEL,
     MY_CARS_LABEL,
     STATISTICS_LABEL,
     STOP_LABEL,
+    TURKEY_BOT_LINK_LABEL,
+    TURKEY_BOT_URL,
 )
 
 
@@ -65,3 +70,24 @@ def test_main_menu_keyboard_does_not_change_ordinary_user_buttons():
         assert label in without
         assert label in with_trusted
     assert len(with_trusted) == len(without) + 2  # + STOP_LABEL + STATISTICS_LABEL
+
+
+def test_main_menu_keyboard_does_not_contain_the_turkey_bot_link():
+    """См. design report "связать Georgian bot и Turkey bot взаимными
+    кнопками перехода" — переход отправляется ОТДЕЛЬНЫМ сообщением (см.
+    reader/public_bot/handlers.py::_send_reply), а не частью этой
+    reply-клавиатуры (Telethon не позволяет смешать Button.text с
+    Button.url в одной разметке, см. main_menu_keyboard докстрок)."""
+    labels = _labels(main_menu_keyboard(is_trusted=True))
+    assert TURKEY_BOT_LINK_LABEL not in labels
+
+
+def test_turkey_bot_link_keyboard_has_the_expected_url_button():
+    keyboard = turkey_bot_link_keyboard()
+
+    assert len(keyboard) == 1
+    assert len(keyboard[0]) == 1
+    button = keyboard[0][0]
+    assert button.text == TURKEY_BOT_LINK_LABEL
+    assert button.url == TURKEY_BOT_URL
+    assert TURKEY_BOT_URL == "https://t.me/ProtocolTRbot"

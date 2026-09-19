@@ -41,6 +41,8 @@ from reader.turkey_bot.texts import (
     CHECK_TOLLS_KGM_LABEL,
     CHECK_TOLLS_LABEL,
     GARAGE_LABEL,
+    GEORGIAN_BOT_LINK_LABEL,
+    GEORGIAN_BOT_URL,
     HELP_AVRASYA_LABEL,
     HELP_BACK_LABEL,
     HELP_GIB_LABEL,
@@ -91,7 +93,11 @@ def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
     retrieve statistics by manually sending the text" — второе
     обеспечивает ConversationController, не эта функция; здесь — только
     видимость самой кнопки). CHECK_FINES_LABEL/CHECK_TOLLS_LABEL/
-    GARAGE_LABEL видны всем всегда (см. design report Stage 2B)."""
+    GARAGE_LABEL видны всем всегда (см. design report Stage 2B).
+
+    НЕ содержит переход в Georgian-бот — см. georgian_bot_link_keyboard()
+    ниже и её докстрок про то, почему это должно быть отдельное сообщение,
+    а не часть этой разметки."""
     rows = [
         [Button.text(CHECK_FINES_LABEL, resize=True)],
         [Button.text(CHECK_TOLLS_LABEL, resize=True)],
@@ -104,6 +110,20 @@ def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
     # порядок последним совпадает с порядком в самой задаче).
     rows.append([Button.text(HELP_LABEL, resize=True)])
     return rows
+
+
+def georgian_bot_link_keyboard() -> list[list[Button]]:
+    """Inline URL-кнопка перехода в Georgian-бот (см. design report
+    "связать Georgian bot и Turkey bot взаимными кнопками перехода") —
+    ОТДЕЛЬНАЯ разметка, не часть main_menu_keyboard() (Telethon/Telegram
+    не позволяет смешивать reply-кнопки, Button.text, с inline URL-кнопкой
+    в ОДНОЙ разметке — client.build_reply_markup поднимает ValueError(
+    'You cannot mix inline with normal buttons') — переход отправляется
+    отдельным сообщением сразу после текста главного меню, см.
+    reader/turkey_bot/handlers.py::_send_reply). Button.url (не callback) —
+    открывает t.me/ProtocolGEbot напрямую, ничего не кодирует и не
+    проверяет на стороне бота."""
+    return [[Button.url(GEORGIAN_BOT_LINK_LABEL, GEORGIAN_BOT_URL)]]
 
 
 def toll_provider_keyboard() -> list[list[Button]]:

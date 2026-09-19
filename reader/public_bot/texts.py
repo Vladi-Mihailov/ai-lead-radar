@@ -24,6 +24,18 @@ STOP_LABEL = "⛔ Остановить мониторинг"
 # и reader/public_bot/handlers.py) — обычный клиент её никогда не видит.
 STATISTICS_LABEL = "📊 Статистика"
 
+# Переход в Turkey-бот (см. design report "связать Georgian bot и Turkey
+# bot взаимными кнопками перехода") — отдельное сообщение сразу ПОСЛЕ
+# главного меню (см. reader/public_bot/keyboards.py::
+# turkey_bot_link_keyboard и её докстрок про то, почему это не может быть
+# частью main_menu_keyboard), видно ВСЕМ пользователям одинаково (не
+# trusted-gated, в отличие от STATISTICS_LABEL выше). @ProtocolTRbot —
+# реальный, уже подключённый username Turkey-бота (см.
+# reader/turkey_bot/main.py — тот же бот, что и в этом коммите).
+TURKEY_BOT_LINK_TEXT = "🇹🇷 Проверка штрафов и платных дорог Турции"
+TURKEY_BOT_LINK_LABEL = "🇹🇷 Штрафы и дороги Турции →"
+TURKEY_BOT_URL = "https://t.me/ProtocolTRbot"
+
 CAR_NUMBER_PROMPT = "🚗 Введите госномер автомобиля\n\nНапример: M295YB196"
 USERNAME_PROMPT = "👤 Введите ваш Telegram-логин\n\nНапример: @VeronaWarm"
 # Trusted-operator delegated flow (см. design report) — ВСЕГДА запрашивается

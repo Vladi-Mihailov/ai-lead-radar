@@ -22,6 +22,7 @@ from reader.turkey_bot.keyboards import (  # noqa: E402
     encode_help_callback,
     encode_toll_provider_callback,
     garage_keyboard,
+    georgian_bot_link_keyboard,
     help_menu_keyboard,
     help_section_keyboard,
     main_menu_keyboard,
@@ -35,6 +36,8 @@ from reader.turkey_bot.texts import (  # noqa: E402
     CHECK_TOLLS_KGM_LABEL,
     CHECK_TOLLS_LABEL,
     GARAGE_LABEL,
+    GEORGIAN_BOT_LINK_LABEL,
+    GEORGIAN_BOT_URL,
     HELP_AVRASYA_LABEL,
     HELP_BACK_LABEL,
     HELP_GIB_LABEL,
@@ -98,6 +101,27 @@ def test_main_menu_shows_statistics_only_for_trusted():
     assert GARAGE_LABEL in labels
     assert HELP_LABEL in labels
     assert STATISTICS_LABEL in labels
+
+
+def test_main_menu_keyboard_does_not_contain_the_georgian_bot_link():
+    """См. design report "связать Georgian bot и Turkey bot взаимными
+    кнопками перехода" — переход отправляется ОТДЕЛЬНЫМ сообщением (см.
+    reader/turkey_bot/handlers.py::_send_reply), а не частью этой
+    reply-клавиатуры (Telethon не позволяет смешать Button.text с
+    Button.url в одной разметке, см. main_menu_keyboard докстрок)."""
+    labels = _text_labels(main_menu_keyboard(is_trusted=True))
+    assert GEORGIAN_BOT_LINK_LABEL not in labels
+
+
+def test_georgian_bot_link_keyboard_has_the_expected_url_button():
+    keyboard = georgian_bot_link_keyboard()
+
+    assert len(keyboard) == 1
+    assert len(keyboard[0]) == 1
+    button = keyboard[0][0]
+    assert button.text == GEORGIAN_BOT_LINK_LABEL
+    assert button.url == GEORGIAN_BOT_URL
+    assert GEORGIAN_BOT_URL == "https://t.me/ProtocolGEbot"
 
 
 def test_garage_keyboard_has_four_buttons_per_car():

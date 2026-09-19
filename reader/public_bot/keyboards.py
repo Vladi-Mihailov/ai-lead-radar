@@ -43,6 +43,8 @@ from reader.public_bot.texts import (
     MY_CARS_LABEL,
     STATISTICS_LABEL,
     STOP_LABEL,
+    TURKEY_BOT_LINK_LABEL,
+    TURKEY_BOT_URL,
     TURN_OFF_BUTTON_LABEL,
     TURN_ON_BUTTON_LABEL,
 )
@@ -92,7 +94,17 @@ def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
       handle_trusted_stop_pick), который умеет останавливать ЛЮБУЮ задачу
       мониторинга (включая операторские, без единой client-подписки) — то,
       что car-centric UX (subscription-based) заведомо не покрывает;
-    - "📊 Статистика" — как и раньше, обычный клиент её никогда не видит."""
+    - "📊 Статистика" — как и раньше, обычный клиент её никогда не видит.
+
+    НЕ содержит переход в Turkey-бот (см. design report "связать Georgian
+    bot и Turkey bot взаимными кнопками перехода") — Telethon/Telegram
+    физически не позволяет смешивать reply-кнопки (Button.text, эта
+    клавиатура) с inline URL-кнопкой в ОДНОЙ разметке (client.
+    build_reply_markup поднимает ValueError('You cannot mix inline with
+    normal buttons') при попытке) — переход отправляется ОТДЕЛЬНЫМ
+    сообщением сразу после текста главного меню, см.
+    turkey_bot_link_keyboard() ниже и reader/public_bot/handlers.py::
+    _send_reply."""
     rows = [
         [Button.text(ADD_CAR_LABEL, resize=True), Button.text(MY_CARS_LABEL, resize=True)],
         [Button.text(CHECK_NOW_LABEL, resize=True)],
@@ -101,6 +113,16 @@ def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
         rows[1].append(Button.text(STOP_LABEL, resize=True))
         rows.append([Button.text(STATISTICS_LABEL, resize=True)])
     return rows
+
+
+def turkey_bot_link_keyboard() -> list[list[Button]]:
+    """Inline URL-кнопка перехода в Turkey-бот (см. design report "связать
+    Georgian bot и Turkey bot взаимными кнопками перехода") — ОТДЕЛЬНАЯ
+    разметка (не часть main_menu_keyboard(), см. её докстрок про то, почему
+    их нельзя смешать в одном сообщении). Button.url (не callback) —
+    открывает t.me/ProtocolTRbot напрямую, ничего не кодирует и не
+    проверяет на стороне бота."""
+    return [[Button.url(TURKEY_BOT_LINK_LABEL, TURKEY_BOT_URL)]]
 
 
 def add_client_decision_keyboard() -> list[list[Button]]:
