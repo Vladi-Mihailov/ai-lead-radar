@@ -40,6 +40,8 @@ from reader.turkey_bot.texts import (
     CHECK_TOLLS_AVRASYA_LABEL,
     CHECK_TOLLS_KGM_LABEL,
     CHECK_TOLLS_LABEL,
+    GARAGE_CHECK_FINES_LABEL,
+    GARAGE_CHECK_TOLLS_KGM_LABEL,
     GARAGE_LABEL,
     GEORGIAN_BOT_LINK_LABEL,
     GEORGIAN_BOT_URL,
@@ -93,35 +95,43 @@ def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
     retrieve statistics by manually sending the text" — второе
     обеспечивает ConversationController, не эта функция; здесь — только
     видимость самой кнопки). CHECK_FINES_LABEL/CHECK_TOLLS_LABEL/
-    GARAGE_LABEL видны всем всегда (см. design report Stage 2B).
+    GARAGE_LABEL/GEORGIAN_BOT_LINK_LABEL/HELP_LABEL видны всем всегда (см.
+    design report Stage 2B и "унификация UI").
 
-    НЕ содержит переход в Georgian-бот — см. georgian_bot_link_keyboard()
-    ниже и её докстрок про то, почему это должно быть отдельное сообщение,
-    а не часть этой разметки."""
+    Макет (см. design report "унификация UI" — 2 кнопки в строке для
+    основных действий):
+      ROW 1: CHECK_FINES_LABEL | CHECK_TOLLS_LABEL
+      ROW 2: GARAGE_LABEL | GEORGIAN_BOT_LINK_LABEL
+      ROW 3: HELP_LABEL (+ STATISTICS_LABEL, ТОЛЬКО если is_trusted)
+
+    "🇬🇪 Штрафы Грузии" (GEORGIAN_BOT_LINK_LABEL) — ОБЫЧНАЯ reply-кнопка
+    (Button.text) — сама по себе НЕ открывает URL (Telegram reply-кнопки
+    не умеют быть URL-кнопками) — нажатие распознаётся как обычный текст
+    (см. reader/turkey_bot/conversation.py::handle_text) и отвечает
+    ОТДЕЛЬНЫМ сообщением с inline URL-кнопкой (см.
+    georgian_bot_link_keyboard() ниже) — НЕ отправляется автоматически при
+    показе главного меню."""
     rows = [
-        [Button.text(CHECK_FINES_LABEL, resize=True)],
-        [Button.text(CHECK_TOLLS_LABEL, resize=True)],
-        [Button.text(GARAGE_LABEL, resize=True)],
+        [Button.text(CHECK_FINES_LABEL, resize=True), Button.text(CHECK_TOLLS_LABEL, resize=True)],
+        [Button.text(GARAGE_LABEL, resize=True), Button.text(GEORGIAN_BOT_LINK_LABEL, resize=True)],
     ]
+    last_row = [Button.text(HELP_LABEL, resize=True)]
     if is_trusted:
-        rows.append([Button.text(STATISTICS_LABEL, resize=True)])
-    # ℹ️ Справка видна ВСЕМ (см. design report: "Do not change permissions
-    # or visibility rules for existing buttons" — только добавляется,
-    # порядок последним совпадает с порядком в самой задаче).
-    rows.append([Button.text(HELP_LABEL, resize=True)])
+        last_row.append(Button.text(STATISTICS_LABEL, resize=True))
+    rows.append(last_row)
     return rows
 
 
 def georgian_bot_link_keyboard() -> list[list[Button]]:
     """Inline URL-кнопка перехода в Georgian-бот (см. design report
-    "связать Georgian bot и Turkey bot взаимными кнопками перехода") —
-    ОТДЕЛЬНАЯ разметка, не часть main_menu_keyboard() (Telethon/Telegram
-    не позволяет смешивать reply-кнопки, Button.text, с inline URL-кнопкой
-    в ОДНОЙ разметке — client.build_reply_markup поднимает ValueError(
-    'You cannot mix inline with normal buttons') — переход отправляется
-    отдельным сообщением сразу после текста главного меню, см.
-    reader/turkey_bot/handlers.py::_send_reply). Button.url (не callback) —
-    открывает t.me/ProtocolGEbot напрямую, ничего не кодирует и не
+    "унификация UI") — ОТДЕЛЬНАЯ разметка, не часть main_menu_keyboard()
+    (Telethon/Telegram не позволяет смешивать reply-кнопки, Button.text, с
+    inline URL-кнопкой в ОДНОЙ разметке — client.build_reply_markup
+    поднимает ValueError('You cannot mix inline with normal buttons') —
+    поэтому нажатие "🇬🇪 Штрафы Грузии" в главном меню отвечает ОТДЕЛЬНЫМ
+    сообщением с этой разметкой, см. reader/turkey_bot/conversation.py::
+    handle_text). Button.url (не callback) — открывает t.me/ProtocolGEbot
+    напрямую, ничего не кодирует и не
     проверяет на стороне бота."""
     return [[Button.url(GEORGIAN_BOT_LINK_LABEL, GEORGIAN_BOT_URL)]]
 
@@ -216,23 +226,26 @@ def help_section_keyboard() -> list[list[Button]]:
 
 
 def garage_keyboard(cars: list[TurkeyUserCar]) -> list[list[Button]]:
-    """[НОМЕР] [🚔 Проверить штрафы] [🚇 Avrasya Tüneli] [🛣 KGM] на
-    строку (см. design report Stage 2B: "Saved cars must show both
-    actions", теперь — все три; см. design report "Реализация KGM
-    provider" п.10 — KGM добавлен как ТРЕТЬЯ кнопка, Avrasya не удалена).
-    Клик по самому номеру запускает ТУ ЖЕ проверку, что и явная кнопка
-    "🚔 Проверить штрафы" (см. design report Stage 1: "Clicking the plate
-    itself may either be a no-op/info action or start the same check —
-    choose the cleanest existing callback architecture") — сохраняет
-    прежнее поведение одиночной кнопки-номера, не вводя отдельный no-op
-    обработчик."""
+    """[НОМЕР] [🚔 Штрафы] [🚇 Туннели] [🛣 Дороги] на строку (см. design
+    report Stage 2B: "Saved cars must show both actions", п.10 — KGM
+    добавлен как ТРЕТЬЯ кнопка, Avrasya не удалена; design report
+    "унификация UI" — подписи укорочены, см. texts.py::
+    GARAGE_CHECK_FINES_LABEL/GARAGE_CHECK_TOLLS_KGM_LABEL докстрок про то,
+    что это ОТДЕЛЬНЫЕ от главного меню константы). callback_data/provider
+    НЕ изменились: gib_callback/avrasya/kgm — те же самые строки, что и
+    раньше, меняется ТОЛЬКО отображаемый текст кнопки. Клик по самому
+    номеру запускает ТУ ЖЕ проверку, что и явная кнопка "🚔 Штрафы" (см.
+    design report Stage 1: "Clicking the plate itself may either be a
+    no-op/info action or start the same check — choose the cleanest
+    existing callback architecture") — сохраняет прежнее поведение
+    одиночной кнопки-номера, не вводя отдельный no-op обработчик."""
     rows = []
     for car in cars:
         gib_callback = encode_garage_check_callback("gib", car.id)
         rows.append([
             Button.inline(car.car_number, gib_callback),
-            Button.inline(CHECK_FINES_LABEL, gib_callback),
+            Button.inline(GARAGE_CHECK_FINES_LABEL, gib_callback),
             Button.inline(CHECK_TOLLS_AVRASYA_LABEL, encode_garage_check_callback("avrasya", car.id)),
-            Button.inline(CHECK_TOLLS_KGM_LABEL, encode_garage_check_callback("kgm", car.id)),
+            Button.inline(GARAGE_CHECK_TOLLS_KGM_LABEL, encode_garage_check_callback("kgm", car.id)),
         ])
     return rows

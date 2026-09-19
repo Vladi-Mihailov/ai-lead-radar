@@ -1577,3 +1577,29 @@ async def test_normal_user_statistics_attempt_does_not_leak_real_numbers(fx):
     )
 
     assert "2" not in reply.text
+
+
+# ---- "🇹🇷 Штрафы Турции" (см. design report "унификация UI") ----
+
+
+async def test_turkey_bot_link_label_returns_reply_with_show_turkey_bot_link(fx):
+    """Штатный способ перехода для reply-кнопки — нажатие распознаётся
+    как обычный текст (см. reader/public_bot/keyboards.py::
+    main_menu_keyboard) и отвечает show_turkey_bot_link=True, ДОСТУПНО
+    ВСЕМ пользователям одинаково (не trusted-gated)."""
+    reply = await fx.controller.handle_text(
+        texts.TURKEY_BOT_LINK_LABEL, chat_id=1, telegram_user_id=1, username="alice",
+    )
+
+    assert reply.text == texts.TURKEY_BOT_LINK_TEXT
+    assert reply.show_turkey_bot_link is True
+    assert reply.show_main_menu is False
+
+
+async def test_turkey_bot_link_label_works_for_trusted_operator_too(trusted_fx):
+    reply = await trusted_fx.controller.handle_text(
+        texts.TURKEY_BOT_LINK_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert reply.text == texts.TURKEY_BOT_LINK_TEXT
+    assert reply.show_turkey_bot_link is True

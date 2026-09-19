@@ -163,7 +163,14 @@ class BotReply:
     reader/public_bot/keyboards.py::owner_fine_cta_buttons, но БЕЗ импорта
     Telethon Button здесь — conversation.py намеренно ничего не знает о
     Telegram API, только handlers.py конвертирует эти пары в реальные
-    Button.url(...)."""
+    Button.url(...).
+
+    show_turkey_bot_link — True ТОЛЬКО в ответ на нажатие
+    "🇹🇷 Штрафы Турции" в главном меню (см. design report "унификация UI":
+    переход в Turkey-бот теперь reply-кнопка, а не автоматическое
+    companion-сообщение) — reader/public_bot/handlers.py прикрепляет
+    turkey_bot_link_keyboard() (inline URL-кнопка) ИМЕННО к этому ответу,
+    никогда сам по себе на экране главного меню."""
 
     text: str
     show_main_menu: bool = False
@@ -184,6 +191,7 @@ class BotReply:
     car_delete_confirm_subscription_id: int | None = None
     car_delete_confirm_page: int | None = None
     cta_buttons: list[list[tuple[str, str]]] | None = None
+    show_turkey_bot_link: bool = False
 
 
 class ConversationController:
@@ -350,6 +358,17 @@ class ConversationController:
                 # "📊 Статистика" ниже.
                 return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
             return self._build_trusted_stop_picker_reply()
+
+        if stripped_text == texts.TURKEY_BOT_LINK_LABEL:
+            # См. design report "унификация UI" — штатный способ перехода
+            # для reply-кнопки (не URL-кнопка сама по себе, Telegram этого
+            # не позволяет для reply-клавиатуры): распознаём нажатие как
+            # обычный текст и отвечаем ОТДЕЛЬНЫМ сообщением с inline
+            # URL-кнопкой (см. BotReply.show_turkey_bot_link докстрок и
+            # reader/public_bot/keyboards.py::turkey_bot_link_keyboard).
+            # Доступно ВСЕМ пользователям одинаково, не trusted-gated.
+            self._states.clear(chat_id)
+            return BotReply(text=texts.TURKEY_BOT_LINK_TEXT, show_turkey_bot_link=True)
 
         if stripped_text == texts.STATISTICS_LABEL:
             self._states.clear(chat_id)

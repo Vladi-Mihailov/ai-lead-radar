@@ -42,11 +42,7 @@ from reader.public_bot.keyboards import (
     turkey_bot_link_keyboard,
 )
 from reader.public_bot.known_users_repository import BotKnownUsersRepository
-from reader.public_bot.texts import (
-    CALLBACK_NOT_AUTHORIZED_TEXT,
-    MAIN_MENU_TEXT,
-    TURKEY_BOT_LINK_TEXT,
-)
+from reader.public_bot.texts import CALLBACK_NOT_AUTHORIZED_TEXT
 
 logger = logging.getLogger(__name__)
 
@@ -304,11 +300,16 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False, is_trusted: bo
         buttons = [
             [Button.url(label, url) for label, url in row] for row in reply.cta_buttons
         ]
+    elif reply.show_turkey_bot_link:
+        # См. design report "унификация UI" — переход в Turkey-бот теперь
+        # ОТВЕТ на нажатие "🇹🇷 Штрафы Турции" (обычной reply-кнопки, см.
+        # reader/public_bot/keyboards.py::main_menu_keyboard), а НЕ
+        # автоматическое companion-сообщение при показе главного меню.
+        buttons = turkey_bot_link_keyboard()
 
     if prefer_edit:
         try:
             await event.edit(reply.text, buttons=buttons)
-            await _maybe_send_turkey_bot_link(event, reply)
             return
         except Exception:
             # Сообщение с кнопками могло стать недоступным для редактирования
@@ -320,17 +321,3 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False, is_trusted: bo
             )
 
     await event.respond(reply.text, buttons=buttons)
-    await _maybe_send_turkey_bot_link(event, reply)
-
-
-async def _maybe_send_turkey_bot_link(event, reply) -> None:
-    """См. design report "связать Georgian bot и Turkey bot взаимными
-    кнопками перехода" — ОТДЕЛЬНОЕ сообщение с inline URL-кнопкой в
-    Turkey-бот, ТОЛЬКО когда реально показан текст главного меню (см.
-    reader/public_bot/keyboards.py::main_menu_keyboard докстрок про
-    ValueError при смешивании reply/inline кнопок) — НЕ на каждом экране
-    с show_main_menu=True (там показывается персистентная клавиатура
-    после результатов проверок/действий, это не "открытие главного меню",
-    см. задачу: "не добавлять переход в каждый экран")."""
-    if reply.show_main_menu and reply.text == MAIN_MENU_TEXT:
-        await event.respond(TURKEY_BOT_LINK_TEXT, buttons=turkey_bot_link_keyboard())

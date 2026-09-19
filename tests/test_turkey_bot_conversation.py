@@ -1713,6 +1713,21 @@ async def test_help_label_opens_help_menu():
     assert reply.help_keyboard == "menu"
 
 
+async def test_georgian_bot_link_label_returns_reply_with_show_georgian_bot_link():
+    """Штатный способ перехода для reply-кнопки (см. design report
+    "унификация UI") — доступно ВСЕМ пользователям одинаково (не
+    trusted-gated)."""
+    controller, _states, _checks, _registry, _garage, _avr, _toll = _make_controller(_FakeCheckFactory([]))
+
+    reply = await controller.handle_text(
+        texts.GEORGIAN_BOT_LINK_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID,
+    )
+
+    assert reply.text == texts.GEORGIAN_BOT_LINK_TEXT
+    assert reply.show_georgian_bot_link is True
+    assert reply.show_main_menu is False
+
+
 async def test_help_label_interrupts_an_in_flight_captcha_wait():
     """Тот же принцип, что и у test_menu_label_interrupts_an_in_flight_
     captcha_wait выше — ℹ️ Справка тоже явная навигация."""

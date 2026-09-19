@@ -30,11 +30,7 @@ from reader.turkey_bot.keyboards import (
     toll_provider_keyboard,
 )
 from reader.turkey_bot.known_users_repository import TurkeyBotKnownUsersRepository
-from reader.turkey_bot.texts import (
-    GEORGIAN_BOT_LINK_TEXT,
-    UNKNOWN_BUTTON_TEXT,
-    WELCOME_TEXT,
-)
+from reader.turkey_bot.texts import UNKNOWN_BUTTON_TEXT
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +173,13 @@ async def _send_reply(event, reply: BotReply, *, is_trusted: bool = False) -> No
         first_buttons = [[Button.url(label, url) for label, url in reply.cta_buttons]]
     elif reply.toll_provider_keyboard:
         first_buttons = toll_provider_keyboard()
+    elif reply.show_georgian_bot_link:
+        # См. design report "унификация UI" — переход в Georgian-бот
+        # теперь ОТВЕТ на нажатие "🇬🇪 Штрафы Грузии" (обычной
+        # reply-кнопки, см. reader/turkey_bot/keyboards.py::
+        # main_menu_keyboard), а НЕ автоматическое companion-сообщение
+        # при показе главного меню.
+        first_buttons = georgian_bot_link_keyboard()
     elif reply.help_keyboard == "menu":
         first_buttons = help_menu_keyboard()
     elif reply.help_keyboard == "section":
@@ -202,14 +205,3 @@ async def _send_reply(event, reply: BotReply, *, is_trusted: bool = False) -> No
         else:
             extra_buttons = None
         await event.respond(extra_text, buttons=extra_buttons)
-
-    # См. design report "связать Georgian bot и Turkey bot взаимными
-    # кнопками перехода" — ОТДЕЛЬНОЕ сообщение с inline URL-кнопкой в
-    # Georgian-бот, ТОЛЬКО когда реально показан текст главного меню (см.
-    # reader/turkey_bot/keyboards.py::main_menu_keyboard докстрок про
-    # ValueError при смешивании reply/inline кнопок) — НЕ на каждом экране
-    # с show_main_menu=True (результаты проверок/действий тоже прикрепляют
-    # персистентную клавиатуру для удобства, но это не "открытие главного
-    # меню", см. задачу: "не добавлять переход в каждый экран").
-    if reply.show_main_menu and reply.text == WELCOME_TEXT:
-        await event.respond(GEORGIAN_BOT_LINK_TEXT, buttons=georgian_bot_link_keyboard())

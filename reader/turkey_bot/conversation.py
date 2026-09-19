@@ -182,7 +182,14 @@ class BotReply:
     (см. _handle_check_tolls_menu) — inline-выбор "🚇 Avrasya Tüneli"/
     "🛣 Все дороги и мосты (KGM)" (см. reader/turkey_bot/keyboards.py::
     toll_provider_keyboard) ДО ввода номера (см. design report
-    "Реализация KGM provider" п.10)."""
+    "Реализация KGM provider" п.10).
+
+    show_georgian_bot_link — True ТОЛЬКО в ответ на нажатие
+    "🇬🇪 Штрафы Грузии" в главном меню (см. design report "унификация UI":
+    переход в Georgian-бот теперь reply-кнопка, а не автоматическое
+    companion-сообщение) — reader/turkey_bot/handlers.py прикрепляет
+    georgian_bot_link_keyboard() (inline URL-кнопка) ИМЕННО к этому
+    ответу, никогда сам по себе на экране главного меню."""
 
     text: str
     photo_png: bytes | None = None
@@ -193,6 +200,7 @@ class BotReply:
     cta_buttons: tuple[tuple[str, str], ...] | None = None
     help_keyboard: str | None = None
     toll_provider_keyboard: bool = False
+    show_georgian_bot_link: bool = False
 
 
 class _AsyncCloseable(Protocol):
@@ -448,6 +456,9 @@ class ConversationController:
         if stripped == texts.HELP_LABEL:
             return await self._handle_help(chat_id=chat_id)
 
+        if stripped == texts.GEORGIAN_BOT_LINK_LABEL:
+            return await self._handle_georgian_bot_link(chat_id=chat_id)
+
         state = self._states.get(chat_id)
 
         if state is not None and state.step == _STEP_AWAITING_PLATE:
@@ -557,6 +568,25 @@ class ConversationController:
             self._states.clear(chat_id)
 
         return BotReply(text=texts.HELP_MENU_TEXT, help_keyboard="menu")
+
+    async def _handle_georgian_bot_link(self, *, chat_id: int) -> BotReply:
+        """"🇬🇪 Штрафы Грузии" — доступна ВСЕМ, без trusted-гейта (см.
+        design report "унификация UI", тот же принцип, что и у
+        _handle_help выше). Штатный способ перехода для reply-кнопки (не
+        URL-кнопка сама по себе, Telegram этого не позволяет для
+        reply-клавиатуры, см. reader/turkey_bot/keyboards.py::
+        main_menu_keyboard докстрок) — отвечает ОТДЕЛЬНЫМ сообщением с
+        inline URL-кнопкой (см. BotReply.show_georgian_bot_link докстрок и
+        reader/turkey_bot/keyboards.py::georgian_bot_link_keyboard).
+        Явная навигация — прошлый незавершённый диалог (если был)
+        отбрасывается, тот же принцип, что и у _handle_help."""
+        async with self._registry.lock_for(chat_id):
+            await self._registry.pop_and_close(chat_id)
+            await self._avrasya_registry.pop_and_close(chat_id)
+            await self._kgm_registry.pop_and_close(chat_id)
+            self._states.clear(chat_id)
+
+        return BotReply(text=texts.GEORGIAN_BOT_LINK_TEXT, show_georgian_bot_link=True)
 
     async def handle_help_callback(self, section: str) -> BotReply:
         """Разделы ℹ️ Справка (см. reader/turkey_bot/keyboards.py::

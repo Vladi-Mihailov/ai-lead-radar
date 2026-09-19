@@ -120,41 +120,55 @@ async def test_show_cancel_button_still_wins_over_cta_buttons():
     assert _button_labels(event.calls[0]["buttons"]) == ["❌ Отмена"]
 
 
-# ---- Переход в Georgian-бот (см. design report "связать Georgian bot и
-# Turkey bot взаимными кнопками перехода") ----
+# ---- Переход в Georgian-бот (см. design report "унификация UI") ----
 
 
-async def test_welcome_text_sends_a_companion_message_with_georgian_bot_link():
-    """Главное меню (WELCOME_TEXT, см. /start) — ЕДИНСТВЕННОЕ место, где
-    появляется переход в Georgian-бот, ОТДЕЛЬНЫМ сообщением (Telethon не
-    позволяет смешать reply- и inline-кнопки в одной разметке, см.
-    reader/turkey_bot/keyboards.py::main_menu_keyboard докстрок)."""
+async def test_welcome_text_no_longer_sends_a_companion_message():
+    """См. design report "унификация UI" — переход в Georgian-бот
+    перенесён в постоянную reply-клавиатуру (см.
+    reader/turkey_bot/keyboards.py::main_menu_keyboard), больше НЕ
+    отправляется автоматическое companion-сообщение при показе главного
+    меню (/start)."""
     reply = BotReply(text=texts.WELCOME_TEXT, show_main_menu=True)
     event = _FakeEvent()
 
     await _send_reply(event, reply)
 
-    assert len(event.calls) == 2
+    assert len(event.calls) == 1
     assert event.calls[0]["text"] == texts.WELCOME_TEXT
     assert event.calls[0]["buttons"] is not None  # main_menu_keyboard(...)
-    assert event.calls[1]["text"] == texts.GEORGIAN_BOT_LINK_TEXT
-    labels = _button_labels(event.calls[1]["buttons"])
-    urls = _button_urls(event.calls[1]["buttons"])
+
+
+async def test_georgian_bot_link_reply_attaches_the_inline_url_button():
+    """Штатный способ перехода для reply-кнопки (см.
+    reader/turkey_bot/conversation.py::_handle_georgian_bot_link) — ответ
+    на "🇬🇪 Штрафы Грузии" несёт show_georgian_bot_link=True, handlers.py
+    прикрепляет georgian_bot_link_keyboard() к ЭТОМУ ЖЕ сообщению (не
+    отдельным вторым, как раньше)."""
+    reply = BotReply(text=texts.GEORGIAN_BOT_LINK_TEXT, show_georgian_bot_link=True)
+    event = _FakeEvent()
+
+    await _send_reply(event, reply)
+
+    assert len(event.calls) == 1
+    assert event.calls[0]["text"] == texts.GEORGIAN_BOT_LINK_TEXT
+    labels = _button_labels(event.calls[0]["buttons"])
+    urls = _button_urls(event.calls[0]["buttons"])
     assert labels == [texts.GEORGIAN_BOT_LINK_LABEL]
     assert urls == {texts.GEORGIAN_BOT_URL}
 
 
 async def test_non_welcome_main_menu_screens_do_not_get_the_georgian_bot_link():
-    """Явное требование задачи: "не добавлять переход в каждый экран —
-    только в главное меню" — show_main_menu=True появляется после МНОГИХ
-    результатов (has_debt/no_debt/ошибки), но companion-сообщение не
-    должно отправляться, если это не буквально экран приветствия."""
+    """show_main_menu=True появляется после МНОГИХ результатов (has_debt/
+    no_debt/ошибки) — companion-логики больше нет вовсе, но регрессия
+    (один и тот же принцип, что и раньше) стоит держать явным тестом."""
     reply = BotReply(text="✅ 34ABC123: штрафов не найдено.", show_main_menu=True)
     event = _FakeEvent()
 
     await _send_reply(event, reply)
 
     assert len(event.calls) == 1
+    assert event.calls[0]["buttons"] is not None  # main_menu_keyboard(...), не georgia-link
 
 
 async def test_georgian_bot_link_keyboard_is_pure_inline_and_does_not_crash_telethon():
@@ -163,7 +177,7 @@ async def test_georgian_bot_link_keyboard_is_pure_inline_and_does_not_crash_tele
     разметке заставляет Telethon поднять ValueError('You cannot mix
     inline with normal buttons') — здесь проверяется, что реальный
     telethon.client.buttons.ButtonMethods.build_reply_markup успешно
-    строит ОБЕ разметки (главное меню и companion-сообщение) по
+    строит ОБЕ разметки (главное меню и ответ на "🇬🇪 Штрафы Грузии") по
     отдельности, без единого смешивания."""
     from telethon.client.buttons import ButtonMethods
 

@@ -24,16 +24,18 @@ STOP_LABEL = "⛔ Остановить мониторинг"
 # и reader/public_bot/handlers.py) — обычный клиент её никогда не видит.
 STATISTICS_LABEL = "📊 Статистика"
 
-# Переход в Turkey-бот (см. design report "связать Georgian bot и Turkey
-# bot взаимными кнопками перехода") — отдельное сообщение сразу ПОСЛЕ
-# главного меню (см. reader/public_bot/keyboards.py::
-# turkey_bot_link_keyboard и её докстрок про то, почему это не может быть
-# частью main_menu_keyboard), видно ВСЕМ пользователям одинаково (не
-# trusted-gated, в отличие от STATISTICS_LABEL выше). @ProtocolTRbot —
-# реальный, уже подключённый username Turkey-бота (см.
-# reader/turkey_bot/main.py — тот же бот, что и в этом коммите).
+# Переход в Turkey-бот (см. design report "унификация UI") —
+# TURKEY_BOT_LINK_LABEL теперь ОБЫЧНАЯ reply-кнопка в главном меню (ROW 2,
+# см. reader/public_bot/keyboards.py::main_menu_keyboard), видна ВСЕМ
+# пользователям одинаково (не trusted-gated, в отличие от STATISTICS_LABEL
+# выше). Нажатие распознаётся как текст (см.
+# reader/public_bot/conversation.py::_handle_menu_label) и отвечает
+# ОТДЕЛЬНЫМ сообщением (TURKEY_BOT_LINK_TEXT) с inline URL-кнопкой (см.
+# turkey_bot_link_keyboard) — Telegram reply-кнопки физически не могут
+# сами быть URL-кнопками. @ProtocolTRbot — реальный, уже подключённый
+# username Turkey-бота (см. reader/turkey_bot/main.py).
+TURKEY_BOT_LINK_LABEL = "🇹🇷 Штрафы Турции"
 TURKEY_BOT_LINK_TEXT = "🇹🇷 Проверка штрафов и платных дорог Турции"
-TURKEY_BOT_LINK_LABEL = "🇹🇷 Штрафы и дороги Турции →"
 TURKEY_BOT_URL = "https://t.me/ProtocolTRbot"
 
 CAR_NUMBER_PROMPT = "🚗 Введите госномер автомобиля\n\nНапример: M295YB196"

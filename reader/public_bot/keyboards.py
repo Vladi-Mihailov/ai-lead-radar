@@ -82,8 +82,8 @@ _MY_CAR_DELETE_NO_PREFIX = b"mycardelno:"
 
 
 def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
-    """is_trusted — управляет ОБЕИМИ кнопками, доступными только
-    trusted_operator_user_ids (см. reader/public_bot/handlers.py —
+    """is_trusted — управляет STOP_LABEL/STATISTICS_LABEL, доступными
+    только trusted_operator_user_ids (см. reader/public_bot/handlers.py —
     единственное место, откуда сюда приходит True):
 
     - "⛔ Остановить мониторинг" — для обычного пользователя эта кнопка
@@ -93,25 +93,28 @@ def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
       ConversationController._build_trusted_stop_picker_reply/
       handle_trusted_stop_pick), который умеет останавливать ЛЮБУЮ задачу
       мониторинга (включая операторские, без единой client-подписки) — то,
-      что car-centric UX (subscription-based) заведомо не покрывает;
+      что car-centric UX (subscription-based) заведомо не покрывает —
+      см. design report "унификация UI": вынесена в ОТДЕЛЬНУЮ последнюю
+      строку (не помещается в ROW 2 вместе с TURKEY_BOT_LINK_LABEL —
+      заданный макет ROW 2 строго 2 кнопки), а не удалена;
     - "📊 Статистика" — как и раньше, обычный клиент её никогда не видит.
 
-    НЕ содержит переход в Turkey-бот (см. design report "связать Georgian
-    bot и Turkey bot взаимными кнопками перехода") — Telethon/Telegram
-    физически не позволяет смешивать reply-кнопки (Button.text, эта
-    клавиатура) с inline URL-кнопкой в ОДНОЙ разметке (client.
-    build_reply_markup поднимает ValueError('You cannot mix inline with
-    normal buttons') при попытке) — переход отправляется ОТДЕЛЬНЫМ
-    сообщением сразу после текста главного меню, см.
-    turkey_bot_link_keyboard() ниже и reader/public_bot/handlers.py::
-    _send_reply."""
+    "🇹🇷 Штрафы Турции" (TURKEY_BOT_LINK_LABEL) — ОБЫЧНАЯ reply-кнопка
+    (Button.text, см. design report "унификация UI": переход в Turkey-бот
+    перенесён из отдельного companion-сообщения СЮДА, в постоянную
+    клавиатуру) — сама по себе НЕ открывает URL (Telegram reply-кнопки не
+    умеют быть URL-кнопками) — нажатие распознаётся как обычный текст (см.
+    reader/public_bot/conversation.py::_handle_menu_label) и отвечает
+    ОТДЕЛЬНЫМ сообщением с inline URL-кнопкой (см.
+    turkey_bot_link_keyboard() ниже) — НЕ отправляется автоматически при
+    показе главного меню."""
     rows = [
         [Button.text(ADD_CAR_LABEL, resize=True), Button.text(MY_CARS_LABEL, resize=True)],
-        [Button.text(CHECK_NOW_LABEL, resize=True)],
+        [Button.text(CHECK_NOW_LABEL, resize=True), Button.text(TURKEY_BOT_LINK_LABEL, resize=True)],
     ]
     if is_trusted:
-        rows[1].append(Button.text(STOP_LABEL, resize=True))
         rows.append([Button.text(STATISTICS_LABEL, resize=True)])
+        rows.append([Button.text(STOP_LABEL, resize=True)])
     return rows
 
 

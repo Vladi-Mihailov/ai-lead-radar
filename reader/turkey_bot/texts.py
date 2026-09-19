@@ -155,22 +155,35 @@ CHECK_TOLLS_LABEL = "🛣 Проверить платные дороги"
 # кнопки.
 CHECK_TOLLS_AVRASYA_LABEL = "🚇 Туннели"
 CHECK_TOLLS_KGM_LABEL = "🛣 Все дороги и мосты (KGM)"
+
+# Укороченные подписи ТОЛЬКО для инлайн-кнопок гаража (см.
+# reader/turkey_bot/keyboards.py::garage_keyboard, design report
+# "унификация UI") — ОТДЕЛЬНЫЕ константы, НЕ переиспользуют
+# CHECK_FINES_LABEL/CHECK_TOLLS_KGM_LABEL, потому что те показываются и в
+# других местах (главное меню/подменю платных дорог), где текст менять не
+# просили. callback_data/provider routing НЕ меняются вовсе (gib/avrasya/
+# kgm остаются буквально теми же строками) — эти константы влияют
+# ИСКЛЮЧИТЕЛЬНО на отображаемый текст кнопки.
+GARAGE_CHECK_FINES_LABEL = "🚔 Штрафы"
+GARAGE_CHECK_TOLLS_KGM_LABEL = "🛣 Дороги"
 # ℹ️ Справка (см. design report) — видна ВСЕМ, как и CHECK_FINES_LABEL/
 # CHECK_TOLLS_LABEL/GARAGE_LABEL (НЕ trusted-gated, в отличие от
 # STATISTICS_LABEL).
 HELP_LABEL = "ℹ️ Справка"
 
-# Переход в Georgian-бот (см. design report "связать Georgian bot и
-# Turkey bot взаимными кнопками перехода") — отдельное сообщение сразу
-# ПОСЛЕ главного меню (см. reader/turkey_bot/keyboards.py::
-# georgian_bot_link_keyboard и её докстрок про то, почему это не может
-# быть частью main_menu_keyboard), видно ВСЕМ пользователям одинаково (не
-# trusted-gated). ProtocolGEbot — реальный username Georgian-бота, взят из
-# reader/public_bot/main.py::_BOT_USERNAME (тот же приём отдельного
-# hardcode на каждой стороне, что и там же — оба бота полностью
-# независимые процессы, не импортируют друг у друга).
+# Переход в Georgian-бот (см. design report "унификация UI") —
+# GEORGIAN_BOT_LINK_LABEL теперь ОБЫЧНАЯ reply-кнопка в главном меню (ROW
+# 2, см. reader/turkey_bot/keyboards.py::main_menu_keyboard), видна ВСЕМ
+# пользователям одинаково (не trusted-gated). Нажатие распознаётся как
+# текст (см. reader/turkey_bot/conversation.py::handle_text) и отвечает
+# ОТДЕЛЬНЫМ сообщением (GEORGIAN_BOT_LINK_TEXT) с inline URL-кнопкой (см.
+# georgian_bot_link_keyboard) — Telegram reply-кнопки физически не могут
+# сами быть URL-кнопками. ProtocolGEbot — реальный username Georgian-бота,
+# взят из reader/public_bot/main.py::_BOT_USERNAME (тот же приём
+# отдельного hardcode на каждой стороне — оба бота полностью независимые
+# процессы, не импортируют друг у друга).
+GEORGIAN_BOT_LINK_LABEL = "🇬🇪 Штрафы Грузии"
 GEORGIAN_BOT_LINK_TEXT = "🇬🇪 Проверка штрафов в Грузии"
-GEORGIAN_BOT_LINK_LABEL = "🇬🇪 Штрафы Грузии →"
 GEORGIAN_BOT_URL = "https://t.me/ProtocolGEbot"
 
 # Подписи 4 разделов ℹ️ Справка + общая "⬅️ Назад" (см.

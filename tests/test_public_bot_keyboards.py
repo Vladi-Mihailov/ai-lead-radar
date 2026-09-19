@@ -1,10 +1,8 @@
 """
 Тесты reader/public_bot/keyboards.py::main_menu_keyboard() — "⛔
-Остановить мониторинг" (task-level, trusted-only после переработки UX,
-см. design report) и "📊 Статистика" добавляются в главное меню ТОЛЬКО
-когда is_trusted=True (см. reader/public_bot/handlers.py — единственный
-вызывающий код, решающий это по ConversationController.is_trusted(
-event.sender_id)).
+Остановить мониторинг"/"📊 Статистика" (trusted-only, см. design report) и
+"🇹🇷 Штрафы Турции" (см. design report "унификация UI" — reply-кнопка
+перехода в Turkey-бот, видна ВСЕМ) добавляются в главное меню.
 """
 
 import sys
@@ -43,11 +41,15 @@ def test_main_menu_keyboard_without_trusted_buttons_by_default():
     assert STOP_LABEL not in labels
 
 
-def test_main_menu_keyboard_excludes_trusted_buttons_for_ordinary_user():
+def test_main_menu_keyboard_ordinary_user_is_a_2x2_layout():
+    """Явное требование задачи "унификация UI":
+    ROW 1: ➕ Добавить авто | 📋 Мои авто
+    ROW 2: 🔎 Проверить сейчас | 🇹🇷 Штрафы Турции"""
     keyboard = main_menu_keyboard(is_trusted=False)
 
-    labels = _labels(keyboard)
-    assert labels == [ADD_CAR_LABEL, MY_CARS_LABEL, CHECK_NOW_LABEL]
+    assert len(keyboard) == 2
+    assert [b.button.text for b in keyboard[0]] == [ADD_CAR_LABEL, MY_CARS_LABEL]
+    assert [b.button.text for b in keyboard[1]] == [CHECK_NOW_LABEL, TURKEY_BOT_LINK_LABEL]
 
 
 def test_main_menu_keyboard_includes_trusted_buttons_for_trusted_operator():
@@ -56,6 +58,20 @@ def test_main_menu_keyboard_includes_trusted_buttons_for_trusted_operator():
     labels = _labels(keyboard)
     assert STATISTICS_LABEL in labels
     assert STOP_LABEL in labels
+
+
+def test_main_menu_keyboard_manager_adds_statistics_row_and_keeps_stop_row():
+    """Задача явно не указала "⛔ Остановить мониторинг" в новом макете —
+    по решению пользователя кнопка сохранена ОТДЕЛЬНОЙ строкой ПОСЛЕ
+    заданных 3 строк (task-level admin flow не должен стать недостижим
+    из главного меню, см. design report)."""
+    keyboard = main_menu_keyboard(is_trusted=True)
+
+    assert len(keyboard) == 4
+    assert [b.button.text for b in keyboard[0]] == [ADD_CAR_LABEL, MY_CARS_LABEL]
+    assert [b.button.text for b in keyboard[1]] == [CHECK_NOW_LABEL, TURKEY_BOT_LINK_LABEL]
+    assert [b.button.text for b in keyboard[2]] == [STATISTICS_LABEL]
+    assert [b.button.text for b in keyboard[3]] == [STOP_LABEL]
 
 
 def test_main_menu_keyboard_does_not_change_ordinary_user_buttons():
@@ -69,17 +85,16 @@ def test_main_menu_keyboard_does_not_change_ordinary_user_buttons():
     for label in (ADD_CAR_LABEL, MY_CARS_LABEL, CHECK_NOW_LABEL):
         assert label in without
         assert label in with_trusted
-    assert len(with_trusted) == len(without) + 2  # + STOP_LABEL + STATISTICS_LABEL
+    assert len(with_trusted) == len(without) + 2  # + STATISTICS_LABEL + STOP_LABEL
 
 
-def test_main_menu_keyboard_does_not_contain_the_turkey_bot_link():
-    """См. design report "связать Georgian bot и Turkey bot взаимными
-    кнопками перехода" — переход отправляется ОТДЕЛЬНЫМ сообщением (см.
-    reader/public_bot/handlers.py::_send_reply), а не частью этой
-    reply-клавиатуры (Telethon не позволяет смешать Button.text с
-    Button.url в одной разметке, см. main_menu_keyboard докстрок)."""
+def test_main_menu_keyboard_contains_the_turkey_bot_link_as_a_reply_button():
+    """См. design report "унификация UI" — переход в Turkey-бот теперь
+    ОБЫЧНАЯ reply-кнопка (Button.text) в главном меню, а не отдельное
+    companion-сообщение (см. reader/public_bot/handlers.py::_send_reply/
+    reader/public_bot/conversation.py::_handle_menu_label)."""
     labels = _labels(main_menu_keyboard(is_trusted=True))
-    assert TURKEY_BOT_LINK_LABEL not in labels
+    assert TURKEY_BOT_LINK_LABEL in labels
 
 
 def test_turkey_bot_link_keyboard_has_the_expected_url_button():

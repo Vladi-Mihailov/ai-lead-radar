@@ -35,6 +35,8 @@ from reader.turkey_bot.texts import (  # noqa: E402
     CHECK_TOLLS_AVRASYA_LABEL,
     CHECK_TOLLS_KGM_LABEL,
     CHECK_TOLLS_LABEL,
+    GARAGE_CHECK_FINES_LABEL,
+    GARAGE_CHECK_TOLLS_KGM_LABEL,
     GARAGE_LABEL,
     GEORGIAN_BOT_LINK_LABEL,
     GEORGIAN_BOT_URL,
@@ -81,36 +83,38 @@ def test_cancel_callback_data_is_a_fixed_constant_without_dynamic_content():
     assert CANCEL_CALLBACK_DATA == b"turkeycancel"
 
 
-def test_main_menu_shows_fines_tolls_garage_and_help_for_everyone():
-    labels = _text_labels(main_menu_keyboard(is_trusted=False))
+def test_main_menu_ordinary_user_is_a_2x2_plus_help_layout():
+    """Явное требование задачи "унификация UI":
+    ROW 1: 🚔 Проверить штрафы | 🛣 Проверить платные дороги
+    ROW 2: 🚗 Мои авто | 🇬🇪 Штрафы Грузии
+    ROW 3: ℹ️ Справка"""
+    keyboard = main_menu_keyboard(is_trusted=False)
 
-    assert CHECK_FINES_LABEL in labels
-    assert CHECK_TOLLS_LABEL in labels
-    assert GARAGE_LABEL in labels
-    assert HELP_LABEL in labels
-    assert STATISTICS_LABEL not in labels
+    assert len(keyboard) == 3
+    assert _text_labels([keyboard[0]]) == [CHECK_FINES_LABEL, CHECK_TOLLS_LABEL]
+    assert _text_labels([keyboard[1]]) == [GARAGE_LABEL, GEORGIAN_BOT_LINK_LABEL]
+    assert _text_labels([keyboard[2]]) == [HELP_LABEL]
+    assert STATISTICS_LABEL not in _text_labels(keyboard)
 
 
-def test_main_menu_shows_statistics_only_for_trusted():
-    """Явное требование задачи: "A normal user must not see the
-    button"."""
+def test_main_menu_manager_puts_help_and_statistics_in_the_same_last_row():
+    """Явное требование задачи: манагеру ROW 3 = ℹ️ Справка | 📊
+    Статистика (одна строка, не две отдельные)."""
+    keyboard = main_menu_keyboard(is_trusted=True)
+
+    assert len(keyboard) == 3
+    assert _text_labels([keyboard[0]]) == [CHECK_FINES_LABEL, CHECK_TOLLS_LABEL]
+    assert _text_labels([keyboard[1]]) == [GARAGE_LABEL, GEORGIAN_BOT_LINK_LABEL]
+    assert _text_labels([keyboard[2]]) == [HELP_LABEL, STATISTICS_LABEL]
+
+
+def test_main_menu_keyboard_contains_the_georgian_bot_link_as_a_reply_button():
+    """См. design report "унификация UI" — переход в Georgian-бот теперь
+    ОБЫЧНАЯ reply-кнопка (Button.text) в главном меню, а не отдельное
+    companion-сообщение (см. reader/turkey_bot/handlers.py::_send_reply/
+    reader/turkey_bot/conversation.py::handle_text)."""
     labels = _text_labels(main_menu_keyboard(is_trusted=True))
-
-    assert CHECK_FINES_LABEL in labels
-    assert CHECK_TOLLS_LABEL in labels
-    assert GARAGE_LABEL in labels
-    assert HELP_LABEL in labels
-    assert STATISTICS_LABEL in labels
-
-
-def test_main_menu_keyboard_does_not_contain_the_georgian_bot_link():
-    """См. design report "связать Georgian bot и Turkey bot взаимными
-    кнопками перехода" — переход отправляется ОТДЕЛЬНЫМ сообщением (см.
-    reader/turkey_bot/handlers.py::_send_reply), а не частью этой
-    reply-клавиатуры (Telethon не позволяет смешать Button.text с
-    Button.url в одной разметке, см. main_menu_keyboard докстрок)."""
-    labels = _text_labels(main_menu_keyboard(is_trusted=True))
-    assert GEORGIAN_BOT_LINK_LABEL not in labels
+    assert GEORGIAN_BOT_LINK_LABEL in labels
 
 
 def test_georgian_bot_link_keyboard_has_the_expected_url_button():
@@ -139,13 +143,18 @@ def test_garage_keyboard_has_four_buttons_per_car():
 
 
 def test_garage_keyboard_shows_plate_and_all_action_labels():
+    """Укороченные подписи (см. design report "унификация UI") —
+    <PLATE> | 🚔 Штрафы | 🚇 Туннели | 🛣 Дороги — НЕ переиспользуют
+    CHECK_FINES_LABEL/CHECK_TOLLS_KGM_LABEL (главное меню/подменю платных
+    дорог их не меняли, см. GARAGE_CHECK_FINES_LABEL/
+    GARAGE_CHECK_TOLLS_KGM_LABEL докстрок в texts.py)."""
     keyboard = garage_keyboard([_car(1, "34ABC123")])
 
     row = keyboard[0]
     assert row[0].text == "34ABC123"
-    assert row[1].text == CHECK_FINES_LABEL
-    assert row[2].text == CHECK_TOLLS_AVRASYA_LABEL
-    assert row[3].text == CHECK_TOLLS_KGM_LABEL
+    assert row[1].text == GARAGE_CHECK_FINES_LABEL == "🚔 Штрафы"
+    assert row[2].text == CHECK_TOLLS_AVRASYA_LABEL == "🚇 Туннели"
+    assert row[3].text == GARAGE_CHECK_TOLLS_KGM_LABEL == "🛣 Дороги"
 
 
 def test_garage_keyboard_plate_and_fines_button_encode_the_same_gib_callback():
