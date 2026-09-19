@@ -7,3 +7,19 @@ tzdata>=2024.1
 beautifulsoup4>=4.12,<5.0
 openai>=1.60,<4.0
 playwright>=1.40,<2.0
+
+# reader/turkey_bot_test/captcha_solver.py — экспериментальный OCR-решатель
+# CAPTCHA test-clone Turkey-бота (только reader/turkey_bot_test/, продовый
+# reader/turkey_bot их не использует).
+opencv-python>=4.9,<5.0
+numpy>=1.26,<3.0
+pytesseract>=0.3.10,<1.0
+Pillow>=10.0,<12.0
+
+# reader/turkey_bot_test/ocr/rapid_ocr.py — экспериментальный "обычный" OCR
+# (RapidOCR, модели PP-OCRv6 в ONNX) для сравнения с pytesseract, только
+# reader/turkey_bot_test/. PaddleOCR/PaddlePaddle НЕ используются — PaddlePaddle
+# не публикует колёса под текущую версию Python (проверено на PyPI), RapidOCR
+# даёт те же модели через onnxruntime без зависимости от paddle.
+rapidocr>=3.9,<4.0
+onnxruntime>=1.30,<2.0

@@ -64,6 +64,7 @@ from reader.turkey_bot_test.avrasya.session import (
     AvrasyaSession,
     AvrasyaTransportError,
 )
+from reader.turkey_bot_test.captcha_solver import CaptchaSolver
 from reader.turkey_bot_test.check_repository import TurkeyCheckRepository
 from reader.turkey_bot_test.conversation_state_repository import (
     TurkeyConversationStateRepository,
@@ -83,7 +84,10 @@ from reader.turkey_bot_test.kgm.live_session_registry import (
 from reader.turkey_bot_test.kgm.models import KgmCaptchaChallenge, KgmSubmitOutcome
 from reader.turkey_bot_test.kgm.provider import KgmProvider
 from reader.turkey_bot_test.kgm.session import KgmSession, KgmTransportError
-from reader.turkey_bot_test.live_session_registry import LiveGibCheck, LiveGibSessionRegistry
+from reader.turkey_bot_test.live_session_registry import (
+    LiveGibCheck,
+    LiveGibSessionRegistry,
+)
 from reader.turkey_bot_test.models import ConversationState, TurkeyUserCar
 from reader.turkey_bot_test.statistics_service import TurkeyStatisticsService
 from reader.turkey_bot_test.toll_check_repository import TurkeyTollCheckRepository
@@ -775,7 +779,7 @@ class ConversationController:
 
             if check is None:
                 # Рестарт процесса, естественная idle-TTL эвикция, или
-                # устаревший challenge — reader/turkey_bot_test/
+                # устаревший challenge — reader/turkey_bot/
                 # live_session_registry.py не различает эти случаи, и мы
                 # тоже не должны: во всех — молча запросить новую CAPTCHA
                 # для номера, уже сохранённого в payload (см. design
@@ -796,10 +800,32 @@ class ConversationController:
                     show_cancel_button=True,
                 )
 
+            # Если пользователь ввел код вручную, используем его
+            user_code = code.strip()
+
+            # Попытка автоматически распознать капчу
+            try:
+                # Получаем текущую капчу
+                current_challenge = await check.provider.refresh_captcha()
+                check.image_id = current_challenge.image_id
+                auto_code = CaptchaSolver.solve_captcha(current_challenge.image_png)
+
+                if auto_code:
+                    logger.info(f"Автоматически распознан код капчи: {auto_code}")
+                    # Используем автоматически распознанный код
+                    code_to_use = auto_code
+                else:
+                    # Если не удалось распознать, используем код пользователя
+                    logger.info("Не удалось автоматически распознать капчу, используем код пользователя")
+                    code_to_use = user_code
+            except Exception as e:
+                logger.warning(f"Ошибка при попытке автоматического распознавания капчи: {e}")
+                code_to_use = user_code
+
             check.submit_attempts += 1
             try:
                 outcome = await check.provider.submit(
-                    plate=check.plate, image_id=check.image_id, captcha_code=code,
+                    plate=check.plate, image_id=check.image_id, captcha_code=code_to_use,
                 )
             except GibTransportError:
                 await self._finish(
@@ -979,19 +1005,10 @@ class ConversationController:
     async def _handle_avrasya_captcha_code(
         self, code: str, *, chat_id: int, telegram_user_id: int, state: ConversationState,
     ) -> BotReply:
-        """Структурная копия _handle_captcha_code() (см. выше) для
-        Avrasya — та же "restart recovery"/rejected-retry семантика, но
-        через LiveAvrasyaSessionRegistry/AvrasyaProvider и без image_id
-        (см. avrasya/models.py — Avrasya его не несёт)."""
         async with self._registry.lock_for(chat_id):
             check = await self._avrasya_registry.get(chat_id)
 
             if check is None:
-                # Тот же принцип, что и у GIB-ветки: рестарт/idle-TTL/
-                # устаревшая сессия — не различаются, молча запрашиваем
-                # новую CAPTCHA для уже сохранённого номера (см. design
-                # report: "Missing/expired live Avrasya session → create a
-                # fresh session/CAPTCHA for the persisted plate").
                 plate = (state.payload or {}).get("plate")
                 if not plate:
                     self._states.clear(chat_id)
@@ -1018,9 +1035,30 @@ class ConversationController:
                     show_cancel_button=True,
                 )
 
+            # Если пользователь ввел код вручную, используем его
+            user_code = code.strip()
+
+            # Попытка автоматически распознать капчу
+            try:
+                # Получаем текущую капчу
+                current_challenge = await check.provider.refresh_captcha()
+                auto_code = CaptchaSolver.solve_captcha(current_challenge.image_png)
+
+                if auto_code:
+                    logger.info(f"Автоматически распознан код капчи Avrasya: {auto_code}")
+                    # Используем автоматически распознанный код
+                    code_to_use = auto_code
+                else:
+                    # Если не удалось распознать, используем код пользователя
+                    logger.info("Не удалось автоматически распознать капчу Avrasya, используем код пользователя")
+                    code_to_use = user_code
+            except Exception as e:
+                logger.warning(f"Ошибка при попытке автоматического распознавания капчи Avrasya: {e}")
+                code_to_use = user_code
+
             check.submit_attempts += 1
             try:
-                outcome = await check.provider.submit(plate=check.plate, captcha_code=code)
+                outcome = await check.provider.submit(plate=check.plate, captcha_code=code_to_use)
             except AvrasyaRateLimitedError:
                 await self._finish_avrasya(
                     chat_id, telegram_user_id=telegram_user_id, check=check,
