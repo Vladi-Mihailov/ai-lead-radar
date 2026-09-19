@@ -122,7 +122,10 @@ class CaptchaSolver:
         try:
             service = _get_rapid_ocr_service()
             results = service.recognize(captcha_img_bytes)
-            text = "".join(r.text for r in results).upper()
+            # НЕ .upper() — реальные GIB CAPTCHA строчные (см. вручную
+            # размеченные образцы в reader/turkey_bot_test/ocr_samples/),
+            # а проверка кода на сервере, вероятно, регистрозависима.
+            text = "".join(r.text for r in results)
             filtered_text = ''.join(filter(str.isalnum, text))
 
             if filtered_text and 4 <= len(filtered_text) <= 6:
