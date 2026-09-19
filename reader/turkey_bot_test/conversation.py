@@ -114,6 +114,12 @@ _PROVIDER_GIB = "gib"
 _PROVIDER_AVRASYA = "avrasya"
 _PROVIDER_KGM = "kgm"
 
+# Сколько раз подряд бот пытается сам получить+распознать+отправить
+# CAPTCHA (через CaptchaSolver/OCR_ENGINE), прежде чем сдаться и показать
+# картинку человеку как обычно. Только GIB/Avrasya (см.
+# _auto_solve_gib_captcha/_auto_solve_avrasya_captcha) — KGM не тронут.
+_MAX_AUTO_CAPTCHA_ATTEMPTS = 7
+
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -752,6 +758,11 @@ class ConversationController:
                         "Turkey Avrasya: failed to start session/captcha (chat_id=%s)", chat_id,
                     )
                     return BotReply(text=texts.AVRASYA_CAPTCHA_FETCH_FAILED_TEXT, show_main_menu=True)
+
+                check = await self._avrasya_registry.get(chat_id)
+                return await self._auto_solve_avrasya_captcha(
+                    chat_id, telegram_user_id=telegram_user_id, check=check, challenge=challenge,
+                )
             elif provider == _PROVIDER_KGM:
                 try:
                     challenge = await self._open_new_kgm_check(chat_id, telegram_user_id, plate)
@@ -760,14 +771,19 @@ class ConversationController:
                         "Turkey KGM: failed to start session/captcha (chat_id=%s)", chat_id,
                     )
                     return BotReply(text=texts.KGM_CAPTCHA_FETCH_FAILED_TEXT, show_main_menu=True)
+
+                return BotReply(
+                    text=texts.ASK_CAPTCHA_TEXT, photo_png=challenge.image_png, show_cancel_button=True,
+                )
             else:
                 challenge = await self._open_new_check(chat_id, telegram_user_id, plate)
                 if challenge is None:
                     return BotReply(text=texts.CAPTCHA_FETCH_FAILED_TEXT, show_main_menu=True)
 
-            return BotReply(
-                text=texts.ASK_CAPTCHA_TEXT, photo_png=challenge.image_png, show_cancel_button=True,
-            )
+                check = await self._registry.get(chat_id)
+                return await self._auto_solve_gib_captcha(
+                    chat_id, telegram_user_id=telegram_user_id, check=check, challenge=challenge,
+                )
 
     # ---- GIB (см. reader/turkey_bot_test/gib/*) — НЕИЗМЕНЁННАЯ логика Stage 3/4 ----
 
@@ -794,38 +810,19 @@ class ConversationController:
                     self._states.clear(chat_id)
                     return BotReply(text=texts.CAPTCHA_FETCH_FAILED_TEXT, show_main_menu=True)
 
-                return BotReply(
-                    text=texts.SESSION_EXPIRED_RETRY_TEXT,
-                    photo_png=challenge.image_png,
-                    show_cancel_button=True,
+                check = await self._registry.get(chat_id)
+                return await self._auto_solve_gib_captcha(
+                    chat_id, telegram_user_id=telegram_user_id, check=check, challenge=challenge,
                 )
 
-            # Если пользователь ввел код вручную, используем его
-            user_code = code.strip()
-
-            # Попытка автоматически распознать капчу
-            try:
-                # Получаем текущую капчу
-                current_challenge = await check.provider.refresh_captcha()
-                check.image_id = current_challenge.image_id
-                auto_code = CaptchaSolver.solve_captcha(current_challenge.image_png)
-
-                if auto_code:
-                    logger.info(f"Автоматически распознан код капчи: {auto_code}")
-                    # Используем автоматически распознанный код
-                    code_to_use = auto_code
-                else:
-                    # Если не удалось распознать, используем код пользователя
-                    logger.info("Не удалось автоматически распознать капчу, используем код пользователя")
-                    code_to_use = user_code
-            except Exception as e:
-                logger.warning(f"Ошибка при попытке автоматического распознавания капчи: {e}")
-                code_to_use = user_code
-
+            # Человеку уже показали CAPTCHA (все автоматические попытки —
+            # см. _auto_solve_gib_captcha — к этому моменту исчерпаны),
+            # используем код, который он ввёл, без повторных попыток
+            # авто-распознавания.
             check.submit_attempts += 1
             try:
                 outcome = await check.provider.submit(
-                    plate=check.plate, image_id=check.image_id, captcha_code=code_to_use,
+                    plate=check.plate, image_id=check.image_id, captcha_code=code,
                 )
             except GibTransportError:
                 await self._finish(
@@ -1000,6 +997,78 @@ class ConversationController:
         )
         return challenge
 
+    async def _auto_solve_gib_captcha(
+        self, chat_id: int, *, telegram_user_id: int, check: LiveGibCheck, challenge: CaptchaChallenge,
+    ) -> BotReply:
+        """До _MAX_AUTO_CAPTCHA_ATTEMPTS раз подряд: распознать текущую
+        CAPTCHA через CaptchaSolver (движок — OCR_ENGINE) и сразу
+        отправить код на GIB. Если сервер принял (не "rejected") —
+        возвращает итоговый результат без участия человека. Если ни одна
+        попытка не подошла (OCR не распознал ИЛИ сервер отклонил код) —
+        после последней попытки показывает последнюю полученную картинку
+        человеку как обычно (_handle_captcha_code дальше отправляет его
+        код напрямую, без повторных авто-попыток)."""
+        for attempt in range(1, _MAX_AUTO_CAPTCHA_ATTEMPTS + 1):
+            auto_code = CaptchaSolver.solve_captcha(challenge.image_png)
+
+            if auto_code:
+                check.submit_attempts += 1
+                try:
+                    outcome = await check.provider.submit(
+                        plate=check.plate, image_id=check.image_id, captcha_code=auto_code,
+                    )
+                except GibTransportError:
+                    await self._finish(
+                        chat_id, telegram_user_id=telegram_user_id, check=check,
+                        status="error", gib_message_text=None, raw_response=None,
+                    )
+                    logger.warning("Turkey GIB auto-solve submit: transport error (chat_id=%s)", chat_id)
+                    return BotReply(text=texts.TRANSPORT_ERROR_TEXT, show_main_menu=True)
+
+                if outcome.kind != "rejected":
+                    logger.info(
+                        "Turkey GIB auto-solve succeeded on attempt %s/%s (chat_id=%s)",
+                        attempt, _MAX_AUTO_CAPTCHA_ATTEMPTS, chat_id,
+                    )
+                    return await self._handle_submit_outcome(
+                        outcome, chat_id=chat_id, telegram_user_id=telegram_user_id, check=check,
+                    )
+                logger.info(
+                    "Turkey GIB auto-solve: код %r отклонён сервером (попытка %s/%s, chat_id=%s)",
+                    auto_code, attempt, _MAX_AUTO_CAPTCHA_ATTEMPTS, chat_id,
+                )
+            else:
+                logger.info(
+                    "Turkey GIB auto-solve: OCR не распознал капчу (попытка %s/%s, chat_id=%s)",
+                    attempt, _MAX_AUTO_CAPTCHA_ATTEMPTS, chat_id,
+                )
+
+            if attempt == _MAX_AUTO_CAPTCHA_ATTEMPTS:
+                break
+
+            try:
+                challenge = await check.provider.refresh_captcha()
+            except GibTransportError:
+                await self._finish(
+                    chat_id, telegram_user_id=telegram_user_id, check=check,
+                    status="error", gib_message_text=None, raw_response=None,
+                )
+                logger.warning("Turkey GIB auto-solve refresh_captcha: transport error (chat_id=%s)", chat_id)
+                return BotReply(text=texts.TRANSPORT_ERROR_TEXT, show_main_menu=True)
+            check.image_id = challenge.image_id
+
+        logger.info(
+            "Turkey GIB auto-solve: %s попыток исчерпано, показываем CAPTCHA пользователю (chat_id=%s)",
+            _MAX_AUTO_CAPTCHA_ATTEMPTS, chat_id,
+        )
+        self._states.set(
+            chat_id, telegram_user_id=telegram_user_id, step=_STEP_AWAITING_CODE,
+            payload={"plate": check.plate, "image_id": challenge.image_id, "provider": _PROVIDER_GIB},
+        )
+        return BotReply(
+            text=texts.ASK_CAPTCHA_TEXT, photo_png=challenge.image_png, show_cancel_button=True,
+        )
+
     # ---- Avrasya Tüneli (см. reader/turkey_bot_test/avrasya/*) — Stage 2B ----
 
     async def _handle_avrasya_captcha_code(
@@ -1029,36 +1098,18 @@ class ConversationController:
                     )
                     return BotReply(text=texts.AVRASYA_CAPTCHA_FETCH_FAILED_TEXT, show_main_menu=True)
 
-                return BotReply(
-                    text=texts.SESSION_EXPIRED_RETRY_TEXT,
-                    photo_png=challenge.image_png,
-                    show_cancel_button=True,
+                check = await self._avrasya_registry.get(chat_id)
+                return await self._auto_solve_avrasya_captcha(
+                    chat_id, telegram_user_id=telegram_user_id, check=check, challenge=challenge,
                 )
 
-            # Если пользователь ввел код вручную, используем его
-            user_code = code.strip()
-
-            # Попытка автоматически распознать капчу
-            try:
-                # Получаем текущую капчу
-                current_challenge = await check.provider.refresh_captcha()
-                auto_code = CaptchaSolver.solve_captcha(current_challenge.image_png)
-
-                if auto_code:
-                    logger.info(f"Автоматически распознан код капчи Avrasya: {auto_code}")
-                    # Используем автоматически распознанный код
-                    code_to_use = auto_code
-                else:
-                    # Если не удалось распознать, используем код пользователя
-                    logger.info("Не удалось автоматически распознать капчу Avrasya, используем код пользователя")
-                    code_to_use = user_code
-            except Exception as e:
-                logger.warning(f"Ошибка при попытке автоматического распознавания капчи Avrasya: {e}")
-                code_to_use = user_code
-
+            # Человеку уже показали CAPTCHA (все автоматические попытки —
+            # см. _auto_solve_avrasya_captcha — к этому моменту исчерпаны),
+            # используем код, который он ввёл, без повторных попыток
+            # авто-распознавания.
             check.submit_attempts += 1
             try:
-                outcome = await check.provider.submit(plate=check.plate, captcha_code=code_to_use)
+                outcome = await check.provider.submit(plate=check.plate, captcha_code=code)
             except AvrasyaRateLimitedError:
                 await self._finish_avrasya(
                     chat_id, telegram_user_id=telegram_user_id, check=check,
@@ -1223,6 +1274,86 @@ class ConversationController:
             payload={"plate": plate, "provider": _PROVIDER_AVRASYA},
         )
         return challenge
+
+    async def _auto_solve_avrasya_captcha(
+        self, chat_id: int, *, telegram_user_id: int, check: LiveAvrasyaCheck,
+        challenge: AvrasyaCaptchaChallenge,
+    ) -> BotReply:
+        """Аналог _auto_solve_gib_captcha() (см. выше) для Avrasya — до
+        _MAX_AUTO_CAPTCHA_ATTEMPTS раз подряд распознать+отправить CAPTCHA
+        автоматически, и только если ни одна попытка не подошла — показать
+        последнюю картинку человеку."""
+        for attempt in range(1, _MAX_AUTO_CAPTCHA_ATTEMPTS + 1):
+            auto_code = CaptchaSolver.solve_captcha(challenge.image_png)
+
+            if auto_code:
+                check.submit_attempts += 1
+                try:
+                    outcome = await check.provider.submit(plate=check.plate, captcha_code=auto_code)
+                except AvrasyaRateLimitedError:
+                    await self._finish_avrasya(
+                        chat_id, telegram_user_id=telegram_user_id, check=check,
+                        status="error", raw_response=None,
+                    )
+                    logger.warning("Turkey Avrasya auto-solve submit: rate limited (chat_id=%s)", chat_id)
+                    return BotReply(text=texts.AVRASYA_RATE_LIMITED_TEXT, show_main_menu=True)
+                except AvrasyaTransportError:
+                    await self._finish_avrasya(
+                        chat_id, telegram_user_id=telegram_user_id, check=check,
+                        status="error", raw_response=None,
+                    )
+                    logger.warning("Turkey Avrasya auto-solve submit: transport error (chat_id=%s)", chat_id)
+                    return BotReply(text=texts.AVRASYA_TRANSPORT_ERROR_TEXT, show_main_menu=True)
+
+                if outcome.kind != "rejected":
+                    logger.info(
+                        "Turkey Avrasya auto-solve succeeded on attempt %s/%s (chat_id=%s)",
+                        attempt, _MAX_AUTO_CAPTCHA_ATTEMPTS, chat_id,
+                    )
+                    return await self._handle_avrasya_submit_outcome(
+                        outcome, chat_id=chat_id, telegram_user_id=telegram_user_id, check=check,
+                    )
+                logger.info(
+                    "Turkey Avrasya auto-solve: код %r отклонён сервером (попытка %s/%s, chat_id=%s)",
+                    auto_code, attempt, _MAX_AUTO_CAPTCHA_ATTEMPTS, chat_id,
+                )
+            else:
+                logger.info(
+                    "Turkey Avrasya auto-solve: OCR не распознал капчу (попытка %s/%s, chat_id=%s)",
+                    attempt, _MAX_AUTO_CAPTCHA_ATTEMPTS, chat_id,
+                )
+
+            if attempt == _MAX_AUTO_CAPTCHA_ATTEMPTS:
+                break
+
+            try:
+                challenge = await check.provider.refresh_captcha()
+            except AvrasyaRateLimitedError:
+                await self._finish_avrasya(
+                    chat_id, telegram_user_id=telegram_user_id, check=check,
+                    status="error", raw_response=None,
+                )
+                logger.warning("Turkey Avrasya auto-solve refresh_captcha: rate limited (chat_id=%s)", chat_id)
+                return BotReply(text=texts.AVRASYA_RATE_LIMITED_TEXT, show_main_menu=True)
+            except AvrasyaTransportError:
+                await self._finish_avrasya(
+                    chat_id, telegram_user_id=telegram_user_id, check=check,
+                    status="error", raw_response=None,
+                )
+                logger.warning("Turkey Avrasya auto-solve refresh_captcha: transport error (chat_id=%s)", chat_id)
+                return BotReply(text=texts.AVRASYA_TRANSPORT_ERROR_TEXT, show_main_menu=True)
+
+        logger.info(
+            "Turkey Avrasya auto-solve: %s попыток исчерпано, показываем CAPTCHA пользователю (chat_id=%s)",
+            _MAX_AUTO_CAPTCHA_ATTEMPTS, chat_id,
+        )
+        self._states.set(
+            chat_id, telegram_user_id=telegram_user_id, step=_STEP_AWAITING_CODE,
+            payload={"plate": check.plate, "provider": _PROVIDER_AVRASYA},
+        )
+        return BotReply(
+            text=texts.ASK_CAPTCHA_TEXT, photo_png=challenge.image_png, show_cancel_button=True,
+        )
 
     # ---- KGM (см. reader/turkey_bot_test/kgm/*) — design report "Реализация
     # KGM provider" — структурная копия ветки Avrasya выше, НЕ общий
