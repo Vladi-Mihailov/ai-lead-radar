@@ -1,0 +1,48 @@
+[Unit]
+Description=AI Lead Radar - Turkey bot EXPERIMENTAL TEST CLONE (@Get_8_Status_bot, isolated from production @ProtocolTRbot)
+After=network-online.target
+Wants=network-online.target
+
+# ИСХОДНЫЙ АРТЕФАКТ - НЕ установлен и не запущен, пока TURKEYBOT_TEST_TOKEN
+# не задан (см. design report "изолированный experimental clone Turkey
+# bot"). ПОЛНОСТЬЮ НЕЗАВИСИМЫЙ процесс от ai-lead-radar-turkeybot.service
+# (production @ProtocolTRbot) и от всех остальных services проекта:
+#   - отдельный Telegram-токен (TURKEYBOT_TEST_TOKEN, см. EnvironmentFile
+#     ниже - НЕ .env репозитория, отдельный файл ВНЕ git, chmod 600, НЕ
+#     содержит и не читает production TURKEYBOT_TOKEN, см.
+#     reader/turkey_bot_test/main.py::read_bot_token);
+#   - отдельная Telethon-сессия (data/sessions/turkey_bot_test.session);
+#   - отдельная SQLite БД (data/turkey_bot_test.db) - НЕ production
+#     data/users.db;
+#   - отдельные in-memory live session registries (GIB/Avrasya/KGM) - не
+#     разделяются с production процессом (разные процессы = разная память).
+#
+# EnvironmentFile путь - ВНЕ WorkingDirectory/git-репозитория (см. задачу:
+# "не помещать secret в repository/systemd unit") - сам файл создаётся
+# отдельно, вручную, на сервере, с правами 600 (leadradar:leadradar),
+# содержит РОВНО одну строку:
+#   TURKEYBOT_TEST_TOKEN=<токен @Get_8_Status_bot>
+# Префикс "-" перед путём - отсутствие файла не мешает systemd СТАРТОВАТЬ
+# unit, но reader/turkey_bot_test/main.py::read_bot_token() всё равно сразу
+# откажется (fail fast, понятная ошибка в journalctl), если
+# TURKEYBOT_TEST_TOKEN не задан.
+#
+# User/Group/WorkingDirectory/venv - те же, что и у остальных процессов
+# проекта (тот же аккаунт/venv, отдельный процесс, отдельные логи).
+[Service]
+Type=simple
+User=leadradar
+Group=leadradar
+WorkingDirectory=/home/leadradar/ai-lead-radar
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/home/leadradar/ai-lead-radar-turkeybot-test.env
+ExecStart=/home/leadradar/.venv/bin/python -m reader.turkey_bot_test.main
+
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
