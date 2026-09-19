@@ -12,6 +12,33 @@ _DATE_FORMAT = "%d.%m.%Y"
 _DATE_FORMAT_HINT = "DD.MM.YYYY"
 _DEFAULT_PERIOD_DAYS = 30
 
+# Визуальное соответствие кириллических букв на российских гос. номерах их
+# латинским аналогам (см. design report "исправить Georgian bot: госномер
+# кириллицей не проходит validation") — ТА ЖЕ таблица, что и в
+# reader/turkey_bot/validation.py::normalize_plate, продублирована здесь
+# намеренно, а не импортирована оттуда: Turkey-бот explicitly не должен
+# импортироваться из reader/fines/* (см. reader/turkey_bot/main.py про
+# независимость процессов), а reader/fines/* — общий, используемый и
+# reader/commands/fine.py, и reader/public_bot/*, и reader/users/*, не
+# должен зависеть от конкретного отдельного бота. Только ЭТИ 12 букв — не
+# произвольная кириллица (тот же принцип, что и в Turkey-реализации).
+_CYRILLIC_TO_LATIN = str.maketrans(
+    {
+        "А": "A",
+        "В": "B",
+        "Е": "E",
+        "К": "K",
+        "М": "M",
+        "Н": "H",
+        "О": "O",
+        "Р": "P",
+        "С": "C",
+        "Т": "T",
+        "У": "Y",
+        "Х": "X",
+    }
+)
+
 
 class FineValidationError(Exception):
     """Ожидаемая ошибка валидации команды — её сообщение показывается
@@ -23,7 +50,15 @@ class FineValidationError(Exception):
 
 
 def normalize_car_number(raw: str) -> str:
-    normalized = raw.strip().upper()
+    """До проверки формата — тот же порядок нормализации, что и в
+    reader/turkey_bot/validation.py::normalize_plate: uppercase, удалить
+    пробелы/дефисы, затем перевести поддерживаемую кириллицу в латиницу
+    (см. _CYRILLIC_TO_LATIN выше). Буква, отсутствующая среди
+    поддерживаемых 12, остаётся кириллической после .translate() и
+    поэтому не проходит _CAR_NUMBER_RE (только [A-Z0-9]) — номер с такой
+    буквой по-прежнему корректно отклоняется, а не "тихо" пропускается."""
+    normalized = raw.strip().upper().replace(" ", "").replace("-", "")
+    normalized = normalized.translate(_CYRILLIC_TO_LATIN)
 
     if not normalized:
         raise FineValidationError("Номер автомобиля не может быть пустым")

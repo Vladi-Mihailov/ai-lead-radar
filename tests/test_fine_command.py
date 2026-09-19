@@ -293,7 +293,7 @@ async def test_fine_add_without_dates_defaults_to_today_plus_30_days(fx):
 
 async def test_fine_add_rejects_invalid_car_number(fx):
     with pytest.raises(CommandError) as exc_info:
-        await fx.command.handle(_ctx(["add", "AA-001-AA"]))
+        await fx.command.handle(_ctx(["add", "AA?001AA"]))
 
     assert "❌" in exc_info.value.message
     assert fx.task_repository.list_active() == []
@@ -1418,14 +1418,14 @@ async def test_fine_add_bulk_reports_already_tracked_for_existing_active_task(fx
 
 async def test_fine_add_bulk_reports_invalid_car_number_among_valid_ones(fx):
     result = await fx.command.handle(
-        _ctx(["add", "bulk", "H663KH702", "AA-001-AA", "C072H0977"])
+        _ctx(["add", "bulk", "H663KH702", "AA?001AA", "C072H0977"])
     )
 
     assert "✅ Добавлено: 2" in result.text
     assert "⚠️ Уже отслеживаются: 0" in result.text
     assert "❌ Ошибок: 1" in result.text
     assert "Ошибки:" in result.text
-    assert "• AA-001-AA — " in result.text
+    assert "• AA?001AA — " in result.text
 
     car_numbers = {task.car_number for task in fx.task_repository.list_active()}
     assert car_numbers == {"H663KH702", "C072H0977"}
@@ -1435,7 +1435,7 @@ async def test_fine_add_bulk_error_in_one_number_does_not_block_others(fx):
     # Невалидный номер посередине списка — оба соседних валидных всё равно
     # должны быть добавлены, ошибка одного не откатывает остальные.
     result = await fx.command.handle(
-        _ctx(["add", "bulk", "H663KH702", "AA-001-AA", "C072H0977", "###", "M012KT193"])
+        _ctx(["add", "bulk", "H663KH702", "AA?001AA", "C072H0977", "###", "M012KT193"])
     )
 
     assert "✅ Добавлено: 3" in result.text
@@ -1579,13 +1579,13 @@ async def test_fine_add_bulk_command_deduplicates_within_message(fx):
 
 async def test_fine_add_bulk_command_reports_invalid_number_among_valid_ones(fx):
     result = await fx.command.handle(
-        _ctx(["add-bulk", "H663KH702", "AA-001-AA", "C072H0977"])
+        _ctx(["add-bulk", "H663KH702", "AA?001AA", "C072H0977"])
     )
 
     assert "Добавлено: 2" in result.text
     assert "Некорректных: 1" in result.text
     assert "Некорректные номера:" in result.text
-    assert "• AA-001-AA — " in result.text
+    assert "• AA?001AA — " in result.text
 
     car_numbers = {task.car_number for task in fx.task_repository.list_active()}
     assert car_numbers == {"H663KH702", "C072H0977"}
@@ -1751,7 +1751,7 @@ async def test_fine_stop_stops_all_active_tasks_for_car_number(fx):
 
 async def test_fine_stop_rejects_invalid_car_number(fx):
     with pytest.raises(CommandError) as exc_info:
-        await fx.command.handle(_ctx(["stop", "AA-001-AA"]))
+        await fx.command.handle(_ctx(["stop", "AA?001AA"]))
 
     assert "❌" in exc_info.value.message
 
@@ -1937,7 +1937,7 @@ async def test_fine_check_unknown_car_number_returns_command_error(fx):
 
 async def test_fine_check_rejects_invalid_car_number(fx):
     with pytest.raises(CommandError) as exc_info:
-        await fx.command.handle(_ctx(["check", "AA-001-AA"]))
+        await fx.command.handle(_ctx(["check", "AA?001AA"]))
 
     assert "❌" in exc_info.value.message
 

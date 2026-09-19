@@ -53,12 +53,60 @@ def test_normalize_car_number_rejects_empty():
 
 def test_normalize_car_number_rejects_special_characters():
     with pytest.raises(FineValidationError):
-        normalize_car_number("B957-MA09")
+        normalize_car_number("B957?MA09")
 
 
-def test_normalize_car_number_rejects_spaces_inside():
+def test_normalize_car_number_strips_internal_dashes():
+    """См. design report "исправить Georgian bot" — дефисы (как и пробелы
+    ниже) теперь удаляются ДО проверки формата, а не отклоняются, тот же
+    принцип, что и в reader/turkey_bot/validation.py::normalize_plate."""
+    assert normalize_car_number("B957-MA09") == "B957MA09"
+
+
+def test_normalize_car_number_strips_internal_spaces():
+    assert normalize_car_number("B957 MA09") == "B957MA09"
+
+
+# ---- Кириллица -> латиница (см. design report "исправить Georgian bot:
+# госномер кириллицей не проходит validation") ----
+
+
+def test_normalize_car_number_cyrillic_plate_normalizes_to_latin():
+    assert normalize_car_number("О687КЕ761") == "O687KE761"
+
+
+def test_normalize_car_number_lowercase_cyrillic_normalizes_to_latin():
+    assert normalize_car_number("о687ке761") == "O687KE761"
+
+
+def test_normalize_car_number_mixed_case_cyrillic_normalizes_to_latin():
+    assert normalize_car_number("о687КЕ761") == "O687KE761"
+
+
+def test_normalize_car_number_cyrillic_plate_with_spaces_normalizes_to_latin():
+    assert normalize_car_number("О 687 КЕ 761") == "O687KE761"
+
+
+def test_normalize_car_number_cyrillic_plate_with_dashes_normalizes_to_latin():
+    assert normalize_car_number("О-687-КЕ-761") == "O687KE761"
+
+
+def test_normalize_car_number_latin_plate_is_unchanged():
+    assert normalize_car_number("M295YB196") == "M295YB196"
+
+
+def test_normalize_car_number_all_twelve_supported_cyrillic_letters_translate_correctly():
+    # А В Е К М Н -> A B E K M H, О Р С Т У Х -> O P C T Y X (см. задачу).
+    assert normalize_car_number("АВЕКМН") == "ABEKMH"
+    assert normalize_car_number("ОРСТУХ") == "OPCTYX"
+
+
+def test_normalize_car_number_unsupported_cyrillic_letter_is_rejected():
+    """Только 12 конкретных букв (тот же принцип, что и в
+    reader/turkey_bot/validation.py) — любая другая кириллическая буква
+    остаётся кириллицей после .translate() и не проходит [A-Z0-9]."""
     with pytest.raises(FineValidationError):
-        normalize_car_number("B957 MA09")
+        normalize_car_number("Б957МА09")
 
 
 # ---- parse_date ----

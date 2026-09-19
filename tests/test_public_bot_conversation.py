@@ -197,6 +197,20 @@ async def test_add_car_with_known_username_skips_username_step(fx):
     assert state.payload == {"car_number": "M295YB196", "username": "alice"}
 
 
+async def test_add_car_accepts_cyrillic_plate_and_normalizes_to_latin(fx):
+    """См. design report "исправить Georgian bot: госномер кириллицей не
+    проходит validation" — О687КЕ761 (реальный пример из задачи)
+    нормализуется в O687KE761 ДО валидации формата, тем же способом, что и
+    в reader/turkey_bot/validation.py::normalize_plate."""
+    await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username="alice")
+
+    reply = await fx.controller.handle_text("О687КЕ761", chat_id=1, telegram_user_id=1, username="alice")
+
+    assert reply.show_period_buttons is True
+    state = fx.conversation_state_repository.get(1)
+    assert state.payload == {"car_number": "O687KE761", "username": "alice"}
+
+
 async def test_add_car_invalid_car_number_stays_on_same_step(fx):
     await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username="alice")
 
