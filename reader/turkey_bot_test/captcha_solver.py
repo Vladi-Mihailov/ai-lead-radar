@@ -1,6 +1,7 @@
 import io
 import logging
 import os
+import re
 
 import cv2
 import numpy as np
@@ -13,6 +14,12 @@ logger = logging.getLogger(__name__)
 
 _VALID_ENGINES = ("tesseract", "rapidocr")
 _DEFAULT_ENGINE = "tesseract"
+
+# KGM CAPTCHA — не случайный код, а математическая задача + хвостовой
+# код, например "16+6 03713" (операнды до 2 цифр — по образцам, реально
+# увиденным в проде: 16+6, 7+7, 18+9, 20+11). Знак операции — второе
+# "значение": +/-/×/÷ в разных начертаниях OCR.
+_KGM_EXPRESSION_RE = re.compile(r"(\d{1,2})\s*([+\-xX×÷*/])\s*(\d{1,2})")
 
 _rapid_ocr_service: RapidOcrService | None = None
 
@@ -137,3 +144,91 @@ class CaptchaSolver:
         except Exception as e:
             logger.error(f"Ошибка при распознавании капчи (rapidocr): {e}")
             return None
+
+    @staticmethod
+    def solve_kgm_captcha(captcha_img_bytes: bytes) -> str | None:
+        """KGM CAPTCHA имеет ДРУГОЙ формат, чем GIB/Avrasya — это не
+        случайный код, а математическая задача + хвостовой код, например
+        "16+6 03713": первое и третье распознанные значения — операнды,
+        второе — знак операции (+/-/×/÷), результат вычисляется и
+        записывается вместо этих трёх значений, затем через пробел —
+        все остальные распознанные значения ("22 03713"). Использует тот
+        же OCR_ENGINE, что и solve_captcha(), но БЕЗ alnum-фильтрации на
+        входе — оператор не буква/цифра."""
+        engine = _read_ocr_engine()
+        try:
+            if engine == "rapidocr":
+                raw_text = CaptchaSolver._raw_text_rapidocr(captcha_img_bytes)
+            else:
+                raw_text = CaptchaSolver._raw_text_tesseract_kgm(captcha_img_bytes)
+        except Exception as e:
+            logger.error(f"Ошибка OCR при решении KGM CAPTCHA: {e}")
+            return None
+
+        return CaptchaSolver._parse_kgm_expression(raw_text)
+
+    @staticmethod
+    def _strip_kgm_background_noise(captcha_img_bytes: bytes) -> np.ndarray:
+        """KGM CAPTCHA заливает фон плотным оранжевым/жёлтым шумом (в
+        отличие от GIB/Avrasya) — обычный OCR без препроцессинга на нём
+        почти не читает текст (см. диагностику). Текст всегда тёмный
+        (низкая V в HSV), шум — светлее и/или насыщенный оранжевый:
+        порог по V отделяет текст от фона намного надёжнее, чем
+        grayscale/adaptiveThreshold (испробованные для GIB — там они
+        только вредили)."""
+        arr = np.frombuffer(captcha_img_bytes, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        value_channel = hsv[:, :, 2]
+        text_mask = value_channel < 120
+        result = np.full_like(img, 255)
+        result[text_mask] = [0, 0, 0]
+        return result
+
+    @staticmethod
+    def _raw_text_rapidocr(captcha_img_bytes: bytes) -> str:
+        service = _get_rapid_ocr_service()
+        processed = CaptchaSolver._strip_kgm_background_noise(captcha_img_bytes)
+        results = service.recognize(processed)
+        return " ".join(r.text for r in results)
+
+    @staticmethod
+    def _raw_text_tesseract_kgm(captcha_img_bytes: bytes) -> str:
+        processed = CaptchaSolver._strip_kgm_background_noise(captcha_img_bytes)
+        return pytesseract.image_to_string(
+            processed, config="--psm 7 -c tessedit_char_whitelist=0123456789+-x*÷×/",
+        )
+
+    @staticmethod
+    def _parse_kgm_expression(raw_text: str) -> str | None:
+        match = _KGM_EXPRESSION_RE.search(raw_text)
+        if not match:
+            logger.info("KGM CAPTCHA: не удалось найти выражение в распознанном тексте %r", raw_text)
+            return None
+
+        left_str, op, right_str = match.groups()
+        left, right = int(left_str), int(right_str)
+
+        if op == "+":
+            result = left + right
+        elif op == "-":
+            result = left - right
+        elif op in ("x", "X", "×", "*"):
+            result = left * right
+        elif op in ("/", "÷"):
+            if right == 0 or left % right != 0:
+                logger.info("KGM CAPTCHA: деление %s/%s не даёт целого результата", left, right)
+                return None
+            result = left // right
+        else:
+            return None
+
+        tail = raw_text[match.end():]
+        tail_value = "".join(ch for ch in tail if ch.isalnum())
+        if not tail_value:
+            logger.info("KGM CAPTCHA: не найден хвостовой код после выражения в %r", raw_text)
+            return None
+
+        code = f"{result} {tail_value}"
+        logger.info(f"Решена KGM CAPTCHA: {code!r}")
+        return code

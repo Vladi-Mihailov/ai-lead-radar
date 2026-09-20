@@ -772,8 +772,9 @@ class ConversationController:
                     )
                     return BotReply(text=texts.KGM_CAPTCHA_FETCH_FAILED_TEXT, show_main_menu=True)
 
-                return BotReply(
-                    text=texts.ASK_CAPTCHA_TEXT, photo_png=challenge.image_png, show_cancel_button=True,
+                check = await self._kgm_registry.get(chat_id)
+                return await self._auto_solve_kgm_captcha(
+                    chat_id, telegram_user_id=telegram_user_id, check=check, challenge=challenge,
                 )
             else:
                 challenge = await self._open_new_check(chat_id, telegram_user_id, plate)
@@ -1384,10 +1385,9 @@ class ConversationController:
                     )
                     return BotReply(text=texts.KGM_CAPTCHA_FETCH_FAILED_TEXT, show_main_menu=True)
 
-                return BotReply(
-                    text=texts.SESSION_EXPIRED_RETRY_TEXT,
-                    photo_png=challenge.image_png,
-                    show_cancel_button=True,
+                check = await self._kgm_registry.get(chat_id)
+                return await self._auto_solve_kgm_captcha(
+                    chat_id, telegram_user_id=telegram_user_id, check=check, challenge=challenge,
                 )
 
             check.submit_attempts += 1
@@ -1539,3 +1539,69 @@ class ConversationController:
             payload={"plate": plate, "provider": _PROVIDER_KGM},
         )
         return challenge
+
+    async def _auto_solve_kgm_captcha(
+        self, chat_id: int, *, telegram_user_id: int, check: LiveKgmCheck,
+        challenge: KgmCaptchaChallenge,
+    ) -> BotReply:
+        """Аналог _auto_solve_gib_captcha()/_auto_solve_avrasya_captcha()
+        (см. выше) для KGM — но KGM CAPTCHA не случайный код, а
+        математическая задача + хвостовой код (см.
+        CaptchaSolver.solve_kgm_captcha)."""
+        for attempt in range(1, _MAX_AUTO_CAPTCHA_ATTEMPTS + 1):
+            auto_code = CaptchaSolver.solve_kgm_captcha(challenge.image_png)
+
+            if auto_code:
+                check.submit_attempts += 1
+                try:
+                    outcome = await check.provider.submit(plate=check.plate, captcha_code=auto_code)
+                except KgmTransportError:
+                    await self._finish_kgm(
+                        chat_id, telegram_user_id=telegram_user_id, check=check,
+                        status="error", raw_response=None,
+                    )
+                    logger.warning("Turkey KGM auto-solve submit: transport error (chat_id=%s)", chat_id)
+                    return BotReply(text=texts.KGM_TRANSPORT_ERROR_TEXT, show_main_menu=True)
+
+                if outcome.kind != "rejected":
+                    logger.info(
+                        "Turkey KGM auto-solve succeeded on attempt %s/%s (chat_id=%s)",
+                        attempt, _MAX_AUTO_CAPTCHA_ATTEMPTS, chat_id,
+                    )
+                    return await self._handle_kgm_submit_outcome(
+                        outcome, chat_id=chat_id, telegram_user_id=telegram_user_id, check=check,
+                    )
+                logger.info(
+                    "Turkey KGM auto-solve: код %r отклонён сервером (попытка %s/%s, chat_id=%s)",
+                    auto_code, attempt, _MAX_AUTO_CAPTCHA_ATTEMPTS, chat_id,
+                )
+            else:
+                logger.info(
+                    "Turkey KGM auto-solve: не удалось разобрать CAPTCHA (попытка %s/%s, chat_id=%s)",
+                    attempt, _MAX_AUTO_CAPTCHA_ATTEMPTS, chat_id,
+                )
+
+            if attempt == _MAX_AUTO_CAPTCHA_ATTEMPTS:
+                break
+
+            try:
+                challenge = await check.provider.refresh_captcha()
+            except KgmTransportError:
+                await self._finish_kgm(
+                    chat_id, telegram_user_id=telegram_user_id, check=check,
+                    status="error", raw_response=None,
+                )
+                logger.warning("Turkey KGM auto-solve refresh_captcha: transport error (chat_id=%s)", chat_id)
+                return BotReply(text=texts.KGM_TRANSPORT_ERROR_TEXT, show_main_menu=True)
+
+        logger.info(
+            "Turkey KGM auto-solve: %s попыток исчерпано, показываем CAPTCHA пользователю (chat_id=%s)",
+            _MAX_AUTO_CAPTCHA_ATTEMPTS, chat_id,
+        )
+        self._states.set(
+            chat_id, telegram_user_id=telegram_user_id, step=_STEP_AWAITING_CODE,
+            payload={"plate": check.plate, "provider": _PROVIDER_KGM},
+        )
+        return BotReply(
+            text=texts.ASK_CAPTCHA_TEXT, photo_png=challenge.image_png, show_cancel_button=True,
+        )

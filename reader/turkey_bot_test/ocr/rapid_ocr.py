@@ -6,11 +6,14 @@ install paddlepaddle` не находит ни одной версии для cp
 последний релиз 3.3.1 поддерживает только cp39-cp313). RapidOCR даёт те же
 предобученные модели без зависимости от фреймворка paddle.
 
-НЕ используется для автоматического решения/отправки CAPTCHA — это
-универсальный OCR-инструмент для offline-оценки качества распознавания
-(см. reader/turkey_bot_test/ocr/rapid_ocr_diagnostic.py), рабочий CAPTCHA
-flow (reader/turkey_bot_test/conversation.py) остаётся полностью ручным и
-этот модуль не импортирует.
+Универсальный OCR-инструмент (см. reader/turkey_bot_test/ocr/
+rapid_ocr_diagnostic.py — offline-оценка качества распознавания на
+обычном тексте). Также используется как один из движков
+CaptchaSolver (reader/turkey_bot_test/captcha_solver.py, включается
+через OCR_ENGINE=rapidocr) для автоматического решения CAPTCHA
+GIB/Avrasya/KGM в reader/turkey_bot_test/conversation.py — см. design
+report про _MAX_AUTO_CAPTCHA_ATTEMPTS и явное решение продолжать
+автоматический обход CAPTCHA в этом экспериментальном test-clone.
 
 reader/turkey_bot -> НЕ трогается, все ONNX-модели идут в комплекте с
 пакетом rapidocr (см. requirements.txt) — сетевых запросов при инференсе
@@ -22,6 +25,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +55,10 @@ class RapidOcrService:
             self._engine = RapidOCR()
         return self._engine
 
-    def recognize(self, image: str | Path | bytes) -> list[OcrResult]:
-        """image — путь к файлу, bytes с содержимым PNG/JPEG или Path.
+    def recognize(self, image: str | Path | bytes | np.ndarray) -> list[OcrResult]:
+        """image — путь к файлу, bytes с содержимым PNG/JPEG, Path, либо
+        уже декодированный numpy-массив (например, после собственного
+        OpenCV-препроцессинга, см. CaptchaSolver._strip_kgm_background_noise).
         Любая ошибка (повреждённое изображение, сбой инференса и т.п.)
         логируется и возвращает пустой список — вызывающий код никогда
         не падает из-за проблем в этом движке."""
