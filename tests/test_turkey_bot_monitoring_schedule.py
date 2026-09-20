@@ -13,6 +13,7 @@ from reader.turkey_bot.monitoring import scheduler_job as scheduler_job_module
 from reader.turkey_bot.monitoring.scheduler_job import (
     TURKEY_MONITORING_TZ,
     TurkeyMonitoringJob,
+    TurkeyMonitoringRetryJob,
     next_monitoring_slot,
 )
 
@@ -150,3 +151,47 @@ def test_turkey_monitoring_tz_is_europe_istanbul_not_business_tz():
     settings.fine_monitor.timezone (default Asia/Tbilisi)."""
     assert TURKEY_MONITORING_TZ == ZoneInfo("Europe/Istanbul")
     assert str(TURKEY_MONITORING_TZ) != "Asia/Tbilisi"
+
+
+# ---- TurkeyMonitoringRetryJob (см. задачу "Retry orchestration Unified
+# Turkey checks" п.3) — ОТДЕЛЬНЫЙ Job, тикает по has_due_retries(), не по
+# calendar slot. ----
+
+class _FakeMonitoringServiceWithRetries:
+    def __init__(self, *, due: bool):
+        self._due = due
+        self.run_due_retries_calls: list = []
+
+    def has_due_retries(self, now) -> bool:
+        return self._due
+
+    async def run_due_retries(self, now) -> None:
+        self.run_due_retries_calls.append(now)
+
+
+async def test_retry_job_should_run_reflects_has_due_retries():
+    job_due = TurkeyMonitoringRetryJob(_FakeMonitoringServiceWithRetries(due=True))
+    job_not_due = TurkeyMonitoringRetryJob(_FakeMonitoringServiceWithRetries(due=False))
+
+    assert await job_due.should_run(datetime.now(timezone.utc)) is True
+    assert await job_not_due.should_run(datetime.now(timezone.utc)) is False
+
+
+async def test_retry_job_run_delegates_to_run_due_retries():
+    service = _FakeMonitoringServiceWithRetries(due=True)
+    job = TurkeyMonitoringRetryJob(service)
+
+    await job.run()
+
+    assert len(service.run_due_retries_calls) == 1
+
+
+async def test_retry_job_should_run_not_tied_to_calendar_slot():
+    """В отличие от TurkeyMonitoringJob (строго 13:00/21:00), retry job
+    может законно сработать в ЛЮБУЮ минуту — если due retry есть, should_run
+    истинен независимо от времени суток (см. задачу: retry ЧЕРЕЗ 5 минут,
+    не привязан к calendar slot)."""
+    job = TurkeyMonitoringRetryJob(_FakeMonitoringServiceWithRetries(due=True))
+    off_slot_time = _istanbul(2026, 9, 20, 13, 5).astimezone(timezone.utc)
+
+    assert await job.should_run(off_slot_time) is True

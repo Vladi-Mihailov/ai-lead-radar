@@ -11,11 +11,27 @@ production"): GİB/Avrasya/KGM providers НЕ дублируются — имп�
 Провайдеры полностью независимы (asyncio.gather(..., return_exceptions=True))
 — ошибка/исключение одного НЕ мешает остальным.
 
-CAPTCHA — см. captcha_resolver.py: РОВНО одна попытка на провайдера через
-CaptchaResolver, БЕЗ retry/refresh-циклов здесь — недоступный/отклонённый
-код -> ProviderCheckResult(status=ERROR), НИКОГДА NO_DEBT. Резолвер (OCR)
-переносится БЕЗ ИЗМЕНЕНИЙ из test — "существующая абстракция", не новая
-и не улучшенная (см. задачу п.3).
+CAPTCHA — см. captcha_resolver.py: САМ резолвер (OCR) НЕ меняется и НЕ
+улучшается (см. задачу "Retry orchestration Unified Turkey checks" п.6:
+"не реализовывать автоматическое многократное решение/обход CAPTCHA") —
+это по-прежнему РОВНО одна попытка распознавания НА КАЖДУЮ отдельную
+captcha-картинку. Что ДОБАВЛЕНО здесь — ОРКЕСТРАЦИЯ повторов: если ОДНА
+попытка (получить challenge -> распознать -> submit) заканчивается
+captcha_unavailable (OCR не смог прочитать) ИЛИ captcha_rejected (сервер
+провайдера отклонил код), вызывающий код (conversation.py — 35 попыток
+для ручной проверки, monitoring/monitoring_service.py — 25 попыток для
+планового мониторинга) может попросить ЗАНОВО: НОВУЮ captcha-картинку
+через provider.refresh_captcha() (та же существующая сессия/client, см.
+GibProvider/AvrasyaProvider/KgmProvider — эти классы НЕ менялись) и НОВУЮ
+попытку резолвера на эту новую картинку — то есть каждая попытка
+по-прежнему проходит ТОЛЬКО через уже существующий разрешённый
+resolver/input, просто может повториться до max_attempts раз. Успех
+(HAS_DEBT/NO_DEBT/unexpected) или НЕ-captcha ошибка (transport_error/
+rate_limited) немедленно прекращает retry этого провайдера — retry
+существует ИСКЛЮЧИТЕЛЬНО для captcha_unavailable/captcha_rejected.
+Каждый логический check (один вызов check()) по-прежнему пишет РОВНО
+один ProviderCheckResult на провайдера — попытки НЕ создают
+промежуточных строк в БД (это отвечает вызывающий код, не этот файл).
 
 ОТЛИЧИЕ от test-версии — сохранение регрессии, найденной READ-ONLY
 аудитом (см. задачу п.4): production ДО этого переноса переводил
@@ -71,6 +87,14 @@ from reader.turkey_bot.unified.models import (
 
 logger = logging.getLogger(__name__)
 
+_ALL_PROVIDERS: tuple[str, ...] = ("gib", "avrasya", "kgm")
+
+# Единственные два исхода, которые вообще запускают retry (см. модуль
+# docstring) — НЕ transport_error/rate_limited/unexpected: те остаются
+# терминальными с первой попытки, как и раньше (см. задачу: retry только
+# "после captcha_unavailable / captcha_rejected").
+_RETRYABLE_ERROR_TYPES = frozenset({"captcha_unavailable", "captcha_rejected"})
+
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -121,6 +145,26 @@ class GibFineTranslatorLike(Protocol):
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _log_attempt(
+    plate: str, provider: str, mode: str, attempt: int, max_attempts: int, result: str,
+) -> None:
+    """Observability на КАЖДУЮ попытку (см. задачу "Retry orchestration
+    Unified Turkey checks" п.6) — ТОЛЬКО plate/provider/mode/attempt/
+    max_attempts/result, НИКОГДА captcha-код, изображение или
+    токены/секреты (их здесь физически нет ни в одном параметре)."""
+    logger.info(
+        "Turkey unified check attempt: plate=%s provider=%s mode=%s attempt=%d/%d result=%s",
+        plate, provider, mode, attempt, max_attempts, result,
+    )
+
+
+def _log_finished(plate: str, provider: str, mode: str, attempts_used: int, final_status: str) -> None:
+    logger.info(
+        "Turkey unified check finished: plate=%s provider=%s mode=%s attempts_used=%d final_status=%s",
+        plate, provider, mode, attempts_used, final_status,
+    )
 
 
 def _error_result(provider: str, error_type: str, *, checked_at: datetime) -> ProviderCheckResult:
@@ -261,31 +305,55 @@ class UnifiedTurkeyCheckService:
         self._captcha_resolver = captcha_resolver or DefaultCaptchaResolver()
         self._gib_translator = gib_translator
 
-    async def check(self, plate: str) -> UnifiedCheckResult:
+    async def check(
+        self,
+        plate: str,
+        *,
+        max_attempts: int = 1,
+        mode: str = "manual",
+        providers: tuple[str, ...] | None = None,
+    ) -> UnifiedCheckResult:
+        """max_attempts — сколько раз ПОВТОРИТЬ (получить новую captcha +
+        новую попытку резолвера) один провайдер, если он упирается в
+        captcha_unavailable/captcha_rejected (см. модуль docstring) —
+        default=1 сохраняет старое поведение (ровно одна попытка, без
+        retry) для любого вызывающего кода, который явно не запрашивает
+        retry. `mode` — ТОЛЬКО для observability-логов ("manual"/
+        "scheduled"/"scheduled_retry"), не меняет логику. `providers` —
+        None означает ВСЕ три (обычный полный check); подмножество — для
+        scheduled retry ЧЕРЕЗ 5 минут, который должен проверять ТОЛЬКО
+        провайдеров, не завершившихся успешно в первом проходе (см.
+        reader/turkey_bot/monitoring/monitoring_service.py) — успешные
+        провайдеры повторно НЕ запрашиваются вообще, ни как HTTP-запрос,
+        ни как отдельная строка в UnifiedCheckResult.providers."""
         started_at = _now()
+        provider_names = providers if providers is not None else _ALL_PROVIDERS
+        checkers = {
+            "gib": self._check_gib,
+            "avrasya": self._check_avrasya,
+            "kgm": self._check_kgm,
+        }
         results = await asyncio.gather(
-            self._check_gib(plate),
-            self._check_avrasya(plate),
-            self._check_kgm(plate),
+            *(checkers[name](plate, max_attempts=max_attempts, mode=mode) for name in provider_names),
             return_exceptions=True,
         )
-        providers = tuple(
+        providers_result = tuple(
             result if isinstance(result, ProviderCheckResult)
             else _error_result(provider_name, "internal_error", checked_at=_now())
-            for provider_name, result in zip(("gib", "avrasya", "kgm"), results)
+            for provider_name, result in zip(provider_names, results)
         )
-        for provider_name, result in zip(("gib", "avrasya", "kgm"), results):
+        for provider_name, result in zip(provider_names, results):
             if isinstance(result, Exception):
                 logger.exception(
                     "Turkey unified check: непойманное исключение в провайдере %s (plate=%s)",
                     provider_name, plate, exc_info=result,
                 )
         finished_at = _now()
-        overall_status = derive_overall_status(providers)
+        overall_status = derive_overall_status(providers_result)
         return UnifiedCheckResult(
             plate=plate, started_at=started_at, finished_at=finished_at,
-            overall_status=overall_status, total_amount=total_amount_for(providers),
-            providers=providers,
+            overall_status=overall_status, total_amount=total_amount_for(providers_result),
+            providers=providers_result,
         )
 
     async def _translate_gib_fines(
@@ -306,81 +374,136 @@ class UnifiedTurkeyCheckService:
             )
             return fines
 
-    async def _check_gib(self, plate: str) -> ProviderCheckResult:
+    async def _check_gib(
+        self, plate: str, *, max_attempts: int, mode: str,
+    ) -> ProviderCheckResult:
         client, provider = self._gib_check_factory()
         try:
-            try:
-                challenge = await provider.start()
-            except GibTransportError:
-                return _error_result("gib", "transport_error", checked_at=_now())
+            last_error_type = "captcha_unavailable"
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    challenge = await provider.start() if attempt == 1 else await provider.refresh_captcha()
+                except GibTransportError:
+                    _log_attempt(plate, "gib", mode, attempt, max_attempts, "transport_error")
+                    return _error_result("gib", "transport_error", checked_at=_now())
 
-            captcha_code = await self._captcha_resolver.resolve(
-                provider="gib", image_png=challenge.image_png,
-            )
-            if not captcha_code:
-                return _error_result("gib", "captcha_unavailable", checked_at=_now())
-
-            try:
-                outcome = await provider.submit(
-                    plate=plate, image_id=challenge.image_id, captcha_code=captcha_code,
+                captcha_code = await self._captcha_resolver.resolve(
+                    provider="gib", image_png=challenge.image_png,
                 )
-            except GibTransportError:
-                return _error_result("gib", "transport_error", checked_at=_now())
+                if not captcha_code:
+                    last_error_type = "captcha_unavailable"
+                    _log_attempt(plate, "gib", mode, attempt, max_attempts, last_error_type)
+                    continue
 
-            if outcome.kind == "has_debt":
-                translated_fines = await self._translate_gib_fines(outcome.fines)
-                outcome = replace(outcome, fines=translated_fines)
+                try:
+                    outcome = await provider.submit(
+                        plate=plate, image_id=challenge.image_id, captcha_code=captcha_code,
+                    )
+                except GibTransportError:
+                    _log_attempt(plate, "gib", mode, attempt, max_attempts, "transport_error")
+                    return _error_result("gib", "transport_error", checked_at=_now())
 
-            return _gib_outcome_to_result(outcome, checked_at=_now())
+                if outcome.kind == "rejected":
+                    last_error_type = "captcha_rejected"
+                    _log_attempt(plate, "gib", mode, attempt, max_attempts, last_error_type)
+                    continue
+
+                _log_attempt(plate, "gib", mode, attempt, max_attempts, outcome.kind)
+                _log_finished(plate, "gib", mode, attempt, outcome.kind)
+                if outcome.kind == "has_debt":
+                    translated_fines = await self._translate_gib_fines(outcome.fines)
+                    outcome = replace(outcome, fines=translated_fines)
+                return _gib_outcome_to_result(outcome, checked_at=_now())
+
+            _log_finished(plate, "gib", mode, max_attempts, f"error({last_error_type})")
+            return _error_result("gib", last_error_type, checked_at=_now())
         finally:
             await client.aclose()
 
-    async def _check_avrasya(self, plate: str) -> ProviderCheckResult:
+    async def _check_avrasya(
+        self, plate: str, *, max_attempts: int, mode: str,
+    ) -> ProviderCheckResult:
         client, provider = self._avrasya_check_factory()
         try:
-            try:
-                challenge = await provider.start()
-            except AvrasyaRateLimitedError:
-                return _error_result("avrasya", "rate_limited", checked_at=_now())
-            except AvrasyaTransportError:
-                return _error_result("avrasya", "transport_error", checked_at=_now())
+            last_error_type = "captcha_unavailable"
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    challenge = await provider.start() if attempt == 1 else await provider.refresh_captcha()
+                except AvrasyaRateLimitedError:
+                    _log_attempt(plate, "avrasya", mode, attempt, max_attempts, "rate_limited")
+                    return _error_result("avrasya", "rate_limited", checked_at=_now())
+                except AvrasyaTransportError:
+                    _log_attempt(plate, "avrasya", mode, attempt, max_attempts, "transport_error")
+                    return _error_result("avrasya", "transport_error", checked_at=_now())
 
-            captcha_code = await self._captcha_resolver.resolve(
-                provider="avrasya", image_png=challenge.image_png,
-            )
-            if not captcha_code:
-                return _error_result("avrasya", "captcha_unavailable", checked_at=_now())
+                captcha_code = await self._captcha_resolver.resolve(
+                    provider="avrasya", image_png=challenge.image_png,
+                )
+                if not captcha_code:
+                    last_error_type = "captcha_unavailable"
+                    _log_attempt(plate, "avrasya", mode, attempt, max_attempts, last_error_type)
+                    continue
 
-            try:
-                outcome = await provider.submit(plate=plate, captcha_code=captcha_code)
-            except AvrasyaRateLimitedError:
-                return _error_result("avrasya", "rate_limited", checked_at=_now())
-            except AvrasyaTransportError:
-                return _error_result("avrasya", "transport_error", checked_at=_now())
+                try:
+                    outcome = await provider.submit(plate=plate, captcha_code=captcha_code)
+                except AvrasyaRateLimitedError:
+                    _log_attempt(plate, "avrasya", mode, attempt, max_attempts, "rate_limited")
+                    return _error_result("avrasya", "rate_limited", checked_at=_now())
+                except AvrasyaTransportError:
+                    _log_attempt(plate, "avrasya", mode, attempt, max_attempts, "transport_error")
+                    return _error_result("avrasya", "transport_error", checked_at=_now())
 
-            return _avrasya_outcome_to_result(outcome, checked_at=_now())
+                if outcome.kind == "rejected":
+                    last_error_type = "captcha_rejected"
+                    _log_attempt(plate, "avrasya", mode, attempt, max_attempts, last_error_type)
+                    continue
+
+                _log_attempt(plate, "avrasya", mode, attempt, max_attempts, outcome.kind)
+                _log_finished(plate, "avrasya", mode, attempt, outcome.kind)
+                return _avrasya_outcome_to_result(outcome, checked_at=_now())
+
+            _log_finished(plate, "avrasya", mode, max_attempts, f"error({last_error_type})")
+            return _error_result("avrasya", last_error_type, checked_at=_now())
         finally:
             await client.aclose()
 
-    async def _check_kgm(self, plate: str) -> ProviderCheckResult:
+    async def _check_kgm(
+        self, plate: str, *, max_attempts: int, mode: str,
+    ) -> ProviderCheckResult:
         client, provider = self._kgm_check_factory()
         try:
-            try:
-                challenge = await provider.start()
-            except KgmTransportError:
-                return _error_result("kgm", "transport_error", checked_at=_now())
+            last_error_type = "captcha_unavailable"
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    challenge = await provider.start() if attempt == 1 else await provider.refresh_captcha()
+                except KgmTransportError:
+                    _log_attempt(plate, "kgm", mode, attempt, max_attempts, "transport_error")
+                    return _error_result("kgm", "transport_error", checked_at=_now())
 
-            captcha_code = await self._captcha_resolver.resolve(
-                provider="kgm", image_png=challenge.image_png,
-            )
-            if not captcha_code:
-                return _error_result("kgm", "captcha_unavailable", checked_at=_now())
+                captcha_code = await self._captcha_resolver.resolve(
+                    provider="kgm", image_png=challenge.image_png,
+                )
+                if not captcha_code:
+                    last_error_type = "captcha_unavailable"
+                    _log_attempt(plate, "kgm", mode, attempt, max_attempts, last_error_type)
+                    continue
 
-            try:
-                outcome = await provider.submit(plate=plate, captcha_code=captcha_code)
-            except KgmTransportError:
-                return _error_result("kgm", "transport_error", checked_at=_now())
+                try:
+                    outcome = await provider.submit(plate=plate, captcha_code=captcha_code)
+                except KgmTransportError:
+                    _log_attempt(plate, "kgm", mode, attempt, max_attempts, "transport_error")
+                    return _error_result("kgm", "transport_error", checked_at=_now())
 
-            return _kgm_outcome_to_result(outcome, checked_at=_now())
+                if outcome.kind == "rejected":
+                    last_error_type = "captcha_rejected"
+                    _log_attempt(plate, "kgm", mode, attempt, max_attempts, last_error_type)
+                    continue
+
+                _log_attempt(plate, "kgm", mode, attempt, max_attempts, outcome.kind)
+                _log_finished(plate, "kgm", mode, attempt, outcome.kind)
+                return _kgm_outcome_to_result(outcome, checked_at=_now())
+
+            _log_finished(plate, "kgm", mode, max_attempts, f"error({last_error_type})")
+            return _error_result("kgm", last_error_type, checked_at=_now())
         finally:
             await client.aclose()

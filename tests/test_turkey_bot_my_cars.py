@@ -65,7 +65,7 @@ class _FakeCheckService:
         self._result = result
         self.calls: list[str] = []
 
-    async def check(self, plate: str) -> UnifiedCheckResult:
+    async def check(self, plate: str, **kwargs) -> UnifiedCheckResult:
         self.calls.append(plate)
         return self._result
 

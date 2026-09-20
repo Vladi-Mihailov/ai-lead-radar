@@ -123,7 +123,7 @@ class _FakeCheckService:
     def __init__(self, results: list[UnifiedCheckResult]):
         self._results = list(results)
 
-    async def check(self, plate: str) -> UnifiedCheckResult:
+    async def check(self, plate: str, **kwargs) -> UnifiedCheckResult:
         return self._results.pop(0)
 
 

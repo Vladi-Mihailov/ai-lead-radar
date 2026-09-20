@@ -55,6 +55,15 @@ _INITIATOR_MANUAL = "manual"
 
 _CAR_ACTIONS_REQUIRING_CHECK = {"check"}
 
+# См. задачу "Retry orchestration Unified Turkey checks" п.1 — РУЧНАЯ
+# проверка допускает до 35 попыток НА ПРОВАЙДЕРА (получить новую captcha
+# через provider.refresh_captcha() + новую попытку резолвера) при
+# captcha_unavailable/captcha_rejected, прежде чем зафиксировать ERROR
+# (см. reader/turkey_bot/unified/check_service.py::UnifiedTurkeyCheckService.
+# check — вся orchestration retry живёт там, здесь только выбор
+# max_attempts для режима "manual").
+_MANUAL_MAX_ATTEMPTS = 35
+
 
 @dataclass(frozen=True)
 class BotReply:
@@ -332,8 +341,13 @@ class ConversationController:
         change-detection/уведомлений (ручная проверка всегда просто
         показывает live-результат целиком, см.
         reader/turkey_bot/monitoring/monitoring_service.py про то,
-        где именно живёт change-detection — не здесь)."""
-        result = await self._check_service.check(car.car_number)
+        где именно живёт change-detection — не здесь). До 35 попыток на
+        провайдера при captcha_unavailable/captcha_rejected (см.
+        _MANUAL_MAX_ATTEMPTS) — вся retry-логика в check_service, здесь
+        только выбор режима/лимита."""
+        result = await self._check_service.check(
+            car.car_number, max_attempts=_MANUAL_MAX_ATTEMPTS, mode="manual",
+        )
 
         self._runs.save(
             result, telegram_user_id=telegram_user_id, telegram_chat_id=chat_id,

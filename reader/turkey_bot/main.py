@@ -71,7 +71,10 @@ from reader.turkey_bot.known_users_repository import (
 from reader.turkey_bot.monitoring.monitoring_service import (
     TurkeyMonitoringService,
 )
-from reader.turkey_bot.monitoring.scheduler_job import TurkeyMonitoringJob
+from reader.turkey_bot.monitoring.scheduler_job import (
+    TurkeyMonitoringJob,
+    TurkeyMonitoringRetryJob,
+)
 from reader.turkey_bot.monitoring.subscription_repository import (
     TurkeyMonitoringSubscriptionRepository,
 )
@@ -219,7 +222,14 @@ async def run() -> None:
             check_service, run_repository, subscription_repository, notifier,
         )
         monitoring_job = TurkeyMonitoringJob(monitoring_service)
-        scheduler = Scheduler([monitoring_job], poll_interval_seconds=_SCHEDULER_POLL_INTERVAL_SECONDS)
+        # См. задачу "Retry orchestration Unified Turkey checks" п.3 —
+        # ОТДЕЛЬНЫЙ Job, тикает вместе с monitoring_job на том же
+        # Scheduler'е, обрабатывает +5-минутные CAPTCHA-retry, поставленные
+        # в очередь TurkeyMonitoringService (см. monitoring_service.py).
+        monitoring_retry_job = TurkeyMonitoringRetryJob(monitoring_service)
+        scheduler = Scheduler(
+            [monitoring_job, monitoring_retry_job], poll_interval_seconds=_SCHEDULER_POLL_INTERVAL_SECONDS,
+        )
 
         # token передаётся ЗДЕСЬ и только здесь.
         await client.start(bot_token=token)

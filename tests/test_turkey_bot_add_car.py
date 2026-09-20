@@ -29,7 +29,7 @@ class _UnusedCheckService:
     report п.2 — просто добавляет и ПРЕДЛАГАЕТ проверить) — check() не
     должен вызываться вообще в этих тестах."""
 
-    async def check(self, plate):
+    async def check(self, plate, **kwargs):
         raise AssertionError("Add Car не должен сам запускать unified check")
 
 

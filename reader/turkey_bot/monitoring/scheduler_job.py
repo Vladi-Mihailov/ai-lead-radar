@@ -74,3 +74,26 @@ class TurkeyMonitoringJob(Job):
         slot_label = f"{slot[0]:02d}:{slot[1]:02d}"
         logger.info("Turkey monitoring: запуск планового цикла (slot=%s Europe/Istanbul)", slot_label)
         await self._monitoring_service.run_scheduled_batch(slot_label)
+
+
+class TurkeyMonitoringRetryJob(Job):
+    """См. задачу "Retry orchestration Unified Turkey checks" п.3 — РОВНО
+    один retry через 5 минут для providers, упавших на CAPTCHA в первом
+    проходе (см. reader/turkey_bot/monitoring/monitoring_service.py::
+    TurkeyMonitoringService._maybe_enqueue_retry/run_due_retries).
+    ОТДЕЛЬНЫЙ Job (не часть TurkeyMonitoringJob выше) — should_run здесь
+    не привязан к calendar slot 13:00/21:00, а к тому, наступил ли уже
+    хотя бы один запланированный retry (тикает вместе с общим poll
+    Scheduler'а раз в 30с, см. reader/jobs/scheduler.py — этого достаточно
+    для 5-минутного окна)."""
+
+    name = "turkey_monitoring_retry"
+
+    def __init__(self, monitoring_service) -> None:
+        self._monitoring_service = monitoring_service
+
+    async def should_run(self, now: datetime) -> bool:
+        return self._monitoring_service.has_due_retries(now)
+
+    async def run(self) -> None:
+        await self._monitoring_service.run_due_retries(datetime.now(timezone.utc))

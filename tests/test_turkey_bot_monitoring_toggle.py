@@ -23,7 +23,7 @@ _TRUSTED_USER_ID = 999
 
 
 class _UnusedCheckService:
-    async def check(self, plate):
+    async def check(self, plate, **kwargs):
         raise AssertionError("не должен вызываться в этих тестах")
 
 
