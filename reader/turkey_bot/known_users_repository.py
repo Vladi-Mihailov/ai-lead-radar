@@ -107,5 +107,20 @@ class TurkeyBotKnownUsersRepository:
         rows = self._conn.execute(_SELECT_ALL_ORDERED).fetchall()
         return [(telegram_user_id, telegram_username) for telegram_user_id, telegram_username in rows]
 
+    def list_all_with_chat_id(self) -> list[tuple[int, int]]:
+        """(telegram_user_id, telegram_chat_id) для КАЖДОГО известного
+        пользователя — ОТДЕЛЬНЫЙ метод от list_all() выше: тот инвариант
+        ("НИКОГДА telegram_chat_id") остаётся в силе именно для list_all()
+        (менеджерская статистика/список пользователей, см. его докстрок).
+        Этот метод — для случаев, где chat_id реально НУЖЕН для работы, а
+        не для показа: отправка сообщений (см. reader/turkey_bot/
+        migration_notify.py::notify_all — единственный текущий
+        потребитель), НИКОГДА не для рендеринга пользователю/менеджеру."""
+        rows = self._conn.execute(
+            "SELECT telegram_user_id, telegram_chat_id FROM turkey_bot_known_users "
+            "ORDER BY first_seen_at ASC, telegram_user_id ASC",
+        ).fetchall()
+        return [(telegram_user_id, telegram_chat_id) for telegram_user_id, telegram_chat_id in rows]
+
     def close(self) -> None:
         self._conn.close()

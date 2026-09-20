@@ -8,8 +8,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from reader.turkey_bot import texts  # noqa: E402
-from reader.turkey_bot.statistics_service import TurkeyStatistics  # noqa: E402
+from reader.turkey_bot import texts
+from reader.turkey_bot.statistics_service import TurkeyStatistics
 
 _TELEGRAM_LIMIT = 4096
 
@@ -18,13 +18,20 @@ def _stats(**overrides) -> TurkeyStatistics:
     defaults = {
         "total_users": 16, "new_users_today": 2, "new_users_7d": 8, "new_users_30d": 16,
         "total_checks": 40, "checks_today": 3, "checks_7d": 12, "checks_30d": 40,
-        "checks_has_debt": 5, "checks_no_debt": 35,
+        "checks_has_debt": 5, "checks_no_debt": 33, "checks_partial": 1, "checks_error": 1,
+        "manual_checks": 25, "scheduled_checks": 15, "active_monitoring_subscriptions": 9,
+        "provider_error_counts": {"gib": 1, "avrasya": 0, "kgm": 0},
     }
     defaults.update(overrides)
     return TurkeyStatistics(**defaults)
 
 
 def test_format_statistics_includes_all_core_numbers():
+    """См. задачу "Перенос Unified Turkey функционала в production" —
+    ПЕРЕНЕСЕНО из reader/turkey_bot_test/texts.py::format_statistics
+    (unified-архитектура: manual/scheduled/active_monitoring_subscriptions/
+    provider_error_counts — НОВЫЕ поля относительно старой GIB-only
+    версии)."""
     text = texts.format_statistics(_stats())
 
     assert "16" in text  # total_users
@@ -36,16 +43,21 @@ def test_format_statistics_includes_all_core_numbers():
     assert "За 7 дней: 12" in text
     assert "За 30 дней: 40" in text
     assert "С задолженностью: 5" in text
-    assert "Без задолженности: 35" in text
+    assert "Без задолженности: 33" in text
+    assert "Ручных: 25" in text
+    assert "По расписанию: 15" in text
+    assert "Активных подписок мониторинга: 9" in text
 
 
-def test_format_statistics_does_not_mention_georgian_only_concepts():
-    """Явное требование задачи: "Do NOT show Georgian-only metrics: active
-    subscriptions, stopped subscriptions, monitoring tasks"."""
+def test_format_statistics_shows_unified_monitoring_metrics():
+    """ОБРАТНОЕ прежнему test_format_statistics_does_not_mention_georgian_
+    only_concepts — эта задача ЯВНО требует monitoring ON/OFF/scheduler в
+    production (см. задачу п.1: "monitoring ON/OFF", "scheduler"),
+    поэтому "мониторинг"/"подписок" ТЕПЕРЬ ожидаемо присутствуют."""
     text = texts.format_statistics(_stats()).lower()
 
-    for forbidden in ("подписк", "мониторинг", "active", "stopped"):
-        assert forbidden not in text
+    assert "мониторинг" in text
+    assert "подписок" in text
 
 
 def test_user_list_username_shown_with_at_sign():

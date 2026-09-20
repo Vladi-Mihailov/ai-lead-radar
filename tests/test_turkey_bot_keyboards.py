@@ -1,8 +1,14 @@
 """
-Тесты reader/turkey_bot/keyboards.py — inline "❌ Отмена", персистентное
-reply-меню (main_menu_keyboard) и inline-гараж (garage_keyboard, теперь с
-двумя действиями на автомобиль — GIB/Avrasya, см. design report Stage 2B).
-"""
+Тесты reader/turkey_bot/keyboards.py — ПЕРЕНЕСЕНО из reader/turkey_bot_test/
+(см. задачу "Перенос Unified Turkey функционала в production") — старая
+версия этого файла (garage_keyboard/toll_provider_keyboard/
+decode_garage_check_callback — provider-by-provider CAPTCHA-visible UX)
+заменена целиком новым car-centric unified UX, поэтому старые тесты
+удалены вместе со старым кодом, который они проверяли (см.
+test_turkey_bot_unified_menu.py/test_turkey_bot_my_cars.py/
+test_turkey_bot_monitoring_toggle.py для conversation.py-уровня
+интеграционных тестов car-centric flow — здесь только сама сборка
+клавиатур/кодирование callback_data)."""
 
 import sys
 from datetime import datetime, timezone
@@ -11,274 +17,218 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from reader.turkey_bot.keyboards import (  # noqa: E402
+from reader.turkey_bot.keyboards import (
+    BACK_TO_MY_CARS_CALLBACK_DATA,
     CANCEL_CALLBACK_DATA,
     HELP_BACK_TO_MAIN_CALLBACK_DATA,
+    add_car_confirmation_keyboard,
     cancel_keyboard,
-    decode_garage_check_callback,
+    car_card_keyboard,
+    car_delete_confirm_keyboard,
+    check_now_picker_keyboard,
+    decode_car_action_callback,
+    decode_car_open_by_plate_callback,
+    decode_car_open_callback,
     decode_help_callback,
-    decode_toll_provider_callback,
-    encode_garage_check_callback,
+    encode_car_action_callback,
+    encode_car_open_by_plate_callback,
+    encode_car_open_callback,
     encode_help_callback,
-    encode_toll_provider_callback,
-    garage_keyboard,
     georgian_bot_link_keyboard,
     help_menu_keyboard,
     help_section_keyboard,
     main_menu_keyboard,
-    toll_provider_keyboard,
+    my_cars_list_keyboard,
 )
-from reader.turkey_bot.models import TurkeyUserCar  # noqa: E402
-from reader.turkey_bot.texts import (  # noqa: E402
+from reader.turkey_bot.models import TurkeyUserCar
+from reader.turkey_bot.texts import (
+    ADD_CAR_LABEL,
     CANCEL_BUTTON_LABEL,
-    CHECK_FINES_LABEL,
-    CHECK_TOLLS_AVRASYA_LABEL,
-    CHECK_TOLLS_KGM_LABEL,
-    CHECK_TOLLS_LABEL,
-    GARAGE_CHECK_FINES_LABEL,
-    GARAGE_CHECK_TOLLS_KGM_LABEL,
-    GARAGE_LABEL,
+    CHECK_NOW_LABEL,
+    DELETE_CANCEL_LABEL,
+    DELETE_CAR_CONFIRM_BUTTON_LABEL,
+    DELETE_CAR_LABEL,
+    DISABLE_MONITORING_LABEL,
+    ENABLE_MONITORING_LABEL,
     GEORGIAN_BOT_LINK_LABEL,
     GEORGIAN_BOT_URL,
-    HELP_AVRASYA_LABEL,
     HELP_BACK_LABEL,
-    HELP_GIB_LABEL,
     HELP_LABEL,
-    HELP_PAYMENT_LABEL,
-    HELP_TERMS_LABEL,
+    HISTORY_LABEL,
+    MY_CARS_LABEL,
     STATISTICS_LABEL,
+    STOP_MONITORING_LABEL,
 )
 
 
-def _text_labels(keyboard) -> list[str]:
-    # Button.text(...) возвращает обёртку telethon.tl.custom.button.Button -
-    # реальный текст лежит на её внутреннем .button (types.KeyboardButton),
-    # не на самой обёртке (см. tests/test_public_bot_keyboards.py про тот
-    # же нюанс).
-    return [row_button.button.text for row in keyboard for row_button in row]
+def _button_texts(rows):
+    return [[btn.text for btn in row] for row in rows]
 
 
-def _car(car_id: int, car_number: str) -> TurkeyUserCar:
-    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+def _reply_button_texts(rows):
+    """Button.text(...) (reply-keyboard, см. main_menu_keyboard) оборачивает
+    подпись иначе, чем Button.inline(...) — доступ через .button.text (тот
+    же приём, что и в test_turkey_bot_unified_menu.py)."""
+    return [[btn.button.text for btn in row] for row in rows]
+
+
+def _car(car_id: int = 1, car_number: str = "34ABC123") -> TurkeyUserCar:
+    now = datetime.now(timezone.utc)
     return TurkeyUserCar(
-        id=car_id, telegram_user_id=1, car_number=car_number, created_at=now, last_checked_at=now,
+        id=car_id, telegram_user_id=222, car_number=car_number,
+        created_at=now, last_checked_at=now,
+        last_overall_status=None, last_total_amount=None,
     )
 
 
-def test_cancel_keyboard_has_one_button_with_expected_label_and_data():
+def test_cancel_keyboard_uses_fixed_callback():
     keyboard = cancel_keyboard()
-
-    assert len(keyboard) == 1
-    assert len(keyboard[0]) == 1
-    button = keyboard[0][0]
-    assert button.text == CANCEL_BUTTON_LABEL
-    assert button.data == CANCEL_CALLBACK_DATA
+    assert keyboard[0][0].text == CANCEL_BUTTON_LABEL
+    assert keyboard[0][0].data == CANCEL_CALLBACK_DATA
 
 
-def test_cancel_callback_data_is_a_fixed_constant_without_dynamic_content():
-    """См. design report Stage 3: callback_data здесь НЕ несёт
-    session_token/subscription_id — идентичность chat_id решается
-    исключительно event.chat_id самого нажатия (см.
-    reader/turkey_bot/handlers.py)."""
-    assert CANCEL_CALLBACK_DATA == b"turkeycancel"
+def test_regular_user_main_menu_layout():
+    rows = main_menu_keyboard(is_trusted=False)
+    grid = _reply_button_texts(rows)
+
+    assert grid[0] == [ADD_CAR_LABEL, MY_CARS_LABEL]
+    assert grid[1] == [CHECK_NOW_LABEL, GEORGIAN_BOT_LINK_LABEL]
+    assert grid[2] == [HELP_LABEL]
+    flat = [label for row in grid for label in row]
+    assert STATISTICS_LABEL not in flat
+    assert STOP_MONITORING_LABEL not in flat
 
 
-def test_main_menu_ordinary_user_is_a_2x2_plus_help_layout():
-    """Явное требование задачи "маленький UI-fix":
-    ROW 1: 🚔 Штрафы | 🛣 Платные дороги
-    ROW 2: 🚗 Мои авто | 🇬🇪 Штрафы Грузии
-    ROW 3: ℹ️ Справка"""
-    keyboard = main_menu_keyboard(is_trusted=False)
+def test_manager_main_menu_layout():
+    rows = main_menu_keyboard(is_trusted=True)
+    grid = _reply_button_texts(rows)
 
-    assert len(keyboard) == 3
-    assert _text_labels([keyboard[0]]) == [CHECK_FINES_LABEL, CHECK_TOLLS_LABEL]
-    assert _text_labels([keyboard[1]]) == [GARAGE_LABEL, GEORGIAN_BOT_LINK_LABEL]
-    assert _text_labels([keyboard[2]]) == [HELP_LABEL]
-    assert STATISTICS_LABEL not in _text_labels(keyboard)
+    assert grid[0] == [ADD_CAR_LABEL, MY_CARS_LABEL]
+    assert grid[1] == [CHECK_NOW_LABEL, STOP_MONITORING_LABEL]
+    assert grid[2] == [STATISTICS_LABEL, GEORGIAN_BOT_LINK_LABEL]
+    assert grid[3] == [HELP_LABEL]
 
 
-def test_main_menu_manager_puts_help_and_statistics_in_the_same_last_row():
-    """Явное требование задачи: манагеру ROW 3 = ℹ️ Справка | 📊
-    Статистика (одна строка, не две отдельные)."""
-    keyboard = main_menu_keyboard(is_trusted=True)
-
-    assert len(keyboard) == 3
-    assert _text_labels([keyboard[0]]) == [CHECK_FINES_LABEL, CHECK_TOLLS_LABEL]
-    assert _text_labels([keyboard[1]]) == [GARAGE_LABEL, GEORGIAN_BOT_LINK_LABEL]
-    assert _text_labels([keyboard[2]]) == [HELP_LABEL, STATISTICS_LABEL]
-
-
-def test_main_menu_keyboard_contains_the_georgian_bot_link_as_a_reply_button():
-    """См. design report "унификация UI" — переход в Georgian-бот теперь
-    ОБЫЧНАЯ reply-кнопка (Button.text) в главном меню, а не отдельное
-    companion-сообщение (см. reader/turkey_bot/handlers.py::_send_reply/
-    reader/turkey_bot/conversation.py::handle_text)."""
-    labels = _text_labels(main_menu_keyboard(is_trusted=True))
-    assert GEORGIAN_BOT_LINK_LABEL in labels
-
-
-def test_georgian_bot_link_keyboard_has_the_expected_url_button():
+def test_georgian_bot_link_keyboard_is_a_url_button():
     keyboard = georgian_bot_link_keyboard()
-
-    assert len(keyboard) == 1
-    assert len(keyboard[0]) == 1
     button = keyboard[0][0]
     assert button.text == GEORGIAN_BOT_LINK_LABEL
     assert button.url == GEORGIAN_BOT_URL
-    assert GEORGIAN_BOT_URL == "https://t.me/ProtocolGEbot"
 
 
-def test_garage_keyboard_has_four_buttons_per_car():
-    """[НОМЕР] [🚔 Штрафы] [🚇 Туннели] [🛣 Дороги] (см. design report
-    Stage 2B: "Saved cars must show both actions", и design report
-    "Реализация KGM provider" п.10 — KGM добавлен как третья кнопка)."""
-    cars = [_car(1, "34ABC123"), _car(2, "06XYZ999")]
-
-    keyboard = garage_keyboard(cars)
-
-    assert len(keyboard) == 2
-    for row in keyboard:
-        assert len(row) == 4
+def test_car_open_callback_roundtrip():
+    data = encode_car_open_callback(42)
+    assert decode_car_open_callback(data) == 42
 
 
-def test_garage_keyboard_shows_plate_and_all_action_labels():
-    """Укороченные подписи (см. design report "унификация UI") —
-    <PLATE> | 🚔 Штрафы | 🚇 Туннели | 🛣 Дороги — НЕ переиспользуют
-    CHECK_FINES_LABEL/CHECK_TOLLS_KGM_LABEL (главное меню/подменю платных
-    дорог их не меняли, см. GARAGE_CHECK_FINES_LABEL/
-    GARAGE_CHECK_TOLLS_KGM_LABEL докстрок в texts.py)."""
-    keyboard = garage_keyboard([_car(1, "34ABC123")])
-
-    row = keyboard[0]
-    assert row[0].text == "34ABC123"
-    assert row[1].text == GARAGE_CHECK_FINES_LABEL == "🚔 Штрафы"
-    assert row[2].text == CHECK_TOLLS_AVRASYA_LABEL == "🚇 Туннели"
-    assert row[3].text == GARAGE_CHECK_TOLLS_KGM_LABEL == "🛣 Дороги"
+def test_car_open_callback_decode_rejects_unrelated_data():
+    assert decode_car_open_callback(b"turkeycancel") is None
+    assert decode_car_open_callback(None) is None
+    assert decode_car_open_callback(b"turkeycaropen:not-a-number") is None
 
 
-def test_garage_keyboard_plate_and_fines_button_encode_the_same_gib_callback():
-    """См. design report Stage 1: "Clicking the plate itself may either
-    be a no-op/info action or start the same check" — здесь обе ведут на
-    ОДИН и тот же (gib, car_id) callback."""
-    keyboard = garage_keyboard([_car(42, "34ABC123")])
-
-    row = keyboard[0]
-    assert row[0].data == row[1].data
-    assert decode_garage_check_callback(row[0].data) == ("gib", 42)
+def test_car_open_by_plate_callback_roundtrip():
+    data = encode_car_open_by_plate_callback("34ABC123")
+    assert decode_car_open_by_plate_callback(data) == "34ABC123"
 
 
-def test_garage_keyboard_tolls_buttons_encode_avrasya_and_kgm_callbacks():
-    keyboard = garage_keyboard([_car(42, "34ABC123")])
-
-    row = keyboard[0]
-    assert decode_garage_check_callback(row[2].data) == ("avrasya", 42)
-    assert decode_garage_check_callback(row[3].data) == ("kgm", 42)
+def test_car_action_callback_roundtrip_for_every_known_action():
+    for action in ("check", "monitor_on", "monitor_off", "history", "delete_prompt", "delete_confirm", "delete_cancel"):
+        data = encode_car_action_callback(action, 7)
+        assert decode_car_action_callback(data) == (action, 7)
 
 
-def test_encode_decode_garage_check_roundtrip_for_each_provider():
-    assert decode_garage_check_callback(encode_garage_check_callback("gib", 7)) == ("gib", 7)
-    assert decode_garage_check_callback(encode_garage_check_callback("avrasya", 7)) == ("avrasya", 7)
-    assert decode_garage_check_callback(encode_garage_check_callback("kgm", 7)) == ("kgm", 7)
+def test_car_action_callback_rejects_unknown_action():
+    """Явное требование задачи п.9 (унаследовано из предыдущего этапа) —
+    вручную сформированный callback с посторонним action не должен
+    маршрутизироваться никуда, а не выполнять произвольное действие."""
+    forged = b"turkeycaraction:delete:7"  # "delete" больше не в _CAR_ACTIONS
+    assert decode_car_action_callback(forged) is None
 
 
-def test_decode_garage_check_rejects_unrelated_callback_data():
-    assert decode_garage_check_callback(CANCEL_CALLBACK_DATA) is None
-    assert decode_garage_check_callback(b"somethingelse:1") is None
-    assert decode_garage_check_callback(None) is None
+def test_car_action_callback_rejects_malformed_car_id():
+    forged = b"turkeycaraction:check:not-a-number"
+    assert decode_car_action_callback(forged) is None
 
 
-def test_decode_garage_check_rejects_non_numeric_payload():
-    assert decode_garage_check_callback(b"turkeygaragecheck:gib:not-a-number") is None
+def test_my_cars_list_keyboard_shows_on_off_and_opens_correct_car():
+    cars = [_car(1, "A123AA123"), _car(2, "B456BB456")]
+    keyboard = my_cars_list_keyboard(cars, {1: True, 2: False})
+
+    assert keyboard[0][0].text == "🟢 A123AA123 — ON"
+    assert keyboard[1][0].text == "⚪ B456BB456 — OFF"
+    assert decode_car_open_callback(keyboard[0][0].data) == 1
+    assert decode_car_open_callback(keyboard[1][0].data) == 2
 
 
-def test_decode_garage_check_rejects_unknown_provider():
-    """См. design report: "design the internal architecture so
-    additional toll-road providers can be added later" — но НЕ принимает
-    произвольную строку как провайдер уже сейчас (только зарегистрированные)."""
-    assert decode_garage_check_callback(b"turkeygaragecheck:unknownprovider:7") is None
+def test_my_cars_list_keyboard_defaults_missing_state_to_off():
+    """monitoring_active без записи для car.id -> OFF, никогда ON по
+    умолчанию (см. задачу: не показывать мониторинг активным без
+    подтверждённого active=1 в БД)."""
+    cars = [_car(1, "A123AA123")]
+    keyboard = my_cars_list_keyboard(cars, {})
+
+    assert keyboard[0][0].text == "⚪ A123AA123 — OFF"
 
 
-def test_toll_provider_keyboard_has_avrasya_and_kgm_buttons():
-    """См. design report "Реализация KGM provider" п.10 — CHECK_TOLLS_LABEL
-    ведёт к явному выбору "🚇 Avrasya Tüneli" / "🛣 Все дороги и мосты
-    (KGM)", Avrasya не удалена."""
-    keyboard = toll_provider_keyboard()
+def test_check_now_picker_keyboard_uses_plain_plate_label():
+    cars = [_car(5, "A123AA123")]
+    keyboard = check_now_picker_keyboard(cars)
 
-    assert len(keyboard) == 2
-    assert keyboard[0][0].text == CHECK_TOLLS_AVRASYA_LABEL
-    assert keyboard[1][0].text == CHECK_TOLLS_KGM_LABEL
-    assert decode_toll_provider_callback(keyboard[0][0].data) == "avrasya"
-    assert decode_toll_provider_callback(keyboard[1][0].data) == "kgm"
+    assert keyboard[0][0].text == "🚗 A123AA123"
+    assert decode_car_action_callback(keyboard[0][0].data) == ("check", 5)
 
 
-def test_encode_decode_toll_provider_roundtrip():
-    assert decode_toll_provider_callback(encode_toll_provider_callback("avrasya")) == "avrasya"
-    assert decode_toll_provider_callback(encode_toll_provider_callback("kgm")) == "kgm"
-
-
-def test_decode_toll_provider_rejects_unrelated_or_unknown_data():
-    assert decode_toll_provider_callback(CANCEL_CALLBACK_DATA) is None
-    assert decode_toll_provider_callback(None) is None
-    # "gib" не входит в выбор платных дорог (см. модуль docstring
-    # keyboards.py про _TOLL_PROVIDERS) — штрафы не имеют подменю.
-    assert decode_toll_provider_callback(b"turkeytollprovider:gib") is None
-
-
-def test_decode_garage_check_rejects_missing_car_id():
-    assert decode_garage_check_callback(b"turkeygaragecheck:gib:") is None
-
-
-# ---- ℹ️ Справка (см. design report) ----
-
-
-def test_help_menu_keyboard_has_four_sections_plus_back_to_main():
-    keyboard = help_menu_keyboard()
-
-    assert len(keyboard) == 5
-    for row in keyboard:
-        assert len(row) == 1
+def test_off_card_shows_enable_button_history_delete_back():
+    keyboard = car_card_keyboard(_car(3), monitoring_active=False)
     labels = [row[0].text for row in keyboard]
-    assert labels == [
-        HELP_TERMS_LABEL, HELP_GIB_LABEL, HELP_AVRASYA_LABEL, HELP_PAYMENT_LABEL, HELP_BACK_LABEL,
-    ]
+
+    assert labels == [CHECK_NOW_LABEL, ENABLE_MONITORING_LABEL, HISTORY_LABEL, DELETE_CAR_LABEL, "⬅️ Назад"]
+    assert decode_car_action_callback(keyboard[1][0].data) == ("monitor_on", 3)
+    assert decode_car_action_callback(keyboard[3][0].data) == ("delete_prompt", 3)
+    assert keyboard[4][0].data == BACK_TO_MY_CARS_CALLBACK_DATA
 
 
-def test_help_menu_keyboard_back_button_uses_fixed_main_menu_callback():
-    keyboard = help_menu_keyboard()
+def test_on_card_shows_disable_button():
+    keyboard = car_card_keyboard(_car(3), monitoring_active=True)
+    labels = [row[0].text for row in keyboard]
 
-    back_button = keyboard[-1][0]
-    assert back_button.data == HELP_BACK_TO_MAIN_CALLBACK_DATA
-
-
-def test_help_menu_keyboard_section_buttons_encode_expected_callbacks():
-    keyboard = help_menu_keyboard()
-
-    assert decode_help_callback(keyboard[0][0].data) == "terms"
-    assert decode_help_callback(keyboard[1][0].data) == "gib"
-    assert decode_help_callback(keyboard[2][0].data) == "avrasya"
-    assert decode_help_callback(keyboard[3][0].data) == "payment"
+    assert labels[1] == DISABLE_MONITORING_LABEL
+    assert decode_car_action_callback(keyboard[1][0].data) == ("monitor_off", 3)
 
 
-def test_help_section_keyboard_has_only_a_back_to_help_menu_button():
-    keyboard = help_section_keyboard()
+def test_car_delete_confirm_keyboard_has_confirm_and_cancel():
+    keyboard = car_delete_confirm_keyboard(9)
+    row = keyboard[0]
 
-    assert len(keyboard) == 1
-    assert len(keyboard[0]) == 1
-    button = keyboard[0][0]
-    assert button.text == HELP_BACK_LABEL
-    assert decode_help_callback(button.data) == "menu"
+    assert row[0].text == DELETE_CAR_CONFIRM_BUTTON_LABEL
+    assert decode_car_action_callback(row[0].data) == ("delete_confirm", 9)
+    assert row[1].text == DELETE_CANCEL_LABEL
+    assert decode_car_action_callback(row[1].data) == ("delete_cancel", 9)
 
 
-def test_encode_decode_help_callback_roundtrip_for_each_section():
-    for section in ("terms", "gib", "avrasya", "payment", "menu"):
+def test_add_car_confirmation_keyboard_offers_check_now():
+    keyboard = add_car_confirmation_keyboard(11)
+    assert keyboard[0][0].text == CHECK_NOW_LABEL
+    assert decode_car_action_callback(keyboard[0][0].data) == ("check", 11)
+
+
+def test_help_callback_roundtrip_for_known_sections():
+    for section in ("menu", "terms", "gib", "avrasya", "payment"):
         assert decode_help_callback(encode_help_callback(section)) == section
 
 
-def test_decode_help_callback_rejects_unrelated_callback_data():
-    assert decode_help_callback(CANCEL_CALLBACK_DATA) is None
-    assert decode_help_callback(HELP_BACK_TO_MAIN_CALLBACK_DATA) is None
-    assert decode_help_callback(None) is None
+def test_help_callback_rejects_unknown_section():
+    assert decode_help_callback(encode_help_callback("unknown")) is None
 
 
-def test_decode_help_callback_rejects_unknown_section():
-    assert decode_help_callback(b"turkeyhelp:somethingelse") is None
+def test_help_menu_keyboard_back_uses_fixed_main_menu_callback():
+    keyboard = help_menu_keyboard()
+    back_button = keyboard[-1][0]
+    assert back_button.text == HELP_BACK_LABEL
+    assert back_button.data == HELP_BACK_TO_MAIN_CALLBACK_DATA
+
+
+def test_help_section_keyboard_back_returns_to_help_menu():
+    keyboard = help_section_keyboard()
+    assert decode_help_callback(keyboard[0][0].data) == "menu"

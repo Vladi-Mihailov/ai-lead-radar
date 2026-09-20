@@ -6,6 +6,7 @@ reader/turkey_bot/gib/models.py, отдельно и независимо от �
 
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 
 
 @dataclass(frozen=True)
@@ -30,16 +31,27 @@ class ConversationState:
 
 @dataclass(frozen=True)
 class TurkeyUserCar:
-    """Одна запись "гаража" — см. reader/turkey_bot/user_cars_repository.py.
-    Появляется ТОЛЬКО после реально завершённой проверки с исходом
-    no_debt/has_debt (см. design report: "must not pollute the garage" —
-    CAPTCHA/rejected/unexpected/error никогда не создают и не обновляют
-    запись). car_number уже нормализован (см.
-    reader/turkey_bot/validation.py::normalize_plate) — тот же формат,
-    что и во всех остальных местах бота."""
+    """Одна запись "Мои авто" — см. reader/turkey_bot/user_cars_repository.py.
+
+    ОБНОВЛЕНО (см. задачу "Перенос Unified Turkey функционала в
+    production", перенесено из reader/turkey_bot_test/models.py): машина
+    появляется СРАЗУ после валидного ввода номера — успешная проверка
+    больше НЕ требуется (та же смена направления, что и в test-боте).
+    car_number уже нормализован (см. reader/turkey_bot/validation.py::
+    normalize_plate).
+
+    last_overall_status/last_total_amount — кэш последнего unified-check
+    (см. reader/turkey_bot/unified/models.py::OverallStatus) для показа в
+    списке "📋 Мои авто" без join на turkey_check_runs — None, пока
+    автомобиль ни разу не проверялся unified-flow (в т.ч. для всех
+    автомобилей, восстановленных production migration-скриптом из
+    turkey_fine_checks/turkey_toll_checks — их legacy-история НЕ
+    переносится в эти поля, см. scripts/migrate_turkey_unified.py)."""
 
     id: int
     telegram_user_id: int
     car_number: str
     created_at: datetime
     last_checked_at: datetime
+    last_overall_status: str | None = None
+    last_total_amount: Decimal | None = None

@@ -108,12 +108,67 @@ def test_test_clone_repositories_do_not_touch_production_repository_state(tmp_pa
     test_repo.close()
 
 
-def test_production_turkey_bot_package_untouched_by_unified_ux_refactor():
-    """Regression-guard для design report п.16 ("КРИТИЧНО: изоляция") —
-    новые unified/monitoring-модули этой задачи физически не существуют
-    под reader/turkey_bot/ и ничего оттуда не импортируют."""
+def test_production_turkey_bot_has_its_own_independent_unified_modules():
+    """См. задачу "Перенос Unified Turkey функционала в production" —
+    production ТЕПЕРЬ ТОЖЕ имеет unified/monitoring (это и есть цель этой
+    задачи), но как ОТДЕЛЬНУЮ, независимую копию под reader/turkey_bot/*,
+    НЕ импорт/reuse из reader/turkey_bot_test/* (см. модуль docstring:
+    "клон — ОТДЕЛЬНЫЕ модули/классы/пути"). Заменяет прежний
+    test_production_turkey_bot_package_untouched_by_unified_ux_refactor
+    (см. design report предыдущей задачи п.16), чья предпосылка
+    ("production ещё не тронут unified-рефакторингом") стала неактуальной
+    по прямому требованию текущей задачи."""
     import reader.turkey_bot.conversation as prod_conversation
+    import reader.turkey_bot.unified.check_service as prod_check_service
+    import reader.turkey_bot_test.unified.check_service as test_check_service
 
-    assert not hasattr(prod_conversation, "UnifiedTurkeyCheckService")
-    assert not (PROJECT_ROOT / "reader" / "turkey_bot" / "unified").exists()
-    assert not (PROJECT_ROOT / "reader" / "turkey_bot" / "monitoring").exists()
+    assert hasattr(prod_conversation, "UnifiedTurkeyCheckService")
+    assert (PROJECT_ROOT / "reader" / "turkey_bot" / "unified").exists()
+    assert (PROJECT_ROOT / "reader" / "turkey_bot" / "monitoring").exists()
+
+    # ОТДЕЛЬНЫЕ объекты модулей, НЕ один и тот же импортированный дважды —
+    # production НИКОГДА не импортирует reader.turkey_bot_test.* (см.
+    # test_no_turkey_bot_test_imports_in_production_runtime ниже).
+    assert prod_check_service is not test_check_service
+    assert prod_check_service.UnifiedTurkeyCheckService is not test_check_service.UnifiedTurkeyCheckService
+
+
+def test_no_turkey_bot_test_imports_in_production_runtime():
+    """См. задачу п.2/п.12 — grep-proof, что ни один модуль
+    reader/turkey_bot/*.py не импортирует reader.turkey_bot_test и никогда
+    РЕАЛЬНО не читает TURKEYBOT_TEST_TOKEN (os.getenv/os.environ) —
+    провенанс-комментарии/докстроки вида "НЕ путать с TURKEYBOT_TEST_TOKEN
+    (см. reader/turkey_bot_test/main.py)" разрешены и намеренно НЕ
+    запрещаются (это документация о том, чего НЕ делает код, не сам
+    код) — поэтому проверка идёт по AST (реальные import/os.getenv/
+    os.environ[...] узлы), а не по голому substring-поиску во всём
+    исходнике."""
+    import ast
+
+    turkey_bot_dir = PROJECT_ROOT / "reader" / "turkey_bot"
+
+    def _string_const(node) -> str | None:
+        return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+    for py_file in turkey_bot_dir.rglob("*.py"):
+        source = py_file.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(py_file))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert not alias.name.startswith("reader.turkey_bot_test"), (
+                        f"{py_file}: import {alias.name}"
+                    )
+            elif isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                assert not module.startswith("reader.turkey_bot_test"), (
+                    f"{py_file}: from {module} import ..."
+                )
+            elif isinstance(node, ast.Call):
+                # os.getenv("TURKEYBOT_TEST_TOKEN") / os.environ.get(...)
+                args = [_string_const(a) for a in node.args]
+                assert "TURKEYBOT_TEST_TOKEN" not in args, f"{py_file}: reads TURKEYBOT_TEST_TOKEN via call"
+            elif isinstance(node, ast.Subscript):
+                # os.environ["TURKEYBOT_TEST_TOKEN"]
+                key = _string_const(node.slice)
+                assert key != "TURKEYBOT_TEST_TOKEN", f"{py_file}: reads TURKEYBOT_TEST_TOKEN via subscript"

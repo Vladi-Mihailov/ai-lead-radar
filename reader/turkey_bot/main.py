@@ -1,21 +1,47 @@
-"""Bootstrap-процесс Turkey-бота — ПОЛНОСТЬЮ ОТДЕЛЬНЫЙ standalone-процесс от
-reader/main.py И от reader/public_bot/main.py (см. design report Stage 1:
-"новый, отдельный Telegram-бот, не расширение существующего Георгия-бота").
-Запускается только вручную/через systemd (см.
+"""Bootstrap-процесс production Turkey-бота (@ProtocolTRbot) — ПОЛНОСТЬЮ
+ОТДЕЛЬНЫЙ standalone-процесс от reader/main.py и от reader/public_bot/
+main.py (не изменилось). Запускается только вручную/через systemd (см.
 deploy/ai-lead-radar-turkeybot.service):
 
     python -m reader.turkey_bot.main
 
-Turkey — ОДНОРАЗОВАЯ проверка (см. design report): здесь нет и не должно
-быть ни FineMonitoringTaskRepository/FineSubscriptionRepository/
-DetectedFineRepository, ни какого-либо scheduler/job — ничего из
-reader/fines/* или reader/public_bot/* сюда не импортируется. Единственная
-разделяемая с Георгией-ботом вещь — тот же физический SQLite-файл
-(settings.app.users_db_file), но ТОЛЬКО Turkey-специфичные таблицы (см.
-reader/turkey_bot/conversation_state_repository.py,
-known_users_repository.py, check_repository.py) — ни одна Георгия-таблица
-здесь не читается и не пишется.
-"""
+ПЕРЕНЕСЕНО из reader/turkey_bot_test/main.py (см. задачу "Перенос Unified
+Turkey функционала в production", READ-ONLY аудит) — UNIFIED UX: USER ->
+CAR -> UNIFIED CHECK -> MONITORING, calendar-based scheduler СТРОГО 13:00
+и 21:00 Europe/Istanbul, работает ВНУТРИ этого же процесса/systemd-юнита
+(ai-lead-radar-turkeybot.service) — отдельный systemd unit НЕ заводится.
+Планировщик — reader.jobs.{Job,Scheduler} (bot-agnostic инфраструктура,
+уже используется reader/main.py, НЕ изменена ни строкой).
+
+ОТЛИЧИЯ от reader/turkey_bot_test/main.py (production identity, см. задачу
+п.2 — НИКОГДА не смешивается с test-ботом):
+  - token — ТОЛЬКО TURKEYBOT_TOKEN (см. read_bot_token());
+  - Telethon session — ОТДЕЛЬНЫЙ файл (data/sessions/turkeybot), тот же,
+    что и раньше — НЕ создаётся заново, старая сессия продолжает работать;
+  - SQLite — settings.app.users_db_file (ТОТ ЖЕ физический файл, что и у
+    Георгия-бота, см. design report исходного Turkey-бота: "Единственная
+    разделяемая с Георгией-ботом вещь — тот же физический SQLite-файл, но
+    ТОЛЬКО Turkey-специфичные таблицы") — НЕ отдельный data/turkey_bot_test.db,
+    это критично для production migration (см. scripts/migrate_turkey_unified.py):
+    новые unified/monitoring-таблицы обязаны жить в ТОМ ЖЕ файле, что и
+    существующие turkey_bot_user_cars/turkey_bot_known_users/
+    turkey_fine_checks/turkey_toll_checks, иначе backfill не увидит
+    исторические данные;
+  - GİB/Avrasya/KGM providers — reader.turkey_bot.{gib,avrasya,kgm}.*
+    (НЕ reader.turkey_bot_test.*, см. reader/turkey_bot/unified/
+    check_service.py — эти модули byte-identical своим test-аналогам, см.
+    READ-ONLY аудит, поэтому НЕ дублируются повторно);
+  - GIB Russian translation (TurkeyFineTranslationService) — ПОДКЛЮЧЕНА
+    (см. задачу п.4: READ-ONLY аудит обнаружил, что test unified-flow эту
+    существовавшую в production фичу потерял; здесь она передаётся в
+    UnifiedTurkeyCheckService как gib_translator, см.
+    reader/turkey_bot/unified/check_service.py) — test-бот сам НЕ
+    затрагивается, его main.py не переносит и не подключает translator;
+  - trusted_operator_user_ids/payment_help_contact_username/tz — ТЕ ЖЕ
+    production-настройки, что были у старого reader/turkey_bot/main.py
+    (settings.public_bot.*, settings.fine_monitor.timezone) — НЕ менялись.
+
+НИЧЕГО из reader/turkey_bot_test/* не импортируется (см. задачу п.2/п.12)."""
 
 import asyncio
 import logging
@@ -27,49 +53,59 @@ from zoneinfo import ZoneInfo
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from dotenv import load_dotenv  # noqa: E402
-from telethon import TelegramClient  # noqa: E402
+from dotenv import load_dotenv
+from telethon import TelegramClient
 
-from reader.logging_setup import setup_logging  # noqa: E402
-from reader.settings import ConfigError, load_settings  # noqa: E402
-from reader.turkey_bot.avrasya.live_session_registry import (  # noqa: E402
-    LiveAvrasyaSessionRegistry,
-)
-from reader.turkey_bot.check_repository import TurkeyCheckRepository  # noqa: E402
-from reader.turkey_bot.conversation import ConversationController  # noqa: E402
-from reader.turkey_bot.conversation_state_repository import (  # noqa: E402
+from reader.jobs.scheduler import Scheduler
+from reader.logging_setup import setup_logging
+from reader.settings import ConfigError, load_settings
+from reader.turkey_bot.conversation import ConversationController
+from reader.turkey_bot.conversation_state_repository import (
     TurkeyConversationStateRepository,
 )
-from reader.turkey_bot.gib.translation import TurkeyFineTranslationService  # noqa: E402
-from reader.turkey_bot.handlers import register  # noqa: E402
-from reader.turkey_bot.kgm.live_session_registry import (
-    LiveKgmSessionRegistry,  # noqa: E402
-)
+from reader.turkey_bot.gib.translation import TurkeyFineTranslationService
+from reader.turkey_bot.handlers import register
 from reader.turkey_bot.known_users_repository import (
-    TurkeyBotKnownUsersRepository,  # noqa: E402
+    TurkeyBotKnownUsersRepository,
 )
-from reader.turkey_bot.live_session_registry import LiveGibSessionRegistry  # noqa: E402
-from reader.turkey_bot.statistics_service import TurkeyStatisticsService  # noqa: E402
-from reader.turkey_bot.toll_check_repository import (
-    TurkeyTollCheckRepository,  # noqa: E402
+from reader.turkey_bot.monitoring.monitoring_service import (
+    TurkeyMonitoringService,
+)
+from reader.turkey_bot.monitoring.scheduler_job import TurkeyMonitoringJob
+from reader.turkey_bot.monitoring.subscription_repository import (
+    TurkeyMonitoringSubscriptionRepository,
+)
+from reader.turkey_bot.statistics_service import TurkeyStatisticsService
+from reader.turkey_bot.unified.check_service import (
+    UnifiedTurkeyCheckService,
+    default_avrasya_check_factory,
+    default_gib_check_factory,
+    default_kgm_check_factory,
+)
+from reader.turkey_bot.unified.run_repository import (
+    TurkeyCheckRunRepository,
 )
 from reader.turkey_bot.user_cars_repository import (
-    TurkeyUserCarsRepository,  # noqa: E402
+    TurkeyUserCarsRepository,
 )
 
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
-# Отдельный .session-файл — своя, независимая Telethon-сессия (см.
-# reader/public_bot/main.py про тот же приём) — ни с одним другим процессом
-# проекта не делится ни credential, ни файл сессии.
+# Отдельный .session-файл — та же production-сессия, что и раньше (см.
+# deploy/ai-lead-radar-turkeybot.service) — НЕ переносится/не заменяется.
 _SESSION_PATH = PROJECT_ROOT / "data" / "sessions" / "turkeybot"
+
+# Планировщик тикает раз в 30с (см. reader/jobs/scheduler.py) — тот же
+# poll_interval, что и у reader/main.py и у test-бота.
+_SCHEDULER_POLL_INTERVAL_SECONDS = 30.0
 
 logger = logging.getLogger(__name__)
 
 
 def read_bot_token() -> str:
     """ТОЛЬКО из окружения (TURKEYBOT_TOKEN, см. .env.example) — никогда из
-    config.yaml, никогда не логируется (тот же приём, что и
-    reader/public_bot/main.py::read_bot_token)."""
+    config.yaml, никогда не логируется. НЕ путать с TURKEYBOT_TEST_TOKEN
+    (test-clone бота, reader/turkey_bot_test/main.py) — эта функция его не
+    читает и не может прочитать (другое имя переменной)."""
     load_dotenv()
     token = os.getenv("TURKEYBOT_TOKEN")
     if not token:
@@ -80,15 +116,42 @@ def read_bot_token() -> str:
     return token
 
 
+class _TelethonNotifier:
+    """NotifierLike (см. reader/turkey_bot/monitoring/monitoring_service.py)
+    поверх уже подключённого TelegramClient — тот же адаптер, что и в
+    reader/turkey_bot_test/main.py."""
+
+    def __init__(self, client: TelegramClient) -> None:
+        self._client = client
+
+    async def send(self, *, telegram_chat_id: int, text: str) -> None:
+        await self._client.send_message(telegram_chat_id, text)
+
+
+async def _run_concurrently(coroutines: list) -> None:
+    """Как asyncio.gather, но при ошибке в одной корутине отменяет
+    остальные — тот же приём, что и в reader/turkey_bot_test/main.py."""
+    tasks = [asyncio.create_task(coro) for coro in coroutines]
+    try:
+        done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    for task in done:
+        exc = task.exception()
+        if exc is not None:
+            raise exc
+
+
 async def run() -> None:
     settings = load_settings(CONFIG_PATH)
     setup_logging(settings.app.log_level)
 
     token = read_bot_token()
 
-    # api_id/api_hash — то же самое Telegram-приложение, что и у остального
-    # Reader (см. .env) — второе приложение не регистрируется, только
-    # третий bot-mode client с собственным .session-файлом (см. выше).
     missing = [name for name in ("TELEGRAM_API_ID", "TELEGRAM_API_HASH") if not os.getenv(name)]
     if missing:
         raise ConfigError(
@@ -99,106 +162,81 @@ async def run() -> None:
 
     _SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+    # ТОТ ЖЕ физический файл, что и всегда (settings.app.users_db_file =
+    # data/users.db) — см. модуль docstring про то, почему это критично
+    # для production migration/backfill.
     db_path = settings.app.users_db_file
     conversation_state_repository = TurkeyConversationStateRepository(db_path)
     known_users_repository = TurkeyBotKnownUsersRepository(db_path)
-    check_repository = TurkeyCheckRepository(db_path)
-    # "Гараж" (см. design report: НЕ мониторинг/подписка — только чтобы не
-    # заставлять пользователя вводить номер заново) — та же схема
-    # additive-таблицы, что и у остальных Turkey-репозиториев.
     garage_repository = TurkeyUserCarsRepository(db_path)
-    statistics_service = TurkeyStatisticsService(known_users_repository, check_repository)
-    # Avrasya Tüneli (см. design report Stage 2B) — ОТДЕЛЬНАЯ, additive
-    # таблица (НЕ trukey_fine_checks) и ОТДЕЛЬНЫЙ, но структурно
-    # идентичный in-memory реестр живых сессий (см.
-    # reader/turkey_bot/avrasya/live_session_registry.py) — тот же принцип
-    # "живая HTTP-сессия никогда не сериализуется в SQLite", что и у GIB.
-    toll_check_repository = TurkeyTollCheckRepository(db_path)
-    # Один процесс - один реестр живых GIB-сессий, полностью in-memory (см.
-    # reader/turkey_bot/live_session_registry.py и design report Stage 3:
-    # "do not pretend that an in-memory client can be reconstructed from a
-    # DB session_token") - создаётся здесь и закрывается здесь же (finally
-    # ниже), ConversationController им не владеет.
-    session_registry = LiveGibSessionRegistry()
-    avrasya_session_registry = LiveAvrasyaSessionRegistry()
-    # KGM (webihlaltakip.kgm.gov.tr, см. design report "Реализация KGM
-    # provider") — ТРЕТИЙ, структурно идентичный in-memory реестр живых
-    # сессий, та же ОБЩАЯ turkey_toll_checks (provider="kgm"), НЕ отдельная
-    # таблица (см. reader/turkey_bot/kgm/live_session_registry.py).
-    kgm_session_registry = LiveKgmSessionRegistry()
+    run_repository = TurkeyCheckRunRepository(db_path)
+    subscription_repository = TurkeyMonitoringSubscriptionRepository(db_path)
+    statistics_service = TurkeyStatisticsService(
+        known_users_repository, run_repository, subscription_repository,
+    )
+
+    # Тот же общий OPENAI_API_KEY (settings.ocr.openai_api_key) и
+    # translation_model, что и у Георгии/у старого reader/turkey_bot/
+    # conversation.py — второй ключ/секрет не заводится. None означает
+    # "перевод недоступен" (нет ключа), не ошибку запуска: клиент увидит
+    # оригинальный турецкий текст (см. reader/turkey_bot/unified/
+    # check_service.py::_translate_gib_fines, тот же fail-open принцип,
+    # что был у старого _translate_fines).
+    translator = (
+        TurkeyFineTranslationService(
+            api_key=settings.ocr.openai_api_key, model=settings.fine_monitor.translation_model,
+        )
+        if settings.ocr.openai_api_key
+        else None
+    )
+    if translator is not None:
+        logger.info(f"✔ Turkey fine translator включён (model={settings.fine_monitor.translation_model})")
+    else:
+        logger.info("Turkey fine translator выключен (OPENAI_API_KEY не задан)")
+
+    check_service = UnifiedTurkeyCheckService(
+        default_gib_check_factory, default_avrasya_check_factory, default_kgm_check_factory,
+        gib_translator=translator,
+    )
 
     try:
-        # Тот же общий OPENAI_API_KEY (settings.ocr.openai_api_key) и
-        # translation_model, что и у Георгии (reader/fines/translation.py) -
-        # второй ключ/секрет не заводится (см. задачу). None - как и там -
-        # означает "перевод недоступен" (нет ключа), не ошибку запуска:
-        # клиент увидит оригинальный турецкий текст (см. conversation.py::
-        # _translate_fines).
-        translator = (
-            TurkeyFineTranslationService(
-                api_key=settings.ocr.openai_api_key, model=settings.fine_monitor.translation_model,
-            )
-            if settings.ocr.openai_api_key
-            else None
-        )
-        # НЕ содержит и не может содержать сам ключ (см. выше) - только
-        # факт "сконструирован/нет" и имя модели (не секрет) - единственный
-        # способ подтвердить в логе, что перевод реально включён, без
-        # тестового запроса к OpenAI (см. задачу: "do not make a
-        # standalone test OpenAI request").
-        if translator is not None:
-            logger.info(f"✔ Turkey fine translator включён (model={settings.fine_monitor.translation_model})")
-        else:
-            logger.info("Turkey fine translator выключен (OPENAI_API_KEY не задан)")
         controller = ConversationController(
-            conversation_state_repository, check_repository, session_registry,
-            garage_repository, statistics_service,
-            avrasya_session_registry, toll_check_repository, kgm_session_registry,
-            translator=translator,
-            # ТА ЖЕ настройка, что и у @ProtocolGEbot (см. design report:
-            # "reuse the same trusted manager IDs/configuration... do not
-            # duplicate/hardcode a second manager list") — trusted даёт
-            # доступ ТОЛЬКО к статистике (см. conversation.py::_is_trusted),
-            # НЕ к чужому гаражу.
+            conversation_state_repository, garage_repository, run_repository,
+            subscription_repository, statistics_service, check_service,
+            # ТА ЖЕ настройка, что и раньше (settings.public_bot.
+            # trusted_operator_user_ids) — production manager
+            # configuration НЕ менялась.
             trusted_operator_user_ids=frozenset(settings.public_bot.trusted_operator_user_ids),
-            # ТА ЖЕ business-timezone, что и у Георгии-статистики
-            # (settings.fine_monitor.timezone) — общий конфиг, не
-            # Turkey-специфичный (см. design report: не вводить отдельную
-            # настройку там, где общая уже есть).
             tz=ZoneInfo(settings.fine_monitor.timezone),
-            # ТА ЖЕ destination коммерческих CTA-кнопок после Avrasya
-            # has_debt (см. design report: "reuse those exact production
-            # values"), что и у @ProtocolGEbot (settings.public_bot.
-            # payment_help_contact_username) — не отдельная настройка.
             payment_help_contact_username=settings.public_bot.payment_help_contact_username,
         )
 
         client = TelegramClient(str(_SESSION_PATH), api_id, api_hash)
         register(client, controller, known_users_repository)
 
+        notifier = _TelethonNotifier(client)
+        monitoring_service = TurkeyMonitoringService(
+            check_service, run_repository, subscription_repository, notifier,
+        )
+        monitoring_job = TurkeyMonitoringJob(monitoring_service)
+        scheduler = Scheduler([monitoring_job], poll_interval_seconds=_SCHEDULER_POLL_INTERVAL_SECONDS)
+
         # token передаётся ЗДЕСЬ и только здесь.
         await client.start(bot_token=token)
-        # Реальный @username берётся у Telegram ПОСЛЕ подключения (не
-        # hardcoded) — единственный надёжный способ подтвердить в логе,
-        # что процесс поднялся именно под ожидаемым ботом, а не спутал
-        # токен с чужим (см. design report: "verify which bot is connected").
         me = await client.get_me()
         logger.info(f"✔ @{me.username} подключён (id={me.id})")
+        logger.info("✔ Turkey monitoring scheduler запущен (13:00/21:00 Europe/Istanbul)")
 
-        await client.run_until_disconnected()
+        await _run_concurrently([
+            client.run_until_disconnected(),
+            scheduler.run_forever(),
+        ])
     finally:
-        # Штатное завершение процесса (Ctrl+C/systemd stop/необработанное
-        # исключение выше) - закрыть ВСЕ ещё открытые httpx.AsyncClient
-        # живых проверок (см. задачу: "graceful shutdown of all live
-        # sessions"), иначе они остались бы висящими TCP-соединениями.
-        await session_registry.close_all()
-        await avrasya_session_registry.close_all()
-        await kgm_session_registry.close_all()
         conversation_state_repository.close()
         known_users_repository.close()
-        check_repository.close()
         garage_repository.close()
-        toll_check_repository.close()
+        run_repository.close()
+        subscription_repository.close()
 
 
 def main() -> None:
