@@ -30,12 +30,15 @@ def test_regular_user_menu_has_no_manager_row():
 
 
 def test_manager_menu_has_statistics_and_stop_monitoring_row():
+    """См. задачу "Расположение кнопок manager ReplyKeyboard" — новый
+    макет: ROW2 checknow/stop_monitoring, ROW3 statistics/georgian."""
     rows = main_menu_keyboard(is_trusted=True)
     texts_grid = _button_texts(rows)
 
     assert texts_grid[0] == [ADD_CAR_LABEL, MY_CARS_LABEL]
-    assert texts_grid[1] == [CHECK_NOW_LABEL, GEORGIAN_BOT_LINK_LABEL]
-    assert texts_grid[2] == [STATISTICS_LABEL, STOP_MONITORING_LABEL]
+    assert texts_grid[1] == [CHECK_NOW_LABEL, STOP_MONITORING_LABEL]
+    assert texts_grid[2] == [STATISTICS_LABEL, GEORGIAN_BOT_LINK_LABEL]
+    assert texts_grid[3] == [HELP_LABEL]
 
 
 def test_old_provider_specific_labels_are_not_in_main_menu():

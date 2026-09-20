@@ -12,11 +12,16 @@ from reader.turkey_bot_test.conversation import ConversationController
 from reader.turkey_bot_test.conversation_state_repository import (
     TurkeyConversationStateRepository,
 )
+from reader.turkey_bot_test.keyboards import car_card_keyboard, my_cars_list_keyboard
 from reader.turkey_bot_test.known_users_repository import TurkeyBotKnownUsersRepository
 from reader.turkey_bot_test.monitoring.subscription_repository import (
     TurkeyMonitoringSubscriptionRepository,
 )
 from reader.turkey_bot_test.statistics_service import TurkeyStatisticsService
+from reader.turkey_bot_test.texts import (
+    DISABLE_MONITORING_LABEL,
+    ENABLE_MONITORING_LABEL,
+)
 from reader.turkey_bot_test.unified.models import (
     OverallStatus,
     ProviderCheckResult,
@@ -30,6 +35,10 @@ pytestmark = pytest.mark.asyncio
 
 _CHAT_ID = 111
 _USER_ID = 222
+
+
+def _button_texts(rows):
+    return [[btn.text for btn in row] for row in rows]
 
 
 def _make_result(plate: str, *, overall: OverallStatus, total: Decimal) -> UnifiedCheckResult:
@@ -134,13 +143,148 @@ async def test_car_action_on_foreign_car_returns_none():
     assert reply is None
 
 
-async def test_delete_car_removes_it_from_my_cars():
+async def test_car_open_callback_opens_the_correct_car():
+    """См. задачу п.1/п.9 — нажатие конкретной inline-кнопки в "🚗 Мои
+    автомобили" открывает ИМЕННО этот автомобиль, не первый попавшийся."""
+    controller, _garage, _ = _make_controller(_FakeCheckService(_make_result("X", overall=OverallStatus.NO_DEBT, total=Decimal(0))))
+    car_a = await _add_car(controller, plate="A123AA123")
+    controller.handle_add_car_start(chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    car_b_reply = await controller.handle_text("B456BB456", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    car_b = car_b_reply.check_now_confirmation_car_id
+
+    reply_a = controller.handle_car_open(car_a, telegram_user_id=_USER_ID)
+    reply_b = controller.handle_car_open(car_b, telegram_user_id=_USER_ID)
+
+    assert reply_a.car_card.car_number == "A123AA123"
+    assert reply_b.car_card.car_number == "B456BB456"
+
+
+async def test_car_open_on_foreign_car_returns_none():
+    """См. задачу п.9 — вручную сформированный callback с чужим car_id не
+    должен открывать чужой автомобиль."""
+    controller, _garage, _ = _make_controller(_FakeCheckService(_make_result("X", overall=OverallStatus.NO_DEBT, total=Decimal(0))))
+    car_id = await _add_car(controller)
+
+    reply = controller.handle_car_open(car_id, telegram_user_id=999)
+    assert reply is None
+
+
+async def test_off_card_shows_enable_monitoring_button():
+    controller, garage, _ = _make_controller(_FakeCheckService(_make_result("X", overall=OverallStatus.NO_DEBT, total=Decimal(0))))
+    car_id = await _add_car(controller)
+    car = garage.get_owned_car(car_id, telegram_user_id=_USER_ID)
+
+    keyboard = car_card_keyboard(car, monitoring_active=False)
+    flat = [label for row in _button_texts(keyboard) for label in row]
+
+    assert ENABLE_MONITORING_LABEL in flat
+    assert DISABLE_MONITORING_LABEL not in flat
+
+
+async def test_on_card_shows_disable_monitoring_button():
+    controller, garage, _ = _make_controller(_FakeCheckService(_make_result("X", overall=OverallStatus.NO_DEBT, total=Decimal(0))))
+    car_id = await _add_car(controller)
+    car = garage.get_owned_car(car_id, telegram_user_id=_USER_ID)
+
+    keyboard = car_card_keyboard(car, monitoring_active=True)
+    flat = [label for row in _button_texts(keyboard) for label in row]
+
+    assert DISABLE_MONITORING_LABEL in flat
+    assert ENABLE_MONITORING_LABEL not in flat
+
+
+async def test_my_cars_list_shows_on_off_button_labels():
+    controller, garage, _ = _make_controller(_FakeCheckService(_make_result("X", overall=OverallStatus.NO_DEBT, total=Decimal(0))))
+    car_a = await _add_car(controller, plate="A123AA123")
+    controller.handle_add_car_start(chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_text("B456BB456", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_car_action("monitor_on", car_a, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    cars = garage.list_cars(_USER_ID)
+
+    reply = controller.handle_my_cars(chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    keyboard = my_cars_list_keyboard(cars, reply.my_cars_monitoring_active)
+    flat = [label for row in _button_texts(keyboard) for label in row]
+
+    assert "🟢 A123AA123 — ON" in flat
+    assert "⚪ B456BB456 — OFF" in flat
+
+
+async def test_back_returns_to_my_cars_with_up_to_date_state():
+    """См. задачу п.8 — "⬅️ Назад" == повторный handle_my_cars, с
+    актуальным ON/OFF (не главное меню)."""
+    controller, _garage, _ = _make_controller(_FakeCheckService(_make_result("X", overall=OverallStatus.NO_DEBT, total=Decimal(0))))
+    car_id = await _add_car(controller)
+    await controller.handle_car_action("monitor_on", car_id, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    back_reply = controller.handle_my_cars(chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert back_reply.text == "🚗 Мои автомобили"
+    assert back_reply.my_cars_monitoring_active[car_id] is True
+    assert back_reply.show_main_menu is False
+
+
+async def test_delete_prompt_shows_confirmation_without_deleting():
+    """См. задачу "Адаптация car-centric UX Georgian bot" п.7 — тот же
+    Georgian pattern: 🗑 Удалить автомобиль сначала показывает
+    подтверждение, НИЧЕГО не удаляя."""
     controller, garage, _ = _make_controller(_FakeCheckService(_make_result("X", overall=OverallStatus.NO_DEBT, total=Decimal(0))))
     car_id = await _add_car(controller)
 
-    reply = await controller.handle_car_action("delete", car_id, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
-    assert "удалён" in reply.text
+    reply = await controller.handle_car_action("delete_prompt", car_id, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert reply.car_delete_confirm_car_id == car_id
+    assert len(garage.list_cars(_USER_ID)) == 1
+
+
+async def test_delete_cancel_returns_to_card_without_deleting():
+    controller, garage, _ = _make_controller(_FakeCheckService(_make_result("X", overall=OverallStatus.NO_DEBT, total=Decimal(0))))
+    car_id = await _add_car(controller)
+    await controller.handle_car_action("delete_prompt", car_id, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    reply = await controller.handle_car_action("delete_cancel", car_id, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert reply.car_card is not None
+    assert reply.car_card.id == car_id
+    assert len(garage.list_cars(_USER_ID)) == 1
+
+
+async def test_delete_confirm_removes_it_from_my_cars():
+    controller, garage, _ = _make_controller(_FakeCheckService(_make_result("X", overall=OverallStatus.NO_DEBT, total=Decimal(0))))
+    car_id = await _add_car(controller)
+    await controller.handle_car_action("delete_prompt", car_id, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    reply = await controller.handle_car_action("delete_confirm", car_id, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
     assert garage.list_cars(_USER_ID) == []
+    assert "нет добавленных" in reply.text
+
+
+async def test_delete_confirm_does_not_affect_other_users_cars():
+    """См. задачу п.7/п.9 — удаление не должно затрагивать чужие
+    автомобили (даже с тем же номером у другого пользователя)."""
+    controller, garage, _ = _make_controller(_FakeCheckService(_make_result("X", overall=OverallStatus.NO_DEBT, total=Decimal(0))))
+    car_id = await _add_car(controller)
+    other_user_id = 777
+    controller.handle_add_car_start(chat_id=999, telegram_user_id=other_user_id)
+    await controller.handle_text("A123AA123", chat_id=999, telegram_user_id=other_user_id)
+
+    await controller.handle_car_action("delete_confirm", car_id, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert garage.list_cars(_USER_ID) == []
+    assert len(garage.list_cars(other_user_id)) == 1
+
+
+async def test_delete_confirm_does_not_remove_a_different_car_of_same_user():
+    controller, garage, _ = _make_controller(_FakeCheckService(_make_result("X", overall=OverallStatus.NO_DEBT, total=Decimal(0))))
+    car_id = await _add_car(controller, plate="A123AA123")
+    controller.handle_add_car_start(chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_text("B456BB456", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    await controller.handle_car_action("delete_confirm", car_id, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    remaining = garage.list_cars(_USER_ID)
+    assert len(remaining) == 1
+    assert remaining[0].car_number == "B456BB456"
 
 
 async def test_history_empty_before_any_check():

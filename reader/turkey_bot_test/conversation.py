@@ -66,10 +66,23 @@ class BotReply:
     "🔎 Проверить сейчас" (см. keyboards.py::my_cars_list_keyboard/
     check_now_picker_keyboard) — is_check_picker различает, какую из двух
     клавиатур строить (одинаковый список car'ов, разный callback).
+    my_cars_monitoring_active — {car.id: active} ТОЛЬКО для my_cars_list_
+    keyboard (см. _monitoring_map — ВСЕГДА читается заново из
+    TurkeyMonitoringSubscriptionRepository, никогда не кэшируется как
+    отдельный UI-state, см. задачу п.1).
 
     car_card — ОДИН автомобиль, для карточки (см. keyboards.py::
     car_card_keyboard) — car_card_monitoring_active управляет тем, какая
     из двух кнопок (Включить/Отключить мониторинг) показывается.
+
+    car_delete_confirm_car_id — не None ТОЛЬКО на экране подтверждения
+    удаления (см. keyboards.py::car_delete_confirm_keyboard) — вместо
+    car_card_keyboard на этом шаге показывается Да/Отмена.
+
+    back_to_car_id — не None, когда после действия (проверка/история)
+    нужна кнопка возврата к карточке конкретного автомобиля (см. задачу
+    п.4: "После результата пользователь должен иметь возможность
+    вернуться к карточке автомобиля").
 
     check_now_confirmation_car_id — не None ТОЛЬКО сразу после успешного
     добавления нового автомобиля (см. keyboards.py::
@@ -80,9 +93,12 @@ class BotReply:
     extra_texts: tuple[str, ...] = ()
     show_main_menu: bool = False
     my_cars: tuple[TurkeyUserCar, ...] | None = None
+    my_cars_monitoring_active: dict[int, bool] | None = None
     is_check_picker: bool = False
     car_card: TurkeyUserCar | None = None
     car_card_monitoring_active: bool = False
+    car_delete_confirm_car_id: int | None = None
+    back_to_car_id: int | None = None
     check_now_confirmation_car_id: int | None = None
     cta_buttons: tuple[tuple[str, str], ...] | None = None
     help_keyboard: str | None = None
@@ -212,7 +228,20 @@ class ConversationController:
             check_now_confirmation_car_id=car.id,
         )
 
-    # ---- 📋 Мои авто / 🔎 Проверить сейчас (см. design report п.3/п.4) ----
+    # ---- 🚗 Мои автомобили / 🔎 Проверить сейчас (адаптация car-centric
+    # UX Georgian bot, см. задачу "Адаптация car-centric UX Georgian bot"
+    # п.1-п.9) ----
+
+    def _monitoring_map(self, cars: tuple[TurkeyUserCar, ...], *, telegram_user_id: int) -> dict[int, bool]:
+        """ВСЕГДА читает РЕАЛЬНОЕ состояние turkey_monitoring_subscriptions
+        (см. задачу п.1: "Не хранить ON/OFF отдельно как UI-state") — ни
+        ConversationController, ни BotReply не кэшируют это между
+        вызовами."""
+        result: dict[int, bool] = {}
+        for car in cars:
+            subscription = self._subscriptions.get(telegram_user_id=telegram_user_id, plate=car.car_number)
+            result[car.id] = subscription is not None and subscription.active
+        return result
 
     def handle_my_cars(self, *, chat_id: int, telegram_user_id: int) -> BotReply:
         self._states.clear(chat_id)
@@ -220,9 +249,9 @@ class ConversationController:
         if not cars:
             return BotReply(text=texts.EMPTY_MY_CARS_TEXT, show_main_menu=True)
 
-        messages = texts.format_my_cars_messages(list(cars), now=datetime.now(timezone.utc))
         return BotReply(
-            text=messages[0], extra_texts=tuple(messages[1:]), my_cars=cars, is_check_picker=False,
+            text=texts.MY_CARS_HEADER, my_cars=cars, is_check_picker=False,
+            my_cars_monitoring_active=self._monitoring_map(cars, telegram_user_id=telegram_user_id),
         )
 
     def handle_check_now_start(self, *, chat_id: int, telegram_user_id: int) -> BotReply:
@@ -257,7 +286,7 @@ class ConversationController:
         subscription = self._subscriptions.get(telegram_user_id=telegram_user_id, plate=car.car_number)
         monitoring_active = subscription is not None and subscription.active
         return BotReply(
-            text=texts.format_car_card_text(car, now=datetime.now(timezone.utc)),
+            text=texts.format_car_card_text(car, monitoring_active=monitoring_active),
             car_card=car, car_card_monitoring_active=monitoring_active,
         )
 
@@ -266,7 +295,11 @@ class ConversationController:
     ) -> BotReply | None:
         """None — car_id не существует/чужой (тот же принцип, что и
         handle_car_open) — reader/turkey_bot_test/handlers.py показывает
-        общий "неизвестная кнопка" alert."""
+        общий "неизвестная кнопка" alert. Ownership перепроверяется здесь
+        ЗАНОВО на каждый вызов (см. задачу п.9) — в том числе для
+        delete_confirm/delete_cancel, даже если пользователь уже прошёл
+        экран подтверждения: car_id из callback_data сам по себе ничего не
+        доказывает."""
         car = self._garage.get_owned_car(car_id, telegram_user_id=telegram_user_id)
         if car is None:
             return None
@@ -279,8 +312,12 @@ class ConversationController:
             return self._disable_monitoring(car, telegram_user_id=telegram_user_id)
         if action == "history":
             return self._show_history(car)
-        if action == "delete":
-            return self._delete_car(car, telegram_user_id=telegram_user_id)
+        if action == "delete_prompt":
+            return self._prompt_delete_car(car)
+        if action == "delete_confirm":
+            return self._delete_car(car, chat_id=chat_id, telegram_user_id=telegram_user_id)
+        if action == "delete_cancel":
+            return self._render_car_card(car, telegram_user_id=telegram_user_id)
 
         # Не должно достигаться — decode_car_action_callback уже
         # ограничивает action допустимым набором (см. keyboards.py).
@@ -308,31 +345,64 @@ class ConversationController:
         )
 
         cta = self._debt_cta_buttons() if result.overall_status == OverallStatus.HAS_DEBT else None
-        return BotReply(text=texts.format_unified_check_result(result), cta_buttons=cta, show_main_menu=True)
+        return BotReply(
+            text=texts.format_unified_check_result(result), cta_buttons=cta,
+            show_main_menu=True, back_to_car_id=car.id,
+        )
 
     def _enable_monitoring(
         self, car: TurkeyUserCar, *, chat_id: int, telegram_user_id: int,
     ) -> BotReply:
+        """▶️ Включить мониторинг (см. задачу п.5) — active=True,
+        next_check_at по строгому расписанию 13:00/21:00 Europe/Istanbul
+        (см. next_monitoring_slot, НЕ изменено). Карточка перерисовывается
+        сразу с обновлённым состоянием (см. _render_car_card) — ОДНО
+        сообщение, без отдельного текста-квитанции (см. задачу: "Не
+        создавать новое Telegram-сообщение без необходимости... повторить
+        pattern [Georgian bot edit-in-place]")."""
         next_check_at = next_monitoring_slot(datetime.now(timezone.utc))
         self._subscriptions.enable(
             telegram_user_id=telegram_user_id, telegram_chat_id=chat_id,
             plate=car.car_number, next_check_at=next_check_at,
         )
-        return BotReply(text=texts.MONITORING_ENABLED_TEMPLATE.format(plate=car.car_number), show_main_menu=True)
+        return self._render_car_card(car, telegram_user_id=telegram_user_id)
 
     def _disable_monitoring(self, car: TurkeyUserCar, *, telegram_user_id: int) -> BotReply:
+        """⏹ Отключить мониторинг (см. задачу п.6) — только подписка
+        ИМЕННО этого автомобиля (см. TurkeyMonitoringSubscriptionRepository.
+        disable — UNIQUE(telegram_user_id, plate), не может затронуть чужие
+        подписки)."""
         self._subscriptions.disable(telegram_user_id=telegram_user_id, plate=car.car_number)
-        return BotReply(text=texts.MONITORING_DISABLED_TEMPLATE.format(plate=car.car_number), show_main_menu=True)
+        return self._render_car_card(car, telegram_user_id=telegram_user_id)
 
     def _show_history(self, car: TurkeyUserCar) -> BotReply:
         runs = self._runs.list_by_plate(car.car_number, limit=10)
         messages = texts.format_history_messages(car.car_number, runs)
-        return BotReply(text=messages[0], extra_texts=tuple(messages[1:]), show_main_menu=True)
+        return BotReply(
+            text=messages[0], extra_texts=tuple(messages[1:]),
+            show_main_menu=True, back_to_car_id=car.id,
+        )
 
-    def _delete_car(self, car: TurkeyUserCar, *, telegram_user_id: int) -> BotReply:
+    def _prompt_delete_car(self, car: TurkeyUserCar) -> BotReply:
+        """Первый шаг удаления — только показывает подтверждение, ЕЩЁ
+        НИЧЕГО не удаляет (см. задачу п.7, тот же Georgian pattern —
+        reader/public_bot/conversation.py::handle_my_car_delete_prompt)."""
+        return BotReply(
+            text=texts.format_delete_confirm_prompt(car.car_number),
+            car_delete_confirm_car_id=car.id,
+        )
+
+    def _delete_car(self, car: TurkeyUserCar, *, chat_id: int, telegram_user_id: int) -> BotReply:
+        """Финальный шаг — удаляет ИМЕННО этот автомобиль и его monitoring
+        subscription (см. задачу п.7 — не затрагивает других
+        пользователей: оба repository-метода фильтруют по
+        telegram_user_id), возвращает обновлённый список "🚗 Мои
+        автомобили" (тот же Georgian pattern, см.
+        reader/public_bot/conversation.py::handle_my_car_delete_confirm —
+        "не отдельное сообщение-квитанция, а сразу актуальный список")."""
         self._subscriptions.disable(telegram_user_id=telegram_user_id, plate=car.car_number)
         self._garage.delete_car(car.id, telegram_user_id=telegram_user_id)
-        return BotReply(text=f"🗑 {car.car_number} удалён.", show_main_menu=True)
+        return self.handle_my_cars(chat_id=chat_id, telegram_user_id=telegram_user_id)
 
     # ---- 📊 Статистика / ⛔ Остановить мониторинг (manager, см. design
     # report п.13) ----

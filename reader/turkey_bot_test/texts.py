@@ -16,7 +16,6 @@ description) — тихий fallback на турецкий текст, если 
 не выполнялся (не пустая строка, не ошибка, см. conversation.py::
 _translate_fines)."""
 
-from datetime import datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -70,15 +69,12 @@ EMPTY_MY_CARS_TEXT = (
     "📋 У вас пока нет добавленных автомобилей.\n\n"
     "Нажмите «➕ Добавить авто», чтобы добавить первый."
 )
-MY_CARS_HEADER = "📋 Мои авто"
-
-MONITORING_ENABLED_TEMPLATE = (
-    "🔔 Мониторинг включён\n\n"
-    "🚗 {plate}\n\n"
-    "Проверяем автомобиль два раза в день:\n"
-    "13:00 и 21:00 по времени Турции."
-)
-MONITORING_DISABLED_TEMPLATE = "🔕 Мониторинг для {plate} отключён."
+# "🚗 Мои автомобили" (см. design report "Адаптация car-centric UX
+# Georgian bot") — та же строка, что и reader/public_bot/texts.py::
+# MY_CARS_HEADER (см. car_monitoring_state/format_car_button_label ниже —
+# тот же ON/OFF-паттерн, адаптированный под Turkey: без периодов/дат
+# окончания, только active: bool, см. TurkeyMonitoringSubscription).
+MY_CARS_HEADER = "🚗 Мои автомобили"
 
 MONITORING_STOPPED_ALL_TEMPLATE = "⛔ Мониторинг остановлен для всех подписок ({count})."
 
@@ -189,11 +185,30 @@ ADD_CAR_LABEL = "➕ Добавить авто"
 MY_CARS_LABEL = "📋 Мои авто"
 CHECK_NOW_LABEL = "🔎 Проверить сейчас"
 STOP_MONITORING_LABEL = "⛔ Остановить мониторинг"
-ENABLE_MONITORING_LABEL = "🔔 Включить мониторинг"
-DISABLE_MONITORING_LABEL = "🔕 Отключить мониторинг"
+# Play/stop-иконки (см. задачу "Адаптация car-centric UX Georgian bot") —
+# ОТЛИЧАЮТСЯ от буквальной формулировки Georgian bot (TURN_OFF_BUTTON_LABEL
+# = "⏸ Выключить мониторинг", pause-иконка) — здесь используется точный
+# текст, явно и многократно заданный в задаче для карточки Turkey-авто.
+ENABLE_MONITORING_LABEL = "▶️ Включить мониторинг"
+DISABLE_MONITORING_LABEL = "⏹ Отключить мониторинг"
 HISTORY_LABEL = "📜 История"
-DELETE_CAR_LABEL = "🗑 Удалить авто"
+DELETE_CAR_LABEL = "🗑 Удалить автомобиль"
 BACK_LABEL = "⬅️ Назад"
+
+# Двухшаговое подтверждение удаления (см. reader/public_bot/texts.py::
+# DELETE_CAR_CONFIRM_BUTTON_LABEL/CANCEL_BUTTON_LABEL — тот же Georgian
+# pattern, отдельная константа отмены, НЕ переиспользует CANCEL_BUTTON_LABEL
+# выше — та привязана к другому flow (отмена ➕ Добавить авто) и к другому
+# callback_data).
+DELETE_CAR_CONFIRM_BUTTON_LABEL = "🗑 Да, удалить"
+DELETE_CANCEL_LABEL = "Отмена"
+
+# Общий, намеренно НЕИНФОРМАТИВНЫЙ отказ для ON/OFF/Delete confirm/cancel
+# (см. UNKNOWN_BUTTON_TEXT ниже про тот же принцип для "не найдено/чужое")
+# — используется, когда владение НА МОМЕНТ действия подтверждено, но само
+# действие не может быть выполнено (гоночное состояние между двумя
+# действиями одного пользователя).
+CAR_ACTION_FAILED_TEXT = "⚠️ Не удалось выполнить действие — откройте автомобиль заново через «📋 Мои авто»."
 
 GARAGE_LABEL = "🚗 Мои авто"
 STATISTICS_LABEL = "📊 Статистика"
@@ -246,9 +261,16 @@ GEORGIAN_BOT_URL = "https://t.me/ProtocolGEbot"
 
 # Подписи 4 разделов ℹ️ Справка + общая "⬅️ Назад" (см.
 # reader/turkey_bot_test/keyboards.py::help_menu_keyboard/help_section_keyboard).
+# HELP_GIB_LABEL/HELP_AVRASYA_LABEL — внутренние ключи секций ("gib"/
+# "avrasya", см. conversation.py::handle_help_callback) НЕ переименованы
+# (чисто техническая деталь маршрутизации, пользователю не видна), но сами
+# подписи и содержимое обновлены под актуальный unified-UX (см. задачу
+# "исправь справку в соответствии с актуальным функционалом" — раньше
+# описывали provider-by-provider выбор через "🚔 Штрафы"/"🛣 Платные
+# дороги" и видимую CAPTCHA, которых в текущем UI больше нет).
 HELP_TERMS_LABEL = "📖 Термины"
-HELP_GIB_LABEL = "❓ Как проверить штрафы"
-HELP_AVRASYA_LABEL = "🛣 Как проверить платные дороги"
+HELP_GIB_LABEL = "❓ Как проверить авто"
+HELP_AVRASYA_LABEL = "🔔 Мои авто и мониторинг"
 HELP_PAYMENT_LABEL = "💳 Как оплатить"
 HELP_BACK_LABEL = "⬅️ Назад"
 
@@ -287,54 +309,67 @@ HELP_TERMS_TEXT = (
     "📖 Термины\n\n"
     "🚔 Штрафы GİB — дорожные штрафы, найденные в государственной "
     "системе Турции.\n\n"
-    "🛣 Avrasya Tüneli — платный автомобильный тоннель. Задолженность "
-    "за проезд через него проверяется отдельно от штрафов GİB.\n\n"
+    "🚇 Avrasya Tüneli — платный автомобильный тоннель.\n\n"
+    "🚧 KGM — остальные платные дороги и мосты Турции (кроме Avrasya "
+    "Tüneli, который выделен отдельно).\n\n"
+    "Бот проверяет GİB, Avrasya Tüneli и KGM ОДНИМ действием — выбирать "
+    "их по отдельности не нужно.\n\n"
     "🚗 Стоимость проездов — стоимость проезда по платной дороге или "
     "тоннелю, которую необходимо было оплатить.\n\n"
     "⚠️ Начисленные штрафы — дополнительная сумма, начисленная за "
     "несвоевременную оплату проезда.\n\n"
-    "💰 Итого к оплате — стоимость неоплаченных проездов плюс "
-    "начисленные штрафы."
+    "💰 Итого — общая сумма задолженности по всем источникам."
 )
 
+# См. задачу "исправь справку в соответствии с актуальным функционалом" —
+# провайдер-by-провайдер выбор (отдельные кнопки "🚔 Штрафы"/"🛣 Платные
+# дороги", видимая CAPTCHA) убран из UI (см. UnifiedTurkeyCheckService/
+# CaptchaResolver — CAPTCHA решается сервером, пользователь её не видит,
+# см. conversation.py docstring), текст справки обновлён под РЕАЛЬНЫЙ
+# текущий flow: добавление номера -> ОДИН unified-результат сразу по всем
+# трём источникам.
 HELP_GIB_TEXT = (
-    "❓ Как проверить штрафы\n\n"
-    "1. Нажмите «🚔 Штрафы».\n"
-    "2. Введите госномер автомобиля.\n"
-    "3. Бот пришлёт CAPTCHA.\n"
-    "4. Введите код с изображения.\n"
-    "5. Бот покажет результат проверки GİB.\n\n"
-    "Сохранённый автомобиль можно проверить через раздел «🚗 Мои авто»."
+    "❓ Как проверить авто\n\n"
+    "1. Нажмите «➕ Добавить авто» и отправьте гос. номер (например, "
+    "А123АА123) — либо просто отправьте номер без предварительного "
+    "нажатия кнопки.\n"
+    "2. Бот добавит автомобиль и предложит проверить его сразу.\n"
+    "3. Бот одним действием проверит штрафы GİB, Avrasya Tüneli и KGM и "
+    "покажет общий результат.\n\n"
+    "CAPTCHA бот решает сам — вводить код не нужно.\n\n"
+    "Сохранённый автомобиль можно проверить повторно через «📋 Мои "
+    "авто» (откройте автомобиль -> «🔎 Проверить сейчас») или через "
+    "«🔎 Проверить сейчас» в главном меню."
 )
 
 HELP_AVRASYA_TEXT = (
-    "🛣 Как проверить платные дороги\n\n"
-    "1. Нажмите «🛣 Платные дороги».\n"
-    "2. Введите госномер автомобиля.\n"
-    "3. Бот пришлёт CAPTCHA.\n"
-    "4. Введите код с изображения.\n"
-    "5. Бот покажет найденную задолженность.\n\n"
-    "Сохранённый автомобиль можно проверить через раздел «🚗 Мои авто».\n\n"
-    "Сейчас проверяется Avrasya Tüneli."
+    "🔔 Мои авто и мониторинг\n\n"
+    "В разделе «📋 Мои авто» каждый автомобиль — отдельная кнопка: "
+    "🟢 — мониторинг включён, ⚪ — выключен.\n\n"
+    "Откройте автомобиль, чтобы:\n"
+    "🔎 Проверить сейчас — мгновенная проверка;\n"
+    "▶️/⏹ Включить/Отключить мониторинг — автоматическая проверка "
+    "дважды в день (13:00 и 21:00 по времени Турции) с уведомлением при "
+    "появлении, исчезновении или изменении суммы задолженности;\n"
+    "📜 История — прошлые проверки;\n"
+    "🗑 Удалить автомобиль — с подтверждением."
 )
 
-# НЕ упоминает GIB — CTA-кнопка "💳 Оплатить в рублях" сейчас появляется
-# ТОЛЬКО после подтверждённого Avrasya has_debt (см.
-# reader/turkey_bot_test/conversation.py::_handle_avrasya_submit_outcome), а не
-# после GIB has_debt (см. задачу: "Do not claim that the bot itself
-# processes the payment if that is not how the current flow works" —
-# то же самое верно и для того, У КАКИХ ИМЕННО результатов кнопка реально
-# появляется). URL кнопки НЕ повторяется здесь текстом (settings.public_bot.
-# payment_help_contact_username остаётся единственным источником, см.
-# ConversationController._avrasya_debt_cta_buttons) — этот текст только
-# объясняет, что кнопка делает.
+# CTA ("💳 Оплатить в рублях"/"🚗 ОСАГО Турции") появляется после ЛЮБОГО
+# unified-результата с has_debt — по GİB, Avrasya Tüneli ИЛИ KGM (см.
+# reader/turkey_bot_test/conversation.py::_debt_cta_buttons/
+# _run_manual_check — НЕ только Avrasya, как было раньше при
+# provider-специфичном UX). URL кнопок НЕ повторяется здесь текстом
+# (settings.public_bot.payment_help_contact_username остаётся единственным
+# источником) — этот текст только объясняет, что кнопки делают.
 HELP_PAYMENT_TEXT = (
     "💳 Как оплатить\n\n"
     "Бот сам не принимает оплату.\n\n"
-    "Если при проверке платных дорог Avrasya Tüneli будет найдена "
-    "задолженность, под результатом появится кнопка:\n\n"
-    "💳 Оплатить в рублях\n\n"
-    "Она откроет чат с оператором, который поможет с оплатой."
+    "Если при проверке будет найдена задолженность (штрафы GİB, Avrasya "
+    "Tüneli или KGM), под результатом появятся кнопки:\n\n"
+    "💳 Оплатить в рублях\n"
+    "🚗 ОСАГО Турции\n\n"
+    "Они откроют чат с оператором, который поможет с оплатой/оформлением."
 )
 
 # Общий, намеренно НЕИНФОРМАТИВНЫЙ текст — и для реально неизвестного
@@ -722,63 +757,37 @@ def format_unified_check_result(result: UnifiedCheckResult) -> str:
     return "\n".join(lines)
 
 
-# ---- "Мои авто" (см. design report п.3) ----
+# ---- "🚗 Мои автомобили" — car-centric ON/OFF (см. задачу "Адаптация
+# car-centric UX Georgian bot", reader/public_bot/texts.py::
+# car_monitoring_state/format_car_button_label/format_car_details —
+# СТРУКТУРНО тот же паттерн, но БЕЗ третьего "ИСТЁК" состояния и БЕЗ
+# "📅 До DATE" (у Turkey monitoring нет периода/даты окончания — только
+# active: bool, см. TurkeyMonitoringSubscription, бессрочно до ручного
+# отключения) ----
 
-def format_car_button_label(car: TurkeyUserCar) -> str:
-    if car.last_overall_status == OverallStatus.HAS_DEBT.value and car.last_total_amount is not None:
-        return f"🚗 {car.car_number} — {_format_try_amount(car.last_total_amount)}"
-    if car.last_overall_status == OverallStatus.NO_DEBT.value:
-        return f"🚗 {car.car_number} — без долгов"
-    if car.last_overall_status == OverallStatus.PARTIAL.value:
-        return f"🚗 {car.car_number} — частично"
-    if car.last_overall_status == OverallStatus.ERROR.value:
-        return f"🚗 {car.car_number} — ⚠️"
-    return f"🚗 {car.car_number}"
-
-
-def _relative_day_label(dt_local: datetime, *, now_local: datetime) -> str:
-    if dt_local.date() == now_local.date():
-        return f"сегодня, {dt_local.strftime('%H:%M')}"
-    if dt_local.date() == now_local.date() - timedelta(days=1):
-        return f"вчера, {dt_local.strftime('%H:%M')}"
-    return dt_local.strftime("%d.%m.%Y %H:%M")
+def format_car_button_label(car: TurkeyUserCar, *, monitoring_active: bool) -> str:
+    emoji = "🟢" if monitoring_active else "⚪"
+    state = "ON" if monitoring_active else "OFF"
+    return f"{emoji} {car.car_number} — {state}"
 
 
-def _format_my_car_block(car: TurkeyUserCar, *, now_local: datetime) -> str:
-    lines = [f"🚗 {car.car_number}"]
-    if car.last_overall_status is None:
-        lines.append("Ещё не проверялся")
-        return "\n".join(lines)
-
-    checked_local = car.last_checked_at.astimezone(_DISPLAY_TZ)
-    lines.append(f"Последняя проверка: {_relative_day_label(checked_local, now_local=now_local)}")
-    if car.last_overall_status == OverallStatus.NO_DEBT.value:
-        lines.append("Задолженность не найдена")
-    elif car.last_overall_status == OverallStatus.HAS_DEBT.value:
-        amount = _format_try_amount(car.last_total_amount) if car.last_total_amount is not None else "?"
-        lines.append(f"Задолженность: {amount}")
-    elif car.last_overall_status == OverallStatus.PARTIAL.value:
-        amount = _format_try_amount(car.last_total_amount) if car.last_total_amount is not None else "?"
-        lines.append(f"Частично проверено (не все службы ответили), известно: {amount}")
-    else:
-        lines.append("⚠️ Последняя проверка завершилась ошибкой")
-    return "\n".join(lines)
+def format_car_card_text(car: TurkeyUserCar, *, monitoring_active: bool) -> str:
+    """Карточка одного автомобиля (см. задачу, п.2): РОВНО две строки,
+    БЕЗ даты/периода — Turkey monitoring бессрочен до ручного отключения."""
+    emoji = "🟢" if monitoring_active else "⚪"
+    state = "ON" if monitoring_active else "OFF"
+    return f"🚗 {car.car_number}\nМониторинг: {emoji} {state}"
 
 
-def format_car_card_text(car: TurkeyUserCar, *, now: datetime) -> str:
-    """Один автомобиль (см. design report п.3, карточка "🚗 {plate}") — тот
-    же блок, что и в списке "Мои авто" (_format_my_car_block), без общего
-    MY_CARS_HEADER."""
-    return _format_my_car_block(car, now_local=now.astimezone(_DISPLAY_TZ))
-
-
-def format_my_cars_messages(cars: list[TurkeyUserCar], *, now: datetime) -> list[str]:
-    if not cars:
-        return [EMPTY_MY_CARS_TEXT]
-    now_local = now.astimezone(_DISPLAY_TZ)
-    blocks = [MY_CARS_HEADER]
-    blocks.extend(_format_my_car_block(car, now_local=now_local) for car in cars)
-    return _split_into_telegram_messages(blocks)
+def format_delete_confirm_prompt(plate: str) -> str:
+    """См. reader/public_bot/texts.py::format_delete_confirm_prompt — тот
+    же Georgian pattern двухшагового подтверждения удаления (см. задачу,
+    п.7: "Если Georgian bot использует confirmation перед удалением —
+    повторить этот pattern")."""
+    return (
+        f"⚠️ Удалить {plate} из списка?\n"
+        "Мониторинг будет отключён, автомобиль исчезнет из «🚗 Мои автомобили»."
+    )
 
 
 # ---- 📜 История (см. design report п.7) ----
