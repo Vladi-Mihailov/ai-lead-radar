@@ -16,12 +16,27 @@ description) — тихий fallback на турецкий текст, если 
 не выполнялся (не пустая строка, не ошибка, см. conversation.py::
 _translate_fines)."""
 
+from datetime import datetime, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from reader.turkey_bot_test.avrasya.models import AvrasyaDebtItem
 from reader.turkey_bot_test.gib.models import GibFineRecord
 from reader.turkey_bot_test.kgm.models import KgmOperatorResult
+from reader.turkey_bot_test.models import TurkeyUserCar
 from reader.turkey_bot_test.statistics_service import TurkeyStatistics
+from reader.turkey_bot_test.unified.models import (
+    OverallStatus,
+    ProviderCheckResult,
+    ProviderStatus,
+    UnifiedCheckResult,
+)
+
+# Тот же Europe/Istanbul, что и reader/turkey_bot_test/monitoring/
+# scheduler_job.py::TURKEY_MONITORING_TZ — НЕ импортируется оттуда напрямую
+# (texts.py — leaf-модуль, monitoring/ на него не завязан ни в одну
+# сторону), значение продублировано намеренно как константа отображения.
+_DISPLAY_TZ = ZoneInfo("Europe/Istanbul")
 
 # Telegram режет сообщение на границе 4096 символов — см. format_has_debt_
 # messages()/_split_into_telegram_messages() про то, как несколько штрафов
@@ -37,12 +52,39 @@ _KEYCAP_DIGITS = {
 }
 
 WELCOME_TEXT = (
-    "🇹🇷 Проверка штрафов и задолженности по гос. номеру в Турции (GIB).\n\n"
-    "Отправьте гос. номер автомобиля (например, А123АА123) — бот запросит "
-    "CAPTCHA с сайта GIB, вы введёте код с картинки, и бот покажет результат.\n\n"
-    "Проверка одноразовая — никакого постоянного мониторинга.\n"
-    "/cancel — отменить текущую проверку."
+    "🇹🇷 Проверка штрафов и задолженности по гос. номеру в Турции.\n\n"
+    "Бот проверяет ОДНИМ действием сразу все источники — штрафы GİB, "
+    "платные дороги Avrasya Tüneli и KGM.\n\n"
+    "➕ Добавьте автомобиль, и бот предложит проверить его сразу и "
+    "включить регулярный мониторинг (дважды в день)."
 )
+
+ASK_PLATE_FOR_NEW_CAR_TEXT = (
+    "Отправьте гос. номер автомобиля, который нужно добавить (например, А123АА123)."
+)
+
+CAR_ADDED_TEMPLATE = "🚗 {plate} добавлен."
+CAR_ALREADY_EXISTS_TEMPLATE = "🚗 {plate} уже есть в вашем списке."
+
+EMPTY_MY_CARS_TEXT = (
+    "📋 У вас пока нет добавленных автомобилей.\n\n"
+    "Нажмите «➕ Добавить авто», чтобы добавить первый."
+)
+MY_CARS_HEADER = "📋 Мои авто"
+
+MONITORING_ENABLED_TEMPLATE = (
+    "🔔 Мониторинг включён\n\n"
+    "🚗 {plate}\n\n"
+    "Проверяем автомобиль два раза в день:\n"
+    "13:00 и 21:00 по времени Турции."
+)
+MONITORING_DISABLED_TEMPLATE = "🔕 Мониторинг для {plate} отключён."
+
+MONITORING_STOPPED_ALL_TEMPLATE = "⛔ Мониторинг остановлен для всех подписок ({count})."
+
+HISTORY_EMPTY_TEMPLATE = "📜 История {plate}\n\nПроверок пока не было."
+
+CAR_NOT_FOUND_TEXT = "Автомобиль не найден или принадлежит другому пользователю."
 
 INVALID_PLATE_TEXT = (
     "Не похоже на гос. номер. Отправьте номер буквами (кириллица или "
@@ -137,6 +179,22 @@ CANCEL_BUTTON_LABEL = "❌ Отмена"
 # garage_keyboard() (см. design report Stage 2B: "Saved cars must show
 # both actions" — те же две подписи, одна константа на каждую, не
 # дублируются под другим именем).
+# НОВОЕ главное меню (см. design report "Перестроить UX Turkey test bot",
+# reader/turkey_bot_test/keyboards.py::main_menu_keyboard) — GİB/Avrasya/KGM
+# больше не выбираются пользователем явно (см. UnifiedTurkeyCheckService),
+# поэтому CHECK_FINES_LABEL/CHECK_TOLLS_LABEL ниже сохранены как константы
+# (ссылки на них могут остаться в старых текстах справки), но БОЛЬШЕ НЕ
+# используются в главном меню/клавиатурах.
+ADD_CAR_LABEL = "➕ Добавить авто"
+MY_CARS_LABEL = "📋 Мои авто"
+CHECK_NOW_LABEL = "🔎 Проверить сейчас"
+STOP_MONITORING_LABEL = "⛔ Остановить мониторинг"
+ENABLE_MONITORING_LABEL = "🔔 Включить мониторинг"
+DISABLE_MONITORING_LABEL = "🔕 Отключить мониторинг"
+HISTORY_LABEL = "📜 История"
+DELETE_CAR_LABEL = "🗑 Удалить авто"
+BACK_LABEL = "⬅️ Назад"
+
 GARAGE_LABEL = "🚗 Мои авто"
 STATISTICS_LABEL = "📊 Статистика"
 CHECK_FINES_LABEL = "🚔 Штрафы"
@@ -553,11 +611,12 @@ def format_has_debt_messages(plate: str, fines: tuple[GibFineRecord, ...]) -> li
 
 
 def format_statistics(stats: TurkeyStatistics) -> str:
-    """Только метрики, надёжно посчитанные reader/turkey_bot_test/
-    statistics_service.py::TurkeyStatisticsService (см. design report,
-    аудит) — никаких Георгия-специфичных полей (active/stopped
-    subscriptions, monitoring tasks) — у Turkey нет мониторинга (см.
-    задачу)."""
+    """См. reader/turkey_bot_test/statistics_service.py::
+    TurkeyStatisticsService — теперь на основе unified-check (все три
+    провайдера одинаково, см. design report "Перестроить UX Turkey test
+    bot" п.13), плюс мониторинг-метрики (active_monitoring_subscriptions/
+    manual_checks/scheduled_checks/provider_error_counts)."""
+    provider_names = {"gib": "GİB", "avrasya": "Avrasya", "kgm": "KGM"}
     lines = [
         STATISTICS_LABEL,
         "",
@@ -572,10 +631,20 @@ def format_statistics(stats: TurkeyStatistics) -> str:
         f"Сегодня: {stats.checks_today}",
         f"За 7 дней: {stats.checks_7d}",
         f"За 30 дней: {stats.checks_30d}",
+        f"Ручных: {stats.manual_checks}",
+        f"По расписанию: {stats.scheduled_checks}",
         "",
         f"🚨 С задолженностью: {stats.checks_has_debt}",
         f"✅ Без задолженности: {stats.checks_no_debt}",
+        f"⚠️ Частично (одна из служб недоступна): {stats.checks_partial}",
+        f"❌ Ошибка (ни одна служба не ответила): {stats.checks_error}",
+        "",
+        f"🔔 Активных подписок мониторинга: {stats.active_monitoring_subscriptions}",
+        "",
+        "Ошибки провайдеров:",
     ]
+    for provider_key, count in stats.provider_error_counts.items():
+        lines.append(f"  {provider_names.get(provider_key, provider_key)}: {count}")
     return "\n".join(lines)
 
 
@@ -621,3 +690,117 @@ def format_user_list_messages(users: list[tuple[int, str | None]]) -> list[str]:
         messages.append("\n".join(current))
 
     return messages
+
+
+# ---- Unified check rendering (см. design report "Перестроить UX Turkey
+# test bot", reader/turkey_bot_test/unified/models.py) ----
+
+_UNIFIED_PROVIDER_DISPLAY = {"gib": "🚔 GİB", "avrasya": "🚇 Avrasya", "kgm": "🛣 KGM"}
+
+
+def _format_unified_provider_line(result: ProviderCheckResult) -> str:
+    name = _UNIFIED_PROVIDER_DISPLAY.get(result.provider, result.provider)
+    if result.status == ProviderStatus.ERROR:
+        return f"{name} — ⚠️ временно не удалось проверить"
+    if result.status == ProviderStatus.NO_DEBT:
+        return f"{name} — задолженностей нет"
+    return f"{name} — {_format_try_amount(result.total_amount)}"
+
+
+def format_unified_check_result(result: UnifiedCheckResult) -> str:
+    """См. design report — компактный построчный вывод по каждому
+    провайдеру + Итого + время проверки (Europe/Istanbul, см. _DISPLAY_TZ).
+    ERROR провайдера показывается честно (⚠️), НИКОГДА не как "нет
+    задолженности" (см. design report п.4/п.7)."""
+    lines = [f"🚗 {result.plate}", ""]
+    lines.extend(_format_unified_provider_line(p) for p in result.providers)
+    lines.append("")
+    lines.append(f"Итого: {_format_try_amount(result.total_amount)}")
+    lines.append("")
+    checked_local = result.finished_at.astimezone(_DISPLAY_TZ)
+    lines.append(f"Проверено: {checked_local.strftime('%d.%m.%Y %H:%M')}")
+    return "\n".join(lines)
+
+
+# ---- "Мои авто" (см. design report п.3) ----
+
+def format_car_button_label(car: TurkeyUserCar) -> str:
+    if car.last_overall_status == OverallStatus.HAS_DEBT.value and car.last_total_amount is not None:
+        return f"🚗 {car.car_number} — {_format_try_amount(car.last_total_amount)}"
+    if car.last_overall_status == OverallStatus.NO_DEBT.value:
+        return f"🚗 {car.car_number} — без долгов"
+    if car.last_overall_status == OverallStatus.PARTIAL.value:
+        return f"🚗 {car.car_number} — частично"
+    if car.last_overall_status == OverallStatus.ERROR.value:
+        return f"🚗 {car.car_number} — ⚠️"
+    return f"🚗 {car.car_number}"
+
+
+def _relative_day_label(dt_local: datetime, *, now_local: datetime) -> str:
+    if dt_local.date() == now_local.date():
+        return f"сегодня, {dt_local.strftime('%H:%M')}"
+    if dt_local.date() == now_local.date() - timedelta(days=1):
+        return f"вчера, {dt_local.strftime('%H:%M')}"
+    return dt_local.strftime("%d.%m.%Y %H:%M")
+
+
+def _format_my_car_block(car: TurkeyUserCar, *, now_local: datetime) -> str:
+    lines = [f"🚗 {car.car_number}"]
+    if car.last_overall_status is None:
+        lines.append("Ещё не проверялся")
+        return "\n".join(lines)
+
+    checked_local = car.last_checked_at.astimezone(_DISPLAY_TZ)
+    lines.append(f"Последняя проверка: {_relative_day_label(checked_local, now_local=now_local)}")
+    if car.last_overall_status == OverallStatus.NO_DEBT.value:
+        lines.append("Задолженность не найдена")
+    elif car.last_overall_status == OverallStatus.HAS_DEBT.value:
+        amount = _format_try_amount(car.last_total_amount) if car.last_total_amount is not None else "?"
+        lines.append(f"Задолженность: {amount}")
+    elif car.last_overall_status == OverallStatus.PARTIAL.value:
+        amount = _format_try_amount(car.last_total_amount) if car.last_total_amount is not None else "?"
+        lines.append(f"Частично проверено (не все службы ответили), известно: {amount}")
+    else:
+        lines.append("⚠️ Последняя проверка завершилась ошибкой")
+    return "\n".join(lines)
+
+
+def format_car_card_text(car: TurkeyUserCar, *, now: datetime) -> str:
+    """Один автомобиль (см. design report п.3, карточка "🚗 {plate}") — тот
+    же блок, что и в списке "Мои авто" (_format_my_car_block), без общего
+    MY_CARS_HEADER."""
+    return _format_my_car_block(car, now_local=now.astimezone(_DISPLAY_TZ))
+
+
+def format_my_cars_messages(cars: list[TurkeyUserCar], *, now: datetime) -> list[str]:
+    if not cars:
+        return [EMPTY_MY_CARS_TEXT]
+    now_local = now.astimezone(_DISPLAY_TZ)
+    blocks = [MY_CARS_HEADER]
+    blocks.extend(_format_my_car_block(car, now_local=now_local) for car in cars)
+    return _split_into_telegram_messages(blocks)
+
+
+# ---- 📜 История (см. design report п.7) ----
+
+def _format_history_line(run: UnifiedCheckResult) -> str:
+    stamp = run.finished_at.astimezone(_DISPLAY_TZ).strftime("%d.%m %H:%M")
+    if run.overall_status == OverallStatus.HAS_DEBT:
+        value = _format_try_amount(run.total_amount)
+    elif run.overall_status == OverallStatus.NO_DEBT:
+        value = "задолженностей не найдено"
+    elif run.overall_status == OverallStatus.PARTIAL:
+        value = f"частично проверено ({_format_try_amount(run.total_amount)}, не все службы ответили)"
+    else:
+        value = "не удалось проверить (ошибка)"
+    return f"{stamp} — {value}"
+
+
+def format_history_messages(plate: str, runs: list[UnifiedCheckResult]) -> list[str]:
+    """PARTIAL/ERROR отображаются честно (см. design report п.7: "не как
+    0 ₺"), никогда не подменяются на "нет задолженности"."""
+    if not runs:
+        return [HISTORY_EMPTY_TEMPLATE.format(plate=plate)]
+    header = f"📜 История {plate}"
+    lines = [_format_history_line(run) for run in runs]
+    return _split_into_telegram_messages([header, "\n".join(lines)])

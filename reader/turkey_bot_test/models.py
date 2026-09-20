@@ -6,6 +6,7 @@ reader/turkey_bot_test/gib/models.py, отдельно и независимо �
 
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 
 
 @dataclass(frozen=True)
@@ -30,16 +31,24 @@ class ConversationState:
 
 @dataclass(frozen=True)
 class TurkeyUserCar:
-    """Одна запись "гаража" — см. reader/turkey_bot_test/user_cars_repository.py.
-    Появляется ТОЛЬКО после реально завершённой проверки с исходом
-    no_debt/has_debt (см. design report: "must not pollute the garage" —
-    CAPTCHA/rejected/unexpected/error никогда не создают и не обновляют
-    запись). car_number уже нормализован (см.
-    reader/turkey_bot_test/validation.py::normalize_plate) — тот же формат,
-    что и во всех остальных местах бота."""
+    """Одна запись "Мои авто" — см. reader/turkey_bot_test/user_cars_repository.py.
+
+    ОБНОВЛЕНО (см. design report "Перестроить UX Turkey test bot", решение
+    п.3): машина появляется СРАЗУ после валидного ввода номера — успешная
+    проверка больше НЕ требуется (это меняет исходный инвариант "гараж —
+    не мониторинг, появляется только после успешной проверки", см. design
+    report решение п.3 — сознательная смена направления). car_number уже
+    нормализован (см. reader/turkey_bot_test/validation.py::normalize_plate).
+
+    last_overall_status/last_total_amount — кэш последнего unified-check
+    (см. reader/turkey_bot_test/unified/models.py::OverallStatus) для
+    показа в списке "📋 Мои авто" без join на turkey_check_runs — None,
+    пока автомобиль ни разу не проверялся."""
 
     id: int
     telegram_user_id: int
     car_number: str
     created_at: datetime
     last_checked_at: datetime
+    last_overall_status: str | None = None
+    last_total_amount: Decimal | None = None
