@@ -763,15 +763,34 @@ def _format_unified_provider_block(result: ProviderCheckResult) -> str:
     return "\n".join(lines)
 
 
+def _format_unified_total_line(result: UnifiedCheckResult) -> str:
+    """См. задачу "Root cause: M295YB196 0 ₺" — presentation-only fix, БЕЗ
+    изменения calculation/status model (total_amount/overall_status
+    считаются и сохраняются ровно как раньше, см.
+    reader/turkey_bot/unified/models.py::total_amount_for/
+    derive_overall_status). Раньше "Итого: {total_amount}" печаталось
+    безусловно — при overall_status ERROR/PARTIAL total_amount технически
+    "правильные" 0/частичная сумма (ERROR-провайдеры в сумму не входят),
+    но пользователю это читалось как подтверждённый нулевой/полный итог,
+    хотя часть или все провайдеры вообще не были проверены."""
+    if result.overall_status == OverallStatus.ERROR:
+        return "Итоговая сумма не определена"
+    if result.overall_status == OverallStatus.PARTIAL:
+        return "Итоговая сумма может быть неполной"
+    return f"Итого: {_format_try_amount(result.total_amount)}"
+
+
 def format_unified_check_result(result: UnifiedCheckResult) -> str:
     """См. design report — компактный построчный вывод по каждому
     провайдеру + Итого + время проверки (Europe/Istanbul, см. _DISPLAY_TZ).
     ERROR провайдера показывается честно (⚠️), НИКОГДА не как "нет
-    задолженности" (см. design report п.4/п.7)."""
+    задолженности" (см. design report п.4/п.7). Итоговая строка — см.
+    _format_unified_total_line (НЕ показывать подтверждённый "Итого: 0 ₺",
+    когда часть/все провайдеры не были реально проверены)."""
     lines = [f"🚗 {result.plate}", ""]
     lines.extend(_format_unified_provider_block(p) for p in result.providers)
     lines.append("")
-    lines.append(f"Итого: {_format_try_amount(result.total_amount)}")
+    lines.append(_format_unified_total_line(result))
     lines.append("")
     checked_local = result.finished_at.astimezone(_DISPLAY_TZ)
     lines.append(f"Проверено: {checked_local.strftime('%d.%m.%Y %H:%M')}")
