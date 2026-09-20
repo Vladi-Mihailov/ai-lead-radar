@@ -76,11 +76,16 @@ def test_partial_does_not_show_confirmed_zero_total():
 def test_partial_with_debt_does_not_show_that_debt_as_confirmed_total():
     """PARTIAL с реальной найденной суммой у успешного провайдера — сумма
     ВСЁ РАВНО не должна выглядеть как подтверждённый "Итого" (один
-    провайдер не ответил, итог не может считаться финальным)."""
+    провайдер не ответил, итог не может считаться финальным). Провайдер с
+    долгом здесь — KGM, не Avrasya: Avrasya сознательно ИСКЛЮЧЕНА из
+    агрегированного total_amount всегда (см. reader/turkey_bot/unified/
+    models.py::total_amount_for — её долг уже учтён внутри KGM), поэтому
+    для проверки именно "PARTIAL прячет реальный total" нужен provider,
+    который в принципе входит в агрегат."""
     result = _result(
         _provider("gib", ProviderStatus.ERROR, error_type="transport_error"),
-        _provider("avrasya", ProviderStatus.HAS_DEBT, total=Decimal(500)),
-        _provider("kgm", ProviderStatus.NO_DEBT),
+        _provider("avrasya", ProviderStatus.NO_DEBT),
+        _provider("kgm", ProviderStatus.HAS_DEBT, total=Decimal(500)),
     )
     assert result.overall_status.value == "partial"
     assert result.total_amount == Decimal(500)

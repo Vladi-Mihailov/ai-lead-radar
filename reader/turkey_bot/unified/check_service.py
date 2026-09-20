@@ -58,7 +58,7 @@ from typing import Protocol
 
 import httpx
 
-from reader.turkey_bot.avrasya.models import AvrasyaSubmitOutcome
+from reader.turkey_bot.avrasya.models import AvrasyaDebtItem, AvrasyaSubmitOutcome
 from reader.turkey_bot.avrasya.provider import AvrasyaProvider
 from reader.turkey_bot.avrasya.session import (
     AvrasyaRateLimitedError,
@@ -69,7 +69,7 @@ from reader.turkey_bot.gib.models import GibFineRecord, GibSubmitOutcome
 from reader.turkey_bot.gib.provider import GibProvider
 from reader.turkey_bot.gib.session import GibSession, GibTransportError
 from reader.turkey_bot.gib.translation import FineTranslationError
-from reader.turkey_bot.kgm.models import KgmSubmitOutcome
+from reader.turkey_bot.kgm.models import KgmDebtItem, KgmSubmitOutcome
 from reader.turkey_bot.kgm.provider import KgmProvider
 from reader.turkey_bot.kgm.session import KgmSession, KgmTransportError
 from reader.turkey_bot.unified.captcha_resolver import (
@@ -175,19 +175,86 @@ def _error_result(provider: str, error_type: str, *, checked_at: datetime) -> Pr
     )
 
 
+def _format_try_amount(amount: Decimal) -> str:
+    """Тот же формат, что и reader/turkey_bot/texts.py::_format_try_amount
+    (не импортирую оттуда напрямую, чтобы unified/ — business logic — не
+    зависел от texts.py — presentation layer; тот же приём, что и
+    reader/turkey_bot/monitoring/notification_texts.py::_format_try_amount:
+    "алгоритм намеренно идентичен, единственный источник истины для
+    формата сумм в проекте")."""
+    quantized = amount.quantize(Decimal("0.01"))
+    if quantized == quantized.to_integral_value():
+        return f"{int(quantized):,}".replace(",", " ") + " ₺"
+    formatted = f"{quantized:,.2f}".replace(",", " ").replace(".", ",")
+    return f"{formatted} ₺"
+
+
 def _gib_fine_description(fine: GibFineRecord) -> str | None:
-    """Собирает ОДНУ строку описания штрафа для DebtItem.description —
-    используются *_ru поля, КОГДА они заполнены (см. reader/turkey_bot/
-    gib/translation.py::translate_fines), иначе исходный турецкий текст
-    (тот же fallback-принцип "location_ru or location", что и в
+    """Собирает ЧЕЛОВЕКОЧИТАЕМУЮ многострочную детализацию ОДНОГО штрафа
+    для DebtItem.description (см. задачу "Улучшить формат unified Turkey
+    check" — "использовать структурированные date/time/location/amount...
+    если поля нет — ничего не выдумывать") — используются ТОЛЬКО реально
+    присутствующие поля GibFineRecord, каждое — своя строка, ничего не
+    показывается, если поле отсутствует. *_ru поля — КОГДА заполнены (см.
+    reader/turkey_bot/gib/translation.py::translate_fines), иначе исходный
+    турецкий текст (тот же fallback "location_ru or location", что и в
     reader/turkey_bot/texts.py::_format_fine_block — сохраняет production
     перевод, найденный READ-ONLY аудитом как regression относительно
-    test unified-flow, см. модуль docstring)."""
+    test unified-flow)."""
+    lines: list[str] = []
+    if fine.violation_date is not None:
+        lines.append(fine.violation_date.strftime("%d.%m.%Y"))
     location = fine.location_ru or fine.location
+    if location:
+        lines.append(location)
     violation = fine.violation_description_ru or fine.violation_description or fine.description
-    if location and violation:
-        return f"{location} — {violation}"
-    return violation or location
+    if violation:
+        lines.append(violation)
+    if fine.amount is not None:
+        lines.append(f"Сумма: {_format_try_amount(fine.amount)}")
+    if fine.late_fee is not None and fine.late_fee > 0:
+        lines.append(f"Пеня: {_format_try_amount(fine.late_fee)}")
+    if fine.discount is not None and fine.discount > 0:
+        lines.append(f"Скидка: -{_format_try_amount(fine.discount)}")
+    if fine.protocol_no:
+        lines.append(f"№ {fine.protocol_no}")
+    return "\n".join(lines) if lines else None
+
+
+def _avrasya_item_description(item: AvrasyaDebtItem) -> str:
+    """См. _gib_fine_description — те же принципы, но AvrasyaDebtItem
+    структурно НЕ несёт ни даты, ни маршрута (см. reader/turkey_bot/
+    avrasya/models.py::AvrasyaDebtItem — этих полей там физически нет,
+    не только "не показаны вживую"), поэтому детализация ограничена тем,
+    что реально есть: service_file_type + суммы."""
+    lines = [item.service_file_type, f"Стоимость: {_format_try_amount(item.principal_amount)}"]
+    if item.penalty_amount is not None and item.penalty_amount > 0:
+        lines.append(f"Начислено: {_format_try_amount(item.penalty_amount)}")
+    lines.append(f"К оплате: {_format_try_amount(item.total_amount)}")
+    return "\n".join(lines)
+
+
+def _kgm_item_description(item: KgmDebtItem) -> str:
+    """Тот же набор полей/формат, что и уже существующий
+    reader/turkey_bot/texts.py::_format_kgm_item_block (legacy
+    provider-specific рендер) — здесь ПРОДУБЛИРОВАН (не импортирован) по
+    той же причине, что и _format_try_amount выше: unified/ не должен
+    зависеть от texts.py. date_time/entry_station/exit_station/
+    penalty_free_deadline пропускаются, если их нет вовсе (см.
+    reader/turkey_bot/kgm/models.py::KgmDebtItem — None означает "буквально
+    пусто на сайте", не ошибку разбора)."""
+    lines = [item.date_time.strftime("%d.%m.%Y %H:%M")]
+    if item.entry_station and item.exit_station:
+        lines.append(f"{item.entry_station} → {item.exit_station}")
+    elif item.exit_station:
+        lines.append(item.exit_station)
+    elif item.entry_station:
+        lines.append(item.entry_station)
+    lines.append(f"Стоимость: {_format_try_amount(item.base_toll)}")
+    lines.append(f"К оплате: {_format_try_amount(item.payable_amount)}")
+    if item.penalty_free_deadline is not None:
+        lines.append(f"Без штрафа до: {item.penalty_free_deadline.strftime('%d.%m.%Y')}")
+    return "\n".join(lines)
 
 
 def _gib_outcome_to_result(outcome: GibSubmitOutcome, *, checked_at: datetime) -> ProviderCheckResult:
@@ -248,7 +315,7 @@ def _avrasya_outcome_to_result(
         # AvrasyaDebtItem не несёт стабильного id — reference всегда None,
         # item-level diff для Avrasya невозможен.
         items = tuple(
-            DebtItem(reference=None, amount=item.total_amount, description=item.service_file_type)
+            DebtItem(reference=None, amount=item.total_amount, description=_avrasya_item_description(item))
             for item in outcome.debt_items
         )
         return ProviderCheckResult(
@@ -275,7 +342,7 @@ def _kgm_outcome_to_result(outcome: KgmSubmitOutcome, *, checked_at: datetime) -
         penalty = total - principal if total > principal else Decimal(0)
         # KgmDebtItem не несёт стабильного id — reference всегда None.
         items = tuple(
-            DebtItem(reference=None, amount=item.payable_amount, description=operator.operator_name)
+            DebtItem(reference=None, amount=item.payable_amount, description=_kgm_item_description(item))
             for operator in outcome.operators
             for item in operator.items
         )

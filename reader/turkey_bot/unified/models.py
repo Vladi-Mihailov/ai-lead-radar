@@ -98,10 +98,28 @@ def derive_overall_status(providers: tuple[ProviderCheckResult, ...]) -> Overall
     return OverallStatus.NO_DEBT
 
 
+# См. задачу "Улучшить формат unified Turkey check и расчёт итоговой
+# суммы": задолженность Avrasya Tüneli УЖЕ входит в KGM ("Платные дороги,
+# включая тунели" — сам KGM-портал агрегирует Avrasya как одного из своих
+# операторов, см. reader/turkey_bot/texts.py::_KGM_OPERATOR_EMOJI/
+# format_kgm_has_debt_messages — "Avrasya Tüneli" уже встречался как ИМЯ
+# ОПЕРАТОРА внутри KGM-ответа) — прибавлять Avrasya's total_amount ЕЩЁ РАЗ
+# к общему "Итого" задвоило бы задолженность. Avrasya's СОБСТВЕННЫЙ
+# ProviderCheckResult.total_amount этим НЕ затрагивается — исключается
+# ТОЛЬКО из этой агрегированной суммы, в своей строке/детализации Avrasya
+# по-прежнему показывает полную сумму (см. design report примера: GIB=80,
+# Avrasya=2580, KGM=2660 -> Итого=2740, а не 5320).
+_EXCLUDED_FROM_OVERALL_TOTAL = frozenset({"avrasya"})
+
+
 def total_amount_for(providers: tuple[ProviderCheckResult, ...]) -> Decimal:
-    """Сумма total_amount ТОЛЬКО у HAS_DEBT-провайдеров (NO_DEBT/ERROR
-    вносят 0, см. задачу: пример "Итого: 5 477 ₺" суммирует именно так)."""
+    """Сумма total_amount у HAS_DEBT-провайдеров (NO_DEBT/ERROR вносят 0),
+    ИСКЛЮЧАЯ providers из _EXCLUDED_FROM_OVERALL_TOTAL (см. выше — сейчас
+    только Avrasya, её долг уже учтён внутри KGM)."""
     return sum(
-        (p.total_amount for p in providers if p.status == ProviderStatus.HAS_DEBT),
+        (
+            p.total_amount for p in providers
+            if p.status == ProviderStatus.HAS_DEBT and p.provider not in _EXCLUDED_FROM_OVERALL_TOTAL
+        ),
         Decimal(0),
     )

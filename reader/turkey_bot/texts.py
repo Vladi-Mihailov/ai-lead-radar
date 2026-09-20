@@ -734,9 +734,14 @@ def format_user_list_messages(users: list[tuple[int, str | None]]) -> list[str]:
 
 
 # ---- Unified check rendering (см. design report "Перестроить UX Turkey
-# test bot", reader/turkey_bot/unified/models.py) ----
+# test bot", reader/turkey_bot/unified/models.py; layout — см. задачу
+# "Улучшить формат unified Turkey check и расчёт итоговой суммы") ----
 
-_UNIFIED_PROVIDER_DISPLAY = {"gib": "🚔 GİB", "avrasya": "🚇 Avrasya", "kgm": "🛣 KGM"}
+_UNIFIED_PROVIDER_DISPLAY = {
+    "gib": "🚔 GİB (Штрафы)",
+    "avrasya": "🚇 Avrasya (Тунели)",
+    "kgm": "🛣 KGM (Платные дороги, включая тунели)",
+}
 
 
 def _format_unified_provider_line(result: ProviderCheckResult) -> str:
@@ -748,19 +753,20 @@ def _format_unified_provider_line(result: ProviderCheckResult) -> str:
     return f"{name} — {_format_try_amount(result.total_amount)}"
 
 
-def _format_unified_provider_block(result: ProviderCheckResult) -> str:
-    """Одна строка-сводка (см. _format_unified_provider_line) + построчная
-    детализация по каждому DebtItem, КОГДА они есть (см. задачу "Перенос
-    Unified Turkey функционала в production" п.4) — для GİB item.description
-    уже содержит русский перевод location/violation_description, когда
-    доступен (см. reader/turkey_bot/unified/check_service.py::
-    _gib_fine_description/TurkeyFineTranslationService) — это ЕДИНСТВЕННОЕ
-    место, где production сохраняет перевод, найденный READ-ONLY аудитом
-    как regression относительно test unified-flow."""
-    lines = [_format_unified_provider_line(result)]
-    if result.status == ProviderStatus.HAS_DEBT:
-        lines.extend(f"  • {item.description}" for item in result.items if item.description)
-    return "\n".join(lines)
+def _format_unified_provider_detail_block(result: ProviderCheckResult) -> str | None:
+    """Заголовок-название provider'а + ПОЛНАЯ детализация каждого
+    найденного долга (item.description уже содержит человекочитаемую,
+    многострочную расшифровку из реальных структурированных полей —
+    см. reader/turkey_bot/unified/check_service.py::_gib_fine_description/
+    _avrasya_item_description/_kgm_item_description, ничего не выдумывается
+    здесь). None — если у provider'а вообще нет ни одного элемента с
+    описанием (NO_DEBT/ERROR всегда имеют пустой items — им нечего
+    детализировать, см. _*_outcome_to_result — эти статусы items=())."""
+    descriptions = [item.description for item in result.items if item.description]
+    if not descriptions:
+        return None
+    name = _UNIFIED_PROVIDER_DISPLAY.get(result.provider, result.provider)
+    return name + "\n" + "\n\n".join(descriptions)
 
 
 def _format_unified_total_line(result: UnifiedCheckResult) -> str:
@@ -781,16 +787,36 @@ def _format_unified_total_line(result: UnifiedCheckResult) -> str:
 
 
 def format_unified_check_result(result: UnifiedCheckResult) -> str:
-    """См. design report — компактный построчный вывод по каждому
-    провайдеру + Итого + время проверки (Europe/Istanbul, см. _DISPLAY_TZ).
-    ERROR провайдера показывается честно (⚠️), НИКОГДА не как "нет
-    задолженности" (см. design report п.4/п.7). Итоговая строка — см.
-    _format_unified_total_line (НЕ показывать подтверждённый "Итого: 0 ₺",
-    когда часть/все провайдеры не были реально проверены)."""
-    lines = [f"🚗 {result.plate}", ""]
-    lines.extend(_format_unified_provider_block(p) for p in result.providers)
-    lines.append("")
-    lines.append(_format_unified_total_line(result))
+    """Новый layout (см. задачу "Улучшить формат unified Turkey check и
+    расчёт итоговой суммы"): "Итого" сразу после заголовка — см.
+    _format_unified_total_line, total_amount берётся из
+    reader/turkey_bot/unified/models.py::total_amount_for(), который
+    сознательно ИСКЛЮЧАЕТ Avrasya из суммы (её долг уже учтён внутри KGM
+    "Платные дороги, включая тунели" — иначе задолженность задваивалась
+    бы, см. total_amount_for docstring) — Avrasya's СОБСТВЕННЫЙ
+    ProviderCheckResult.total_amount при этом не меняется, показывается
+    как есть в своей сводной строке И в "Детализация:" ниже (она НЕ
+    "теряется", просто не входит в агрегат). Далее — сводная строка на
+    каждого provider (ERROR — честно ⚠️, НИКОГДА не "нет задолженности",
+    см. design report п.4/п.7), затем ОТДЕЛЬНЫЙ раздел "Детализация:" —
+    построчная расшифровка каждого найденного долга (см.
+    _format_unified_provider_detail_block), только для provider'ов, у
+    которых реально есть items — раздел целиком опускается, если
+    детализировать нечего (все NO_DEBT/ERROR)."""
+    lines = [f"🚗 {result.plate}", "", _format_unified_total_line(result)]
+    lines.extend(_format_unified_provider_line(p) for p in result.providers)
+
+    detail_blocks = []
+    for provider_result in result.providers:
+        block = _format_unified_provider_detail_block(provider_result)
+        if block is not None:
+            detail_blocks.append(block)
+    if detail_blocks:
+        lines.append("")
+        lines.append("Детализация:")
+        lines.append("")
+        lines.append("\n\n".join(detail_blocks))
+
     lines.append("")
     checked_local = result.finished_at.astimezone(_DISPLAY_TZ)
     lines.append(f"Проверено: {checked_local.strftime('%d.%m.%Y %H:%M')}")
