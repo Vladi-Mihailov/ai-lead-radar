@@ -142,9 +142,17 @@ class _FakeTelegramClient:
         get_input_entity_error=None, entity_responses=None,
         participant_check_errors=None,
         is_authorized=True, get_me_result=None, get_me_error=None,
+        disconnect_error=None,
     ):
         self.account = account
         self._connect_error = connect_error
+        # Симулирует падение disconnect() (см. Telethon
+        # _save_states_and_entities -> session.set_update_state) —
+        # независимо от connect_error, см. задачу про readonly database у
+        # @vvz982/@ib85gnat: раньше необработанное исключение здесь роняло
+        # весь InviterService._execute_account (и, соответственно, run()/
+        # run_one_worker_attempt() целиком).
+        self._disconnect_error = disconnect_error
         # is_authorized/get_me_result/get_me_error — проверка identity (см.
         # InviterService._verify_account_identity/reader/inviter/
         # identity.py), выполняется СРАЗУ после connect(), до
@@ -253,6 +261,8 @@ class _FakeTelegramClient:
         return object()
 
     async def disconnect(self) -> None:
+        if self._disconnect_error is not None:
+            raise self._disconnect_error
         self.disconnected = True
 
 
@@ -261,6 +271,7 @@ def _make_client_factory(
     target_entities=None, get_input_entity_errors=None, entity_responses=None,
     participant_check_errors=None,
     is_authorized_overrides=None, get_me_results=None, get_me_errors=None,
+    disconnect_errors=None,
     created=None,
 ):
     """connect_errors/get_entity_errors/call_errors/get_input_entity_errors —
@@ -289,6 +300,7 @@ def _make_client_factory(
     is_authorized_overrides = is_authorized_overrides or {}
     get_me_results = get_me_results or {}
     get_me_errors = get_me_errors or {}
+    disconnect_errors = disconnect_errors or {}
 
     def factory(account):
         client = _FakeTelegramClient(
@@ -303,6 +315,7 @@ def _make_client_factory(
             is_authorized=is_authorized_overrides.get(account.name, True),
             get_me_result=get_me_results.get(account.name),
             get_me_error=get_me_errors.get(account.name),
+            disconnect_error=disconnect_errors.get(account.name),
         )
         if created is not None:
             created.append(client)
@@ -4666,6 +4679,137 @@ def test_execute_one_blocked_account_does_not_block_next_account(tmp_path):
         # Оба реальных кандидата ушли рабочему аккаунту.
         assert len(invites) == 2
         assert all(i.account_id == 2 for i in invites)
+    finally:
+        invite_repository.close()
+
+
+# ---- disconnect() падает (readonly session sqlite и т.п.) — не должен ----
+# ---- ронять весь _execute_account/run()/run_one_worker_attempt() (см. ----
+# ---- задачу про readonly database у @vvz982/@ib85gnat: session-файлы ----
+# ---- принадлежали root, а сервис работает как leadradar) ------------------
+
+
+def test_worker_attempt_disconnect_failure_after_connect_failure_does_not_crash(tmp_path, caplog):
+    """connect() падает (сессия недоступна) И disconnect() в finally тоже
+    падает (та же причина — недоступный на запись session-файл) —
+    run_one_worker_attempt() должен вернуться нормально (не пробросить
+    исключение из disconnect() наружу), а исходная ошибка connect() должна
+    остаться в логах, а не потеряться/замениться ошибкой disconnect()."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    client_factory = _make_client_factory(
+        connect_errors={"acc1": ConnectionError("подключение недоступно")},
+        disconnect_errors={
+            "acc1": sqlite3.OperationalError("attempt to write a readonly database"),
+        },
+    )
+    service, account_repository, campaign_repository, invite_repository = _build_service(
+        db_path, client_factory=client_factory,
+    )
+    try:
+        campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
+        account = account_repository.create(
+            name="acc1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=24,
+        )
+
+        with caplog.at_level("WARNING", logger="reader.inviter.service"):
+            stats = asyncio.run(service.run_one_worker_attempt(campaign, account, hourly_limit=2))
+
+        # Сам факт, что мы дошли сюда без исключения, уже подтверждает
+        # фикс — до него disconnect() пробросил бы OperationalError и
+        # уронил бы весь вызов (и, в реальном worker, весь процесс).
+        assert stats is not None
+        assert stats.sent == 0
+        assert "Не удалось подключиться" in caplog.text
+        assert "подключение недоступно" in caplog.text
+        assert len(invite_repository.list()) == 0
+    finally:
+        account_repository.close()
+        campaign_repository.close()
+        invite_repository.close()
+
+
+def test_execute_account_with_broken_connect_and_disconnect_does_not_block_next_account(tmp_path):
+    """Аккаунт, у которого падают И connect(), И disconnect() (см. задачу
+    про readonly database) — не должен останавливать обработку СЛЕДУЮЩЕГО
+    аккаунта в той же кампании. До фикса необработанное исключение из
+    disconnect() внутри _execute_account пробрасывалось прямо из цикла
+    for account in accounts (см. run()), и ни один следующий аккаунт не
+    обрабатывался вовсе — ровно то, что произошло в проде с @vvz982
+    (сломанным) и @ib85gnat (до которого очередь не доходила)."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="broken", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+        account_repository.create(
+            name="works", phone="+995500000002", session_name="acc2",
+            session_path="acc2.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(
+        connect_errors={"broken": ConnectionError("подключение недоступно")},
+        disconnect_errors={
+            "broken": sqlite3.OperationalError("attempt to write a readonly database"),
+        },
+        created=created_clients,
+    )
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    # Оба аккаунта дошли до попытки подключения — "broken" не остановил
+    # обработку "works" (до фикса второй клиент здесь вообще не создавался).
+    assert [c.account.name for c in created_clients] == ["broken", "works"]
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        # Оба реальных кандидата ушли рабочему аккаунту — "broken" не
+        # отправил ничего (connect не удался), но и не заблокировал "works".
+        assert len(invites) == 2
+        assert all(i.account_id == 2 for i in invites)
+    finally:
+        invite_repository.close()
+
+
+def test_execute_normal_disconnect_still_works_after_hardening(tmp_path, caplog):
+    """Обычный успешный disconnect() (без ошибок) должен работать ровно
+    как раньше — защитный try/except вокруг disconnect() не должен ни
+    скрывать реальную отправку, ни добавлять лишний "не удалось отключить"
+    лог для штатного случая."""
+    db_path = _setup_db(tmp_path)
+    _campaign, _account = _setup_single_candidate_campaign(db_path)
+
+    created_clients: list = []
+    client_factory = _make_client_factory(created=created_clients)
+
+    with caplog.at_level("WARNING", logger="reader.inviter.service"):
+        asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    assert "Не удалось корректно отключить клиента" not in caplog.text
+
+    client = created_clients[0]
+    assert client.connected is True
+    assert client.disconnected is True
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == 1
+        assert invites[0].status == "joined"
     finally:
         invite_repository.close()
 

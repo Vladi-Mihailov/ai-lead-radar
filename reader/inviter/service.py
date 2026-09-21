@@ -1269,7 +1269,21 @@ class InviterService:
                         self._invite_repository.list_pending(account.id, campaign.id)
                     )
         finally:
-            await client.disconnect()
+            # disconnect() пишет update_state в session sqlite (см. Telethon
+            # _save_states_and_entities) — если это падает (например,
+            # session-файл временно недоступен на запись), ошибка не должна
+            # проглотить/заменить результат основной операции выше и не
+            # должна ронять весь InviterWorker (см. задачу про readonly
+            # database у @vvz982/@ib85gnat: одно необработанное исключение
+            # здесь останавливало обработку ВСЕХ следующих аккаунтов).
+            try:
+                await client.disconnect()
+            except Exception:
+                logger.exception(
+                    f"[EXECUTE]\nAccount: {account.name}\n"
+                    f"Не удалось корректно отключить клиента (disconnect) — "
+                    f"продолжаем, следующий аккаунт/кампания обрабатываются как обычно."
+                )
 
         await self._notify_account_result(campaign, account, stats, time.monotonic() - started_at)
         return stats
