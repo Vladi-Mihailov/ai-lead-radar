@@ -93,6 +93,16 @@ STEP_AWAITING_TRUSTED_CHECK_NOW_CAR_NUMBER = "awaiting_trusted_check_now_car_num
 
 PERIOD_CHOICES = (30, 90, 180, 365)
 
+# Manager-facing "📋 Мои авто" ON/OFF (см. design report про per-car
+# monitoring toggle) — "▶️ Продолжить мониторинг" после OFF: ОТДЕЛЬНЫЙ
+# набор длительностей от PERIOD_CHOICES выше (15/30/90, не 30/90/180/365) —
+# другая клавиатура (3 кнопки + "⬅️ Назад" в один столбец, см. design
+# report layout, не 2x2 grid), другой шаг/действие (продлить УЖЕ
+# существующую task-level задачу менеджера, а не создать новую подписку
+# при "➕ Добавить авто") — поэтому не переиспользует PERIOD_CHOICES/
+# STEP_AWAITING_PERIOD напрямую.
+TRUSTED_TASK_PERIOD_CHOICES = (15, 30, 90)
+
 _START_PREFIX = "/start"
 _CLAIM_PAYLOAD_PREFIX = "claim_"
 
@@ -139,6 +149,26 @@ class BotReply:
     и НЕ является доказательством авторизации: is_trusted() перепроверяется
     на каждом callback заново, а page вне диапазона клампится сервером.
 
+    trusted_tasks_page_options — (task_id, car_number, is_on) на строку
+    "📋 Мои авто" (см. design report про per-car ON/OFF toggle) — is_on
+    решает, какую переключатель-кнопку показать рядом с car_number
+    (🟢 ON/⚪ OFF, см. reader/public_bot/keyboards.py::
+    trusted_tasks_page_keyboard). task_id публичен и НЕ является
+    доказательством авторизации сам по себе — тот же принцип, что и везде
+    в этом модуле (is_trusted() + существование задачи перепроверяются
+    server-side на каждом действии).
+
+    trusted_task_off_id/trusted_task_off_page — экран "▶️ Продолжить
+    мониторинг" (см. design report) — показывается после ⚪ OFF в списке
+    ИЛИ сразу после ON -> OFF toggle (см. handle_trusted_task_toggle).
+    page — куда вернёт "⬅️ Назад" (на "📋 Мои авто", ту же страницу).
+
+    trusted_task_period_id/trusted_task_period_page — экран выбора срока
+    15/30/90 дней (см. design report, TRUSTED_TASK_PERIOD_CHOICES) — "⬅️
+    Назад" отсюда возвращает на экран "▶️ Продолжить мониторинг" (тот же
+    task_id/page, см. handle_trusted_task_toggle — переиспользуется как
+    no-op показ, задача уже OFF).
+
     my_cars_page_options/my_cars_page/my_cars_total_pages — car-centric
     "📋 Мои авто" для ОБЫЧНОГО (не-trusted) пользователя (см. design
     report про переработку UX): (subscription_id, label) для списка
@@ -182,6 +212,11 @@ class BotReply:
     trusted_stop_confirm_button_label: str | None = None
     trusted_tasks_page: int | None = None
     trusted_tasks_total_pages: int | None = None
+    trusted_tasks_page_options: list[tuple[int, str, bool]] | None = None
+    trusted_task_off_id: int | None = None
+    trusted_task_off_page: int | None = None
+    trusted_task_period_id: int | None = None
+    trusted_task_period_page: int | None = None
     my_cars_page_options: list[tuple[int, str]] | None = None
     my_cars_page: int | None = None
     my_cars_total_pages: int | None = None
@@ -390,26 +425,31 @@ class ConversationController:
 
     def _format_trusted_tasks_page_reply(self, page: int) -> BotReply:
         """"📋 Мои авто" для trusted-оператора — ОДНА страница ВСЕХ
-        активных fine_monitoring_tasks (см. design report: hard cap
-        "первые 50" убран — пагинация по _TRUSTED_TASKS_PAGE_SIZE вместо
-        него), subscription для отображения не требуется вовсе.
+        fine_monitoring_tasks, ЛЮБОГО статуса (см. design report про
+        per-car ON/OFF toggle: менеджер должен видеть и OFF-машины —
+        hard cap "первые 50" убран — пагинация по _TRUSTED_TASKS_PAGE_SIZE
+        вместо него), subscription для отображения не требуется вовсе.
 
         page — ЛЮБОЕ int (в т.ч. отрицательное/за пределами общего числа
         страниц, см. design report: "page из callback нельзя считать
         authorization") — клампится здесь, а не у вызывающего кода,
         поэтому единственная точка, где может быть баг с границами."""
-        total = self._subscriptions.count_active_tasks()
+        total = self._subscriptions.count_all_tasks()
         if total == 0:
             return BotReply(text=texts.NO_ACTIVE_TASKS_TEXT)
 
         total_pages = -(-total // _TRUSTED_TASKS_PAGE_SIZE)  # ceil division
         page = max(0, min(page, total_pages - 1))
-        tasks = self._subscriptions.list_active_tasks_page(page=page, page_size=_TRUSTED_TASKS_PAGE_SIZE)
+        tasks = self._subscriptions.list_all_tasks_page(page=page, page_size=_TRUSTED_TASKS_PAGE_SIZE)
 
+        options = [
+            (task.id, task.car_number, task.status == "active") for task in tasks
+        ]
         return BotReply(
             text=texts.format_trusted_tasks_page(tasks, page=page, total_pages=total_pages),
             trusted_tasks_page=page,
             trusted_tasks_total_pages=total_pages,
+            trusted_tasks_page_options=options,
         )
 
     def handle_trusted_tasks_page(self, page: int, *, telegram_user_id: int) -> BotReply | None:
@@ -1015,6 +1055,117 @@ class ConversationController:
         if subscription is None:
             return None
         return self._format_car_detail_reply(subscription, page)
+
+    # ---- manager-facing "📋 Мои авто" ON/OFF + "▶️ Продолжить мониторинг"
+    # 15/30/90 дней (см. design report про per-car monitoring toggle) —
+    # task-level, ПРЯМО как ⚪/⛔ ниже (fine_monitoring_tasks, subscription
+    # НЕ требуется), is_trusted() перепроверяется ЗАНОВО на каждом шаге по
+    # РЕАЛЬНОМУ telegram_user_id — task_id/days/page в callback_data
+    # публичны и НЕ являются доказательством авторизации сами по себе. ----
+
+    def handle_trusted_task_toggle(
+        self, task_id: int, page: int, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """🟢 ON / ⚪ OFF кнопка в списке (см. design report):
+          - задача сейчас ON (status='active') — выключает её (см.
+            SubscriptionService.stop_task_for_trusted_admin, тот же метод,
+            что и у ⛔, включая остановку client-подписок задачи) и
+            показывает экран "▶️ Продолжить мониторинг" с подтверждением
+            выключения;
+          - задача уже OFF — ничего не меняет, просто показывает тот же
+            экран (см. design report п.2: "⚪ OFF открывает следующий
+            экран") — ЭТО ЖЕ переиспользуется как "⬅️ Назад" с экрана
+            выбора 15/30/90 (см. keyboards.py::
+            trusted_task_period_choice_keyboard — там кнопка "⬅️ Назад"
+            кодирует ровно этот же callback).
+
+        None — не trusted, ИЛИ задача с таким task_id не существует вовсе
+        (см. SubscriptionService.get_task_for_trusted_admin — в отличие от
+        get_active_task_for_trusted_admin, здесь допустим ЛЮБОЙ статус,
+        задача просто должна существовать)."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+
+        task = self._subscriptions.get_task_for_trusted_admin(task_id)
+        if task is None:
+            return None
+
+        if task.status == "active":
+            if not self._subscriptions.stop_task_for_trusted_admin(task_id):
+                return BotReply(text=texts.CAR_ACTION_FAILED_TEXT, show_main_menu=True)
+            task = self._subscriptions.get_task_for_trusted_admin(task_id)
+            if task is None:
+                return BotReply(text=texts.CAR_ACTION_FAILED_TEXT, show_main_menu=True)
+            text = (
+                texts.format_trusted_task_turn_off_success(task.car_number)
+                + "\n\n" + texts.format_trusted_task_off_detail(task)
+            )
+        else:
+            text = texts.format_trusted_task_off_detail(task)
+
+        return BotReply(text=text, trusted_task_off_id=task.id, trusted_task_off_page=page)
+
+    def handle_trusted_task_continue(
+        self, task_id: int, page: int, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """"▶️ Продолжить мониторинг" на экране OFF-детали (см. design
+        report) — показывает выбор срока 15/30/90 дней, ЕЩЁ НИЧЕГО не
+        меняет (тот же принцип, что и у handle_my_car_delete_prompt:
+        промежуточный экран перед реальным действием). None — не trusted,
+        ИЛИ задача не существует."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+
+        task = self._subscriptions.get_task_for_trusted_admin(task_id)
+        if task is None:
+            return None
+
+        return BotReply(
+            text=texts.TRUSTED_TASK_PERIOD_PROMPT,
+            trusted_task_period_id=task.id, trusted_task_period_page=page,
+        )
+
+    def handle_trusted_task_period_choice(
+        self, task_id: int, days: int, page: int, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """Финальный шаг — 15/30/90 дней (см. design report,
+        TRUSTED_TASK_PERIOD_CHOICES): включает мониторинг ИМЕННО этой
+        задачи на выбранный срок (см. SubscriptionService.resume_task_for_
+        trusted_admin — тот же return_to_active_monitoring(), что и у
+        архивных задач, никакой отдельной реализации), затем возвращает
+        менеджера в ОБНОВЛЁННОЕ "📋 Мои авто" (та же page, см. design
+        report: "После этого вернуть менеджера в 📋 Мои авто") с
+        подтверждением ПЕРЕД списком — тот же принцип "подтверждение +
+        сразу обновлённый список в одном экране", что и у
+        handle_my_car_turn_off/on (подтверждение + карточка), только здесь
+        подтверждение + список, а не подтверждение + карточка.
+
+        None — не trusted, ИЛИ days не входит в TRUSTED_TASK_PERIOD_CHOICES
+        (defensive — keyboards.py::decode_trusted_task_period_callback уже
+        не пропускает произвольные значения, но проверяется и здесь, тот
+        же принцип "allowlist, не любое целое число", что и у
+        decode_period_callback)."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+        if days not in TRUSTED_TASK_PERIOD_CHOICES:
+            return None
+
+        resumed = self._subscriptions.resume_task_for_trusted_admin(
+            task_id, days=days, today=self._today(),
+        )
+        if resumed is None:
+            return BotReply(text=texts.CAR_ACTION_FAILED_TEXT, show_main_menu=True)
+
+        confirmation = texts.format_trusted_task_resume_success(
+            resumed.car_number, days, resumed.end_date,
+        )
+        list_reply = self._format_trusted_tasks_page_reply(page)
+        return BotReply(
+            text=confirmation + "\n\n" + list_reply.text,
+            trusted_tasks_page=list_reply.trusted_tasks_page,
+            trusted_tasks_total_pages=list_reply.trusted_tasks_total_pages,
+            trusted_tasks_page_options=list_reply.trusted_tasks_page_options,
+        )
 
     # ---- trusted-operator task-level admin (см. design report: пересмотр
     # архитектуры) — 🔎/⛔ работают НАПРЯМУЮ с fine_monitoring_tasks, без

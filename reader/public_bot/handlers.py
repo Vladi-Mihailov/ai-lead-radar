@@ -32,12 +32,17 @@ from reader.public_bot.keyboards import (
     decode_period_callback,
     decode_trusted_stop_confirm_callback,
     decode_trusted_stop_pick_callback,
+    decode_trusted_task_continue_callback,
+    decode_trusted_task_period_callback,
+    decode_trusted_task_toggle_callback,
     decode_trusted_tasks_page_callback,
     main_menu_keyboard,
     my_cars_page_keyboard,
     period_choice_keyboard,
     trusted_stop_confirm_keyboard,
     trusted_stop_options_keyboard,
+    trusted_task_off_keyboard,
+    trusted_task_period_choice_keyboard,
     trusted_tasks_page_keyboard,
     turkey_bot_link_keyboard,
 )
@@ -206,6 +211,29 @@ def register(
             await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
+        trusted_task_toggle = decode_trusted_task_toggle_callback(data)
+        if trusted_task_toggle is not None:
+            task_id, page = trusted_task_toggle
+            reply = controller.handle_trusted_task_toggle(task_id, page, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        trusted_task_continue = decode_trusted_task_continue_callback(data)
+        if trusted_task_continue is not None:
+            task_id, page = trusted_task_continue
+            reply = controller.handle_trusted_task_continue(task_id, page, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        trusted_task_period = decode_trusted_task_period_callback(data)
+        if trusted_task_period is not None:
+            task_id, days, page = trusted_task_period
+            reply = controller.handle_trusted_task_period_choice(
+                task_id, days, page, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
         trusted_stop_pick_id = decode_trusted_stop_pick_callback(data)
         if trusted_stop_pick_id is not None:
             reply = controller.handle_trusted_stop_pick(
@@ -271,7 +299,14 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False, is_trusted: bo
         )
     elif reply.trusted_tasks_page is not None:
         buttons = trusted_tasks_page_keyboard(
+            reply.trusted_tasks_page_options or [],
             page=reply.trusted_tasks_page, total_pages=reply.trusted_tasks_total_pages,
+        )
+    elif reply.trusted_task_off_id is not None:
+        buttons = trusted_task_off_keyboard(reply.trusted_task_off_id, page=reply.trusted_task_off_page)
+    elif reply.trusted_task_period_id is not None:
+        buttons = trusted_task_period_choice_keyboard(
+            reply.trusted_task_period_id, page=reply.trusted_task_period_page,
         )
     elif reply.my_cars_page_options is not None:
         # car-centric "📋 Мои авто" (см. design report про переработку

@@ -104,6 +104,22 @@ _SELECT_ACTIVE_PAGE = f"""
     LIMIT :limit OFFSET :offset
 """
 
+# Manager-facing "📋 Мои авто" ON/OFF (см. design report про per-car
+# monitoring toggle) — В ОТЛИЧИЕ от _SELECT_ACTIVE_PAGE выше, БЕЗ WHERE
+# status = 'active': менеджеру нужно видеть и остановленные/завершённые
+# задачи тоже (как ⚪ OFF), не только активные — тот же принцип, что и у
+# list_my_cars() для обычного пользователя (список показывает любой
+# статус, ON/OFF — это отдельное отображаемое состояние, а не фильтр
+# списка). ORDER BY id ASC — та же стабильная сортировка, что и у
+# _SELECT_ACTIVE_PAGE, независимая от status.
+_SELECT_ALL_PAGE = f"""
+    SELECT {_SELECT_FIELDS} FROM fine_monitoring_tasks
+    ORDER BY id ASC
+    LIMIT :limit OFFSET :offset
+"""
+
+_COUNT_ALL = "SELECT COUNT(*) FROM fine_monitoring_tasks"
+
 _SELECT_DUE_FOR_ARCHIVE_CHECK = f"""
     SELECT {_SELECT_FIELDS} FROM fine_monitoring_tasks
     WHERE archive_check_enabled = 1
@@ -332,6 +348,20 @@ class FineMonitoringTaskRepository:
             _SELECT_ACTIVE_PAGE, {"offset": offset, "limit": limit},
         ).fetchall()
         return [_row_to_task(row) for row in rows]
+
+    def list_all_page(self, *, offset: int, limit: int) -> list[FineMonitoringTask]:
+        """Как list_active_page(), но БЕЗ фильтра по status (см.
+        _SELECT_ALL_PAGE выше) — manager-facing "📋 Мои авто" ON/OFF
+        (см. design report): менеджер должен видеть и OFF-машины
+        (status='stopped'/'completed'), не только активные. count_all()
+        (см. ниже) даёт общее число для той же пагинации."""
+        rows = self._conn.execute(
+            _SELECT_ALL_PAGE, {"offset": offset, "limit": limit},
+        ).fetchall()
+        return [_row_to_task(row) for row in rows]
+
+    def count_all(self) -> int:
+        return self._conn.execute(_COUNT_ALL).fetchone()[0]
 
     def set_status(self, task_id: int, status: FineTaskStatus) -> None:
         self._conn.execute(_UPDATE_STATUS, (status, task_id))

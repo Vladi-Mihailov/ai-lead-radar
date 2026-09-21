@@ -970,9 +970,12 @@ async def test_trusted_my_cars_shows_task_without_any_subscription(trusted_fx):
     assert trusted_fx.subscription_repository.list_by_user(_TRUSTED_ID) == []
 
 
-async def test_trusted_my_cars_shows_all_active_tasks_operator_and_client_bot(trusted_fx):
-    """Явное требование: trusted видит ВСЕ active tasks — операторские И
-    клиентские, независимо от scope."""
+async def test_trusted_my_cars_shows_all_tasks_operator_and_client_bot_and_off(trusted_fx):
+    """Явное требование: trusted видит ВСЕ tasks — операторские И
+    клиентские, независимо от scope, И независимо от статуса (см. design
+    report про per-car ON/OFF toggle — completed/stopped теперь тоже
+    попадают в список, просто как ⚪ OFF, а не скрываются вовсе, см.
+    handle_trusted_task_toggle/trusted_tasks_page_options)."""
     _make_operator_task(trusted_fx, "E911EE95")
     client_task = trusted_fx.task_repository.create(
         car_number="M398YK763", label=None,
@@ -980,7 +983,7 @@ async def test_trusted_my_cars_shows_all_active_tasks_operator_and_client_bot(tr
         telegram_chat_id=_TRUSTED_ID, created_by_user_id=_TRUSTED_ID,
         monitoring_scope="client_bot",
     )
-    _make_operator_task(trusted_fx, "COMPLETED1", status="completed")
+    completed_id = _make_operator_task(trusted_fx, "COMPLETED1", status="completed")
 
     reply = await trusted_fx.controller.handle_text(
         texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
@@ -988,7 +991,10 @@ async def test_trusted_my_cars_shows_all_active_tasks_operator_and_client_bot(tr
 
     assert "E911EE95" in reply.text
     assert client_task.car_number in reply.text
-    assert "COMPLETED1" not in reply.text  # completed — не активна, не должна попасть в список
+    assert "COMPLETED1" in reply.text  # completed — теперь показывается как ⚪ OFF, не скрыт
+
+    options_by_id = {task_id: (car_number, is_on) for task_id, car_number, is_on in reply.trusted_tasks_page_options}
+    assert options_by_id[completed_id] == ("COMPLETED1", False)
 
 
 async def test_ordinary_user_my_cars_never_shows_task_only_cars(fx):
@@ -1183,6 +1189,207 @@ async def test_ordinary_user_my_cars_menu_label_never_paginates(fx):
 
     assert reply.trusted_tasks_page is None
     assert reply.trusted_tasks_total_pages is None
+
+
+# ==== manager-facing "📋 Мои авто" ON/OFF + "▶️ Продолжить мониторинг"
+# 15/30/90 дней (см. design report про per-car monitoring toggle) ====
+
+
+async def test_trusted_my_cars_shows_on_off_button_next_to_each_car(trusted_fx):
+    """1. Manager видит рядом с каждой машиной ON/OFF — trusted_tasks_page_
+    options несёт (task_id, car_number, is_on) на каждую задачу страницы."""
+    on_id = _make_operator_task(trusted_fx, "M295YB196")
+    off_id = _make_operator_task(trusted_fx, "A123AA180", status="stopped")
+
+    reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
+
+    options_by_id = {tid: (car, is_on) for tid, car, is_on in reply.trusted_tasks_page_options}
+    assert options_by_id[on_id] == ("M295YB196", True)
+    assert options_by_id[off_id] == ("A123AA180", False)
+
+
+def test_trusted_task_state_matches_real_monitoring_status(trusted_fx):
+    """2. Состояние ON/OFF соответствует реальному monitoring state —
+    'active' -> ON, 'stopped'/'completed' -> OFF (см. texts.task_monitoring_
+    state)."""
+    active_id = _make_operator_task(trusted_fx, "AA001AA")
+    stopped_id = _make_operator_task(trusted_fx, "BB002BB", status="stopped")
+    completed_id = _make_operator_task(trusted_fx, "CC003CC", status="completed")
+
+    reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
+    options_by_id = {tid: is_on for tid, _car, is_on in reply.trusted_tasks_page_options}
+
+    assert options_by_id[active_id] is True
+    assert options_by_id[stopped_id] is False
+    assert options_by_id[completed_id] is False
+
+
+def test_trusted_task_toggle_on_turns_off_and_shows_continue_screen(trusted_fx):
+    """3. ON → нажатие → OFF: handle_trusted_task_toggle на активной задаче
+    выключает мониторинг и показывает экран "▶️ Продолжить мониторинг"."""
+    task_id = _make_operator_task(trusted_fx, "M295YB196")
+
+    reply = trusted_fx.controller.handle_trusted_task_toggle(task_id, 0, telegram_user_id=_TRUSTED_ID)
+
+    assert trusted_fx.task_repository.get(task_id).status == "stopped"
+    assert reply.trusted_task_off_id == task_id
+    assert reply.trusted_task_off_page == 0
+    assert "M295YB196" in reply.text
+    assert "⚪ OFF" in reply.text
+
+
+def test_trusted_task_toggle_off_opens_continue_screen_without_changing_state(trusted_fx):
+    """4. OFF → открывается "Продолжить мониторинг" — нажатие ⚪ OFF (уже
+    выключенной задачи) НЕ меняет её статус, просто показывает тот же
+    экран."""
+    task_id = _make_operator_task(trusted_fx, "A123AA180", status="stopped")
+
+    reply = trusted_fx.controller.handle_trusted_task_toggle(task_id, 0, telegram_user_id=_TRUSTED_ID)
+
+    assert trusted_fx.task_repository.get(task_id).status == "stopped"
+    assert reply.trusted_task_off_id == task_id
+    assert "Мониторинг: ⚪ OFF" in reply.text
+    # "выключен" (turn-off confirmation) НЕ должно появляться — статус не менялся этим вызовом.
+    assert "выключен" not in reply.text
+
+
+def test_trusted_task_continue_shows_15_30_90_choice(trusted_fx):
+    """5. Далее появляется выбор 15/30/90 — "▶️ Продолжить мониторинг" на
+    OFF-экране открывает TRUSTED_TASK_PERIOD_PROMPT с task_id/page для
+    trusted_task_period_choice_keyboard."""
+    task_id = _make_operator_task(trusted_fx, "A123AA180", status="stopped")
+
+    reply = trusted_fx.controller.handle_trusted_task_continue(task_id, 0, telegram_user_id=_TRUSTED_ID)
+
+    assert reply.text == texts.TRUSTED_TASK_PERIOD_PROMPT
+    assert reply.trusted_task_period_id == task_id
+    assert reply.trusted_task_period_page == 0
+
+
+@pytest.mark.parametrize("days", [15, 30, 90])
+def test_trusted_task_period_choice_saves_period_and_turns_on(trusted_fx, days):
+    """6/7/8/9. 15/30/90 дней корректно сохраняется, задача становится ON,
+    end_date = today + N дней."""
+    task_id = _make_operator_task(trusted_fx, "M295YB196", status="stopped")
+    today = _today()
+
+    reply = trusted_fx.controller.handle_trusted_task_period_choice(
+        task_id, days, 0, telegram_user_id=_TRUSTED_ID,
+    )
+
+    task = trusted_fx.task_repository.get(task_id)
+    assert task.status == "active"
+    assert task.start_date == today
+    assert task.end_date == today + timedelta(days=days)
+    assert f"включён на {days} дней" in reply.text
+    assert f"До: {task.end_date.strftime('%d.%m.%Y')}" in reply.text
+    # Явное требование: после подтверждения менеджер возвращается в
+    # "📋 Мои авто" — там уже видно новое состояние (ON).
+    options_by_id = {tid: is_on for tid, _car, is_on in reply.trusted_tasks_page_options}
+    assert options_by_id[task_id] is True
+
+
+def test_trusted_task_period_choice_rejects_value_outside_allowlist(trusted_fx):
+    """Defensive: days не из TRUSTED_TASK_PERIOD_CHOICES (например,
+    подделанный callback) отклоняется, ничего не меняется."""
+    task_id = _make_operator_task(trusted_fx, "M295YB196", status="stopped")
+
+    reply = trusted_fx.controller.handle_trusted_task_period_choice(
+        task_id, 45, 0, telegram_user_id=_TRUSTED_ID,
+    )
+
+    assert reply is None
+    assert trusted_fx.task_repository.get(task_id).status == "stopped"
+
+
+def test_trusted_task_back_from_period_choice_returns_to_continue_screen(trusted_fx):
+    """12a. "⬅️ Назад" с экрана 15/30/90 возвращает на экран "▶️
+    Продолжить мониторинг" — keyboards.py::trusted_task_period_choice_
+    keyboard кодирует его ЧЕРЕЗ encode_trusted_task_toggle_callback (задача
+    уже OFF — повторный вызов handle_trusted_task_toggle ничего не меняет,
+    просто показывает тот же экран, см. design report)."""
+    task_id = _make_operator_task(trusted_fx, "A123AA180", status="stopped")
+
+    back_reply = trusted_fx.controller.handle_trusted_task_toggle(task_id, 0, telegram_user_id=_TRUSTED_ID)
+
+    assert trusted_fx.task_repository.get(task_id).status == "stopped"  # без изменений
+    assert back_reply.trusted_task_off_id == task_id
+    assert "Мониторинг: ⚪ OFF" in back_reply.text
+
+
+def test_trusted_task_back_from_continue_screen_returns_to_my_cars_list(trusted_fx):
+    """12b. Ещё один "⬅️ Назад" с OFF-экрана возвращает в "📋 Мои авто" —
+    keyboards.py::trusted_task_off_keyboard кодирует его через
+    encode_trusted_tasks_page_callback(page), т.е. handle_trusted_tasks_page
+    на той же странице."""
+    task_id = _make_operator_task(trusted_fx, "A123AA180", status="stopped")
+
+    list_reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
+
+    assert list_reply.trusted_tasks_page == 0
+    assert any(tid == task_id for tid, _car, _is_on in list_reply.trusted_tasks_page_options)
+
+
+def test_trusted_task_toggle_of_one_car_does_not_affect_another(trusted_fx):
+    """13. Изменение одной машины не влияет на остальные."""
+    car_a = _make_operator_task(trusted_fx, "M295YB196")
+    car_b = _make_operator_task(trusted_fx, "C196BA250")
+
+    trusted_fx.controller.handle_trusted_task_toggle(car_a, 0, telegram_user_id=_TRUSTED_ID)
+
+    assert trusted_fx.task_repository.get(car_a).status == "stopped"
+    assert trusted_fx.task_repository.get(car_b).status == "active"
+
+
+def test_trusted_task_toggle_missing_task_returns_none(trusted_fx):
+    reply = trusted_fx.controller.handle_trusted_task_toggle(999999, 0, telegram_user_id=_TRUSTED_ID)
+    assert reply is None
+
+
+def test_trusted_task_continue_missing_task_returns_none(trusted_fx):
+    reply = trusted_fx.controller.handle_trusted_task_continue(999999, 0, telegram_user_id=_TRUSTED_ID)
+    assert reply is None
+
+
+def test_trusted_task_period_choice_missing_task_returns_failure(trusted_fx):
+    reply = trusted_fx.controller.handle_trusted_task_period_choice(
+        999999, 30, 0, telegram_user_id=_TRUSTED_ID,
+    )
+    assert reply.text == texts.CAR_ACTION_FAILED_TEXT
+
+
+def test_ordinary_user_cannot_use_trusted_task_toggle(fx):
+    """14a. Обычный пользователь не получает доступ к manager-only ON/OFF
+    (is_trusted() перепроверяется заново — не влияет на обычный UX)."""
+    task_id = _make_operator_task(fx, "M295YB196")
+
+    assert fx.controller.handle_trusted_task_toggle(task_id, 0, telegram_user_id=1) is None
+    assert fx.controller.handle_trusted_task_continue(task_id, 0, telegram_user_id=1) is None
+    assert fx.controller.handle_trusted_task_period_choice(task_id, 30, 0, telegram_user_id=1) is None
+    # Задача не должна была измениться ни одним из отклонённых вызовов.
+    assert fx.task_repository.get(task_id).status == "active"
+
+
+async def test_ordinary_user_my_cars_ux_unchanged_by_manager_toggle_feature(fx):
+    """14b. Регрессия: car-centric "📋 Мои авто" обычного пользователя (ON/
+    OFF/Delete через SubscriptionService.turn_on_car/turn_off_car/
+    delete_car) не затронут — эти carts/кнопки продолжают работать через
+    ПРЕЖНИЙ, subscription-based путь, никак не связанный с task-level
+    manager toggle."""
+    outcome = await fx.service.add_car(
+        telegram_user_id=1, telegram_chat_id=1, username="alice",
+        first_name=None, last_name=None, car_number="M295YB196",
+        period_days=30, today=date(2026, 9, 3),
+    )
+
+    reply = await fx.controller.handle_text(
+        texts.MY_CARS_LABEL, chat_id=1, telegram_user_id=1, username=None,
+    )
+
+    assert reply.trusted_tasks_page is None
+    assert reply.trusted_tasks_page_options is None
+    assert reply.my_cars_page_options is not None
+    assert reply.my_cars_page_options[0][0] == outcome.subscription.id
 
 
 async def test_trusted_check_now_asks_for_car_number_not_a_list(trusted_fx):

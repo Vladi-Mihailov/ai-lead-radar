@@ -12,7 +12,16 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from reader.public_bot.keyboards import (  # noqa: E402
+    decode_trusted_task_continue_callback,
+    decode_trusted_task_period_callback,
+    decode_trusted_task_toggle_callback,
+    encode_trusted_task_continue_callback,
+    encode_trusted_task_period_callback,
+    encode_trusted_task_toggle_callback,
     main_menu_keyboard,
+    trusted_task_off_keyboard,
+    trusted_task_period_choice_keyboard,
+    trusted_tasks_page_keyboard,
     turkey_bot_link_keyboard,
 )
 from reader.public_bot.texts import (  # noqa: E402
@@ -82,7 +91,82 @@ def test_main_menu_keyboard_does_not_change_ordinary_user_buttons():
     for label in (ADD_CAR_LABEL, MY_CARS_LABEL, CHECK_NOW_LABEL):
         assert label in without
         assert label in with_trusted
+
     assert len(with_trusted) == len(without) + 2  # + STATISTICS_LABEL + STOP_LABEL
+
+
+# ==== manager-facing "📋 Мои авто" ON/OFF + "▶️ Продолжить мониторинг"
+# 15/30/90 дней (см. design report про per-car monitoring toggle) ====
+
+
+def test_trusted_task_toggle_callback_round_trips():
+    data = encode_trusted_task_toggle_callback(42, 3)
+    assert decode_trusted_task_toggle_callback(data) == (42, 3)
+
+
+def test_trusted_task_continue_callback_round_trips():
+    data = encode_trusted_task_continue_callback(42, 3)
+    assert decode_trusted_task_continue_callback(data) == (42, 3)
+
+
+def test_trusted_task_period_callback_round_trips():
+    data = encode_trusted_task_period_callback(42, 30, 3)
+    assert decode_trusted_task_period_callback(data) == (42, 30, 3)
+
+
+def test_trusted_task_period_callback_rejects_days_outside_allowlist():
+    """Тот же принцип, что и у decode_period_callback — allowlist, не
+    любое целое число (подделанный/чужой callback_data не должен
+    пройти)."""
+    forged = b"ttaskperiod:42:45:3"
+    assert decode_trusted_task_period_callback(forged) is None
+
+
+def test_trusted_task_period_callback_rejects_malformed_data():
+    assert decode_trusted_task_period_callback(b"ttaskperiod:42:30") is None
+    assert decode_trusted_task_period_callback(b"ttaskperiod:notanumber:30:3") is None
+    assert decode_trusted_task_period_callback(None) is None
+    assert decode_trusted_task_period_callback(b"somethingelse:42:30:3") is None
+
+
+def test_trusted_task_toggle_callback_does_not_collide_with_continue_prefix():
+    """Разные префиксы — decode одного никогда не путает callback другого
+    (тот же принцип "коллизий по префиксу нет", см. design report)."""
+    toggle_data = encode_trusted_task_toggle_callback(1, 0)
+    assert decode_trusted_task_continue_callback(toggle_data) is None
+
+
+def test_trusted_tasks_page_keyboard_shows_plate_and_on_off_buttons_per_row():
+    keyboard = trusted_tasks_page_keyboard(
+        [(1, "M295YB196", True), (2, "A123AA180", False)], page=0, total_pages=1,
+    )
+
+    assert len(keyboard) == 2  # без пагинации (total_pages=1)
+    row0 = [b.text for b in keyboard[0]]
+    row1 = [b.text for b in keyboard[1]]
+    assert row0 == ["M295YB196", "🟢 ON"]
+    assert row1 == ["A123AA180", "⚪ OFF"]
+
+
+def test_trusted_tasks_page_keyboard_adds_pagination_row_when_multiple_pages():
+    keyboard = trusted_tasks_page_keyboard([(1, "M295YB196", True)], page=0, total_pages=2)
+
+    assert len(keyboard) == 2  # 1 car row + 1 pagination row
+    assert len(keyboard[-1]) == 3
+
+
+def test_trusted_task_off_keyboard_has_continue_and_back():
+    keyboard = trusted_task_off_keyboard(42, page=1)
+
+    labels = [b.text for row in keyboard for b in row]
+    assert labels == ["▶️ Продолжить мониторинг", "⬅️ Назад"]
+
+
+def test_trusted_task_period_choice_keyboard_has_15_30_90_and_back():
+    keyboard = trusted_task_period_choice_keyboard(42, page=1)
+
+    labels = [b.text for row in keyboard for b in row]
+    assert labels == ["15 дней", "30 дней", "90 дней", "⬅️ Назад"]
 
 
 def test_main_menu_keyboard_contains_the_turkey_bot_link_as_a_reply_button():

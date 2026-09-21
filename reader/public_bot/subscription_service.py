@@ -837,6 +837,60 @@ class SubscriptionService:
         offset = page * page_size
         return self._task_repository.list_active_page(offset=offset, limit=page_size)
 
+    def count_all_tasks(self) -> int:
+        """Общее число ВСЕХ задач (любой status) — используется для
+        пагинации manager-facing "📋 Мои авто" ON/OFF (см. design report:
+        менеджер должен видеть и OFF-машины, не только активные), в
+        отличие от count_active_tasks() выше, который остаётся
+        потребителем ТОЛЬКО ⛔ picker'а (без изменений)."""
+        return self._task_repository.count_all()
+
+    def list_all_tasks_page(self, *, page: int, page_size: int) -> list[FineMonitoringTask]:
+        """Как list_active_tasks_page(), но БЕЗ фильтра по status (см.
+        FineMonitoringTaskRepository.list_all_page) — см. design report
+        про per-car ON/OFF toggle в "📋 Мои авто" для менеджера."""
+        offset = page * page_size
+        return self._task_repository.list_all_page(offset=offset, limit=page_size)
+
+    def get_task_for_trusted_admin(self, task_id: int) -> FineMonitoringTask | None:
+        """Как get_active_task_for_trusted_admin(), но БЕЗ требования
+        status == 'active' — используется manager-facing ON/OFF toggle
+        (см. design report): задача может быть уже OFF (stopped/
+        completed), и её всё равно нужно найти, чтобы показать экран
+        "▶️ Продолжить мониторинг"/переключить обратно на ON. None —
+        ТОЛЬКО если задача не существует вовсе."""
+        return self._task_repository.get(task_id)
+
+    def resume_task_for_trusted_admin(
+        self, task_id: int, *, days: int, today: date,
+    ) -> FineMonitoringTask | None:
+        """▶️ Продолжить мониторинг (см. design report про manager-facing
+        ON/OFF + выбор срока 15/30/90 дней) — переиспользует УЖЕ
+        существующий FineMonitoringTaskRepository.return_to_active_
+        monitoring() (тот же метод, что и у архивных задач, см. его
+        докстрок): новый период [today, today + days] БЕЗУСЛОВНО
+        перезаписывает старый (в отличие от turn_on_car() для client-
+        подписок — здесь нет "оставшегося оплаченного времени", менеджер
+        явно выбирает НОВЫЙ срок), status возвращается в 'active', архивный
+        режим (если был) выключается. Работает независимо от текущего
+        status задачи (active/stopped/completed) — идемпотентно безопасно
+        вызвать даже для уже активной задачи (просто сбросит период).
+
+        Существующие client-подписки этой задачи (если есть) НЕ трогает —
+        это отдельный, subscription-based ON/OFF слой (см. turn_on_car/
+        turn_off_car выше), вне зоны действия этого task-level действия.
+
+        None — задача не существует."""
+        task = self._task_repository.get(task_id)
+        if task is None:
+            return None
+
+        end_date = today + timedelta(days=days)
+        self._task_repository.return_to_active_monitoring(
+            task_id, start_date=today, end_date=end_date,
+        )
+        return self._task_repository.get(task_id)
+
     def get_active_task_for_trusted_admin(self, task_id: int) -> FineMonitoringTask | None:
         """None — задача не существует ИЛИ уже не 'active' (завершена/
         остановлена) — единственная server-side проверка СУЩЕСТВОВАНИЯ и

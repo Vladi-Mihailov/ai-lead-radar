@@ -7,7 +7,7 @@ FineCheckService, что использует и операторский FineJo
 """
 
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -1114,6 +1114,120 @@ def test_list_active_tasks_page_computes_offset_from_page_and_size(fx):
     assert [t.id for t in page0] == ids[0:10]
     assert [t.id for t in page1] == ids[10:20]
     assert [t.id for t in page2] == ids[20:25]
+
+
+# ---- count_all_tasks / list_all_tasks_page / get_task_for_trusted_admin /
+# resume_task_for_trusted_admin (manager-facing "📋 Мои авто" ON/OFF, см.
+# design report про per-car monitoring toggle) ----
+
+
+def test_count_all_tasks_counts_every_status(fx):
+    active = fx.task_repository.create(
+        car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    completed = fx.task_repository.create(
+        car_number="BB002BB", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    fx.task_repository.set_status(completed.id, "completed")
+
+    assert fx.service.count_all_tasks() == 2
+    assert active.status == "active"
+
+
+def test_list_all_tasks_page_includes_stopped_and_completed(fx):
+    active = fx.task_repository.create(
+        car_number="AA001AA", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    stopped = fx.task_repository.create(
+        car_number="BB002BB", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    fx.task_repository.set_status(stopped.id, "stopped")
+
+    page = fx.service.list_all_tasks_page(page=0, page_size=10)
+
+    assert [t.id for t in page] == [active.id, stopped.id]
+
+
+def test_get_task_for_trusted_admin_returns_none_for_missing_task(fx):
+    assert fx.service.get_task_for_trusted_admin(999999) is None
+
+
+def test_get_task_for_trusted_admin_returns_stopped_task(fx):
+    task = fx.task_repository.create(
+        car_number="E911EE95", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    fx.task_repository.set_status(task.id, "stopped")
+
+    found = fx.service.get_task_for_trusted_admin(task.id)
+
+    assert found is not None
+    assert found.status == "stopped"
+
+
+def test_resume_task_for_trusted_admin_sets_new_period_and_activates(fx):
+    task = fx.task_repository.create(
+        car_number="E911EE95", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    fx.task_repository.set_status(task.id, "stopped")
+
+    resumed = fx.service.resume_task_for_trusted_admin(task.id, days=30, today=date(2026, 9, 21))
+
+    assert resumed.status == "active"
+    assert resumed.start_date == date(2026, 9, 21)
+    assert resumed.end_date == date(2026, 10, 21)
+
+
+def test_resume_task_for_trusted_admin_works_from_completed_and_archived(fx):
+    """Задача, уже переведённая в архивный режим (archive_check_enabled=1,
+    см. reader/fines/archive_enrollment.py) — тот же
+    return_to_active_monitoring(), что и у обычного completed, ДОЛЖЕН
+    выключать архивный режим тоже (см. его докстрок)."""
+    task = fx.task_repository.create(
+        car_number="E911EE95", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    fx.task_repository.set_status(task.id, "completed")
+    fx.task_repository.schedule_first_archive_check(
+        task.id, next_check_at=datetime(2026, 2, 1),  # noqa: DTZ001
+    )
+
+    resumed = fx.service.resume_task_for_trusted_admin(task.id, days=15, today=date(2026, 9, 21))
+
+    assert resumed.status == "active"
+    assert resumed.archive_check_enabled is False
+    assert resumed.next_archive_check_at is None
+    assert resumed.end_date == date(2026, 10, 6)
+
+
+def test_resume_task_for_trusted_admin_returns_none_for_missing_task(fx):
+    assert fx.service.resume_task_for_trusted_admin(999999, days=30, today=date(2026, 9, 21)) is None
+
+
+def test_resume_task_for_trusted_admin_does_not_touch_other_tasks(fx):
+    """Изменение одной задачи не влияет на другие (см. design report про
+    per-car isolation)."""
+    task_a = fx.task_repository.create(
+        car_number="AA001AA", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    task_b = fx.task_repository.create(
+        car_number="BB002BB", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    fx.task_repository.set_status(task_a.id, "stopped")
+
+    fx.service.resume_task_for_trusted_admin(task_a.id, days=30, today=date(2026, 9, 21))
+
+    unchanged = fx.task_repository.get(task_b.id)
+    assert unchanged.status == "active"
+    assert unchanged.start_date == date(2026, 8, 1)
+    assert unchanged.end_date == date(2026, 12, 31)
 
 
 # ---- check_now_task_by_car_number (trusted 🔎 Проверить сейчас по

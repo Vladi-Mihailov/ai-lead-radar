@@ -363,6 +363,47 @@ async def test_task_after_end_date_is_completed_and_not_checked(tmp_path):
         fine_repo.close()
 
 
+async def test_task_resumed_by_manager_for_a_fixed_period_expires_and_is_excluded(tmp_path):
+    """10/11. Manager-facing "▶️ Продолжить мониторинг" 15/30/90 дней (см.
+    reader/public_bot/subscription_service.py::resume_task_for_trusted_
+    admin) переиспользует ровно return_to_active_monitoring() — тот же
+    примитив, что и здесь: после истечения выбранного срока задача
+    автоматически считается OFF (status != 'active', см.
+    texts.task_monitoring_state) и больше НЕ участвует в plановых
+    проверках (list_active() её не возвращает, FineJob её не запрашивает)
+    — никакой отдельной логики для manager-flow не требуется."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    try:
+        task = task_repo.create(
+            car_number="M295YB196", label=None,
+            start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+        task_repo.set_status(task.id, "stopped")  # ранее выключена менеджером
+
+        # Менеджер выбирает "15 дней" 2026-09-21 -> [2026-09-21, 2026-10-06],
+        # ровно то же, что делает resume_task_for_trusted_admin(days=15).
+        task_repo.return_to_active_monitoring(
+            task.id, start_date=date(2026, 9, 21), end_date=date(2026, 10, 6),
+        )
+        assert task_repo.get(task.id).status == "active"
+
+        provider = _FakeProvider()
+        job = _make_job(task_repo, fine_repo, provider, _FakeNotificationService())
+
+        after_expiration = datetime(2026, 10, 7, 10, 0, tzinfo=timezone.utc)
+        await job.run(after_expiration)
+
+        expired = task_repo.get(task.id)
+        assert expired.status == "completed"  # автоматически OFF
+        assert provider.requested_plates == []  # не участвует в проверке
+        assert expired.id not in [t.id for t in task_repo.list_active()]
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
 # ---- run(): архивный режим (см. reader/jobs/archive_fine_job.py) ----
 
 

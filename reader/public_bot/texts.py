@@ -70,8 +70,13 @@ CALLBACK_NOT_AUTHORIZED_TEXT = "Это действие недоступно —
 # для этих трёх пунктов меню НЕ требуется вовсе).
 NO_ACTIVE_TASKS_TEXT = "Активных задач мониторинга нет."
 # 📋 Мои авто — пагинирован (см. design report: hard cap "первые 50 из N"
-# убран, доступны ВСЕ активные задачи по 10 на страницу).
-TRUSTED_TASKS_HEADER = "📋 Все активные автомобили"
+# убран, доступны ВСЕ задачи, включая OFF, по 10 на страницу, см. design
+# report про per-car ON/OFF toggle — заголовок больше не говорит
+# "активные", т.к. список теперь показывает и остановленные/завершённые
+# задачи тоже, просто со статусом ⚪ OFF).
+TRUSTED_TASKS_HEADER = "📋 Мои авто"
+
+TRUSTED_TASK_PERIOD_PROMPT = "📅 На какой срок продолжить мониторинг?"
 TRUSTED_STOP_PICK_PROMPT = "⛔ Выберите автомобиль для остановки мониторинга:"
 TRUSTED_STOP_FAILED_TEXT = "⚠️ Не удалось остановить — попробуйте ещё раз через «⛔ Остановить мониторинг»."
 _TRUSTED_STOP_CONFIRM_PROMPT_NO_CLIENTS = "Остановить мониторинг для {car_number}?"
@@ -365,6 +370,37 @@ def format_trusted_check_now_not_found(car_number: str) -> str:
     Явное требование: ничего не добавляется автоматически, только эта
     ошибка."""
     return f"❌ Автомобиль {car_number} не найден в активном мониторинге."
+
+
+def task_monitoring_state(task: FineMonitoringTask) -> tuple[str, str]:
+    """(emoji, state) для manager-facing "📋 Мои авто" ON/OFF (см. design
+    report про per-car monitoring toggle) — task-level, В ОТЛИЧИЕ от
+    car_monitoring_state() выше (subscription-based, три состояния
+    ON/OFF/ИСТЁК): здесь только ДВА состояния, ON/OFF, ровно как в задаче
+    ("🟢 ON / ⚪ OFF", без отдельного "ИСТЁК") — status='active' САМ ПО
+    СЕБЕ и есть ON (просроченный, но ещё не подхваченный FineJob'ом active
+    — переходное состояние на секунды/минуты до следующего прогона
+    FineJob, не отдельный UI-статус, см. reader/jobs/fine_job.py)."""
+    if task.status == "active":
+        return "🟢", "ON"
+    return "⚪", "OFF"
+
+
+def format_trusted_task_off_detail(task: FineMonitoringTask) -> str:
+    """Экран "▶️ Продолжить мониторинг" (см. design report) — показывается
+    после нажатия ⚪ OFF в списке, ИЛИ сразу после ON -> OFF toggle."""
+    return f"🚗 {task.car_number}\nМониторинг: ⚪ OFF"
+
+
+def format_trusted_task_turn_off_success(car_number: str) -> str:
+    return f"⏸ Мониторинг {car_number} выключен."
+
+
+def format_trusted_task_resume_success(car_number: str, days: int, end_date: date) -> str:
+    """Подтверждение после выбора 15/30/90 дней (см. design report,
+    ТОЧНЫЙ формат из задачи: "✅ Мониторинг {car} включён на {N} дней\\nДо:
+    {дата}")."""
+    return f"✅ Мониторинг {car_number} включён на {days} дней\nДо: {_fmt_date(end_date)}"
 
 
 def format_trusted_stop_confirm_prompt(car_number: str, subscriber_count: int) -> str:

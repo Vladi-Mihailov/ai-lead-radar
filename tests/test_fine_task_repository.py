@@ -235,6 +235,53 @@ def test_list_active_page_offset_beyond_total_returns_empty(tmp_path):
         repo.close()
 
 
+def test_list_all_page_includes_inactive_tasks(tmp_path):
+    """Manager-facing "📋 Мои авто" ON/OFF (см. design report про per-car
+    monitoring toggle) — В ОТЛИЧИЕ от list_active_page, НЕ фильтрует по
+    status: completed/stopped задачи тоже должны быть видны (как ⚪ OFF)."""
+    repo = _make_repo(tmp_path)
+    try:
+        ids = _make_active_tasks(repo, 5)
+        repo.set_status(ids[2], "completed")
+        repo.set_status(ids[4], "stopped")
+
+        page = repo.list_all_page(offset=0, limit=10)
+
+        assert [t.id for t in page] == ids
+    finally:
+        repo.close()
+
+
+def test_list_all_page_returns_stable_ordered_slice(tmp_path):
+    repo = _make_repo(tmp_path)
+    try:
+        ids = _make_active_tasks(repo, 25)
+        repo.set_status(ids[10], "completed")
+
+        page0 = repo.list_all_page(offset=0, limit=10)
+        page1 = repo.list_all_page(offset=10, limit=10)
+        page2 = repo.list_all_page(offset=20, limit=10)
+
+        assert [t.id for t in page0] == ids[0:10]
+        assert [t.id for t in page1] == ids[10:20]  # completed задача остаётся на своей позиции
+        assert [t.id for t in page2] == ids[20:25]
+    finally:
+        repo.close()
+
+
+def test_count_all_counts_every_status(tmp_path):
+    repo = _make_repo(tmp_path)
+    try:
+        assert repo.count_all() == 0
+
+        ids = _make_active_tasks(repo, 3)
+        repo.set_status(ids[1], "stopped")
+
+        assert repo.count_all() == 3
+    finally:
+        repo.close()
+
+
 def test_set_status_updates_status_and_updated_at(tmp_path):
     repo = _make_repo(tmp_path)
     try:
