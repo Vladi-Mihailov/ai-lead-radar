@@ -307,6 +307,25 @@ class PublicBotSettings(BaseModel):
     payment_help_contact_username: str = "tplgee"
 
 
+class InviterAdminBotSettings(BaseModel):
+    """Закрытый control-plane бот над существующим reader/inviter/ (см.
+    reader/inviter_admin_bot/) — НЕ второй инвайтер, только управление уже
+    существующими telegram_accounts/campaigns и глобальной паузой (см.
+    reader/inviter/runtime_state_repository.py). Токен самого бота
+    (INVITER_ADMIN_BOT_TOKEN) сюда намеренно не входит — читается отдельно
+    из окружения (см. reader/inviter_admin_bot/main.py::read_bot_token),
+    никогда не через Settings, тот же принцип, что и у
+    PublicBotSettings/GESHTRAFBOT_TOKEN выше.
+
+    trusted_admin_user_ids пуст по умолчанию — без явной настройки в
+    config.yaml НИКТО не получает доступ (см. design: "⛔ Нет доступа" для
+    всех остальных) — авторизация ТОЛЬКО по numeric Telegram user_id,
+    НИКОГДА по username (тот же security-инвариант, что и у
+    trusted_operator_user_ids выше)."""
+
+    trusted_admin_user_ids: list[int] = Field(default_factory=list)
+
+
 class Settings(BaseModel):
     telegram: TelegramSettings
     app: AppSettings
@@ -316,6 +335,7 @@ class Settings(BaseModel):
     checkout: CheckoutSettings = Field(default_factory=CheckoutSettings)
     lead_ai: LeadAiSettings = Field(default_factory=LeadAiSettings)
     public_bot: PublicBotSettings = Field(default_factory=PublicBotSettings)
+    inviter_admin_bot: InviterAdminBotSettings = Field(default_factory=InviterAdminBotSettings)
 
 
 def load_settings(config_path: Path) -> Settings:
@@ -362,6 +382,7 @@ def load_settings(config_path: Path) -> Settings:
     checkout_raw = raw.get("checkout", {})
     lead_ai_raw = raw.get("lead_ai", {})
     public_bot_raw = raw.get("public_bot", {})
+    inviter_admin_bot_raw = raw.get("inviter_admin_bot", {})
 
     # payment_bank/policy_period — LEGACY (см. reader/settings.py::
     # CheckoutSettings): формат по-прежнему валидируется, чтобы не молча
@@ -550,6 +571,11 @@ def load_settings(config_path: Path) -> Settings:
                 ),
                 payment_help_contact_username=public_bot_raw.get(
                     "payment_help_contact_username", "tplgee"
+                ),
+            ),
+            inviter_admin_bot=InviterAdminBotSettings(
+                trusted_admin_user_ids=list(
+                    inviter_admin_bot_raw.get("trusted_admin_user_ids", [])
                 ),
             ),
         )

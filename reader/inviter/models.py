@@ -59,7 +59,17 @@ class TelegramAccount:
     reconcile_account_identity) — name синхронизируется с реальным текущим
     username при каждой успешной проверке идентичности, поэтому старое имя
     иначе было бы безвозвратно потеряно, включая для is_old=True записей
-    (см. задачу: "DB row 7 исторически была @Misha_Offroad")."""
+    (см. задачу: "DB row 7 исторически была @Misha_Offroad").
+
+    last_synced_at — момент последней УСПЕШНОЙ проверки identity через
+    живую сессию (fetch_telegram_identity + reconcile_account_identity,
+    см. reader/inviter/identity.py) — ОТДЕЛЬНО от last_used_at (последняя
+    реальная отправка приглашения этим аккаунтом): аккаунт можно
+    синхронизировать (см. reader/inviter_admin_bot/), ни разу не
+    использовав в этот день для приглашений, и наоборот. Добавлено ради
+    "📊 Статус"/карточки аккаунта в reader/inviter_admin_bot/ — ни один
+    существующий вызывающий код (InviterService/manage.py) его не читает
+    и не обязан задавать."""
 
     id: int
     name: str
@@ -77,6 +87,7 @@ class TelegramAccount:
     is_old: bool = False
     old_reason: str | None = None
     previous_names: list[str] = field(default_factory=list)
+    last_synced_at: datetime | None = None
 
 
 @dataclass(frozen=True)

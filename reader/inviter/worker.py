@@ -1,7 +1,12 @@
 import asyncio
 import logging
+from datetime import datetime, timezone
 
-from reader.inviter.repository import InviteCampaignRepository, TelegramAccountRepository
+from reader.inviter.repository import (
+    InviteCampaignRepository,
+    TelegramAccountRepository,
+)
+from reader.inviter.runtime_state_repository import InviterRuntimeStateRepository
 from reader.inviter.service import InviterService
 
 logger = logging.getLogger(__name__)
@@ -56,6 +61,7 @@ class InviterWorker:
         invitations_per_account_per_hour: int,
         poll_interval_seconds: float,
         shutdown_event: asyncio.Event,
+        runtime_state_repository: InviterRuntimeStateRepository | None = None,
     ) -> None:
         self._service = service
         self._campaign_repository = campaign_repository
@@ -63,6 +69,14 @@ class InviterWorker:
         self._invitations_per_account_per_hour = invitations_per_account_per_hour
         self._poll_interval_seconds = poll_interval_seconds
         self._shutdown_event = shutdown_event
+        # None (по умолчанию, как и у существующих тестов/вызывающего кода
+        # до появления reader/inviter_admin_bot/) — глобальная пауза
+        # недоступна вовсе, run_one_tick() ведёт себя БИТ В БИТ как раньше:
+        # heartbeat не пишется, inviter_enabled не проверяется. Задаётся
+        # только явно (см. reader/inviter/main.py::run_worker) — единственный
+        # способ приостановить/возобновить автоприглашения ИЗ Telegram-бота
+        # без systemctl (см. reader/inviter/runtime_state_repository.py).
+        self._runtime_state_repository = runtime_state_repository
         self._rotation_index = 0
 
     async def run_forever(self) -> None:
@@ -92,7 +106,22 @@ class InviterWorker:
         """Один тик — не более одной пары (кампания, аккаунт), следующей
         по кругу. Список enabled-пар перечитывается заново на каждом тике
         (а не кэшируется) — новый/отключённый аккаунт или кампания
-        подхватываются со следующего же тика, без перезапуска процесса."""
+        подхватываются со следующего же тика, без перезапуска процесса.
+
+        Heartbeat (record_tick) пишется ПЕРВЫМ и БЕЗУСЛОВНО, до проверки
+        inviter_enabled — "📊 Статус" в reader/inviter_admin_bot/ должен
+        видеть, что worker жив, даже пока автоприглашения приостановлены
+        (см. InviterWorker.__init__ про runtime_state_repository=None по
+        умолчанию — без него это поведение полностью отсутствует, никакой
+        БД-записи не происходит, тот же путь, что и раньше)."""
+        if self._runtime_state_repository is not None:
+            self._runtime_state_repository.record_tick(datetime.now(timezone.utc))
+            if not self._runtime_state_repository.get().inviter_enabled:
+                logger.info(
+                    "[WORKER] Автоприглашения приостановлены (inviter_enabled=false) — тик пропущен."
+                )
+                return
+
         pairs = self._enabled_pairs()
         if not pairs:
             logger.info(

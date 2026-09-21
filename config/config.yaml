@@ -206,3 +206,18 @@ public_bot:
   # trusted_operator и операторский чат этот блок не получают (см.
   # reader/public_bot/delivery_texts.py).
   payment_help_contact_username: "tplgee"
+
+inviter_admin_bot:
+  # Telegram User ID администраторов, которым доступен закрытый control-
+  # plane бот над reader/inviter/ (см. reader/inviter_admin_bot/) — любой
+  # ДРУГОЙ пользователь получает "⛔ Нет доступа" и никаких данных.
+  # ТОЛЬКО numeric id — авторизация НИКОГДА не проверяется по username.
+  # Это ОТДЕЛЬНЫЙ список от public_bot.trusted_operator_user_ids выше (не
+  # обязаны совпадать) — сейчас содержит тот же id (5712994689 —
+  # Vladimir Mihailov, см. production data/users.db: users.first_name/
+  # last_name='Vladimir'/'Mihailov', bot_known_users.telegram_username/
+  # telegram_accounts(id=4).name='@Mihailov_vm' — все три независимо
+  # подтверждают один и тот же физический человек), потому что это ровно
+  # тот же trusted operator, кому и так уже доверено управлять инвайтером.
+  trusted_admin_user_ids:
+    - 5712994689

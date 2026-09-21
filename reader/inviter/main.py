@@ -16,6 +16,7 @@ from reader.inviter.repository import (  # noqa: E402
     TelegramAccountRepository,
     UserCampaignInviteRepository,
 )
+from reader.inviter.runtime_state_repository import InviterRuntimeStateRepository  # noqa: E402
 from reader.inviter.service import InviterService, TEST_MODE_MAX_SUCCESSFUL_INVITES  # noqa: E402
 from reader.inviter.worker import InviterWorker  # noqa: E402
 from reader.logging_setup import setup_logging  # noqa: E402
@@ -203,6 +204,11 @@ async def run_worker() -> None:
     campaign_repository = InviteCampaignRepository(settings.app.users_db_file)
     invite_repository = UserCampaignInviteRepository(settings.app.users_db_file)
     user_repository = UserRepository(settings.app.users_db_file)
+    # Глобальная пауза/heartbeat (см. reader/inviter/runtime_state_repository.py
+    # и reader/inviter_admin_bot/) — единственный способ приостановить
+    # автоприглашения из Telegram-бота без systemctl. Тот же users_db_file,
+    # что и у остальных репозиториев инвайтера.
+    runtime_state_repository = InviterRuntimeStateRepository(settings.app.users_db_file)
 
     notifier = _build_operator_notifier(settings)
     await notifier.start()
@@ -221,6 +227,7 @@ async def run_worker() -> None:
             invitations_per_account_per_hour=settings.inviter.worker.invitations_per_account_per_hour,
             poll_interval_seconds=settings.inviter.worker.poll_interval_seconds,
             shutdown_event=shutdown_event,
+            runtime_state_repository=runtime_state_repository,
         )
         await worker.run_forever()
         logger.info("Инвайтер (worker): получен сигнал остановки — завершение работы.")
@@ -230,6 +237,7 @@ async def run_worker() -> None:
         campaign_repository.close()
         invite_repository.close()
         user_repository.close()
+        runtime_state_repository.close()
 
 
 def main() -> None:

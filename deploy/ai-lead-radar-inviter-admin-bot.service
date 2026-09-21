@@ -1,0 +1,42 @@
+[Unit]
+Description=AI Lead Radar Inviter Admin Bot
+After=network-online.target
+Wants=network-online.target
+
+# ЧЕРНОВИК — НЕ установлен и НЕ запущен на production (см. задачу
+# "Создать Telegram Admin Bot для управления существующим Inviter":
+# "STOP CONDITIONS: НЕ deploy"). Подготовлен здесь только как эталон для
+# будущей установки — copy в /etc/systemd/system/, затем systemctl
+# daemon-reload/enable/start, ТОЛЬКО отдельным, явным решением.
+#
+# User/Group/WorkingDirectory — ТЕ ЖЕ, что и у ai-lead-radar.service/
+# ai-lead-radar-inviter.service/ai-lead-radar-geshtrafbot.service
+# (см. `systemctl cat ai-lead-radar-inviter.service` на сервере) — тот же
+# venv/аккаунт (leadradar), тот же users.db (та же БД, что и у
+# reader.inviter.main --worker: telegram_accounts/campaigns/
+# inviter_runtime_state — общие таблицы, см. reader/inviter/
+# runtime_state_repository.py), отдельный процесс, отдельная .session
+# (data/sessions/inviter_admin_bot.session — НЕ session ни одного из
+# аккаунтов инвайтера, см. reader/inviter_admin_bot/main.py). .env —
+# тот же файл, что и у остальных процессов (WorkingDirectory совпадает,
+# load_dotenv() ищет .env в cwd) — переменная INVITER_ADMIN_BOT_TOKEN
+# (см. .env.example) должна быть заполнена токеном НОВОГО бота у
+# @BotFather ДО первого запуска, а config/config.yaml::
+# inviter_admin_bot.trusted_admin_user_ids — списком numeric Telegram
+# user_id доверенных администраторов (см. config.yaml, сейчас пусто).
+[Service]
+Type=simple
+User=leadradar
+Group=leadradar
+WorkingDirectory=/home/leadradar/ai-lead-radar
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/leadradar/.venv/bin/python -m reader.inviter_admin_bot.main
+
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

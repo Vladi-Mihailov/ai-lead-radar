@@ -53,6 +53,11 @@ _TELEGRAM_ACCOUNTS_COLUMN_MIGRATIONS = {
     "is_old": "ALTER TABLE telegram_accounts ADD COLUMN is_old INTEGER NOT NULL DEFAULT 0",
     "old_reason": "ALTER TABLE telegram_accounts ADD COLUMN old_reason TEXT",
     "previous_names": "ALTER TABLE telegram_accounts ADD COLUMN previous_names TEXT",
+    # Момент последней успешной проверки identity через живую сессию (см.
+    # TelegramAccount.last_synced_at) — добавлено ради "📊 Статус"/карточки
+    # аккаунта в reader/inviter_admin_bot/, ни один существующий вызывающий
+    # код его не читает/не обязан задавать (NULL — обратная совместимость).
+    "last_synced_at": "ALTER TABLE telegram_accounts ADD COLUMN last_synced_at TIMESTAMP",
 }
 
 _INVITE_CAMPAIGNS_SCHEMA = """
@@ -301,6 +306,7 @@ class TelegramAccountRepository:
         "daily_limit", "enabled", "last_used_at",
         "blocked_until", "blocked_reason", "verify_membership",
         "telegram_user_id", "is_old", "old_reason", "previous_names",
+        "last_synced_at",
     )
 
     def __init__(self, db_path: Path):
@@ -377,6 +383,8 @@ class TelegramAccountRepository:
                 fields["last_used_at"] = _isoformat(fields["last_used_at"])
             if "blocked_until" in fields:
                 fields["blocked_until"] = _isoformat(fields["blocked_until"])
+            if "last_synced_at" in fields:
+                fields["last_synced_at"] = _isoformat(fields["last_synced_at"])
             if "previous_names" in fields:
                 fields["previous_names"] = _format_previous_names(fields["previous_names"] or [])
             assignments = ", ".join(f"{column} = :{column}" for column in fields)
@@ -396,7 +404,8 @@ class TelegramAccountRepository:
             """
             SELECT id, name, phone, session_name, session_path, daily_limit,
                    enabled, created_at, last_used_at, blocked_until, blocked_reason,
-                   verify_membership, telegram_user_id, is_old, old_reason, previous_names
+                   verify_membership, telegram_user_id, is_old, old_reason, previous_names,
+                   last_synced_at
             FROM telegram_accounts WHERE id = ?
             """,
             (account_id,),
@@ -408,7 +417,8 @@ class TelegramAccountRepository:
             """
             SELECT id, name, phone, session_name, session_path, daily_limit,
                    enabled, created_at, last_used_at, blocked_until, blocked_reason,
-                   verify_membership, telegram_user_id, is_old, old_reason, previous_names
+                   verify_membership, telegram_user_id, is_old, old_reason, previous_names,
+                   last_synced_at
             FROM telegram_accounts ORDER BY id
             """
         ).fetchall()
@@ -423,6 +433,7 @@ def _row_to_account(row) -> TelegramAccount:
         id_, name, phone, session_name, session_path, daily_limit,
         enabled, created_at, last_used_at, blocked_until, blocked_reason,
         verify_membership, telegram_user_id, is_old, old_reason, previous_names,
+        last_synced_at,
     ) = row
     return TelegramAccount(
         id=id_,
@@ -441,6 +452,7 @@ def _row_to_account(row) -> TelegramAccount:
         is_old=bool(is_old),
         old_reason=old_reason,
         previous_names=_parse_previous_names(previous_names),
+        last_synced_at=_parse_datetime(last_synced_at),
     )
 
 

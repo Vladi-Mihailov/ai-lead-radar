@@ -17,6 +17,9 @@ from reader.inviter.repository import (  # noqa: E402
     InviteCampaignRepository,
     TelegramAccountRepository,
 )
+from reader.inviter.runtime_state_repository import (
+    InviterRuntimeStateRepository,  # noqa: E402
+)
 from reader.inviter.worker import InviterWorker  # noqa: E402
 
 
@@ -310,6 +313,123 @@ def test_new_worker_instance_after_restart_attempts_only_one_pair_not_a_burst(tm
     finally:
         campaign_repository.close()
         account_repository.close()
+
+
+# ---- runtime_state_repository — глобальная пауза (см.
+# reader/inviter/runtime_state_repository.py и reader/inviter_admin_bot/) ----
+
+
+def test_run_one_tick_without_runtime_state_repository_behaves_exactly_as_before(tmp_path):
+    """runtime_state_repository=None (значение по умолчанию, как и у ВСЕХ
+    существующих тестов выше в этом файле) — поведение БИТ В БИТ как до
+    появления reader/inviter_admin_bot/: ни heartbeat не пишется, ни
+    inviter_enabled не проверяется."""
+    campaign_repository, account_repository = _make_repos(tmp_path)
+    try:
+        campaign_repository.create(name="Campaign", keyword="осаго", target_chat="@t")
+        account_repository.create(
+            name="Account1", phone="+995500000001", session_name="a1", session_path="a1.session",
+        )
+        service = _FakeWorkerService()
+        worker = _make_worker(service, campaign_repository, account_repository)
+
+        asyncio.run(worker.run_one_tick())
+
+        assert len(service.calls) == 1
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+
+def test_run_one_tick_skips_invitations_when_globally_paused(tmp_path):
+    """13/14. inviter_enabled=false — worker НЕ выполняет ни одной
+    попытки приглашения (run_one_worker_attempt вообще не вызывается),
+    независимо от того, сколько enabled campaigns/accounts есть."""
+    campaign_repository, account_repository = _make_repos(tmp_path)
+    runtime_state_repository = InviterRuntimeStateRepository(tmp_path / "inviter.db")
+    try:
+        campaign_repository.create(name="Campaign", keyword="осаго", target_chat="@t")
+        account_repository.create(
+            name="Account1", phone="+995500000001", session_name="a1", session_path="a1.session",
+        )
+        runtime_state_repository.set_enabled(False)
+
+        service = _FakeWorkerService()
+        worker = InviterWorker(
+            service, campaign_repository, account_repository,
+            invitations_per_account_per_hour=2, poll_interval_seconds=600,
+            shutdown_event=asyncio.Event(),
+            runtime_state_repository=runtime_state_repository,
+        )
+
+        asyncio.run(worker.run_one_tick())
+        asyncio.run(worker.run_one_tick())
+
+        assert service.calls == []
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+        runtime_state_repository.close()
+
+
+def test_run_one_tick_records_heartbeat_even_while_paused(tmp_path):
+    """"Worker остаётся running" (см. design report) — heartbeat
+    (last_tick_at) должен обновляться, даже пока автоприглашения
+    приостановлены, иначе "📊 Статус" ошибочно показал бы worker мёртвым."""
+    campaign_repository, account_repository = _make_repos(tmp_path)
+    runtime_state_repository = InviterRuntimeStateRepository(tmp_path / "inviter.db")
+    try:
+        runtime_state_repository.set_enabled(False)
+        assert runtime_state_repository.get().last_tick_at is None
+
+        service = _FakeWorkerService()
+        worker = InviterWorker(
+            service, campaign_repository, account_repository,
+            invitations_per_account_per_hour=2, poll_interval_seconds=600,
+            shutdown_event=asyncio.Event(),
+            runtime_state_repository=runtime_state_repository,
+        )
+
+        asyncio.run(worker.run_one_tick())
+
+        assert runtime_state_repository.get().last_tick_at is not None
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+        runtime_state_repository.close()
+
+
+def test_run_one_tick_resumes_invitations_after_re_enabling(tmp_path):
+    """▶️ Запустить после ⏸ Приостановить — следующий тик снова
+    выполняет попытки приглашения, без перезапуска процесса worker'а."""
+    campaign_repository, account_repository = _make_repos(tmp_path)
+    runtime_state_repository = InviterRuntimeStateRepository(tmp_path / "inviter.db")
+    try:
+        campaign_repository.create(name="Campaign", keyword="осаго", target_chat="@t")
+        account_repository.create(
+            name="Account1", phone="+995500000001", session_name="a1", session_path="a1.session",
+        )
+        runtime_state_repository.set_enabled(False)
+
+        service = _FakeWorkerService()
+        worker = InviterWorker(
+            service, campaign_repository, account_repository,
+            invitations_per_account_per_hour=2, poll_interval_seconds=600,
+            shutdown_event=asyncio.Event(),
+            runtime_state_repository=runtime_state_repository,
+        )
+
+        asyncio.run(worker.run_one_tick())
+        assert service.calls == []
+
+        runtime_state_repository.set_enabled(True)
+        asyncio.run(worker.run_one_tick())
+
+        assert len(service.calls) == 1
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+        runtime_state_repository.close()
 
 
 # ---- run_forever() — graceful shutdown ----
