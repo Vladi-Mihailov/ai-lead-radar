@@ -151,22 +151,23 @@ class BotReply:
 
     trusted_tasks_page_options — (task_id, car_number, is_on, end_date) на
     строку "📋 Мои авто" (см. design report про per-car ON/OFF toggle) —
-    is_on решает, какую переключатель-кнопку показать рядом с car_number
-    (🟢 ON/⚪ OFF, см. reader/public_bot/keyboards.py::
-    trusted_tasks_page_keyboard). task_id публичен и НЕ является
-    доказательством авторизации сам по себе — тот же принцип, что и везде
-    в этом модуле (is_trusted() + существование задачи перепроверяются
-    server-side на каждом действии). Список БЕЗ текстового перечня машин
-    (см. design report: Telegram не позволяет inline-кнопку справа от
-    строки текста) — номер/ON-OFF каждой машины ТОЛЬКО в этих кнопках, а
-    не в reply.text. end_date — короткая "· до ДД.ММ" прямо в левой
-    кнопке (см. design report "после переделки списка пропал период
-    мониторинга") — ТОЛЬКО день/месяц, БЕЗ года и БЕЗ start_date (кнопка
-    иначе становится слишком длинной) — полный период по-прежнему в
-    карточке машины (см. texts.format_trusted_task_detail).
-    FineMonitoringTask.end_date — NOT NULL (см. reader/fines/
-    task_repository.py::_SCHEMA), поэтому этот элемент кортежа всегда
-    date, никогда None.
+    is_on + end_date решают, что показать в ПРАВОЙ кнопке (см.
+    reader/public_bot/keyboards.py::trusted_tasks_page_keyboard/
+    _format_trusted_task_toggle_label): "🟢 до ДД.ММ" для ON, просто "⚪"
+    для OFF (см. design report "переделываем строки": длинный текст в
+    ЛЕВОЙ кнопке обрезался Telegram'ом — период переехал в правую кнопку,
+    левая теперь ТОЛЬКО голый car_number, без 🚗 и без даты; слова ON/OFF
+    убраны совсем; для OFF дата не показывается вовсе). task_id публичен и
+    НЕ является доказательством авторизации сам по себе — тот же принцип,
+    что и везде в этом модуле (is_trusted() + существование задачи
+    перепроверяются server-side на каждом действии). Список БЕЗ
+    текстового перечня машин (см. design report: Telegram не позволяет
+    inline-кнопку справа от строки текста) — номер/период/ON-OFF каждой
+    машины ТОЛЬКО в этих кнопках, а не в reply.text. Полный период
+    (start_date — end_date) по-прежнему только в карточке машины (см.
+    texts.format_trusted_task_detail). FineMonitoringTask.end_date —
+    NOT NULL (см. reader/fines/task_repository.py::_SCHEMA), поэтому этот
+    элемент кортежа всегда date, никогда None.
 
     trusted_task_detail_id/trusted_task_detail_page — карточка ОДНОЙ
     машины (см. design report, format_trusted_task_detail) — период/

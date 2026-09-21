@@ -35,6 +35,10 @@ from reader.public_bot.conversation import (  # noqa: E402
     ConversationController,
 )
 from reader.public_bot.conversation_state_repository import BotConversationStateRepository  # noqa: E402
+from reader.public_bot.keyboards import (  # noqa: E402
+    encode_trusted_task_open_callback,
+    trusted_tasks_page_keyboard,
+)
 from reader.public_bot.known_users_repository import BotKnownUsersRepository  # noqa: E402
 from reader.public_bot.statistics_service import BotStatisticsService  # noqa: E402
 from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
@@ -1237,12 +1241,12 @@ async def test_trusted_my_cars_shows_on_off_button_next_to_each_car(trusted_fx):
     assert options_by_id[off_id] == ("A123AA180", False)
 
 
-def test_trusted_my_cars_options_carry_end_date_for_the_left_button(trusted_fx):
-    """Явное требование задачи: "После переделки списка пропал период
-    мониторинга. Добавь период прямо в ЛЕВУЮ кнопку автомобиля" —
-    end_date каждой задачи (ON и OFF одинаково — "последний сохранённый
-    период") доступен через trusted_tasks_page_options для построения
-    "· до ДД.ММ" (см. keyboards.py::_format_trusted_task_button_label)."""
+def test_trusted_my_cars_options_carry_end_date_for_the_right_button(trusted_fx):
+    """Явное требование задачи: "Добавь период" — end_date каждой задачи
+    (ON и OFF одинаково — "последний сохранённый период") доступен через
+    trusted_tasks_page_options для построения ПРАВОЙ кнопки "🟢 до ДД.ММ"
+    (см. keyboards.py::_format_trusted_task_toggle_label — для OFF дата в
+    саму кнопку не идёт, но данные в options есть у обеих)."""
     on_id = _make_operator_task(trusted_fx, "K892AC126")  # end_date по умолчанию 2026-12-31
     off_id = _make_operator_task(trusted_fx, "A123AA180", status="stopped")
 
@@ -1251,6 +1255,36 @@ def test_trusted_my_cars_options_carry_end_date_for_the_left_button(trusted_fx):
     ends_by_id = {tid: end for tid, _car, _is_on, end in reply.trusted_tasks_page_options}
     assert ends_by_id[on_id] == date(2026, 12, 31)
     assert ends_by_id[off_id] == date(2026, 12, 31)  # OFF: последний сохранённый период
+
+
+def test_trusted_my_cars_renders_exact_labels_from_the_task(trusted_fx):
+    """Явное требование задачи ("Обновить тесты под точные labels"):
+    ON:  left = "Y111CA18",  right = "🟢 до 20.12"
+    OFF: left = "B641XE89",  right = "⚪"
+    Сквозной тест — реальная задача в БД -> controller -> реальная
+    keyboards.trusted_tasks_page_keyboard(), а не только сырые данные."""
+    on_task = trusted_fx.task_repository.create(
+        car_number="Y111CA18", label=None,
+        start_date=date(2026, 6, 20), end_date=date(2026, 12, 20),
+        telegram_chat_id=-100999, created_by_user_id=111,
+    )
+    off_task = trusted_fx.task_repository.create(
+        car_number="B641XE89", label=None,
+        start_date=date(2026, 2, 8), end_date=date(2026, 8, 8),
+        telegram_chat_id=-100999, created_by_user_id=111,
+    )
+    trusted_fx.task_repository.set_status(off_task.id, "stopped")
+
+    reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
+    keyboard = trusted_tasks_page_keyboard(
+        reply.trusted_tasks_page_options, page=0, total_pages=reply.trusted_tasks_total_pages,
+    )
+    rows_by_open_callback = {row[0].data: row for row in keyboard}
+
+    on_row = rows_by_open_callback[encode_trusted_task_open_callback(on_task.id, 0)]
+    off_row = rows_by_open_callback[encode_trusted_task_open_callback(off_task.id, 0)]
+    assert (on_row[0].text, on_row[1].text) == ("Y111CA18", "🟢 до 20.12")
+    assert (off_row[0].text, off_row[1].text) == ("B641XE89", "⚪")
 
 
 def test_trusted_task_state_matches_real_monitoring_status(trusted_fx):
@@ -1379,9 +1413,18 @@ def test_trusted_task_period_choice_saves_period_and_turns_on(trusted_fx, days):
     assert f"До: {task.end_date.strftime('%d.%m.%Y')}" in reply.text
     # Явное требование: после подтверждения менеджер возвращается в
     # "📋 Мои авто" — там уже видно новое состояние (ON) И новую дату
-    # (пример из задачи: "выбрали 30 дней -> [🚗 ... · до 21.10] [🟢 ON]").
+    # (пример из задачи: "выбрали 30 дней -> [Y111CA18] [🟢 до 21.10]").
     options_by_id = {tid: (is_on, end) for tid, _car, is_on, end in reply.trusted_tasks_page_options}
     assert options_by_id[task_id] == (True, task.end_date)
+
+    # Явное требование: "Проверить также, что после resume end_date сразу
+    # появляется в зелёной кнопке" — рендерим РЕАЛЬНУЮ клавиатуру из тех
+    # же options, что вернул controller, а не только сырые данные выше.
+    rendered_keyboard = trusted_tasks_page_keyboard(
+        reply.trusted_tasks_page_options, page=reply.trusted_tasks_page, total_pages=reply.trusted_tasks_total_pages,
+    )
+    right_labels = {row[0].data: row[1].text for row in rendered_keyboard if len(row) == 2}
+    assert right_labels[encode_trusted_task_open_callback(task_id, 0)] == f"🟢 до {task.end_date.strftime('%d.%m')}"
 
 
 def test_trusted_task_period_choice_rejects_value_outside_allowlist(trusted_fx):
