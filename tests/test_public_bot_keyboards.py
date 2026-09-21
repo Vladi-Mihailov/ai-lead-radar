@@ -6,6 +6,7 @@
 """
 
 import sys
+from datetime import date
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -141,32 +142,67 @@ def test_trusted_task_toggle_callback_does_not_collide_with_continue_prefix():
 
 def test_trusted_tasks_page_keyboard_shows_plate_and_on_off_buttons_per_row():
     """Явное требование задачи: каждая машина — строка из ДВУХ кнопок,
-    "🚗 {номер}" (открывает карточку) + 🟢 ON/⚪ OFF — список БОЛЬШЕ НЕ
-    дублируется текстом (см. design report: Telegram не позволяет
-    inline-кнопку справа от строки текста)."""
+    "🚗 {номер} · до ДД.ММ" (открывает карточку) + 🟢 ON/⚪ OFF — список
+    БОЛЬШЕ НЕ дублируется текстом (см. design report: Telegram не
+    позволяет inline-кнопку справа от строки текста)."""
     keyboard = trusted_tasks_page_keyboard(
-        [(1, "M295YB196", True), (2, "A123AA180", False)], page=0, total_pages=1,
+        [
+            (1, "M295YB196", True, date(2026, 9, 4)),
+            (2, "A123AA180", False, date(2026, 10, 21)),
+        ],
+        page=0, total_pages=1,
     )
 
     assert len(keyboard) == 2  # без пагинации (total_pages=1)
     row0 = [b.text for b in keyboard[0]]
     row1 = [b.text for b in keyboard[1]]
-    assert row0 == ["🚗 M295YB196", "🟢 ON"]
-    assert row1 == ["🚗 A123AA180", "⚪ OFF"]
+    assert row0 == ["🚗 M295YB196 · до 04.09", "🟢 ON"]
+    assert row1 == ["🚗 A123AA180 · до 21.10", "⚪ OFF"]
+
+
+def test_trusted_tasks_page_keyboard_end_date_label_has_no_year_and_no_start_date():
+    """Явное требование задачи: "не выводить полный период
+    04.08.2026-04.09.2026 — кнопка станет слишком длинной. В списке
+    достаточно конечной даты: · до DD.MM" — год и start_date НЕ должны
+    появляться в кнопке ни в каком виде."""
+    keyboard = trusted_tasks_page_keyboard(
+        [(1, "K892AC126", True, date(2026, 9, 4))], page=0, total_pages=1,
+    )
+
+    label = keyboard[0][0].text
+    assert label == "🚗 K892AC126 · до 04.09"
+    assert "2026" not in label
+    assert "04.08" not in label  # start_date не должен просачиваться в кнопку
+
+
+def test_trusted_tasks_page_keyboard_off_car_shows_last_saved_end_date():
+    """OFF-машина показывает последний сохранённый период — тот же
+    end_date, что и был у неё в last active-состоянии (отдельного поля
+    для "последнего сохранённого периода" нет и не нужно)."""
+    keyboard = trusted_tasks_page_keyboard(
+        [(2, "K892AC126", False, date(2026, 9, 4))], page=0, total_pages=1,
+    )
+
+    assert keyboard[0][0].text == "🚗 K892AC126 · до 04.09"
+    assert keyboard[0][1].text == "⚪ OFF"
 
 
 def test_trusted_tasks_page_keyboard_plate_button_opens_task_detail():
     """Кнопка-номер больше НЕ no-op (как раньше) — кодирует
     encode_trusted_task_open_callback(task_id, page), открывающий
     карточку этой конкретной машины."""
-    keyboard = trusted_tasks_page_keyboard([(42, "M295YB196", True)], page=3, total_pages=1)
+    keyboard = trusted_tasks_page_keyboard(
+        [(42, "M295YB196", True, date(2026, 9, 4))], page=3, total_pages=1,
+    )
 
     plate_button = keyboard[0][0]
     assert decode_trusted_task_open_callback(plate_button.data) == (42, 3)
 
 
 def test_trusted_tasks_page_keyboard_adds_pagination_row_when_multiple_pages():
-    keyboard = trusted_tasks_page_keyboard([(1, "M295YB196", True)], page=0, total_pages=2)
+    keyboard = trusted_tasks_page_keyboard(
+        [(1, "M295YB196", True, date(2026, 9, 4))], page=0, total_pages=2,
+    )
 
     assert len(keyboard) == 2  # 1 car row + 1 pagination row
     assert len(keyboard[-1]) == 3

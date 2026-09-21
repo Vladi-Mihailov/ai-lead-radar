@@ -609,7 +609,7 @@ async def test_trusted_my_cars_shows_all_active_tasks_not_subscriptions(trusted_
     )
 
     assert reply.text.startswith(texts.TRUSTED_TASKS_HEADER)
-    assert any(car == "M295YB196" for _tid, car, _is_on in reply.trusted_tasks_page_options)
+    assert any(car == "M295YB196" for _tid, car, _is_on, _end in reply.trusted_tasks_page_options)
     assert reply.my_cars_page_options is None  # task-level, не car-centric
 
 
@@ -968,7 +968,7 @@ async def test_trusted_my_cars_shows_task_without_any_subscription(trusted_fx):
 
     # Список — чистая inline keyboard (см. design report про переработку
     # экрана), номер машины теперь в trusted_tasks_page_options, не в тексте.
-    assert any(car == "E911EE95" for _tid, car, _is_on in reply.trusted_tasks_page_options)
+    assert any(car == "E911EE95" for _tid, car, _is_on, _end in reply.trusted_tasks_page_options)
     assert trusted_fx.subscription_repository.list_by_user(_TRUSTED_ID) == []
 
 
@@ -993,12 +993,15 @@ async def test_trusted_my_cars_shows_all_tasks_operator_and_client_bot_and_off(t
 
     # Список — чистая inline keyboard (см. design report), номера машин —
     # ТОЛЬКО в trusted_tasks_page_options, не в тексте сообщения.
-    cars_shown = {car for _tid, car, _is_on in reply.trusted_tasks_page_options}
+    cars_shown = {car for _tid, car, _is_on, _end in reply.trusted_tasks_page_options}
     assert "E911EE95" in cars_shown
     assert client_task.car_number in cars_shown
     assert "COMPLETED1" in cars_shown  # completed — теперь показывается как ⚪ OFF, не скрыт
 
-    options_by_id = {task_id: (car_number, is_on) for task_id, car_number, is_on in reply.trusted_tasks_page_options}
+    options_by_id = {
+        task_id: (car_number, is_on)
+        for task_id, car_number, is_on, _end in reply.trusted_tasks_page_options
+    }
     assert options_by_id[completed_id] == ("COMPLETED1", False)
 
 
@@ -1050,7 +1053,7 @@ def _cars_on_page(reply) -> list[str]:
     report про переработку "📋 Мои авто" в чистую inline keyboard —
     список больше НЕ дублируется текстом, единственный источник —
     trusted_tasks_page_options)."""
-    return [car for _task_id, car, _is_on in reply.trusted_tasks_page_options]
+    return [car for _task_id, car, _is_on, _end in reply.trusted_tasks_page_options]
 
 
 def test_trusted_my_cars_shows_10_tasks_per_page(trusted_fx):
@@ -1229,9 +1232,25 @@ async def test_trusted_my_cars_shows_on_off_button_next_to_each_car(trusted_fx):
 
     reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
 
-    options_by_id = {tid: (car, is_on) for tid, car, is_on in reply.trusted_tasks_page_options}
+    options_by_id = {tid: (car, is_on) for tid, car, is_on, _end in reply.trusted_tasks_page_options}
     assert options_by_id[on_id] == ("M295YB196", True)
     assert options_by_id[off_id] == ("A123AA180", False)
+
+
+def test_trusted_my_cars_options_carry_end_date_for_the_left_button(trusted_fx):
+    """Явное требование задачи: "После переделки списка пропал период
+    мониторинга. Добавь период прямо в ЛЕВУЮ кнопку автомобиля" —
+    end_date каждой задачи (ON и OFF одинаково — "последний сохранённый
+    период") доступен через trusted_tasks_page_options для построения
+    "· до ДД.ММ" (см. keyboards.py::_format_trusted_task_button_label)."""
+    on_id = _make_operator_task(trusted_fx, "K892AC126")  # end_date по умолчанию 2026-12-31
+    off_id = _make_operator_task(trusted_fx, "A123AA180", status="stopped")
+
+    reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
+
+    ends_by_id = {tid: end for tid, _car, _is_on, end in reply.trusted_tasks_page_options}
+    assert ends_by_id[on_id] == date(2026, 12, 31)
+    assert ends_by_id[off_id] == date(2026, 12, 31)  # OFF: последний сохранённый период
 
 
 def test_trusted_task_state_matches_real_monitoring_status(trusted_fx):
@@ -1243,7 +1262,7 @@ def test_trusted_task_state_matches_real_monitoring_status(trusted_fx):
     completed_id = _make_operator_task(trusted_fx, "CC003CC", status="completed")
 
     reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
-    options_by_id = {tid: is_on for tid, _car, is_on in reply.trusted_tasks_page_options}
+    options_by_id = {tid: is_on for tid, _car, is_on, _end in reply.trusted_tasks_page_options}
 
     assert options_by_id[active_id] is True
     assert options_by_id[stopped_id] is False
@@ -1359,9 +1378,10 @@ def test_trusted_task_period_choice_saves_period_and_turns_on(trusted_fx, days):
     assert f"включён на {days} дней" in reply.text
     assert f"До: {task.end_date.strftime('%d.%m.%Y')}" in reply.text
     # Явное требование: после подтверждения менеджер возвращается в
-    # "📋 Мои авто" — там уже видно новое состояние (ON).
-    options_by_id = {tid: is_on for tid, _car, is_on in reply.trusted_tasks_page_options}
-    assert options_by_id[task_id] is True
+    # "📋 Мои авто" — там уже видно новое состояние (ON) И новую дату
+    # (пример из задачи: "выбрали 30 дней -> [🚗 ... · до 21.10] [🟢 ON]").
+    options_by_id = {tid: (is_on, end) for tid, _car, is_on, end in reply.trusted_tasks_page_options}
+    assert options_by_id[task_id] == (True, task.end_date)
 
 
 def test_trusted_task_period_choice_rejects_value_outside_allowlist(trusted_fx):
@@ -1402,7 +1422,7 @@ def test_trusted_task_back_from_continue_screen_returns_to_my_cars_list(trusted_
     list_reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
 
     assert list_reply.trusted_tasks_page == 0
-    assert any(tid == task_id for tid, _car, _is_on in list_reply.trusted_tasks_page_options)
+    assert any(tid == task_id for tid, _car, _is_on, _end in list_reply.trusted_tasks_page_options)
 
 
 def test_trusted_task_toggle_of_one_car_does_not_affect_another(trusted_fx):

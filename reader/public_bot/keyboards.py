@@ -30,6 +30,8 @@ page в my-car-* callback'ах — ТОЛЬКО для навигации (ку�
 идентификатор ресурса и не доказательство чего-либо.
 """
 
+from datetime import date
+
 from telethon import Button
 
 from reader.public_bot.conversation import PERIOD_CHOICES, TRUSTED_TASK_PERIOD_CHOICES
@@ -413,30 +415,44 @@ def decode_trusted_task_period_callback(data: bytes | None) -> tuple[int, int, i
     return task_id, days, page
 
 
+def _format_trusted_task_button_label(car_number: str, end_date: date) -> str:
+    """"🚗 {номер} · до ДД.ММ" (см. design report "после переделки списка
+    пропал период мониторинга") — ТОЛЬКО день/месяц конечной даты, БЕЗ
+    года и БЕЗ start_date (полный период — в карточке машины, см.
+    texts.format_trusted_task_detail): кнопка иначе становится слишком
+    длинной. end_date — NOT NULL в fine_monitoring_tasks, показывается
+    всегда, независимо от ON/OFF ("последний сохранённый период" для OFF
+    — тот же самый end_date, отдельного поля для него нет и не нужно)."""
+    return f"🚗 {car_number} · до {end_date.strftime('%d.%m')}"
+
+
 def trusted_tasks_page_keyboard(
-    options: list[tuple[int, str, bool]], *, page: int, total_pages: int,
+    options: list[tuple[int, str, bool, date]], *, page: int, total_pages: int,
 ) -> list[list[Button]]:
     """Manager-facing "📋 Мои авто" (см. design report про per-car
     monitoring toggle + "убрать текстовый перечень, список машин — ТОЛЬКО
     inline keyboard, Telegram не позволяет кнопку справа от строки
-    текста") — options: (task_id, car_number, is_on), ДВЕ кнопки на
-    строку: "🚗 {car_number}" открывает карточку этой машины (период/
-    последняя проверка, см. encode_trusted_task_open_callback/
-    ConversationController.handle_trusted_task_open/texts.
-    format_trusted_task_detail) и 🟢 ON/⚪ OFF-переключатель (см.
-    encode_trusted_task_toggle_callback).
+    текста") — options: (task_id, car_number, is_on, end_date), ДВЕ
+    кнопки на строку: "🚗 {car_number} · до ДД.ММ" открывает карточку этой
+    машины (полный период/последняя проверка, см.
+    encode_trusted_task_open_callback/ConversationController.
+    handle_trusted_task_open/texts.format_trusted_task_detail) и 🟢 ON/
+    ⚪ OFF-переключатель (см. encode_trusted_task_toggle_callback).
 
     [◀️ Назад] [N / M] [Вперёд ▶️] — пагинация тем же приёмом, что и
     раньше: Back на первой странице и Next на последней — no-op (кламп к
     той же странице), средняя кнопка-индикатор — тоже no-op."""
     rows = [
         [
-            Button.inline(f"🚗 {car_number}", encode_trusted_task_open_callback(task_id, page)),
+            Button.inline(
+                _format_trusted_task_button_label(car_number, end_date),
+                encode_trusted_task_open_callback(task_id, page),
+            ),
             Button.inline(
                 "🟢 ON" if is_on else "⚪ OFF", encode_trusted_task_toggle_callback(task_id, page),
             ),
         ]
-        for task_id, car_number, is_on in options
+        for task_id, car_number, is_on, end_date in options
     ]
     if total_pages > 1:
         back_page = max(page - 1, 0)

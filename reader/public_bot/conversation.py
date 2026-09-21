@@ -149,9 +149,9 @@ class BotReply:
     и НЕ является доказательством авторизации: is_trusted() перепроверяется
     на каждом callback заново, а page вне диапазона клампится сервером.
 
-    trusted_tasks_page_options — (task_id, car_number, is_on) на строку
-    "📋 Мои авто" (см. design report про per-car ON/OFF toggle) — is_on
-    решает, какую переключатель-кнопку показать рядом с car_number
+    trusted_tasks_page_options — (task_id, car_number, is_on, end_date) на
+    строку "📋 Мои авто" (см. design report про per-car ON/OFF toggle) —
+    is_on решает, какую переключатель-кнопку показать рядом с car_number
     (🟢 ON/⚪ OFF, см. reader/public_bot/keyboards.py::
     trusted_tasks_page_keyboard). task_id публичен и НЕ является
     доказательством авторизации сам по себе — тот же принцип, что и везде
@@ -159,7 +159,14 @@ class BotReply:
     server-side на каждом действии). Список БЕЗ текстового перечня машин
     (см. design report: Telegram не позволяет inline-кнопку справа от
     строки текста) — номер/ON-OFF каждой машины ТОЛЬКО в этих кнопках, а
-    не в reply.text.
+    не в reply.text. end_date — короткая "· до ДД.ММ" прямо в левой
+    кнопке (см. design report "после переделки списка пропал период
+    мониторинга") — ТОЛЬКО день/месяц, БЕЗ года и БЕЗ start_date (кнопка
+    иначе становится слишком длинной) — полный период по-прежнему в
+    карточке машины (см. texts.format_trusted_task_detail).
+    FineMonitoringTask.end_date — NOT NULL (см. reader/fines/
+    task_repository.py::_SCHEMA), поэтому этот элемент кортежа всегда
+    date, никогда None.
 
     trusted_task_detail_id/trusted_task_detail_page — карточка ОДНОЙ
     машины (см. design report, format_trusted_task_detail) — период/
@@ -220,7 +227,7 @@ class BotReply:
     trusted_stop_confirm_button_label: str | None = None
     trusted_tasks_page: int | None = None
     trusted_tasks_total_pages: int | None = None
-    trusted_tasks_page_options: list[tuple[int, str, bool]] | None = None
+    trusted_tasks_page_options: list[tuple[int, str, bool, date]] | None = None
     trusted_task_detail_id: int | None = None
     trusted_task_detail_page: int | None = None
     trusted_task_off_id: int | None = None
@@ -453,7 +460,7 @@ class ConversationController:
         tasks = self._subscriptions.list_all_tasks_page(page=page, page_size=_TRUSTED_TASKS_PAGE_SIZE)
 
         options = [
-            (task.id, task.car_number, task.status == "active") for task in tasks
+            (task.id, task.car_number, task.status == "active", task.end_date) for task in tasks
         ]
         return BotReply(
             text=texts.format_trusted_tasks_page(tasks, page=page, total_pages=total_pages),
