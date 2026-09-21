@@ -341,8 +341,16 @@ def format_delete_confirm_prompt(car_number: str) -> str:
     )
 
 
-def _format_trusted_task_line(task: FineMonitoringTask) -> str:
+def format_trusted_task_detail(task: FineMonitoringTask) -> str:
+    """Карточка одной машины (см. design report про "убрать текстовый
+    перечень из списка, показывать в карточке по нажатию на номер") —
+    открывается по нажатию на кнопку-номер в списке "📋 Мои авто" (см.
+    keyboards.py::trusted_tasks_page_keyboard/encode_trusted_task_open_
+    callback). ON/OFF + период + последняя проверка — та же информация,
+    что раньше была видна прямо в списке, теперь ТОЛЬКО здесь."""
+    emoji, state = task_monitoring_state(task)
     lines = [f"🚗 {task.car_number}" + (f" ({task.label})" if task.label else "")]
+    lines.append(f"Мониторинг: {emoji} {state}")
     lines.append(f"📅 {_fmt_date(task.start_date)} — {_fmt_date(task.end_date)}")
     if task.last_checked_at is not None:
         lines.append(f"🔎 Последняя проверка: {_fmt_date(task.last_checked_at.date())}")
@@ -353,15 +361,23 @@ def _format_trusted_task_line(task: FineMonitoringTask) -> str:
 
 def format_trusted_tasks_page(tasks: list[FineMonitoringTask], *, page: int, total_pages: int) -> str:
     """"📋 Мои авто" для trusted-оператора — ОДНА страница (0-indexed page)
-    из ВСЕХ активных fine_monitoring_tasks (см. design report: hard cap
-    "первые 50 из N" убран — все задачи доступны через пагинацию, 10 на
-    страницу). Показ "Страница N из M" — 1-indexed для человека."""
+    из ВСЕХ fine_monitoring_tasks (см. design report: hard cap "первые 50
+    из N" убран — все задачи доступны через пагинацию, 10 на страницу).
+    Показ "Страница N из M" — 1-indexed для человека.
+
+    БЕЗ текстового перечня машин (см. design report про переработку этого
+    экрана в чистую inline keyboard — Telegram не позволяет разместить
+    inline-кнопку справа от строки обычного текста, поэтому номер/ON-OFF
+    каждой машины — ТОЛЬКО кнопки, см. keyboards.py::
+    trusted_tasks_page_keyboard, а не текст здесь): период/последняя
+    проверка конкретной машины теперь смотрят в её карточке (см.
+    format_trusted_task_detail), а не в этом общем списке. tasks
+    используется ТОЛЬКО для "список пуст" — держит тот же сигнатуру
+    вызова, что и раньше, чтобы не трогать вызывающий код лишний раз."""
     if not tasks:
         return NO_ACTIVE_TASKS_TEXT
 
-    blocks = [_format_trusted_task_line(task) for task in tasks]
-    header = f"{TRUSTED_TASKS_HEADER}\nСтраница {page + 1} из {total_pages}"
-    return header + "\n\n" + "\n\n".join(blocks)
+    return f"{TRUSTED_TASKS_HEADER}\nСтраница {page + 1} из {total_pages}"
 
 
 def format_trusted_check_now_not_found(car_number: str) -> str:

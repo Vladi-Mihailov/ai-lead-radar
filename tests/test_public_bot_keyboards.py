@@ -13,12 +13,15 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from reader.public_bot.keyboards import (  # noqa: E402
     decode_trusted_task_continue_callback,
+    decode_trusted_task_open_callback,
     decode_trusted_task_period_callback,
     decode_trusted_task_toggle_callback,
     encode_trusted_task_continue_callback,
+    encode_trusted_task_open_callback,
     encode_trusted_task_period_callback,
     encode_trusted_task_toggle_callback,
     main_menu_keyboard,
+    trusted_task_detail_keyboard,
     trusted_task_off_keyboard,
     trusted_task_period_choice_keyboard,
     trusted_tasks_page_keyboard,
@@ -137,6 +140,10 @@ def test_trusted_task_toggle_callback_does_not_collide_with_continue_prefix():
 
 
 def test_trusted_tasks_page_keyboard_shows_plate_and_on_off_buttons_per_row():
+    """Явное требование задачи: каждая машина — строка из ДВУХ кнопок,
+    "🚗 {номер}" (открывает карточку) + 🟢 ON/⚪ OFF — список БОЛЬШЕ НЕ
+    дублируется текстом (см. design report: Telegram не позволяет
+    inline-кнопку справа от строки текста)."""
     keyboard = trusted_tasks_page_keyboard(
         [(1, "M295YB196", True), (2, "A123AA180", False)], page=0, total_pages=1,
     )
@@ -144,8 +151,18 @@ def test_trusted_tasks_page_keyboard_shows_plate_and_on_off_buttons_per_row():
     assert len(keyboard) == 2  # без пагинации (total_pages=1)
     row0 = [b.text for b in keyboard[0]]
     row1 = [b.text for b in keyboard[1]]
-    assert row0 == ["M295YB196", "🟢 ON"]
-    assert row1 == ["A123AA180", "⚪ OFF"]
+    assert row0 == ["🚗 M295YB196", "🟢 ON"]
+    assert row1 == ["🚗 A123AA180", "⚪ OFF"]
+
+
+def test_trusted_tasks_page_keyboard_plate_button_opens_task_detail():
+    """Кнопка-номер больше НЕ no-op (как раньше) — кодирует
+    encode_trusted_task_open_callback(task_id, page), открывающий
+    карточку этой конкретной машины."""
+    keyboard = trusted_tasks_page_keyboard([(42, "M295YB196", True)], page=3, total_pages=1)
+
+    plate_button = keyboard[0][0]
+    assert decode_trusted_task_open_callback(plate_button.data) == (42, 3)
 
 
 def test_trusted_tasks_page_keyboard_adds_pagination_row_when_multiple_pages():
@@ -153,6 +170,18 @@ def test_trusted_tasks_page_keyboard_adds_pagination_row_when_multiple_pages():
 
     assert len(keyboard) == 2  # 1 car row + 1 pagination row
     assert len(keyboard[-1]) == 3
+
+
+def test_trusted_task_detail_keyboard_has_only_back():
+    keyboard = trusted_task_detail_keyboard(page=1)
+
+    labels = [b.text for row in keyboard for b in row]
+    assert labels == ["⬅️ Назад"]
+
+
+def test_trusted_task_open_callback_round_trips():
+    data = encode_trusted_task_open_callback(42, 3)
+    assert decode_trusted_task_open_callback(data) == (42, 3)
 
 
 def test_trusted_task_off_keyboard_has_continue_and_back():

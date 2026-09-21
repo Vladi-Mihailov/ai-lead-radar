@@ -33,6 +33,7 @@ from reader.public_bot.keyboards import (
     decode_trusted_stop_confirm_callback,
     decode_trusted_stop_pick_callback,
     decode_trusted_task_continue_callback,
+    decode_trusted_task_open_callback,
     decode_trusted_task_period_callback,
     decode_trusted_task_toggle_callback,
     decode_trusted_tasks_page_callback,
@@ -41,6 +42,7 @@ from reader.public_bot.keyboards import (
     period_choice_keyboard,
     trusted_stop_confirm_keyboard,
     trusted_stop_options_keyboard,
+    trusted_task_detail_keyboard,
     trusted_task_off_keyboard,
     trusted_task_period_choice_keyboard,
     trusted_tasks_page_keyboard,
@@ -211,6 +213,13 @@ def register(
             await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
+        trusted_task_open = decode_trusted_task_open_callback(data)
+        if trusted_task_open is not None:
+            task_id, page = trusted_task_open
+            reply = controller.handle_trusted_task_open(task_id, page, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
         trusted_task_toggle = decode_trusted_task_toggle_callback(data)
         if trusted_task_toggle is not None:
             task_id, page = trusted_task_toggle
@@ -302,6 +311,8 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False, is_trusted: bo
             reply.trusted_tasks_page_options or [],
             page=reply.trusted_tasks_page, total_pages=reply.trusted_tasks_total_pages,
         )
+    elif reply.trusted_task_detail_id is not None:
+        buttons = trusted_task_detail_keyboard(page=reply.trusted_task_detail_page)
     elif reply.trusted_task_off_id is not None:
         buttons = trusted_task_off_keyboard(reply.trusted_task_off_id, page=reply.trusted_task_off_page)
     elif reply.trusted_task_period_id is not None:

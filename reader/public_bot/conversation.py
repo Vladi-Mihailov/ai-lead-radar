@@ -156,7 +156,15 @@ class BotReply:
     trusted_tasks_page_keyboard). task_id публичен и НЕ является
     доказательством авторизации сам по себе — тот же принцип, что и везде
     в этом модуле (is_trusted() + существование задачи перепроверяются
-    server-side на каждом действии).
+    server-side на каждом действии). Список БЕЗ текстового перечня машин
+    (см. design report: Telegram не позволяет inline-кнопку справа от
+    строки текста) — номер/ON-OFF каждой машины ТОЛЬКО в этих кнопках, а
+    не в reply.text.
+
+    trusted_task_detail_id/trusted_task_detail_page — карточка ОДНОЙ
+    машины (см. design report, format_trusted_task_detail) — период/
+    последняя проверка, открывается нажатием на кнопку-номер в списке (см.
+    handle_trusted_task_open). page — куда вернёт "⬅️ Назад".
 
     trusted_task_off_id/trusted_task_off_page — экран "▶️ Продолжить
     мониторинг" (см. design report) — показывается после ⚪ OFF в списке
@@ -213,6 +221,8 @@ class BotReply:
     trusted_tasks_page: int | None = None
     trusted_tasks_total_pages: int | None = None
     trusted_tasks_page_options: list[tuple[int, str, bool]] | None = None
+    trusted_task_detail_id: int | None = None
+    trusted_task_detail_page: int | None = None
     trusted_task_off_id: int | None = None
     trusted_task_off_page: int | None = None
     trusted_task_period_id: int | None = None
@@ -1062,6 +1072,28 @@ class ConversationController:
     # НЕ требуется), is_trusted() перепроверяется ЗАНОВО на каждом шаге по
     # РЕАЛЬНОМУ telegram_user_id — task_id/days/page в callback_data
     # публичны и НЕ являются доказательством авторизации сами по себе. ----
+
+    def handle_trusted_task_open(
+        self, task_id: int, page: int, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """Кнопка-номер машины в списке (см. design report про
+        переработку "📋 Мои авто" в чистую inline keyboard) — открывает
+        карточку ЭТОЙ машины (период/последняя проверка/ON-OFF, см.
+        texts.format_trusted_task_detail) — та же информация, что раньше
+        была видна прямо в списке текстом, теперь ТОЛЬКО здесь. Ничего не
+        меняет, чисто read-only экран. None — не trusted, ИЛИ задача не
+        существует."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+
+        task = self._subscriptions.get_task_for_trusted_admin(task_id)
+        if task is None:
+            return None
+
+        return BotReply(
+            text=texts.format_trusted_task_detail(task),
+            trusted_task_detail_id=task.id, trusted_task_detail_page=page,
+        )
 
     def handle_trusted_task_toggle(
         self, task_id: int, page: int, *, telegram_user_id: int,

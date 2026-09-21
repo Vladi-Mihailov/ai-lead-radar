@@ -73,6 +73,7 @@ _TRUSTED_TASKS_PAGE_PREFIX = b"ttaskspage:"
 # нет, см. _decode_id/_decode_id_page). task_id публичен, авторизация —
 # ИСКЛЮЧИТЕЛЬНО server-side (is_trusted() + задача существует), тот же
 # принцип, что и везде в этом модуле.
+_TRUSTED_TASK_OPEN_PREFIX = b"ttaskopen:"
 _TRUSTED_TASK_TOGGLE_PREFIX = b"ttasktoggle:"
 _TRUSTED_TASK_CONTINUE_PREFIX = b"ttaskcontinue:"
 _TRUSTED_TASK_PERIOD_PREFIX = b"ttaskperiod:"
@@ -365,6 +366,14 @@ def decode_trusted_tasks_page_callback(data: bytes | None) -> int | None:
     return _decode_id(data, _TRUSTED_TASKS_PAGE_PREFIX)
 
 
+def encode_trusted_task_open_callback(task_id: int, page: int) -> bytes:
+    return _encode_id_page(_TRUSTED_TASK_OPEN_PREFIX, task_id, page)
+
+
+def decode_trusted_task_open_callback(data: bytes | None) -> tuple[int, int] | None:
+    return _decode_id_page(data, _TRUSTED_TASK_OPEN_PREFIX)
+
+
 def encode_trusted_task_toggle_callback(task_id: int, page: int) -> bytes:
     return _encode_id_page(_TRUSTED_TASK_TOGGLE_PREFIX, task_id, page)
 
@@ -408,18 +417,21 @@ def trusted_tasks_page_keyboard(
     options: list[tuple[int, str, bool]], *, page: int, total_pages: int,
 ) -> list[list[Button]]:
     """Manager-facing "📋 Мои авто" (см. design report про per-car
-    monitoring toggle) — options: (task_id, car_number, is_on), ДВЕ
-    кнопки на строку: номер авто (сам по себе — no-op, кодирует ту же
-    page, тот же приём, что и у средней кнопки-индикатора пагинации ниже —
-    "остаётся отдельной кнопкой, как сейчас", см. design report) и
-    🟢 ON/⚪ OFF-переключатель (см. encode_trusted_task_toggle_callback).
+    monitoring toggle + "убрать текстовый перечень, список машин — ТОЛЬКО
+    inline keyboard, Telegram не позволяет кнопку справа от строки
+    текста") — options: (task_id, car_number, is_on), ДВЕ кнопки на
+    строку: "🚗 {car_number}" открывает карточку этой машины (период/
+    последняя проверка, см. encode_trusted_task_open_callback/
+    ConversationController.handle_trusted_task_open/texts.
+    format_trusted_task_detail) и 🟢 ON/⚪ OFF-переключатель (см.
+    encode_trusted_task_toggle_callback).
 
     [◀️ Назад] [N / M] [Вперёд ▶️] — пагинация тем же приёмом, что и
     раньше: Back на первой странице и Next на последней — no-op (кламп к
     той же странице), средняя кнопка-индикатор — тоже no-op."""
     rows = [
         [
-            Button.inline(car_number, encode_trusted_tasks_page_callback(page)),
+            Button.inline(f"🚗 {car_number}", encode_trusted_task_open_callback(task_id, page)),
             Button.inline(
                 "🟢 ON" if is_on else "⚪ OFF", encode_trusted_task_toggle_callback(task_id, page),
             ),
@@ -435,6 +447,12 @@ def trusted_tasks_page_keyboard(
             Button.inline("Вперёд ▶️", encode_trusted_tasks_page_callback(next_page)),
         ])
     return rows
+
+
+def trusted_task_detail_keyboard(*, page: int) -> list[list[Button]]:
+    """Карточка одной машины (см. design report) — read-only, единственное
+    действие — "⬅️ Назад" на "📋 Мои авто" (ту же page)."""
+    return [[Button.inline(BACK_BUTTON_LABEL, encode_trusted_tasks_page_callback(page))]]
 
 
 def trusted_task_off_keyboard(task_id: int, *, page: int) -> list[list[Button]]:

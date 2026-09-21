@@ -609,7 +609,7 @@ async def test_trusted_my_cars_shows_all_active_tasks_not_subscriptions(trusted_
     )
 
     assert reply.text.startswith(texts.TRUSTED_TASKS_HEADER)
-    assert "M295YB196" in reply.text
+    assert any(car == "M295YB196" for _tid, car, _is_on in reply.trusted_tasks_page_options)
     assert reply.my_cars_page_options is None  # task-level, не car-centric
 
 
@@ -966,7 +966,9 @@ async def test_trusted_my_cars_shows_task_without_any_subscription(trusted_fx):
         texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert "E911EE95" in reply.text
+    # Список — чистая inline keyboard (см. design report про переработку
+    # экрана), номер машины теперь в trusted_tasks_page_options, не в тексте.
+    assert any(car == "E911EE95" for _tid, car, _is_on in reply.trusted_tasks_page_options)
     assert trusted_fx.subscription_repository.list_by_user(_TRUSTED_ID) == []
 
 
@@ -989,9 +991,12 @@ async def test_trusted_my_cars_shows_all_tasks_operator_and_client_bot_and_off(t
         texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert "E911EE95" in reply.text
-    assert client_task.car_number in reply.text
-    assert "COMPLETED1" in reply.text  # completed — теперь показывается как ⚪ OFF, не скрыт
+    # Список — чистая inline keyboard (см. design report), номера машин —
+    # ТОЛЬКО в trusted_tasks_page_options, не в тексте сообщения.
+    cars_shown = {car for _tid, car, _is_on in reply.trusted_tasks_page_options}
+    assert "E911EE95" in cars_shown
+    assert client_task.car_number in cars_shown
+    assert "COMPLETED1" in cars_shown  # completed — теперь показывается как ⚪ OFF, не скрыт
 
     options_by_id = {task_id: (car_number, is_on) for task_id, car_number, is_on in reply.trusted_tasks_page_options}
     assert options_by_id[completed_id] == ("COMPLETED1", False)
@@ -1040,12 +1045,20 @@ async def test_trusted_my_cars_paginates_250_active_tasks_into_25_pages(trusted_
     assert "Страница 1 из 25" in reply.text
 
 
+def _cars_on_page(reply) -> list[str]:
+    """Номера машин, показанные кнопками текущей страницы (см. design
+    report про переработку "📋 Мои авто" в чистую inline keyboard —
+    список больше НЕ дублируется текстом, единственный источник —
+    trusted_tasks_page_options)."""
+    return [car for _task_id, car, _is_on in reply.trusted_tasks_page_options]
+
+
 def test_trusted_my_cars_shows_10_tasks_per_page(trusted_fx):
     car_numbers = _make_many_tasks(trusted_fx, 250)
 
     reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
 
-    shown = [c for c in car_numbers if c in reply.text]
+    shown = _cars_on_page(reply)
     assert len(shown) == 10
     assert shown == car_numbers[:10]
 
@@ -1056,9 +1069,9 @@ def test_trusted_my_cars_first_page_content(trusted_fx):
     reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
 
     assert "Страница 1 из 25" in reply.text
-    for c in car_numbers[:10]:
-        assert c in reply.text
-    assert car_numbers[10] not in reply.text
+    shown = _cars_on_page(reply)
+    assert shown == car_numbers[:10]
+    assert car_numbers[10] not in shown
 
 
 def test_trusted_my_cars_middle_page_content(trusted_fx):
@@ -1067,10 +1080,10 @@ def test_trusted_my_cars_middle_page_content(trusted_fx):
     reply = trusted_fx.controller.handle_trusted_tasks_page(12, telegram_user_id=_TRUSTED_ID)
 
     assert "Страница 13 из 25" in reply.text
-    for c in car_numbers[120:130]:
-        assert c in reply.text
-    assert car_numbers[119] not in reply.text
-    assert car_numbers[130] not in reply.text
+    shown = _cars_on_page(reply)
+    assert shown == car_numbers[120:130]
+    assert car_numbers[119] not in shown
+    assert car_numbers[130] not in shown
 
 
 def test_trusted_my_cars_last_page_content_exact_multiple(trusted_fx):
@@ -1081,8 +1094,7 @@ def test_trusted_my_cars_last_page_content_exact_multiple(trusted_fx):
     reply = trusted_fx.controller.handle_trusted_tasks_page(24, telegram_user_id=_TRUSTED_ID)
 
     assert "Страница 25 из 25" in reply.text
-    for c in car_numbers[240:250]:
-        assert c in reply.text
+    assert _cars_on_page(reply) == car_numbers[240:250]
 
 
 def test_trusted_my_cars_last_incomplete_page_content(trusted_fx):
@@ -1093,8 +1105,22 @@ def test_trusted_my_cars_last_incomplete_page_content(trusted_fx):
 
     assert reply.trusted_tasks_total_pages == 21
     assert "Страница 21 из 21" in reply.text
-    for c in car_numbers[200:205]:
-        assert c in reply.text
+    assert _cars_on_page(reply) == car_numbers[200:205]
+
+
+def test_trusted_my_cars_list_text_has_no_car_details_anymore(trusted_fx):
+    """Явное требование задачи: убрать из текста сообщения 📅 период и 🔎
+    последнюю проверку каждой машины — теперь эта информация ТОЛЬКО в
+    карточке машины (см. handle_trusted_task_open), список — чистый
+    заголовок + пагинация."""
+    _make_operator_task(trusted_fx, "H331HA763")
+
+    reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
+
+    assert "H331HA763" not in reply.text
+    assert "📅" not in reply.text
+    assert "🔎" not in reply.text
+    assert reply.text == f"{texts.TRUSTED_TASKS_HEADER}\nСтраница 1 из 1"
 
 
 def test_trusted_my_cars_next_moves_forward_one_page(trusted_fx):
@@ -1222,6 +1248,55 @@ def test_trusted_task_state_matches_real_monitoring_status(trusted_fx):
     assert options_by_id[active_id] is True
     assert options_by_id[stopped_id] is False
     assert options_by_id[completed_id] is False
+
+
+def test_trusted_task_open_shows_car_detail_card(trusted_fx):
+    """Кнопка-номер машины в списке открывает карточку с периодом/ON-OFF —
+    ровно та информация, что раньше была видна текстом прямо в списке
+    (см. design report про переработку экрана)."""
+    task_id = _make_operator_task(trusted_fx, "H331HA763")
+
+    reply = trusted_fx.controller.handle_trusted_task_open(task_id, 0, telegram_user_id=_TRUSTED_ID)
+
+    assert reply.trusted_task_detail_id == task_id
+    assert reply.trusted_task_detail_page == 0
+    assert "🚗 H331HA763" in reply.text
+    assert "Мониторинг: 🟢 ON" in reply.text
+    assert "📅 01.08.2026 — 31.12.2026" in reply.text
+    assert "🔎 Ещё не проверялась" in reply.text
+
+
+def test_trusted_task_open_shows_off_status_and_last_check(trusted_fx):
+    task_id = _make_operator_task(trusted_fx, "A123AA180", status="stopped")
+    trusted_fx.task_repository.record_check_result(task_id, last_check_status="ok", last_error=None)
+
+    reply = trusted_fx.controller.handle_trusted_task_open(task_id, 0, telegram_user_id=_TRUSTED_ID)
+
+    assert "Мониторинг: ⚪ OFF" in reply.text
+    assert "🔎 Последняя проверка:" in reply.text
+
+
+def test_trusted_task_open_missing_task_returns_none(trusted_fx):
+    reply = trusted_fx.controller.handle_trusted_task_open(999999, 0, telegram_user_id=_TRUSTED_ID)
+    assert reply is None
+
+
+def test_trusted_task_open_rejects_non_trusted_user(fx):
+    task_id = _make_operator_task(fx, "H331HA763")
+    reply = fx.controller.handle_trusted_task_open(task_id, 0, telegram_user_id=1)
+    assert reply is None
+
+
+def test_trusted_task_open_of_one_car_does_not_affect_another(trusted_fx):
+    """Открытие карточки — read-only, не может повлиять ни на эту, ни на
+    другую машину."""
+    car_a = _make_operator_task(trusted_fx, "M295YB196")
+    car_b = _make_operator_task(trusted_fx, "C196BA250", status="stopped")
+
+    trusted_fx.controller.handle_trusted_task_open(car_a, 0, telegram_user_id=_TRUSTED_ID)
+
+    assert trusted_fx.task_repository.get(car_a).status == "active"
+    assert trusted_fx.task_repository.get(car_b).status == "stopped"
 
 
 def test_trusted_task_toggle_on_turns_off_and_shows_continue_screen(trusted_fx):
