@@ -376,3 +376,105 @@ def test_status_snapshot_reflects_todays_invite_counts(fx):
     assert snapshot.failed_today == 1
     assert snapshot.campaign_name == "Страхование"
     assert snapshot.campaign_target_chat == "@car_ins_georgia"
+
+
+# ---- ⚙️ Лимиты: список для "⚙️ Лимиты" (daily_limit, не enabled) ----
+
+
+def test_list_accounts_for_limits_shows_daily_limit(fx):
+    _make_account(fx, name="@vladimihailov", telegram_user_id=1, daily_limit=15)
+    _make_account(fx, name="@vvz982", telegram_user_id=2, daily_limit=25, enabled=False)
+
+    entries = fx.service.list_accounts_for_limits()
+
+    limits_by_name = {e.display_name: e.daily_limit for e in entries}
+    assert limits_by_name == {"@vladimihailov": 15, "@vvz982": 25}
+
+
+def test_list_accounts_for_limits_reflects_updated_value(fx):
+    account = _make_account(fx, daily_limit=15)
+
+    fx.service.set_daily_limit(account.id, 20)
+    entries = fx.service.list_accounts_for_limits()
+
+    assert entries[0].daily_limit == 20
+
+
+def test_list_accounts_for_limits_empty_when_no_accounts(fx):
+    assert fx.service.list_accounts_for_limits() == []
+
+
+def test_list_accounts_for_limits_missing_username_falls_back_to_telegram_id(fx):
+    fx.accounts.create(
+        name="tg_995500000001", phone="+995500000001", session_name="tg_995500000001",
+        session_path=str(fx.db_path.parent / "sessions" / "tg_995500000001"),
+        telegram_user_id=123456789,
+    )
+
+    entries = fx.service.list_accounts_for_limits()
+
+    assert entries[0].display_name == "Telegram ID 123456789"
+
+
+# ---- 📊 Статус: список per-account (enabled/blocked раздельно) ----
+
+
+def test_list_account_statuses_enabled_no_block(fx):
+    _make_account(fx, name="@vvz982", telegram_user_id=1, enabled=True)
+
+    entries = fx.service.list_account_statuses()
+
+    assert entries[0].display_name == "@vvz982"
+    assert entries[0].enabled is True
+    assert entries[0].is_blocked is False
+
+
+def test_list_account_statuses_disabled_no_block(fx):
+    _make_account(fx, name="@Mihailov_vm", telegram_user_id=1, enabled=False)
+
+    entries = fx.service.list_account_statuses()
+
+    assert entries[0].enabled is False
+    assert entries[0].is_blocked is False
+
+
+def test_list_account_statuses_blocked_until_future_is_blocked(fx):
+    account = _make_account(fx, name="@wwww86w", telegram_user_id=1, enabled=True)
+    future = datetime.now(timezone.utc) + timedelta(hours=2)
+    fx.accounts.update(account.id, blocked_until=future, blocked_reason="peer_flood")
+
+    entries = fx.service.list_account_statuses()
+
+    assert entries[0].is_blocked is True
+    assert entries[0].blocked_reason == "peer_flood"
+    assert entries[0].blocked_until == future
+
+
+def test_list_account_statuses_blocked_until_past_is_not_blocked(fx):
+    """blocked_until уже прошёл -> is_blocked=False, даже если
+    blocked_reason остался в БД (см. design: "показывать как Не
+    заблокирован")."""
+    account = _make_account(fx, name="@vvz982", telegram_user_id=1, enabled=True)
+    past = datetime.now(timezone.utc) - timedelta(hours=2)
+    fx.accounts.update(account.id, blocked_until=past, blocked_reason="peer_flood")
+
+    entries = fx.service.list_account_statuses()
+
+    assert entries[0].is_blocked is False
+    # blocked_reason остаётся в возвращаемых данных (исторический факт из
+    # БД) — именно texts.py решает не показывать его, когда is_blocked=False.
+    assert entries[0].blocked_reason == "peer_flood"
+
+
+def test_list_account_statuses_enabled_independent_from_blocked(fx):
+    """enabled=True + is_blocked=True одновременно — два независимых поля,
+    оба должны быть видны вызывающей стороне (см. design "Это два разных
+    состояния")."""
+    account = _make_account(fx, name="@wwww86w", telegram_user_id=1, enabled=True)
+    future = datetime.now(timezone.utc) + timedelta(hours=2)
+    fx.accounts.update(account.id, blocked_until=future, blocked_reason="peer_flood")
+
+    entries = fx.service.list_account_statuses()
+
+    assert entries[0].enabled is True
+    assert entries[0].is_blocked is True

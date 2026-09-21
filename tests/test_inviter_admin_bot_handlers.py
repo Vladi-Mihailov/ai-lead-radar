@@ -21,6 +21,8 @@ class _FakeReply:
         self.account_card_id = None
         self.account_card_enabled = None
         self.limit_choice_account_id = None
+        self.limits_page_options = None
+        self.limits_choice_account_id = None
         for key, value in fields.items():
             setattr(self, key, value)
 
@@ -110,6 +112,33 @@ async def test_limit_choice_reply_attaches_limit_keyboard():
     labels = _labels(event.calls[0]["buttons"])
     assert "15" in labels
     assert texts.MANUAL_LIMIT_LABEL in labels
+
+
+async def test_limits_page_reply_shows_daily_limit_not_enabled_toggle():
+    reply = _FakeReply(
+        text=texts.LIMITS_HEADER,
+        limits_page_options=[(1, "@vladimihailov", 15), (2, "@vvz982", 20)],
+    )
+    event = _FakeEvent()
+
+    await _send_reply(event, reply)
+
+    labels = _labels(event.calls[0]["buttons"])
+    assert labels == ["@vladimihailov", "15 / день", "@vvz982", "20 / день"]
+    assert "🟢" not in labels
+    assert "⚪" not in labels
+
+
+async def test_limits_choice_reply_attaches_limit_keyboard_with_limits_back():
+    reply = _FakeReply(text="limit", limits_choice_account_id=1)
+    event = _FakeEvent()
+
+    await _send_reply(event, reply)
+
+    labels = _labels(event.calls[0]["buttons"])
+    assert "15" in labels
+    assert texts.MANUAL_LIMIT_LABEL in labels
+    assert texts.BACK_BUTTON_LABEL in labels
 
 
 async def test_cancel_button_reply_attaches_cancel_keyboard():

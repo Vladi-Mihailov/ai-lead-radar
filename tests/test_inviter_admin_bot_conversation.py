@@ -5,7 +5,7 @@
 tests/test_inviter_admin_bot_auth.py)."""
 
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -399,3 +399,171 @@ async def test_status_screen_shows_pause_state(fx):
     reply = await fx.controller.handle_text(texts.STATUS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
 
     assert "приостановлено" in reply.text
+
+
+# ---- ⚙️ Лимиты: список показывает daily_limit, не enabled ----
+
+
+async def test_limits_list_shows_daily_limit_not_enabled(fx):
+    _make_account(fx, name="@vladimihailov", telegram_user_id=1, daily_limit=15, enabled=True)
+    _make_account(fx, name="@ao777oa777", telegram_user_id=2, daily_limit=15, enabled=False)
+
+    reply = await fx.controller.handle_text(texts.LIMITS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+
+    assert reply.text == texts.LIMITS_HEADER
+    limits_by_name = {name: limit for _id, name, limit in reply.limits_page_options}
+    assert limits_by_name == {"@vladimihailov": 15, "@ao777oa777": 15}
+    # enabled нигде не участвует в этих данных — только id/имя/daily_limit.
+    assert all(len(entry) == 3 for entry in reply.limits_page_options)
+
+
+async def test_limits_list_empty_shows_helpful_message(fx):
+    reply = await fx.controller.handle_text(texts.LIMITS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+    assert reply.text == texts.NO_ACCOUNTS_TEXT
+
+
+def test_limits_open_shows_value_chooser(fx):
+    account = _make_account(fx, daily_limit=15)
+
+    reply = fx.controller.handle_limits_open(account.id, telegram_user_id=_TRUSTED_ID)
+
+    assert "Сегодня: 0 / 15" in reply.text
+    assert reply.limits_choice_account_id == account.id
+
+
+def test_limits_value_selection_updates_and_returns_to_limits_list(fx):
+    account = _make_account(fx, daily_limit=15)
+
+    reply = fx.controller.handle_limits_value(account.id, 20, telegram_user_id=_TRUSTED_ID)
+
+    assert fx.accounts.get(account.id).daily_limit == 20
+    limits_by_id = {aid: limit for aid, _name, limit in reply.limits_page_options}
+    assert limits_by_id[account.id] == 20
+    # После изменения возвращаемся именно к списку лимитов, не к карточке.
+    assert reply.account_card_id is None
+
+
+async def test_limits_manual_flow_returns_to_limits_list(fx):
+    account = _make_account(fx, daily_limit=15)
+
+    prompt_reply = fx.controller.handle_limits_manual_prompt(
+        account.id, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID,
+    )
+    assert prompt_reply.text == texts.LIMIT_MANUAL_PROMPT_TEXT
+
+    final_reply = await fx.controller.handle_text("42", chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+
+    assert fx.accounts.get(account.id).daily_limit == 42
+    limits_by_id = {aid: limit for aid, _name, limit in final_reply.limits_page_options}
+    assert limits_by_id[account.id] == 42
+    assert final_reply.account_card_id is None
+
+
+def test_limits_back_returns_to_limits_list(fx):
+    _make_account(fx, daily_limit=15)
+    reply = fx.controller.handle_limits_back(telegram_user_id=_TRUSTED_ID)
+    assert reply.text == texts.LIMITS_HEADER
+
+
+def test_account_card_limit_flow_still_returns_to_card_unchanged(fx):
+    """Регрессия: изменение лимита с карточки аккаунта ("⚙️ Изменить
+    лимит") по-прежнему возвращает на карточку, а не на список лимитов —
+    новый флоу через "⚙️ Лимиты" НЕ подменяет старый."""
+    account = _make_account(fx, daily_limit=15)
+
+    reply = fx.controller.handle_account_limit_value(account.id, 20, telegram_user_id=_TRUSTED_ID)
+
+    assert fx.accounts.get(account.id).daily_limit == 20
+    assert reply.account_card_id == account.id
+    assert reply.limits_page_options is None
+
+
+def test_unauthorized_user_cannot_open_or_change_limits(fx):
+    account = _make_account(fx, daily_limit=15)
+
+    open_reply = fx.controller.handle_limits_open(account.id, telegram_user_id=_OTHER_ID)
+    value_reply = fx.controller.handle_limits_value(account.id, 20, telegram_user_id=_OTHER_ID)
+
+    assert open_reply.text == texts.ACCESS_DENIED_TEXT
+    assert value_reply.text == texts.ACCESS_DENIED_TEXT
+    assert fx.accounts.get(account.id).daily_limit == 15  # не изменилось
+
+
+# ---- 📊 Статус: per-account enabled/blocked, раздельно ----
+
+
+async def test_status_screen_enabled_and_not_blocked(fx):
+    _make_account(fx, name="@vvz982", telegram_user_id=1, enabled=True)
+
+    reply = await fx.controller.handle_text(texts.STATUS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+
+    assert "🟢 @vvz982" in reply.text
+    assert "Аккаунт: включён" in reply.text
+    assert "Блокировка: нет" in reply.text
+
+
+async def test_status_screen_disabled_and_not_blocked(fx):
+    _make_account(fx, name="@Mihailov_vm", telegram_user_id=1, enabled=False)
+
+    reply = await fx.controller.handle_text(texts.STATUS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+
+    assert "⚪ @Mihailov_vm" in reply.text
+    assert "Аккаунт: выключен" in reply.text
+    assert "Блокировка: нет" in reply.text
+
+
+async def test_status_screen_blocked_until_future_shows_blocked_with_reason(fx):
+    account = _make_account(fx, name="@wwww86w", telegram_user_id=1, enabled=True)
+    future = datetime.now(timezone.utc) + timedelta(hours=2)
+    fx.accounts.update(account.id, blocked_until=future, blocked_reason="peer_flood")
+
+    reply = await fx.controller.handle_text(texts.STATUS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+
+    assert "🔴 @wwww86w" in reply.text
+    assert "Аккаунт: включён" in reply.text
+    assert "Заблокирован до:" in reply.text
+    assert "Причина: peer_flood" in reply.text
+    assert "Блокировка: нет" not in reply.text  # единственный аккаунт в тесте — заблокирован
+
+
+async def test_status_screen_blocked_until_past_shown_as_not_blocked(fx):
+    """blocked_until уже прошёл -> "Не заблокирован"/"Блокировка: нет",
+    даже если исторический blocked_reason остался в БД (см. design "если
+    blocked_until уже прошёл — показывать как Не заблокирован")."""
+    account = _make_account(fx, name="@vvz982", telegram_user_id=1, enabled=True)
+    past = datetime.now(timezone.utc) - timedelta(hours=2)
+    fx.accounts.update(account.id, blocked_until=past, blocked_reason="peer_flood")
+
+    reply = await fx.controller.handle_text(texts.STATUS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+
+    assert "🟢 @vvz982" in reply.text
+    assert "Блокировка: нет" in reply.text
+    assert "peer_flood" not in reply.text
+    assert "Заблокирован до:" not in reply.text
+
+
+async def test_status_screen_missing_username_falls_back_to_telegram_id(fx):
+    fx.accounts.create(
+        name="tg_995500000009", phone="+995500000009", session_name="tg_995500000009",
+        session_path=str(fx.db_path.parent / "sessions" / "tg_995500000009"),
+        daily_limit=15, enabled=True, telegram_user_id=777777,
+    )
+
+    reply = await fx.controller.handle_text(texts.STATUS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+
+    assert "Telegram ID 777777" in reply.text
+
+
+async def test_status_screen_enabled_state_not_mixed_with_block_state(fx):
+    """enabled/disabled и blocked/unblocked — два разных, независимых
+    состояния (см. design): включённый заблокированный аккаунт должен
+    показывать ОБЕ строки, а не одну вместо другой."""
+    account = _make_account(fx, name="@wwww86w", telegram_user_id=1, enabled=True)
+    future = datetime.now(timezone.utc) + timedelta(hours=2)
+    fx.accounts.update(account.id, blocked_until=future, blocked_reason="peer_flood")
+
+    reply = await fx.controller.handle_text(texts.STATUS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+
+    account_block = next(b for b in reply.text.split("\n\n") if "@wwww86w" in b)
+    assert "Аккаунт: включён" in account_block
+    assert "Заблокирован до:" in account_block

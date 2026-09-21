@@ -40,6 +40,16 @@ _ACCOUNT_SYNC_PREFIX = b"acc_sync:"
 _ACCOUNT_REAUTH_PREFIX = b"acc_reauth:"
 ACCOUNTS_BACK = b"accounts_back"
 
+# "⚙️ Лимиты" — ОТДЕЛЬНЫЙ набор callback'ов от карточки аккаунта (см.
+# design: правая кнопка списка лимитов открывает тот же выбор лимита, но
+# по завершении возвращает на СПИСОК ЛИМИТОВ, а не на карточку аккаунта —
+# _ACCOUNT_LIMIT_*/handle_account_limit_* выше остаются НЕТРОНУТЫМИ,
+# карточка ("⚙️ Изменить лимит") по-прежнему возвращает на карточку).
+_LIMITS_OPEN_PREFIX = b"limits_open:"
+_LIMITS_VALUE_PREFIX = b"limits_val:"
+_LIMITS_MANUAL_PREFIX = b"limits_manual:"
+LIMITS_BACK = b"limits_back"
+
 
 def _encode_id(prefix: bytes, account_id: int) -> bytes:
     return prefix + str(account_id).encode("ascii")
@@ -105,6 +115,41 @@ def decode_account_limit_manual_callback(data: bytes | None) -> int | None:
     return _decode_id(data, _ACCOUNT_LIMIT_MANUAL_PREFIX)
 
 
+def encode_limits_open_callback(account_id: int) -> bytes:
+    return _encode_id(_LIMITS_OPEN_PREFIX, account_id)
+
+
+def decode_limits_open_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _LIMITS_OPEN_PREFIX)
+
+
+def encode_limits_value_callback(account_id: int, value: int) -> bytes:
+    return _LIMITS_VALUE_PREFIX + f"{account_id}:{value}".encode("ascii")
+
+
+def decode_limits_value_callback(data: bytes | None) -> tuple[int, int] | None:
+    if not data or not data.startswith(_LIMITS_VALUE_PREFIX):
+        return None
+    parts = data[len(_LIMITS_VALUE_PREFIX):].split(b":")
+    if len(parts) != 2:
+        return None
+    try:
+        account_id, value = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if value not in LIMIT_PROMPT_CHOICES:
+        return None
+    return account_id, value
+
+
+def encode_limits_manual_callback(account_id: int) -> bytes:
+    return _encode_id(_LIMITS_MANUAL_PREFIX, account_id)
+
+
+def decode_limits_manual_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _LIMITS_MANUAL_PREFIX)
+
+
 def encode_account_sync_callback(account_id: int) -> bytes:
     return _encode_id(_ACCOUNT_SYNC_PREFIX, account_id)
 
@@ -141,6 +186,39 @@ def accounts_page_keyboard(entries: list[tuple[int, str, bool]]) -> list[list[Bu
         ]
         for account_id, display_name, enabled in entries
     ]
+
+
+def limits_page_keyboard(entries: list[tuple[int, str, int]]) -> list[list[Button]]:
+    """entries — (account_id, display_name, daily_limit) (см. design "⚙️
+    Лимиты"). Левая кнопка — имя, открывает ТУ ЖЕ карточку аккаунта, что и
+    "👤 Аккаунты" (encode_account_open_callback, без изменений). Правая
+    кнопка показывает daily_limit (НЕ enabled 🟢/⚪ — см. design "Правая
+    кнопка здесь должна показывать именно daily_limit"), открывает выбор
+    лимита, который возвращает на этот же список (см.
+    limits_value_choice_keyboard)."""
+    return [
+        [
+            Button.inline(display_name, encode_account_open_callback(account_id)),
+            Button.inline(f"{daily_limit} / день", encode_limits_open_callback(account_id)),
+        ]
+        for account_id, display_name, daily_limit in entries
+    ]
+
+
+def limits_value_choice_keyboard(account_id: int) -> list[list[Button]]:
+    """Тот же набор значений/раскладка, что и limit_choice_keyboard (5/10/
+    15/20/25 + "Ввести вручную"), но callback'и и "Назад" ведут на список
+    "⚙️ Лимиты" (LIMITS_BACK), а не на карточку аккаунта (см. design
+    "После изменения возвращаемся к списку, где сразу отображается новое
+    значение")."""
+    buttons = [
+        Button.inline(str(value), encode_limits_value_callback(account_id, value))
+        for value in LIMIT_PROMPT_CHOICES
+    ]
+    rows = [buttons[0:3], buttons[3:5]]
+    rows.append([Button.inline(MANUAL_LIMIT_LABEL, encode_limits_manual_callback(account_id))])
+    rows.append([Button.inline(BACK_BUTTON_LABEL, LIMITS_BACK)])
+    return rows
 
 
 def account_card_keyboard(account_id: int, *, enabled: bool) -> list[list[Button]]:

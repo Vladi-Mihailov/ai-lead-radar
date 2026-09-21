@@ -37,6 +37,8 @@ class BotReply:
     account_card_id: int | None = None
     account_card_enabled: bool | None = None
     limit_choice_account_id: int | None = None
+    limits_page_options: list[tuple[int, str, int]] | None = None
+    limits_choice_account_id: int | None = None
 
 
 def _looks_like_phone(text: str) -> bool:
@@ -100,9 +102,15 @@ class AdminBotController:
             self._service.set_global_enabled(False)
             return BotReply(text=texts.GLOBAL_PAUSED_TEXT, show_main_menu=True)
         if stripped == texts.STATUS_LABEL:
-            return BotReply(text=texts.format_status(self._service.status_snapshot()), show_main_menu=True)
+            return BotReply(
+                text=texts.format_account_statuses(
+                    self._service.list_account_statuses(),
+                    inviter_enabled=self._service.is_global_enabled(),
+                ),
+                show_main_menu=True,
+            )
         if stripped == texts.LIMITS_LABEL:
-            return self._format_accounts_reply()
+            return self._format_limits_reply()
         if stripped == texts.SYNC_LABEL:
             return await self._handle_sync_all()
 
@@ -188,6 +196,17 @@ class AdminBotController:
         account = self._service.set_daily_limit(account_id, value)
         if account is None:
             return BotReply(text=texts.ACTION_FAILED_TEXT, show_main_menu=True)
+
+        # return_to="limits" — ручной ввод лимита, открытый со списка "⚙️
+        # Лимиты" (см. handle_limits_manual_prompt), возвращает на СПИСОК
+        # ЛИМИТОВ (см. design "возвращаемся к списку"), а не на карточку —
+        # ручной ввод, открытый с карточки (payload без return_to,
+        # handle_account_limit_manual_prompt), поведение НЕ изменилось.
+        if payload.get("return_to") == "limits":
+            return BotReply(
+                text=texts.format_limit_updated(account.name, value),
+                limits_page_options=self._limits_page_options(),
+            )
         return BotReply(
             text=texts.format_limit_updated(account.name, value),
             account_card_id=account.id, account_card_enabled=account.enabled,
@@ -201,6 +220,15 @@ class AdminBotController:
             text=texts.ACCOUNTS_HEADER,
             accounts_page_options=[(e.id, e.display_name, e.enabled) for e in entries],
         )
+
+    def _limits_page_options(self) -> list[tuple[int, str, int]]:
+        return [(e.id, e.display_name, e.daily_limit) for e in self._service.list_accounts_for_limits()]
+
+    def _format_limits_reply(self) -> BotReply:
+        options = self._limits_page_options()
+        if not options:
+            return BotReply(text=texts.NO_ACCOUNTS_TEXT, show_main_menu=True)
+        return BotReply(text=texts.LIMITS_HEADER, limits_page_options=options)
 
     # ---- 👤 Аккаунты: открыть карточку / toggle / лимит / sync / reauth ----
 
@@ -261,6 +289,49 @@ class AdminBotController:
         self._states.set(
             chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_MANUAL_LIMIT,
             payload={"account_id": account_id},
+        )
+        return BotReply(text=texts.LIMIT_MANUAL_PROMPT_TEXT, show_cancel_button=True)
+
+    # ---- ⚙️ Лимиты: список с daily_limit / выбор нового значения ----
+
+    def handle_limits_back(self, *, telegram_user_id: int) -> BotReply:
+        if not self.is_trusted(telegram_user_id):
+            return self._denied()
+        return self._format_limits_reply()
+
+    def handle_limits_open(self, account_id: int, *, telegram_user_id: int) -> BotReply:
+        if not self.is_trusted(telegram_user_id):
+            return self._denied()
+        card = self._service.account_card(account_id)
+        if card is None:
+            return BotReply(text=texts.ACTION_FAILED_TEXT, show_main_menu=True)
+        return BotReply(
+            text=texts.format_limit_prompt(card.display_name, card.usage.sent_today, card.usage.daily_limit),
+            limits_choice_account_id=account_id,
+        )
+
+    def handle_limits_value(self, account_id: int, value: int, *, telegram_user_id: int) -> BotReply:
+        if not self.is_trusted(telegram_user_id):
+            return self._denied()
+        account = self._service.set_daily_limit(account_id, value)
+        if account is None:
+            return BotReply(text=texts.ACTION_FAILED_TEXT, show_main_menu=True)
+        return BotReply(
+            text=texts.format_limit_updated(account.name, value),
+            limits_page_options=self._limits_page_options(),
+        )
+
+    def handle_limits_manual_prompt(
+        self, account_id: int, *, chat_id: int, telegram_user_id: int,
+    ) -> BotReply:
+        if not self.is_trusted(telegram_user_id):
+            return self._denied()
+        account = self._service.get_account(account_id)
+        if account is None:
+            return BotReply(text=texts.ACTION_FAILED_TEXT, show_main_menu=True)
+        self._states.set(
+            chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_MANUAL_LIMIT,
+            payload={"account_id": account_id, "return_to": "limits"},
         )
         return BotReply(text=texts.LIMIT_MANUAL_PROMPT_TEXT, show_cancel_button=True)
 

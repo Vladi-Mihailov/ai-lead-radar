@@ -12,6 +12,7 @@ from telethon import TelegramClient, events
 from reader.inviter_admin_bot.conversation import AdminBotController
 from reader.inviter_admin_bot.keyboards import (
     ACCOUNTS_BACK,
+    LIMITS_BACK,
     account_card_keyboard,
     accounts_page_keyboard,
     cancel_keyboard,
@@ -22,7 +23,12 @@ from reader.inviter_admin_bot.keyboards import (
     decode_account_reauthorize_callback,
     decode_account_sync_callback,
     decode_account_toggle_callback,
+    decode_limits_manual_callback,
+    decode_limits_open_callback,
+    decode_limits_value_callback,
     limit_choice_keyboard,
+    limits_page_keyboard,
+    limits_value_choice_keyboard,
     main_menu_keyboard,
 )
 from reader.inviter_admin_bot.texts import ACCESS_DENIED_TEXT
@@ -82,6 +88,32 @@ def register(client: TelegramClient, controller: AdminBotController) -> None:
             await _answer_and_send(event, reply)
             return
 
+        if data == LIMITS_BACK:
+            reply = controller.handle_limits_back(telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply)
+            return
+
+        account_id = decode_limits_open_callback(data)
+        if account_id is not None:
+            reply = controller.handle_limits_open(account_id, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply)
+            return
+
+        limit_value = decode_limits_value_callback(data)
+        if limit_value is not None:
+            account_id, value = limit_value
+            reply = controller.handle_limits_value(account_id, value, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply)
+            return
+
+        account_id = decode_limits_manual_callback(data)
+        if account_id is not None:
+            reply = controller.handle_limits_manual_prompt(
+                account_id, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply)
+            return
+
         account_id = decode_account_sync_callback(data)
         if account_id is not None:
             await event.answer("🔄 Проверяем...")
@@ -115,10 +147,14 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False) -> None:
         buttons = cancel_keyboard()
     elif reply.accounts_page_options is not None:
         buttons = accounts_page_keyboard(reply.accounts_page_options)
+    elif reply.limits_page_options is not None:
+        buttons = limits_page_keyboard(reply.limits_page_options)
     elif reply.account_card_id is not None:
         buttons = account_card_keyboard(reply.account_card_id, enabled=bool(reply.account_card_enabled))
     elif reply.limit_choice_account_id is not None:
         buttons = limit_choice_keyboard(reply.limit_choice_account_id)
+    elif reply.limits_choice_account_id is not None:
+        buttons = limits_value_choice_keyboard(reply.limits_choice_account_id)
 
     if reply.text == ACCESS_DENIED_TEXT:
         buttons = None

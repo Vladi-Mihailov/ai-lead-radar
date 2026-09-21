@@ -25,6 +25,35 @@ class AccountListEntry:
 
 
 @dataclass(frozen=True)
+class LimitListEntry:
+    """Одна строка "⚙️ Лимиты" (см. design: экран лимитов показывает
+    daily_limit каждого аккаунта, а не enabled — это отдельный экран от
+    "👤 Аккаунты", хоть и построен над тем же списком аккаунтов)."""
+
+    id: int
+    display_name: str
+    daily_limit: int
+
+
+@dataclass(frozen=True)
+class AccountStatusEntry:
+    """Одна строка "📊 Статус" — enabled и is_blocked ПРИНЦИПИАЛЬНО два
+    разных, независимых поля (см. reader/inviter/models.py::TelegramAccount
+    "enabled и blocked_until — разные вещи, не путать") — texts.py их не
+    смешивает при показе. is_blocked уже вычислен (см. service.py::
+    _is_blocked — та же формула blocked_until > now, что и у
+    status_snapshot()) — texts.py здесь только форматирует, никакого
+    сравнения с datetime.now() само не делает (см. texts.py module
+    docstring: "никакой... бизнес-логики здесь нет")."""
+
+    display_name: str
+    enabled: bool
+    is_blocked: bool
+    blocked_until: datetime | None
+    blocked_reason: str | None
+
+
+@dataclass(frozen=True)
 class AccountUsage:
     """Один расчёт остатка дневного лимита — ТА ЖЕ формула, что и
     InviterService._remaining_daily_budget (daily_limit - joined_today -

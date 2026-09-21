@@ -4,6 +4,7 @@
 
 from reader.inviter_admin_bot.models import (
     AccountCard,
+    AccountStatusEntry,
     StatusSnapshot,
     SyncSummary,
 )
@@ -30,6 +31,8 @@ CANCEL_BUTTON_LABEL = "Отмена"
 MANUAL_LIMIT_LABEL = "Ввести вручную"
 
 ACCOUNTS_HEADER = "👤 Аккаунты"
+LIMITS_HEADER = "⚙️ Лимиты"
+STATUS_ACCOUNTS_HEADER = "📊 Статус аккаунтов"
 NO_ACCOUNTS_TEXT = "Аккаунтов пока нет. Добавьте первый через «➕ Добавить аккаунт»."
 
 PHONE_PROMPT = "Введите номер телефона:\n\nпример:\n+995571024864"
@@ -62,6 +65,12 @@ def _dash_if_none(value) -> str:
 
 def _fmt_dt(value) -> str:
     return format_tbilisi(value) if value is not None else "—"
+
+
+def _fmt_dt_short(value) -> str:
+    """"DD.MM HH:MM" без суффикса "по Тбилиси" — компактнее, чем _fmt_dt,
+    для построчного списка "📊 Статус" (см. format_account_statuses)."""
+    return format_tbilisi(value, fmt="%d.%m %H:%M", suffix=None) if value is not None else "—"
 
 
 def format_account_card(card: AccountCard) -> str:
@@ -151,6 +160,44 @@ def format_sync_one_result(result) -> str:
         "identity_mismatch": "Сессия авторизована под другим аккаунтом",
     }.get(result.status, result.status)
     return f"🔴 {result.display_name}\n{reason}"
+
+
+def format_account_statuses(entries: list[AccountStatusEntry], *, inviter_enabled: bool) -> str:
+    """"📊 Статус" — статус КАЖДОГО аккаунта инвайтера (см. design:
+    "прежде всего статус КАЖДОГО Telegram-аккаунта"). enabled и is_blocked
+    показаны ОТДЕЛЬНЫМИ строками, никогда не смешиваются в одно значение
+    (см. design "Это два разных состояния") — icon 🔴 только при is_blocked
+    (даже если enabled=True, см. design пример "@wwww86w"), иначе 🟢/⚪ по
+    enabled. is_blocked уже вычислен вызывающей стороной (см.
+    service.py::list_account_statuses) — здесь никакого сравнения с
+    datetime.now() нет.
+
+    inviter_enabled — ГЛОБАЛЬНЫЙ ▶️/⏸ переключатель автодобавления (см.
+    InviterAdminService.is_global_enabled), отдельная короткая строка
+    вверху экрана — НЕ путать с per-account enabled ниже (два независимых
+    понятия: один "автодобавление в целом", другой "этот конкретный
+    аккаунт")."""
+    auto_state = "▶️ включено" if inviter_enabled else "⏸ приостановлено"
+    header = f"{STATUS_ACCOUNTS_HEADER}\n\nАвтодобавление: {auto_state}"
+
+    if not entries:
+        return f"{header}\n\n{NO_ACCOUNTS_TEXT}"
+
+    blocks = []
+    for entry in entries:
+        icon = "🔴" if entry.is_blocked else ("🟢" if entry.enabled else "⚪")
+        lines = [
+            f"{icon} {entry.display_name}",
+            f"Аккаунт: {'включён' if entry.enabled else 'выключен'}",
+        ]
+        if entry.is_blocked:
+            lines.append(f"Заблокирован до: {_fmt_dt_short(entry.blocked_until)}")
+            lines.append(f"Причина: {entry.blocked_reason or '—'}")
+        else:
+            lines.append("Блокировка: нет")
+        blocks.append("\n".join(lines))
+
+    return header + "\n\n" + "\n\n".join(blocks)
 
 
 def format_status(snapshot: StatusSnapshot) -> str:

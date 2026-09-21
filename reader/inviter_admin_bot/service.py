@@ -29,8 +29,10 @@ from reader.inviter_admin_bot.auth import TelethonAuthClientLike
 from reader.inviter_admin_bot.models import (
     AccountCard,
     AccountListEntry,
+    AccountStatusEntry,
     AccountUsage,
     AttentionItem,
+    LimitListEntry,
     StatusSnapshot,
     SyncAccountOutcome,
     SyncSummary,
@@ -135,6 +137,17 @@ class InviterAdminService:
 
     def get_account(self, account_id: int) -> TelegramAccount | None:
         return self._accounts.get(account_id)
+
+    # ---- ⚙️ Лимиты ----
+
+    def list_accounts_for_limits(self) -> list[LimitListEntry]:
+        """Список для "⚙️ Лимиты" (см. design: показывать daily_limit
+        каждого аккаунта, НЕ enabled) — тот же account_repository.list(),
+        что и list_accounts(), просто другая проекция полей."""
+        return [
+            LimitListEntry(id=a.id, display_name=_display_name(a), daily_limit=a.daily_limit)
+            for a in self._accounts.list()
+        ]
 
     def account_card(self, account_id: int) -> AccountCard | None:
         account = self._accounts.get(account_id)
@@ -262,6 +275,26 @@ class InviterAdminService:
         return self._runtime_state.get().inviter_enabled
 
     # ---- 📊 Статус ----
+
+    def list_account_statuses(self) -> list[AccountStatusEntry]:
+        """Список для "📊 Статус" (см. design: "статус КАЖДОГО Telegram-
+        аккаунта... enabled и blocked — два разных состояния, не
+        смешивать") — is_blocked считается ТОЙ ЖЕ _is_blocked(), что и
+        status_snapshot()/_needs_attention() ниже, никакого нового понятия
+        "статус" не вводится (см. design "Не придумывать новый статус":
+        только account.enabled + account.blocked_until/blocked_reason,
+        уже существующие поля TelegramAccount)."""
+        now = datetime.now(timezone.utc)
+        return [
+            AccountStatusEntry(
+                display_name=_display_name(a),
+                enabled=a.enabled,
+                is_blocked=_is_blocked(a, now),
+                blocked_until=a.blocked_until,
+                blocked_reason=a.blocked_reason,
+            )
+            for a in self._accounts.list()
+        ]
 
     def status_snapshot(self) -> StatusSnapshot:
         accounts = self._accounts.list()
