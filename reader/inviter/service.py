@@ -283,6 +283,28 @@ _CONFIRMED_PERMANENT_IDENTITY_ERROR_TYPES = (
     PeerIdInvalidError,
 )
 
+# ДОСТОВЕРНО постоянная ошибка ДРУГОГО рода — identity кандидата валидна
+# (Telegram успешно резолвит его), но сама отправка приглашения
+# структурно невозможна из-за настройки приватности самого кандидата: у
+# UserNotMutualContactError ("The provided user is not a mutual contact")
+# нет зависимости от того, КАКОЙ конкретно наш аккаунт приглашает — это
+# per-target-user privacy-настройка ("кто может добавлять меня в группы:
+# только контакты"), а не что-то, что могло бы стать другим при попытке
+# другим аккаунтом (см. задачу: @alina_sav11/1000597118 — 30+ попыток за
+# 5+ дней ТРЕМЯ разными аккаунтами, 100% та же ошибка каждый раз — ни один
+# из наших invite-аккаунтов не станет взаимным контактом случайного лида
+# в рамках этой автоматизации). Раньше входила в _SKIP_USER_ERROR_TYPES
+# (db_status="failed", транзиентная) — из-за этого один и тот же кандидат
+# выбирался заново на каждом прогоне бесконечно, тратя тик впустую и
+# засоряя user_campaign_invites повторами. Здесь — тот же canonical
+# "кандидата больше нельзя использовать" статус 'invalid', что и у
+# _CONFIRMED_PERMANENT_IDENTITY_ERROR_TYPES/ботов (см.
+# _classify_invite_error/_CANDIDATES_BASE_WHERE) — переиспользуем
+# существующий механизм, не вводим новый статус/поле.
+_PERMANENT_CANDIDATE_ERROR_TYPES = (
+    UserNotMutualContactError,
+)
+
 
 def _format_username(username: str | None) -> str:
     return f"@{username}" if username else "(без username)"
@@ -552,6 +574,8 @@ class InviteErrorClassification:
 
 # Проблема только в конкретном кандидате (устарел/удалён/заблокировал этот
 # аккаунт/настройки приватности и т.п.) — риска для самого аккаунта нет.
+# UserNotMutualContactError сюда НЕ входит — см. _PERMANENT_CANDIDATE_ERROR_TYPES
+# выше (постоянная ошибка, не транзиентная).
 _SKIP_USER_ERROR_TYPES = (
     UserPrivacyRestrictedError,
     UserChannelsTooMuchError,
@@ -562,7 +586,6 @@ _SKIP_USER_ERROR_TYPES = (
     InputUserDeactivatedError,
     UserKickedError,
     UserBlockedError,
-    UserNotMutualContactError,
 )
 
 # Telegram подтвердил RPC-ошибкой, что кандидат — бот (см. также
@@ -659,6 +682,10 @@ def _classify_invite_error(exc: Exception) -> InviteErrorClassification:
         return InviteErrorClassification(
             InviteErrorAction.SKIP_USER, db_status="invalid", stat_field="invalid",
             mark_as_bot=True,
+        )
+    if isinstance(exc, _PERMANENT_CANDIDATE_ERROR_TYPES):
+        return InviteErrorClassification(
+            InviteErrorAction.SKIP_USER, db_status="invalid", stat_field="invalid",
         )
     if isinstance(exc, _SKIP_USER_ERROR_TYPES):
         return InviteErrorClassification(
@@ -1454,8 +1481,25 @@ class InviterService:
         - Любой другой сбой самой проверки (сеть, таймаут и т.п.) — мы
           НЕ уверены, остаётся 'pending' без изменений, место остаётся
           зарезервированным; итоговое stats.pending считает
-          _execute_account по факту из БД, а не здесь."""
+          _execute_account по факту из БД, а не здесь.
+
+        ChatAdminRequiredError — отдельная, ОЖИДАЕМАЯ ветка (см. задачу про
+        "Chat admin privileges are required.../GetParticipantRequest"):
+        get_permissions() на ЧУЖОМ user_id физически требует админ-прав в
+        target_chat у самого аккаунта — обычный (не админ) участник эту
+        ошибку получит на КАЖДОМ pending гарантированно, не только на
+        этом. Раньше это тоже проваливалось в generic except Exception
+        ниже и писало отдельный warning с полным текстом ошибки НА КАЖДОГО
+        pending-кандидата — сотни одинаковых строк в логе за один прогон
+        аккаунта без прав. Здесь — тот же самый исход (status не меняется,
+        joined/not_joined не считается, аккаунт не останавливается,
+        лимит/бюджет не трогается, см. docstring выше), но лог агрегирован
+        в одно понятное сообщение на уровне account/campaign после цикла,
+        а не размножается по кандидатам. Кто должен видеть эту ситуацию
+        как повод действовать (нет прав → см. TelegramAccount.
+        verify_membership) — решается оператором, не здесь."""
         pending = self._invite_repository.list_pending(account.id, campaign.id)
+        chat_admin_required_count = 0
         for invite in pending:
             try:
                 user_ref = await client.get_input_entity(invite.user_id)
@@ -1464,6 +1508,9 @@ class InviterService:
                 self._invite_repository.update(
                     invite.id, status="not_joined", verified_at=datetime.now(timezone.utc),
                 )
+                continue
+            except ChatAdminRequiredError:
+                chat_admin_required_count += 1
                 continue
             except Exception as exc:
                 logger.warning(
@@ -1476,6 +1523,14 @@ class InviterService:
                 invite.id, status="joined", verified_at=datetime.now(timezone.utc),
             )
             stats.joined += 1
+
+        if chat_admin_required_count:
+            logger.warning(
+                f"[VERIFY]\nAccount: {account.name}\nCampaign: {campaign.name}\n"
+                f"GetParticipantRequest недоступен (нет админ-прав в {campaign.target_chat}) "
+                f"для {chat_admin_required_count} pending-кандидатов — статусы не изменены. "
+                f"См. TelegramAccount.verify_membership."
+            )
 
     async def _invite_candidate(
         self,

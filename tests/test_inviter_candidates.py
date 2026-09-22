@@ -28,6 +28,7 @@ from telethon.errors import (  # noqa: E402
     UserChannelsTooMuchError,
     UserIdInvalidError,
     UserKickedError,
+    UserNotMutualContactError,
     UserNotParticipantError,
     UsernameNotOccupiedError,
     UserPrivacyRestrictedError,
@@ -732,6 +733,32 @@ def test_select_candidates_not_joined_status_still_does_not_exclude(tmp_path):
     try:
         campaign = campaign_repository.create(name="A", keyword="осаго", target_chat="@a")
         invite_repository.create(user_id=1, campaign_id=campaign.id, status="not_joined")
+
+        candidates = invite_repository.select_candidates(campaign.id, limit=10)
+        assert [c.user_id for c in candidates] == [1]
+    finally:
+        campaign_repository.close()
+        invite_repository.close()
+
+
+def test_select_candidates_failed_status_still_does_not_exclude(tmp_path):
+    """RETRYABLE-ошибки (см. _SKIP_USER_ERROR_TYPES/_classify_invite_error
+    — например UserPrivacyRestrictedError/UserBlockedError, транзиентные по
+    своей природе) по-прежнему пишутся как status='failed' и НЕ исключают
+    кандидата из будущей выборки — в отличие от status='invalid' (см.
+    test_select_candidates_excludes_invalid_status), это сознательно
+    оставленное поведение, а не упущение (задача про permanent/retryable
+    классификацию: расширять исключение на 'failed' в целом — неверно,
+    только конкретные ДОСТОВЕРНО-постоянные ошибки переводятся в
+    'invalid', см. _PERMANENT_CANDIDATE_ERROR_TYPES)."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        campaign = campaign_repository.create(name="A", keyword="осаго", target_chat="@a")
+        invite_repository.create(user_id=1, campaign_id=campaign.id, status="failed")
 
         candidates = invite_repository.select_candidates(campaign.id, limit=10)
         assert [c.user_id for c in candidates] == [1]
@@ -1807,6 +1834,78 @@ def test_execute_verify_pending_leaves_pending_on_unexpected_check_error(tmp_pat
         assert invite.verified_at is None
     finally:
         invite_repository.close()
+
+
+def test_execute_verify_chat_admin_required_leaves_pending_alive_and_aggregates_log(tmp_path, caplog):
+    """Продакшен-инцидент: verify_membership=True у аккаунта БЕЗ админ-прав
+    в target_chat -> ChatAdminRequiredError на КАЖДОМ pending при проверке
+    (см. задачу "Chat admin privileges are required.../GetParticipantRequest").
+    Раньше это тоже проваливалось в общий except Exception — то же самое
+    поведение по данным (status не меняется, joined не считается, аккаунт
+    не останавливается, лимит не трогается), но теперь лог — ОДНО
+    агрегированное предупреждение на account/campaign, а не по строке на
+    каждого pending-кандидата (задача про log spam)."""
+    db_path = _setup_db(tmp_path)
+    total_users = 3
+    for user_id in range(1, total_users + 1):
+        _seed_user(
+            db_path, user_id, keywords=["осаго"], access_hash=user_id,
+            last_seen_at=_BASE_TIME + timedelta(days=user_id),
+        )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account = account_repository.create(
+            name="account_1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=total_users, verify_membership=True,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    client_factory = _make_client_factory(
+        participant_check_errors={
+            "account_1": {
+                user_id: ChatAdminRequiredError(request=GetHistoryRequest)
+                for user_id in range(1, total_users + 1)
+            },
+        },
+    )
+
+    with caplog.at_level("WARNING", logger="reader.inviter.service"):
+        asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    # Данные не изменились: все 3 остаются pending, не joined/not_joined.
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == total_users
+        assert all(i.status == "pending" for i in invites)
+        assert all(i.verified_at is None for i in invites)
+    finally:
+        invite_repository.close()
+
+    # Аккаунт не остановлен/не заблокирован этой ошибкой.
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        refreshed = account_repository.get(account.id)
+        assert refreshed.blocked_until is None
+    finally:
+        account_repository.close()
+
+    # Ровно ОДНО агрегированное предупреждение, а не по одному на каждого
+    # pending-кандидата.
+    warnings = [
+        r for r in caplog.records
+        if r.levelname == "WARNING" and "GetParticipantRequest недоступен" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert f"для {total_users} pending-кандидатов" in warnings[0].getMessage()
+    assert "account_1" in warnings[0].getMessage()
+    # Старый per-user формат для ЭТОЙ ошибки больше не пишется.
+    assert "Не удалось проверить участие в группе" not in caplog.text
 
 
 # ---- InviterService: account.verify_membership ----
@@ -2966,6 +3065,128 @@ def test_andrey_permanently_invalid_not_selected_by_next_account(tmp_path):
         invite_repository.close()
 
 
+def test_mutual_contact_error_marks_candidate_invalid_not_failed(tmp_path):
+    """Задача: @alina_sav11/1000597118 — UserNotMutualContactError на самой
+    отправке (InviteToChannelRequest) раньше писался как status='failed'
+    (транзиентно) и кандидат выбирался заново на каждом прогоне бесконечно
+    (30+ попыток за 5+ дней в production). Теперь — тот же 'invalid', что и
+    у permanently-invalid identity/ботов (см. _PERMANENT_CANDIDATE_ERROR_TYPES)."""
+    db_path = _setup_db(tmp_path)
+    _setup_single_candidate_campaign(db_path)
+
+    client_factory = _make_client_factory(
+        call_errors={"Основной": [UserNotMutualContactError(request=InviteToChannelRequest)]},
+    )
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == 1
+        assert invites[0].status == "invalid"
+        assert invites[0].error == str(UserNotMutualContactError(request=InviteToChannelRequest))
+    finally:
+        invite_repository.close()
+
+
+def test_mutual_contact_invalid_not_selected_by_next_account(tmp_path):
+    """3/5. Тот же production-паттерн, что и
+    test_andrey_permanently_invalid_not_selected_by_next_account, но для
+    UserNotMutualContactError: после того как account_1 получил её на
+    единственном кандидате (status='invalid'), account_2 не должен даже
+    попытаться его пригласить — SQL-исключение (_CANDIDATES_BASE_WHERE)
+    срабатывает до его обработки. Заодно покрывает "лимит не расходуется
+    повторно на terminal candidate" — account_2 не тратит ни одной попытки
+    (daily_limit) на этого кандидата."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(
+        db_path, 1000597118, username="alina_sav11", keywords=["осаго"],
+        access_hash=1, last_seen_at=_BASE_TIME,
+    )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+        account_repository.create(
+            name="account_2", phone="+995500000002", session_name="acc2",
+            session_path="acc2.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(
+        call_errors={"account_1": [UserNotMutualContactError(request=InviteToChannelRequest)]},
+        created=created_clients,
+    )
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    by_name = {c.account.name: c for c in created_clients}
+    assert by_name["account_2"].call_requests == []
+    assert by_name["account_2"].get_input_entity_calls == []
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == 1  # НЕ два — account_2 даже не выбрал кандидата
+        assert invites[0].status == "invalid"
+    finally:
+        invite_repository.close()
+
+
+def test_valid_candidate_processed_after_permanent_invalid_same_account(tmp_path):
+    """5. Один invalid-кандидат не должен блокировать остальных: та же
+    отправка (SKIP_USER, не STOP_ACCOUNT — см. _classify_invite_error)
+    продолжает обработку следующего кандидата тем же аккаунтом в том же
+    прогоне."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(
+        db_path, 1, username="invalid_one", keywords=["осаго"],
+        access_hash=1, last_seen_at=_BASE_TIME + timedelta(days=1),
+    )
+    _seed_user(
+        db_path, 2, username="valid_one", keywords=["осаго"],
+        access_hash=2, last_seen_at=_BASE_TIME,
+    )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="Основной", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    # По last_seen_at DESC: кандидат 1 (invalid) обрабатывается первым,
+    # кандидат 2 — вторым, тем же аккаунтом, в том же прогоне.
+    client_factory = _make_client_factory(
+        call_errors={"Основной": [UserNotMutualContactError(request=InviteToChannelRequest), None]},
+    )
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = {i.user_id: i for i in invite_repository.list()}
+        assert len(invites) == 2
+        assert invites[1].status == "invalid"
+        assert invites[2].status in ("pending", "joined")
+    finally:
+        invite_repository.close()
+
+
 def test_divanauto_invalid_object_id_retries_with_stored_access_hash_and_succeeds(tmp_path):
     """3/5. Реальный случай @Divanauto/telegram_user_id=726716985 — резолв
     УСПЕШЕН (id-кэш находит кандидата), но САМА отправка
@@ -3932,6 +4153,14 @@ def test_humanize_error_falls_back_to_str_for_unmapped_exception():
         (
             UserKickedError(request=GetHistoryRequest),
             InviteErrorAction.SKIP_USER, "failed", "errors",
+        ),
+        (
+            # ДОСТОВЕРНО постоянная (не транзиентная) ошибка — см.
+            # _PERMANENT_CANDIDATE_ERROR_TYPES/задачу про @alina_sav11:
+            # privacy-настройка цели, не зависит от того, какой наш
+            # аккаунт приглашает, поэтому 'invalid', а не 'failed'.
+            UserNotMutualContactError(request=InviteToChannelRequest),
+            InviteErrorAction.SKIP_USER, "invalid", "invalid",
         ),
         (
             UserBotError(request=GetHistoryRequest),
