@@ -219,5 +219,11 @@ inviter_admin_bot:
   # telegram_accounts(id=4).name='@Mihailov_vm' — все три независимо
   # подтверждают один и тот же физический человек), потому что это ровно
   # тот же trusted operator, кому и так уже доверено управлять инвайтером.
+  #
+  # 410811386 — @alenaogir (Алена, Любовь Моя), см. production
+  # data/users.db: users.username/bot_known_users.telegram_username/
+  # turkey_bot_known_users.telegram_username — все три независимо
+  # подтверждают один и тот же telegram_user_id для этого username.
   trusted_admin_user_ids:
     - 5712994689
+    - 410811386
