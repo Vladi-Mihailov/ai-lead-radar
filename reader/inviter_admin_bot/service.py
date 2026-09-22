@@ -129,10 +129,21 @@ class InviterAdminService:
 
     # ---- 👤 Аккаунты ----
 
+    def _current_accounts(self) -> list[TelegramAccount]:
+        """Все ОБЫЧНЫЕ operational-экраны (👤 Аккаунты/⚙️ Лимиты/📊 Статус)
+        по умолчанию показывают ТОЛЬКО is_old=False (см. design "History-
+        only records не должны выглядеть как обычные рабочие accounts") —
+        is_old=True записи НИКУДА из БД не удаляются (см.
+        resolve_duplicate_group), просто исключены из этих списков.
+        account_card()/get_account() (прямой доступ по id) этот фильтр
+        сознательно НЕ применяют — они не участвуют в rotation и не
+        показывают ничего разрушительного сами по себе."""
+        return [a for a in self._accounts.list() if not a.is_old]
+
     def list_accounts(self) -> list[AccountListEntry]:
         return [
             AccountListEntry(id=a.id, display_name=_display_name(a), enabled=a.enabled)
-            for a in self._accounts.list()
+            for a in self._current_accounts()
         ]
 
     def get_account(self, account_id: int) -> TelegramAccount | None:
@@ -142,17 +153,17 @@ class InviterAdminService:
 
     def list_accounts_for_limits(self) -> list[LimitListEntry]:
         """Список для "⚙️ Лимиты" (см. design: показывать USED / daily_limit
-        каждого аккаунта, НЕ enabled) — тот же account_repository.list(),
-        что и list_accounts(), плюс _account_usage() (ТА ЖЕ формула, что и
-        account_card()/InviterService._remaining_daily_budget — joined_today
-        + pending_today), никакого нового счётчика."""
+        каждого аккаунта, НЕ enabled) — тот же _current_accounts(), что и
+        list_accounts() (is_old=False), плюс _account_usage() (ТА ЖЕ
+        формула, что и account_card()/InviterService._remaining_daily_budget
+        — joined_today + pending_today), никакого нового счётчика."""
         return [
             LimitListEntry(
                 id=a.id, display_name=_display_name(a),
                 sent_today=_account_usage(self._invites, a).sent_today,
                 daily_limit=a.daily_limit,
             )
-            for a in self._accounts.list()
+            for a in self._current_accounts()
         ]
 
     def account_card(self, account_id: int) -> AccountCard | None:
@@ -171,10 +182,20 @@ class InviterAdminService:
         выключать account.enabled") — TelegramAccountRepository.update()
         уже существует, отдельного enable()/disable() метода заводить не
         нужно (см. аудит: "нет отдельных методов — всё через generic
-        update(**fields)")."""
+        update(**fields)").
+
+        FAIL-CLOSED для is_old=True (см. design "Нельзя включить OLD
+        account" — даже если вручную сформировать callback с чужим/старым
+        account_id: это проверяется здесь, а не только скрытием из
+        списков, см. _current_accounts) — возвращает account БЕЗ изменений
+        (не None — account найден, просто переключение отклонено).
+        conversation.py различает этот случай по account.is_old в
+        возвращённом объекте."""
         account = self._accounts.get(account_id)
         if account is None:
             return None
+        if account.is_old:
+            return account
         return self._accounts.update(account_id, enabled=not account.enabled)
 
     def set_daily_limit(self, account_id: int, value: int) -> TelegramAccount | None:
@@ -289,7 +310,10 @@ class InviterAdminService:
         status_snapshot()/_needs_attention() ниже, никакого нового понятия
         "статус" не вводится (см. design "Не придумывать новый статус":
         только account.enabled + account.blocked_until/blocked_reason,
-        уже существующие поля TelegramAccount)."""
+        уже существующие поля TelegramAccount). is_old=True — тот же
+        _current_accounts(), что и list_accounts()/list_accounts_for_limits
+        (см. design "History-only records не должны выглядеть как обычные
+        рабочие accounts")."""
         now = datetime.now(timezone.utc)
         return [
             AccountStatusEntry(
@@ -301,7 +325,7 @@ class InviterAdminService:
                 sent_today=_account_usage(self._invites, a).sent_today,
                 daily_limit=a.daily_limit,
             )
-            for a in self._accounts.list()
+            for a in self._current_accounts()
         ]
 
     def status_snapshot(self) -> StatusSnapshot:

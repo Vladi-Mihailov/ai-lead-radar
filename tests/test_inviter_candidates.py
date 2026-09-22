@@ -21,12 +21,15 @@ from telethon.errors import (  # noqa: E402
     ChatWriteForbiddenError,
     FloodWaitError,
     PeerFloodError,
+    PeerIdInvalidError,
     RPCError,
     UserAlreadyParticipantError,
     UserBotError,
     UserChannelsTooMuchError,
+    UserIdInvalidError,
     UserKickedError,
     UserNotParticipantError,
+    UsernameNotOccupiedError,
     UserPrivacyRestrictedError,
 )
 from telethon.tl.functions.channels import InviteToChannelRequest  # noqa: E402
@@ -44,6 +47,7 @@ from reader.inviter.service import (  # noqa: E402
     InviteErrorAction,
     InviterService,
     _CandidateIsBotError,
+    _CandidatePermanentlyInvalidError,
     _CandidateUnresolvableError,
     _classify_invite_error,
     _format_duration,
@@ -127,6 +131,51 @@ def _setup_db(tmp_path) -> Path:
     # Создаёт/мигрирует таблицу users — до этого её в файле нет.
     UserRepository(db_path).close()
     return db_path
+
+
+def _seed_duplicate_pair_raw(db_path, *, primary, duplicate):
+    """Создаёт ДВЕ is_old=False записи telegram_accounts с одинаковым
+    telegram_user_id НАПРЯМУЮ через sqlite3 — ДО первого открытия
+    TelegramAccountRepository на этом файле (иначе миграция уже создала бы
+    partial UNIQUE index telegram_accounts(telegram_user_id) WHERE is_old=0,
+    см. reader/inviter/repository.py, на ещё чистых данных, и вторая строка
+    была бы отклонена БД точно так же, как и через ORM — в этом и цель
+    индекса). Эти тесты сознательно проверяют is_old-защиту InviterService
+    на УЖЕ существующем конфликте (реальный production-сценарий id=6/id=7 —
+    легаси-данные до появления этой защиты), а не создают новый дубль
+    через обычный флоу. primary/duplicate — dict с name/phone/
+    session_name/session_path/telegram_user_id/enabled."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS telegram_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL, phone TEXT NOT NULL, session_name TEXT NOT NULL,
+                session_path TEXT NOT NULL, daily_limit INTEGER NOT NULL DEFAULT 30,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TIMESTAMP, telegram_user_id INTEGER,
+                is_old INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        ids = []
+        for row in (primary, duplicate):
+            cursor = conn.execute(
+                "INSERT INTO telegram_accounts "
+                "(name, phone, session_name, session_path, daily_limit, telegram_user_id, enabled, is_old) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+                (
+                    row["name"], row["phone"], row["session_name"], row["session_path"],
+                    row.get("daily_limit", 30), row["telegram_user_id"], int(row["enabled"]),
+                ),
+            )
+            ids.append(cursor.lastrowid)
+        conn.commit()
+        return tuple(ids)
+    finally:
+        conn.close()
 
 
 class _FakeTelegramClient:
@@ -632,6 +681,57 @@ def test_select_candidates_non_invited_status_does_not_exclude(tmp_path):
     try:
         campaign = campaign_repository.create(name="A", keyword="осаго", target_chat="@a")
         invite_repository.create(user_id=1, campaign_id=campaign.id, status="failed")
+
+        candidates = invite_repository.select_candidates(campaign.id, limit=10)
+        assert [c.user_id for c in candidates] == [1]
+    finally:
+        campaign_repository.close()
+        invite_repository.close()
+
+
+def test_select_candidates_excludes_invalid_status(tmp_path):
+    """ROOT CAUSE FIX (см. задачу про production-инцидент: worker тратил
+    тики на permanently invalid кандидатах — @andrey/"No user has ... as
+    username", @Divanauto/"Invalid object ID for a user"): status='invalid'
+    ТЕПЕРЬ исключается из будущей выборки, в отличие от 'failed'/
+    'not_joined' — один результат с этим статусом от ЛЮБОГО account_id
+    достаточен, чтобы кандидат больше не появлялся ни для одного другого
+    аккаунта (NOT EXISTS не фильтрует по account_id, см.
+    _CANDIDATES_BASE_WHERE)."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+    _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        campaign = campaign_repository.create(name="A", keyword="осаго", target_chat="@a")
+        # account_id=999 — permanent invalid, отправленный КАКИМ-ТО первым
+        # аккаунтом — следующий аккаунт (любой другой account_id) не
+        # должен снова его увидеть.
+        invite_repository.create(user_id=1, campaign_id=campaign.id, account_id=999, status="invalid")
+
+        candidates = invite_repository.select_candidates(campaign.id, limit=10)
+        assert [c.user_id for c in candidates] == [2]
+        assert invite_repository.count_candidates(campaign.id) == 1
+    finally:
+        campaign_repository.close()
+        invite_repository.close()
+
+
+def test_select_candidates_not_joined_status_still_does_not_exclude(tmp_path):
+    """Регрессия: 'not_joined' (Telegram достоверно подтвердил отсутствие
+    участия при проверке pending, см. InviterService._verify_pending_invites)
+    по-прежнему НЕ исключается — это другой кандидат для другой попытки, не
+    permanently invalid identity."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        campaign = campaign_repository.create(name="A", keyword="осаго", target_chat="@a")
+        invite_repository.create(user_id=1, campaign_id=campaign.id, status="not_joined")
 
         candidates = invite_repository.select_candidates(campaign.id, limit=10)
         assert [c.user_id for c in candidates] == [1]
@@ -2388,13 +2488,18 @@ def test_execute_does_not_update_access_hash_for_non_user_entity(tmp_path):
     assert user_repository.calls == []
 
 
-async def test_resolve_input_peer_raises_for_candidate_without_username(tmp_path):
+async def test_resolve_input_peer_falls_back_to_stored_access_hash_without_username(tmp_path):
     """select_candidates() теперь никогда не отдаёт кандидата без username
     (см. тесты test_select_candidates_excludes_users_without_username в
-    tests/test_inviter_repository.py), поэтому эта ветка _resolve_input_peer
-    недостижима через обычный run() — но остаётся защитой на случай, если
-    InviteCandidate придёт сюда как-то иначе. Проверяем её напрямую, минуя
-    выборку."""
+    tests/test_inviter_repository.py), поэтому эта ветка обычно недостижима
+    через run() — но остаётся защитой, если InviteCandidate придёт сюда
+    как-то иначе. id-кэш этого аккаунта не резолвит, username отсутствует —
+    но candidate.access_hash уже известен (см. задачу "не полагаться
+    исключительно на username, если DB уже содержит достаточную identity")
+    — _resolve_input_peer теперь пробует именно его как последний
+    известный источник identity, ПРЕЖДЕ чем сдаться (см. тест ниже,
+    test_resolve_input_peer_raises_permanently_invalid_..., — про случай,
+    когда и этот fallback не срабатывает)."""
     account_repository = TelegramAccountRepository(tmp_path / "users.db")
     campaign_repository = InviteCampaignRepository(tmp_path / "users.db")
     invite_repository = UserCampaignInviteRepository(tmp_path / "users.db")
@@ -2411,12 +2516,127 @@ async def test_resolve_input_peer_raises_for_candidate_without_username(tmp_path
             user_id=1, username=None, keywords=["осаго"], access_hash=11, last_seen_at=None,
         )
 
+        input_peer = await service._resolve_input_peer(client, candidate)
+
+        assert input_peer.user_id == 1
+        assert input_peer.access_hash == 11
+        assert client.call_requests == []
+    finally:
+        account_repository.close()
+        campaign_repository.close()
+        invite_repository.close()
+
+
+async def test_resolve_input_peer_raises_permanently_invalid_when_all_paths_exhausted(tmp_path):
+    """3/4. id-кэш не резолвит, username-резолв ДОСТОВЕРНО подтверждён
+    Telegram как невалидный (UsernameNotOccupiedError — "No user has ...
+    as username", реальный случай @andrey/telegram_user_id=508233997), и
+    fallback по сохранённому access_hash ТОЖЕ не срабатывает (Telegram
+    отверг тем же confirmed-permanent классом ошибок) — только тогда
+    кандидат признаётся permanently invalid, не раньше (см. задачу "сначала
+    проверить существующие данные и Telethon resolve path")."""
+    account_repository = TelegramAccountRepository(tmp_path / "users.db")
+    campaign_repository = InviteCampaignRepository(tmp_path / "users.db")
+    invite_repository = UserCampaignInviteRepository(tmp_path / "users.db")
+    try:
+        service = InviterService(
+            account_repository, campaign_repository, invite_repository,
+            client_factory=_make_client_factory(),
+        )
+        client = _FakeTelegramClient(
+            SimpleNamespace(name="Основной"),
+            get_input_entity_error=ValueError("не известен этому аккаунту"),
+            entity_responses={
+                "@andrey": UsernameNotOccupiedError(request=GetHistoryRequest),
+                # fallback по access_hash=508 — тоже подтверждённо невалиден.
+                508233997: UserIdInvalidError(request=InviteToChannelRequest),
+            },
+        )
+        candidate = InviteCandidate(
+            user_id=508233997, username="andrey", keywords=["осаго"],
+            access_hash=508, last_seen_at=None,
+        )
+
+        import reader.inviter.service as service_module
+
+        with pytest.raises(service_module._CandidatePermanentlyInvalidError):
+            await service._resolve_input_peer(client, candidate)
+
+        assert client.call_requests == []
+    finally:
+        account_repository.close()
+        campaign_repository.close()
+        invite_repository.close()
+
+
+async def test_resolve_input_peer_stays_transient_when_fallback_fails_for_unknown_reason(tmp_path):
+    """6/7/8. Если username-резолв падает с НЕ подтверждённо-permanent
+    ошибкой (например network/timeout) и access_hash-fallback тоже не
+    срабатывает — кандидат остаётся _CandidateUnresolvableError
+    (транзиентный/account-specific), а НЕ permanently invalid (см. задачу
+    "не превращать в permanent invalid... временную невозможность resolve
+    entity конкретной session")."""
+    account_repository = TelegramAccountRepository(tmp_path / "users.db")
+    campaign_repository = InviteCampaignRepository(tmp_path / "users.db")
+    invite_repository = UserCampaignInviteRepository(tmp_path / "users.db")
+    try:
+        service = InviterService(
+            account_repository, campaign_repository, invite_repository,
+            client_factory=_make_client_factory(),
+        )
+        client = _FakeTelegramClient(
+            SimpleNamespace(name="Основной"),
+            get_input_entity_error=ValueError("не известен этому аккаунту"),
+            entity_responses={
+                "@andrey": ConnectionError("network unreachable"),
+                508233997: ConnectionError("network unreachable"),
+            },
+        )
+        candidate = InviteCandidate(
+            user_id=508233997, username="andrey", keywords=["осаго"],
+            access_hash=508, last_seen_at=None,
+        )
+
         import reader.inviter.service as service_module
 
         with pytest.raises(service_module._CandidateUnresolvableError):
             await service._resolve_input_peer(client, candidate)
+    finally:
+        account_repository.close()
+        campaign_repository.close()
+        invite_repository.close()
 
-        assert client.call_requests == []
+
+async def test_resolve_input_peer_raises_permanently_invalid_for_confirmed_peer_id_invalid(tmp_path):
+    """PeerIdInvalidError — второй confirmed-permanent тип, наравне с
+    UserIdInvalidError (см. _CONFIRMED_PERMANENT_IDENTITY_ERROR_TYPES) —
+    тоже переводит кандидата в permanently invalid после исчерпания всех
+    fallback-путей, не только UserIdInvalidError."""
+    account_repository = TelegramAccountRepository(tmp_path / "users.db")
+    campaign_repository = InviteCampaignRepository(tmp_path / "users.db")
+    invite_repository = UserCampaignInviteRepository(tmp_path / "users.db")
+    try:
+        service = InviterService(
+            account_repository, campaign_repository, invite_repository,
+            client_factory=_make_client_factory(),
+        )
+        client = _FakeTelegramClient(
+            SimpleNamespace(name="Основной"),
+            get_input_entity_error=ValueError("не известен этому аккаунту"),
+            entity_responses={
+                "@andrey": PeerIdInvalidError(request=GetHistoryRequest),
+                508233997: PeerIdInvalidError(request=GetHistoryRequest),
+            },
+        )
+        candidate = InviteCandidate(
+            user_id=508233997, username="andrey", keywords=["осаго"],
+            access_hash=508, last_seen_at=None,
+        )
+
+        import reader.inviter.service as service_module
+
+        with pytest.raises(service_module._CandidatePermanentlyInvalidError):
+            await service._resolve_input_peer(client, candidate)
     finally:
         account_repository.close()
         campaign_repository.close()
@@ -2525,13 +2745,13 @@ def test_execute_skips_confirmed_bot_before_sending_invite_request(tmp_path):
     """Кандидат с is_bot=NULL в users.db, который Telegram подтверждает
     ботом при живой проверке (см. _resolve_input_peer) — НИ ОДНОГО
     InviteToChannelRequest/AddChatUserRequest не отправляется вовсе,
-    записывается status='invalid', is_bot=1 сохраняется в users.db, и
-    аккаунт продолжает обработку ОСТАЛЬНЫХ кандидатов (это не PeerFlood/
-    ChatAdminRequired — риска для аккаунта здесь нет). Настоящий
-    UserRepository (не фейк) — чтобы is_bot=1 реально попал в users.db и
-    не дал волне добора (см. _execute_account) повторно выбрать того же
-    "бота", раз status='invalid' сам по себе не исключается из будущей
-    выборки."""
+    записывается status='invalid' (теперь и сам по себе исключается из
+    будущей выборки на уровне SQL, см. _CANDIDATES_BASE_WHERE, — не только
+    через is_bot), is_bot=1 сохраняется в users.db, и аккаунт продолжает
+    обработку ОСТАЛЬНЫХ кандидатов (это не PeerFlood/ChatAdminRequired —
+    риска для аккаунта здесь нет). Настоящий UserRepository (не фейк) —
+    чтобы is_bot=1 реально попал в users.db (двойная защита от повторного
+    выбора того же "бота" — is_bot=1 И status='invalid')."""
     db_path = _setup_db(tmp_path)
     # По last_seen_at DESC: 2 (бот, is_bot=NULL), 1 (обычный, is_bot=False
     # — уже подтверждён, чтобы не отвлекать проверку лишним вызовом).
@@ -2591,9 +2811,10 @@ def test_execute_marks_bot_via_rpc_error_as_defense_in_depth(tmp_path):
     приглашения тоже должна сохранить is_bot=1 в users.db (через
     mark_as_bot — полноценного entity здесь уже нет) и не останавливать
     аккаунт (это SKIP_USER, а не STOP_ACCOUNT). Настоящий UserRepository
-    (не фейк) — чтобы is_bot=1 реально попал в users.db и не дал волне
-    добора (см. _execute_account) повторно выбрать того же "бота", раз
-    status='invalid' сам по себе не исключается из будущей выборки."""
+    (не фейк) — чтобы is_bot=1 реально попал в users.db (двойная защита от
+    повторного выбора того же "бота" — is_bot=1 И status='invalid',
+    которое теперь тоже само по себе исключается из будущей выборки, см.
+    _CANDIDATES_BASE_WHERE)."""
     db_path = _setup_db(tmp_path)
     _seed_user(db_path, 2, username="vlars_bot", keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1), is_bot=False)
     _seed_user(db_path, 1, username="ivan", keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME, is_bot=False)
@@ -2636,6 +2857,384 @@ def test_execute_marks_bot_via_rpc_error_as_defense_in_depth(tmp_path):
     finally:
         user_repository.close()
 
+
+# ---- PERMANENTLY INVALID кандидаты (см. задачу про production-инцидент: ----
+# ---- @andrey/telegram_user_id=508233997 — "No user has 'andrey' as -------
+# ---- username", @Divanauto/telegram_user_id=726716985 — "Invalid ---------
+# ---- object ID for a user") -----------------------------------------------
+
+
+def test_andrey_username_not_found_with_no_fallback_becomes_permanently_invalid(tmp_path):
+    """1. Реальный случай @andrey/telegram_user_id=508233997 — username-
+    резолв ДОСТОВЕРНО невалиден (UsernameNotOccupiedError, "No user has
+    'andrey' as username"), и fallback по сохранённому access_hash тоже не
+    срабатывает (тоже confirmed-permanent) — candidate становится
+    status='invalid', НЕ 'failed'."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(
+        db_path, 508233997, username="andrey", keywords=["осаго"],
+        access_hash=999, last_seen_at=_BASE_TIME,
+    )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="Основной", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    client_factory = _make_client_factory(
+        get_input_entity_errors={"Основной": ValueError("не известен этому аккаунту")},
+        entity_responses={
+            "Основной": {
+                "@andrey": UsernameNotOccupiedError(request=GetHistoryRequest),
+                508233997: UserIdInvalidError(request=InviteToChannelRequest),
+            },
+        },
+    )
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == 1
+        assert invites[0].status == "invalid"
+    finally:
+        invite_repository.close()
+
+
+def test_andrey_permanently_invalid_not_selected_by_next_account(tmp_path):
+    """2. После permanent invalid следующий inviter account НЕ должен
+    получить того же кандидата (см. задачу: worker тратил тики на одних и
+    тех же permanently invalid кандидатах). account_1 делает @andrey
+    invalid; account_2 (со здоровым резолвом) не должен даже попытаться
+    его пригласить — SQL-исключение уже сработало к моменту его
+    обработки (аккаунты обрабатываются последовательно внутри одного
+    run(), см. InviterService.run())."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(
+        db_path, 508233997, username="andrey", keywords=["осаго"],
+        access_hash=999, last_seen_at=_BASE_TIME,
+    )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+        account_repository.create(
+            name="account_2", phone="+995500000002", session_name="acc2",
+            session_path="acc2.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(
+        get_input_entity_errors={"account_1": ValueError("не известен этому аккаунту")},
+        entity_responses={
+            "account_1": {
+                "@andrey": UsernameNotOccupiedError(request=GetHistoryRequest),
+                508233997: UserIdInvalidError(request=InviteToChannelRequest),
+            },
+        },
+        created=created_clients,
+    )
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    by_name = {c.account.name: c for c in created_clients}
+    assert by_name["account_2"].call_requests == []
+    assert by_name["account_2"].get_input_entity_calls == []
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == 1  # НЕ два — account_2 даже не выбрал кандидата
+        assert invites[0].status == "invalid"
+    finally:
+        invite_repository.close()
+
+
+def test_divanauto_invalid_object_id_retries_with_stored_access_hash_and_succeeds(tmp_path):
+    """3/5. Реальный случай @Divanauto/telegram_user_id=726716985 — резолв
+    УСПЕШЕН (id-кэш находит кандидата), но САМА отправка
+    (InviteToChannelRequest) падает с UserIdInvalidError ("Invalid object
+    ID for a user") — прежде чем считать identity невалидной, делается
+    ОДНА повторная попытка со stored access_hash; здесь она УСПЕШНА —
+    кандидат приглашён как обычно, НЕ помечен invalid (см. задачу "если
+    можно восстановить по telegram_user_id/access_hash — лучше исправить
+    resolve, а не выбрасывать кандидата")."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(
+        db_path, 726716985, username="Divanauto", keywords=["осаго"],
+        access_hash=777, last_seen_at=_BASE_TIME,
+    )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="Основной", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(
+        call_errors={"Основной": [UserIdInvalidError(request=InviteToChannelRequest), None]},
+        created=created_clients,
+    )
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    client = created_clients[0]
+    assert len(client.call_requests) == 2  # исходная попытка + ровно один retry
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == 1
+        assert invites[0].status in ("pending", "joined")
+        assert invites[0].status != "invalid"
+    finally:
+        invite_repository.close()
+
+
+def test_divanauto_invalid_object_id_retry_also_fails_becomes_permanently_invalid(tmp_path):
+    """4. И исходная отправка, И повторная попытка со stored access_hash
+    падают с confirmed-permanent ошибкой — ТОЛЬКО тогда кандидат
+    признаётся permanently invalid (не после первой же ошибки — см. задачу
+    "не классифицируй Invalid object ID как permanent вслепую")."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(
+        db_path, 726716985, username="Divanauto", keywords=["осаго"],
+        access_hash=777, last_seen_at=_BASE_TIME,
+    )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="Основной", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    created_clients: list = []
+    client_factory = _make_client_factory(
+        call_errors={"Основной": [
+            UserIdInvalidError(request=InviteToChannelRequest),
+            UserIdInvalidError(request=InviteToChannelRequest),
+        ]},
+        created=created_clients,
+    )
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    client = created_clients[0]
+    assert len(client.call_requests) == 2
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == 1
+        assert invites[0].status == "invalid"
+    finally:
+        invite_repository.close()
+
+
+def test_divanauto_retry_flood_wait_is_not_permanent_invalid(tmp_path, monkeypatch):
+    """6. Если ПОВТОРНАЯ попытка (см. _retry_send_with_stored_access_hash)
+    сама получает FloodWaitError — это НЕ permanent invalid, обрабатывается
+    как обычный FloodWait (см. _classify_invite_error), кандидат остаётся
+    'failed', НЕ 'invalid'."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(
+        db_path, 726716985, username="Divanauto", keywords=["осаго"],
+        access_hash=777, last_seen_at=_BASE_TIME,
+    )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="Основной", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    client_factory = _make_client_factory(
+        call_errors={"Основной": [
+            UserIdInvalidError(request=InviteToChannelRequest),
+            FloodWaitError(request=GetHistoryRequest, capture=5),
+        ]},
+    )
+
+    import reader.inviter.service as service_module
+
+    sleep_calls: list = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(service_module.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    assert 5 in sleep_calls
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert len(invites) == 1
+        assert invites[0].status == "failed"
+    finally:
+        invite_repository.close()
+
+
+def test_permanent_invalid_does_not_increase_daily_or_hourly_counters(tmp_path):
+    """9/10. permanent invalid НЕ увеличивает ни daily (joined+pending), ни
+    hourly (count_recent_sent) счётчики — 'invalid' не входит ни в один из
+    них (см. _COUNT_TODAY_JOINED/_COUNT_TODAY_PENDING/_COUNT_RECENT_SENT в
+    reader/inviter/repository.py) — diagnostic-запись при этом сохраняется."""
+    db_path = _setup_db(tmp_path)
+    _seed_user(
+        db_path, 508233997, username="andrey", keywords=["осаго"],
+        access_hash=999, last_seen_at=_BASE_TIME,
+    )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account = account_repository.create(
+            name="Основной", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    client_factory = _make_client_factory(
+        get_input_entity_errors={"Основной": ValueError("не известен этому аккаунту")},
+        entity_responses={
+            "Основной": {
+                "@andrey": UsernameNotOccupiedError(request=GetHistoryRequest),
+                508233997: UserIdInvalidError(request=InviteToChannelRequest),
+            },
+        },
+    )
+
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = invite_repository.list()
+        assert invites[0].status == "invalid"  # diagnostic-запись сохранена
+
+        now = datetime.now(timezone.utc)
+        assert invite_repository.count_today_joined(account.id) == 0
+        assert invite_repository.count_today_pending(account.id) == 0
+        assert invite_repository.count_recent_sent(account.id, now - timedelta(hours=1)) == 0
+    finally:
+        invite_repository.close()
+
+
+async def test_worker_reaches_next_eligible_candidate_in_same_call_after_invalid(tmp_path, monkeypatch):
+    """13. candidate A (permanently invalid) + candidate B (valid) — ОДИН
+    вызов run_one_worker_attempt (см. reader/inviter/worker.py — постоянный
+    фоновый режим) должен дойти и до B (через волну добора внутри ТОГО ЖЕ
+    _execute_account), а не ждать следующего 10-минутного тика."""
+    db_path = _setup_db(tmp_path)
+    # last_seen_at DESC -> A выбирается основной волной первым, B — доборной.
+    _seed_user(
+        db_path, 508233997, username="andrey", keywords=["осаго"],
+        access_hash=999, last_seen_at=_BASE_TIME + timedelta(days=1),
+    )
+    _seed_user(
+        db_path, 1, username="ivan", keywords=["осаго"],
+        access_hash=11, last_seen_at=_BASE_TIME,
+    )
+
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account = account_repository.create(
+            name="Основной", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    client_factory = _make_client_factory(
+        # get_input_entity_error применяется ко ВСЕМ кандидатам этого
+        # аккаунта (не выборочно) — поэтому ivan (B) тоже идёт через
+        # username-резолв, а не через id-кэш; явный ответ для "@ivan" ниже
+        # обеспечивает ему успешный резолв (B — валидный кандидат).
+        get_input_entity_errors={"Основной": ValueError("не известен этому аккаунту")},
+        entity_responses={
+            "Основной": {
+                "@andrey": UsernameNotOccupiedError(request=GetHistoryRequest),
+                508233997: UserIdInvalidError(request=InviteToChannelRequest),
+                "@ivan": User(id=1, access_hash=11, username="ivan", bot=False),
+            },
+        },
+    )
+
+    import reader.inviter.service as service_module
+
+    async def fake_sleep(seconds):
+        pass
+
+    monkeypatch.setattr(service_module.asyncio, "sleep", fake_sleep)
+
+    account_repository = TelegramAccountRepository(db_path)
+    campaign_repository = InviteCampaignRepository(db_path)
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        service = InviterService(
+            account_repository, campaign_repository, invite_repository,
+            client_factory=client_factory, session_checker=lambda account: True,
+        )
+        stats = await service.run_one_worker_attempt(campaign, account, hourly_limit=100)
+    finally:
+        account_repository.close()
+        campaign_repository.close()
+        invite_repository.close()
+
+    assert stats is not None
+    assert stats.invalid == 1
+    assert stats.sent == 1  # B тоже приглашён — в рамках ОДНОГО вызова, не следующего тика
+
+    invite_repository = UserCampaignInviteRepository(db_path)
+    try:
+        invites = {i.user_id: i for i in invite_repository.list()}
+        assert invites[508233997].status == "invalid"
+        assert invites[1].status in ("pending", "joined")
+    finally:
+        invite_repository.close()
 
 
 def test_execute_flood_wait_during_resolution_handled_like_during_send(tmp_path, monkeypatch):
@@ -3310,6 +3909,12 @@ def test_humanize_error_falls_back_to_str_for_unmapped_exception():
         ),
         (
             _CandidateIsBotError("42 — известный Telegram-бот"),
+            InviteErrorAction.SKIP_USER, "invalid", "invalid",
+        ),
+        (
+            # permanently invalid identity (см. задачу @andrey/@Divanauto) —
+            # тот же canonical "invalid" статус, что и у ботов выше.
+            _CandidatePermanentlyInvalidError("508233997 — не резолвится ни одним способом"),
             InviteErrorAction.SKIP_USER, "invalid", "invalid",
         ),
         (
@@ -5723,21 +6328,24 @@ def test_execute_skips_duplicate_enabled_account_sharing_same_tg_id(tmp_path):
     _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
     _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
 
+    primary_id, _duplicate_id = _seed_duplicate_pair_raw(
+        db_path,
+        primary={
+            "name": "@Iv_vla_sov", "phone": "+995568759201", "session_name": "Iv_vla_sov",
+            "session_path": "Iv_vla_sov.session", "daily_limit": 1,
+            "telegram_user_id": 8838087889, "enabled": True,
+        },
+        duplicate={
+            "name": "@Misha_Offroad", "phone": "+995568759201", "session_name": "Misha_Offroad",
+            "session_path": "Misha_Offroad.session", "daily_limit": 1,
+            "telegram_user_id": 8838087889, "enabled": True,
+        },
+    )
     campaign_repository = InviteCampaignRepository(db_path)
-    account_repository = TelegramAccountRepository(db_path)
     try:
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
-        primary = account_repository.create(
-            name="@Iv_vla_sov", phone="+995568759201", session_name="Iv_vla_sov",
-            session_path="Iv_vla_sov.session", daily_limit=1, telegram_user_id=8838087889,
-        )
-        account_repository.create(
-            name="@Misha_Offroad", phone="+995568759201", session_name="Misha_Offroad",
-            session_path="Misha_Offroad.session", daily_limit=1, telegram_user_id=8838087889,
-        )
     finally:
         campaign_repository.close()
-        account_repository.close()
 
     created_clients: list = []
     asyncio.run(
@@ -5763,7 +6371,7 @@ def test_execute_skips_duplicate_enabled_account_sharing_same_tg_id(tmp_path):
     try:
         invites = invite_repository.list()
         assert len(invites) == 1
-        assert invites[0].account_id == primary.id
+        assert invites[0].account_id == primary_id
     finally:
         invite_repository.close()
 
@@ -5776,22 +6384,24 @@ def test_execute_disabled_duplicate_does_not_block_enabled_primary(tmp_path):
     db_path = _setup_db(tmp_path)
     _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
 
+    primary_id, _duplicate_id = _seed_duplicate_pair_raw(
+        db_path,
+        primary={
+            "name": "@Iv_vla_sov", "phone": "+995568759201", "session_name": "Iv_vla_sov",
+            "session_path": "Iv_vla_sov.session", "daily_limit": 1,
+            "telegram_user_id": 8838087889, "enabled": True,
+        },
+        duplicate={
+            "name": "@Misha_Offroad", "phone": "+995568759201", "session_name": "Misha_Offroad",
+            "session_path": "Misha_Offroad.session", "daily_limit": 1,
+            "telegram_user_id": 8838087889, "enabled": False,
+        },
+    )
     campaign_repository = InviteCampaignRepository(db_path)
-    account_repository = TelegramAccountRepository(db_path)
     try:
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
-        primary = account_repository.create(
-            name="@Iv_vla_sov", phone="+995568759201", session_name="Iv_vla_sov",
-            session_path="Iv_vla_sov.session", daily_limit=1, telegram_user_id=8838087889,
-        )
-        account_repository.create(
-            name="@Misha_Offroad", phone="+995568759201", session_name="Misha_Offroad",
-            session_path="Misha_Offroad.session", daily_limit=1, telegram_user_id=8838087889,
-            enabled=False,
-        )
     finally:
         campaign_repository.close()
-        account_repository.close()
 
     created_clients: list = []
     asyncio.run(
@@ -5813,7 +6423,7 @@ def test_execute_disabled_duplicate_does_not_block_enabled_primary(tmp_path):
     try:
         invites = invite_repository.list()
         assert len(invites) == 1
-        assert invites[0].account_id == primary.id
+        assert invites[0].account_id == primary_id
     finally:
         invite_repository.close()
 
@@ -5922,20 +6532,25 @@ def test_execute_old_row_is_never_used_even_if_manually_enabled(tmp_path, caplog
     _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
     _seed_user(db_path, 2, keywords=["осаго"], access_hash=2, last_seen_at=_BASE_TIME + timedelta(days=1))
 
+    primary_id, duplicate_id = _seed_duplicate_pair_raw(
+        db_path,
+        primary={
+            "name": "@Iv_vla_sov", "phone": "+995568759201", "session_name": "Iv_vla_sov",
+            "session_path": "Iv_vla_sov.session", "daily_limit": 1,
+            "telegram_user_id": 8838087889, "enabled": True,
+        },
+        duplicate={
+            "name": "@Misha_Offroad", "phone": "+995568759201", "session_name": "Misha_Offroad",
+            "session_path": "Misha_Offroad.session", "daily_limit": 1,
+            "telegram_user_id": 8838087889, "enabled": False,
+        },
+    )
     campaign_repository = InviteCampaignRepository(db_path)
     account_repository = TelegramAccountRepository(db_path)
     try:
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
-        primary = account_repository.create(
-            name="@Iv_vla_sov", phone="+995568759201", session_name="Iv_vla_sov",
-            session_path="Iv_vla_sov.session", daily_limit=1,
-            telegram_user_id=8838087889, enabled=True,
-        )
-        duplicate = account_repository.create(
-            name="@Misha_Offroad", phone="+995568759201", session_name="Misha_Offroad",
-            session_path="Misha_Offroad.session", daily_limit=1,
-            telegram_user_id=8838087889, enabled=False,
-        )
+        primary = account_repository.get(primary_id)
+        duplicate = account_repository.get(duplicate_id)
         # Уже разрешённый дубликат из предыдущего sync/тика — is_old=True,
         # затем оператор (или баг) вручную снова выставил ему enabled=1.
         account_repository.update(
@@ -5998,23 +6613,24 @@ def test_execute_automatically_flags_disabled_duplicate_as_old_without_operator_
     db_path = _setup_db(tmp_path)
     _seed_user(db_path, 1, keywords=["осаго"], access_hash=1, last_seen_at=_BASE_TIME)
 
+    primary_id, duplicate_id = _seed_duplicate_pair_raw(
+        db_path,
+        primary={
+            "name": "@Iv_vla_sov", "phone": "+995568759201", "session_name": "Iv_vla_sov",
+            "session_path": "Iv_vla_sov.session", "daily_limit": 1,
+            "telegram_user_id": 8838087889, "enabled": True,
+        },
+        duplicate={
+            "name": "@Misha_Offroad", "phone": "+995568759201", "session_name": "Misha_Offroad",
+            "session_path": "Misha_Offroad.session", "daily_limit": 1,
+            "telegram_user_id": 8838087889, "enabled": False,
+        },
+    )
     campaign_repository = InviteCampaignRepository(db_path)
-    account_repository = TelegramAccountRepository(db_path)
     try:
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
-        primary = account_repository.create(
-            name="@Iv_vla_sov", phone="+995568759201", session_name="Iv_vla_sov",
-            session_path="Iv_vla_sov.session", daily_limit=1,
-            telegram_user_id=8838087889, enabled=True,
-        )
-        duplicate = account_repository.create(
-            name="@Misha_Offroad", phone="+995568759201", session_name="Misha_Offroad",
-            session_path="Misha_Offroad.session", daily_limit=1,
-            telegram_user_id=8838087889, enabled=False,
-        )
     finally:
         campaign_repository.close()
-        account_repository.close()
 
     created_clients: list = []
     asyncio.run(
@@ -6036,8 +6652,8 @@ def test_execute_automatically_flags_disabled_duplicate_as_old_without_operator_
 
     account_repository = TelegramAccountRepository(db_path)
     try:
-        refreshed_primary = account_repository.get(primary.id)
-        refreshed_duplicate = account_repository.get(duplicate.id)
+        refreshed_primary = account_repository.get(primary_id)
+        refreshed_duplicate = account_repository.get(duplicate_id)
     finally:
         account_repository.close()
 
@@ -6050,6 +6666,6 @@ def test_execute_automatically_flags_disabled_duplicate_as_old_without_operator_
     try:
         invites = invite_repository.list()
         assert len(invites) == 1
-        assert invites[0].account_id == primary.id
+        assert invites[0].account_id == primary_id
     finally:
         invite_repository.close()

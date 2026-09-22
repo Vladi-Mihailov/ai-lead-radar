@@ -54,6 +54,10 @@ GLOBAL_ENABLED_TEXT = "▶️ Автоприглашения включены."
 GLOBAL_PAUSED_TEXT = "⏸ Автоприглашения приостановлены."
 
 ACTION_FAILED_TEXT = "⚠️ Не удалось выполнить действие — откройте список заново через «👤 Аккаунты»."
+OLD_ACCOUNT_TOGGLE_BLOCKED_TEXT = (
+    "⚠️ Архивный аккаунт нельзя включить.\n"
+    "Используйте актуальную запись этого Telegram-аккаунта."
+)
 
 HELP_TEXT = (
     "ℹ️ Inviter Admin Bot\n"

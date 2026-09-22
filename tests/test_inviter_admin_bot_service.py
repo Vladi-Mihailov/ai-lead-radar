@@ -56,11 +56,11 @@ def fx(tmp_path):
     fixture.close()
 
 
-def _make_account(fx, *, name="@vvz982", telegram_user_id=100, daily_limit=15, enabled=True):
+def _make_account(fx, *, name="@vvz982", telegram_user_id=100, daily_limit=15, enabled=True, is_old=False):
     account = fx.accounts.create(
         name=name, phone="+995500000001", session_name=name.lstrip("@"),
         session_path=str(Path(fx.db_path).parent / "sessions" / name.lstrip("@")),
-        daily_limit=daily_limit, enabled=enabled, telegram_user_id=telegram_user_id,
+        daily_limit=daily_limit, enabled=enabled, telegram_user_id=telegram_user_id, is_old=is_old,
     )
     return account
 
@@ -509,3 +509,57 @@ def test_list_account_statuses_includes_sent_today_and_daily_limit(fx):
 
     assert entries[0].sent_today == 2
     assert entries[0].daily_limit == 15
+
+
+# ---- E. is_old=True исключены из operational-списков (👤/⚙️/📊) ----
+
+
+def test_list_accounts_excludes_old_accounts(fx):
+    current = _make_account(fx, name="@Iv_vla_sov", telegram_user_id=6, is_old=False)
+    _make_account(fx, name="@Iv_vla_sov", telegram_user_id=6, is_old=True, enabled=False)
+
+    entries = fx.service.list_accounts()
+
+    assert [e.id for e in entries] == [current.id]
+
+
+def test_list_accounts_for_limits_excludes_old_accounts(fx):
+    current = _make_account(fx, name="@bdlapq", telegram_user_id=9, is_old=False)
+    _make_account(fx, name="@bdlapq", telegram_user_id=9, is_old=True, enabled=False)
+
+    entries = fx.service.list_accounts_for_limits()
+
+    assert [e.id for e in entries] == [current.id]
+
+
+def test_list_account_statuses_excludes_old_accounts(fx):
+    current = _make_account(fx, name="@bdlapq", telegram_user_id=9, is_old=False)
+    _make_account(fx, name="@bdlapq", telegram_user_id=9, is_old=True, enabled=False)
+
+    entries = fx.service.list_account_statuses()
+
+    assert len(entries) == 1
+    assert entries[0].display_name == current.name
+
+
+# ---- F/G. toggle_enabled fail-closed для is_old, CURRENT — как раньше ----
+
+
+def test_toggle_enabled_blocked_for_old_account(fx):
+    old = _make_account(fx, name="@bdlapq", telegram_user_id=9, is_old=True, enabled=True)
+
+    result = fx.service.toggle_enabled(old.id)
+
+    assert result is not None
+    assert result.is_old is True
+    assert result.enabled is True  # НЕ изменилось
+    assert fx.accounts.get(old.id).enabled is True  # и в БД тоже не изменилось
+
+
+def test_toggle_enabled_still_works_for_current_account(fx):
+    current = _make_account(fx, is_old=False, enabled=True)
+
+    result = fx.service.toggle_enabled(current.id)
+
+    assert result.enabled is False
+    assert fx.accounts.get(current.id).enabled is False

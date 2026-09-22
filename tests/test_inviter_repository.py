@@ -754,3 +754,129 @@ def test_list_pending_returns_empty_when_none_pending(tmp_path):
         assert repository.list_pending(7, 1) == []
     finally:
         repository.close()
+
+
+# ---- partial UNIQUE index: одновременно только одна CURRENT (is_old=0)
+# запись на telegram_user_id (см. задачу про production-дубли id=6/7,
+# id=8/9) ----
+
+
+def _make_account(repository, *, name, telegram_user_id, is_old=False, enabled=True):
+    return repository.create(
+        name=name, phone="+995500000001", session_name=name.lstrip("@"),
+        session_path=f"data/sessions/{name.lstrip('@')}",
+        telegram_user_id=telegram_user_id, is_old=is_old, enabled=enabled,
+    )
+
+
+def test_current_identity_index_is_created_on_fresh_db(tmp_path):
+    repository = TelegramAccountRepository(tmp_path / "inviter.db")
+    try:
+        index_names = _index_names(tmp_path / "inviter.db", "telegram_accounts")
+        assert "idx_telegram_accounts_current_user_id" in index_names
+    finally:
+        repository.close()
+
+
+def test_two_current_rows_with_same_telegram_user_id_are_rejected(tmp_path):
+    db_path = tmp_path / "inviter.db"
+    repository = TelegramAccountRepository(db_path)
+    try:
+        _make_account(repository, name="@one", telegram_user_id=555, is_old=False)
+        with pytest.raises(sqlite3.IntegrityError):
+            _make_account(repository, name="@two", telegram_user_id=555, is_old=False)
+    finally:
+        repository.close()
+
+
+def test_current_plus_old_with_same_telegram_user_id_is_allowed(tmp_path):
+    db_path = tmp_path / "inviter.db"
+    repository = TelegramAccountRepository(db_path)
+    try:
+        current = _make_account(repository, name="@current", telegram_user_id=555, is_old=False)
+        old = _make_account(repository, name="@old", telegram_user_id=555, is_old=True, enabled=False)
+
+        assert repository.get(current.id) is not None
+        assert repository.get(old.id) is not None
+    finally:
+        repository.close()
+
+
+def test_null_telegram_user_id_legacy_rows_unaffected_by_index(tmp_path):
+    """NULL telegram_user_id (аккаунт ещё не синхронизирован ни разу, см.
+    задачу про backfill) — сколько угодно таких строк, индекс их не
+    ограничивает (WHERE ... telegram_user_id IS NOT NULL)."""
+    db_path = tmp_path / "inviter.db"
+    repository = TelegramAccountRepository(db_path)
+    try:
+        a1 = repository.create(
+            name="tg_1", phone="+995500000001", session_name="a1", session_path="data/sessions/a1",
+        )
+        a2 = repository.create(
+            name="tg_2", phone="+995500000002", session_name="a2", session_path="data/sessions/a2",
+        )
+        assert a1.telegram_user_id is None
+        assert a2.telegram_user_id is None
+        assert repository.get(a1.id) is not None
+        assert repository.get(a2.id) is not None
+    finally:
+        repository.close()
+
+
+def test_reopening_db_with_existing_two_current_conflict_skips_index_without_crashing(tmp_path):
+    """Если конфликт (два is_old=0 с одним telegram_user_id) УЖЕ существует
+    на диске до появления этой защиты (см. design "не пытаться
+    автоматически угадывать canonical, fail clearly / skip migration") —
+    открытие репозитория НЕ падает, просто не создаёт индекс в этом
+    запуске. Конфликтующие строки создаются НАПРЯМУЮ через sqlite3, БЕЗ
+    единого предшествующего открытия TelegramAccountRepository — иначе
+    индекс успел бы создаться на ещё чистых данных раньше, чем возник
+    конфликт, и сам не дал бы его создать (что и требовалось бы доказать
+    ЭТИМ тестом иначе)."""
+    db_path = tmp_path / "inviter.db"
+
+    raw = sqlite3.connect(db_path)
+    try:
+        raw.execute(
+            """
+            CREATE TABLE telegram_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                session_name TEXT NOT NULL,
+                session_path TEXT NOT NULL,
+                daily_limit INTEGER NOT NULL DEFAULT 30,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TIMESTAMP,
+                telegram_user_id INTEGER,
+                is_old INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        raw.execute(
+            "INSERT INTO telegram_accounts (name, phone, session_name, session_path, telegram_user_id, is_old) "
+            "VALUES ('@one', '+995500000001', 'one', 'data/sessions/one', 777, 0)"
+        )
+        raw.execute(
+            "INSERT INTO telegram_accounts (name, phone, session_name, session_path, telegram_user_id, is_old) "
+            "VALUES ('@two', '+995500000002', 'two', 'data/sessions/two', 777, 0)"
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    index_names_before = _index_names(db_path, "telegram_accounts")
+    assert "idx_telegram_accounts_current_user_id" not in index_names_before
+
+    # Первое открытие через репозиторий встречает конфликт сразу — не
+    # падает (даже несмотря на _migrate_missing_columns добавляющую все
+    # остальные колонки заново на этой "legacy" таблице), индекс не создан.
+    repository = TelegramAccountRepository(db_path)
+    try:
+        accounts = repository.list()
+        assert len([a for a in accounts if a.telegram_user_id == 777 and not a.is_old]) == 2
+        index_names_after = _index_names(db_path, "telegram_accounts")
+        assert "idx_telegram_accounts_current_user_id" not in index_names_after
+    finally:
+        repository.close()

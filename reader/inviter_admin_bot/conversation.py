@@ -259,6 +259,12 @@ class AdminBotController:
         account = self._service.toggle_enabled(account_id)
         if account is None:
             return BotReply(text=texts.ACTION_FAILED_TEXT, show_main_menu=True)
+        # fail-closed (см. InviterAdminService.toggle_enabled) — даже
+        # вручную сформированный callback на is_old-запись не включает её,
+        # только показывает понятную причину отказа (см. design "Нельзя
+        # включить OLD account").
+        if account.is_old:
+            return BotReply(text=texts.OLD_ACCOUNT_TOGGLE_BLOCKED_TEXT, show_main_menu=True)
         return self._format_accounts_reply()
 
     def handle_account_limit_open(self, account_id: int, *, telegram_user_id: int) -> BotReply:

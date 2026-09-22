@@ -5,6 +5,7 @@ Telegram-аккаунт). Без Telethon, без TelegramClient — тольк�
 TelegramAccountRepository + чистые функции."""
 
 import asyncio
+import sqlite3
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,54 @@ from reader.inviter.identity import (  # noqa: E402
     resolve_duplicate_group,
 )
 from reader.inviter.repository import TelegramAccountRepository  # noqa: E402
+
+
+def _seed_duplicate_pair_raw(db_path, *, primary, duplicate):
+    """Создаёт ДВЕ is_old=False записи с одинаковым telegram_user_id
+    НАПРЯМУЮ через sqlite3 — ДО первого открытия TelegramAccountRepository
+    на этом файле (иначе миграция уже создала бы partial UNIQUE index
+    telegram_accounts(telegram_user_id) WHERE is_old=0, см.
+    reader/inviter/repository.py, на ещё чистых данных, и сам raw INSERT
+    второй строки был бы отклонён БД точно так же, как и через ORM — цель
+    индекса именно в этом). Эти тесты сознательно проверяют
+    resolve_duplicate_group() на УЖЕ существующем конфликте (легаси-
+    данные / состояние до появления защиты) — сама функция под тестом
+    ничего не знает и не должна знать про этот индекс, только приводит
+    such группу к единственной CURRENT.
+
+    primary/duplicate — dict с name/phone/session_name/session_path/
+    telegram_user_id/enabled. Возвращает (primary_id, duplicate_id)."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE telegram_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL, phone TEXT NOT NULL, session_name TEXT NOT NULL,
+                session_path TEXT NOT NULL, daily_limit INTEGER NOT NULL DEFAULT 30,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TIMESTAMP, telegram_user_id INTEGER,
+                is_old INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        ids = []
+        for row in (primary, duplicate):
+            cursor = conn.execute(
+                "INSERT INTO telegram_accounts "
+                "(name, phone, session_name, session_path, telegram_user_id, enabled, is_old) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0)",
+                (
+                    row["name"], row["phone"], row["session_name"], row["session_path"],
+                    row["telegram_user_id"], int(row["enabled"]),
+                ),
+            )
+            ids.append(cursor.lastrowid)
+        conn.commit()
+        return tuple(ids)
+    finally:
+        conn.close()
 
 
 class _FakeClient:
@@ -262,21 +311,24 @@ def test_resolve_duplicate_group_prefers_the_enabled_row_as_current(tmp_path):
     @Misha_Offroad (изначально тоже enabled в этом тесте) — обе физически
     telegram_user_id=8838087889. Ровно одна CURRENT, вторая OLD+disabled,
     ничего не удалено."""
-    repository = TelegramAccountRepository(tmp_path / "inviter.db")
+    db_path = tmp_path / "inviter.db"
+    primary_id, duplicate_id = _seed_duplicate_pair_raw(
+        db_path,
+        primary={
+            "name": "@Iv_vla_sov", "phone": "+995568759201", "session_name": "Iv_vla_sov",
+            "session_path": "Iv_vla_sov", "telegram_user_id": 8838087889, "enabled": True,
+        },
+        duplicate={
+            "name": "@Misha_Offroad", "phone": "+995568759201", "session_name": "Misha_Offroad",
+            "session_path": "Misha_Offroad", "telegram_user_id": 8838087889, "enabled": False,
+        },
+    )
+    repository = TelegramAccountRepository(db_path)
     try:
-        primary = repository.create(
-            name="@Iv_vla_sov", phone="+995568759201", session_name="Iv_vla_sov",
-            session_path="Iv_vla_sov", telegram_user_id=8838087889, enabled=True,
-        )
-        duplicate = repository.create(
-            name="@Misha_Offroad", phone="+995568759201", session_name="Misha_Offroad",
-            session_path="Misha_Offroad", telegram_user_id=8838087889, enabled=False,
-        )
-
         resolve_duplicate_group(repository, 8838087889)
 
-        current = repository.get(primary.id)
-        old = repository.get(duplicate.id)
+        current = repository.get(primary_id)
+        old = repository.get(duplicate_id)
         assert current.is_old is False
         assert current.enabled is True  # CURRENT не трогаем — уже был enabled
         assert old.is_old is True
@@ -293,21 +345,24 @@ def test_resolve_duplicate_group_tie_breaks_by_lowest_id_when_none_enabled(tmp_p
     детерминированно (наименьший id), но enabled НЕ включается автоматически
     ни для одной из них (см. задачу: "если все disabled — не включать ни
     одну автоматически, просто определить primary/current для отображения")."""
-    repository = TelegramAccountRepository(tmp_path / "inviter.db")
+    db_path = tmp_path / "inviter.db"
+    lower_id, higher_id = _seed_duplicate_pair_raw(
+        db_path,
+        primary={
+            "name": "@m_vlad_i_mir", "phone": "+79495447392", "session_name": "inviter_m_vlad_i_mir",
+            "session_path": "inviter_m_vlad_i_mir", "telegram_user_id": 8847286898, "enabled": False,
+        },
+        duplicate={
+            "name": "@bdlapq", "phone": "+79495447392", "session_name": "inviter_bdlapq",
+            "session_path": "inviter_bdlapq", "telegram_user_id": 8847286898, "enabled": False,
+        },
+    )
+    repository = TelegramAccountRepository(db_path)
     try:
-        lower = repository.create(
-            name="@m_vlad_i_mir", phone="+79495447392", session_name="inviter_m_vlad_i_mir",
-            session_path="inviter_m_vlad_i_mir", telegram_user_id=8847286898, enabled=False,
-        )
-        higher = repository.create(
-            name="@bdlapq", phone="+79495447392", session_name="inviter_bdlapq",
-            session_path="inviter_bdlapq", telegram_user_id=8847286898, enabled=False,
-        )
-
         resolve_duplicate_group(repository, 8847286898)
 
-        current = repository.get(lower.id)
-        old = repository.get(higher.id)
+        current = repository.get(lower_id)
+        old = repository.get(higher_id)
         assert current.is_old is False
         assert current.enabled is False  # никогда не включать автоматически
         assert old.is_old is True
@@ -322,27 +377,30 @@ def test_resolve_duplicate_group_is_sticky_even_if_old_row_manually_enabled(tmp_
     resolve_duplicate_group не должен реклассифицировать её обратно в
     CURRENT — только принудительно возвращает enabled=False (защита в
     рантайме дополнительно проверяет is_old напрямую, см. service.py)."""
-    repository = TelegramAccountRepository(tmp_path / "inviter.db")
+    db_path = tmp_path / "inviter.db"
+    primary_id, duplicate_id = _seed_duplicate_pair_raw(
+        db_path,
+        primary={
+            "name": "@Iv_vla_sov", "phone": "+995568759201", "session_name": "Iv_vla_sov",
+            "session_path": "Iv_vla_sov", "telegram_user_id": 8838087889, "enabled": True,
+        },
+        duplicate={
+            "name": "@Misha_Offroad", "phone": "+995568759201", "session_name": "Misha_Offroad",
+            "session_path": "Misha_Offroad", "telegram_user_id": 8838087889, "enabled": False,
+        },
+    )
+    repository = TelegramAccountRepository(db_path)
     try:
-        primary = repository.create(
-            name="@Iv_vla_sov", phone="+995568759201", session_name="Iv_vla_sov",
-            session_path="Iv_vla_sov", telegram_user_id=8838087889, enabled=True,
-        )
-        duplicate = repository.create(
-            name="@Misha_Offroad", phone="+995568759201", session_name="Misha_Offroad",
-            session_path="Misha_Offroad", telegram_user_id=8838087889, enabled=False,
-        )
-
         resolve_duplicate_group(repository, 8838087889)
-        assert repository.get(duplicate.id).is_old is True
+        assert repository.get(duplicate_id).is_old is True
 
         # Оператор (или баг) вручную включает уже помеченный OLD дубликат.
-        repository.update(duplicate.id, enabled=True)
+        repository.update(duplicate_id, enabled=True)
 
         resolve_duplicate_group(repository, 8838087889)
 
-        refreshed_duplicate = repository.get(duplicate.id)
-        refreshed_primary = repository.get(primary.id)
+        refreshed_duplicate = repository.get(duplicate_id)
+        refreshed_primary = repository.get(primary_id)
         assert refreshed_duplicate.is_old is True  # остаётся OLD, не реклассифицирован
         assert refreshed_duplicate.enabled is False  # принудительно возвращено
         assert refreshed_primary.is_old is False  # primary остаётся CURRENT
@@ -353,22 +411,25 @@ def test_resolve_duplicate_group_is_sticky_even_if_old_row_manually_enabled(tmp_
 def test_resolve_duplicate_group_is_idempotent(tmp_path):
     """Повторный вызов без изменения входных данных не производит новых
     записей в БД (см. задачу: "repeated sync идемпотентен")."""
-    repository = TelegramAccountRepository(tmp_path / "inviter.db")
+    db_path = tmp_path / "inviter.db"
+    primary_id, duplicate_id = _seed_duplicate_pair_raw(
+        db_path,
+        primary={
+            "name": "@Iv_vla_sov", "phone": "+995568759201", "session_name": "Iv_vla_sov",
+            "session_path": "Iv_vla_sov", "telegram_user_id": 8838087889, "enabled": True,
+        },
+        duplicate={
+            "name": "@Misha_Offroad", "phone": "+995568759201", "session_name": "Misha_Offroad",
+            "session_path": "Misha_Offroad", "telegram_user_id": 8838087889, "enabled": False,
+        },
+    )
+    repository = TelegramAccountRepository(db_path)
     try:
-        primary = repository.create(
-            name="@Iv_vla_sov", phone="+995568759201", session_name="Iv_vla_sov",
-            session_path="Iv_vla_sov", telegram_user_id=8838087889, enabled=True,
-        )
-        duplicate = repository.create(
-            name="@Misha_Offroad", phone="+995568759201", session_name="Misha_Offroad",
-            session_path="Misha_Offroad", telegram_user_id=8838087889, enabled=False,
-        )
+        resolve_duplicate_group(repository, 8838087889)
+        first_pass = (repository.get(primary_id), repository.get(duplicate_id))
 
         resolve_duplicate_group(repository, 8838087889)
-        first_pass = (repository.get(primary.id), repository.get(duplicate.id))
-
-        resolve_duplicate_group(repository, 8838087889)
-        second_pass = (repository.get(primary.id), repository.get(duplicate.id))
+        second_pass = (repository.get(primary_id), repository.get(duplicate_id))
 
         assert first_pass == second_pass
     finally:

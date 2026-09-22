@@ -304,6 +304,149 @@ async def test_reauthorize_reuses_existing_session_path_not_a_new_one(tmp_path):
         repo.close()
 
 
+# ---- root cause fix: ➕ Добавить аккаунт с НОВЫМ phone/session_path, но
+# УЖЕ существующим telegram_user_id (см. задачу про production-дубли
+# id=6/7, id=8/9 — session_path НЕ identity, telegram_user_id — ДА) ----
+
+
+async def test_add_account_with_existing_telegram_user_id_does_not_create_duplicate(tmp_path):
+    """A. Тот же физический Telegram-аккаунт (telegram_user_id) добавляют
+    повторно под НОВЫМ телефоном/session slug — account count НЕ
+    увеличивается (было: создавала вторую строку, см. задачу)."""
+    repo = TelegramAccountRepository(tmp_path / "inviter.db")
+    try:
+        existing = repo.create(
+            name="@Iv_vla_sov", phone="995568759201", session_name="Iv_vla_sov",
+            session_path=str(tmp_path / "sessions" / "Iv_vla_sov"), telegram_user_id=8838087889,
+        )
+        assert len(repo.list()) == 1
+
+        client = _FakeAuthClient(
+            get_me_result=SimpleNamespace(id=8838087889, username="Iv_vla_sov", phone="995500000999"),
+        )
+        coordinator = AccountAuthCoordinator(
+            lambda session_path: client, repo, sessions_dir=tmp_path / "sessions",
+        )
+
+        await coordinator.start_new(chat_id=1, phone="+995500000999")
+        outcome = await coordinator.submit_code(chat_id=1, code=_SECRET_CODE)
+
+        assert outcome.result == AuthResult.AUTHORIZED
+        all_accounts = repo.list()
+        assert len(all_accounts) == 1  # B. НЕ увеличилось — тот же canonical id
+        assert all_accounts[0].id == existing.id  # B. canonical account.id сохранился
+        assert outcome.account.id == existing.id
+    finally:
+        repo.close()
+
+
+async def test_add_account_existing_telegram_user_id_updates_username(tmp_path):
+    """C. username изменился на живой сессии -> canonical row обновился
+    (та же reconcile_account_identity, что и раньше)."""
+    repo = TelegramAccountRepository(tmp_path / "inviter.db")
+    try:
+        existing = repo.create(
+            name="@oldname", phone="995500000001", session_name="oldname",
+            session_path=str(tmp_path / "sessions" / "oldname"), telegram_user_id=42,
+        )
+
+        client = _FakeAuthClient(
+            get_me_result=SimpleNamespace(id=42, username="newname", phone="995500000002"),
+        )
+        coordinator = AccountAuthCoordinator(
+            lambda session_path: client, repo, sessions_dir=tmp_path / "sessions",
+        )
+
+        await coordinator.start_new(chat_id=1, phone="+995500000002")
+        outcome = await coordinator.submit_code(chat_id=1, code=_SECRET_CODE)
+
+        assert outcome.account.id == existing.id
+        assert outcome.account.name == "@newname"
+        assert "@oldname" in outcome.account.previous_names
+        assert repo.get(existing.id).session_path == existing.session_path  # session_path canonical не тронут
+    finally:
+        repo.close()
+
+
+async def test_add_account_existing_telegram_user_id_does_not_create_old_row(tmp_path):
+    """D. OLD-запись не появляется в результате повторного add-account —
+    результат сразу СТАБИЛЕН (is_old=False у единственной строки), не
+    полагается на постфактумную подчистку resolve_duplicate_group."""
+    repo = TelegramAccountRepository(tmp_path / "inviter.db")
+    try:
+        repo.create(
+            name="@bdlapq", phone="79495447392", session_name="inviter_bdlapq",
+            session_path=str(tmp_path / "sessions" / "inviter_bdlapq"), telegram_user_id=8847286898,
+        )
+
+        client = _FakeAuthClient(
+            get_me_result=SimpleNamespace(id=8847286898, username="bdlapq", phone="79495447393"),
+        )
+        coordinator = AccountAuthCoordinator(
+            lambda session_path: client, repo, sessions_dir=tmp_path / "sessions",
+        )
+
+        await coordinator.start_new(chat_id=1, phone="+79495447393")
+        await coordinator.submit_code(chat_id=1, code=_SECRET_CODE)
+
+        all_accounts = repo.list()
+        assert len(all_accounts) == 1
+        assert all_accounts[0].is_old is False
+        assert all_accounts[0].enabled is True
+    finally:
+        repo.close()
+
+
+async def test_add_account_existing_telegram_user_id_sets_last_synced_at(tmp_path):
+    repo = TelegramAccountRepository(tmp_path / "inviter.db")
+    try:
+        existing = repo.create(
+            name="@oldname", phone="995500000001", session_name="oldname",
+            session_path=str(tmp_path / "sessions" / "oldname"), telegram_user_id=42,
+        )
+        assert existing.last_synced_at is None
+
+        client = _FakeAuthClient(get_me_result=SimpleNamespace(id=42, username="oldname", phone=None))
+        coordinator = AccountAuthCoordinator(
+            lambda session_path: client, repo, sessions_dir=tmp_path / "sessions",
+        )
+
+        await coordinator.start_new(chat_id=1, phone="+995500000002")
+        outcome = await coordinator.submit_code(chat_id=1, code=_SECRET_CODE)
+
+        assert outcome.account.last_synced_at is not None
+    finally:
+        repo.close()
+
+
+async def test_add_account_genuinely_new_telegram_user_id_still_creates_row(tmp_path):
+    """Регрессия: НЕ связанный физический аккаунт (другой telegram_user_id)
+    по-прежнему создаёт новую запись как раньше — фикс не должен мешать
+    обычному первому добавлению аккаунта."""
+    repo = TelegramAccountRepository(tmp_path / "inviter.db")
+    try:
+        repo.create(
+            name="@existing", phone="995500000001", session_name="existing",
+            session_path=str(tmp_path / "sessions" / "existing"), telegram_user_id=1,
+        )
+
+        client = _FakeAuthClient(get_me_result=SimpleNamespace(id=2, username="brandnew", phone=None))
+        coordinator = AccountAuthCoordinator(
+            lambda session_path: client, repo, sessions_dir=tmp_path / "sessions",
+        )
+
+        await coordinator.start_new(chat_id=1, phone="+995500000002")
+        outcome = await coordinator.submit_code(chat_id=1, code=_SECRET_CODE)
+
+        assert outcome.result == AuthResult.AUTHORIZED
+        all_accounts = repo.list()
+        assert len(all_accounts) == 2
+        assert outcome.account.telegram_user_id == 2
+        assert outcome.account.is_old is False
+    finally:
+        repo.close()
+
+
 # ---- ошибки/отмена ----
 
 

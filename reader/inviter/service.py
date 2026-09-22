@@ -31,6 +31,7 @@ from telethon.errors import (
     UserIdInvalidError,
     UserIsBotError,
     UserKickedError,
+    UsernameNotOccupiedError,
     UserNotMutualContactError,
     UserNotParticipantError,
     UserPrivacyRestrictedError,
@@ -239,6 +240,48 @@ class _CandidateIsBotError(Exception):
     InviterService._resolve_input_peer) Telegram-бот — приглашение
     отменяется ДО отправки InviteToChannelRequest/AddChatUserRequest. Не
     Telethon-ошибка (см. _CandidateUnresolvableError)."""
+
+
+class _CandidatePermanentlyInvalidError(Exception):
+    """Telegram ДОСТОВЕРНО подтвердил (см.
+    _CONFIRMED_PERMANENT_IDENTITY_ERROR_TYPES ниже), что у кандидата нет
+    валидной identity НИ ОДНИМ из известных способов — id-кэш этого
+    аккаунта, @username, и, наконец, уже сохранённый в users.db
+    access_hash (см. _resolve_input_peer/_retry_send_with_stored_access_hash
+    — задача про production-инцидент: @andrey/telegram_user_id=508233997 —
+    "No user has \"andrey\" as username", @Divanauto/telegram_user_id=
+    726716985 — "Invalid object ID for a user").
+
+    В ОТЛИЧИЕ от _CandidateUnresolvableError (тоже SKIP_USER/этот аккаунт
+    просто не смог — кандидат остаётся кандидатом для СЛЕДУЮЩЕГО прогона),
+    эта ошибка означает status='invalid' (см. _classify_invite_error) —
+    тот же canonical "кандидата больше нельзя использовать" статус, что и
+    у подтверждённых ботов (_CandidateIsBotError) — и, начиная с этой
+    задачи, ИСКЛЮЧАЕТСЯ из будущей выборки для ЛЮБОГО следующего аккаунта
+    (см. reader/inviter/repository.py::_CANDIDATES_BASE_WHERE)."""
+
+
+# Telethon ДОСТОВЕРНО подтверждает, что identity кандидата физически
+# невалидна — не "мы сейчас не смогли её найти", а "Telegram явно сказал,
+# что такого объекта/username не существует" (см. задачу):
+#   - UsernameNotOccupiedError ("No user has \"...\" as username") —
+#     username освобождён/сменился (см. задачу "username — mutable").
+#   - UserIdInvalidError/PeerIdInvalidError ("Invalid object ID for a
+#     user...") — сервер отверг (user_id, access_hash) как несуществующую
+#     пару. Оба используются ТОЛЬКО после того, как исчерпаны ВСЕ известные
+#     пути резолва (id-кэш/username/сохранённый access_hash, см.
+#     _resolve_input_peer) — сам факт того, что ОДИН путь дал такую ошибку,
+#     ещё не значит permanent, пока не проверены остальные.
+#
+# ВАЖНО: сюда НЕ входят PeerFloodError/FloodWaitError (временное
+# ограничение, обрабатывается отдельно и раньше, см. _resolve_input_peer/
+# _classify_invite_error), ни любые другие RPC/сетевые ошибки — они
+# остаются как раньше (_SKIP_USER_ERROR_TYPES/STOP_ACCOUNT/RETRY_LATER).
+_CONFIRMED_PERMANENT_IDENTITY_ERROR_TYPES = (
+    UsernameNotOccupiedError,
+    UserIdInvalidError,
+    PeerIdInvalidError,
+)
 
 
 def _format_username(username: str | None) -> str:
@@ -576,6 +619,13 @@ def _classify_invite_error(exc: Exception) -> InviteErrorClassification:
             mark_verified_now=True,
         )
     if isinstance(exc, _CandidateIsBotError):
+        return InviteErrorClassification(
+            InviteErrorAction.SKIP_USER, db_status="invalid", stat_field="invalid",
+        )
+    if isinstance(exc, _CandidatePermanentlyInvalidError):
+        # Тот же canonical "invalid" статус, что и у подтверждённых ботов
+        # выше — переиспользуем существующую модель, не вводим новую (см.
+        # задачу "используй его, не добавляй новое поле").
         return InviteErrorClassification(
             InviteErrorAction.SKIP_USER, db_status="invalid", stat_field="invalid",
         )
@@ -1215,10 +1265,14 @@ class InviterService:
                     # Кандидаты, уже обработанные ЭТИМ вызовом
                     # _execute_account (см. _run_invite_wave) — волна
                     # добора не должна тут же повторно пытаться того же
-                    # кандидата, который только что провалился/оказался
-                    # ботом (status='failed'/'invalid' сами по себе не
-                    # исключаются из select_candidates() — это специально,
-                    # чтобы они остались кандидатами для СЛЕДУЮЩЕГО прогона).
+                    # кандидата, который только что провалился транзиентно
+                    # (status='failed' САМ ПО СЕБЕ не исключается из
+                    # select_candidates() — это специально, чтобы такой
+                    # кандидат остался кандидатом для СЛЕДУЮЩЕГО прогона;
+                    # 'invalid' же ИСКЛЮЧАЕТСЯ на уровне SQL, см.
+                    # _CANDIDATES_BASE_WHERE, — attempted_user_ids здесь
+                    # нужен именно для 'failed'/только что отправленных в
+                    # рамках ЭТОГО запуска, не для 'invalid').
                     attempted_user_ids: set[int] = set()
 
                     # Волна №1 (основная) — лимит = остаток дневного лимита
@@ -1307,12 +1361,16 @@ class InviterService:
         attempted_user_ids — user_id, уже обработанные ЭТИМ вызовом
         _execute_account (в т.ч. предыдущей волной) — исключаются из ЭТОЙ
         волны в Python, а не в SQL: select_candidates() не исключает
-        status='failed'/'invalid'/'not_joined' (это специально — они
-        остаются кандидатами для СЛЕДУЮЩЕГО прогона, см. задачу), но волна
-        добора не должна тут же, в рамках одного запуска, повторно
-        пытаться того же кандидата, который только что провалился,
-        оказался ботом или не подтвердил участие при проверке.
-        Пополняется прямо здесь.
+        status='failed'/'not_joined' (это специально — они остаются
+        кандидатами для СЛЕДУЮЩЕГО прогона, см. задачу). 'invalid' уже
+        исключается на уровне SQL (см. _CANDIDATES_BASE_WHERE) — как только
+        _invite_candidate запишет его в БД, следующая волна (добор) его и
+        так больше не увидит; attempted_user_ids здесь принципиально нужен
+        именно для 'failed' (и уже отправленных этой же волной), не для
+        'invalid'. Волна добора не должна тут же, в рамках одного запуска,
+        повторно пытаться того же кандидата, который только что
+        провалился или не подтвердил участие при проверке. Пополняется
+        прямо здесь.
 
         limit + len(attempted_user_ids) запрашивается у select_candidates()
         (а не просто limit) — иначе, если самые "свежие" (last_seen_at
@@ -1447,40 +1505,118 @@ class InviterService:
         проверяет его на статус Telegram-бота (см. _resolve_input_peer) —
         access_hash из users.db получен читающим аккаунтом (sync_users.py/
         main.py), а не текущим инвайтящим, и часто невалиден для него.
-        Любая ошибка резолва или самой отправки — через единый
-        классификатор (см. _classify_invite_error/_handle_invite_error), а
-        не разбросанные except-ветки."""
+        Любая ошибка резолва — через единый классификатор (см.
+        _classify_invite_error/_handle_invite_error), а не разбросанные
+        except-ветки.
+
+        Ошибка САМОЙ отправки (InviteToChannelRequest/AddChatUserRequest) —
+        ОТДЕЛЬНЫЙ try/except от резолва: UserIdInvalidError/
+        PeerIdInvalidError здесь означают, что Telegram принял input_peer
+        при резолве (get_entity/get_input_entity), но отклонил его именно
+        для МУТИРУЮЩЕГО запроса (см. задачу @Divanauto/"Invalid object ID
+        for a user"/InviteToChannelRequest — известное поведение Telegram:
+        access_hash, валидный для чтения, не всегда валиден для приглашения)
+        — прежде чем считать identity permanently invalid, делаем РОВНО ОДНУ
+        повторную попытку с access_hash, уже сохранённым в users.db (см.
+        _retry_send_with_stored_access_hash), а не сразу сдаёмся."""
         user_label = f"{candidate.user_id} {_format_username(candidate.username)}"
 
         try:
             input_peer = await self._resolve_input_peer(client, candidate)
-            request = _build_invite_request(target_entity, input_peer)
-            await client(request)
         except Exception as exc:
             return await self._handle_invite_error(
                 exc, campaign, account, candidate, stats, user_label,
             )
-        else:
-            # Telegram принял приглашение — это ещё не подтверждённое
-            # участие (см. задачу): status='pending', пока
-            # _verify_pending_invites не подтвердит вступление.
-            logger.info(
-                _format_execute_block(account, user_label, campaign.target_chat, status="pending")
+
+        try:
+            request = _build_invite_request(target_entity, input_peer)
+            await client(request)
+        except _CONFIRMED_PERMANENT_IDENTITY_ERROR_TYPES as exc:
+            try:
+                retry_error = await self._retry_send_with_stored_access_hash(
+                    client, target_entity, candidate,
+                )
+            except Exception as retry_raised_exc:
+                # Сама повторная попытка подняла FloodWaitError/
+                # PeerFloodError (см. _retry_send_with_stored_access_hash —
+                # они там НЕ перехватываются, а поднимаются) — обрабатываем
+                # ТОЧНО так же, как если бы это случилось при первой
+                # попытке (RETRY_LATER/STOP_ACCOUNT с сохранением
+                # blocked_until, см. _classify_invite_error) — НЕ даём этой
+                # ошибке улететь необработанной мимо _handle_invite_error.
+                return await self._handle_invite_error(
+                    retry_raised_exc, campaign, account, candidate, stats, user_label,
+                )
+            if retry_error is not None:
+                final_exc = (
+                    _CandidatePermanentlyInvalidError(
+                        f"{candidate.user_id} ({_format_username(candidate.username)}): "
+                        f"identity invalid даже после повторной отправки со "
+                        f"stored access_hash (первая ошибка: {exc}): {retry_error}"
+                    )
+                    if isinstance(retry_error, _CONFIRMED_PERMANENT_IDENTITY_ERROR_TYPES)
+                    else retry_error
+                )
+                return await self._handle_invite_error(
+                    final_exc, campaign, account, candidate, stats, user_label,
+                )
+            # retry_error is None -> повторная отправка удалась, продолжаем
+            # как при обычном успехе ниже.
+        except Exception as exc:
+            return await self._handle_invite_error(
+                exc, campaign, account, candidate, stats, user_label,
             )
-            self._record_invite_result(campaign, account, candidate, status="pending")
-            stats.sent += 1
-            self._successful_invites_count += 1
-            await self._pause_between_invites()
-            if (
-                self._max_successful_invites is not None
-                and self._successful_invites_count >= self._max_successful_invites
-            ):
-                # Лимит тестового режима достигнут — сигнализируем
-                # _execute_account остановить ЭТОТ аккаунт (как при
-                # STOP_ACCOUNT); переход к следующему аккаунту/кампании
-                # останавливает уже run() (см. выше).
-                return True
-            return False
+
+        # Telegram принял приглашение (с первой попытки или после retry) —
+        # это ещё не подтверждённое участие (см. задачу): status='pending',
+        # пока _verify_pending_invites не подтвердит вступление.
+        logger.info(
+            _format_execute_block(account, user_label, campaign.target_chat, status="pending")
+        )
+        self._record_invite_result(campaign, account, candidate, status="pending")
+        stats.sent += 1
+        self._successful_invites_count += 1
+        await self._pause_between_invites()
+        if (
+            self._max_successful_invites is not None
+            and self._successful_invites_count >= self._max_successful_invites
+        ):
+            # Лимит тестового режима достигнут — сигнализируем
+            # _execute_account остановить ЭТОТ аккаунт (как при
+            # STOP_ACCOUNT); переход к следующему аккаунту/кампании
+            # останавливает уже run() (см. выше).
+            return True
+        return False
+
+    async def _retry_send_with_stored_access_hash(
+        self,
+        client: DryRunTelegramClient,
+        target_entity,
+        candidate: InviteCandidate,
+    ) -> Exception | None:
+        """Единственная повторная попытка ПОСЛЕ того, как отправка с уже
+        резолвленным этим аккаунтом input_peer упала с ДОСТОВЕРНО
+        identity-невалидной ошибкой (см. _CONFIRMED_PERMANENT_IDENTITY_ERROR_TYPES
+        и задачу @Divanauto) — используем access_hash, уже сохранённый в
+        users.db (см. InviteCandidate.access_hash) — последний известный
+        источник identity перед тем, как признать кандидата permanently
+        invalid. Не перехватывает FloodWaitError/PeerFloodError — они
+        поднимаются как обычно (см. _resolve_input_peer).
+
+        Возвращает None при успехе (запрос уже отправлен — вызывающий код
+        продолжает как при обычном успехе), иначе саму ошибку повторной
+        попытки (вызывающий код сам решает, permanent она или нет)."""
+        try:
+            fallback_peer = InputPeerUser(
+                user_id=candidate.user_id, access_hash=candidate.access_hash,
+            )
+            request = _build_invite_request(target_entity, fallback_peer)
+            await client(request)
+        except (FloodWaitError, PeerFloodError):
+            raise
+        except Exception as exc:
+            return exc
+        return None
 
     async def _handle_invite_error(
         self,
@@ -1601,10 +1737,29 @@ class InviterService:
         FloodWaitError/PeerFloodError, полученные при резолве, не
         перехватываются здесь — поднимаются в _invite_candidate и
         обрабатываются там точно так же, как если бы случились при самой
-        отправке приглашения. Кандидат, которого не удалось резолвить
-        никак — _CandidateUnresolvableError; подтверждённый бот —
-        _CandidateIsBotError — оба обрабатываются в _invite_candidate через
-        единый классификатор (см. _classify_invite_error)."""
+        отправке приглашения.
+
+        Если и username-резолв (или живая проверка is_bot) не сработали —
+        ПОСЛЕДНИЙ известный источник identity: уже сохранённый в users.db
+        candidate.access_hash (см. модульный докстрок про "часто
+        отклоняется" — "часто" не значит "всегда", поэтому пробуем, а не
+        сдаёмся сразу, см. задачу "не полагаться исключительно на
+        username, если DB уже содержит достаточную identity"). Только если
+        И этот последний путь не сработал:
+        - последняя ошибка — ДОСТОВЕРНО permanent (см.
+          _CONFIRMED_PERMANENT_IDENTITY_ERROR_TYPES: UsernameNotOccupiedError/
+          UserIdInvalidError/PeerIdInvalidError — Telegram явно подтвердил
+          невалидность) -> _CandidatePermanentlyInvalidError (status=
+          'invalid', исключается из будущей выборки для ЛЮБОГО аккаунта,
+          см. _classify_invite_error/_CANDIDATES_BASE_WHERE);
+        - иначе (сеть/таймаут/что угодно ещё не подтверждённое Telegram
+          явно) -> _CandidateUnresolvableError, как раньше — этот
+          конкретный аккаунт сейчас не смог, кандидат остаётся кандидатом
+          для следующего прогона/аккаунта.
+
+        Оба обрабатываются в _invite_candidate через единый классификатор
+        (см. _classify_invite_error); подтверждённый бот —
+        _CandidateIsBotError."""
         if candidate.is_bot:
             raise _CandidateIsBotError(f"{candidate.user_id} — известный Telegram-бот")
 
@@ -1618,20 +1773,17 @@ class InviterService:
         if input_peer is not None and candidate.is_bot is False:
             return input_peer
 
+        entity = None
+        last_exc: Exception | None = None
+
         if input_peer is None:
-            if not candidate.username:
-                raise _CandidateUnresolvableError(
-                    f"пользователь {candidate.user_id} не известен этому аккаунту "
-                    f"и не имеет username для резолва"
-                )
-            try:
-                entity = await client.get_entity(f"@{candidate.username}")
-            except (FloodWaitError, PeerFloodError):
-                raise
-            except Exception as exc:
-                raise _CandidateUnresolvableError(
-                    f"не удалось резолвить @{candidate.username} этим аккаунтом: {exc}"
-                ) from exc
+            if candidate.username:
+                try:
+                    entity = await client.get_entity(f"@{candidate.username}")
+                except (FloodWaitError, PeerFloodError):
+                    raise
+                except Exception as exc:
+                    last_exc = exc
         else:
             # candidate.is_bot is None — статус неизвестен, убеждаемся перед
             # отправкой приглашения (см. докстрок выше).
@@ -1640,9 +1792,29 @@ class InviterService:
             except (FloodWaitError, PeerFloodError):
                 raise
             except Exception as exc:
-                raise _CandidateUnresolvableError(
-                    f"не удалось проверить статус бота у {candidate.user_id}: {exc}"
-                ) from exc
+                last_exc = exc
+
+        if entity is None:
+            try:
+                fallback_peer = InputPeerUser(
+                    user_id=candidate.user_id, access_hash=candidate.access_hash,
+                )
+                entity = await client.get_entity(fallback_peer)
+                last_exc = None
+            except (FloodWaitError, PeerFloodError):
+                raise
+            except Exception as exc:
+                last_exc = exc
+
+        if entity is None:
+            reason = (
+                f"{candidate.user_id} ({_format_username(candidate.username)}): "
+                f"не резолвится ни одним известным способом (id-кэш/username/"
+                f"сохранённый access_hash) этим аккаунтом: {last_exc}"
+            )
+            if isinstance(last_exc, _CONFIRMED_PERMANENT_IDENTITY_ERROR_TYPES):
+                raise _CandidatePermanentlyInvalidError(reason) from last_exc
+            raise _CandidateUnresolvableError(reason) from last_exc
 
         if isinstance(entity, User):
             self._update_user_access_hash(entity)

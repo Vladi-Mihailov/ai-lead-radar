@@ -23,6 +23,7 @@ AuthOutcome.error_summary (там — только заранее заданны
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
@@ -206,17 +207,49 @@ class AccountAuthCoordinator:
         ИСКЛЮЧИТЕЛЬНО отсюда, никогда из того, что ввёл админ на шаге
         "номер телефона" (Telegram может нормализовать номер иначе).
 
-        По session_path ищет уже существующую DB-запись (см.
-        start_reauthorize — тот же session_path, что и у существующего
-        аккаунта) — если она есть, обновляет её через
-        reconcile_account_identity (НИКОГДА не создаёт вторую запись для
-        того же физического аккаунта, см. design "USERNAME SYNC"), иначе
-        создаёт новую с уже известным telegram_user_id (не оставляет его
-        None до отдельного sync — в отличие от reader/inviter/manage.py
-        add-account, здесь identity уже подтверждена живой сессией).
+        Решение create-vs-update — ДВУХСТУПЕНЧАТОЕ, session_path НИКОГДА
+        не единственный критерий (см. задачу про production-дубли id=6/7,
+        id=8/9: тот же физический аккаунт добавляли повторно под НОВЫМ
+        телефоном/session_path, из-за чего session_path-only матч не
+        находил уже существующую запись и создавал вторую строку —
+        resolve_duplicate_group ниже подчищала это лишь ПОСТФАКТУМ,
+        оставляя лишнюю строку в БД навсегда):
+
+        1. Сначала — по session_path (та же сессия, что уже используется
+           этой DB-записью — самый точный и дешёвый матч, когда он есть;
+           это, в частности, ВСЕГДА срабатывает для start_reauthorize, см.
+           её докстрок — session_path там намеренно тот же, что и у
+           account).
+        2. Если по session_path не нашлось — по telegram_user_id среди
+           ТЕКУЩИХ (is_old=False) записей (см. reader/inviter/identity.py
+           module docstring: "session_path — НЕ identity, единственный
+           стабильный идентификатор — telegram_user_id"). Найдена — canonical
+           account.id СОХРАНЯЕТСЯ, обновляются только identity-поля
+           (name/phone/previous_names через reconcile_account_identity,
+           та же логика, что и для username rename) — ВТОРАЯ DB-запись НЕ
+           создаётся. Только что созданный .session-файл (pending.
+           session_path) сознательно НЕ привязывается ни к одной записи —
+           canonical account продолжает использовать свой уже РАБОТАЮЩИЙ
+           session_path (см. задачу "не потерять рабочую существующую
+           session вслепую" — Telegram допускает множество параллельных
+           авторизованных сессий одного аккаунта, менять уже рабочую
+           session_path ради этой новой не нужно). Клиент уже отключён
+           (см. finally выше) — новый .session-файл остаётся на диске,
+           просто не используется никаким процессом инвайтера, ничего
+           дополнительно закрывать не требуется.
+        3. Иначе — действительно новый физический аккаунт (или единственный
+           оставшийся кандидат внутри уже полностью is_old-группы, см.
+           resolve_duplicate_group sticky-логику ниже) — создаётся новая
+           запись с уже известным telegram_user_id (не оставляет его None
+           до отдельного sync — в отличие от reader/inviter/manage.py
+           add-account, здесь identity уже подтверждена живой сессией).
+
         resolve_duplicate_group() — та же финальная сверка, что и в
-        sync_accounts(), на случай если этот физический аккаунт уже был
-        добавлен раньше под другим session_path/номером."""
+        sync_accounts(), защита от постороннего сценария (например, если
+        именно эта попытка всё же создала новую запись, совпавшую с уже
+        существующей is_old-группой). last_synced_at обновляется всегда —
+        identity только что подтверждена живой сессией, независимо от
+        того, какая из трёх веток сработала."""
         try:
             identity = await fetch_telegram_identity(pending.client)
         except Exception as exc:
@@ -232,24 +265,37 @@ class AccountAuthCoordinator:
             await self._safe_disconnect(pending.client)
         self._pending.pop(chat_id, None)
 
-        existing = next(
-            (a for a in self._account_repository.list() if a.session_path == pending.session_path), None,
+        all_accounts = self._account_repository.list()
+        existing_by_session = next(
+            (a for a in all_accounts if a.session_path == pending.session_path), None,
         )
-        if existing is not None:
-            account = reconcile_account_identity(self._account_repository, existing, identity)
+        if existing_by_session is not None:
+            account = reconcile_account_identity(self._account_repository, existing_by_session, identity)
         else:
-            display_name = f"@{identity.username}" if identity.username else pending.session_name
-            account = self._account_repository.create(
-                name=display_name,
-                phone=identity.phone or pending.phone,
-                session_name=pending.session_name,
-                session_path=pending.session_path,
-                telegram_user_id=identity.telegram_user_id,
+            existing_current = next(
+                (
+                    a for a in all_accounts
+                    if a.telegram_user_id == identity.telegram_user_id and not a.is_old
+                ),
+                None,
             )
+            if existing_current is not None:
+                account = reconcile_account_identity(self._account_repository, existing_current, identity)
+            else:
+                display_name = f"@{identity.username}" if identity.username else pending.session_name
+                account = self._account_repository.create(
+                    name=display_name,
+                    phone=identity.phone or pending.phone,
+                    session_name=pending.session_name,
+                    session_path=pending.session_path,
+                    telegram_user_id=identity.telegram_user_id,
+                )
 
         resolve_duplicate_group(self._account_repository, identity.telegram_user_id)
-        refreshed = self._account_repository.get(account.id)
-        return AuthOutcome(result=AuthResult.AUTHORIZED, account=refreshed or account)
+        account = self._account_repository.update(
+            account.id, last_synced_at=datetime.now(timezone.utc),
+        )
+        return AuthOutcome(result=AuthResult.AUTHORIZED, account=account)
 
     async def cancel(self, chat_id: int) -> None:
         pending = self._pending.pop(chat_id, None)

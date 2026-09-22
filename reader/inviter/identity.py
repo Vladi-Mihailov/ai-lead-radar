@@ -69,6 +69,23 @@ async def fetch_telegram_identity(client: IdentityTelegramClientLike) -> Telegra
     )
 
 
+_DUPLICATE_OLD_REASON = "duplicate_telegram_user_id"
+
+
+def _pick_current_winner(candidates: list[TelegramAccount]) -> int:
+    """Общий tie-break для resolve_duplicate_group И reconcile_account_identity
+    (см. ниже, зачем он нужен и там тоже) — среди НЕ is_old candidates:
+      1. если ровно один enabled — он CURRENT;
+      2. иначе (ни одного или несколько enabled) — CURRENT детерминированно
+         наименьший id (без изменения enabled — см. задачу "никогда не
+         включать аккаунт автоматически").
+    candidates непустой — вызывающий код гарантирует это сам."""
+    enabled_candidates = [a for a in candidates if a.enabled]
+    if len(enabled_candidates) == 1:
+        return enabled_candidates[0].id
+    return min(a.id for a in candidates)
+
+
 def reconcile_account_identity(
     account_repository: TelegramAccountRepository,
     account: TelegramAccount,
@@ -91,7 +108,30 @@ def reconcile_account_identity(
     Если name реально меняется — старое значение добавляется в
     previous_names (если его там ещё нет), а не теряется молча (см. задачу:
     "DB row 7 исторически была @Misha_Offroad", даже если её name синхронизируют
-    на актуальный username того же физического аккаунта)."""
+    на актуальный username того же физического аккаунта).
+
+    КОЛЛИЗИЯ С ДРУГОЙ CURRENT-записью (см. задачу про DB-level partial
+    UNIQUE index telegram_accounts(telegram_user_id) WHERE is_old=0, см.
+    reader/inviter/repository.py): если у account ЕЩЁ НЕТ этого
+    telegram_user_id (первая проверка ИЛИ переход с другого физического
+    аккаунта невозможен — см. AccountIdentityMismatchError выше), а
+    ДРУГАЯ is_old=False запись УЖЕ имеет этот telegram_user_id (два
+    отдельных session/DB-записи оказались одним и тем же физическим
+    аккаунтом — см. задачу про id=6/7, id=8/9), UPDATE ниже НЕЛЬЗЯ просто
+    выполнить "как есть": SQLite проверяет UNIQUE index НЕМЕДЛЕННО (нет
+    deferred constraints), поэтому write, временно создающий вторую
+    CURRENT-запись с тем же telegram_user_id, был бы отклонён БД раньше,
+    чем следующий resolve_duplicate_group() (см. каждый caller —
+    service.py/manage.py/auth.py, вызывается сразу после) успел бы всё
+    поправить. Поэтому победитель здесь решается СЕЙЧАС, ДО записи, ТЕМ ЖЕ
+    tie-break'ом (_pick_current_winner), что и resolve_duplicate_group:
+    если проигрывает СУЩЕСТВУЮЩАЯ другая запись — она демоутится is_old=True
+    ПЕРВЫМ отдельным UPDATE (уже безопасно, снимает конфликт), и только
+    потом пишется telegram_user_id на account; если проигрывает сам
+    account — он сразу пишется как is_old=True (никогда не бывает
+    CURRENT ни одного мгновения). resolve_duplicate_group() всё равно
+    вызывается сразу после — как идемпотентная финальная сверка (обычный
+    случай — no-op) и как единственная логика для групп из 3+ записей."""
     if (
         account.telegram_user_id is not None
         and account.telegram_user_id != identity.telegram_user_id
@@ -117,16 +157,32 @@ def reconcile_account_identity(
     if new_name != account.name and account.name not in new_previous_names:
         new_previous_names.append(account.name)
 
-    return account_repository.update(
-        account.id,
-        telegram_user_id=identity.telegram_user_id,
-        name=new_name,
-        phone=new_phone,
-        previous_names=new_previous_names,
-    )
+    fields = {
+        "telegram_user_id": identity.telegram_user_id,
+        "name": new_name,
+        "phone": new_phone,
+        "previous_names": new_previous_names,
+    }
 
+    is_new_identity = account.telegram_user_id != identity.telegram_user_id
+    if is_new_identity and not account.is_old:
+        other_current = [
+            a for a in account_repository.list()
+            if a.id != account.id
+            and a.telegram_user_id == identity.telegram_user_id
+            and not a.is_old
+        ]
+        if other_current:
+            winner_id = _pick_current_winner([*other_current, account])
+            if winner_id == account.id:
+                for loser in other_current:
+                    account_repository.update(
+                        loser.id, is_old=True, enabled=False, old_reason=_DUPLICATE_OLD_REASON,
+                    )
+            else:
+                fields.update(is_old=True, enabled=False, old_reason=_DUPLICATE_OLD_REASON)
 
-_DUPLICATE_OLD_REASON = "duplicate_telegram_user_id"
+    return account_repository.update(account.id, **fields)
 
 
 def resolve_duplicate_group(
@@ -147,16 +203,13 @@ def resolve_duplicate_group(
     делает функцию идемпотентной — повторный вызов без изменения входных
     данных не производит новых записей в БД.
 
-    Выбор CURRENT среди ещё не помеченных (candidates), по убыванию
-    приоритета:
-      1. если ровно один из candidates enabled — он CURRENT;
-      2. если ни одного или несколько enabled — CURRENT детерминированно
-         наименьший id среди candidates (без изменения enabled — см.
-         задачу "никогда не включать аккаунт автоматически").
-    Если candidates пуст (защитный случай — не должен происходить в
-    норме, т.к. группа не может стать полностью is_old сама по себе),
-    CURRENT восстанавливается как наименьший id во всей группе, тоже без
-    включения enabled.
+    Выбор CURRENT среди ещё не помеченных (candidates) — см.
+    _pick_current_winner (тот же tie-break, что и в reconcile_account_identity
+    для избежания мгновенного конфликта с partial UNIQUE index). Если
+    candidates пуст (защитный случай — не должен происходить в норме, т.к.
+    группа не может стать полностью is_old сама по себе), CURRENT
+    восстанавливается как наименьший id во всей группе, тоже без включения
+    enabled.
 
     Ни одна запись не удаляется и не сливается — user_campaign_invites
     остаётся нетронутым (там нет ссылок на telegram_accounts.is_old)."""
@@ -165,17 +218,7 @@ def resolve_duplicate_group(
         return
 
     candidates = [a for a in group if not a.is_old]
-
-    if not candidates:
-        winner_id = min(a.id for a in group)
-    elif len(candidates) == 1:
-        winner_id = candidates[0].id
-    else:
-        enabled_candidates = [a for a in candidates if a.enabled]
-        if len(enabled_candidates) == 1:
-            winner_id = enabled_candidates[0].id
-        else:
-            winner_id = min(a.id for a in candidates)
+    winner_id = min(a.id for a in group) if not candidates else _pick_current_winner(candidates)
 
     for account in group:
         if account.id == winner_id:

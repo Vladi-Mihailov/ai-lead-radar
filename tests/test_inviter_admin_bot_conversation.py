@@ -114,11 +114,11 @@ def fx(tmp_path):
     fixture.close()
 
 
-def _make_account(fx, *, name="@vvz982", telegram_user_id=100, daily_limit=15, enabled=True):
+def _make_account(fx, *, name="@vvz982", telegram_user_id=100, daily_limit=15, enabled=True, is_old=False):
     return fx.accounts.create(
         name=name, phone="+995500000001", session_name=name.lstrip("@"),
         session_path=str(fx.db_path.parent / "sessions" / name.lstrip("@")),
-        daily_limit=daily_limit, enabled=enabled, telegram_user_id=telegram_user_id,
+        daily_limit=daily_limit, enabled=enabled, telegram_user_id=telegram_user_id, is_old=is_old,
     )
 
 
@@ -662,3 +662,43 @@ async def test_help_screen_denied_for_unauthorized_user(fx):
     reply = await fx.controller.handle_text(texts.HELP_LABEL, chat_id=_CHAT_ID, telegram_user_id=_OTHER_ID)
 
     assert reply.text == texts.ACCESS_DENIED_TEXT
+
+
+# ---- OLD accounts: скрыты из operational-списков, toggle fail-closed ----
+
+
+async def test_old_account_hidden_from_accounts_limits_and_status_screens(fx):
+    current = _make_account(fx, name="@Iv_vla_sov", telegram_user_id=6, is_old=False)
+    _make_account(fx, name="@Iv_vla_sov", telegram_user_id=6, is_old=True, enabled=False)
+
+    accounts_reply = await fx.controller.handle_text(texts.ACCOUNTS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+    limits_reply = await fx.controller.handle_text(texts.LIMITS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+    status_reply = await fx.controller.handle_text(texts.STATUS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+
+    assert [a[0] for a in accounts_reply.accounts_page_options] == [current.id]
+    assert [o[0] for o in limits_reply.limits_page_options] == [current.id]
+    assert status_reply.text.count("@Iv_vla_sov") == 1  # только canonical, не оба
+
+
+def test_toggle_on_old_account_via_callback_is_blocked_even_if_manually_crafted(fx):
+    """F. Даже если callback на is_old account_id сформирован вручную
+    (напрямую, минуя список, где его и так не видно после E) —
+    переключение отклоняется с понятным текстом, enabled не меняется."""
+    old = _make_account(fx, name="@bdlapq", telegram_user_id=9, is_old=True, enabled=True)
+
+    reply = fx.controller.handle_account_toggle(old.id, telegram_user_id=_TRUSTED_ID)
+
+    assert reply.text == texts.OLD_ACCOUNT_TOGGLE_BLOCKED_TEXT
+    assert fx.accounts.get(old.id).enabled is True
+
+
+def test_toggle_on_current_account_still_works_as_before(fx):
+    """G. CURRENT-аккаунт по-прежнему переключается как раньше — фикс не
+    задевает обычный флоу."""
+    current = _make_account(fx, is_old=False, enabled=True)
+
+    reply = fx.controller.handle_account_toggle(current.id, telegram_user_id=_TRUSTED_ID)
+
+    assert fx.accounts.get(current.id).enabled is False
+    options_by_id = {aid: enabled for aid, _name, enabled in reply.accounts_page_options}
+    assert options_by_id[current.id] is False

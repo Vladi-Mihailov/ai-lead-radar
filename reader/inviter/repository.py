@@ -1,3 +1,4 @@
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,6 +10,8 @@ from reader.inviter.models import (
     UserCampaignInvite,
 )
 from reader.users.repository import UserRepository
+
+logger = logging.getLogger(__name__)
 
 _TELEGRAM_ACCOUNTS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS telegram_accounts (
@@ -59,6 +62,21 @@ _TELEGRAM_ACCOUNTS_COLUMN_MIGRATIONS = {
     # код его не читает/не обязан задавать (NULL — обратная совместимость).
     "last_synced_at": "ALTER TABLE telegram_accounts ADD COLUMN last_synced_at TIMESTAMP",
 }
+
+# DB-level защита от повторения production-дублей (см. задачу про id=6/7,
+# id=8/9: тот же telegram_user_id, два CURRENT (is_old=0) одновременно
+# быть не должно) — partial index, действует ТОЛЬКО среди is_old=0 записей,
+# поэтому НЕ мешает сколь угодно многим is_old=1 (архивным) записям того
+# же telegram_user_id (см. resolve_duplicate_group — именно так и
+# задумано: одна CURRENT, остальные OLD, история остаётся). Условие в
+# WHERE — та же формула "is_old = 0 AND telegram_user_id IS NOT NULL", что
+# и filtering в reader/inviter_admin_bot/service.py (список операционных
+# экранов) — единообразно по всему проекту.
+_TELEGRAM_ACCOUNTS_CURRENT_IDENTITY_INDEX = "idx_telegram_accounts_current_user_id"
+_TELEGRAM_ACCOUNTS_CURRENT_IDENTITY_INDEX_SQL = (
+    f"CREATE UNIQUE INDEX IF NOT EXISTS {_TELEGRAM_ACCOUNTS_CURRENT_IDENTITY_INDEX} "
+    "ON telegram_accounts(telegram_user_id) WHERE is_old = 0 AND telegram_user_id IS NOT NULL"
+)
 
 _INVITE_CAMPAIGNS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS invite_campaigns (
@@ -162,13 +180,25 @@ def _format_previous_names(names: list[str]) -> str | None:
 # (например @Vlars_Bot) заканчивается ChatAdminRequiredError — отсеиваем
 # заранее, на этапе выборки, а не после ошибки Telegram.
 #
-# status IN ('invited', 'pending', 'joined') — кандидата, для которого уже
-# отправлено приглашение (pending — ждёт подтверждения вступления) или
-# участие уже подтверждено (joined), повторно приглашать не нужно; status
-# 'failed'/'invalid' НЕ исключается — такой кандидат остаётся кандидатом
-# для следующего прогона. 'invited' сохранён для обратной совместимости
-# со строками, записанными до перехода на жизненный цикл pending -> joined
-# (см. задачу про подтверждение реального вступления, а не успешного RPC).
+# status IN ('invited', 'pending', 'joined', 'invalid') — кандидата, для
+# которого уже отправлено приглашение (pending — ждёт подтверждения
+# вступления), участие уже подтверждено (joined), ИЛИ достоверно известно,
+# что приглашать его принципиально нельзя (invalid — подтверждённый бот,
+# см. _CandidateIsBotError, или identity, которую Telegram подтверждённо
+# отверг ЛЮБЫМ известным способом резолва — id/username/access_hash, см.
+# InviterService._CandidatePermanentlyInvalidError/_resolve_input_peer) —
+# повторно приглашать/выбирать не нужно НИ ОДНИМ следующим аккаунтом (см.
+# задачу про permanently invalid кандидатов: worker тратил тики на одних и
+# тех же "No user has ... as username"/"Invalid object ID for a user",
+# т.к. status='invalid' раньше НЕ исключался отсюда).
+#
+# status 'failed' НЕ исключается — только ТРАНЗИЕНТНЫЕ/account-specific
+# сбои (сеть, таймаут, FloodWait-обвязка и т.п., см. _classify_invite_error)
+# попадают в 'failed', и такой кандидат должен остаться кандидатом для
+# следующего прогона/другого аккаунта, который вполне может резолвить его
+# успешно. 'invited' сохранён для обратной совместимости со строками,
+# записанными до перехода на жизненный цикл pending -> joined (см. задачу
+# про подтверждение реального вступления, а не успешного RPC).
 _CANDIDATES_BASE_WHERE = """
     u.access_hash IS NOT NULL
     AND (u.is_bot IS NULL OR u.is_bot = 0)
@@ -177,7 +207,7 @@ _CANDIDATES_BASE_WHERE = """
         SELECT 1 FROM user_campaign_invites uci
         WHERE uci.user_id = u.user_id
           AND uci.campaign_id = :campaign_id
-          AND uci.status IN ('invited', 'pending', 'joined')
+          AND uci.status IN ('invited', 'pending', 'joined', 'invalid')
     )
 """
 
@@ -313,6 +343,7 @@ class TelegramAccountRepository:
         self._conn = _connect(db_path)
         self._conn.execute(_TELEGRAM_ACCOUNTS_SCHEMA)
         self._migrate_missing_columns()
+        self._migrate_current_identity_unique_index()
         self._conn.commit()
 
     def _migrate_missing_columns(self) -> None:
@@ -326,6 +357,40 @@ class TelegramAccountRepository:
         for column, statement in _TELEGRAM_ACCOUNTS_COLUMN_MIGRATIONS.items():
             if column not in existing_columns:
                 self._conn.execute(statement)
+
+    def _migrate_current_identity_unique_index(self) -> None:
+        """Additive/idempotent — CREATE UNIQUE INDEX IF NOT EXISTS само по
+        себе безопасно повторять на каждом открытии репозитория (см.
+        _migrate_missing_columns про тот же принцип для колонок). Но перед
+        первым созданием индекса явно проверяем, нет ли УЖЕ двух CURRENT
+        (is_old=0) записей с одинаковым telegram_user_id — если есть,
+        сырой CREATE UNIQUE INDEX упал бы IntegrityError и ломал бы
+        КАЖДЫЙ последующий запуск любого процесса, открывающего эту БД
+        (worker/admin-бот/CLI), до ручного разбора конфликта (см. задачу
+        "не пытаться автоматически угадывать canonical, fail clearly").
+        Обнаруженный конфликт только логируется — миграция пропускается в
+        этом запуске, но ничего не портит и не блокирует обычную работу
+        репозитория (сама таблица/колонки уже созданы выше)."""
+        conflicts = self._conn.execute(
+            """
+            SELECT telegram_user_id, COUNT(*) AS cnt
+            FROM telegram_accounts
+            WHERE is_old = 0 AND telegram_user_id IS NOT NULL
+            GROUP BY telegram_user_id
+            HAVING COUNT(*) > 1
+            """
+        ).fetchall()
+        if conflicts:
+            conflict_ids = ", ".join(str(row[0]) for row in conflicts)
+            logger.warning(
+                "telegram_accounts: несколько CURRENT (is_old=0) записей с "
+                "одинаковым telegram_user_id (%s) — partial UNIQUE index НЕ "
+                "создан в этом запуске, требуется ручной разбор конфликта "
+                "(см. scripts/cleanup_inviter_duplicate_accounts.py).",
+                conflict_ids,
+            )
+            return
+        self._conn.execute(_TELEGRAM_ACCOUNTS_CURRENT_IDENTITY_INDEX_SQL)
 
     def create(
         self,
