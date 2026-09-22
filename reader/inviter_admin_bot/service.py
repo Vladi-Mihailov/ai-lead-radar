@@ -141,11 +141,17 @@ class InviterAdminService:
     # ---- ⚙️ Лимиты ----
 
     def list_accounts_for_limits(self) -> list[LimitListEntry]:
-        """Список для "⚙️ Лимиты" (см. design: показывать daily_limit
+        """Список для "⚙️ Лимиты" (см. design: показывать USED / daily_limit
         каждого аккаунта, НЕ enabled) — тот же account_repository.list(),
-        что и list_accounts(), просто другая проекция полей."""
+        что и list_accounts(), плюс _account_usage() (ТА ЖЕ формула, что и
+        account_card()/InviterService._remaining_daily_budget — joined_today
+        + pending_today), никакого нового счётчика."""
         return [
-            LimitListEntry(id=a.id, display_name=_display_name(a), daily_limit=a.daily_limit)
+            LimitListEntry(
+                id=a.id, display_name=_display_name(a),
+                sent_today=_account_usage(self._invites, a).sent_today,
+                daily_limit=a.daily_limit,
+            )
             for a in self._accounts.list()
         ]
 
@@ -292,6 +298,8 @@ class InviterAdminService:
                 is_blocked=_is_blocked(a, now),
                 blocked_until=a.blocked_until,
                 blocked_reason=a.blocked_reason,
+                sent_today=_account_usage(self._invites, a).sent_today,
+                daily_limit=a.daily_limit,
             )
             for a in self._accounts.list()
         ]

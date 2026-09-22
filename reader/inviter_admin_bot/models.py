@@ -26,12 +26,16 @@ class AccountListEntry:
 
 @dataclass(frozen=True)
 class LimitListEntry:
-    """Одна строка "⚙️ Лимиты" (см. design: экран лимитов показывает
-    daily_limit каждого аккаунта, а не enabled — это отдельный экран от
-    "👤 Аккаунты", хоть и построен над тем же списком аккаунтов)."""
+    """Одна строка "⚙️ Лимиты" (см. design: показывать USED / daily_limit,
+    НЕ enabled — это отдельный экран от "👤 Аккаунты", хоть и построен над
+    тем же списком аккаунтов). sent_today — ТА ЖЕ формула, что и
+    AccountUsage.sent_today/InviterService._remaining_daily_budget (см.
+    service.py::_account_usage — joined_today + pending_today), никакого
+    отдельного счётчика здесь не вводится."""
 
     id: int
     display_name: str
+    sent_today: int
     daily_limit: int
 
 
@@ -44,13 +48,18 @@ class AccountStatusEntry:
     _is_blocked — та же формула blocked_until > now, что и у
     status_snapshot()) — texts.py здесь только форматирует, никакого
     сравнения с datetime.now() само не делает (см. texts.py module
-    docstring: "никакой... бизнес-логики здесь нет")."""
+    docstring: "никакой... бизнес-логики здесь нет"). sent_today/
+    daily_limit — ТА ЖЕ формула, что и AccountUsage (см. LimitListEntry
+    выше) — "Сегодня: X / LIMIT" на этом экране использует ровно те же
+    числа, что и "⚙️ Лимиты"."""
 
     display_name: str
     enabled: bool
     is_blocked: bool
     blocked_until: datetime | None
     blocked_reason: str | None
+    sent_today: int
+    daily_limit: int
 
 
 @dataclass(frozen=True)

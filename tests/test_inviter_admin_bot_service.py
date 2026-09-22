@@ -378,7 +378,7 @@ def test_status_snapshot_reflects_todays_invite_counts(fx):
     assert snapshot.campaign_target_chat == "@car_ins_georgia"
 
 
-# ---- ⚙️ Лимиты: список для "⚙️ Лимиты" (daily_limit, не enabled) ----
+# ---- ⚙️ Лимиты: список для "⚙️ Лимиты" (USED / daily_limit, не enabled) ----
 
 
 def test_list_accounts_for_limits_shows_daily_limit(fx):
@@ -389,6 +389,24 @@ def test_list_accounts_for_limits_shows_daily_limit(fx):
 
     limits_by_name = {e.display_name: e.daily_limit for e in entries}
     assert limits_by_name == {"@vladimihailov": 15, "@vvz982": 25}
+
+
+def test_list_accounts_for_limits_sent_today_uses_same_formula_as_account_usage(fx):
+    """sent_today — ТА ЖЕ формула joined_today + pending_today, что и
+    _account_usage()/InviterService._remaining_daily_budget (см. design
+    "не придумывать новый счётчик")."""
+    account = _make_account(fx, daily_limit=15)
+    campaign = fx.campaigns.create(name="Campaign", keyword="осаго", target_chat="@t")
+    now = datetime.now(timezone.utc)
+    fx.invites.create(user_id=1, campaign_id=campaign.id, account_id=account.id, status="joined", invited_at=now, verified_at=now)
+    fx.invites.create(user_id=2, campaign_id=campaign.id, account_id=account.id, status="pending", invited_at=now)
+    fx.invites.create(user_id=3, campaign_id=campaign.id, account_id=account.id, status="failed", invited_at=now)
+
+    entries = fx.service.list_accounts_for_limits()
+    card = fx.service.account_card(account.id)
+
+    assert entries[0].sent_today == 2  # failed не считается
+    assert entries[0].sent_today == card.usage.sent_today  # та же формула, что и в карточке
 
 
 def test_list_accounts_for_limits_reflects_updated_value(fx):
@@ -478,3 +496,16 @@ def test_list_account_statuses_enabled_independent_from_blocked(fx):
 
     assert entries[0].enabled is True
     assert entries[0].is_blocked is True
+
+
+def test_list_account_statuses_includes_sent_today_and_daily_limit(fx):
+    account = _make_account(fx, daily_limit=15)
+    campaign = fx.campaigns.create(name="Campaign", keyword="осаго", target_chat="@t")
+    now = datetime.now(timezone.utc)
+    fx.invites.create(user_id=1, campaign_id=campaign.id, account_id=account.id, status="joined", invited_at=now, verified_at=now)
+    fx.invites.create(user_id=2, campaign_id=campaign.id, account_id=account.id, status="pending", invited_at=now)
+
+    entries = fx.service.list_account_statuses()
+
+    assert entries[0].sent_today == 2
+    assert entries[0].daily_limit == 15

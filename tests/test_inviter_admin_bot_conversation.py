@@ -401,20 +401,38 @@ async def test_status_screen_shows_pause_state(fx):
     assert "приостановлено" in reply.text
 
 
-# ---- ⚙️ Лимиты: список показывает daily_limit, не enabled ----
+# ---- ⚙️ Лимиты: список показывает USED / LIMIT, не enabled ----
 
 
-async def test_limits_list_shows_daily_limit_not_enabled(fx):
+async def test_limits_list_shows_used_over_limit_not_enabled(fx):
     _make_account(fx, name="@vladimihailov", telegram_user_id=1, daily_limit=15, enabled=True)
     _make_account(fx, name="@ao777oa777", telegram_user_id=2, daily_limit=15, enabled=False)
 
     reply = await fx.controller.handle_text(texts.LIMITS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
 
     assert reply.text == texts.LIMITS_HEADER
-    limits_by_name = {name: limit for _id, name, limit in reply.limits_page_options}
-    assert limits_by_name == {"@vladimihailov": 15, "@ao777oa777": 15}
-    # enabled нигде не участвует в этих данных — только id/имя/daily_limit.
-    assert all(len(entry) == 3 for entry in reply.limits_page_options)
+    by_name = {name: (used, limit) for _id, name, used, limit in reply.limits_page_options}
+    assert by_name == {"@vladimihailov": (0, 15), "@ao777oa777": (0, 15)}
+    # enabled нигде не участвует в этих данных — только id/имя/used/daily_limit.
+    assert all(len(entry) == 4 for entry in reply.limits_page_options)
+
+
+async def test_limits_list_used_reuses_inviter_joined_plus_pending_formula(fx):
+    """USED — ТА ЖЕ формула joined_today + pending_today, что использует
+    сам inviter для расходования daily budget (см. design "не придумывать
+    новый счётчик"), а не что-то новое."""
+    account = _make_account(fx, name="@vvz982", telegram_user_id=1, daily_limit=15)
+    campaign = fx.campaigns.create(name="Campaign", keyword="осаго", target_chat="@t")
+    now = datetime.now(timezone.utc)
+    fx.invites.create(user_id=1, campaign_id=campaign.id, account_id=account.id, status="joined", invited_at=now, verified_at=now)
+    fx.invites.create(user_id=2, campaign_id=campaign.id, account_id=account.id, status="pending", invited_at=now)
+    fx.invites.create(user_id=3, campaign_id=campaign.id, account_id=account.id, status="failed", invited_at=now)
+
+    reply = await fx.controller.handle_text(texts.LIMITS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+
+    used_by_id = {aid: used for aid, _name, used, _limit in reply.limits_page_options}
+    # joined + pending = 2, failed НЕ считается — та же формула, что и card.usage.
+    assert used_by_id[account.id] == 2
 
 
 async def test_limits_list_empty_shows_helpful_message(fx):
@@ -437,7 +455,7 @@ def test_limits_value_selection_updates_and_returns_to_limits_list(fx):
     reply = fx.controller.handle_limits_value(account.id, 20, telegram_user_id=_TRUSTED_ID)
 
     assert fx.accounts.get(account.id).daily_limit == 20
-    limits_by_id = {aid: limit for aid, _name, limit in reply.limits_page_options}
+    limits_by_id = {aid: limit for aid, _name, _used, limit in reply.limits_page_options}
     assert limits_by_id[account.id] == 20
     # После изменения возвращаемся именно к списку лимитов, не к карточке.
     assert reply.account_card_id is None
@@ -454,7 +472,7 @@ async def test_limits_manual_flow_returns_to_limits_list(fx):
     final_reply = await fx.controller.handle_text("42", chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
 
     assert fx.accounts.get(account.id).daily_limit == 42
-    limits_by_id = {aid: limit for aid, _name, limit in final_reply.limits_page_options}
+    limits_by_id = {aid: limit for aid, _name, _used, limit in final_reply.limits_page_options}
     assert limits_by_id[account.id] == 42
     assert final_reply.account_card_id is None
 
@@ -521,15 +539,16 @@ async def test_status_screen_blocked_until_future_shows_blocked_with_reason(fx):
 
     assert "🔴 @wwww86w" in reply.text
     assert "Аккаунт: включён" in reply.text
-    assert "Заблокирован до:" in reply.text
+    assert "Блокировка: до" in reply.text
     assert "Причина: peer_flood" in reply.text
     assert "Блокировка: нет" not in reply.text  # единственный аккаунт в тесте — заблокирован
+    assert "Последняя причина" not in reply.text  # активная блокировка — не историческая
 
 
-async def test_status_screen_blocked_until_past_shown_as_not_blocked(fx):
-    """blocked_until уже прошёл -> "Не заблокирован"/"Блокировка: нет",
-    даже если исторический blocked_reason остался в БД (см. design "если
-    blocked_until уже прошёл — показывать как Не заблокирован")."""
+async def test_status_screen_blocked_until_past_shown_as_not_blocked_with_last_reason(fx):
+    """blocked_until уже прошёл -> НЕ 🔴, "Блокировка: нет", но
+    исторический blocked_reason остаётся видимым отдельной строкой
+    "Последняя причина" (см. design "не менять blocked state ради UI")."""
     account = _make_account(fx, name="@vvz982", telegram_user_id=1, enabled=True)
     past = datetime.now(timezone.utc) - timedelta(hours=2)
     fx.accounts.update(account.id, blocked_until=past, blocked_reason="peer_flood")
@@ -537,9 +556,32 @@ async def test_status_screen_blocked_until_past_shown_as_not_blocked(fx):
     reply = await fx.controller.handle_text(texts.STATUS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
 
     assert "🟢 @vvz982" in reply.text
+    assert "🔴" not in reply.text
     assert "Блокировка: нет" in reply.text
-    assert "peer_flood" not in reply.text
-    assert "Заблокирован до:" not in reply.text
+    assert "Последняя причина: peer_flood" in reply.text
+    assert "Блокировка: до" not in reply.text
+
+
+async def test_status_screen_no_blocked_reason_hides_last_reason_line(fx):
+    """Никогда не блокировался — blocked_reason=None — строки "Последняя
+    причина" быть не должно вообще."""
+    _make_account(fx, name="@vvz982", telegram_user_id=1, enabled=True)
+
+    reply = await fx.controller.handle_text(texts.STATUS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+
+    assert "Последняя причина" not in reply.text
+
+
+async def test_status_screen_shows_used_over_limit_per_account(fx):
+    account = _make_account(fx, name="@vvz982", telegram_user_id=1, daily_limit=15)
+    campaign = fx.campaigns.create(name="Campaign", keyword="осаго", target_chat="@t")
+    now = datetime.now(timezone.utc)
+    fx.invites.create(user_id=1, campaign_id=campaign.id, account_id=account.id, status="joined", invited_at=now, verified_at=now)
+    fx.invites.create(user_id=2, campaign_id=campaign.id, account_id=account.id, status="pending", invited_at=now)
+
+    reply = await fx.controller.handle_text(texts.STATUS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+
+    assert "Сегодня: 2 / 15" in reply.text
 
 
 async def test_status_screen_missing_username_falls_back_to_telegram_id(fx):
@@ -566,4 +608,57 @@ async def test_status_screen_enabled_state_not_mixed_with_block_state(fx):
 
     account_block = next(b for b in reply.text.split("\n\n") if "@wwww86w" in b)
     assert "Аккаунт: включён" in account_block
-    assert "Заблокирован до:" in account_block
+    assert "Блокировка: до" in account_block
+
+
+# ---- 👤 Аккаунты: enabled НЕ зависит от глобального inviter_enabled ----
+
+
+async def test_account_enabled_icon_independent_of_global_pause(fx):
+    """▶️ Запустить / ⏸ Приостановить управляют ГЛОБАЛЬНЫМ inviter_enabled;
+    🟢/⚪ у конкретного аккаунта — ТОЛЬКО account.enabled (см. design "Не
+    смешивать эти состояния") — приостановка глобально не должна погасить
+    🟢 у включённого аккаунта."""
+    _make_account(fx, name="@vvz982", telegram_user_id=1, enabled=True)
+
+    await fx.controller.handle_text(texts.PAUSE_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+    accounts_reply = await fx.controller.handle_text(texts.ACCOUNTS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+
+    enabled_by_name = {name: enabled for _id, name, enabled in accounts_reply.accounts_page_options}
+    assert enabled_by_name["@vvz982"] is True  # глобальная пауза не трогает account.enabled
+
+    status_reply = await fx.controller.handle_text(texts.STATUS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+    assert "🟢 @vvz982" in status_reply.text  # тоже не 🔴/⚪ из-за глобальной паузы
+    assert "Автоприглашение: ⏸ приостановлено" in status_reply.text
+
+
+async def test_global_pause_does_not_change_account_enabled_flag(fx):
+    account = _make_account(fx, enabled=True)
+
+    await fx.controller.handle_text(texts.PAUSE_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+
+    assert fx.accounts.get(account.id).enabled is True
+
+
+# ---- ℹ️ Справка ----
+
+
+async def test_help_screen_accessible_to_trusted_admin(fx):
+    reply = await fx.controller.handle_text(texts.HELP_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+
+    assert reply.text == texts.HELP_TEXT
+    assert reply.show_main_menu is True
+
+
+async def test_help_screen_explains_global_vs_account_state(fx):
+    reply = await fx.controller.handle_text(texts.HELP_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+
+    assert "глобально" in reply.text
+    assert "🟢" in reply.text and "⚪" in reply.text and "🔴" in reply.text
+    assert "3 / 15" in reply.text
+
+
+async def test_help_screen_denied_for_unauthorized_user(fx):
+    reply = await fx.controller.handle_text(texts.HELP_LABEL, chat_id=_CHAT_ID, telegram_user_id=_OTHER_ID)
+
+    assert reply.text == texts.ACCESS_DENIED_TEXT

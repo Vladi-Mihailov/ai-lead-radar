@@ -58,6 +58,7 @@ async def test_main_menu_reply_attaches_main_menu_keyboard():
     assert texts.ADD_ACCOUNT_LABEL in labels
     assert texts.START_LABEL in labels
     assert texts.PAUSE_LABEL in labels
+    assert texts.HELP_LABEL in labels
 
 
 async def test_access_denied_reply_has_no_buttons_at_all():
@@ -114,17 +115,17 @@ async def test_limit_choice_reply_attaches_limit_keyboard():
     assert texts.MANUAL_LIMIT_LABEL in labels
 
 
-async def test_limits_page_reply_shows_daily_limit_not_enabled_toggle():
+async def test_limits_page_reply_shows_used_over_limit_not_enabled_toggle():
     reply = _FakeReply(
         text=texts.LIMITS_HEADER,
-        limits_page_options=[(1, "@vladimihailov", 15), (2, "@vvz982", 20)],
+        limits_page_options=[(1, "@vladimihailov", 3, 15), (2, "@vvz982", 0, 20)],
     )
     event = _FakeEvent()
 
     await _send_reply(event, reply)
 
     labels = _labels(event.calls[0]["buttons"])
-    assert labels == ["@vladimihailov", "15 / день", "@vvz982", "20 / день"]
+    assert labels == ["@vladimihailov", "3 / 15", "@vvz982", "0 / 20"]
     assert "🟢" not in labels
     assert "⚪" not in labels
 

@@ -19,6 +19,7 @@ from reader.inviter_admin_bot.texts import (
     CANCEL_BUTTON_LABEL,
     CHANGE_LIMIT_LABEL,
     CHECK_SYNC_LABEL,
+    HELP_LABEL,
     LIMIT_PROMPT_CHOICES,
     LIMITS_LABEL,
     MANUAL_LIMIT_LABEL,
@@ -171,7 +172,7 @@ def main_menu_keyboard() -> list[list[Button]]:
         [Button.text(ACCOUNTS_LABEL, resize=True), Button.text(ADD_ACCOUNT_LABEL, resize=True)],
         [Button.text(START_LABEL, resize=True), Button.text(PAUSE_LABEL, resize=True)],
         [Button.text(STATUS_LABEL, resize=True), Button.text(LIMITS_LABEL, resize=True)],
-        [Button.text(SYNC_LABEL, resize=True)],
+        [Button.text(SYNC_LABEL, resize=True), Button.text(HELP_LABEL, resize=True)],
     ]
 
 
@@ -188,20 +189,20 @@ def accounts_page_keyboard(entries: list[tuple[int, str, bool]]) -> list[list[Bu
     ]
 
 
-def limits_page_keyboard(entries: list[tuple[int, str, int]]) -> list[list[Button]]:
-    """entries — (account_id, display_name, daily_limit) (см. design "⚙️
-    Лимиты"). Левая кнопка — имя, открывает ТУ ЖЕ карточку аккаунта, что и
-    "👤 Аккаунты" (encode_account_open_callback, без изменений). Правая
-    кнопка показывает daily_limit (НЕ enabled 🟢/⚪ — см. design "Правая
-    кнопка здесь должна показывать именно daily_limit"), открывает выбор
-    лимита, который возвращает на этот же список (см.
-    limits_value_choice_keyboard)."""
+def limits_page_keyboard(entries: list[tuple[int, str, int, int]]) -> list[list[Button]]:
+    """entries — (account_id, display_name, sent_today, daily_limit) (см.
+    design "⚙️ Лимиты"). Левая кнопка — имя, открывает ТУ ЖЕ карточку
+    аккаунта, что и "👤 Аккаунты" (encode_account_open_callback, без
+    изменений). Правая кнопка показывает "USED / LIMIT" (НЕ enabled 🟢/⚪,
+    НЕ просто daily_limit — см. design "Показывать USED/LIMIT, USED — та
+    же формула, что и у inviter"), открывает выбор лимита, который
+    возвращает на этот же список (см. limits_value_choice_keyboard)."""
     return [
         [
             Button.inline(display_name, encode_account_open_callback(account_id)),
-            Button.inline(f"{daily_limit} / день", encode_limits_open_callback(account_id)),
+            Button.inline(f"{sent_today} / {daily_limit}", encode_limits_open_callback(account_id)),
         ]
-        for account_id, display_name, daily_limit in entries
+        for account_id, display_name, sent_today, daily_limit in entries
     ]
 
 

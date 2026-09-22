@@ -20,6 +20,7 @@ PAUSE_LABEL = "⏸ Приостановить"
 STATUS_LABEL = "📊 Статус"
 LIMITS_LABEL = "⚙️ Лимиты"
 SYNC_LABEL = "🔄 Синхронизировать"
+HELP_LABEL = "ℹ️ Справка"
 
 TURN_OFF_ACCOUNT_LABEL = "⏸ Отключить"
 TURN_ON_ACCOUNT_LABEL = "▶️ Включить"
@@ -53,6 +54,44 @@ GLOBAL_ENABLED_TEXT = "▶️ Автоприглашения включены."
 GLOBAL_PAUSED_TEXT = "⏸ Автоприглашения приостановлены."
 
 ACTION_FAILED_TEXT = "⚠️ Не удалось выполнить действие — откройте список заново через «👤 Аккаунты»."
+
+HELP_TEXT = (
+    "ℹ️ Inviter Admin Bot\n"
+    "\n"
+    "▶️ Запустить\n"
+    "Включает автоматические приглашения глобально.\n"
+    "\n"
+    "⏸ Приостановить\n"
+    "Останавливает автоматические приглашения. Аккаунты и настройки "
+    "сохраняются.\n"
+    "\n"
+    "👤 Аккаунты\n"
+    "Управление отдельными Telegram-аккаунтами.\n"
+    "\n"
+    "🟢 — аккаунт разрешён для приглашений.\n"
+    "⚪ — аккаунт выключен.\n"
+    "🔴 — аккаунт временно заблокирован.\n"
+    "\n"
+    "⚙️ Лимиты\n"
+    "Показывает: отправлено сегодня / дневной лимит.\n"
+    "\n"
+    "Например: 3 / 15\n"
+    "Это означает: сегодня использовано 3 из лимита 15.\n"
+    "\n"
+    "🔄 Синхронизировать\n"
+    "Проверяет session/account через Telegram, обновляет текущий "
+    "username и состояние авторизации.\n"
+    "\n"
+    "📊 Статус\n"
+    "Показывает состояние inviter и всех аккаунтов.\n"
+    "\n"
+    "Чтобы аккаунт реально использовался для приглашений, одновременно "
+    "должны выполняться условия:\n"
+    "1. Автоприглашение глобально включено.\n"
+    "2. Аккаунт включён 🟢.\n"
+    "3. Нет активной блокировки.\n"
+    "4. Дневной/часовой лимит не исчерпан."
+)
 
 
 def format_toggle_label(*, enabled: bool) -> str:
@@ -172,13 +211,19 @@ def format_account_statuses(entries: list[AccountStatusEntry], *, inviter_enable
     service.py::list_account_statuses) — здесь никакого сравнения с
     datetime.now() нет.
 
+    blocked_reason ИСТОРИЧЕСКИЙ (blocked_until уже прошёл) показывается
+    ОТДЕЛЬНОЙ строкой "Последняя причина" — НЕ как активная блокировка (см.
+    design "Не менять blocked state ради UI" — is_blocked остаётся
+    единственным источником истины про АКТИВНОСТЬ блокировки, здесь только
+    решается, какую строку про reason показать).
+
     inviter_enabled — ГЛОБАЛЬНЫЙ ▶️/⏸ переключатель автодобавления (см.
     InviterAdminService.is_global_enabled), отдельная короткая строка
     вверху экрана — НЕ путать с per-account enabled ниже (два независимых
-    понятия: один "автодобавление в целом", другой "этот конкретный
+    понятия: один "автоприглашение в целом", другой "этот конкретный
     аккаунт")."""
     auto_state = "▶️ включено" if inviter_enabled else "⏸ приостановлено"
-    header = f"{STATUS_ACCOUNTS_HEADER}\n\nАвтодобавление: {auto_state}"
+    header = f"{STATUS_ACCOUNTS_HEADER}\n\nАвтоприглашение: {auto_state}"
 
     if not entries:
         return f"{header}\n\n{NO_ACCOUNTS_TEXT}"
@@ -191,10 +236,13 @@ def format_account_statuses(entries: list[AccountStatusEntry], *, inviter_enable
             f"Аккаунт: {'включён' if entry.enabled else 'выключен'}",
         ]
         if entry.is_blocked:
-            lines.append(f"Заблокирован до: {_fmt_dt_short(entry.blocked_until)}")
+            lines.append(f"Блокировка: до {_fmt_dt_short(entry.blocked_until)}")
             lines.append(f"Причина: {entry.blocked_reason or '—'}")
         else:
             lines.append("Блокировка: нет")
+            if entry.blocked_reason:
+                lines.append(f"Последняя причина: {entry.blocked_reason}")
+        lines.append(f"Сегодня: {entry.sent_today} / {entry.daily_limit}")
         blocks.append("\n".join(lines))
 
     return header + "\n\n" + "\n\n".join(blocks)

@@ -37,7 +37,7 @@ class BotReply:
     account_card_id: int | None = None
     account_card_enabled: bool | None = None
     limit_choice_account_id: int | None = None
-    limits_page_options: list[tuple[int, str, int]] | None = None
+    limits_page_options: list[tuple[int, str, int, int]] | None = None
     limits_choice_account_id: int | None = None
 
 
@@ -113,6 +113,8 @@ class AdminBotController:
             return self._format_limits_reply()
         if stripped == texts.SYNC_LABEL:
             return await self._handle_sync_all()
+        if stripped == texts.HELP_LABEL:
+            return BotReply(text=texts.HELP_TEXT, show_main_menu=True)
 
         state = self._states.get(chat_id)
         if state is not None and state.telegram_user_id == telegram_user_id:
@@ -221,8 +223,11 @@ class AdminBotController:
             accounts_page_options=[(e.id, e.display_name, e.enabled) for e in entries],
         )
 
-    def _limits_page_options(self) -> list[tuple[int, str, int]]:
-        return [(e.id, e.display_name, e.daily_limit) for e in self._service.list_accounts_for_limits()]
+    def _limits_page_options(self) -> list[tuple[int, str, int, int]]:
+        return [
+            (e.id, e.display_name, e.sent_today, e.daily_limit)
+            for e in self._service.list_accounts_for_limits()
+        ]
 
     def _format_limits_reply(self) -> BotReply:
         options = self._limits_page_options()
