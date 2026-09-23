@@ -153,6 +153,27 @@ async def test_add_car_creates_new_client_bot_task_when_none_exists(fx):
     assert task.id == outcome.task.id
 
 
+async def test_add_car_without_username_creates_subscription_bound_by_numeric_id(fx):
+    """Задача "Georgia должен работать с Telegram identity так же, как
+    Turkey" — username=None (клиент без публичного Telegram-логина) не
+    должен мешать созданию подписки/мониторинга: telegram_user_id остаётся
+    единственным идентификатором, telegram_username сохраняется как NULL,
+    а не блокирует/ломает flow."""
+    outcome = await fx.service.add_car(
+        telegram_user_id=42, telegram_chat_id=42, username=None,
+        first_name="Anna", last_name=None, car_number="M295YB196",
+        period_days=30, today=date(2026, 9, 3),
+    )
+
+    assert outcome.subscription.telegram_user_id == 42
+    assert outcome.subscription.telegram_username is None
+    assert outcome.check_ok is True
+
+    [subscription] = fx.subscription_repository.list_by_user(42)
+    assert subscription.telegram_user_id == 42
+    assert subscription.telegram_username is None
+
+
 # ---- переиспользование существующей client_bot задачи ----
 
 

@@ -31,7 +31,6 @@ from reader.public_bot.conversation import (  # noqa: E402
     STEP_AWAITING_OWNER_USERNAME,
     STEP_AWAITING_PERIOD,
     STEP_AWAITING_TRUSTED_CHECK_NOW_CAR_NUMBER,
-    STEP_AWAITING_USERNAME,
     ConversationController,
 )
 from reader.public_bot.conversation_state_repository import BotConversationStateRepository  # noqa: E402
@@ -225,41 +224,62 @@ async def test_add_car_invalid_car_number_stays_on_same_step(fx):
     assert state.step == STEP_AWAITING_CAR_NUMBER  # диалог не сброшен, можно ввести заново
 
 
-# ---- Add Car: username отсутствует ----
+# ---- Add Car: self-service — username больше НИКОГДА не запрашивается
+# вручную (см. задачу "Georgia должен работать с Telegram identity так же,
+# как Turkey") ----
 
 
-async def test_add_car_without_username_asks_for_it(fx):
+async def test_add_car_without_username_skips_prompt_straight_to_period(fx):
+    """2. self-service user БЕЗ username: номер авто → сразу period,
+    никакого username prompt — username=None штатно сохраняется в payload,
+    а не считается ошибкой/поводом что-то запросить."""
     await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=2, telegram_user_id=2, username=None)
 
     reply = await fx.controller.handle_text("M295YB196", chat_id=2, telegram_user_id=2, username=None)
 
-    assert reply.text == texts.USERNAME_PROMPT
-    state = fx.conversation_state_repository.get(2)
-    assert state.step == STEP_AWAITING_USERNAME
-    assert state.payload == {"car_number": "M295YB196"}
-
-
-async def test_add_car_valid_username_after_missing_proceeds_to_period(fx):
-    await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=2, telegram_user_id=2, username=None)
-    await fx.controller.handle_text("M295YB196", chat_id=2, telegram_user_id=2, username=None)
-
-    reply = await fx.controller.handle_text("@VeronaWarm", chat_id=2, telegram_user_id=2, username=None)
-
+    assert reply.text == texts.PERIOD_PROMPT
     assert reply.show_period_buttons is True
     state = fx.conversation_state_repository.get(2)
     assert state.step == STEP_AWAITING_PERIOD
-    assert state.payload == {"car_number": "M295YB196", "username": "VeronaWarm"}
+    assert state.payload == {"car_number": "M295YB196", "username": None}
 
 
-async def test_add_car_invalid_username_stays_on_same_step(fx):
+async def test_add_car_without_username_completes_subscription_successfully(fx):
+    """3. Отсутствие username не мешает subscription creation/monitoring/
+    telegram_user_id binding — период выбирается, подписка создаётся,
+    привязка идёт по numeric telegram_user_id как обычно."""
     await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=2, telegram_user_id=2, username=None)
     await fx.controller.handle_text("M295YB196", chat_id=2, telegram_user_id=2, username=None)
 
-    reply = await fx.controller.handle_text("!!", chat_id=2, telegram_user_id=2, username=None)
+    reply = await fx.controller.handle_period_choice(
+        30, chat_id=2, telegram_user_id=2, first_name=None, last_name=None,
+    )
 
-    assert "❌" in reply.text
-    state = fx.conversation_state_repository.get(2)
-    assert state.step == STEP_AWAITING_USERNAME
+    assert reply is not None
+    assert "✅ Автомобиль добавлен на мониторинг" in reply.text
+    [subscription] = fx.subscription_repository.list_by_user(2)
+    assert subscription.telegram_user_id == 2
+    assert subscription.telegram_username is None
+    assert fx.conversation_state_repository.get(2) is None  # диалог завершён
+
+
+async def test_add_car_summary_without_username_has_no_none_or_prompt_text(fx):
+    """4. self-service summary НЕ содержит "@None"/"None"/запрос придумать
+    username — строка "👤 @username" убрана из summary целиком (см.
+    texts.format_add_car_summary)."""
+    await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=2, telegram_user_id=2, username=None)
+    await fx.controller.handle_text("M295YB196", chat_id=2, telegram_user_id=2, username=None)
+
+    reply = await fx.controller.handle_period_choice(
+        30, chat_id=2, telegram_user_id=2, first_name=None, last_name=None,
+    )
+
+    assert "@None" not in reply.text
+    assert "None" not in reply.text
+    assert "Telegram-логин" not in reply.text
+    assert "👤" not in reply.text
+    assert "🚗 M295YB196" in reply.text
+    assert "📅 Мониторинг:" in reply.text
 
 
 # ---- выбор периода: 30/90/180/365 ----
@@ -279,7 +299,11 @@ async def test_period_choice_creates_subscription_with_expected_dates(fx, days):
     assert reply is not None
     assert "✅ Автомобиль добавлен на мониторинг" in reply.text
     assert "🚗 M295YB196" in reply.text
-    assert "👤 @driver3" in reply.text
+    # Строка "👤 @username" убрана из self-service summary целиком (см.
+    # задачу "Georgia должен работать с Telegram identity так же, как
+    # Turkey") — даже когда username реально есть, он не показывается.
+    assert "👤" not in reply.text
+    assert "@driver3" not in reply.text
     assert f"{today.strftime('%d.%m.%Y')} — {expected_end.strftime('%d.%m.%Y')}" in reply.text
     assert "новых штрафов нет" in reply.text
 
@@ -391,24 +415,31 @@ async def test_my_cars_shows_expired_state_for_past_end_date(fx):
 
 
 async def test_conversation_state_survives_restart_simulated_reopen(tmp_path):
+    """Self-service БЕЗ username — состояние STEP_AWAITING_PERIOD (с
+    payload["username"]=None) переживает "рестарт" (переоткрытие БД) точно
+    так же, как и раньше промежуточный STEP_AWAITING_USERNAME — сам факт,
+    что username больше не запрашивается, не должен ломать persistence."""
     fixture1 = _Fixture(tmp_path)
     try:
         await fixture1.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=7, telegram_user_id=7, username=None)
         await fixture1.controller.handle_text("M295YB196", chat_id=7, telegram_user_id=7, username=None)
-        # состояние теперь STEP_AWAITING_USERNAME — "процесс" останавливается.
+        # состояние теперь STEP_AWAITING_PERIOD (username=None) — "процесс" останавливается.
     finally:
         fixture1.close()
 
     fixture2 = _Fixture(tmp_path)
     try:
         state = fixture2.conversation_state_repository.get(7)
-        assert state.step == STEP_AWAITING_USERNAME
-        assert state.payload == {"car_number": "M295YB196"}
+        assert state.step == STEP_AWAITING_PERIOD
+        assert state.payload == {"car_number": "M295YB196", "username": None}
 
-        reply = await fixture2.controller.handle_text("@VeronaWarm", chat_id=7, telegram_user_id=7, username=None)
+        reply = await fixture2.controller.handle_period_choice(
+            30, chat_id=7, telegram_user_id=7, first_name=None, last_name=None,
+        )
 
-        assert reply.show_period_buttons is True
-        assert fixture2.conversation_state_repository.get(7).step == STEP_AWAITING_PERIOD
+        assert reply is not None
+        assert "✅ Автомобиль добавлен на мониторинг" in reply.text
+        assert fixture2.conversation_state_repository.get(7) is None
     finally:
         fixture2.close()
 
@@ -416,16 +447,19 @@ async def test_conversation_state_survives_restart_simulated_reopen(tmp_path):
 # ==== trusted-operator delegated flow (см. design report) ====
 
 
-async def test_ordinary_user_never_sees_owner_username_prompt(fx):
-    """Регресс: обычный пользователь (не в trusted_operator_user_ids) —
-    поведение self-service flow не должно отличаться от Stage 2, даже
-    если у него самого нет username (авто-детект/обычный USERNAME_PROMPT)."""
+async def test_ordinary_user_without_username_never_sees_owner_username_prompt(fx):
+    """6. Регресс: обычный пользователь (не в trusted_operator_user_ids)
+    без username никогда не видит OWNER_USERNAME_PROMPT (тот относится
+    ИСКЛЮЧИТЕЛЬНО к delegated flow) — и, после задачи "убрать username
+    requirement", вообще никакого username prompt: сразу период."""
     await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username=None)
 
     reply = await fx.controller.handle_text("M295YB196", chat_id=1, telegram_user_id=1, username=None)
 
-    assert reply.text == texts.USERNAME_PROMPT
-    assert fx.conversation_state_repository.get(1).step == STEP_AWAITING_USERNAME
+    assert reply.text != texts.OWNER_USERNAME_PROMPT
+    assert reply.text == texts.PERIOD_PROMPT
+    assert reply.show_period_buttons is True
+    assert fx.conversation_state_repository.get(1).step == STEP_AWAITING_PERIOD
 
 
 async def test_trusted_user_car_number_shows_add_client_decision_first(trusted_fx):

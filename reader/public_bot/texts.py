@@ -39,10 +39,17 @@ TURKEY_BOT_LINK_TEXT = "🇹🇷 Проверка штрафов и платны
 TURKEY_BOT_URL = "https://t.me/ProtocolTRbot"
 
 CAR_NUMBER_PROMPT = "🚗 Введите госномер автомобиля\n\nНапример: M295YB196"
-USERNAME_PROMPT = "👤 Введите ваш Telegram-логин\n\nНапример: @VeronaWarm"
+# Self-service (обычный клиент) больше НЕ имеет своего username-prompt (см.
+# задачу "Georgia должен работать с Telegram identity так же, как Turkey")
+# — telegram_user_id достаточен как identity, username — только auto-
+# captured metadata, если Telegram его отдал. OWNER_USERNAME_PROMPT ниже
+# относится ИСКЛЮЧИТЕЛЬНО к delegated-флоу (оператор указывает клиента) и
+# НЕ затронут этой задачей.
+#
 # Trusted-operator delegated flow (см. design report) — ВСЕГДА запрашивается
-# после номера авто у пользователей из trusted_operator_user_ids, вместо
-# USERNAME_PROMPT выше. Может быть указан и собственный username trusted-
+# после номера авто у пользователей из trusted_operator_user_ids (self-
+# service username-prompt выше больше не существует, см. комментарий про
+# CAR_NUMBER_PROMPT). Может быть указан и собственный username trusted-
 # оператора, если он ставит на мониторинг свой же автомобиль.
 OWNER_USERNAME_PROMPT = "👤 Укажите Telegram владельца автомобиля\n\nНапример: @VeronaWarm"
 # Trusted-operator flow — ПЕРЕД OWNER_USERNAME_PROMPT (см. design: username
@@ -123,7 +130,6 @@ def _fmt_date(value: date) -> str:
 def format_add_car_summary(
     *,
     car_number: str,
-    username: str,
     start_date: date,
     end_date: date,
     check_ok: bool,
@@ -133,7 +139,15 @@ def format_add_car_summary(
     reader/commands/fine.py::_format_add_summary (другой текст/аудитория,
     но тот же принцип: короткая факт-строка, без дублирования детального
     уведомления о самом штрафе — его здесь на этом этапе ещё нет вовсе,
-    см. Stage 2 report)."""
+    см. Stage 2 report).
+
+    Без строки "👤 @username" (см. задачу "Georgia должен работать с
+    Telegram identity так же, как Turkey") — self-service username больше
+    не обязателен и часто отсутствует (None), показывать "@None" или
+    вообще опускать строку по условию было бы непоследовательно; вместо
+    этого строка убрана целиком для ВСЕХ self-service подтверждений,
+    независимо от того, есть ли у клиента username — клиент и так знает
+    свой Telegram-логин, это не новая для него информация."""
     period = f"{_fmt_date(start_date)} — {_fmt_date(end_date)}"
 
     if not check_ok:
@@ -142,7 +156,6 @@ def format_add_car_summary(
             "но проверить штрафы сейчас не удалось",
             "",
             f"🚗 {car_number}",
-            f"👤 @{username}",
             f"📅 Мониторинг: {period}",
         ])
 
@@ -155,7 +168,6 @@ def format_add_car_summary(
         "✅ Автомобиль добавлен на мониторинг",
         "",
         f"🚗 {car_number}",
-        f"👤 @{username}",
         f"📅 Мониторинг: {period}",
         check_line,
     ])

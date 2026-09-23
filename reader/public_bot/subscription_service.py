@@ -187,14 +187,14 @@ class SubscriptionService:
         self._owner_resolver_client = owner_resolver_client
         self._bot_username = bot_username
 
-    # ---- self-service (обычный пользователь) — БЕЗ ИЗМЕНЕНИЙ с Stage 2 ----
+    # ---- self-service (обычный пользователь) ----
 
     async def add_car(
         self,
         *,
         telegram_user_id: int,
         telegram_chat_id: int,
-        username: str,
+        username: str | None,
         first_name: str | None,
         last_name: str | None,
         car_number: str,
@@ -531,7 +531,7 @@ class SubscriptionService:
         car_number: str,
         telegram_user_id: int,
         telegram_chat_id: int,
-        username: str,
+        username: str | None,
         start_date: date,
         end_date: date,
         owner_username_hint: str | None = None,

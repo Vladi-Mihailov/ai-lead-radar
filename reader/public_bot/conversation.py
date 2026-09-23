@@ -18,6 +18,18 @@ deep-link claim (см. _handle_claim_start) — claim_token опаден, но
 identity, которой он в итоге биндится, берётся ИСКЛЮЧИТЕЛЬНО из
 event.sender_id этого конкретного /start, а не из чего-либо в payload.
 
+Self-service Add Car (обычный, не-trusted пользователь, см. задачу "Georgia
+должен работать с Telegram identity так же, как Turkey"): username больше
+НИКОГДА не запрашивается вручную — telegram_user_id (event.sender_id)
+остаётся единственной stable identity, username сохраняется ТОЛЬКО если
+его отдал сам Telegram (event.sender.username), иначе остаётся None —
+номер авто ведёт СРАЗУ к STEP_AWAITING_PERIOD в обоих случаях. Раньше
+здесь был отдельный STEP_AWAITING_USERNAME/USERNAME_PROMPT для клиентов
+без публичного username — убран целиком (см. _handle_car_number_input),
+username=None для self-service — штатное, а не ошибочное состояние (см.
+handle_period_choice — отличает self-service от delegated по наличию
+ключа "username" в payload, а не по его истинности).
+
 Trusted-operator delegated flow (см. design report): пользователь из
 trusted_operator_user_ids — единственная авторизация ТОЛЬКО по numeric
 telegram_user_id из конфига (reader/settings.py::PublicBotSettings,
@@ -83,7 +95,6 @@ from reader.public_bot.subscription_service import SubscriptionService
 from reader.public_bot.validation import UsernameValidationError, normalize_telegram_username
 
 STEP_AWAITING_CAR_NUMBER = "awaiting_car_number"
-STEP_AWAITING_USERNAME = "awaiting_username"
 STEP_AWAITING_CLIENT_DECISION = "awaiting_client_decision"
 STEP_AWAITING_OWNER_USERNAME = "awaiting_owner_username"
 STEP_AWAITING_PERIOD = "awaiting_period"
@@ -584,11 +595,6 @@ class ConversationController:
                 stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, username=username,
             )
 
-        if state.step == STEP_AWAITING_USERNAME:
-            return self._handle_username_input(
-                stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, state_payload=state.payload,
-            )
-
         if state.step == STEP_AWAITING_CLIENT_DECISION:
             # Тот же приём, что и у STEP_AWAITING_PERIOD ниже — выбор
             # только inline-кнопкой, текст на этом шаге просто повторно
@@ -637,33 +643,16 @@ class ConversationController:
                 text=texts.ADD_CLIENT_DECISION_PROMPT, show_add_client_decision_buttons=True,
             )
 
-        if username:
-            # Telegram уже отдал username — шаг "Введите Telegram-логин"
-            # пропускается полностью (см. design).
-            self._states.set(
-                chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_PERIOD,
-                payload={"car_number": car_number, "username": username},
-            )
-            return BotReply(text=texts.PERIOD_PROMPT, show_period_buttons=True)
-
+        # Self-service: username больше НИКОГДА не запрашивается вручную
+        # (см. задачу "Georgia должен работать с Telegram identity так же,
+        # как Turkey") — telegram_user_id уже достаточен как stable
+        # identity. Если Telegram отдал username — сохраняем как metadata;
+        # если нет — payload["username"] = None, штатное состояние (см.
+        # handle_period_choice, различающий self-service от delegated по
+        # наличию ключа "username" в payload, а не по его истинности).
         self._states.set(
-            chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_USERNAME,
-            payload={"car_number": car_number},
-        )
-        return BotReply(text=texts.USERNAME_PROMPT)
-
-    def _handle_username_input(
-        self, raw_text: str, *, chat_id: int, telegram_user_id: int, state_payload: dict | None,
-    ) -> BotReply:
-        try:
-            username = normalize_telegram_username(raw_text)
-        except UsernameValidationError as exc:
-            return BotReply(text=f"❌ {exc.message}\n\n{texts.USERNAME_PROMPT}")
-
-        payload = dict(state_payload or {})
-        payload["username"] = username
-        self._states.set(
-            chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_PERIOD, payload=payload,
+            chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_PERIOD,
+            payload={"car_number": car_number, "username": username},
         )
         return BotReply(text=texts.PERIOD_PROMPT, show_period_buttons=True)
 
@@ -794,10 +783,16 @@ class ConversationController:
         payload = state.payload or {}
         car_number = payload.get("car_number")
         owner_username = payload.get("owner_username")
-        username = payload.get("username")
         no_client = bool(payload.get("no_client"))
+        # "username" in payload (а не bool(username)!) отличает self-service
+        # от delegated: self-service ВСЕГДА кладёт этот ключ в payload (см.
+        # _handle_car_number_input), даже когда значение None (Telegram не
+        # отдал username) — bool(username) ошибочно принял бы это за
+        # повреждённое состояние (см. задачу про Georgia/Turkey identity).
+        is_self_service = "username" in payload
+        username = payload.get("username")
 
-        if not car_number or not (owner_username or username or no_client):
+        if not car_number or not (owner_username or no_client or is_self_service):
             # Не должно происходить штатно (payload всегда заполняется к
             # моменту STEP_AWAITING_PERIOD) — но не падаем молча, если
             # состояние всё же оказалось повреждено/устарело.
@@ -842,7 +837,6 @@ class ConversationController:
         return BotReply(
             text=texts.format_add_car_summary(
                 car_number=car_number,
-                username=username,
                 start_date=outcome.subscription.start_date,
                 end_date=outcome.subscription.end_date,
                 check_ok=outcome.check_ok,
