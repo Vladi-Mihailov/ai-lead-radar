@@ -17,24 +17,20 @@ class AccountListEntry:
     telegram_accounts"). display_name уже разрешён по правилу "username
     если есть, иначе Telegram ID, иначе номер сессии" (см.
     service.py::_display_name) — conversation.py/keyboards.py никогда
-    сами не решают, что показывать вместо отсутствующего username."""
+    сами не решают, что показывать вместо отсутствующего username.
 
-    id: int
-    display_name: str
-    enabled: bool
-
-
-@dataclass(frozen=True)
-class LimitListEntry:
-    """Одна строка "⚙️ Лимиты" (см. design: показывать USED / daily_limit,
-    НЕ enabled — это отдельный экран от "👤 Аккаунты", хоть и построен над
-    тем же списком аккаунтов). sent_today — ТА ЖЕ формула, что и
+    sent_today/daily_limit — раньше были отдельным LimitListEntry для
+    отдельного экрана "⚙️ Лимиты" (см. задачу "объедини экраны 👤
+    Аккаунты и ⚙️ Лимиты" — ⚙️ Лимиты как отдельный экран больше не
+    существует, третья inline-кнопка каждой строки "👤 Аккаунты" теперь
+    сама показывает "USED / LIMIT"). ТА ЖЕ формула, что и
     AccountUsage.sent_today/InviterService._remaining_daily_budget (см.
     service.py::_account_usage — joined_today + pending_today), никакого
     отдельного счётчика здесь не вводится."""
 
     id: int
     display_name: str
+    enabled: bool
     sent_today: int
     daily_limit: int
 

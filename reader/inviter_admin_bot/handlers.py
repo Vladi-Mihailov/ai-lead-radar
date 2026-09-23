@@ -12,7 +12,6 @@ from telethon import TelegramClient, events
 from reader.inviter_admin_bot.conversation import AdminBotController
 from reader.inviter_admin_bot.keyboards import (
     ACCOUNTS_BACK,
-    LIMITS_BACK,
     account_card_keyboard,
     accounts_page_keyboard,
     cancel_keyboard,
@@ -27,7 +26,6 @@ from reader.inviter_admin_bot.keyboards import (
     decode_limits_open_callback,
     decode_limits_value_callback,
     limit_choice_keyboard,
-    limits_page_keyboard,
     limits_value_choice_keyboard,
     main_menu_keyboard,
 )
@@ -88,11 +86,6 @@ def register(client: TelegramClient, controller: AdminBotController) -> None:
             await _answer_and_send(event, reply)
             return
 
-        if data == LIMITS_BACK:
-            reply = controller.handle_limits_back(telegram_user_id=event.sender_id)
-            await _answer_and_send(event, reply)
-            return
-
         account_id = decode_limits_open_callback(data)
         if account_id is not None:
             reply = controller.handle_limits_open(account_id, telegram_user_id=event.sender_id)
@@ -147,8 +140,6 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False) -> None:
         buttons = cancel_keyboard()
     elif reply.accounts_page_options is not None:
         buttons = accounts_page_keyboard(reply.accounts_page_options)
-    elif reply.limits_page_options is not None:
-        buttons = limits_page_keyboard(reply.limits_page_options)
     elif reply.account_card_id is not None:
         buttons = account_card_keyboard(reply.account_card_id, enabled=bool(reply.account_card_enabled))
     elif reply.limit_choice_account_id is not None:

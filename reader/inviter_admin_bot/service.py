@@ -32,7 +32,6 @@ from reader.inviter_admin_bot.models import (
     AccountStatusEntry,
     AccountUsage,
     AttentionItem,
-    LimitListEntry,
     StatusSnapshot,
     SyncAccountOutcome,
     SyncSummary,
@@ -141,30 +140,22 @@ class InviterAdminService:
         return [a for a in self._accounts.list() if not a.is_old]
 
     def list_accounts(self) -> list[AccountListEntry]:
+        """Список для "👤 Аккаунты" — после объединения с бывшим отдельным
+        "⚙️ Лимиты" (см. задачу) каждая запись несёт также sent_today/
+        daily_limit, ТА ЖЕ _account_usage() (joined_today + pending_today),
+        что и account_card()/InviterService._remaining_daily_budget —
+        никакого нового счётчика."""
         return [
-            AccountListEntry(id=a.id, display_name=_display_name(a), enabled=a.enabled)
-            for a in self._current_accounts()
-        ]
-
-    def get_account(self, account_id: int) -> TelegramAccount | None:
-        return self._accounts.get(account_id)
-
-    # ---- ⚙️ Лимиты ----
-
-    def list_accounts_for_limits(self) -> list[LimitListEntry]:
-        """Список для "⚙️ Лимиты" (см. design: показывать USED / daily_limit
-        каждого аккаунта, НЕ enabled) — тот же _current_accounts(), что и
-        list_accounts() (is_old=False), плюс _account_usage() (ТА ЖЕ
-        формула, что и account_card()/InviterService._remaining_daily_budget
-        — joined_today + pending_today), никакого нового счётчика."""
-        return [
-            LimitListEntry(
-                id=a.id, display_name=_display_name(a),
+            AccountListEntry(
+                id=a.id, display_name=_display_name(a), enabled=a.enabled,
                 sent_today=_account_usage(self._invites, a).sent_today,
                 daily_limit=a.daily_limit,
             )
             for a in self._current_accounts()
         ]
+
+    def get_account(self, account_id: int) -> TelegramAccount | None:
+        return self._accounts.get(account_id)
 
     def account_card(self, account_id: int) -> AccountCard | None:
         account = self._accounts.get(account_id)
@@ -311,9 +302,8 @@ class InviterAdminService:
         "статус" не вводится (см. design "Не придумывать новый статус":
         только account.enabled + account.blocked_until/blocked_reason,
         уже существующие поля TelegramAccount). is_old=True — тот же
-        _current_accounts(), что и list_accounts()/list_accounts_for_limits
-        (см. design "History-only records не должны выглядеть как обычные
-        рабочие accounts")."""
+        _current_accounts(), что и list_accounts() (см. design "History-
+        only records не должны выглядеть как обычные рабочие accounts")."""
         now = datetime.now(timezone.utc)
         return [
             AccountStatusEntry(

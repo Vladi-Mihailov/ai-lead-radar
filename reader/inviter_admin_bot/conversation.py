@@ -33,11 +33,10 @@ class BotReply:
     text: str
     show_main_menu: bool = False
     show_cancel_button: bool = False
-    accounts_page_options: list[tuple[int, str, bool]] | None = None
+    accounts_page_options: list[tuple[int, str, bool, int, int]] | None = None
     account_card_id: int | None = None
     account_card_enabled: bool | None = None
     limit_choice_account_id: int | None = None
-    limits_page_options: list[tuple[int, str, int, int]] | None = None
     limits_choice_account_id: int | None = None
 
 
@@ -109,8 +108,6 @@ class AdminBotController:
                 ),
                 show_main_menu=True,
             )
-        if stripped == texts.LIMITS_LABEL:
-            return self._format_limits_reply()
         if stripped == texts.SYNC_LABEL:
             return await self._handle_sync_all()
         if stripped == texts.HELP_LABEL:
@@ -199,41 +196,33 @@ class AdminBotController:
         if account is None:
             return BotReply(text=texts.ACTION_FAILED_TEXT, show_main_menu=True)
 
-        # return_to="limits" — ручной ввод лимита, открытый со списка "⚙️
-        # Лимиты" (см. handle_limits_manual_prompt), возвращает на СПИСОК
-        # ЛИМИТОВ (см. design "возвращаемся к списку"), а не на карточку —
-        # ручной ввод, открытый с карточки (payload без return_to,
+        # return_to="accounts_list" — ручной ввод лимита, открытый третьей
+        # кнопкой строки "👤 Аккаунты" (см. handle_limits_manual_prompt),
+        # возвращает на СПИСОК "👤 Аккаунты" с уже обновлённым значением
+        # (см. design "возвращаемся к списку"), а не на карточку — ручной
+        # ввод, открытый с карточки (payload без return_to,
         # handle_account_limit_manual_prompt), поведение НЕ изменилось.
-        if payload.get("return_to") == "limits":
+        if payload.get("return_to") == "accounts_list":
             return BotReply(
                 text=texts.format_limit_updated(account.name, value),
-                limits_page_options=self._limits_page_options(),
+                accounts_page_options=self._accounts_page_options(),
             )
         return BotReply(
             text=texts.format_limit_updated(account.name, value),
             account_card_id=account.id, account_card_enabled=account.enabled,
         )
 
-    def _format_accounts_reply(self) -> BotReply:
-        entries = self._service.list_accounts()
-        if not entries:
-            return BotReply(text=texts.NO_ACCOUNTS_TEXT, show_main_menu=True)
-        return BotReply(
-            text=texts.ACCOUNTS_HEADER,
-            accounts_page_options=[(e.id, e.display_name, e.enabled) for e in entries],
-        )
-
-    def _limits_page_options(self) -> list[tuple[int, str, int, int]]:
+    def _accounts_page_options(self) -> list[tuple[int, str, bool, int, int]]:
         return [
-            (e.id, e.display_name, e.sent_today, e.daily_limit)
-            for e in self._service.list_accounts_for_limits()
+            (e.id, e.display_name, e.enabled, e.sent_today, e.daily_limit)
+            for e in self._service.list_accounts()
         ]
 
-    def _format_limits_reply(self) -> BotReply:
-        options = self._limits_page_options()
+    def _format_accounts_reply(self) -> BotReply:
+        options = self._accounts_page_options()
         if not options:
             return BotReply(text=texts.NO_ACCOUNTS_TEXT, show_main_menu=True)
-        return BotReply(text=texts.LIMITS_HEADER, limits_page_options=options)
+        return BotReply(text=texts.ACCOUNTS_HEADER, accounts_page_options=options)
 
     # ---- 👤 Аккаунты: открыть карточку / toggle / лимит / sync / reauth ----
 
@@ -303,12 +292,10 @@ class AdminBotController:
         )
         return BotReply(text=texts.LIMIT_MANUAL_PROMPT_TEXT, show_cancel_button=True)
 
-    # ---- ⚙️ Лимиты: список с daily_limit / выбор нового значения ----
-
-    def handle_limits_back(self, *, telegram_user_id: int) -> BotReply:
-        if not self.is_trusted(telegram_user_id):
-            return self._denied()
-        return self._format_limits_reply()
+    # ---- 👤 Аккаунты: третья кнопка "USED / LIMIT" — выбор нового значения,
+    # возврат в тот же список (см. keyboards.py::limits_value_choice_keyboard
+    # — бывший отдельный экран "⚙️ Лимиты" удалён, см. задачу "объедини
+    # экраны") ----
 
     def handle_limits_open(self, account_id: int, *, telegram_user_id: int) -> BotReply:
         if not self.is_trusted(telegram_user_id):
@@ -329,7 +316,7 @@ class AdminBotController:
             return BotReply(text=texts.ACTION_FAILED_TEXT, show_main_menu=True)
         return BotReply(
             text=texts.format_limit_updated(account.name, value),
-            limits_page_options=self._limits_page_options(),
+            accounts_page_options=self._accounts_page_options(),
         )
 
     def handle_limits_manual_prompt(
@@ -342,7 +329,7 @@ class AdminBotController:
             return BotReply(text=texts.ACTION_FAILED_TEXT, show_main_menu=True)
         self._states.set(
             chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_MANUAL_LIMIT,
-            payload={"account_id": account_id, "return_to": "limits"},
+            payload={"account_id": account_id, "return_to": "accounts_list"},
         )
         return BotReply(text=texts.LIMIT_MANUAL_PROMPT_TEXT, show_cancel_button=True)
 

@@ -21,7 +21,6 @@ from reader.inviter_admin_bot.texts import (
     CHECK_SYNC_LABEL,
     HELP_LABEL,
     LIMIT_PROMPT_CHOICES,
-    LIMITS_LABEL,
     MANUAL_LIMIT_LABEL,
     PAUSE_LABEL,
     REAUTHORIZE_LABEL,
@@ -41,15 +40,17 @@ _ACCOUNT_SYNC_PREFIX = b"acc_sync:"
 _ACCOUNT_REAUTH_PREFIX = b"acc_reauth:"
 ACCOUNTS_BACK = b"accounts_back"
 
-# "⚙️ Лимиты" — ОТДЕЛЬНЫЙ набор callback'ов от карточки аккаунта (см.
-# design: правая кнопка списка лимитов открывает тот же выбор лимита, но
-# по завершении возвращает на СПИСОК ЛИМИТОВ, а не на карточку аккаунта —
+# Третья кнопка каждой строки "👤 Аккаунты" — "USED / LIMIT" (см. задачу
+# "объедини экраны 👤 Аккаунты и ⚙️ Лимиты": бывший отдельный экран "⚙️
+# Лимиты" удалён, эта кнопка — единственный оставшийся вход в тот же выбор
+# лимита из СПИСКА, а не из карточки). Сознательно ОТДЕЛЬНЫЙ набор
+# callback'ов от карточки аккаунта: тот же выбор лимита, но по завершении
+# возвращает на СПИСОК "👤 Аккаунты" (ACCOUNTS_BACK), а не на карточку —
 # _ACCOUNT_LIMIT_*/handle_account_limit_* выше остаются НЕТРОНУТЫМИ,
-# карточка ("⚙️ Изменить лимит") по-прежнему возвращает на карточку).
+# карточка ("⚙️ Изменить лимит") по-прежнему возвращает на карточку.
 _LIMITS_OPEN_PREFIX = b"limits_open:"
 _LIMITS_VALUE_PREFIX = b"limits_val:"
 _LIMITS_MANUAL_PREFIX = b"limits_manual:"
-LIMITS_BACK = b"limits_back"
 
 
 def _encode_id(prefix: bytes, account_id: int) -> bytes:
@@ -171,54 +172,45 @@ def main_menu_keyboard() -> list[list[Button]]:
     return [
         [Button.text(ACCOUNTS_LABEL, resize=True), Button.text(ADD_ACCOUNT_LABEL, resize=True)],
         [Button.text(START_LABEL, resize=True), Button.text(PAUSE_LABEL, resize=True)],
-        [Button.text(STATUS_LABEL, resize=True), Button.text(LIMITS_LABEL, resize=True)],
-        [Button.text(SYNC_LABEL, resize=True), Button.text(HELP_LABEL, resize=True)],
+        [Button.text(STATUS_LABEL, resize=True), Button.text(SYNC_LABEL, resize=True)],
+        [Button.text(HELP_LABEL, resize=True)],
     ]
 
 
-def accounts_page_keyboard(entries: list[tuple[int, str, bool]]) -> list[list[Button]]:
-    """entries — (account_id, display_name, enabled). Две кнопки на
-    строку: номер открывает карточку, 🟢/⚪ переключает enabled напрямую
-    из списка (см. design "Нажатие должно включать/выключать account.enabled")."""
+def accounts_page_keyboard(entries: list[tuple[int, str, bool, int, int]]) -> list[list[Button]]:
+    """entries — (account_id, display_name, enabled, sent_today,
+    daily_limit) (см. задачу "объедини экраны 👤 Аккаунты и ⚙️ Лимиты" —
+    бывший отдельный экран "⚙️ Лимиты" удалён, его данные/кнопка
+    перенесены сюда третьей кнопкой строки). Три кнопки на строку: имя
+    открывает карточку (encode_account_open_callback, без изменений),
+    🟢/⚪ переключает enabled напрямую из списка (см. design "Нажатие
+    должно включать/выключать account.enabled", логика НЕ менялась),
+    "USED / LIMIT" (та же формула, что и у inviter — joined_today +
+    pending_today) открывает выбор лимита, который возвращает на этот же
+    список (см. limits_value_choice_keyboard/ACCOUNTS_BACK)."""
     return [
         [
             Button.inline(display_name, encode_account_open_callback(account_id)),
             Button.inline("🟢" if enabled else "⚪", encode_account_toggle_callback(account_id)),
-        ]
-        for account_id, display_name, enabled in entries
-    ]
-
-
-def limits_page_keyboard(entries: list[tuple[int, str, int, int]]) -> list[list[Button]]:
-    """entries — (account_id, display_name, sent_today, daily_limit) (см.
-    design "⚙️ Лимиты"). Левая кнопка — имя, открывает ТУ ЖЕ карточку
-    аккаунта, что и "👤 Аккаунты" (encode_account_open_callback, без
-    изменений). Правая кнопка показывает "USED / LIMIT" (НЕ enabled 🟢/⚪,
-    НЕ просто daily_limit — см. design "Показывать USED/LIMIT, USED — та
-    же формула, что и у inviter"), открывает выбор лимита, который
-    возвращает на этот же список (см. limits_value_choice_keyboard)."""
-    return [
-        [
-            Button.inline(display_name, encode_account_open_callback(account_id)),
             Button.inline(f"{sent_today} / {daily_limit}", encode_limits_open_callback(account_id)),
         ]
-        for account_id, display_name, sent_today, daily_limit in entries
+        for account_id, display_name, enabled, sent_today, daily_limit in entries
     ]
 
 
 def limits_value_choice_keyboard(account_id: int) -> list[list[Button]]:
     """Тот же набор значений/раскладка, что и limit_choice_keyboard (5/10/
     15/20/25 + "Ввести вручную"), но callback'и и "Назад" ведут на список
-    "⚙️ Лимиты" (LIMITS_BACK), а не на карточку аккаунта (см. design
+    "👤 Аккаунты" (ACCOUNTS_BACK), а не на карточку аккаунта (см. design
     "После изменения возвращаемся к списку, где сразу отображается новое
-    значение")."""
+    значение") — открывается третьей кнопкой строки accounts_page_keyboard."""
     buttons = [
         Button.inline(str(value), encode_limits_value_callback(account_id, value))
         for value in LIMIT_PROMPT_CHOICES
     ]
     rows = [buttons[0:3], buttons[3:5]]
     rows.append([Button.inline(MANUAL_LIMIT_LABEL, encode_limits_manual_callback(account_id))])
-    rows.append([Button.inline(BACK_BUTTON_LABEL, LIMITS_BACK)])
+    rows.append([Button.inline(BACK_BUTTON_LABEL, ACCOUNTS_BACK)])
     return rows
 
 

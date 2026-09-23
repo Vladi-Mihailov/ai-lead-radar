@@ -172,13 +172,27 @@ async def test_trusted_user_sees_accounts_list(fx):
     reply = await fx.controller.handle_text(texts.ACCOUNTS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
 
     assert reply.text == texts.ACCOUNTS_HEADER
-    names = {name for _id, name, _enabled in reply.accounts_page_options}
+    names = {name for _id, name, _enabled, _used, _limit in reply.accounts_page_options}
     assert names == {"@vvz982", "@ib85gnat"}
 
 
 async def test_accounts_list_empty_shows_helpful_message(fx):
     reply = await fx.controller.handle_text(texts.ACCOUNTS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
     assert reply.text == texts.NO_ACCOUNTS_TEXT
+
+
+async def test_accounts_list_shows_used_over_limit_per_row(fx):
+    """Задача "объедини экраны 👤 Аккаунты и ⚙️ Лимиты" — каждая строка
+    "👤 Аккаунты" теперь также несёт USED/LIMIT (бывший отдельный экран
+    "⚙️ Лимиты" удалён), ТА ЖЕ формула joined_today + pending_today, что и
+    у самого inviter (см. design "не придумывать новый счётчик")."""
+    _make_account(fx, name="@vladimihailov", telegram_user_id=1, daily_limit=15, enabled=True)
+    _make_account(fx, name="@ao777oa777", telegram_user_id=2, daily_limit=15, enabled=False)
+
+    reply = await fx.controller.handle_text(texts.ACCOUNTS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+
+    by_name = {name: (used, limit) for _id, name, _enabled, used, limit in reply.accounts_page_options}
+    assert by_name == {"@vladimihailov": (0, 15), "@ao777oa777": (0, 15)}
 
 
 # ---- 3. account card ----
@@ -209,7 +223,7 @@ def test_toggle_account_from_card_flow(fx):
     reply = fx.controller.handle_account_toggle(account.id, telegram_user_id=_TRUSTED_ID)
 
     assert fx.accounts.get(account.id).enabled is False
-    options_by_id = {aid: enabled for aid, _name, enabled in reply.accounts_page_options}
+    options_by_id = {aid: enabled for aid, _name, enabled, _used, _limit in reply.accounts_page_options}
     assert options_by_id[account.id] is False
 
 
@@ -401,43 +415,10 @@ async def test_status_screen_shows_pause_state(fx):
     assert "приостановлено" in reply.text
 
 
-# ---- ⚙️ Лимиты: список показывает USED / LIMIT, не enabled ----
-
-
-async def test_limits_list_shows_used_over_limit_not_enabled(fx):
-    _make_account(fx, name="@vladimihailov", telegram_user_id=1, daily_limit=15, enabled=True)
-    _make_account(fx, name="@ao777oa777", telegram_user_id=2, daily_limit=15, enabled=False)
-
-    reply = await fx.controller.handle_text(texts.LIMITS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
-
-    assert reply.text == texts.LIMITS_HEADER
-    by_name = {name: (used, limit) for _id, name, used, limit in reply.limits_page_options}
-    assert by_name == {"@vladimihailov": (0, 15), "@ao777oa777": (0, 15)}
-    # enabled нигде не участвует в этих данных — только id/имя/used/daily_limit.
-    assert all(len(entry) == 4 for entry in reply.limits_page_options)
-
-
-async def test_limits_list_used_reuses_inviter_joined_plus_pending_formula(fx):
-    """USED — ТА ЖЕ формула joined_today + pending_today, что использует
-    сам inviter для расходования daily budget (см. design "не придумывать
-    новый счётчик"), а не что-то новое."""
-    account = _make_account(fx, name="@vvz982", telegram_user_id=1, daily_limit=15)
-    campaign = fx.campaigns.create(name="Campaign", keyword="осаго", target_chat="@t")
-    now = datetime.now(timezone.utc)
-    fx.invites.create(user_id=1, campaign_id=campaign.id, account_id=account.id, status="joined", invited_at=now, verified_at=now)
-    fx.invites.create(user_id=2, campaign_id=campaign.id, account_id=account.id, status="pending", invited_at=now)
-    fx.invites.create(user_id=3, campaign_id=campaign.id, account_id=account.id, status="failed", invited_at=now)
-
-    reply = await fx.controller.handle_text(texts.LIMITS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
-
-    used_by_id = {aid: used for aid, _name, used, _limit in reply.limits_page_options}
-    # joined + pending = 2, failed НЕ считается — та же формула, что и card.usage.
-    assert used_by_id[account.id] == 2
-
-
-async def test_limits_list_empty_shows_helpful_message(fx):
-    reply = await fx.controller.handle_text(texts.LIMITS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
-    assert reply.text == texts.NO_ACCOUNTS_TEXT
+# ---- 👤 Аккаунты: третья кнопка "USED / LIMIT" (см. задачу "объедини
+# экраны 👤 Аккаунты и ⚙️ Лимиты" — бывший отдельный экран "⚙️ Лимиты"
+# удалён, этот же выбор лимита теперь открывается из СПИСКА "👤 Аккаунты"
+# и возвращает на него же) ----
 
 
 def test_limits_open_shows_value_chooser(fx):
@@ -449,19 +430,19 @@ def test_limits_open_shows_value_chooser(fx):
     assert reply.limits_choice_account_id == account.id
 
 
-def test_limits_value_selection_updates_and_returns_to_limits_list(fx):
+def test_limits_value_selection_updates_and_returns_to_accounts_list(fx):
     account = _make_account(fx, daily_limit=15)
 
     reply = fx.controller.handle_limits_value(account.id, 20, telegram_user_id=_TRUSTED_ID)
 
     assert fx.accounts.get(account.id).daily_limit == 20
-    limits_by_id = {aid: limit for aid, _name, _used, limit in reply.limits_page_options}
+    limits_by_id = {aid: limit for aid, _name, _enabled, _used, limit in reply.accounts_page_options}
     assert limits_by_id[account.id] == 20
-    # После изменения возвращаемся именно к списку лимитов, не к карточке.
+    # После изменения возвращаемся именно к списку "👤 Аккаунты", не к карточке.
     assert reply.account_card_id is None
 
 
-async def test_limits_manual_flow_returns_to_limits_list(fx):
+async def test_limits_manual_flow_returns_to_accounts_list(fx):
     account = _make_account(fx, daily_limit=15)
 
     prompt_reply = fx.controller.handle_limits_manual_prompt(
@@ -472,28 +453,23 @@ async def test_limits_manual_flow_returns_to_limits_list(fx):
     final_reply = await fx.controller.handle_text("42", chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
 
     assert fx.accounts.get(account.id).daily_limit == 42
-    limits_by_id = {aid: limit for aid, _name, _used, limit in final_reply.limits_page_options}
+    limits_by_id = {aid: limit for aid, _name, _enabled, _used, limit in final_reply.accounts_page_options}
     assert limits_by_id[account.id] == 42
     assert final_reply.account_card_id is None
 
 
-def test_limits_back_returns_to_limits_list(fx):
-    _make_account(fx, daily_limit=15)
-    reply = fx.controller.handle_limits_back(telegram_user_id=_TRUSTED_ID)
-    assert reply.text == texts.LIMITS_HEADER
-
-
 def test_account_card_limit_flow_still_returns_to_card_unchanged(fx):
     """Регрессия: изменение лимита с карточки аккаунта ("⚙️ Изменить
-    лимит") по-прежнему возвращает на карточку, а не на список лимитов —
-    новый флоу через "⚙️ Лимиты" НЕ подменяет старый."""
+    лимит") по-прежнему возвращает на карточку, а не на список "👤
+    Аккаунты" — третья кнопка списка (handle_limits_value) НЕ подменяет
+    старый флоу с карточки (handle_account_limit_value)."""
     account = _make_account(fx, daily_limit=15)
 
     reply = fx.controller.handle_account_limit_value(account.id, 20, telegram_user_id=_TRUSTED_ID)
 
     assert fx.accounts.get(account.id).daily_limit == 20
     assert reply.account_card_id == account.id
-    assert reply.limits_page_options is None
+    assert reply.accounts_page_options is None
 
 
 def test_unauthorized_user_cannot_open_or_change_limits(fx):
@@ -624,7 +600,7 @@ async def test_account_enabled_icon_independent_of_global_pause(fx):
     await fx.controller.handle_text(texts.PAUSE_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
     accounts_reply = await fx.controller.handle_text(texts.ACCOUNTS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
 
-    enabled_by_name = {name: enabled for _id, name, enabled in accounts_reply.accounts_page_options}
+    enabled_by_name = {name: enabled for _id, name, enabled, _used, _limit in accounts_reply.accounts_page_options}
     assert enabled_by_name["@vvz982"] is True  # глобальная пауза не трогает account.enabled
 
     status_reply = await fx.controller.handle_text(texts.STATUS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
@@ -667,16 +643,14 @@ async def test_help_screen_denied_for_unauthorized_user(fx):
 # ---- OLD accounts: скрыты из operational-списков, toggle fail-closed ----
 
 
-async def test_old_account_hidden_from_accounts_limits_and_status_screens(fx):
+async def test_old_account_hidden_from_accounts_and_status_screens(fx):
     current = _make_account(fx, name="@Iv_vla_sov", telegram_user_id=6, is_old=False)
     _make_account(fx, name="@Iv_vla_sov", telegram_user_id=6, is_old=True, enabled=False)
 
     accounts_reply = await fx.controller.handle_text(texts.ACCOUNTS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
-    limits_reply = await fx.controller.handle_text(texts.LIMITS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
     status_reply = await fx.controller.handle_text(texts.STATUS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
 
     assert [a[0] for a in accounts_reply.accounts_page_options] == [current.id]
-    assert [o[0] for o in limits_reply.limits_page_options] == [current.id]
     assert status_reply.text.count("@Iv_vla_sov") == 1  # только canonical, не оба
 
 
@@ -700,5 +674,5 @@ def test_toggle_on_current_account_still_works_as_before(fx):
     reply = fx.controller.handle_account_toggle(current.id, telegram_user_id=_TRUSTED_ID)
 
     assert fx.accounts.get(current.id).enabled is False
-    options_by_id = {aid: enabled for aid, _name, enabled in reply.accounts_page_options}
+    options_by_id = {aid: enabled for aid, _name, enabled, _used, _limit in reply.accounts_page_options}
     assert options_by_id[current.id] is False

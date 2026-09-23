@@ -378,20 +378,23 @@ def test_status_snapshot_reflects_todays_invite_counts(fx):
     assert snapshot.campaign_target_chat == "@car_ins_georgia"
 
 
-# ---- ⚙️ Лимиты: список для "⚙️ Лимиты" (USED / daily_limit, не enabled) ----
+# ---- 👤 Аккаунты: list_accounts() также несёт USED / daily_limit (см.
+# задачу "объедини экраны 👤 Аккаунты и ⚙️ Лимиты" — бывший отдельный
+# list_accounts_for_limits()/LimitListEntry удалены, эти же данные теперь
+# часть AccountListEntry) ----
 
 
-def test_list_accounts_for_limits_shows_daily_limit(fx):
+def test_list_accounts_shows_daily_limit(fx):
     _make_account(fx, name="@vladimihailov", telegram_user_id=1, daily_limit=15)
     _make_account(fx, name="@vvz982", telegram_user_id=2, daily_limit=25, enabled=False)
 
-    entries = fx.service.list_accounts_for_limits()
+    entries = fx.service.list_accounts()
 
     limits_by_name = {e.display_name: e.daily_limit for e in entries}
     assert limits_by_name == {"@vladimihailov": 15, "@vvz982": 25}
 
 
-def test_list_accounts_for_limits_sent_today_uses_same_formula_as_account_usage(fx):
+def test_list_accounts_sent_today_uses_same_formula_as_account_usage(fx):
     """sent_today — ТА ЖЕ формула joined_today + pending_today, что и
     _account_usage()/InviterService._remaining_daily_budget (см. design
     "не придумывать новый счётчик")."""
@@ -402,36 +405,20 @@ def test_list_accounts_for_limits_sent_today_uses_same_formula_as_account_usage(
     fx.invites.create(user_id=2, campaign_id=campaign.id, account_id=account.id, status="pending", invited_at=now)
     fx.invites.create(user_id=3, campaign_id=campaign.id, account_id=account.id, status="failed", invited_at=now)
 
-    entries = fx.service.list_accounts_for_limits()
+    entries = fx.service.list_accounts()
     card = fx.service.account_card(account.id)
 
     assert entries[0].sent_today == 2  # failed не считается
     assert entries[0].sent_today == card.usage.sent_today  # та же формула, что и в карточке
 
 
-def test_list_accounts_for_limits_reflects_updated_value(fx):
+def test_list_accounts_reflects_updated_daily_limit(fx):
     account = _make_account(fx, daily_limit=15)
 
     fx.service.set_daily_limit(account.id, 20)
-    entries = fx.service.list_accounts_for_limits()
+    entries = fx.service.list_accounts()
 
     assert entries[0].daily_limit == 20
-
-
-def test_list_accounts_for_limits_empty_when_no_accounts(fx):
-    assert fx.service.list_accounts_for_limits() == []
-
-
-def test_list_accounts_for_limits_missing_username_falls_back_to_telegram_id(fx):
-    fx.accounts.create(
-        name="tg_995500000001", phone="+995500000001", session_name="tg_995500000001",
-        session_path=str(fx.db_path.parent / "sessions" / "tg_995500000001"),
-        telegram_user_id=123456789,
-    )
-
-    entries = fx.service.list_accounts_for_limits()
-
-    assert entries[0].display_name == "Telegram ID 123456789"
 
 
 # ---- 📊 Статус: список per-account (enabled/blocked раздельно) ----
@@ -511,7 +498,7 @@ def test_list_account_statuses_includes_sent_today_and_daily_limit(fx):
     assert entries[0].daily_limit == 15
 
 
-# ---- E. is_old=True исключены из operational-списков (👤/⚙️/📊) ----
+# ---- E. is_old=True исключены из operational-списков (👤/📊) ----
 
 
 def test_list_accounts_excludes_old_accounts(fx):
@@ -519,15 +506,6 @@ def test_list_accounts_excludes_old_accounts(fx):
     _make_account(fx, name="@Iv_vla_sov", telegram_user_id=6, is_old=True, enabled=False)
 
     entries = fx.service.list_accounts()
-
-    assert [e.id for e in entries] == [current.id]
-
-
-def test_list_accounts_for_limits_excludes_old_accounts(fx):
-    current = _make_account(fx, name="@bdlapq", telegram_user_id=9, is_old=False)
-    _make_account(fx, name="@bdlapq", telegram_user_id=9, is_old=True, enabled=False)
-
-    entries = fx.service.list_accounts_for_limits()
 
     assert [e.id for e in entries] == [current.id]
 

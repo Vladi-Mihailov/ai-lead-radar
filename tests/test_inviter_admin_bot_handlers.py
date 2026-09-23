@@ -21,7 +21,6 @@ class _FakeReply:
         self.account_card_id = None
         self.account_card_enabled = None
         self.limit_choice_account_id = None
-        self.limits_page_options = None
         self.limits_choice_account_id = None
         for key, value in fields.items():
             setattr(self, key, value)
@@ -73,13 +72,19 @@ async def test_access_denied_reply_has_no_buttons_at_all():
 
 
 async def test_accounts_page_reply_attaches_account_rows():
-    reply = _FakeReply(text=texts.ACCOUNTS_HEADER, accounts_page_options=[(1, "@vvz982", True), (2, "@ib85gnat", False)])
+    """Задача "объедини экраны 👤 Аккаунты и ⚙️ Лимиты" — каждая строка
+    теперь три кнопки: имя, 🟢/⚪, USED / LIMIT (бывший отдельный экран
+    "⚙️ Лимиты" удалён, его данные — третья кнопка этой же строки)."""
+    reply = _FakeReply(
+        text=texts.ACCOUNTS_HEADER,
+        accounts_page_options=[(1, "@vvz982", True, 3, 15), (2, "@ib85gnat", False, 0, 20)],
+    )
     event = _FakeEvent()
 
     await _send_reply(event, reply)
 
     labels = _labels(event.calls[0]["buttons"])
-    assert labels == ["@vvz982", "🟢", "@ib85gnat", "⚪"]
+    assert labels == ["@vvz982", "🟢", "3 / 15", "@ib85gnat", "⚪", "0 / 20"]
 
 
 async def test_account_card_reply_shows_turn_off_when_enabled():
@@ -115,22 +120,7 @@ async def test_limit_choice_reply_attaches_limit_keyboard():
     assert texts.MANUAL_LIMIT_LABEL in labels
 
 
-async def test_limits_page_reply_shows_used_over_limit_not_enabled_toggle():
-    reply = _FakeReply(
-        text=texts.LIMITS_HEADER,
-        limits_page_options=[(1, "@vladimihailov", 3, 15), (2, "@vvz982", 0, 20)],
-    )
-    event = _FakeEvent()
-
-    await _send_reply(event, reply)
-
-    labels = _labels(event.calls[0]["buttons"])
-    assert labels == ["@vladimihailov", "3 / 15", "@vvz982", "0 / 20"]
-    assert "🟢" not in labels
-    assert "⚪" not in labels
-
-
-async def test_limits_choice_reply_attaches_limit_keyboard_with_limits_back():
+async def test_limits_choice_reply_attaches_limit_keyboard_with_back_to_accounts():
     reply = _FakeReply(text="limit", limits_choice_account_id=1)
     event = _FakeEvent()
 
