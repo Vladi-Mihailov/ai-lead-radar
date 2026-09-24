@@ -89,6 +89,7 @@ from zoneinfo import ZoneInfo
 from reader.fines.validation import FineValidationError, normalize_car_number
 from reader.public_bot import texts
 from reader.public_bot.conversation_state_repository import BotConversationStateRepository
+from reader.public_bot.known_users_repository import BotKnownUsersRepository
 from reader.public_bot.owner_resolution import OwnerResolutionError
 from reader.public_bot.statistics_service import BotStatisticsService
 from reader.public_bot.subscription_service import SubscriptionService
@@ -160,15 +161,20 @@ class BotReply:
     и НЕ является доказательством авторизации: is_trusted() перепроверяется
     на каждом callback заново, а page вне диапазона клампится сервером.
 
-    trusted_tasks_page_options — (task_id, car_number, is_on, end_date) на
+    trusted_tasks_page_options — (task_id, car_label, is_on, end_date) на
     строку "📋 Мои авто" (см. design report про per-car ON/OFF toggle) —
     is_on + end_date решают, что показать в ПРАВОЙ кнопке (см.
     reader/public_bot/keyboards.py::trusted_tasks_page_keyboard/
     _format_trusted_task_toggle_label): "🟢 до ДД.ММ" для ON, просто "⚪"
     для OFF (см. design report "переделываем строки": длинный текст в
     ЛЕВОЙ кнопке обрезался Telegram'ом — период переехал в правую кнопку,
-    левая теперь ТОЛЬКО голый car_number, без 🚗 и без даты; слова ON/OFF
-    убраны совсем; для OFF дата не показывается вовсе). task_id публичен и
+    левая теперь ТОЛЬКО car_number + опционально " @username" владельца
+    (см. задачу "показывать владельца в manager car list" —
+    _owner_username_for_car/texts.format_owner_username_suffix), без 🚗 и
+    без даты; слова ON/OFF убраны совсем; для OFF дата не показывается
+    вовсе). username — ТОЛЬКО display, не влияет на callback_data (та
+    по-прежнему строится исключительно из task_id) и не меняет
+    авторизацию/ownership. task_id публичен и
     НЕ является доказательством авторизации сам по себе — тот же принцип,
     что и везде в этом модуле (is_trusted() + существование задачи
     перепроверяются server-side на каждом действии). Список БЕЗ
@@ -264,6 +270,7 @@ class ConversationController:
         conversation_state_repository: BotConversationStateRepository,
         subscription_service: SubscriptionService,
         statistics_service: BotStatisticsService,
+        known_users_repository: BotKnownUsersRepository,
         *,
         tz: ZoneInfo,
         trusted_operator_user_ids: frozenset[int] = frozenset(),
@@ -272,6 +279,15 @@ class ConversationController:
         self._states = conversation_state_repository
         self._subscriptions = subscription_service
         self._statistics = statistics_service
+        # ТОЛЬКО для manager/trusted-operator "📋 Мои авто" — показать
+        # auto-captured username владельца рядом с номером (см. задачу
+        # "показывать владельца в manager car list"), см.
+        # _format_trusted_tasks_page_reply/_owner_username_display. НЕ
+        # используется для identity/authorization нигде — тот же
+        # bot_known_users, что handlers.py обновляет на КАЖДОЕ входящее
+        # событие (см. known_users_repository.py), а не отдельный
+        # tracking-механизм.
+        self._known_users = known_users_repository
         self._tz = tz
         # frozenset(...) на входе — на случай, если вызывающий код (см.
         # reader/public_bot/main.py) передал обычный list из config.yaml.
@@ -287,6 +303,23 @@ class ConversationController:
 
     def _today(self) -> date:
         return datetime.now(timezone.utc).astimezone(self._tz).date()
+
+    def _owner_username_for_car(self, car_number: str, *, today: date) -> str | None:
+        """Auto-captured username текущего владельца этого номера — ТОЛЬКО
+        для manager/trusted-operator "📋 Мои авто" (см. задачу), никогда
+        не identity. Источник — bot_known_users (self._known_users),
+        всегда самое свежее известное значение (см. BotKnownUsersRepository._UPSERT
+        — обновляется на каждое сообщение этого пользователя боту), а НЕ
+        исторический fine_monitoring_subscriptions.telegram_username,
+        который мог устареть (задача явно требует "актуальный username из
+        known_users, а не исторический"). None — либо нет активного
+        подписчика на этот номер вовсе, либо подписчик ни разу не писал
+        боту (username физически неизвестен)."""
+        owner_id = self._subscriptions.owner_telegram_user_id_for_car(car_number, today=today)
+        if owner_id is None:
+            return None
+        known = self._known_users.get(owner_id)
+        return known.telegram_username if known else None
 
     def _is_trusted(self, telegram_user_id: int) -> bool:
         """Единственная проверка авторизации trusted-режима — ТОЛЬКО по
@@ -457,7 +490,11 @@ class ConversationController:
         fine_monitoring_tasks, ЛЮБОГО статуса (см. design report про
         per-car ON/OFF toggle: менеджер должен видеть и OFF-машины —
         hard cap "первые 50" убран — пагинация по _TRUSTED_TASKS_PAGE_SIZE
-        вместо него), subscription для отображения не требуется вовсе.
+        вместо него), сама выборка задач subscription не требует — только
+        владелец в лейбле (см. _owner_username_for_car) читает активные
+        подписки этого car_number отдельным вызовом, задачи без клиента
+        (см. add_delegated_car_without_client) просто не получают суффикс
+        username.
 
         page — ЛЮБОЕ int (в т.ч. отрицательное/за пределами общего числа
         страниц, см. design report: "page из callback нельзя считать
@@ -471,8 +508,17 @@ class ConversationController:
         page = max(0, min(page, total_pages - 1))
         tasks = self._subscriptions.list_all_tasks_page(page=page, page_size=_TRUSTED_TASKS_PAGE_SIZE)
 
+        today = self._today()
         options = [
-            (task.id, task.car_number, task.status == "active", task.end_date) for task in tasks
+            (
+                task.id,
+                task.car_number + texts.format_owner_username_suffix(
+                    self._owner_username_for_car(task.car_number, today=today),
+                ),
+                task.status == "active",
+                task.end_date,
+            )
+            for task in tasks
         ]
         return BotReply(
             text=texts.format_trusted_tasks_page(tasks, page=page, total_pages=total_pages),

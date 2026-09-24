@@ -304,6 +304,17 @@ def format_car_button_label(subscription: FineMonitoringSubscription, today: dat
     return f"{emoji} {subscription.car_number} — {state}"
 
 
+def format_owner_username_suffix(username: str | None) -> str:
+    """" @username", если владелец автомобиля известен (auto-captured, см.
+    bot_known_users), иначе пустая строка — единственное место, где
+    решается ЭТОТ формат (см. задачу "показывать владельца в
+    manager/trusted-operator car list": никогда "@None"/"None"/пустой "@",
+    username — ТОЛЬКО display metadata, не identity). Пустая строка, а не
+    None, чтобы вызывающий код мог всегда делать f"{car_number}{suffix}"
+    без отдельной ветки на "username есть/нет"."""
+    return f" @{username}" if username else ""
+
+
 MY_CARS_HEADER = "🚗 Мои автомобили"
 
 

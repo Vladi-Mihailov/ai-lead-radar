@@ -435,27 +435,33 @@ def trusted_tasks_page_keyboard(
     """Manager-facing "📋 Мои авто" (см. design report про per-car
     monitoring toggle + "убрать текстовый перечень, список машин — ТОЛЬКО
     inline keyboard, Telegram не позволяет кнопку справа от строки
-    текста") — options: (task_id, car_number, is_on, end_date), ДВЕ
-    кнопки на строку: голый car_number (см. design report "переделываем
-    строки" — 🚗 и "· до ДД.ММ" убраны из ЛЕВОЙ кнопки, иначе длинные
-    номера обрезаются Telegram'ом) открывает карточку этой машины (полный
-    период/последняя проверка, см. encode_trusted_task_open_callback/
+    текста") — options: (task_id, car_label, is_on, end_date), ДВЕ
+    кнопки на строку: ЛЕВАЯ (см. design report "переделываем строки" — 🚗
+    и "· до ДД.ММ" убраны, иначе длинные номера обрезаются Telegram'ом) —
+    car_label — это car_number, плюс " @username" владельца, если он
+    известен (см. задачу "показывать владельца в manager car list" —
+    ConversationController._owner_username_for_car/
+    texts.format_owner_username_suffix уже собрали готовую строку, здесь
+    только Button.inline(car_label, ...) — callback_data по-прежнему
+    строится ИСКЛЮЧИТЕЛЬНО из task_id, текст лейбла на него не влияет).
+    Левая кнопка открывает карточку этой машины (полный период/последняя
+    проверка, см. encode_trusted_task_open_callback/
     ConversationController.handle_trusted_task_open/texts.
-    format_trusted_task_detail) и "🟢 до ДД.ММ"/"⚪"-переключатель (см.
-    _format_trusted_task_toggle_label, encode_trusted_task_toggle_callback).
+    format_trusted_task_detail), ПРАВАЯ — "🟢 до ДД.ММ"/"⚪"-переключатель
+    (см. _format_trusted_task_toggle_label, encode_trusted_task_toggle_callback).
 
     [◀️ Назад] [N / M] [Вперёд ▶️] — пагинация тем же приёмом, что и
     раньше: Back на первой странице и Next на последней — no-op (кламп к
     той же странице), средняя кнопка-индикатор — тоже no-op."""
     rows = [
         [
-            Button.inline(car_number, encode_trusted_task_open_callback(task_id, page)),
+            Button.inline(car_label, encode_trusted_task_open_callback(task_id, page)),
             Button.inline(
                 _format_trusted_task_toggle_label(is_on=is_on, end_date=end_date),
                 encode_trusted_task_toggle_callback(task_id, page),
             ),
         ]
-        for task_id, car_number, is_on, end_date in options
+        for task_id, car_label, is_on, end_date in options
     ]
     if total_pages > 1:
         back_page = max(page - 1, 0)

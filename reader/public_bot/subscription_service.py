@@ -852,6 +852,23 @@ class SubscriptionService:
         offset = page * page_size
         return self._task_repository.list_all_page(offset=offset, limit=page_size)
 
+    def owner_telegram_user_id_for_car(self, car_number: str, *, today: date) -> int | None:
+        """Numeric telegram_user_id первого (стабильно — ORDER BY id ASC,
+        см. list_active_subscribers_for_car) активного подписчика этого
+        номера — ТОЛЬКО для manager-facing "📋 Мои авто" (см. задачу
+        "показывать владельца в manager car list"), чисто display: НЕ
+        identity/authorization, ничей доступ этим не расширяется и не
+        проверяется. Несколько активных подписчиков на одну машину
+        теоретически возможны — берётся первый, а не "все" (упрощение,
+        достаточное для display одной строки). None — ни одного активного
+        подписчика (например, задача без клиента, см.
+        add_delegated_car_without_client) — вызывающий код тогда не
+        показывает username вовсе."""
+        subscribers = self._subscription_repository.list_active_subscribers_for_car(
+            car_number, today=today,
+        )
+        return subscribers[0].telegram_user_id if subscribers else None
+
     def get_task_for_trusted_admin(self, task_id: int) -> FineMonitoringTask | None:
         """Как get_active_task_for_trusted_admin(), но БЕЗ требования
         status == 'active' — используется manager-facing ON/OFF toggle

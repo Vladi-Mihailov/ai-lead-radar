@@ -122,7 +122,8 @@ class _Fixture:
             self.known_users_repository, self.subscription_repository, self.detected_fine_repository,
         )
         self.controller = ConversationController(
-            self.conversation_state_repository, self.service, self.statistics_service, tz=_TBILISI,
+            self.conversation_state_repository, self.service, self.statistics_service,
+            self.known_users_repository, tz=_TBILISI,
             trusted_operator_user_ids=frozenset(trusted_operator_user_ids),
         )
 
@@ -649,6 +650,218 @@ async def test_trusted_my_cars_shows_all_active_tasks_not_subscriptions(trusted_
     assert reply.text.startswith(texts.TRUSTED_TASKS_HEADER)
     assert any(car == "M295YB196" for _tid, car, _is_on, _end in reply.trusted_tasks_page_options)
     assert reply.my_cars_page_options is None  # task-level, не car-centric
+
+
+# ---- manager/trusted-operator car list: владелец (@username), см. задачу
+# "показывать владельца в manager car list" — ТОЛЬКО этот список, self-
+# service "📋 Мои авто" НЕ затронут (см. тест
+# test_ordinary_user_my_cars_never_shows_username ниже) ----
+
+
+async def test_trusted_my_cars_shows_owner_username_when_known(trusted_fx):
+    """1. Авто с известным (auto-captured, bot_known_users) владельцем —
+    левая кнопка "NUMBER @username"."""
+    trusted_fx.user_repository.upsert(
+        TelegramUserInfo(user_id=777, username="real_owner", first_name=None, last_name=None)
+    )
+    await trusted_fx.service.add_delegated_car(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        owner_username="real_owner", car_number="M295YB196", period_days=30, today=_today(),
+    )
+    trusted_fx.known_users_repository.record_seen(
+        telegram_user_id=777, telegram_chat_id=777, telegram_username="alenaogir",
+    )
+
+    reply = await trusted_fx.controller.handle_text(
+        texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    labels = {car for _tid, car, _is_on, _end in reply.trusted_tasks_page_options}
+    assert "M295YB196 @alenaogir" in labels
+
+
+async def test_trusted_my_cars_hides_username_when_unknown(trusted_fx):
+    """2/3. Без known username — левая кнопка остаётся голым номером, без
+    "@"/"None"/"@None" (владелец резолвлен для delegated-флоу, но НИ РАЗУ
+    не писал боту — bot_known_users про него ничего не знает)."""
+    trusted_fx.user_repository.upsert(
+        TelegramUserInfo(user_id=777, username="real_owner", first_name=None, last_name=None)
+    )
+    await trusted_fx.service.add_delegated_car(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        owner_username="real_owner", car_number="M295YB196", period_days=30, today=_today(),
+    )
+    # record_seen НЕ вызывается — владелец физически неизвестен bot_known_users.
+
+    reply = await trusted_fx.controller.handle_text(
+        texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    labels = {car for _tid, car, _is_on, _end in reply.trusted_tasks_page_options}
+    assert "M295YB196" in labels
+    assert not any("@" in label or "None" in label for label in labels)
+
+
+async def test_trusted_my_cars_task_without_subscription_shows_no_username(trusted_fx):
+    """2. Задача без единого клиента (см. add_delegated_car_without_client) —
+    owner_telegram_user_id_for_car возвращает None, суффикса нет вовсе."""
+    await trusted_fx.service.add_delegated_car_without_client(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        car_number="E911EE95", period_days=30, today=_today(),
+    )
+
+    reply = await trusted_fx.controller.handle_text(
+        texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    labels = {car for _tid, car, _is_on, _end in reply.trusted_tasks_page_options}
+    assert "E911EE95" in labels
+    assert not any("@" in label for label in labels)
+
+
+async def test_trusted_my_cars_username_reflects_latest_known_value_not_subscription_snapshot(trusted_fx):
+    """8. Требование: "если username изменился, показывать актуальное
+    значение из known_users, а не исторический вручную сохранённый
+    username subscription" — fine_monitoring_subscriptions.telegram_username
+    остаётся тем, что было при создании ("real_owner"), но список
+    показывает свежее known_users-значение, а не его — ownership
+    (telegram_user_id=777) при этом не меняется."""
+    trusted_fx.user_repository.upsert(
+        TelegramUserInfo(user_id=777, username="real_owner", first_name=None, last_name=None)
+    )
+    await trusted_fx.service.add_delegated_car(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        owner_username="real_owner", car_number="M295YB196", period_days=30, today=_today(),
+    )
+    # владелец сменил username уже ПОСЛЕ того, как машина была добавлена.
+    trusted_fx.known_users_repository.record_seen(
+        telegram_user_id=777, telegram_chat_id=777, telegram_username="brand_new_handle",
+    )
+
+    reply = await trusted_fx.controller.handle_text(
+        texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    labels = {car for _tid, car, _is_on, _end in reply.trusted_tasks_page_options}
+    assert "M295YB196 @brand_new_handle" in labels
+    assert not any("real_owner" in label for label in labels)
+
+    # ownership (numeric identity) не изменился — historical username в
+    # самой subscription тоже остаётся нетронутым (задача явно требует
+    # "без schema migration" — список просто не читает это поле).
+    [subscription] = trusted_fx.subscription_repository.list_by_user(777)
+    assert subscription.telegram_user_id == 777
+    assert subscription.telegram_username == "real_owner"
+
+
+async def test_trusted_my_cars_callback_data_unchanged_by_username_suffix(trusted_fx):
+    """4. callback_data строится ИСКЛЮЧИТЕЛЬНО из task_id — добавление
+    " @username" в текст левой кнопки не меняет encode/decode, открытие
+    карточки машины по task_id продолжает работать как раньше."""
+    trusted_fx.user_repository.upsert(
+        TelegramUserInfo(user_id=777, username="real_owner", first_name=None, last_name=None)
+    )
+    outcome = await trusted_fx.service.add_delegated_car(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        owner_username="real_owner", car_number="M295YB196", period_days=30, today=_today(),
+    )
+    trusted_fx.known_users_repository.record_seen(
+        telegram_user_id=777, telegram_chat_id=777, telegram_username="alenaogir",
+    )
+    task_id = outcome.task.id
+
+    reply = await trusted_fx.controller.handle_text(
+        texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+    keyboard = trusted_tasks_page_keyboard(
+        reply.trusted_tasks_page_options, page=0, total_pages=reply.trusted_tasks_total_pages,
+    )
+    rows_by_open_callback = {row[0].data: row for row in keyboard}
+
+    assert encode_trusted_task_open_callback(task_id, 0) in rows_by_open_callback
+    row = rows_by_open_callback[encode_trusted_task_open_callback(task_id, 0)]
+    assert row[0].text == "M295YB196 @alenaogir"
+
+    open_reply = trusted_fx.controller.handle_trusted_task_open(task_id, 0, telegram_user_id=_TRUSTED_ID)
+    assert open_reply.trusted_task_detail_id == task_id
+
+
+async def test_trusted_my_cars_monitoring_status_and_date_unaffected(trusted_fx):
+    """5. Правая кнопка (🟢 до ДД.ММ / ⚪) не меняется добавлением
+    username — те же значения, что и раньше."""
+    trusted_fx.user_repository.upsert(
+        TelegramUserInfo(user_id=777, username="real_owner", first_name=None, last_name=None)
+    )
+    await trusted_fx.service.add_delegated_car(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        owner_username="real_owner", car_number="Y111CA18", period_days=30,
+        today=date(2026, 11, 20),
+    )
+    trusted_fx.known_users_repository.record_seen(
+        telegram_user_id=777, telegram_chat_id=777, telegram_username="alenaogir",
+    )
+
+    reply = await trusted_fx.controller.handle_text(
+        texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+    keyboard = trusted_tasks_page_keyboard(
+        reply.trusted_tasks_page_options, page=0, total_pages=reply.trusted_tasks_total_pages,
+    )
+    [row] = keyboard
+    assert row[0].text == "Y111CA18 @alenaogir"
+    assert row[1].text == "🟢 до 20.12"
+
+
+async def test_trusted_my_cars_links_each_car_to_its_own_owner(trusted_fx):
+    """6. Manager list с несколькими машинами разных владельцев — каждая
+    строка показывает СВОЕГО, а не чужого/перепутанного владельца."""
+    trusted_fx.user_repository.upsert(
+        TelegramUserInfo(user_id=777, username="owner_one", first_name=None, last_name=None)
+    )
+    trusted_fx.user_repository.upsert(
+        TelegramUserInfo(user_id=888, username="owner_two", first_name=None, last_name=None)
+    )
+    await trusted_fx.service.add_delegated_car(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        owner_username="owner_one", car_number="AA001AA", period_days=30, today=_today(),
+    )
+    await trusted_fx.service.add_delegated_car(
+        created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
+        owner_username="owner_two", car_number="BB002BB", period_days=30, today=_today(),
+    )
+    trusted_fx.known_users_repository.record_seen(
+        telegram_user_id=777, telegram_chat_id=777, telegram_username="first_handle",
+    )
+    trusted_fx.known_users_repository.record_seen(
+        telegram_user_id=888, telegram_chat_id=888, telegram_username="second_handle",
+    )
+
+    reply = await trusted_fx.controller.handle_text(
+        texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    labels = {car for _tid, car, _is_on, _end in reply.trusted_tasks_page_options}
+    assert "AA001AA @first_handle" in labels
+    assert "BB002BB @second_handle" in labels
+
+
+async def test_ordinary_user_my_cars_never_shows_username(fx):
+    """7. Обычный пользователь по-прежнему видит car-centric список БЕЗ
+    username вовсе — это изменение ТОЛЬКО для manager/trusted-operator
+    списка, self-service scope не расширяется (см. задачу)."""
+    fx.known_users_repository.record_seen(
+        telegram_user_id=1, telegram_chat_id=1, telegram_username="alice_handle",
+    )
+    await fx.service.add_car(
+        telegram_user_id=1, telegram_chat_id=1, username="alice",
+        first_name=None, last_name=None, car_number="M295YB196", period_days=30, today=_today(),
+    )
+
+    reply = await fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=1, telegram_user_id=1, username="alice")
+
+    [(_sub_id, label)] = reply.my_cars_page_options
+    assert "@" not in label
+    assert "alice_handle" not in label
 
 
 async def test_ordinary_user_my_cars_uses_car_buttons_not_trusted_task_list(fx):

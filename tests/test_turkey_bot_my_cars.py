@@ -209,6 +209,38 @@ async def test_my_cars_list_shows_on_off_button_labels():
     assert "⚪ B456BB456 — OFF" in flat
 
 
+async def test_my_cars_never_shows_owner_username():
+    """Задача "показывать владельца в manager car list" — уточнение
+    scope: ТОЛЬКО manager/trusted-operator вариант, self-service UI не
+    меняется. Turkey bot вообще не имеет manager/trusted-operator car
+    list (см. архитектуру: "📋 Мои авто" здесь ВСЕГДА car-centric,
+    car.telegram_user_id всегда равен самому caller'у, единственная
+    версия экрана) — self-service список НЕ должен показывать username
+    владельца, даже если он известен turkey_bot_known_users, ни сейчас,
+    ни как защита от случайного расширения этого экрана в будущем."""
+    states = TurkeyConversationStateRepository(":memory:")
+    garage = TurkeyUserCarsRepository(":memory:")
+    runs = TurkeyCheckRunRepository(":memory:")
+    subscriptions = TurkeyMonitoringSubscriptionRepository(":memory:")
+    known_users = TurkeyBotKnownUsersRepository(":memory:")
+    statistics = TurkeyStatisticsService(known_users, runs, subscriptions)
+    check_service = _FakeCheckService(_make_result("X", overall=OverallStatus.NO_DEBT, total=Decimal(0)))
+    controller = ConversationController(states, garage, runs, subscriptions, statistics, check_service)
+
+    known_users.record_seen(
+        telegram_user_id=_USER_ID, telegram_chat_id=_CHAT_ID, telegram_username="known_handle",
+    )
+    controller.handle_add_car_start(chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    await controller.handle_text("A123AA123", chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    reply = controller.handle_my_cars(chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+    keyboard = my_cars_list_keyboard(garage.list_cars(_USER_ID), reply.my_cars_monitoring_active)
+    flat = [label for row in _button_texts(keyboard) for label in row]
+
+    assert flat == ["⚪ A123AA123 — OFF"]
+    assert not any("@" in label or "known_handle" in label for label in flat)
+
+
 async def test_back_returns_to_my_cars_with_up_to_date_state():
     """См. задачу п.8 — "⬅️ Назад" == повторный handle_my_cars, с
     актуальным ON/OFF (не главное меню)."""

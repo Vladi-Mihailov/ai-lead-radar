@@ -238,6 +238,7 @@ async def run() -> None:
             conversation_state_repository,
             subscription_service,
             statistics_service,
+            known_users_repository,
             tz=ZoneInfo(settings.fine_monitor.timezone),
             trusted_operator_user_ids=frozenset(settings.public_bot.trusted_operator_user_ids),
             payment_help_contact_username=settings.public_bot.payment_help_contact_username,
