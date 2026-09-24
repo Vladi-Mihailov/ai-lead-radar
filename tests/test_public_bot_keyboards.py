@@ -17,6 +17,7 @@ from reader.public_bot.keyboards import (  # noqa: E402
     decode_trusted_task_open_callback,
     decode_trusted_task_period_callback,
     decode_trusted_task_toggle_callback,
+    decode_trusted_tasks_page_callback,
     encode_trusted_task_continue_callback,
     encode_trusted_task_open_callback,
     encode_trusted_task_period_callback,
@@ -140,16 +141,16 @@ def test_trusted_task_toggle_callback_does_not_collide_with_continue_prefix():
     assert decode_trusted_task_continue_callback(toggle_data) is None
 
 
-def test_trusted_tasks_page_keyboard_shows_plate_and_on_off_buttons_per_row():
-    """Явное требование задачи "переделываем строки" (текст в левой
-    кнопке обрезался Telegram'ом): каждая машина — строка из ДВУХ кнопок,
-    голый номер (открывает карточку) + "🟢 до ДД.ММ"/"⚪" — список
-    БОЛЬШЕ НЕ дублируется текстом (см. design report: Telegram не
-    позволяет inline-кнопку справа от строки текста)."""
+def test_trusted_tasks_page_keyboard_shows_plate_owner_and_on_off_buttons_per_row():
+    """Явное требование задачи "унифицировать оба интерфейса Georgia/
+    Turkey": каждая машина — строка из РОВНО ТРЁХ кнопок —
+    [CAR_NUMBER] [@username/—] [🟢 до ДД.ММ / ⚪] — список БОЛЬШЕ НЕ
+    дублируется текстом (см. design report: Telegram не позволяет inline-
+    кнопку справа от строки текста)."""
     keyboard = trusted_tasks_page_keyboard(
         [
-            (1, "Y111CA18", True, date(2026, 12, 20)),
-            (2, "B641XE89", False, date(2026, 8, 8)),
+            (1, "Y111CA18", "@alenaogir", True, date(2026, 12, 20)),
+            (2, "B641XE89", "—", False, date(2026, 8, 8)),
         ],
         page=0, total_pages=1,
     )
@@ -157,15 +158,16 @@ def test_trusted_tasks_page_keyboard_shows_plate_and_on_off_buttons_per_row():
     assert len(keyboard) == 2  # без пагинации (total_pages=1)
     row0 = [b.text for b in keyboard[0]]
     row1 = [b.text for b in keyboard[1]]
-    assert row0 == ["Y111CA18", "🟢 до 20.12"]
-    assert row1 == ["B641XE89", "⚪"]
+    assert row0 == ["Y111CA18", "@alenaogir", "🟢 до 20.12"]
+    assert row1 == ["B641XE89", "—", "⚪"]
 
 
 def test_trusted_tasks_page_keyboard_left_button_is_bare_car_number():
-    """Явное требование задачи: ЛЕВАЯ кнопка — ТОЛЬКО номер, без 🚗 и без
-    "· до ДД.ММ" (иначе длинные номера обрезаются Telegram'ом)."""
+    """Явное требование задачи: ЛЕВАЯ кнопка — ТОЛЬКО номер, без 🚗, без
+    username и без "· до ДД.ММ" (иначе длинные номера обрезаются
+    Telegram'ом)."""
     keyboard = trusted_tasks_page_keyboard(
-        [(1, "K892AC126", True, date(2026, 9, 4))], page=0, total_pages=1,
+        [(1, "K892AC126", "@someone", True, date(2026, 9, 4))], page=0, total_pages=1,
     )
 
     left_label = keyboard[0][0].text
@@ -173,16 +175,52 @@ def test_trusted_tasks_page_keyboard_left_button_is_bare_car_number():
     assert "🚗" not in left_label
     assert "до" not in left_label
     assert "2026" not in left_label
+    assert "@" not in left_label
+
+
+def test_trusted_tasks_page_keyboard_middle_button_shows_owner_username():
+    """Средняя кнопка — "@username" владельца, если он известен (см.
+    задачу: НИКОГДА "@None"/"None"/пустая кнопка)."""
+    keyboard = trusted_tasks_page_keyboard(
+        [(1, "K892AC126", "@alenaogir", True, date(2026, 9, 4))], page=0, total_pages=1,
+    )
+
+    assert keyboard[0][1].text == "@alenaogir"
+
+
+def test_trusted_tasks_page_keyboard_middle_button_shows_dash_when_owner_unknown():
+    keyboard = trusted_tasks_page_keyboard(
+        [(1, "K892AC126", "—", True, date(2026, 9, 4))], page=0, total_pages=1,
+    )
+
+    label = keyboard[0][1].text
+    assert label == "—"
+    assert "None" not in label
+
+
+def test_trusted_tasks_page_keyboard_middle_button_is_safe_noop():
+    """Средняя (username) кнопка НЕ меняет monitoring/status — её
+    callback_data переоткрывает ту же страницу (тот же безопасный no-op,
+    что и средний пагинационный индикатор), не адресует конкретный
+    task_id."""
+    keyboard = trusted_tasks_page_keyboard(
+        [(42, "M295YB196", "@alenaogir", True, date(2026, 9, 4))], page=3, total_pages=1,
+    )
+
+    middle_button = keyboard[0][1]
+    assert decode_trusted_tasks_page_callback(middle_button.data) == 3
+    assert decode_trusted_task_open_callback(middle_button.data) is None
+    assert decode_trusted_task_toggle_callback(middle_button.data) is None
 
 
 def test_trusted_tasks_page_keyboard_right_button_on_shows_short_end_date():
     """ON: "🟢 до ДД.ММ" — короткая дата (день.месяц), без года, без слова
     "ON"."""
     keyboard = trusted_tasks_page_keyboard(
-        [(1, "K892AC126", True, date(2026, 9, 4))], page=0, total_pages=1,
+        [(1, "K892AC126", "—", True, date(2026, 9, 4))], page=0, total_pages=1,
     )
 
-    right_label = keyboard[0][1].text
+    right_label = keyboard[0][2].text
     assert right_label == "🟢 до 04.09"
     assert "2026" not in right_label
     assert "ON" not in right_label
@@ -193,11 +231,11 @@ def test_trusted_tasks_page_keyboard_right_button_off_is_just_grey_circle():
     есть последний сохранённый end_date (см. design report: "Для OFF дату
     НЕ показывать")."""
     keyboard = trusted_tasks_page_keyboard(
-        [(2, "K892AC126", False, date(2026, 9, 4))], page=0, total_pages=1,
+        [(2, "K892AC126", "—", False, date(2026, 9, 4))], page=0, total_pages=1,
     )
 
     assert keyboard[0][0].text == "K892AC126"
-    assert keyboard[0][1].text == "⚪"
+    assert keyboard[0][2].text == "⚪"
 
 
 def test_trusted_tasks_page_keyboard_plate_button_opens_task_detail():
@@ -205,7 +243,7 @@ def test_trusted_tasks_page_keyboard_plate_button_opens_task_detail():
     encode_trusted_task_open_callback(task_id, page), открывающий
     карточку этой конкретной машины."""
     keyboard = trusted_tasks_page_keyboard(
-        [(42, "M295YB196", True, date(2026, 9, 4))], page=3, total_pages=1,
+        [(42, "M295YB196", "—", True, date(2026, 9, 4))], page=3, total_pages=1,
     )
 
     plate_button = keyboard[0][0]
@@ -214,10 +252,11 @@ def test_trusted_tasks_page_keyboard_plate_button_opens_task_detail():
 
 def test_trusted_tasks_page_keyboard_adds_pagination_row_when_multiple_pages():
     keyboard = trusted_tasks_page_keyboard(
-        [(1, "M295YB196", True, date(2026, 9, 4))], page=0, total_pages=2,
+        [(1, "M295YB196", "—", True, date(2026, 9, 4))], page=0, total_pages=2,
     )
 
     assert len(keyboard) == 2  # 1 car row + 1 pagination row
+    assert len(keyboard[0]) == 3  # car row: 3 buttons
     assert len(keyboard[-1]) == 3
 
 

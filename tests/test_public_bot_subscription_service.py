@@ -1170,7 +1170,7 @@ def test_list_all_tasks_page_includes_stopped_and_completed(fx):
 
     page = fx.service.list_all_tasks_page(page=0, page_size=10)
 
-    assert [t.id for t in page] == [active.id, stopped.id]
+    assert [t.id for t in page] == [stopped.id, active.id]
 
 
 def test_get_task_for_trusted_admin_returns_none_for_missing_task(fx):

@@ -119,13 +119,17 @@ class BotReply:
     show_georgian_bot_link: bool = False
 
     # manager/trusted-operator "🚗 Мои автомобили" (см. задачу "Реализуем
-    # manager/trusted 'Мои автомобили' для Turkey bot", референс —
-    # Georgian bot trusted_tasks_page_options/_format_trusted_tasks_page_reply) —
-    # ОТДЕЛЬНЫЕ поля от my_cars/my_cars_monitoring_active выше (self-service
-    # НЕ трогается). manager_cars_page_options — (car_id, car_label,
-    # monitoring_active); car_label уже включает " @username" владельца
-    # (см. _format_manager_cars_page_reply/texts.format_owner_username_suffix).
-    manager_cars_page_options: list[tuple[int, str, bool]] | None = None
+    # manager/trusted 'Мои автомобили' для Turkey bot" + "унифицировать оба
+    # интерфейса", референс — Georgian bot trusted_tasks_page_options/
+    # _format_trusted_tasks_page_reply) — ОТДЕЛЬНЫЕ поля от my_cars/
+    # my_cars_monitoring_active выше (self-service НЕ трогается).
+    # manager_cars_page_options — (car_id, car_number, owner_display,
+    # monitoring_active) — РОВНО ТРИ кнопки на строку
+    # (keyboards.py::manager_cars_page_keyboard): car_number, готовая
+    # "@username"/"—" (см. _format_manager_cars_page_reply/
+    # texts.format_owner_username_button — НИКОГДА @None/None/пустая
+    # кнопка), 🟢/⚪.
+    manager_cars_page_options: list[tuple[int, str, str, bool]] | None = None
     manager_cars_page: int | None = None
     manager_cars_total_pages: int | None = None
     # Read-only детали ОДНОЙ строки manager-списка (см.
@@ -342,12 +346,12 @@ class ConversationController:
         options = []
         for car in cars:
             username = self._owner_username_display(car.telegram_user_id)
-            label = car.car_number + texts.format_owner_username_suffix(username)
+            owner_display = texts.format_owner_username_button(username)
             subscription = self._subscriptions.get(
                 telegram_user_id=car.telegram_user_id, plate=car.car_number,
             )
             monitoring_active = subscription is not None and subscription.active
-            options.append((car.id, label, monitoring_active))
+            options.append((car.id, car.car_number, owner_display, monitoring_active))
 
         return BotReply(
             text=texts.format_manager_cars_page(page=page, total_pages=total_pages),

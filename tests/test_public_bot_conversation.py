@@ -35,6 +35,7 @@ from reader.public_bot.conversation import (  # noqa: E402
 )
 from reader.public_bot.conversation_state_repository import BotConversationStateRepository  # noqa: E402
 from reader.public_bot.keyboards import (  # noqa: E402
+    decode_trusted_task_open_callback,
     encode_trusted_task_open_callback,
     trusted_tasks_page_keyboard,
 )
@@ -648,7 +649,7 @@ async def test_trusted_my_cars_shows_all_active_tasks_not_subscriptions(trusted_
     )
 
     assert reply.text.startswith(texts.TRUSTED_TASKS_HEADER)
-    assert any(car == "M295YB196" for _tid, car, _is_on, _end in reply.trusted_tasks_page_options)
+    assert any(car == "M295YB196" for _tid, car, _owner, _is_on, _end in reply.trusted_tasks_page_options)
     assert reply.my_cars_page_options is None  # task-level, не car-centric
 
 
@@ -660,7 +661,8 @@ async def test_trusted_my_cars_shows_all_active_tasks_not_subscriptions(trusted_
 
 async def test_trusted_my_cars_shows_owner_username_when_known(trusted_fx):
     """1. Авто с известным (auto-captured, bot_known_users) владельцем —
-    левая кнопка "NUMBER @username"."""
+    средняя кнопка "@username" (см. задачу "унифицировать оба
+    интерфейса": [CAR_NUMBER] [@username] [STATUS], РОВНО ТРИ кнопки)."""
     trusted_fx.user_repository.upsert(
         TelegramUserInfo(user_id=777, username="real_owner", first_name=None, last_name=None)
     )
@@ -676,14 +678,15 @@ async def test_trusted_my_cars_shows_owner_username_when_known(trusted_fx):
         texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    labels = {car for _tid, car, _is_on, _end in reply.trusted_tasks_page_options}
-    assert "M295YB196 @alenaogir" in labels
+    rows = {(car, owner) for _tid, car, owner, _is_on, _end in reply.trusted_tasks_page_options}
+    assert ("M295YB196", "@alenaogir") in rows
 
 
 async def test_trusted_my_cars_hides_username_when_unknown(trusted_fx):
-    """2/3. Без known username — левая кнопка остаётся голым номером, без
-    "@"/"None"/"@None" (владелец резолвлен для delegated-флоу, но НИ РАЗУ
-    не писал боту — bot_known_users про него ничего не знает)."""
+    """2/3. Без known username — средняя кнопка показывает "—", а левая
+    (номер) остаётся голой, без "@"/"None"/"@None" (владелец резолвлен для
+    delegated-флоу, но НИ РАЗУ не писал боту — bot_known_users про него
+    ничего не знает)."""
     trusted_fx.user_repository.upsert(
         TelegramUserInfo(user_id=777, username="real_owner", first_name=None, last_name=None)
     )
@@ -697,14 +700,15 @@ async def test_trusted_my_cars_hides_username_when_unknown(trusted_fx):
         texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    labels = {car for _tid, car, _is_on, _end in reply.trusted_tasks_page_options}
-    assert "M295YB196" in labels
-    assert not any("@" in label or "None" in label for label in labels)
+    rows = {(car, owner) for _tid, car, owner, _is_on, _end in reply.trusted_tasks_page_options}
+    assert ("M295YB196", "—") in rows
+    assert not any("@" in car or "None" in car for car, _owner in rows)
+    assert not any("None" in owner for _car, owner in rows)
 
 
 async def test_trusted_my_cars_task_without_subscription_shows_no_username(trusted_fx):
     """2. Задача без единого клиента (см. add_delegated_car_without_client) —
-    owner_telegram_user_id_for_car возвращает None, суффикса нет вовсе."""
+    owner_telegram_user_id_for_car возвращает None, средняя кнопка — "—"."""
     await trusted_fx.service.add_delegated_car_without_client(
         created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
         car_number="E911EE95", period_days=30, today=_today(),
@@ -714,9 +718,9 @@ async def test_trusted_my_cars_task_without_subscription_shows_no_username(trust
         texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    labels = {car for _tid, car, _is_on, _end in reply.trusted_tasks_page_options}
-    assert "E911EE95" in labels
-    assert not any("@" in label for label in labels)
+    rows = {(car, owner) for _tid, car, owner, _is_on, _end in reply.trusted_tasks_page_options}
+    assert ("E911EE95", "—") in rows
+    assert not any("@" in car for car, _owner in rows)
 
 
 async def test_trusted_my_cars_username_reflects_latest_known_value_not_subscription_snapshot(trusted_fx):
@@ -742,9 +746,9 @@ async def test_trusted_my_cars_username_reflects_latest_known_value_not_subscrip
         texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    labels = {car for _tid, car, _is_on, _end in reply.trusted_tasks_page_options}
-    assert "M295YB196 @brand_new_handle" in labels
-    assert not any("real_owner" in label for label in labels)
+    rows = {(car, owner) for _tid, car, owner, _is_on, _end in reply.trusted_tasks_page_options}
+    assert ("M295YB196", "@brand_new_handle") in rows
+    assert not any("real_owner" in owner for _car, owner in rows)
 
     # ownership (numeric identity) не изменился — historical username в
     # самой subscription тоже остаётся нетронутым (задача явно требует
@@ -755,9 +759,10 @@ async def test_trusted_my_cars_username_reflects_latest_known_value_not_subscrip
 
 
 async def test_trusted_my_cars_callback_data_unchanged_by_username_suffix(trusted_fx):
-    """4. callback_data строится ИСКЛЮЧИТЕЛЬНО из task_id — добавление
-    " @username" в текст левой кнопки не меняет encode/decode, открытие
-    карточки машины по task_id продолжает работать как раньше."""
+    """4. callback_data car-кнопки строится ИСКЛЮЧИТЕЛЬНО из task_id —
+    добавление отдельной username-кнопки не меняет encode/decode car-
+    кнопки, открытие карточки машины по task_id продолжает работать как
+    раньше."""
     trusted_fx.user_repository.upsert(
         TelegramUserInfo(user_id=777, username="real_owner", first_name=None, last_name=None)
     )
@@ -780,7 +785,8 @@ async def test_trusted_my_cars_callback_data_unchanged_by_username_suffix(truste
 
     assert encode_trusted_task_open_callback(task_id, 0) in rows_by_open_callback
     row = rows_by_open_callback[encode_trusted_task_open_callback(task_id, 0)]
-    assert row[0].text == "M295YB196 @alenaogir"
+    assert row[0].text == "M295YB196"
+    assert row[1].text == "@alenaogir"
 
     open_reply = trusted_fx.controller.handle_trusted_task_open(task_id, 0, telegram_user_id=_TRUSTED_ID)
     assert open_reply.trusted_task_detail_id == task_id
@@ -808,8 +814,9 @@ async def test_trusted_my_cars_monitoring_status_and_date_unaffected(trusted_fx)
         reply.trusted_tasks_page_options, page=0, total_pages=reply.trusted_tasks_total_pages,
     )
     [row] = keyboard
-    assert row[0].text == "Y111CA18 @alenaogir"
-    assert row[1].text == "🟢 до 20.12"
+    assert row[0].text == "Y111CA18"
+    assert row[1].text == "@alenaogir"
+    assert row[2].text == "🟢 до 20.12"
 
 
 async def test_trusted_my_cars_links_each_car_to_its_own_owner(trusted_fx):
@@ -840,9 +847,9 @@ async def test_trusted_my_cars_links_each_car_to_its_own_owner(trusted_fx):
         texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    labels = {car for _tid, car, _is_on, _end in reply.trusted_tasks_page_options}
-    assert "AA001AA @first_handle" in labels
-    assert "BB002BB @second_handle" in labels
+    rows = {(car, owner) for _tid, car, owner, _is_on, _end in reply.trusted_tasks_page_options}
+    assert ("AA001AA", "@first_handle") in rows
+    assert ("BB002BB", "@second_handle") in rows
 
 
 async def test_ordinary_user_my_cars_never_shows_username(fx):
@@ -1219,7 +1226,7 @@ async def test_trusted_my_cars_shows_task_without_any_subscription(trusted_fx):
 
     # Список — чистая inline keyboard (см. design report про переработку
     # экрана), номер машины теперь в trusted_tasks_page_options, не в тексте.
-    assert any(car == "E911EE95" for _tid, car, _is_on, _end in reply.trusted_tasks_page_options)
+    assert any(car == "E911EE95" for _tid, car, _owner, _is_on, _end in reply.trusted_tasks_page_options)
     assert trusted_fx.subscription_repository.list_by_user(_TRUSTED_ID) == []
 
 
@@ -1244,14 +1251,14 @@ async def test_trusted_my_cars_shows_all_tasks_operator_and_client_bot_and_off(t
 
     # Список — чистая inline keyboard (см. design report), номера машин —
     # ТОЛЬКО в trusted_tasks_page_options, не в тексте сообщения.
-    cars_shown = {car for _tid, car, _is_on, _end in reply.trusted_tasks_page_options}
+    cars_shown = {car for _tid, car, _owner, _is_on, _end in reply.trusted_tasks_page_options}
     assert "E911EE95" in cars_shown
     assert client_task.car_number in cars_shown
     assert "COMPLETED1" in cars_shown  # completed — теперь показывается как ⚪ OFF, не скрыт
 
     options_by_id = {
         task_id: (car_number, is_on)
-        for task_id, car_number, is_on, _end in reply.trusted_tasks_page_options
+        for task_id, car_number, _owner, is_on, _end in reply.trusted_tasks_page_options
     }
     assert options_by_id[completed_id] == ("COMPLETED1", False)
 
@@ -1304,11 +1311,14 @@ def _cars_on_page(reply) -> list[str]:
     report про переработку "📋 Мои авто" в чистую inline keyboard —
     список больше НЕ дублируется текстом, единственный источник —
     trusted_tasks_page_options)."""
-    return [car for _task_id, car, _is_on, _end in reply.trusted_tasks_page_options]
+    return [car for _task_id, car, _owner, _is_on, _end in reply.trusted_tasks_page_options]
 
 
 def test_trusted_my_cars_shows_10_tasks_per_page(trusted_fx):
-    car_numbers = _make_many_tasks(trusted_fx, 250)
+    # ORDER BY id DESC (см. root cause report "унифицировать оба
+    # интерфейса" — недавно созданные задачи должны быть на ПЕРВЫХ
+    # страницах) — новейшая задача первая, поэтому reversed(car_numbers).
+    car_numbers = list(reversed(_make_many_tasks(trusted_fx, 250)))
 
     reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
 
@@ -1318,7 +1328,7 @@ def test_trusted_my_cars_shows_10_tasks_per_page(trusted_fx):
 
 
 def test_trusted_my_cars_first_page_content(trusted_fx):
-    car_numbers = _make_many_tasks(trusted_fx, 250)
+    car_numbers = list(reversed(_make_many_tasks(trusted_fx, 250)))
 
     reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
 
@@ -1329,7 +1339,7 @@ def test_trusted_my_cars_first_page_content(trusted_fx):
 
 
 def test_trusted_my_cars_middle_page_content(trusted_fx):
-    car_numbers = _make_many_tasks(trusted_fx, 250)
+    car_numbers = list(reversed(_make_many_tasks(trusted_fx, 250)))
 
     reply = trusted_fx.controller.handle_trusted_tasks_page(12, telegram_user_id=_TRUSTED_ID)
 
@@ -1343,7 +1353,7 @@ def test_trusted_my_cars_middle_page_content(trusted_fx):
 def test_trusted_my_cars_last_page_content_exact_multiple(trusted_fx):
     """250 = 25 * 10 — последняя страница ровно полная (проверяется
     отдельно от неполной последней страницы ниже)."""
-    car_numbers = _make_many_tasks(trusted_fx, 250)
+    car_numbers = list(reversed(_make_many_tasks(trusted_fx, 250)))
 
     reply = trusted_fx.controller.handle_trusted_tasks_page(24, telegram_user_id=_TRUSTED_ID)
 
@@ -1353,7 +1363,7 @@ def test_trusted_my_cars_last_page_content_exact_multiple(trusted_fx):
 
 def test_trusted_my_cars_last_incomplete_page_content(trusted_fx):
     """205 задач, 10 на страницу — 21 страница, последняя неполная (5)."""
-    car_numbers = _make_many_tasks(trusted_fx, 205)
+    car_numbers = list(reversed(_make_many_tasks(trusted_fx, 205)))
 
     reply = trusted_fx.controller.handle_trusted_tasks_page(20, telegram_user_id=_TRUSTED_ID)
 
@@ -1483,7 +1493,7 @@ async def test_trusted_my_cars_shows_on_off_button_next_to_each_car(trusted_fx):
 
     reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
 
-    options_by_id = {tid: (car, is_on) for tid, car, is_on, _end in reply.trusted_tasks_page_options}
+    options_by_id = {tid: (car, is_on) for tid, car, _owner, is_on, _end in reply.trusted_tasks_page_options}
     assert options_by_id[on_id] == ("M295YB196", True)
     assert options_by_id[off_id] == ("A123AA180", False)
 
@@ -1499,7 +1509,7 @@ def test_trusted_my_cars_options_carry_end_date_for_the_right_button(trusted_fx)
 
     reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
 
-    ends_by_id = {tid: end for tid, _car, _is_on, end in reply.trusted_tasks_page_options}
+    ends_by_id = {tid: end for tid, _car, _owner, _is_on, end in reply.trusted_tasks_page_options}
     assert ends_by_id[on_id] == date(2026, 12, 31)
     assert ends_by_id[off_id] == date(2026, 12, 31)  # OFF: последний сохранённый период
 
@@ -1530,8 +1540,8 @@ def test_trusted_my_cars_renders_exact_labels_from_the_task(trusted_fx):
 
     on_row = rows_by_open_callback[encode_trusted_task_open_callback(on_task.id, 0)]
     off_row = rows_by_open_callback[encode_trusted_task_open_callback(off_task.id, 0)]
-    assert (on_row[0].text, on_row[1].text) == ("Y111CA18", "🟢 до 20.12")
-    assert (off_row[0].text, off_row[1].text) == ("B641XE89", "⚪")
+    assert (on_row[0].text, on_row[1].text, on_row[2].text) == ("Y111CA18", "—", "🟢 до 20.12")
+    assert (off_row[0].text, off_row[1].text, off_row[2].text) == ("B641XE89", "—", "⚪")
 
 
 def test_trusted_task_state_matches_real_monitoring_status(trusted_fx):
@@ -1543,7 +1553,7 @@ def test_trusted_task_state_matches_real_monitoring_status(trusted_fx):
     completed_id = _make_operator_task(trusted_fx, "CC003CC", status="completed")
 
     reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
-    options_by_id = {tid: is_on for tid, _car, is_on, _end in reply.trusted_tasks_page_options}
+    options_by_id = {tid: is_on for tid, _car, _owner, is_on, _end in reply.trusted_tasks_page_options}
 
     assert options_by_id[active_id] is True
     assert options_by_id[stopped_id] is False
@@ -1661,16 +1671,24 @@ def test_trusted_task_period_choice_saves_period_and_turns_on(trusted_fx, days):
     # Явное требование: после подтверждения менеджер возвращается в
     # "📋 Мои авто" — там уже видно новое состояние (ON) И новую дату
     # (пример из задачи: "выбрали 30 дней -> [Y111CA18] [🟢 до 21.10]").
-    options_by_id = {tid: (is_on, end) for tid, _car, is_on, end in reply.trusted_tasks_page_options}
+    options_by_id = {tid: (is_on, end) for tid, _car, _owner, is_on, end in reply.trusted_tasks_page_options}
     assert options_by_id[task_id] == (True, task.end_date)
 
     # Явное требование: "Проверить также, что после resume end_date сразу
     # появляется в зелёной кнопке" — рендерим РЕАЛЬНУЮ клавиатуру из тех
     # же options, что вернул controller, а не только сырые данные выше.
+    # Car-строки адресуются по encode_trusted_task_open_callback (левая
+    # кнопка) — пагинационная строка использует другой callback-тип
+    # (encode_trusted_tasks_page_callback), поэтому фильтр по длине строки
+    # (раньше 2 vs 3 кнопки) больше не различает их — обе теперь по 3.
     rendered_keyboard = trusted_tasks_page_keyboard(
         reply.trusted_tasks_page_options, page=reply.trusted_tasks_page, total_pages=reply.trusted_tasks_total_pages,
     )
-    right_labels = {row[0].data: row[1].text for row in rendered_keyboard if len(row) == 2}
+    right_labels = {
+        row[0].data: row[2].text
+        for row in rendered_keyboard
+        if decode_trusted_task_open_callback(row[0].data) is not None
+    }
     assert right_labels[encode_trusted_task_open_callback(task_id, 0)] == f"🟢 до {task.end_date.strftime('%d.%m')}"
 
 
@@ -1712,7 +1730,7 @@ def test_trusted_task_back_from_continue_screen_returns_to_my_cars_list(trusted_
     list_reply = trusted_fx.controller.handle_trusted_tasks_page(0, telegram_user_id=_TRUSTED_ID)
 
     assert list_reply.trusted_tasks_page == 0
-    assert any(tid == task_id for tid, _car, _is_on, _end in list_reply.trusted_tasks_page_options)
+    assert any(tid == task_id for tid, _car, _owner, _is_on, _end in list_reply.trusted_tasks_page_options)
 
 
 def test_trusted_task_toggle_of_one_car_does_not_affect_another(trusted_fx):

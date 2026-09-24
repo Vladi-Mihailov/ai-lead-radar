@@ -414,34 +414,36 @@ async def test_manager_cars_shows_cars_from_multiple_owners():
 
     reply = await controller.handle_text(texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
 
-    labels = {label for _id, label, _on in reply.manager_cars_page_options}
-    assert "A111AA111" in labels
-    assert "B222BB222" in labels
+    cars = {car for _id, car, _owner, _on in reply.manager_cars_page_options}
+    assert "A111AA111" in cars
+    assert "B222BB222" in cars
 
 
 async def test_manager_cars_shows_owner_username_when_known():
-    """D. username отображается: CAR_NUMBER @username."""
+    """D. username отображается отдельной кнопкой: [CAR_NUMBER] [@username]
+    [STATUS] (см. задачу "унифицировать оба интерфейса Georgia/Turkey")."""
     controller, garage, _runs, _subs, known_users = _make_manager_controller(_no_debt_check_service())
     garage.add_car(telegram_user_id=333, car_number="M295YB196")
     known_users.record_seen(telegram_user_id=333, telegram_chat_id=333, telegram_username="Mihailov_vm")
 
     reply = await controller.handle_text(texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
 
-    labels = {label for _id, label, _on in reply.manager_cars_page_options}
-    assert "M295YB196 @Mihailov_vm" in labels
+    rows = {(car, owner) for _id, car, owner, _on in reply.manager_cars_page_options}
+    assert ("M295YB196", "@Mihailov_vm") in rows
 
 
 async def test_manager_cars_hides_username_when_unknown():
-    """E. username=None: только CAR_NUMBER, без @None/None/пустого @."""
+    """E. username=None: средняя кнопка — "—", без @None/None/пустого @."""
     controller, garage, _runs, _subs, _known = _make_manager_controller(_no_debt_check_service())
     garage.add_car(telegram_user_id=333, car_number="M295YB196")
     # record_seen НЕ вызывается — владелец никогда не писал боту.
 
     reply = await controller.handle_text(texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
 
-    labels = {label for _id, label, _on in reply.manager_cars_page_options}
-    assert "M295YB196" in labels
-    assert not any("@" in label or "None" in label for label in labels)
+    rows = {(car, owner) for _id, car, owner, _on in reply.manager_cars_page_options}
+    assert ("M295YB196", "—") in rows
+    assert not any("@" in car or "None" in car for car, _owner in rows)
+    assert not any("None" in owner for _car, owner in rows)
 
 
 async def test_manager_cars_same_plate_different_owners_are_separate_rows():
@@ -457,9 +459,9 @@ async def test_manager_cars_same_plate_different_owners_are_separate_rows():
 
     reply = await controller.handle_text(texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
 
-    label_by_id = {car_id: label for car_id, label, _on in reply.manager_cars_page_options}
-    assert label_by_id[car_a.id] == "A123AA123 @owner_one"
-    assert label_by_id[car_b.id] == "A123AA123 @owner_two"
+    row_by_id = {car_id: (car, owner) for car_id, car, owner, _on in reply.manager_cars_page_options}
+    assert row_by_id[car_a.id] == ("A123AA123", "@owner_one")
+    assert row_by_id[car_b.id] == ("A123AA123", "@owner_two")
 
     detail_a = controller.handle_manager_car_open(car_a.id, 0, telegram_user_id=_TRUSTED_ID)
     detail_b = controller.handle_manager_car_open(car_b.id, 0, telegram_user_id=_TRUSTED_ID)
@@ -494,8 +496,8 @@ async def test_manager_cars_pagination_next_back_and_boundaries():
     assert clamped_high.manager_cars_page == 1
 
     # страницы не пересекаются (15 машин суммарно, без дублей)
-    ids_page0 = {car_id for car_id, _label, _on in page0.manager_cars_page_options}
-    ids_page1 = {car_id for car_id, _label, _on in page1.manager_cars_page_options}
+    ids_page0 = {car_id for car_id, _car, _owner, _on in page0.manager_cars_page_options}
+    ids_page1 = {car_id for car_id, _car, _owner, _on in page1.manager_cars_page_options}
     assert ids_page0.isdisjoint(ids_page1)
     assert len(ids_page0 | ids_page1) == 15
 
@@ -513,13 +515,13 @@ async def test_manager_toggle_affects_owner_subscription_not_manager():
     assert owner_sub is not None
     assert owner_sub.active is True
     assert subscriptions.get(telegram_user_id=_TRUSTED_ID, plate="M295YB196") is None
-    status_by_id = {car_id: on for car_id, _label, on in reply.manager_cars_page_options}
+    status_by_id = {car_id: on for car_id, _car, _owner, on in reply.manager_cars_page_options}
     assert status_by_id[car.id] is True
 
     reply2 = controller.handle_manager_car_toggle(car.id, 0, telegram_user_id=_TRUSTED_ID)
     owner_sub2 = subscriptions.get(telegram_user_id=333, plate="M295YB196")
     assert owner_sub2.active is False
-    status_by_id2 = {car_id: on for car_id, _label, on in reply2.manager_cars_page_options}
+    status_by_id2 = {car_id: on for car_id, _car, _owner, on in reply2.manager_cars_page_options}
     assert status_by_id2[car.id] is False
 
 
@@ -540,13 +542,14 @@ async def test_manager_callbacks_reject_non_trusted_user():
 
 async def test_manager_cars_page_keyboard_labels_and_callbacks():
     """Прямая проверка keyboard-builder'а (референс —
-    reader/public_bot/keyboards.py::trusted_tasks_page_keyboard) — левая
-    кнопка несёт готовый car_label (номер + опционально @username),
-    правая — 🟢/⚪ БЕЗ даты/периода (Turkey monitoring бессрочен)."""
-    options = [(1, "A123AA123 @owner", True), (2, "B456BB456", False)]
+    reader/public_bot/keyboards.py::trusted_tasks_page_keyboard) — РОВНО
+    ТРИ кнопки на строку: car_number, готовый owner_display
+    ("@username"/"—"), 🟢/⚪ БЕЗ даты/периода (Turkey monitoring
+    бессрочен)."""
+    options = [(1, "A123AA123", "@owner", True), (2, "B456BB456", "—", False)]
     rows = manager_cars_page_keyboard(options, page=0, total_pages=1)
     flat = _button_texts(rows)
-    assert flat == [["A123AA123 @owner", "🟢"], ["B456BB456", "⚪"]]
+    assert flat == [["A123AA123", "@owner", "🟢"], ["B456BB456", "—", "⚪"]]
 
 
 async def test_manager_car_detail_keyboard_has_back_button():

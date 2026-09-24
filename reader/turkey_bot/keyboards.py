@@ -213,30 +213,43 @@ def decode_manager_car_toggle_callback(data: bytes | None) -> tuple[int, int] | 
 
 
 def manager_cars_page_keyboard(
-    options: list[tuple[int, str, bool]], *, page: int, total_pages: int,
+    options: list[tuple[int, str, str, bool]], *, page: int, total_pages: int,
 ) -> list[list[Button]]:
-    """Manager-facing "🚗 Мои автомобили" (см. задачу, референс — Georgian
-    bot trusted_tasks_page_keyboard) — options: (car_id, car_label,
-    monitoring_active), car_label уже содержит " @username" владельца,
-    если он известен (см. ConversationController._format_manager_cars_page_reply/
-    texts.format_owner_username_suffix). ДВЕ кнопки на строку: ЛЕВАЯ
-    (car_label) открывает read-only детали этой строки (см.
-    encode_manager_car_open_callback/handle_manager_car_open), ПРАВАЯ
-    (🟢/⚪) переключает мониторинг НАПРЯМУЮ, без промежуточного экрана (см.
-    encode_manager_car_toggle_callback/handle_manager_car_toggle — Turkey
-    monitoring бессрочен, в отличие от Georgian bot с периодами, поэтому
-    здесь нет аналога "выбора срока"). car_id — PK строки
-    turkey_bot_user_cars, однозначно адресует конкретного владельца даже
-    при повторяющемся car_number (см. задачу п.6)."""
+    """Manager-facing "🚗 Мои автомобили" (см. задачу "унифицировать оба
+    интерфейса Georgia/Turkey", референс — Georgian bot
+    trusted_tasks_page_keyboard) — options: (car_id, car_number,
+    owner_display, monitoring_active). РОВНО ТРИ кнопки на строку —
+    [CAR_NUMBER] [@username/—] [STATUS]:
+
+    ЛЕВАЯ — car_number, открывает read-only детали этой строки (см.
+    encode_manager_car_open_callback/handle_manager_car_open).
+
+    СРЕДНЯЯ — owner_display, уже готовая строка "@username"/"—" (см.
+    ConversationController._format_manager_cars_page_reply/
+    texts.format_owner_username_button — НИКОГДА "@None"/"None"/пустая
+    кнопка) — чисто информационная, НЕ меняет monitoring/status:
+    callback_data — тот же безопасный no-op, что и средний пагинационный
+    индикатор ниже (encode_manager_cars_page_callback(page) —
+    переоткрывает ту же страницу, не раскрывает дополнительных данных).
+
+    ПРАВАЯ (🟢/⚪) переключает мониторинг НАПРЯМУЮ, без промежуточного
+    экрана (см. encode_manager_car_toggle_callback/handle_manager_car_toggle
+    — Turkey monitoring бессрочен, в отличие от Georgian bot с периодами,
+    поэтому здесь нет аналога "выбора срока").
+
+    car_id — PK строки turkey_bot_user_cars, однозначно адресует
+    конкретного владельца даже при повторяющемся car_number (см. задачу
+    п.6); owner_display на car/status callback_data не влияет."""
     rows = [
         [
-            Button.inline(car_label, encode_manager_car_open_callback(car_id, page)),
+            Button.inline(car_number, encode_manager_car_open_callback(car_id, page)),
+            Button.inline(owner_display, encode_manager_cars_page_callback(page)),
             Button.inline(
                 format_manager_car_status_label(monitoring_active=monitoring_active),
                 encode_manager_car_toggle_callback(car_id, page),
             ),
         ]
-        for car_id, car_label, monitoring_active in options
+        for car_id, car_number, owner_display, monitoring_active in options
     ]
     if total_pages > 1:
         back_page = max(page - 1, 0)

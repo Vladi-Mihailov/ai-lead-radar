@@ -110,11 +110,17 @@ _SELECT_ACTIVE_PAGE = f"""
 # задачи тоже (как ⚪ OFF), не только активные — тот же принцип, что и у
 # list_my_cars() для обычного пользователя (список показывает любой
 # статус, ON/OFF — это отдельное отображаемое состояние, а не фильтр
-# списка). ORDER BY id ASC — та же стабильная сортировка, что и у
-# _SELECT_ACTIVE_PAGE, независимая от status.
+# списка). ORDER BY id DESC (а не ASC, как у _SELECT_ACTIVE_PAGE) —
+# новые/недавно тронутые задачи (у которых чаще есть активный подписчик
+# с известным username) идут ПЕРВЫМИ (см. root cause "manager листал 109
+# страниц и не увидел ни одного @username" — при id ASC все такие строки
+# были на последних страницах 84 и 117-138 из 138, а не потому что
+# owner-resolution была сломана); тот же порядок, что и у Turkey
+# TurkeyUserCarsRepository._SELECT_ALL_PAGE (см. задачу "унифицировать оба
+# интерфейса").
 _SELECT_ALL_PAGE = f"""
     SELECT {_SELECT_FIELDS} FROM fine_monitoring_tasks
-    ORDER BY id ASC
+    ORDER BY id DESC
     LIMIT :limit OFFSET :offset
 """
 

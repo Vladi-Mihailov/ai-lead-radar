@@ -853,14 +853,16 @@ def format_car_button_label(car: TurkeyUserCar, *, monitoring_active: bool) -> s
     return f"{emoji} {car.car_number} — {state}"
 
 
-def format_owner_username_suffix(username: str | None) -> str:
-    """" @username", если владелец известен (auto-captured, см.
-    turkey_bot_known_users), иначе пустая строка — тот же формат/тот же
-    принцип, что и reader/public_bot/texts.py::format_owner_username_suffix
-    (задача явно требует "никогда @None/None/пустой @") — пустая строка, а
-    не None, чтобы вызывающий код мог всегда писать
-    f"{car_number}{suffix}" без отдельной ветки."""
-    return f" @{username}" if username else ""
+def format_owner_username_button(username: str | None) -> str:
+    """Средняя из трёх кнопок manager-строки "🚗 Все автомобили" —
+    [CAR_NUMBER] [@username/—] [STATUS] (см. задачу "унифицировать оба
+    интерфейса", тот же формат, что и у Georgian bot
+    reader/public_bot/texts.py::format_owner_username_button).
+    "@username", если владелец известен (auto-captured, см.
+    turkey_bot_known_users), иначе "—" (задача явно требует "никогда
+    @None/None/пустая кнопка" — Telegram inline-кнопка не может быть
+    пустой строкой)."""
+    return f"@{username}" if username else "—"
 
 
 def format_manager_car_status_label(*, monitoring_active: bool) -> str:

@@ -161,26 +161,26 @@ class BotReply:
     и НЕ является доказательством авторизации: is_trusted() перепроверяется
     на каждом callback заново, а page вне диапазона клампится сервером.
 
-    trusted_tasks_page_options — (task_id, car_label, is_on, end_date) на
-    строку "📋 Мои авто" (см. design report про per-car ON/OFF toggle) —
-    is_on + end_date решают, что показать в ПРАВОЙ кнопке (см.
-    reader/public_bot/keyboards.py::trusted_tasks_page_keyboard/
-    _format_trusted_task_toggle_label): "🟢 до ДД.ММ" для ON, просто "⚪"
-    для OFF (см. design report "переделываем строки": длинный текст в
-    ЛЕВОЙ кнопке обрезался Telegram'ом — период переехал в правую кнопку,
-    левая теперь ТОЛЬКО car_number + опционально " @username" владельца
-    (см. задачу "показывать владельца в manager car list" —
-    _owner_username_for_car/texts.format_owner_username_suffix), без 🚗 и
-    без даты; слова ON/OFF убраны совсем; для OFF дата не показывается
-    вовсе). username — ТОЛЬКО display, не влияет на callback_data (та
-    по-прежнему строится исключительно из task_id) и не меняет
-    авторизацию/ownership. task_id публичен и
-    НЕ является доказательством авторизации сам по себе — тот же принцип,
-    что и везде в этом модуле (is_trusted() + существование задачи
-    перепроверяются server-side на каждом действии). Список БЕЗ
+    trusted_tasks_page_options — (task_id, car_number, owner_display, is_on,
+    end_date) на строку "📋 Мои авто" — РОВНО ТРИ кнопки на машину (см.
+    задачу "унифицировать оба интерфейса Georgia/Turkey":
+    [CAR_NUMBER] [@username/—] [STATUS], тот же вид, что и у Turkey bot):
+    ЛЕВАЯ — car_number (см. reader/public_bot/keyboards.py::
+    trusted_tasks_page_keyboard), СРЕДНЯЯ — owner_display, уже готовая
+    строка "@username" или "—" (см. _owner_username_for_car/
+    texts.format_owner_username_button — НИКОГДА "@None"/"None"/пустая
+    кнопка), информационная, её callback — безопасный no-op (переоткрывает
+    ту же страницу, см. encode_trusted_tasks_page_callback), ПРАВАЯ —
+    is_on + end_date решают "🟢 до ДД.ММ"/"⚪" (см.
+    _format_trusted_task_toggle_label). owner_display — ТОЛЬКО display, не
+    влияет на callback_data car/status-кнопок (та по-прежнему строится
+    исключительно из task_id) и не меняет авторизацию/ownership. task_id
+    публичен и НЕ является доказательством авторизации сам по себе — тот
+    же принцип, что и везде в этом модуле (is_trusted() + существование
+    задачи перепроверяются server-side на каждом действии). Список БЕЗ
     текстового перечня машин (см. design report: Telegram не позволяет
-    inline-кнопку справа от строки текста) — номер/период/ON-OFF каждой
-    машины ТОЛЬКО в этих кнопках, а не в reply.text. Полный период
+    inline-кнопку справа от строки текста) — номер/владелец/период/ON-OFF
+    каждой машины ТОЛЬКО в этих кнопках, а не в reply.text. Полный период
     (start_date — end_date) по-прежнему только в карточке машины (см.
     texts.format_trusted_task_detail). FineMonitoringTask.end_date —
     NOT NULL (см. reader/fines/task_repository.py::_SCHEMA), поэтому этот
@@ -245,7 +245,7 @@ class BotReply:
     trusted_stop_confirm_button_label: str | None = None
     trusted_tasks_page: int | None = None
     trusted_tasks_total_pages: int | None = None
-    trusted_tasks_page_options: list[tuple[int, str, bool, date]] | None = None
+    trusted_tasks_page_options: list[tuple[int, str, str, bool, date]] | None = None
     trusted_task_detail_id: int | None = None
     trusted_task_detail_page: int | None = None
     trusted_task_off_id: int | None = None
@@ -491,10 +491,10 @@ class ConversationController:
         per-car ON/OFF toggle: менеджер должен видеть и OFF-машины —
         hard cap "первые 50" убран — пагинация по _TRUSTED_TASKS_PAGE_SIZE
         вместо него), сама выборка задач subscription не требует — только
-        владелец в лейбле (см. _owner_username_for_car) читает активные
-        подписки этого car_number отдельным вызовом, задачи без клиента
-        (см. add_delegated_car_without_client) просто не получают суффикс
-        username.
+        владелец в отдельной кнопке (см. _owner_username_for_car) читает
+        активные подписки этого car_number отдельным вызовом, задачи без
+        клиента (см. add_delegated_car_without_client) просто получают "—"
+        вместо username (см. texts.format_owner_username_button).
 
         page — ЛЮБОЕ int (в т.ч. отрицательное/за пределами общего числа
         страниц, см. design report: "page из callback нельзя считать
@@ -512,7 +512,8 @@ class ConversationController:
         options = [
             (
                 task.id,
-                task.car_number + texts.format_owner_username_suffix(
+                task.car_number,
+                texts.format_owner_username_button(
                     self._owner_username_for_car(task.car_number, today=today),
                 ),
                 task.status == "active",
