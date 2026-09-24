@@ -30,6 +30,9 @@ from reader.public_bot.keyboards import (
     decode_my_car_turn_on_callback,
     decode_my_cars_page_callback,
     decode_period_callback,
+    decode_search_back_callback,
+    decode_search_new_callback,
+    decode_search_page_callback,
     decode_trusted_stop_confirm_callback,
     decode_trusted_stop_pick_callback,
     decode_trusted_task_continue_callback,
@@ -40,6 +43,8 @@ from reader.public_bot.keyboards import (
     main_menu_keyboard,
     my_cars_page_keyboard,
     period_choice_keyboard,
+    search_entry_keyboard,
+    search_result_keyboard,
     trusted_stop_confirm_keyboard,
     trusted_stop_options_keyboard,
     trusted_task_detail_keyboard,
@@ -266,6 +271,25 @@ def register(
             await _send_reply(event, reply, prefer_edit=True, is_trusted=is_trusted)
             return
 
+        search_page = decode_search_page_callback(data)
+        if search_page is not None:
+            query_type, query, page = search_page
+            reply = await controller.handle_search_page(
+                query_type, query, page, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        if decode_search_new_callback(data):
+            reply = controller.handle_search_new(chat_id=event.chat_id, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        if decode_search_back_callback(data):
+            reply = controller.handle_search_back(chat_id=event.chat_id, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
         await event.answer("Неизвестная или устаревшая кнопка", alert=True)
 
     # Bot identity switch (см. audit report) — @ProtocolGEbot.
@@ -352,6 +376,17 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False, is_trusted: bo
         # reader/public_bot/keyboards.py::main_menu_keyboard), а НЕ
         # автоматическое companion-сообщение при показе главного меню.
         buttons = turkey_bot_link_keyboard()
+    elif reply.search_prompt:
+        # Manager/trusted Search (см. задачу) — экран ввода запроса,
+        # единственная кнопка "↩️ Назад".
+        buttons = search_entry_keyboard()
+    elif reply.search_result_shown:
+        # Экран результата Search (найден он или нет) — пагинация (если
+        # search_total_pages > 1) + [🔎 Новый поиск][↩️ В меню].
+        buttons = search_result_keyboard(
+            query_type=reply.search_query_type, query=reply.search_query,
+            page=reply.search_page, total_pages=reply.search_total_pages,
+        )
 
     if prefer_edit:
         try:

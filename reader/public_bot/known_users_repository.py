@@ -39,6 +39,19 @@ _SELECT = (
     "FROM bot_known_users WHERE telegram_user_id = ?"
 )
 
+# Manager/trusted Search по @username (см. задачу) — COLLATE NOCASE даёт
+# case-insensitive сравнение (задача явно требует: "case-insensitive
+# search"), без отдельной нормализации регистра в Python. telegram_username
+# не PRIMARY KEY — теоретически возможна гонка (два разных telegram_user_id
+# сохранили один и тот же username в разное время, старое значение ещё не
+# обновлено до нового владельца, см. _UPSERT COALESCE) — берём самый
+# СВЕЖИЙ по last_seen_at, а не произвольную строку.
+_SELECT_BY_USERNAME = (
+    "SELECT telegram_user_id, telegram_chat_id, telegram_username, first_seen_at, last_seen_at "
+    "FROM bot_known_users WHERE telegram_username = ? COLLATE NOCASE "
+    "ORDER BY last_seen_at DESC LIMIT 1"
+)
+
 
 def _row_to_known_user(row) -> BotKnownUser:
     telegram_user_id, telegram_chat_id, telegram_username, first_seen_at, last_seen_at = row
@@ -81,6 +94,15 @@ class BotKnownUsersRepository:
 
     def get(self, telegram_user_id: int) -> BotKnownUser | None:
         row = self._conn.execute(_SELECT, (telegram_user_id,)).fetchone()
+        return _row_to_known_user(row) if row else None
+
+    def find_by_username(self, username: str) -> BotKnownUser | None:
+        """Case-insensitive lookup по telegram_username (см. задачу
+        "manager/trusted Search"), НЕ по numeric telegram_user_id (тот —
+        get() выше) — вызывающий код (ConversationController) передаёт
+        уже trim'ленный, без ведущего "@" username. None — ни один
+        известный пользователь не писал боту под этим username."""
+        row = self._conn.execute(_SELECT_BY_USERNAME, (username,)).fetchone()
         return _row_to_known_user(row) if row else None
 
     def count_total(self) -> int:

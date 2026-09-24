@@ -38,8 +38,11 @@ from reader.turkey_bot.texts import (
     HELP_TERMS_LABEL,
     HISTORY_LABEL,
     MY_CARS_LABEL,
+    SEARCH_BACK_LABEL,
+    SEARCH_LABEL,
+    SEARCH_MENU_LABEL,
+    SEARCH_NEW_LABEL,
     STATISTICS_LABEL,
-    STOP_MONITORING_LABEL,
     format_car_button_label,
     format_manager_car_status_label,
 )
@@ -98,15 +101,23 @@ def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
 
     Макет manager (is_trusted=True):
       ROW 1: ADD_CAR_LABEL | MY_CARS_LABEL
-      ROW 2: CHECK_NOW_LABEL | STOP_MONITORING_LABEL
+      ROW 2: CHECK_NOW_LABEL | SEARCH_LABEL
       ROW 3: STATISTICS_LABEL | GEORGIAN_BOT_LINK_LABEL
       ROW 4: HELP_LABEL
+
+    SEARCH_LABEL (см. задачу "manager/trusted Search") заменяет здесь
+    бывшую "⛔ Остановить мониторинг" (STOP_MONITORING_LABEL, см.
+    reader/turkey_bot/texts.py — константа и весь underlying flow
+    сознательно НЕ удалены) — per-car ON/OFF в manager "🚗 Мои
+    автомобили" [STATUS] кнопке остаётся штатным способом остановить
+    мониторинг КОНКРЕТНОЙ машины; полный "остановить всё" по-прежнему
+    доступен через handle_stop_monitoring(), просто без кнопки в меню.
 
     "🇬🇪 Штрафы Грузии" — обычная reply-кнопка (см. georgian_bot_link_keyboard
     докстрок ниже про то, почему она не может сама быть URL-кнопкой)."""
     rows = [[Button.text(ADD_CAR_LABEL, resize=True), Button.text(MY_CARS_LABEL, resize=True)]]
     if is_trusted:
-        rows.append([Button.text(CHECK_NOW_LABEL, resize=True), Button.text(STOP_MONITORING_LABEL, resize=True)])
+        rows.append([Button.text(CHECK_NOW_LABEL, resize=True), Button.text(SEARCH_LABEL, resize=True)])
         rows.append([Button.text(STATISTICS_LABEL, resize=True), Button.text(GEORGIAN_BOT_LINK_LABEL, resize=True)])
     else:
         rows.append([Button.text(CHECK_NOW_LABEL, resize=True), Button.text(GEORGIAN_BOT_LINK_LABEL, resize=True)])
@@ -365,3 +376,89 @@ def help_menu_keyboard() -> list[list[Button]]:
 
 def help_section_keyboard() -> list[list[Button]]:
     return [[Button.inline(HELP_BACK_LABEL, encode_help_callback("menu"))]]
+
+
+# ==== manager/trusted Search (см. задачу "manager/trusted Search") —
+# ТОЛЬКО trusted-facing клавиатуры, self-service не затронут. Тот же
+# приём, что и reader/public_bot/keyboards.py (Georgian bot) — query
+# (username/plate) кодируется В ОТКРЫТУЮ в callback_data, публичен, НЕ
+# доказательство авторизации (is_trusted() перепроверяется на каждом
+# handle_search_* заново). normalize_plate() никогда не отдаёт ":" в
+# результате — split(":") безопасен. ====
+
+_SEARCH_BACK_CALLBACK = b"turkeysearchback"
+_SEARCH_NEW_CALLBACK = b"turkeysearchnew"
+_SEARCH_PAGE_PREFIX = b"turkeysearchpage:"
+_SEARCH_QUERY_TYPES = ("username", "car")
+
+
+def encode_search_back_callback() -> bytes:
+    return _SEARCH_BACK_CALLBACK
+
+
+def decode_search_back_callback(data: bytes | None) -> bool:
+    return data == _SEARCH_BACK_CALLBACK
+
+
+def encode_search_new_callback() -> bytes:
+    return _SEARCH_NEW_CALLBACK
+
+
+def decode_search_new_callback(data: bytes | None) -> bool:
+    return data == _SEARCH_NEW_CALLBACK
+
+
+def encode_search_page_callback(query_type: str, query: str, page: int) -> bytes:
+    return _SEARCH_PAGE_PREFIX + f"{query_type}:{query}:{page}".encode()
+
+
+def decode_search_page_callback(data: bytes | None) -> tuple[str, str, int] | None:
+    """None для чего угодно, кроме РОВНО трёх сегментов с query_type из
+    _SEARCH_QUERY_TYPES (allowlist) — не доверяет произвольному
+    query_type/пустому query из чужого/подделанного callback_data."""
+    if not data or not data.startswith(_SEARCH_PAGE_PREFIX):
+        return None
+    try:
+        remainder = data[len(_SEARCH_PAGE_PREFIX):].decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None
+    parts = remainder.split(":")
+    if len(parts) != 3:
+        return None
+    query_type, query, page_text = parts
+    if query_type not in _SEARCH_QUERY_TYPES or not query:
+        return None
+    try:
+        page = int(page_text)
+    except ValueError:
+        return None
+    return query_type, query, page
+
+
+def search_entry_keyboard() -> list[list[Button]]:
+    """Экран ввода запроса (см. texts.SEARCH_ENTRY_TEXT) — единственная
+    кнопка "↩️ Назад", возвращает в главное меню."""
+    return [[Button.inline(SEARCH_BACK_LABEL, encode_search_back_callback())]]
+
+
+def search_result_keyboard(
+    *, query_type: str, query: str, page: int, total_pages: int,
+) -> list[list[Button]]:
+    """Экран результата (найден он или нет) — пагинация (если
+    total_pages > 1) + [🔎 Новый поиск][↩️ В меню]. "↩️ В меню"
+    переиспользует ТОТ ЖЕ callback, что и "↩️ Назад" на экране ввода —
+    оба ведут в главное меню (handle_search_back)."""
+    rows = []
+    if total_pages > 1:
+        back_page = max(page - 1, 0)
+        next_page = min(page + 1, total_pages - 1)
+        rows.append([
+            Button.inline("◀️ Назад", encode_search_page_callback(query_type, query, back_page)),
+            Button.inline(f"{page + 1} / {total_pages}", encode_search_page_callback(query_type, query, page)),
+            Button.inline("Вперёд ▶️", encode_search_page_callback(query_type, query, next_page)),
+        ])
+    rows.append([
+        Button.inline(SEARCH_NEW_LABEL, encode_search_new_callback()),
+        Button.inline(SEARCH_MENU_LABEL, encode_search_back_callback()),
+    ])
+    return rows

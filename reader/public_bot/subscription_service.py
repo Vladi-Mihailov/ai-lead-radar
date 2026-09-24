@@ -969,6 +969,55 @@ class SubscriptionService:
         # что и в reader/commands/fine.py::_handle_check/_handle_stop.
         return await self.check_now_task(tasks[0].id)
 
+    async def check_now_task_for_search(self, task_id: int) -> CheckNowOutcome | None:
+        """Как check_now_task(), но БЕЗ требования status=='active' (см.
+        get_task_for_trusted_admin вместо get_active_task_for_trusted_admin)
+        — manager/trusted Search (см. задачу) должен показывать реальный
+        текущий долг даже для OFF/completed задачи (тот же принцип, что и у
+        manager car list, который тоже показывает OFF-машины, а не только
+        активные, см. SubscriptionService.list_all_tasks_page). ТОТ ЖЕ
+        FineCheckService.check_task() — никакой отдельной реализации
+        проверки/расчёта штрафов. None — задача не существует."""
+        task = self.get_task_for_trusted_admin(task_id)
+        if task is None:
+            return None
+
+        check_result = await self._check_service.check_task(task)
+
+        return CheckNowOutcome(
+            car_number=task.car_number,
+            check_ok=check_result.status == "ok",
+            fines=check_result.current_fines if check_result.status == "ok" else [],
+            is_owner=False,
+        )
+
+    def list_tasks_for_car(self, car_number: str) -> list[FineMonitoringTask]:
+        """ВСЕ fine_monitoring_tasks с этим car_number, ЛЮБОГО статуса (см.
+        FineMonitoringTaskRepository.list_by_car_number) — источник задач
+        для manager/trusted Search по номеру, включая задачи БЕЗ единого
+        подписчика (см. add_delegated_car_without_client) — такие задачи
+        list_subscriptions_for_car() выше не найдёт вовсе (нет ни одной
+        строки в fine_monitoring_subscriptions), но они всё равно валидный
+        результат поиска по номеру (owner отображается как "—", тот же
+        принцип, что и в manager car list)."""
+        return self._task_repository.list_by_car_number(car_number)
+
+    def list_subscriptions_for_car(self, car_number: str) -> list[FineMonitoringSubscription]:
+        """ВСЕ подписки (любого владельца) на этот car_number, КРОМЕ
+        'archived' (см. FineSubscriptionRepository.list_by_car_number) —
+        источник владельцев для manager/trusted Search по номеру (см.
+        задачу п.6/п.7: "не делать dedup, показать каждую связь отдельно",
+        "использовать наиболее прямую существующую связь с numeric
+        telegram_user_id" — subscription.telegram_user_id ИМЕННО такая
+        связь, прямее, чем "первый активный подписчик", используемый в
+        manager car list). archived исключается тем же принципом, что и у
+        list_my_cars — удалённый пользователем автомобиль не должен
+        находиться Search'ем как всё ещё "его"."""
+        return [
+            subscription for subscription in self._subscription_repository.list_by_car_number(car_number)
+            if subscription.status != "archived"
+        ]
+
     def stop_task_for_trusted_admin(self, task_id: int) -> bool:
         """Task-level ⛔ Остановить мониторинг для trusted-оператора —
         останавливает саму задачу (тот же task_repository.set_status(...,

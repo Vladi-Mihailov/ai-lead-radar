@@ -83,6 +83,18 @@ _SELECT_ALL_PAGE = (
     "FROM turkey_bot_user_cars ORDER BY id DESC LIMIT ? OFFSET ?"
 )
 
+# Manager/trusted Search по номеру (см. задачу "manager/trusted Search") —
+# ВСЕ владельцы этого car_number, БЕЗ dedup (UNIQUE(telegram_user_id,
+# car_number) гарантирует, что один и тот же пользователь не может иметь
+# два раза один номер, но РАЗНЫЕ пользователи — могут, тот же принцип, что
+# и у list_all_page/manager car list). ORDER BY id DESC — та же
+# конвенция.
+_SELECT_BY_CAR_NUMBER = (
+    "SELECT id, telegram_user_id, car_number, created_at, last_checked_at, "
+    "last_overall_status, last_total_amount "
+    "FROM turkey_bot_user_cars WHERE car_number = ? ORDER BY id DESC"
+)
+
 
 def _row_to_car(row) -> TurkeyUserCar:
     car_id, telegram_user_id, car_number, created_at, last_checked_at, last_status, last_total = row
@@ -204,6 +216,16 @@ class TurkeyUserCarsRepository:
         строка это конкретная запись turkey_bot_user_cars, адресуется
         car.id, а не car_number)."""
         rows = self._conn.execute(_SELECT_ALL_PAGE, (limit, offset)).fetchall()
+        return [_row_to_car(row) for row in rows]
+
+    def list_by_car_number(self, car_number: str) -> list[TurkeyUserCar]:
+        """ВСЕ строки с этим car_number, ЛЮБОГО владельца (см. задачу
+        "manager/trusted Search" п.6: "не делать dedup, показать каждую
+        связь отдельно") — для manager-only Search-flow, тот же принцип
+        авторизации, что и list_all_page/get_any_car (is_trusted()
+        проверяется в ConversationController, не здесь). НИКОГДА не
+        использовать в self-service путях."""
+        rows = self._conn.execute(_SELECT_BY_CAR_NUMBER, (car_number,)).fetchall()
         return [_row_to_car(row) for row in rows]
 
     def get_any_car(self, car_id: int) -> TurkeyUserCar | None:

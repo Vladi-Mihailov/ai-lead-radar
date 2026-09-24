@@ -33,8 +33,8 @@ from reader.public_bot.texts import (  # noqa: E402
     ADD_CAR_LABEL,
     CHECK_NOW_LABEL,
     MY_CARS_LABEL,
+    SEARCH_LABEL,
     STATISTICS_LABEL,
-    STOP_LABEL,
     TURKEY_BOT_LINK_LABEL,
     TURKEY_BOT_URL,
 )
@@ -52,7 +52,7 @@ def test_main_menu_keyboard_without_trusted_buttons_by_default():
 
     labels = _labels(keyboard)
     assert STATISTICS_LABEL not in labels
-    assert STOP_LABEL not in labels
+    assert SEARCH_LABEL not in labels
 
 
 def test_main_menu_keyboard_ordinary_user_is_a_2x2_layout():
@@ -71,18 +71,19 @@ def test_main_menu_keyboard_includes_trusted_buttons_for_trusted_operator():
 
     labels = _labels(keyboard)
     assert STATISTICS_LABEL in labels
-    assert STOP_LABEL in labels
+    assert SEARCH_LABEL in labels
 
 
-def test_main_menu_keyboard_manager_puts_statistics_and_stop_in_one_row():
-    """Явное требование задачи "маленький UI-fix": ROW 3 = 📊 Статистика |
-    ⛔ Остановить мониторинг (одна строка, не две отдельные)."""
+def test_main_menu_keyboard_manager_puts_statistics_and_search_in_one_row():
+    """См. задачу "manager/trusted Search": ROW 3 = 📊 Статистика |
+    🔎 Поиск (одна строка, не две отдельные) — заменяет бывшую "⛔
+    Остановить мониторинг"."""
     keyboard = main_menu_keyboard(is_trusted=True)
 
     assert len(keyboard) == 3
     assert [b.button.text for b in keyboard[0]] == [ADD_CAR_LABEL, MY_CARS_LABEL]
     assert [b.button.text for b in keyboard[1]] == [CHECK_NOW_LABEL, TURKEY_BOT_LINK_LABEL]
-    assert [b.button.text for b in keyboard[2]] == [STATISTICS_LABEL, STOP_LABEL]
+    assert [b.button.text for b in keyboard[2]] == [STATISTICS_LABEL, SEARCH_LABEL]
 
 
 def test_main_menu_keyboard_does_not_change_ordinary_user_buttons():
@@ -97,7 +98,7 @@ def test_main_menu_keyboard_does_not_change_ordinary_user_buttons():
         assert label in without
         assert label in with_trusted
 
-    assert len(with_trusted) == len(without) + 2  # + STATISTICS_LABEL + STOP_LABEL
+    assert len(with_trusted) == len(without) + 2  # + STATISTICS_LABEL + SEARCH_LABEL
 
 
 # ==== manager-facing "📋 Мои авто" ON/OFF + "▶️ Продолжить мониторинг"

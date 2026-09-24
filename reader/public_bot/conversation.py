@@ -102,6 +102,9 @@ STEP_AWAITING_PERIOD = "awaiting_period"
 # Trusted-operator task-level 🔎 Проверить сейчас — ввод номера (см.
 # design report: "искать автомобиль в списке неудобно"), а не список.
 STEP_AWAITING_TRUSTED_CHECK_NOW_CAR_NUMBER = "awaiting_trusted_check_now_car_number"
+# Manager/trusted Search (см. задачу "manager/trusted Search") — ввод
+# @username/username/номера, см. _handle_search_query_input.
+STEP_AWAITING_SEARCH_QUERY = "awaiting_search_query"
 
 PERIOD_CHOICES = (30, 90, 180, 365)
 
@@ -134,6 +137,27 @@ _TRUSTED_TASKS_PAGE_SIZE = 10
 # переработку UX) — та же страница в 10 (см. задачу: "существующую
 # pagination 10/page сохранить").
 _MY_CARS_PAGE_SIZE = 10
+
+# Manager/trusted Search (см. задачу "manager/trusted Search" п.11) —
+# "Предпочтительно PAGE_SIZE = 10, если это согласуется с существующими
+# manager screens" — та же величина, что и _TRUSTED_TASKS_PAGE_SIZE/
+# _MY_CARS_PAGE_SIZE выше.
+_SEARCH_PAGE_SIZE = 10
+
+
+@dataclass(frozen=True)
+class _SearchHit:
+    """Одна строка результата manager/trusted Search — ОДНА подписка
+    (или, для delegated-без-клиента задачи без единой подписки, task без
+    owner) — см. ConversationController._resolve_search_hits.
+    owner_telegram_user_id — самая прямая существующая связь с numeric
+    identity (subscription.telegram_user_id), НЕ "первый активный
+    подписчик car_number" (см. задачу п.7: "не определять owner только по
+    car_number, если есть более прямая связь")."""
+
+    task_id: int
+    owner_telegram_user_id: int | None
+    car_number: str
 
 
 @dataclass(frozen=True)
@@ -262,6 +286,29 @@ class BotReply:
     car_delete_confirm_page: int | None = None
     cta_buttons: list[list[tuple[str, str]]] | None = None
     show_turkey_bot_link: bool = False
+
+    # Manager/trusted Search (см. задачу "manager/trusted Search") —
+    # ТОЛЬКО trusted_operator_user_ids, self-service вообще не видит эти
+    # поля. search_prompt — экран ввода запроса (см. texts.SEARCH_ENTRY_TEXT/
+    # keyboards.py::search_entry_keyboard) — единственная кнопка "↩️ Назад"
+    # (encode_search_back_callback). search_result_shown — экран РЕЗУЛЬТАТА
+    # (найден он или нет, см. texts.format_search_results/
+    # format_search_not_found) — показывает [🔎 Новый поиск][↩️ В меню]
+    # (см. keyboards.py::search_result_keyboard), плюс пагинацию, если
+    # search_total_pages > 1. search_query_type ("username"/"car") +
+    # search_query (уже нормализованный, БЕЗ ведущего "@") — достаточно,
+    # чтобы детерминированно пересчитать ЛЮБУЮ страницу заново (см.
+    # ConversationController._format_search_results_reply) — результаты
+    # поиска НЕ кэшируются в conversation_state, каждый page-callback
+    # честно перевыполняет DB-запрос (дёшево) и live-проверку (см. задачу
+    # "manager/trusted Search" — Live check per result) ТОЛЬКО для машин
+    # текущей страницы, а не всех найденных сразу.
+    search_prompt: bool = False
+    search_result_shown: bool = False
+    search_query_type: str | None = None
+    search_query: str | None = None
+    search_page: int | None = None
+    search_total_pages: int | None = None
 
 
 class ConversationController:
@@ -479,6 +526,20 @@ class ConversationController:
                 return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
             return self._format_statistics_reply()
 
+        if stripped_text == texts.SEARCH_LABEL:
+            self._states.clear(chat_id)
+            if not self._is_trusted(telegram_user_id):
+                # Manager/trusted Search (см. задачу) — та же защита, что и
+                # у STATISTICS_LABEL/STOP_LABEL выше: кнопка обычному
+                # пользователю никогда не показывается, но текст можно
+                # отправить вручную — безопасный отказ, никаких
+                # cross-user данных не раскрывается.
+                return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
+            self._states.set(
+                chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_SEARCH_QUERY,
+            )
+            return BotReply(text=texts.SEARCH_ENTRY_TEXT, search_prompt=True)
+
         return None
 
     def _format_statistics_reply(self) -> BotReply:
@@ -657,6 +718,11 @@ class ConversationController:
 
         if state.step == STEP_AWAITING_TRUSTED_CHECK_NOW_CAR_NUMBER:
             return await self._handle_trusted_check_now_car_number_input(
+                stripped, chat_id=chat_id, telegram_user_id=telegram_user_id,
+            )
+
+        if state.step == STEP_AWAITING_SEARCH_QUERY:
+            return await self._handle_search_query_input(
                 stripped, chat_id=chat_id, telegram_user_id=telegram_user_id,
             )
 
@@ -1295,3 +1361,256 @@ class ConversationController:
             return BotReply(text=texts.TRUSTED_STOP_FAILED_TEXT, show_main_menu=True)
 
         return BotReply(text=texts.format_stop_success(task.car_number), show_main_menu=True)
+
+    # ---- manager/trusted Search (см. задачу "manager/trusted Search") —
+    # ТОЛЬКО trusted_operator_user_ids: is_trusted() перепроверяется
+    # ЗАНОВО в КАЖДОМ из методов ниже (вход через SEARCH_LABEL клампит это
+    # один раз в _handle_menu_label, но query-ввод/pagination/New Search/
+    # Back callback'и приходят НАПРЯМУЮ из Telegram, см. задачу п.14) —
+    # тот же authorization-инвариант, что и везде в этом модуле.
+    #
+    # Live check per result (см. задачу): для КАЖДОЙ найденной машины
+    # текущей страницы (НЕ всех найденных сразу — см. _SEARCH_PAGE_SIZE)
+    # выполняется ТА ЖЕ live-проверка police.ge, что и у "🔎 Проверить
+    # сейчас" (SubscriptionService.check_now_task_for_search — тот же
+    # FineCheckService.check_task()) — никакой отдельной "системы расчёта
+    # штрафов": в Georgia-модели НЕТ persisted "текущей суммы долга"
+    # (detected_fines — append-only исторический лог для дедупа
+    # уведомлений, а не "currently owed"), поэтому единственный честный
+    # source of truth "сколько машина должна ПРЯМО СЕЙЧАС" — свежий live
+    # check. Несколько hits, ссылающихся на ОДНУ и ту же task_id (см.
+    # design: "несколько подписок могут указывать на одну и ту же
+    # monitoring_task_id"), проверяются ОДИН раз, а не по разу на hit. ----
+
+    def _parse_search_query(self, raw_text: str) -> tuple[str, str] | None:
+        """None — запрос не похож НИ на @username/username, НИ на номер
+        автомобиля (см. задачу п.3). Ведущий "@" — ВСЕГДА username (см.
+        задачу: "@username" в примере), однозначно, без попытки
+        интерпретировать как номер. БЕЗ "@" — сначала пробуем
+        normalize_car_number (см. задачу: "переиспользовать СУЩЕСТВУЮЩУЮ
+        normalization каждой страны, не создавать вторую реализацию") —
+        похоже на валидный номер (только [A-Z0-9] после нормализации) —
+        car-search; иначе — bare username (normalize_telegram_username,
+        та же функция, что и у trusted delegated Add Car flow). Порядок
+        ("сначала номер") — детерминированный, задокументированный выбор
+        для редкого случая, когда bare-username по форме совпадает с
+        валидным номером (например, короткий alphanumeric username без
+        "_")."""
+        stripped = raw_text.strip()
+        if not stripped:
+            return None
+
+        if stripped.startswith("@"):
+            try:
+                username = normalize_telegram_username(stripped)
+            except UsernameValidationError:
+                return None
+            return "username", username
+
+        try:
+            car_number = normalize_car_number(stripped)
+        except FineValidationError:
+            pass
+        else:
+            return "car", car_number
+
+        try:
+            username = normalize_telegram_username(stripped)
+        except UsernameValidationError:
+            return None
+        return "username", username
+
+    def _resolve_search_hits(self, query_type: str, query: str) -> list[_SearchHit]:
+        if query_type == "username":
+            known = self._known_users.find_by_username(query)
+            if known is None:
+                return []
+            subscriptions = self._subscriptions.list_my_cars(known.telegram_user_id)
+            return [
+                _SearchHit(
+                    task_id=s.monitoring_task_id,
+                    owner_telegram_user_id=known.telegram_user_id,
+                    car_number=s.car_number,
+                )
+                for s in subscriptions
+            ]
+
+        subscriptions = self._subscriptions.list_subscriptions_for_car(query)
+        task_ids_with_subscription = {s.monitoring_task_id for s in subscriptions}
+        hits = [
+            _SearchHit(
+                task_id=s.monitoring_task_id,
+                owner_telegram_user_id=s.telegram_user_id,
+                car_number=s.car_number,
+            )
+            for s in subscriptions
+        ]
+        # Задачи БЕЗ единой подписки (см. add_delegated_car_without_client) —
+        # валидный результат поиска по номеру, owner отображается как "—"
+        # (см. задачу: не dedup, показать КАЖДУЮ связь, включая "связь
+        # отсутствует, но задача существует").
+        for task in self._subscriptions.list_tasks_for_car(query):
+            if task.id not in task_ids_with_subscription:
+                hits.append(
+                    _SearchHit(task_id=task.id, owner_telegram_user_id=None, car_number=task.car_number)
+                )
+        # Стабильный, детерминированный порядок — новые задачи первыми
+        # (та же конвенция id DESC, что и manager car list), owner как
+        # вторичный ключ ТОЛЬКО для полной детерминированности между hits
+        # одной задачи.
+        hits.sort(key=lambda h: (-h.task_id, h.owner_telegram_user_id or 0))
+        return hits
+
+    async def _task_search_check(self, task_id: int) -> tuple[bool, bool, list]:
+        """(monitoring_active, check_ok, fines) для ОДНОЙ task_id — дорогая
+        часть блока (task-статус + live-проверка), кэшируемая по task_id
+        вызывающим кодом (см. _format_search_results_reply) — В ОТЛИЧИЕ от
+        owner-специфичной части (username), которая различается ДАЖЕ для
+        hits, делящих одну task_id (см. design: "несколько подписок могут
+        указывать на одну и ту же monitoring_task_id" — задача явно
+        требует показать КАЖДОГО владельца отдельно, а не только первого)."""
+        task = self._subscriptions.get_task_for_trusted_admin(task_id)
+        monitoring_active = task is not None and task.status == "active"
+
+        outcome = await self._subscriptions.check_now_task_for_search(task_id)
+        check_ok = outcome.check_ok if outcome is not None else False
+        fines = outcome.fines if outcome is not None else []
+        return monitoring_active, check_ok, fines
+
+    def _format_search_block(
+        self,
+        hit: _SearchHit,
+        *,
+        query_type: str,
+        monitoring_active: bool,
+        check_ok: bool,
+        fines: list,
+        checked_at: datetime,
+    ) -> str:
+        # get() может вернуть None, даже если owner_telegram_user_id
+        # задан (владелец известен по subscription, но НИ РАЗУ не писал
+        # ЭТОМУ боту) — format_owner_username_button() корректно даёт "—"
+        # в обоих случаях (owner_telegram_user_id=None ИЛИ known=None).
+        known = self._known_users.get(hit.owner_telegram_user_id) if hit.owner_telegram_user_id is not None else None
+        owner_username = known.telegram_username if known else None
+        owner_display = texts.format_owner_username_button(owner_username)
+
+        lines = [
+            f"🚗 {hit.car_number}" if query_type == "username" else f"👤 {owner_display}",
+            texts.format_search_money_line(check_ok=check_ok, fines=fines),
+            texts.format_search_monitoring_line(monitoring_active=monitoring_active),
+            texts.format_search_checked_at_line(checked_at),
+        ]
+        return "\n".join(lines)
+
+    async def _format_search_results_reply(self, query_type: str, query: str, page: int) -> BotReply:
+        """page — ЛЮБОЕ int (forged/устаревший callback, см. задачу п.14) —
+        клампится здесь же, тот же приём, что и у _format_trusted_tasks_page_reply.
+        Результаты НЕ кэшируются между вызовами (см. класс docstring) —
+        DB-запрос (дёшево) выполняется заново на КАЖДЫЙ page, live-проверка
+        (дорого, сетевой запрос) — ТОЛЬКО для hits текущей страницы.
+
+        query_display для username — АКТУАЛЬНЫЙ known username (корректный
+        регистр из bot_known_users), НЕ введённый пользователем запрос
+        as-is (см. задачу п.5: "username — display/query поле, stable
+        identity — numeric") — "не найдено" fallback использует запрос
+        as-is (единственный доступный вариант, если пользователь неизвестен)."""
+        if query_type == "username":
+            known = self._known_users.find_by_username(query)
+            query_display = f"@{known.telegram_username}" if known else f"@{query}"
+        else:
+            query_display = query
+
+        all_hits = self._resolve_search_hits(query_type, query)
+        if not all_hits:
+            return BotReply(
+                text=texts.format_search_not_found(query_display),
+                search_result_shown=True,
+                search_query_type=query_type,
+                search_query=query,
+                search_page=0,
+                search_total_pages=1,
+            )
+
+        total_pages = -(-len(all_hits) // _SEARCH_PAGE_SIZE)  # ceil division
+        page = max(0, min(page, total_pages - 1))
+        page_hits = all_hits[page * _SEARCH_PAGE_SIZE:page * _SEARCH_PAGE_SIZE + _SEARCH_PAGE_SIZE]
+
+        # Дедуп ТОЛЬКО дорогой части (task-статус + live-проверка) — по
+        # task_id, а не всего блока целиком (owner-часть остаётся
+        # индивидуальной для каждого hit, см. _task_search_check
+        # докстрок). Порядок вызовов сохраняет порядок появления в
+        # page_hits (dict, Python 3.7+ гарантирует insertion order).
+        checked_at = datetime.now(timezone.utc).astimezone(self._tz)
+        task_checks: dict[int, tuple[bool, bool, list]] = {}
+        blocks = []
+        for hit in page_hits:
+            if hit.task_id not in task_checks:
+                task_checks[hit.task_id] = await self._task_search_check(hit.task_id)
+            monitoring_active, check_ok, fines = task_checks[hit.task_id]
+            blocks.append(
+                self._format_search_block(
+                    hit, query_type=query_type, monitoring_active=monitoring_active,
+                    check_ok=check_ok, fines=fines, checked_at=checked_at,
+                )
+            )
+
+        text = texts.format_search_results(query_type=query_type, query_display=query_display, blocks=blocks)
+        if total_pages > 1:
+            text += "\n\n" + texts.format_search_pagination_footer(page=page, total_pages=total_pages)
+
+        return BotReply(
+            text=text,
+            search_result_shown=True,
+            search_query_type=query_type,
+            search_query=query,
+            search_page=page,
+            search_total_pages=total_pages,
+        )
+
+    async def _handle_search_query_input(
+        self, raw_text: str, *, chat_id: int, telegram_user_id: int,
+    ) -> BotReply:
+        if not self._is_trusted(telegram_user_id):
+            self._states.clear(chat_id)
+            return BotReply(text=texts.CALLBACK_NOT_AUTHORIZED_TEXT, show_main_menu=True)
+
+        parsed = self._parse_search_query(raw_text)
+        if parsed is None:
+            # Остаёмся на том же шаге — тот же UX, что и у
+            # _handle_car_number_input/_handle_owner_username_input:
+            # пользователь может ввести запрос заново без повторного
+            # нажатия "🔎 Поиск".
+            return BotReply(
+                text=f"❌ Не удалось распознать запрос.\n\n{texts.SEARCH_ENTRY_TEXT}", search_prompt=True,
+            )
+
+        query_type, query = parsed
+        self._states.clear(chat_id)
+        return await self._format_search_results_reply(query_type, query, 0)
+
+    async def handle_search_page(
+        self, query_type: str, query: str, page: int, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """None — telegram_user_id НЕ trusted (см. задачу п.14: "на каждом
+        callback повторно проверять") — query_type/query из callback_data
+        публичны и НЕ являются доказательством авторизации сами по себе."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+        return await self._format_search_results_reply(query_type, query, page)
+
+    def handle_search_new(self, *, chat_id: int, telegram_user_id: int) -> BotReply | None:
+        """"🔎 Новый поиск" с экрана результата — возвращает на экран ввода
+        запроса (см. handle_text SEARCH_LABEL branch)."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+        self._states.set(chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_SEARCH_QUERY)
+        return BotReply(text=texts.SEARCH_ENTRY_TEXT, search_prompt=True)
+
+    def handle_search_back(self, *, chat_id: int, telegram_user_id: int) -> BotReply | None:
+        """"↩️ Назад"/"↩️ В меню" — возвращает в главное меню, очищая
+        любое незавершённое состояние Search."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+        self._states.clear(chat_id)
+        return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)

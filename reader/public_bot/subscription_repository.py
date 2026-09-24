@@ -167,6 +167,18 @@ _SELECT_ACTIVE_SUBSCRIBERS_FOR_CAR = f"""
     ORDER BY id ASC
 """
 
+# Manager/trusted Search по номеру (см. задачу "manager/trusted Search") —
+# ВСЕ подписчики этого номера, ЛЮБОГО статуса (в отличие от
+# _SELECT_ACTIVE_SUBSCRIBERS_FOR_CAR выше, которая используется только
+# display'ом username владельца в manager car list) — Search должен
+# показывать каждую связь car_number -> user отдельно, не только текущего
+# активного подписчика (см. задачу п.6: "не делать dedup").
+_SELECT_BY_CAR_NUMBER = f"""
+    SELECT {_SELECT_FIELDS} FROM fine_monitoring_subscriptions
+    WHERE car_number = ?
+    ORDER BY id DESC
+"""
+
 _UPDATE_PERIOD = """
 UPDATE fine_monitoring_subscriptions
 SET start_date = :start_date, end_date = :end_date, updated_at = CURRENT_TIMESTAMP
@@ -689,6 +701,16 @@ class FineSubscriptionRepository:
         отображение само решает, как показать "истёк"/"остановлен"/"активен"
         (см. FineMonitoringSubscription.is_effectively_active)."""
         rows = self._conn.execute(_SELECT_BY_USER, (telegram_user_id,)).fetchall()
+        return [_row_to_subscription(row) for row in rows]
+
+    def list_by_car_number(self, car_number: str) -> list[FineMonitoringSubscription]:
+        """ВСЕ подписки на этот car_number, ЛЮБОГО статуса И ЛЮБОГО
+        владельца (см. задачу "manager/trusted Search" п.6: "если
+        car_number связан с несколькими users — не делать dedup, показать
+        каждую связь отдельно") — в отличие от list_active_subscribers_for_car
+        выше (только status='active' AND end_date>=today, используется
+        display'ом ОДНОГО username в manager car list)."""
+        rows = self._conn.execute(_SELECT_BY_CAR_NUMBER, (car_number,)).fetchall()
         return [_row_to_subscription(row) for row in rows]
 
     def list_managed_by_creator(self, created_by_telegram_user_id: int) -> list[FineMonitoringSubscription]:

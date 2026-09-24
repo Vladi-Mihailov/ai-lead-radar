@@ -200,7 +200,16 @@ CANCEL_BUTTON_LABEL = "❌ Отмена"
 ADD_CAR_LABEL = "➕ Добавить авто"
 MY_CARS_LABEL = "📋 Мои авто"
 CHECK_NOW_LABEL = "🔎 Проверить сейчас"
+# ⛔ Остановить мониторинг — БОЛЬШЕ НЕ показывается в manager main menu
+# (см. задачу "manager/trusted Search" п.1/п.16: заменена на SEARCH_LABEL
+# ниже, см. reader/turkey_bot/keyboards.py::main_menu_keyboard) —
+# константа и её underlying-логика (handle_stop_monitoring/
+# TurkeyMonitoringSubscriptionRepository.deactivate_all) сознательно НЕ
+# удалены (задача явно требует "underlying functionality не удалять").
 STOP_MONITORING_LABEL = "⛔ Остановить мониторинг"
+# Manager/trusted Search (см. задачу) — заменяет STOP_MONITORING_LABEL в
+# manager main menu.
+SEARCH_LABEL = "🔎 Поиск"
 # Play/stop-иконки (см. задачу "Адаптация car-centric UX Georgian bot") —
 # ОТЛИЧАЮТСЯ от буквальной формулировки Georgian bot (TURN_OFF_BUTTON_LABEL
 # = "⏸ Выключить мониторинг", pause-иконка) — здесь используется точный
@@ -934,3 +943,78 @@ def format_history_messages(plate: str, runs: list[UnifiedCheckResult]) -> list[
     header = f"📜 История {plate}"
     lines = [_format_history_line(run) for run in runs]
     return _split_into_telegram_messages([header, "\n".join(lines)])
+
+
+# ==== manager/trusted Search (см. задачу "manager/trusted Search") —
+# ТОЛЬКО manager/trusted-operator, self-service вообще не затронут ====
+
+SEARCH_ENTRY_TEXT = (
+    "🔎 Поиск\n\n"
+    "Введите:\n"
+    "• @username пользователя\n"
+    "или\n"
+    "• номер автомобиля\n\n"
+    "Например:\n"
+    "@Mihailov_vm\n"
+    "AA123BB"
+)
+SEARCH_BACK_LABEL = "↩️ Назад"
+SEARCH_NEW_LABEL = "🔎 Новый поиск"
+SEARCH_MENU_LABEL = "↩️ В меню"
+# Та же формулировка, что и reader/public_bot/texts.py::CALLBACK_NOT_AUTHORIZED_TEXT
+# (см. задачу п.14: forged/устаревшее состояние — безопасный отказ, а не
+# падение/раскрытие данных).
+SEARCH_NOT_AUTHORIZED_TEXT = "Это действие недоступно — начните заново через меню."
+
+
+def format_search_not_found(query: str) -> str:
+    return f"🔎 Ничего не найдено\n\nПо запросу:\n{query}"
+
+
+def format_search_monitoring_line(*, monitoring_active: bool) -> str:
+    return f"Мониторинг: {'🟢' if monitoring_active else '⚪'}"
+
+
+def format_search_block(
+    *, query_type: str, owner_display: str, car_number: str,
+    monitoring_active: bool, unified_result: UnifiedCheckResult | None,
+) -> str:
+    """Один блок Search-результата (одна машина/владелец) — ПЕРЕИСПОЛЬЗУЕТ
+    format_unified_check_result() as-is для GİB/Avrasya/KGM/Итого/
+    "Проверено: ..." (см. задачу п.9: "НЕ рассчитывать Turkey total новой
+    формулой внутри Search, переиспользовать существующую production
+    unified-total business logic" — total_amount_for()/derive_overall_status()
+    уже посчитаны ТАМ, где unified_result сохранялся, здесь — только
+    сборка карточки). unified_result=None — для этой машины/владельца ещё
+    не было ни одной проверки (см. TurkeyCheckRunRepository.
+    get_latest_for_owner) — честно показываем "Ещё не проверялось", а НЕ
+    0 ₺/подделанный статус."""
+    lines = [f"🚗 {car_number}" if query_type == "username" else f"👤 {owner_display}"]
+    if unified_result is None:
+        lines.append("Ещё не проверялось")
+    else:
+        # format_unified_check_result() уже включает "🚗 {plate}" первой
+        # строкой — для query_type == "car" это дублирует заголовок блока
+        # выше (👤 owner), что приемлемо (полная, самодостаточная карточка
+        # на каждый блок, см. reader/public_bot/texts.py::
+        # format_search_results — тот же принцип группировки).
+        lines.append(format_unified_check_result(unified_result))
+    lines.append(format_search_monitoring_line(monitoring_active=monitoring_active))
+    return "\n".join(lines)
+
+
+def format_search_results(*, query_type: str, query_display: str, blocks: list[str]) -> str:
+    """query_type — "username" (заголовок "👤 {query_display}", каждый
+    block начинается со своего "🚗 CAR_NUMBER") или "car" (заголовок
+    "🚗 {query_display}", каждый block начинается со своего
+    "👤 @username/—") — тот же принцип, что и
+    reader/public_bot/texts.py::format_search_results (Georgian bot)."""
+    title = "🔎 Результат поиска" if len(blocks) == 1 else "🔎 Результаты поиска"
+    header_icon = "👤" if query_type == "username" else "🚗"
+    lines = [title, "", f"{header_icon} {query_display}", ""]
+    lines.append("\n\n".join(blocks))
+    return "\n".join(lines)
+
+
+def format_search_pagination_footer(*, page: int, total_pages: int) -> str:
+    return f"Страница {page + 1} из {total_pages}"

@@ -56,6 +56,7 @@ from reader.turkey_bot.texts import (
     HELP_LABEL,
     HISTORY_LABEL,
     MY_CARS_LABEL,
+    SEARCH_LABEL,
     STATISTICS_LABEL,
     STOP_MONITORING_LABEL,
 )
@@ -100,13 +101,18 @@ def test_regular_user_main_menu_layout():
 
 
 def test_manager_main_menu_layout():
+    """См. задачу "manager/trusted Search": SEARCH_LABEL заменяет бывшую
+    STOP_MONITORING_LABEL в этой строке (константа/underlying flow
+    остаются, см. reader/turkey_bot/keyboards.py::main_menu_keyboard)."""
     rows = main_menu_keyboard(is_trusted=True)
     grid = _reply_button_texts(rows)
 
     assert grid[0] == [ADD_CAR_LABEL, MY_CARS_LABEL]
-    assert grid[1] == [CHECK_NOW_LABEL, STOP_MONITORING_LABEL]
+    assert grid[1] == [CHECK_NOW_LABEL, SEARCH_LABEL]
     assert grid[2] == [STATISTICS_LABEL, GEORGIAN_BOT_LINK_LABEL]
     assert grid[3] == [HELP_LABEL]
+    flat = [label for row in grid for label in row]
+    assert STOP_MONITORING_LABEL not in flat
 
 
 def test_georgian_bot_link_keyboard_is_a_url_button():

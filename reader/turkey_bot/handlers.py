@@ -28,6 +28,9 @@ from reader.turkey_bot.keyboards import (
     decode_manager_car_open_callback,
     decode_manager_car_toggle_callback,
     decode_manager_cars_page_callback,
+    decode_search_back_callback,
+    decode_search_new_callback,
+    decode_search_page_callback,
     encode_car_open_callback,
     georgian_bot_link_keyboard,
     help_menu_keyboard,
@@ -36,6 +39,8 @@ from reader.turkey_bot.keyboards import (
     manager_car_detail_keyboard,
     manager_cars_page_keyboard,
     my_cars_list_keyboard,
+    search_entry_keyboard,
+    search_result_keyboard,
 )
 from reader.turkey_bot.known_users_repository import TurkeyBotKnownUsersRepository
 from reader.turkey_bot.texts import BACK_LABEL, UNKNOWN_BUTTON_TEXT
@@ -191,6 +196,35 @@ def register(
             await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
             return
 
+        search_page = decode_search_page_callback(event.data)
+        if search_page is not None:
+            query_type, query, page = search_page
+            reply = controller.handle_search_page(query_type, query, page, telegram_user_id=event.sender_id)
+            if reply is None:
+                await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
+                return
+            await event.answer()
+            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            return
+
+        if decode_search_new_callback(event.data):
+            reply = controller.handle_search_new(chat_id=event.chat_id, telegram_user_id=event.sender_id)
+            if reply is None:
+                await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
+                return
+            await event.answer()
+            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            return
+
+        if decode_search_back_callback(event.data):
+            reply = controller.handle_search_back(chat_id=event.chat_id, telegram_user_id=event.sender_id)
+            if reply is None:
+                await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
+                return
+            await event.answer()
+            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            return
+
         await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
 
     logger.info("✔ Turkey bot handlers зарегистрированы")
@@ -238,6 +272,14 @@ def _first_message_buttons(reply: BotReply, *, is_trusted: bool, has_extra: bool
         return [[Button.inline(BACK_LABEL, encode_car_open_callback(reply.back_to_car_id))]]
     if reply.show_georgian_bot_link:
         return georgian_bot_link_keyboard()
+    if reply.search_prompt:
+        # Manager/trusted Search (см. задачу) — экран ввода запроса.
+        return search_entry_keyboard()
+    if reply.search_result_shown:
+        return search_result_keyboard(
+            query_type=reply.search_query_type, query=reply.search_query,
+            page=reply.search_page, total_pages=reply.search_total_pages,
+        )
     if reply.help_keyboard == "menu":
         return help_menu_keyboard()
     if reply.help_keyboard == "section":

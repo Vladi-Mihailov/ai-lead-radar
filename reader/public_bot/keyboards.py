@@ -43,8 +43,11 @@ from reader.public_bot.texts import (
     DELETE_CAR_BUTTON_LABEL,
     DELETE_CAR_CONFIRM_BUTTON_LABEL,
     MY_CARS_LABEL,
+    SEARCH_BACK_LABEL,
+    SEARCH_LABEL,
+    SEARCH_MENU_LABEL,
+    SEARCH_NEW_LABEL,
     STATISTICS_LABEL,
-    STOP_LABEL,
     TURKEY_BOT_LINK_LABEL,
     TURKEY_BOT_URL,
     TURN_OFF_BUTTON_LABEL,
@@ -95,22 +98,22 @@ _MY_CAR_DELETE_NO_PREFIX = b"mycardelno:"
 
 
 def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
-    """is_trusted — управляет STOP_LABEL/STATISTICS_LABEL, доступными
+    """is_trusted — управляет SEARCH_LABEL/STATISTICS_LABEL, доступными
     только trusted_operator_user_ids (см. reader/public_bot/handlers.py —
     единственное место, откуда сюда приходит True):
 
-    - "⛔ Остановить мониторинг" — для обычного пользователя эта кнопка
-      стала избыточной (car-centric ON/OFF в "📋 Мои авто" её заменяет
-      целиком, см. design report п.8), но trusted-оператору всё ещё нужна:
-      она ведёт к ЕГО ОТДЕЛЬНОМУ, task-level admin flow (см.
-      ConversationController._build_trusted_stop_picker_reply/
-      handle_trusted_stop_pick), который умеет останавливать ЛЮБУЮ задачу
-      мониторинга (включая операторские, без единой client-подписки) — то,
-      что car-centric UX (subscription-based) заведомо не покрывает;
+    - "🔎 Поиск" (SEARCH_LABEL) — см. задачу "manager/trusted Search":
+      заменяет здесь бывшую "⛔ Остановить мониторинг" (STOP_LABEL, см.
+      reader/public_bot/texts.py — константа и весь underlying flow
+      сознательно НЕ удалены, задача явно требует "underlying
+      functionality не удалять", просто эта кнопка ей больше не ведёт) —
+      per-car ON/OFF в manager "📋 Мои авто" [STATUS] кнопке остаётся
+      единственным штатным способом остановить мониторинг конкретной
+      машины;
     - "📊 Статистика" — как и раньше, обычный клиент её никогда не видит.
 
-    Обе trusted-only кнопки — ОДНА последняя строка (см. design report
-    "маленький UI-fix": "📊 Статистика | ⛔ Остановить мониторинг").
+    Обе trusted-only кнопки — ОДНА последняя строка (тот же layout, что
+    и раньше у "📊 Статистика | ⛔ Остановить мониторинг").
 
     "🇹🇷 Штрафы Турции" (TURKEY_BOT_LINK_LABEL) — ОБЫЧНАЯ reply-кнопка
     (Button.text, см. design report "унификация UI": переход в Turkey-бот
@@ -126,7 +129,7 @@ def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
         [Button.text(CHECK_NOW_LABEL, resize=True), Button.text(TURKEY_BOT_LINK_LABEL, resize=True)],
     ]
     if is_trusted:
-        rows.append([Button.text(STATISTICS_LABEL, resize=True), Button.text(STOP_LABEL, resize=True)])
+        rows.append([Button.text(STATISTICS_LABEL, resize=True), Button.text(SEARCH_LABEL, resize=True)])
     return rows
 
 
@@ -546,3 +549,96 @@ def owner_fine_cta_buttons(contact_username: str) -> list[list[Button]]:
         Button.url(_PAYMENT_HELP_BUTTON_LABEL, url),
         Button.url(_INSURANCE_BUTTON_LABEL, url),
     ]]
+
+
+# ==== manager/trusted Search (см. задачу "manager/trusted Search") —
+# ТОЛЬКО trusted-facing клавиатуры, self-service не затронут. Query
+# (username/car_number) кодируется В ОТКРЫТУЮ в callback_data — тот же
+# принцип, что и везде в этом модуле: query публичен, НЕ является
+# доказательством авторизации (is_trusted() перепроверяется на каждом
+# handle_search_* заново, см. reader/public_bot/conversation.py). Оба
+# нормализованных формата (username — reader/public_bot/validation.py::
+# normalize_telegram_username, car_number — reader/fines/validation.py::
+# normalize_car_number) никогда не содержат ":" — split(":") безопасен. ====
+
+_SEARCH_BACK_CALLBACK = b"searchback"
+_SEARCH_NEW_CALLBACK = b"searchnew"
+_SEARCH_PAGE_PREFIX = b"searchpage:"
+_SEARCH_QUERY_TYPES = ("username", "car")
+
+
+def encode_search_back_callback() -> bytes:
+    return _SEARCH_BACK_CALLBACK
+
+
+def decode_search_back_callback(data: bytes | None) -> bool:
+    return data == _SEARCH_BACK_CALLBACK
+
+
+def encode_search_new_callback() -> bytes:
+    return _SEARCH_NEW_CALLBACK
+
+
+def decode_search_new_callback(data: bytes | None) -> bool:
+    return data == _SEARCH_NEW_CALLBACK
+
+
+def encode_search_page_callback(query_type: str, query: str, page: int) -> bytes:
+    return _SEARCH_PAGE_PREFIX + f"{query_type}:{query}:{page}".encode()
+
+
+def decode_search_page_callback(data: bytes | None) -> tuple[str, str, int] | None:
+    """None для чего угодно, кроме РОВНО трёх сегментов с query_type из
+    _SEARCH_QUERY_TYPES (allowlist, тот же принцип, что и у
+    decode_trusted_task_period_callback — не доверяет произвольному
+    query_type/пустому query из чужого/подделанного callback_data)."""
+    if not data or not data.startswith(_SEARCH_PAGE_PREFIX):
+        return None
+    try:
+        remainder = data[len(_SEARCH_PAGE_PREFIX):].decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None
+    parts = remainder.split(":")
+    if len(parts) != 3:
+        return None
+    query_type, query, page_text = parts
+    if query_type not in _SEARCH_QUERY_TYPES or not query:
+        return None
+    try:
+        page = int(page_text)
+    except ValueError:
+        return None
+    return query_type, query, page
+
+
+def search_entry_keyboard() -> list[list[Button]]:
+    """Экран ввода запроса (см. texts.SEARCH_ENTRY_TEXT) — единственная
+    кнопка "↩️ Назад", возвращает в главное меню."""
+    return [[Button.inline(SEARCH_BACK_LABEL, encode_search_back_callback())]]
+
+
+def search_result_keyboard(
+    *, query_type: str, query: str, page: int, total_pages: int,
+) -> list[list[Button]]:
+    """Экран результата (найден он или нет, см. texts.format_search_results/
+    format_search_not_found) — пагинация (если total_pages > 1, тот же
+    приём "Back на первой/Next на последней — no-op", что и у
+    trusted_tasks_page_keyboard) + [🔎 Новый поиск][↩️ В меню]. "↩️ В
+    меню" переиспользует ТОТ ЖЕ callback, что и "↩️ Назад" на экране
+    ввода (encode_search_back_callback) — оба ведут в главное меню,
+    разный текст кнопки под разный экран, одна и та же серверная логика
+    (handle_search_back)."""
+    rows = []
+    if total_pages > 1:
+        back_page = max(page - 1, 0)
+        next_page = min(page + 1, total_pages - 1)
+        rows.append([
+            Button.inline("◀️ Назад", encode_search_page_callback(query_type, query, back_page)),
+            Button.inline(f"{page + 1} / {total_pages}", encode_search_page_callback(query_type, query, page)),
+            Button.inline("Вперёд ▶️", encode_search_page_callback(query_type, query, next_page)),
+        ])
+    rows.append([
+        Button.inline(SEARCH_NEW_LABEL, encode_search_new_callback()),
+        Button.inline(SEARCH_MENU_LABEL, encode_search_back_callback()),
+    ])
+    return rows

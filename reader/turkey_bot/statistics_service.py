@@ -111,3 +111,11 @@ class TurkeyStatisticsService:
         переиспользует уже открытый here known_users_repository вместо
         нового constructor-параметра в ConversationController."""
         return self._known_users.get_username(telegram_user_id)
+
+    def find_username(self, username: str) -> tuple[int, str] | None:
+        """Прокси к TurkeyBotKnownUsersRepository.find_by_username() — тот
+        же приём, что и get_known_username() выше, для manager/trusted
+        Search (см. задачу "manager/trusted Search" — @username -> numeric
+        telegram_user_id), без нового constructor-параметра в
+        ConversationController."""
+        return self._known_users.find_by_username(username)

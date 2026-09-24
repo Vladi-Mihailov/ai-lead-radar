@@ -175,6 +175,32 @@ class TurkeyCheckRunRepository:
         results = [self.get_run(run_id) for run_id in run_ids]
         return [r for r in results if r is not None]
 
+    def get_latest_for_owner(
+        self, *, plate: str, telegram_user_id: int,
+    ) -> UnifiedCheckResult | None:
+        """Последний ЗАВЕРШЁННЫЙ unified-check ИМЕННО этого владельца этой
+        машины (см. задачу "manager/trusted Search" п.9: "переиспользовать
+        существующую production unified-total business logic" — читает уже
+        сохранённый UnifiedCheckResult как есть, никакой новой проверки не
+        запускает и ничего не пересчитывает). В отличие от list_by_plate()
+        выше (только plate, БЕЗ фильтра по владельцу — течёт между
+        разными пользователями одного car_number), здесь ОБЯЗАТЕЛЬНО и
+        plate, И telegram_user_id — turkey_check_runs не имеет FK на
+        turkey_bot_user_cars (см. модуль docstring), пишущий код (ручная
+        проверка/плановый мониторинг) всегда сохраняет ИМЕННО владельца
+        (см. conversation.py::_run_manual_check/monitoring_service.py),
+        поэтому (plate, telegram_user_id) — корректный составной ключ для
+        "последний результат для конкретной строки turkey_bot_user_cars".
+        None — для этой пары ещё не было ни одной проверки."""
+        row = self._conn.execute(
+            "SELECT id FROM turkey_check_runs WHERE plate = ? AND telegram_user_id = ? "
+            "ORDER BY finished_at DESC, id DESC LIMIT 1",
+            (plate, telegram_user_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return self.get_run(row[0])
+
     def get_last_successful_provider_result(
         self, plate: str, provider: str,
     ) -> ProviderCheckResult | None:

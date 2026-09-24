@@ -89,6 +89,18 @@ _SELECT_ACTIVE_BY_CAR = f"""
     WHERE car_number = ? AND status = 'active'
 """
 
+# Manager/trusted Search по номеру (см. задачу "manager/trusted Search") —
+# БЕЗ фильтра по status (в отличие от _SELECT_ACTIVE_BY_CAR выше) — Search
+# должен находить и OFF/completed задачи, тот же принцип, что и у
+# _SELECT_ALL_PAGE manager car list. ORDER BY id DESC — та же, уже
+# устоявшаяся конвенция "новые сначала" (см. root cause report про
+# _SELECT_ALL_PAGE).
+_SELECT_BY_CAR_NUMBER = f"""
+    SELECT {_SELECT_FIELDS} FROM fine_monitoring_tasks
+    WHERE car_number = ?
+    ORDER BY id DESC
+"""
+
 _SELECT_ACTIVE_BY_SCOPE = f"""
     SELECT {_SELECT_FIELDS} FROM fine_monitoring_tasks
     WHERE status = 'active' AND monitoring_scope = ?
@@ -342,6 +354,14 @@ class FineMonitoringTaskRepository:
 
     def get_active_by_car_number(self, car_number: str) -> list[FineMonitoringTask]:
         rows = self._conn.execute(_SELECT_ACTIVE_BY_CAR, (car_number,)).fetchall()
+        return [_row_to_task(row) for row in rows]
+
+    def list_by_car_number(self, car_number: str) -> list[FineMonitoringTask]:
+        """Как get_active_by_car_number(), но ЛЮБОГО status (см.
+        _SELECT_BY_CAR_NUMBER выше) — manager/trusted Search должен
+        находить и OFF/completed задачи, не только active (тот же принцип,
+        что и list_all_page для manager car list)."""
+        rows = self._conn.execute(_SELECT_BY_CAR_NUMBER, (car_number,)).fetchall()
         return [_row_to_task(row) for row in rows]
 
     def list_active_page(self, *, offset: int, limit: int) -> list[FineMonitoringTask]:

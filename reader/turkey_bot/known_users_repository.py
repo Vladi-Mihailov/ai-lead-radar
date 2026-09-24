@@ -42,6 +42,16 @@ _SELECT_ALL_ORDERED = (
     "ORDER BY first_seen_at ASC, telegram_user_id ASC"
 )
 
+# Manager/trusted Search по @username (см. задачу "manager/trusted
+# Search", тот же приём, что и reader/public_bot/known_users_repository.py::
+# _SELECT_BY_USERNAME) — COLLATE NOCASE для case-insensitive сравнения,
+# самый свежий по last_seen_at при коллизии.
+_SELECT_BY_USERNAME = (
+    "SELECT telegram_user_id, telegram_username FROM turkey_bot_known_users "
+    "WHERE telegram_username = ? COLLATE NOCASE "
+    "ORDER BY last_seen_at DESC LIMIT 1"
+)
+
 
 class TurkeyBotKnownUsersRepository:
     def __init__(self, db_path: Path | str):
@@ -91,6 +101,18 @@ class TurkeyBotKnownUsersRepository:
         if row is None:
             return None
         return row[2]  # telegram_username, см. _SELECT column order
+
+    def find_by_username(self, username: str) -> tuple[int, str] | None:
+        """(telegram_user_id, telegram_username) — case-insensitive lookup
+        по username (см. задачу "manager/trusted Search"), НЕ по numeric
+        telegram_user_id (тот — get_username() выше). Вызывающий код
+        (ConversationController) передаёт уже trim'ленный, без ведущего
+        "@" username. None — ни один известный пользователь этого бота не
+        писал под этим username."""
+        row = self._conn.execute(_SELECT_BY_USERNAME, (username,)).fetchone()
+        if row is None:
+            return None
+        return row[0], row[1]
 
     def count_total(self) -> int:
         """Всего уникальных Telegram user id, когда-либо написавших ЭТОМУ
