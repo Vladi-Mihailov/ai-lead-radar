@@ -988,16 +988,26 @@ def format_search_block(
     сборка карточки). unified_result=None — для этой машины/владельца ещё
     не было ни одной проверки (см. TurkeyCheckRunRepository.
     get_latest_for_owner) — честно показываем "Ещё не проверялось", а НЕ
-    0 ₺/подделанный статус."""
-    lines = [f"🚗 {car_number}" if query_type == "username" else f"👤 {owner_display}"]
+    0 ₺/подделанный статус.
+
+    query_type == "car": блок ВСЕГДА начинается с "👤 {owner_display}" —
+    format_unified_check_result() ничего не знает про владельца, номер
+    машины при этом придёт ЕЁ первой строкой ("🚗 {plate}"), без
+    дублирования. query_type == "username": номер машины НЕ добавляется
+    здесь отдельно, если unified_result есть — format_unified_check_result()
+    уже открывается строкой "🚗 {plate}" (иначе получилось бы "🚗 X" два
+    раза подряд); "🚗 {car_number}" добавляется ТОЛЬКО когда unified_result
+    is None (там format_unified_check_result() вообще не вызывается — это
+    единственный источник номера машины в блоке)."""
+    lines = []
+    if query_type == "car":
+        lines.append(f"👤 {owner_display}")
+    elif unified_result is None:
+        lines.append(f"🚗 {car_number}")
+
     if unified_result is None:
         lines.append("Ещё не проверялось")
     else:
-        # format_unified_check_result() уже включает "🚗 {plate}" первой
-        # строкой — для query_type == "car" это дублирует заголовок блока
-        # выше (👤 owner), что приемлемо (полная, самодостаточная карточка
-        # на каждый блок, см. reader/public_bot/texts.py::
-        # format_search_results — тот же принцип группировки).
         lines.append(format_unified_check_result(unified_result))
     lines.append(format_search_monitoring_line(monitoring_active=monitoring_active))
     return "\n".join(lines)

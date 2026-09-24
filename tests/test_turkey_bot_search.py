@@ -204,6 +204,26 @@ async def test_search_by_username_shows_all_cars(fx):
     assert "🔎 Результаты поиска" in reply.text
 
 
+async def test_search_by_username_does_not_duplicate_plate_line(fx):
+    """format_unified_check_result() уже открывается строкой "🚗 {plate}"
+    — username-mode блок не должен добавлять её ещё раз поверх (см.
+    texts.format_search_block докстрок про "🚗 X" два раза подряд)."""
+    fx.add_car(telegram_user_id=777, car_number="M295YB196")
+    fx.record_known(telegram_user_id=777, username="alenaogir")
+    result = _make_unified_result(
+        "M295YB196", (
+            _provider("gib", status=ProviderStatus.NO_DEBT),
+            _provider("avrasya", status=ProviderStatus.NO_DEBT),
+            _provider("kgm", status=ProviderStatus.NO_DEBT),
+        ),
+    )
+    fx.save_run(telegram_user_id=777, result=result)
+
+    reply = await _search(fx, "@alenaogir")
+
+    assert reply.text.count("M295YB196") == 1
+
+
 # ---- 11. plate -> correct owner ----
 
 
