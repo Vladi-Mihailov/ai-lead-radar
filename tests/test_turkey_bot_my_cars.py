@@ -8,11 +8,17 @@ from decimal import Decimal
 
 import pytest
 
+from reader.turkey_bot import texts
 from reader.turkey_bot.conversation import ConversationController
 from reader.turkey_bot.conversation_state_repository import (
     TurkeyConversationStateRepository,
 )
-from reader.turkey_bot.keyboards import car_card_keyboard, my_cars_list_keyboard
+from reader.turkey_bot.keyboards import (
+    car_card_keyboard,
+    manager_car_detail_keyboard,
+    manager_cars_page_keyboard,
+    my_cars_list_keyboard,
+)
 from reader.turkey_bot.known_users_repository import TurkeyBotKnownUsersRepository
 from reader.turkey_bot.monitoring.subscription_repository import (
     TurkeyMonitoringSubscriptionRepository,
@@ -79,6 +85,26 @@ def _make_controller(check_service):
     statistics = TurkeyStatisticsService(known_users, runs, subscriptions)
     controller = ConversationController(states, garage, runs, subscriptions, statistics, check_service)
     return controller, garage, runs
+
+
+_TRUSTED_ID = 5712994689
+
+
+def _make_manager_controller(check_service, *, trusted_operator_user_ids=frozenset({_TRUSTED_ID})):
+    """Как _make_controller(), но с доступом к known_users (для
+    record_seen в тестах) и с trusted_operator_user_ids — см. задачу
+    "Реализуем manager/trusted 'Мои автомобили' для Turkey bot"."""
+    states = TurkeyConversationStateRepository(":memory:")
+    garage = TurkeyUserCarsRepository(":memory:")
+    runs = TurkeyCheckRunRepository(":memory:")
+    subscriptions = TurkeyMonitoringSubscriptionRepository(":memory:")
+    known_users = TurkeyBotKnownUsersRepository(":memory:")
+    statistics = TurkeyStatisticsService(known_users, runs, subscriptions)
+    controller = ConversationController(
+        states, garage, runs, subscriptions, statistics, check_service,
+        trusted_operator_user_ids=frozenset(trusted_operator_user_ids),
+    )
+    return controller, garage, runs, subscriptions, known_users
 
 
 async def _add_car(controller, plate="A123AA123"):
@@ -336,3 +362,194 @@ async def test_history_shows_past_checks_after_manual_check():
     reply = await controller.handle_car_action("history", car_id, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     assert "500" in reply.text
+
+
+# ==== manager/trusted-operator "🚗 Мои автомобили" (см. задачу "Реализуем
+# manager/trusted 'Мои автомобили' для Turkey bot") ====
+
+
+def _no_debt_check_service():
+    return _FakeCheckService(_make_result("X", overall=OverallStatus.NO_DEBT, total=Decimal(0)))
+
+
+async def test_my_cars_label_routes_trusted_operator_to_manager_flow():
+    """A. trusted 5712994689: MY_CARS_LABEL -> manager flow."""
+    controller, garage, _runs, _subs, _known = _make_manager_controller(_no_debt_check_service())
+    garage.add_car(telegram_user_id=999, car_number="A123AA123")
+
+    reply = await controller.handle_text(texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
+
+    assert reply.manager_cars_page_options is not None
+    assert reply.my_cars is None
+
+
+async def test_my_cars_label_routes_ordinary_user_to_self_service_flow():
+    """B. Обычный пользователь: MY_CARS_LABEL -> старый self-service flow,
+    БЕЗ изменений (регресс)."""
+    controller, garage, _runs, _subs, _known = _make_manager_controller(_no_debt_check_service())
+    garage.add_car(telegram_user_id=_USER_ID, car_number="A123AA123")
+
+    reply = await controller.handle_text(texts.MY_CARS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
+
+    assert reply.my_cars is not None
+    assert len(reply.my_cars) == 1
+    assert reply.my_cars[0].car_number == "A123AA123"
+    assert reply.manager_cars_page_options is None
+
+
+async def test_manager_cars_empty_when_no_cars_at_all():
+    controller, _garage, _runs, _subs, _known = _make_manager_controller(_no_debt_check_service())
+
+    reply = await controller.handle_text(texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
+
+    assert "Автомобилей пока нет" in reply.text
+    assert reply.manager_cars_page_options is None
+
+
+async def test_manager_cars_shows_cars_from_multiple_owners():
+    """C. Manager видит автомобили нескольких telegram_user_id."""
+    controller, garage, _runs, _subs, _known = _make_manager_controller(_no_debt_check_service())
+    garage.add_car(telegram_user_id=111, car_number="A111AA111")
+    garage.add_car(telegram_user_id=222, car_number="B222BB222")
+
+    reply = await controller.handle_text(texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
+
+    labels = {label for _id, label, _on in reply.manager_cars_page_options}
+    assert "A111AA111" in labels
+    assert "B222BB222" in labels
+
+
+async def test_manager_cars_shows_owner_username_when_known():
+    """D. username отображается: CAR_NUMBER @username."""
+    controller, garage, _runs, _subs, known_users = _make_manager_controller(_no_debt_check_service())
+    garage.add_car(telegram_user_id=333, car_number="M295YB196")
+    known_users.record_seen(telegram_user_id=333, telegram_chat_id=333, telegram_username="Mihailov_vm")
+
+    reply = await controller.handle_text(texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
+
+    labels = {label for _id, label, _on in reply.manager_cars_page_options}
+    assert "M295YB196 @Mihailov_vm" in labels
+
+
+async def test_manager_cars_hides_username_when_unknown():
+    """E. username=None: только CAR_NUMBER, без @None/None/пустого @."""
+    controller, garage, _runs, _subs, _known = _make_manager_controller(_no_debt_check_service())
+    garage.add_car(telegram_user_id=333, car_number="M295YB196")
+    # record_seen НЕ вызывается — владелец никогда не писал боту.
+
+    reply = await controller.handle_text(texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
+
+    labels = {label for _id, label, _on in reply.manager_cars_page_options}
+    assert "M295YB196" in labels
+    assert not any("@" in label or "None" in label for label in labels)
+
+
+async def test_manager_cars_same_plate_different_owners_are_separate_rows():
+    """F. Одинаковый car_number у двух пользователей: две отдельные
+    строки, правильные owner usernames, callbacks не конфликтуют (см.
+    задачу п.6 — адресация по car.id, а не car_number)."""
+    controller, garage, _runs, _subs, known_users = _make_manager_controller(_no_debt_check_service())
+    car_a = garage.add_car(telegram_user_id=111, car_number="A123AA123")
+    car_b = garage.add_car(telegram_user_id=222, car_number="A123AA123")
+    known_users.record_seen(telegram_user_id=111, telegram_chat_id=111, telegram_username="owner_one")
+    known_users.record_seen(telegram_user_id=222, telegram_chat_id=222, telegram_username="owner_two")
+    assert car_a.id != car_b.id
+
+    reply = await controller.handle_text(texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
+
+    label_by_id = {car_id: label for car_id, label, _on in reply.manager_cars_page_options}
+    assert label_by_id[car_a.id] == "A123AA123 @owner_one"
+    assert label_by_id[car_b.id] == "A123AA123 @owner_two"
+
+    detail_a = controller.handle_manager_car_open(car_a.id, 0, telegram_user_id=_TRUSTED_ID)
+    detail_b = controller.handle_manager_car_open(car_b.id, 0, telegram_user_id=_TRUSTED_ID)
+    assert "owner_one" in detail_a.text
+    assert "owner_two" not in detail_a.text
+    assert "owner_two" in detail_b.text
+    assert "owner_one" not in detail_b.text
+
+
+async def test_manager_cars_pagination_next_back_and_boundaries():
+    """G. Pagination: >10 записей, next/back, границы страниц."""
+    controller, garage, _runs, _subs, _known = _make_manager_controller(_no_debt_check_service())
+    for i in range(15):
+        garage.add_car(telegram_user_id=1000 + i, car_number=f"P{i:03d}AA01")
+
+    page0 = await controller.handle_text(texts.MY_CARS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
+    assert len(page0.manager_cars_page_options) == 10
+    assert page0.manager_cars_total_pages == 2
+    assert page0.manager_cars_page == 0
+
+    page1 = controller.handle_manager_cars_page(1, telegram_user_id=_TRUSTED_ID)
+    assert len(page1.manager_cars_page_options) == 5
+    assert page1.manager_cars_page == 1
+
+    back_to_0 = controller.handle_manager_cars_page(0, telegram_user_id=_TRUSTED_ID)
+    assert back_to_0.manager_cars_page == 0
+
+    clamped_low = controller.handle_manager_cars_page(-5, telegram_user_id=_TRUSTED_ID)
+    assert clamped_low.manager_cars_page == 0
+
+    clamped_high = controller.handle_manager_cars_page(999, telegram_user_id=_TRUSTED_ID)
+    assert clamped_high.manager_cars_page == 1
+
+    # страницы не пересекаются (15 машин суммарно, без дублей)
+    ids_page0 = {car_id for car_id, _label, _on in page0.manager_cars_page_options}
+    ids_page1 = {car_id for car_id, _label, _on in page1.manager_cars_page_options}
+    assert ids_page0.isdisjoint(ids_page1)
+    assert len(ids_page0 | ids_page1) == 15
+
+
+async def test_manager_toggle_affects_owner_subscription_not_manager():
+    """6. Toggle действует от имени ВЛАДЕЛЬЦА, а не менеджера — см. задачу
+    п.5 "не подменять owner вызывающим manager user_id"."""
+    controller, garage, _runs, subscriptions, _known = _make_manager_controller(_no_debt_check_service())
+    car = garage.add_car(telegram_user_id=333, car_number="M295YB196")
+    assert subscriptions.get(telegram_user_id=333, plate="M295YB196") is None
+
+    reply = controller.handle_manager_car_toggle(car.id, 0, telegram_user_id=_TRUSTED_ID)
+
+    owner_sub = subscriptions.get(telegram_user_id=333, plate="M295YB196")
+    assert owner_sub is not None
+    assert owner_sub.active is True
+    assert subscriptions.get(telegram_user_id=_TRUSTED_ID, plate="M295YB196") is None
+    status_by_id = {car_id: on for car_id, _label, on in reply.manager_cars_page_options}
+    assert status_by_id[car.id] is True
+
+    reply2 = controller.handle_manager_car_toggle(car.id, 0, telegram_user_id=_TRUSTED_ID)
+    owner_sub2 = subscriptions.get(telegram_user_id=333, plate="M295YB196")
+    assert owner_sub2.active is False
+    status_by_id2 = {car_id: on for car_id, _label, on in reply2.manager_cars_page_options}
+    assert status_by_id2[car.id] is False
+
+
+async def test_manager_callbacks_reject_non_trusted_user():
+    """H. Обычный пользователь не может вызвать manager callback вручную
+    и получить cross-user данные — trusted проверяется не только при
+    входе через меню, но и на pagination/open/toggle callbacks напрямую."""
+    controller, garage, _runs, subscriptions, _known = _make_manager_controller(_no_debt_check_service())
+    car = garage.add_car(telegram_user_id=333, car_number="M295YB196")
+
+    assert controller.handle_manager_cars_page(0, telegram_user_id=_USER_ID) is None
+    assert controller.handle_manager_car_open(car.id, 0, telegram_user_id=_USER_ID) is None
+    assert controller.handle_manager_car_toggle(car.id, 0, telegram_user_id=_USER_ID) is None
+
+    # forged car_id (чужой, не self-service владение) + не-trusted -> ничего не изменилось
+    assert subscriptions.get(telegram_user_id=333, plate="M295YB196") is None
+
+
+async def test_manager_cars_page_keyboard_labels_and_callbacks():
+    """Прямая проверка keyboard-builder'а (референс —
+    reader/public_bot/keyboards.py::trusted_tasks_page_keyboard) — левая
+    кнопка несёт готовый car_label (номер + опционально @username),
+    правая — 🟢/⚪ БЕЗ даты/периода (Turkey monitoring бессрочен)."""
+    options = [(1, "A123AA123 @owner", True), (2, "B456BB456", False)]
+    rows = manager_cars_page_keyboard(options, page=0, total_pages=1)
+    flat = _button_texts(rows)
+    assert flat == [["A123AA123 @owner", "🟢"], ["B456BB456", "⚪"]]
+
+
+async def test_manager_car_detail_keyboard_has_back_button():
+    rows = manager_car_detail_keyboard(3)
+    flat = _button_texts(rows)
+    assert flat == [["⬅️ Назад"]]

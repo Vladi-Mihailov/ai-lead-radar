@@ -25,11 +25,16 @@ from reader.turkey_bot.keyboards import (
     decode_car_open_by_plate_callback,
     decode_car_open_callback,
     decode_help_callback,
+    decode_manager_car_open_callback,
+    decode_manager_car_toggle_callback,
+    decode_manager_cars_page_callback,
     encode_car_open_callback,
     georgian_bot_link_keyboard,
     help_menu_keyboard,
     help_section_keyboard,
     main_menu_keyboard,
+    manager_car_detail_keyboard,
+    manager_cars_page_keyboard,
     my_cars_list_keyboard,
 )
 from reader.turkey_bot.known_users_repository import TurkeyBotKnownUsersRepository
@@ -147,6 +152,45 @@ def register(
             await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=action not in ("check", "history"))
             return
 
+        # manager/trusted-operator "🚗 Мои автомобили" (см. задачу
+        # "Реализуем manager/trusted 'Мои автомобили' для Turkey bot") —
+        # is_trusted перепроверяется ВНУТРИ controller-методов на каждый
+        # вызов (см. задачу п.8.H), не только здесь через is_trusted
+        # переменную выше (которая только решает layout main_menu_keyboard) —
+        # None от controller означает либо НЕ trusted, либо car_id не
+        # существует, в обоих случаях один и тот же безопасный отказ.
+        manager_page = decode_manager_cars_page_callback(event.data)
+        if manager_page is not None:
+            reply = controller.handle_manager_cars_page(manager_page, telegram_user_id=event.sender_id)
+            if reply is None:
+                await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
+                return
+            await event.answer()
+            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            return
+
+        manager_car_open = decode_manager_car_open_callback(event.data)
+        if manager_car_open is not None:
+            car_id, page = manager_car_open
+            reply = controller.handle_manager_car_open(car_id, page, telegram_user_id=event.sender_id)
+            if reply is None:
+                await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
+                return
+            await event.answer()
+            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            return
+
+        manager_car_toggle = decode_manager_car_toggle_callback(event.data)
+        if manager_car_toggle is not None:
+            car_id, page = manager_car_toggle
+            reply = controller.handle_manager_car_toggle(car_id, page, telegram_user_id=event.sender_id)
+            if reply is None:
+                await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
+                return
+            await event.answer()
+            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            return
+
         await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
 
     logger.info("✔ Turkey bot handlers зарегистрированы")
@@ -155,10 +199,15 @@ def register(
 def _first_message_buttons(reply: BotReply, *, is_trusted: bool, has_extra: bool):
     """Приоритет клавiатур на ПЕРВОМ отправленном сообщении (Telethon не
     может совместить несколько видов сразу) — show_cancel_button >
-    my_cars/check-picker > car_delete_confirm > car_card >
-    check_now_confirmation > cta_buttons (+ back_to_car_id, если задан) >
-    back_to_car_id (один) > show_georgian_bot_link > help_keyboard >
-    show_main_menu (если нет extra_texts)."""
+    my_cars/check-picker > manager_cars_page_options > manager_car_detail_page >
+    car_delete_confirm > car_card > check_now_confirmation > cta_buttons
+    (+ back_to_car_id, если задан) > back_to_car_id (один) >
+    show_georgian_bot_link > help_keyboard > show_main_menu (если нет
+    extra_texts). manager_cars_page_options/manager_car_detail_page — см.
+    задачу "Реализуем manager/trusted 'Мои автомобили' для Turkey bot" —
+    ОТДЕЛЬНЫЕ поля от my_cars выше, никогда не заданы одновременно с ним
+    (см. ConversationController: self-service и manager — разные ветки
+    handle_text)."""
     if reply.show_cancel_button:
         return cancel_keyboard()
     if reply.my_cars is not None:
@@ -166,6 +215,14 @@ def _first_message_buttons(reply: BotReply, *, is_trusted: bool, has_extra: bool
         if reply.is_check_picker:
             return check_now_picker_keyboard(cars)
         return my_cars_list_keyboard(cars, reply.my_cars_monitoring_active or {})
+    if reply.manager_cars_page_options is not None:
+        return manager_cars_page_keyboard(
+            reply.manager_cars_page_options,
+            page=reply.manager_cars_page or 0,
+            total_pages=reply.manager_cars_total_pages or 1,
+        )
+    if reply.manager_car_detail_page is not None:
+        return manager_car_detail_keyboard(reply.manager_car_detail_page)
     if reply.car_delete_confirm_car_id is not None:
         return car_delete_confirm_keyboard(reply.car_delete_confirm_car_id)
     if reply.car_card is not None:

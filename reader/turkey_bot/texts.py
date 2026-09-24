@@ -76,6 +76,22 @@ EMPTY_MY_CARS_TEXT = (
 # окончания, только active: bool, см. TurkeyMonitoringSubscription).
 MY_CARS_HEADER = "🚗 Мои автомобили"
 
+# manager/trusted-operator "🚗 Мои автомобили" (см. задачу "Реализуем
+# manager/trusted 'Мои автомобили' для Turkey bot" — референс: Georgian
+# bot TRUSTED_TASKS_HEADER/format_trusted_tasks_page) — сознательно
+# ОТДЕЛЬНЫЙ текст от MY_CARS_HEADER выше, чтобы оператору было сразу
+# видно, что он смотрит на ВСЕ машины, а не только свои.
+MANAGER_CARS_HEADER = "🚗 Все автомобили"
+MANAGER_CARS_EMPTY_TEXT = "Автомобилей пока нет ни у одного пользователя."
+
+
+def format_manager_cars_page(*, page: int, total_pages: int) -> str:
+    """Заголовок manager-списка — та же схема "Страница N из M" (1-indexed
+    для человека), что и Georgian bot::format_trusted_tasks_page — список
+    машин/владельцев ТОЛЬКО в inline-клавиатуре (см.
+    keyboards.py::manager_cars_page_keyboard), не в этом тексте."""
+    return f"{MANAGER_CARS_HEADER}\nСтраница {page + 1} из {total_pages}"
+
 MONITORING_STOPPED_ALL_TEMPLATE = "⛔ Мониторинг остановлен для всех подписок ({count})."
 
 HISTORY_EMPTY_TEMPLATE = "📜 История {plate}\n\nПроверок пока не было."
@@ -835,6 +851,43 @@ def format_car_button_label(car: TurkeyUserCar, *, monitoring_active: bool) -> s
     emoji = "🟢" if monitoring_active else "⚪"
     state = "ON" if monitoring_active else "OFF"
     return f"{emoji} {car.car_number} — {state}"
+
+
+def format_owner_username_suffix(username: str | None) -> str:
+    """" @username", если владелец известен (auto-captured, см.
+    turkey_bot_known_users), иначе пустая строка — тот же формат/тот же
+    принцип, что и reader/public_bot/texts.py::format_owner_username_suffix
+    (задача явно требует "никогда @None/None/пустой @") — пустая строка, а
+    не None, чтобы вызывающий код мог всегда писать
+    f"{car_number}{suffix}" без отдельной ветки."""
+    return f" @{username}" if username else ""
+
+
+def format_manager_car_status_label(*, monitoring_active: bool) -> str:
+    """Правая кнопка manager-строки — ТОЛЬКО 🟢/⚪ (см. задачу пример
+    "[M295YB196 @Mihailov_vm] [🟢]") — БЕЗ "ON"/"OFF"-текста и БЕЗ даты
+    (в отличие от format_car_button_label выше, который остаётся
+    НЕТРОНУТЫМ и продолжает использоваться self-service списком)."""
+    return "🟢" if monitoring_active else "⚪"
+
+
+def format_manager_car_detail(
+    car: TurkeyUserCar, *, owner_username: str | None, monitoring_active: bool,
+) -> str:
+    """Read-only карточка ОДНОЙ строки manager-списка (см. задачу,
+    референс — Georgian bot format_trusted_task_detail) — никаких действий
+    с этого экрана, только просмотр (см. design report этой задачи: "не
+    придумывай новую бизнес-логику" — check/monitor toggle/delete чужого
+    автомобиля здесь сознательно не предлагаются, ТОЛЬКО просмотр +
+    toggle мониторинга остаётся на самом списке, см.
+    keyboards.py::manager_cars_page_keyboard)."""
+    owner_line = f"👤 @{owner_username}" if owner_username else "👤 Владелец неизвестен"
+    emoji, state = ("🟢", "ON") if monitoring_active else ("⚪", "OFF")
+    return "\n".join([
+        f"🚗 {car.car_number}",
+        owner_line,
+        f"Мониторинг: {emoji} {state}",
+    ])
 
 
 def format_car_card_text(car: TurkeyUserCar, *, monitoring_active: bool) -> str:

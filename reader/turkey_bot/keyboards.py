@@ -41,6 +41,7 @@ from reader.turkey_bot.texts import (
     STATISTICS_LABEL,
     STOP_MONITORING_LABEL,
     format_car_button_label,
+    format_manager_car_status_label,
 )
 
 CANCEL_CALLBACK_DATA = b"turkeycancel"
@@ -66,6 +67,22 @@ _CAR_ACTIONS = frozenset({
     "check", "monitor_on", "monitor_off", "history",
     "delete_prompt", "delete_confirm", "delete_cancel",
 })
+
+# manager/trusted-operator "🚗 Мои автомобили" (см. задачу "Реализуем
+# manager/trusted 'Мои автомобили' для Turkey bot", референс — Georgian
+# bot keyboards.py::trusted_tasks_page_keyboard) — ОТДЕЛЬНЫЙ набор
+# callback'ов от self-service (_CAR_OPEN_PREFIX/_CAR_ACTION_PREFIX выше
+# остаются НЕТРОНУТЫМИ) — car_id здесь адресует КОНКРЕТНУЮ строку
+# turkey_bot_user_cars (её PK), а не car_number: один и тот же номер у
+# нескольких пользователей — разные car_id, callback однозначен (см.
+# задачу п.6). is_trusted() ВСЕГДА перепроверяется server-side в
+# ConversationController.handle_manager_cars_page/
+# handle_manager_car_open/handle_manager_car_toggle на КАЖДЫЙ вызов — эти
+# callback'и сами по себе НЕ являются доказательством авторизации (тот же
+# принцип, что и везде в проекте).
+_MANAGER_CARS_PAGE_PREFIX = b"turkeymgrcarspage:"
+_MANAGER_CAR_OPEN_PREFIX = b"turkeymgrcaropen:"
+_MANAGER_CAR_TOGGLE_PREFIX = b"turkeymgrcartoggle:"
 
 
 def cancel_keyboard() -> list[list[Button]]:
@@ -147,6 +164,95 @@ def decode_car_action_callback(data: bytes | None) -> tuple[str, int] | None:
         return action, int(car_id_text)
     except ValueError:
         return None
+
+
+def encode_manager_cars_page_callback(page: int) -> bytes:
+    return _MANAGER_CARS_PAGE_PREFIX + str(page).encode("ascii")
+
+
+def decode_manager_cars_page_callback(data: bytes | None) -> int | None:
+    if not data or not data.startswith(_MANAGER_CARS_PAGE_PREFIX):
+        return None
+    try:
+        return int(data[len(_MANAGER_CARS_PAGE_PREFIX):])
+    except ValueError:
+        return None
+
+
+def _encode_car_and_page(prefix: bytes, car_id: int, page: int) -> bytes:
+    return prefix + f"{car_id}:{page}".encode("ascii")
+
+
+def _decode_car_and_page(data: bytes | None, prefix: bytes) -> tuple[int, int] | None:
+    if not data or not data.startswith(prefix):
+        return None
+    remainder = data[len(prefix):].decode("ascii", errors="strict")
+    car_id_text, _, page_text = remainder.partition(":")
+    if not car_id_text or not page_text:
+        return None
+    try:
+        return int(car_id_text), int(page_text)
+    except ValueError:
+        return None
+
+
+def encode_manager_car_open_callback(car_id: int, page: int) -> bytes:
+    return _encode_car_and_page(_MANAGER_CAR_OPEN_PREFIX, car_id, page)
+
+
+def decode_manager_car_open_callback(data: bytes | None) -> tuple[int, int] | None:
+    return _decode_car_and_page(data, _MANAGER_CAR_OPEN_PREFIX)
+
+
+def encode_manager_car_toggle_callback(car_id: int, page: int) -> bytes:
+    return _encode_car_and_page(_MANAGER_CAR_TOGGLE_PREFIX, car_id, page)
+
+
+def decode_manager_car_toggle_callback(data: bytes | None) -> tuple[int, int] | None:
+    return _decode_car_and_page(data, _MANAGER_CAR_TOGGLE_PREFIX)
+
+
+def manager_cars_page_keyboard(
+    options: list[tuple[int, str, bool]], *, page: int, total_pages: int,
+) -> list[list[Button]]:
+    """Manager-facing "🚗 Мои автомобили" (см. задачу, референс — Georgian
+    bot trusted_tasks_page_keyboard) — options: (car_id, car_label,
+    monitoring_active), car_label уже содержит " @username" владельца,
+    если он известен (см. ConversationController._format_manager_cars_page_reply/
+    texts.format_owner_username_suffix). ДВЕ кнопки на строку: ЛЕВАЯ
+    (car_label) открывает read-only детали этой строки (см.
+    encode_manager_car_open_callback/handle_manager_car_open), ПРАВАЯ
+    (🟢/⚪) переключает мониторинг НАПРЯМУЮ, без промежуточного экрана (см.
+    encode_manager_car_toggle_callback/handle_manager_car_toggle — Turkey
+    monitoring бессрочен, в отличие от Georgian bot с периодами, поэтому
+    здесь нет аналога "выбора срока"). car_id — PK строки
+    turkey_bot_user_cars, однозначно адресует конкретного владельца даже
+    при повторяющемся car_number (см. задачу п.6)."""
+    rows = [
+        [
+            Button.inline(car_label, encode_manager_car_open_callback(car_id, page)),
+            Button.inline(
+                format_manager_car_status_label(monitoring_active=monitoring_active),
+                encode_manager_car_toggle_callback(car_id, page),
+            ),
+        ]
+        for car_id, car_label, monitoring_active in options
+    ]
+    if total_pages > 1:
+        back_page = max(page - 1, 0)
+        next_page = min(page + 1, total_pages - 1)
+        rows.append([
+            Button.inline("◀️ Назад", encode_manager_cars_page_callback(back_page)),
+            Button.inline(f"{page + 1} / {total_pages}", encode_manager_cars_page_callback(page)),
+            Button.inline("Вперёд ▶️", encode_manager_cars_page_callback(next_page)),
+        ])
+    return rows
+
+
+def manager_car_detail_keyboard(page: int) -> list[list[Button]]:
+    """"⬅️ Назад" из read-only деталей строки -> та же страница
+    manager-списка (см. handle_manager_car_open/_format_manager_cars_page_reply)."""
+    return [[Button.inline(BACK_LABEL, encode_manager_cars_page_callback(page))]]
 
 
 def my_cars_list_keyboard(

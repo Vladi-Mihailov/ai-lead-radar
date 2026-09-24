@@ -76,6 +76,22 @@ class TurkeyBotKnownUsersRepository:
     def is_known(self, telegram_user_id: int) -> bool:
         return self._conn.execute(_SELECT, (telegram_user_id,)).fetchone() is not None
 
+    def get_username(self, telegram_user_id: int) -> str | None:
+        """Актуальный auto-captured username ОДНОГО пользователя — см.
+        задачу "manager/trusted 'Мои автомобили' для Turkey bot": owner
+        каждой строки резолвится по turkey_bot_user_cars.telegram_user_id,
+        а не по вызывающему (менеджеру) — этот метод и даёт такой
+        per-owner lookup (в отличие от list_all()/list_all_with_chat_id(),
+        которые отдают ВЕСЬ список сразу, для статистики). None — либо
+        пользователь никогда не писал боту вовсе, либо писал, но у него
+        нет публичного Telegram username (тот же смысл, что и у
+        record_seen(telegram_username=None) — не путать с "не найден
+        вовсе")."""
+        row = self._conn.execute(_SELECT, (telegram_user_id,)).fetchone()
+        if row is None:
+            return None
+        return row[2]  # telegram_username, см. _SELECT column order
+
     def count_total(self) -> int:
         """Всего уникальных Telegram user id, когда-либо написавших ЭТОМУ
         боту — telegram_user_id уже PRIMARY KEY (см. _SCHEMA), тот же

@@ -101,3 +101,13 @@ class TurkeyStatisticsService:
     def list_known_users(self) -> list[tuple[int, str | None]]:
         """Прокси к TurkeyBotKnownUsersRepository.list_all()."""
         return self._known_users.list_all()
+
+    def get_known_username(self, telegram_user_id: int) -> str | None:
+        """Прокси к TurkeyBotKnownUsersRepository.get_username() — ТОЛЬКО
+        этот единичный lookup нужен manager/trusted-operator "🚗 Мои
+        автомобили" (см. ConversationController._owner_username_display),
+        чтобы резолвить username ВЛАДЕЛЬЦА каждой строки (по
+        turkey_bot_user_cars.telegram_user_id), не вызывающего менеджера —
+        переиспользует уже открытый here known_users_repository вместо
+        нового constructor-параметра в ConversationController."""
+        return self._known_users.get_username(telegram_user_id)

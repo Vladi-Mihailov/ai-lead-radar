@@ -71,6 +71,18 @@ _SELECT_FOR_USER = (
 
 _DELETE_OWNED = "DELETE FROM turkey_bot_user_cars WHERE id = ? AND telegram_user_id = ?"
 
+_SELECT_ANY = (
+    "SELECT id, telegram_user_id, car_number, created_at, last_checked_at, "
+    "last_overall_status, last_total_amount "
+    "FROM turkey_bot_user_cars WHERE id = ?"
+)
+
+_SELECT_ALL_PAGE = (
+    "SELECT id, telegram_user_id, car_number, created_at, last_checked_at, "
+    "last_overall_status, last_total_amount "
+    "FROM turkey_bot_user_cars ORDER BY id DESC LIMIT ? OFFSET ?"
+)
+
 
 def _row_to_car(row) -> TurkeyUserCar:
     car_id, telegram_user_id, car_number, created_at, last_checked_at, last_status, last_total = row
@@ -167,6 +179,41 @@ class TurkeyUserCarsRepository:
         cursor = self._conn.execute(_DELETE_OWNED, (car_id, telegram_user_id))
         self._conn.commit()
         return cursor.rowcount > 0
+
+    # ---- manager/trusted-operator "🚗 Мои автомобили" (см. задачу
+    # "Реализуем manager/trusted 'Мои автомобили' для Turkey bot") — ВСЕ
+    # машины ВСЕХ пользователей, БЕЗ ownership-фильтра. is_trusted()
+    # проверяется ИСКЛЮЧИТЕЛЬНО в ConversationController (см.
+    # handle_manager_cars_page/handle_manager_car_open/
+    # handle_manager_car_toggle) — эти два метода репозитория сами по себе
+    # авторизацию не проверяют и не должны использоваться ни в одном
+    # self-service пути (get_owned_car/list_cars выше остаются
+    # НЕТРОНУТЫМИ и по-прежнему единственный путь для обычных
+    # пользователей). ----
+
+    def count_all(self) -> int:
+        """Общее число ВСЕХ автомобилей (любого владельца) — для
+        пагинации manager-списка."""
+        return self._conn.execute("SELECT COUNT(*) FROM turkey_bot_user_cars").fetchone()[0]
+
+    def list_all_page(self, *, offset: int, limit: int) -> list[TurkeyUserCar]:
+        """Одна страница ВСЕХ машин, ЛЮБОГО владельца — ORDER BY id DESC
+        (стабильная, deterministic — см. задачу), БЕЗ dedup по
+        car_number: один и тот же номер, добавленный разными
+        пользователями, — отдельные строки (см. задачу п.2 — каждая
+        строка это конкретная запись turkey_bot_user_cars, адресуется
+        car.id, а не car_number)."""
+        rows = self._conn.execute(_SELECT_ALL_PAGE, (limit, offset)).fetchall()
+        return [_row_to_car(row) for row in rows]
+
+    def get_any_car(self, car_id: int) -> TurkeyUserCar | None:
+        """Как get_owned_car(), но БЕЗ проверки telegram_user_id — ТОЛЬКО
+        для manager-flow (is_trusted() уже проверен вызывающим кодом в
+        ConversationController), чтобы менеджер мог открыть/переключить
+        чужой автомобиль по его car.id. НИКОГДА не использовать в
+        self-service путях — там всегда get_owned_car."""
+        row = self._conn.execute(_SELECT_ANY, (car_id,)).fetchone()
+        return _row_to_car(row) if row else None
 
     def close(self) -> None:
         self._conn.close()

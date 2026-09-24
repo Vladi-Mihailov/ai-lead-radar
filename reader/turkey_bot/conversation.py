@@ -64,6 +64,11 @@ _CAR_ACTIONS_REQUIRING_CHECK = {"check"}
 # max_attempts для режима "manual").
 _MANUAL_MAX_ATTEMPTS = 35
 
+# manager/trusted-operator "🚗 Мои автомобили" (см. задачу "Реализуем
+# manager/trusted 'Мои автомобили' для Turkey bot", референс — Georgian
+# bot _TRUSTED_TASKS_PAGE_SIZE) — та же величина страницы.
+_MANAGER_CARS_PAGE_SIZE = 10
+
 
 @dataclass(frozen=True)
 class BotReply:
@@ -112,6 +117,22 @@ class BotReply:
     cta_buttons: tuple[tuple[str, str], ...] | None = None
     help_keyboard: str | None = None
     show_georgian_bot_link: bool = False
+
+    # manager/trusted-operator "🚗 Мои автомобили" (см. задачу "Реализуем
+    # manager/trusted 'Мои автомобили' для Turkey bot", референс —
+    # Georgian bot trusted_tasks_page_options/_format_trusted_tasks_page_reply) —
+    # ОТДЕЛЬНЫЕ поля от my_cars/my_cars_monitoring_active выше (self-service
+    # НЕ трогается). manager_cars_page_options — (car_id, car_label,
+    # monitoring_active); car_label уже включает " @username" владельца
+    # (см. _format_manager_cars_page_reply/texts.format_owner_username_suffix).
+    manager_cars_page_options: list[tuple[int, str, bool]] | None = None
+    manager_cars_page: int | None = None
+    manager_cars_total_pages: int | None = None
+    # Read-only детали ОДНОЙ строки manager-списка (см.
+    # handle_manager_car_open/texts.format_manager_car_detail) —
+    # manager_car_detail_page — куда вернёт "⬅️ Назад" (та же страница
+    # списка, см. keyboards.py::manager_car_detail_keyboard).
+    manager_car_detail_page: int | None = None
 
 
 class ConversationController:
@@ -172,6 +193,13 @@ class ConversationController:
             return self.handle_add_car_start(chat_id=chat_id, telegram_user_id=telegram_user_id)
 
         if stripped == texts.MY_CARS_LABEL:
+            # Manager/trusted-operator видит ВСЕ автомобили ВСЕХ
+            # пользователей (см. задачу "Реализуем manager/trusted 'Мои
+            # автомобили' для Turkey bot", референс — Georgian bot
+            # _handle_menu_label) — обычный пользователь получает
+            # handle_my_cars() БЕЗ ИЗМЕНЕНИЙ, как и раньше.
+            if self._is_trusted(telegram_user_id):
+                return self._format_manager_cars_page_reply(0)
             return self.handle_my_cars(chat_id=chat_id, telegram_user_id=telegram_user_id)
 
         if stripped == texts.CHECK_NOW_LABEL:
@@ -269,6 +297,127 @@ class ConversationController:
         if not cars:
             return BotReply(text=texts.EMPTY_MY_CARS_TEXT, show_main_menu=True)
         return BotReply(text=texts.MY_CARS_LABEL, my_cars=cars, is_check_picker=True)
+
+    # ---- manager/trusted-operator "🚗 Мои автомобили" (см. задачу
+    # "Реализуем manager/trusted 'Мои автомобили' для Turkey bot",
+    # референс — Georgian bot _format_trusted_tasks_page_reply/
+    # handle_trusted_tasks_page/handle_trusted_task_open/
+    # handle_trusted_task_toggle) — is_trusted() перепроверяется ЗАНОВО на
+    # КАЖДОМ из трёх методов ниже (вход через меню клампит это один раз,
+    # но pagination/open/toggle callback'и приходят НАПРЯМУЮ из Telegram —
+    # см. задачу п.8.H: "проверка trusted должна быть не только при входе
+    # через меню, но и на manager pagination/action callbacks", тот же
+    # authorization-инвариант, что и везде в проекте: callback_data
+    # публичен и НЕ является доказательством авторизации сам по себе). ----
+
+    def _owner_username_display(self, telegram_user_id: int) -> str | None:
+        """Auto-captured username владельца ОДНОЙ строки manager-списка —
+        см. задачу п.4/п.5: "Username получать из turkey_bot_known_users
+        по telegram_user_id ВЛАДЕЛЬЦА машины" (car.telegram_user_id, а НЕ
+        telegram_user_id менеджера, см. _format_manager_cars_page_reply
+        ниже, где именно car.telegram_user_id сюда передаётся) — ТА ЖЕ
+        актуальная запись, что обновляется на каждое сообщение владельца
+        боту (см. reader/turkey_bot/handlers.py::_record_known_user), а не
+        историческое значение откуда-либо ещё."""
+        return self._statistics.get_known_username(telegram_user_id)
+
+    def _format_manager_cars_page_reply(self, page: int) -> BotReply:
+        """Manager-facing "🚗 Мои автомобили" — ОДНА страница ВСЕХ строк
+        turkey_bot_user_cars, ЛЮБОГО владельца, БЕЗ dedup по car_number
+        (см. задачу п.2: "если один и тот же автомобиль добавлен разными
+        пользователями, manager должен видеть отдельные строки"). page —
+        ЛЮБОЕ int (форматированный/устаревший callback — см. задачу
+        п.8.G) — клампится здесь же, тот же приём, что и у Georgian bot
+        _format_trusted_tasks_page_reply."""
+        total = self._garage.count_all()
+        if total == 0:
+            return BotReply(text=texts.MANAGER_CARS_EMPTY_TEXT)
+
+        total_pages = -(-total // _MANAGER_CARS_PAGE_SIZE)  # ceil division
+        page = max(0, min(page, total_pages - 1))
+        cars = self._garage.list_all_page(
+            offset=page * _MANAGER_CARS_PAGE_SIZE, limit=_MANAGER_CARS_PAGE_SIZE,
+        )
+
+        options = []
+        for car in cars:
+            username = self._owner_username_display(car.telegram_user_id)
+            label = car.car_number + texts.format_owner_username_suffix(username)
+            subscription = self._subscriptions.get(
+                telegram_user_id=car.telegram_user_id, plate=car.car_number,
+            )
+            monitoring_active = subscription is not None and subscription.active
+            options.append((car.id, label, monitoring_active))
+
+        return BotReply(
+            text=texts.format_manager_cars_page(page=page, total_pages=total_pages),
+            manager_cars_page_options=options,
+            manager_cars_page=page,
+            manager_cars_total_pages=total_pages,
+        )
+
+    def handle_manager_cars_page(self, page: int, *, telegram_user_id: int) -> BotReply | None:
+        """Навигация ◀️/индикатор/▶️ — None, только если telegram_user_id
+        НЕ trusted (см. задачу п.8.H) — сам page не может быть
+        "невалидным", клампится в _format_manager_cars_page_reply."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+        return self._format_manager_cars_page_reply(page)
+
+    def handle_manager_car_open(self, car_id: int, page: int, *, telegram_user_id: int) -> BotReply | None:
+        """Левая кнопка строки — read-only детали (см.
+        texts.format_manager_car_detail) — None, если НЕ trusted ИЛИ
+        car_id не существует (тот же принцип, что и handle_car_open, но
+        БЕЗ ownership-фильтра — get_any_car(), см. задачу: менеджер должен
+        видеть чужие машины)."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+        car = self._garage.get_any_car(car_id)
+        if car is None:
+            return None
+
+        username = self._owner_username_display(car.telegram_user_id)
+        subscription = self._subscriptions.get(
+            telegram_user_id=car.telegram_user_id, plate=car.car_number,
+        )
+        monitoring_active = subscription is not None and subscription.active
+        return BotReply(
+            text=texts.format_manager_car_detail(
+                car, owner_username=username, monitoring_active=monitoring_active,
+            ),
+            manager_car_detail_page=page,
+        )
+
+    def handle_manager_car_toggle(self, car_id: int, page: int, *, telegram_user_id: int) -> BotReply | None:
+        """Правая кнопка строки — переключает мониторинг НАПРЯМУЮ (см.
+        задачу п.6: "сохрани существующую Turkey семантику monitoring/
+        status" — тот же прямой toggle без промежуточного экрана, что и
+        self-service _enable_monitoring/_disable_monitoring, никакого
+        нового "выбора периода" — Turkey monitoring бессрочен). Действует
+        от имени ВЛАДЕЛЬЦА (car.telegram_user_id/car.telegram_user_id как
+        chat_id — приватный чат с ботом, chat_id == user_id, тот же
+        инвариант, что и во всей остальной Turkey-схеме), НЕ от имени
+        менеджера — см. задачу п.5: "не подменять owner вызывающим manager
+        user_id". Возвращает ТУ ЖЕ страницу списка с уже обновлённым
+        статусом. None — НЕ trusted ИЛИ car_id не существует."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+        car = self._garage.get_any_car(car_id)
+        if car is None:
+            return None
+
+        subscription = self._subscriptions.get(
+            telegram_user_id=car.telegram_user_id, plate=car.car_number,
+        )
+        if subscription is not None and subscription.active:
+            self._subscriptions.disable(telegram_user_id=car.telegram_user_id, plate=car.car_number)
+        else:
+            next_check_at = next_monitoring_slot(datetime.now(timezone.utc))
+            self._subscriptions.enable(
+                telegram_user_id=car.telegram_user_id, telegram_chat_id=car.telegram_user_id,
+                plate=car.car_number, next_check_at=next_check_at,
+            )
+        return self._format_manager_cars_page_reply(page)
 
     def handle_car_open(self, car_id: int, *, telegram_user_id: int) -> BotReply | None:
         """None — car_id не существует ИЛИ принадлежит другому
