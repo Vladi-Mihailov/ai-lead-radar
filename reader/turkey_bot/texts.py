@@ -948,15 +948,13 @@ def format_history_messages(plate: str, runs: list[UnifiedCheckResult]) -> list[
 # ==== manager/trusted Search (см. задачу "manager/trusted Search") —
 # ТОЛЬКО manager/trusted-operator, self-service вообще не затронут ====
 
+# Компактный prompt (см. задачу "add name search to trusted bot search"
+# п.1: "не добавлять дополнительные пояснения") — заменяет прежний
+# развёрнутый вариант целиком.
 SEARCH_ENTRY_TEXT = (
     "🔎 Поиск\n\n"
-    "Введите:\n"
-    "• @username пользователя\n"
-    "или\n"
-    "• номер автомобиля\n\n"
-    "Например:\n"
-    "@Mihailov_vm\n"
-    "AA123BB"
+    "Введите имя, @логин или номер авто\n"
+    "Например: Иван, @Mihailov_vm, AA123BB"
 )
 SEARCH_BACK_LABEL = "↩️ Назад"
 SEARCH_NEW_LABEL = "🔎 Новый поиск"
@@ -971,41 +969,60 @@ def format_search_not_found(query: str) -> str:
     return f"🔎 Ничего не найдено\n\nПо запросу:\n{query}"
 
 
+def _full_name(first_name: str | None, last_name: str | None) -> str | None:
+    parts = [part for part in (first_name, last_name) if part]
+    return " ".join(parts) if parts else None
+
+
+def format_search_owner_display(
+    *, first_name: str | None, last_name: str | None, username: str | None,
+) -> str:
+    """Owner-строка Search-результата (см. задачу "add name search to
+    trusted bot search" п.7, тот же принцип, что и
+    reader/public_bot/texts.py::format_search_owner_display):
+      имя + username -> "Имя Фамилия (@username)";
+      только имя     -> "Имя Фамилия" (или просто "Имя");
+      только username -> "@username";
+      ничего         -> "—".
+    ОТДЕЛЬНАЯ функция от format_owner_username_button (manager car list,
+    задача явно требует его НЕ менять) — другой набор случаев (имя)."""
+    name = _full_name(first_name, last_name)
+    if name and username:
+        return f"{name} (@{username})"
+    if name:
+        return name
+    if username:
+        return f"@{username}"
+    return "—"
+
+
 def format_search_monitoring_line(*, monitoring_active: bool) -> str:
     return f"Мониторинг: {'🟢' if monitoring_active else '⚪'}"
 
 
 def format_search_block(
-    *, query_type: str, owner_display: str, car_number: str,
-    monitoring_active: bool, unified_result: UnifiedCheckResult | None,
+    *, owner_display: str, car_number: str, monitoring_active: bool, unified_result: UnifiedCheckResult | None,
 ) -> str:
-    """Один блок Search-результата (одна машина/владелец) — ПЕРЕИСПОЛЬЗУЕТ
-    format_unified_check_result() as-is для GİB/Avrasya/KGM/Итого/
-    "Проверено: ..." (см. задачу п.9: "НЕ рассчитывать Turkey total новой
-    формулой внутри Search, переиспользовать существующую production
-    unified-total business logic" — total_amount_for()/derive_overall_status()
-    уже посчитаны ТАМ, где unified_result сохранялся, здесь — только
-    сборка карточки). unified_result=None — для этой машины/владельца ещё
-    не было ни одной проверки (см. TurkeyCheckRunRepository.
-    get_latest_for_owner) — честно показываем "Ещё не проверялось", а НЕ
-    0 ₺/подделанный статус.
+    """Один блок Search-результата (одна машина/владелец) — ВСЕГДА
+    начинается с "👤 {owner_display}" (см. задачу "add name search to
+    trusted bot search" п.7 — единый формат независимо от того, что
+    искали) — ПЕРЕИСПОЛЬЗУЕТ format_unified_check_result() as-is для
+    GİB/Avrasya/KGM/Итого/"Проверено: ..." (см. задачу п.9: "НЕ
+    рассчитывать Turkey total новой формулой внутри Search" —
+    total_amount_for()/derive_overall_status() уже посчитаны ТАМ, где
+    unified_result сохранялся, здесь — только сборка карточки).
 
-    query_type == "car": блок ВСЕГДА начинается с "👤 {owner_display}" —
-    format_unified_check_result() ничего не знает про владельца, номер
-    машины при этом придёт ЕЁ первой строкой ("🚗 {plate}"), без
-    дублирования. query_type == "username": номер машины НЕ добавляется
-    здесь отдельно, если unified_result есть — format_unified_check_result()
-    уже открывается строкой "🚗 {plate}" (иначе получилось бы "🚗 X" два
-    раза подряд); "🚗 {car_number}" добавляется ТОЛЬКО когда unified_result
-    is None (там format_unified_check_result() вообще не вызывается — это
-    единственный источник номера машины в блоке)."""
-    lines = []
-    if query_type == "car":
-        lines.append(f"👤 {owner_display}")
-    elif unified_result is None:
-        lines.append(f"🚗 {car_number}")
-
+    format_unified_check_result() САМА открывается строкой "🚗 {plate}",
+    когда unified_result задан — "🚗 {car_number}" здесь добавляется
+    ТОЛЬКО когда unified_result is None (там format_unified_check_result()
+    вообще не вызывается — это единственный источник номера машины в
+    блоке), иначе получилось бы "🚗 X" два раза подряд. unified_result=None
+    — для этой машины/владельца ещё не было ни одной проверки (см.
+    TurkeyCheckRunRepository.get_latest_for_owner) — честно показываем
+    "Ещё не проверялось", а НЕ 0 ₺/подделанный статус."""
+    lines = [f"👤 {owner_display}"]
     if unified_result is None:
+        lines.append(f"🚗 {car_number}")
         lines.append("Ещё не проверялось")
     else:
         lines.append(format_unified_check_result(unified_result))
@@ -1013,17 +1030,15 @@ def format_search_block(
     return "\n".join(lines)
 
 
-def format_search_results(*, query_type: str, query_display: str, blocks: list[str]) -> str:
-    """query_type — "username" (заголовок "👤 {query_display}", каждый
-    block начинается со своего "🚗 CAR_NUMBER") или "car" (заголовок
-    "🚗 {query_display}", каждый block начинается со своего
-    "👤 @username/—") — тот же принцип, что и
-    reader/public_bot/texts.py::format_search_results (Georgian bot)."""
+def format_search_results(*, blocks: list[str]) -> str:
+    """Каждый block уже самодостаточен (владелец И машина вместе, см.
+    format_search_block) — тот же принцип, что и
+    reader/public_bot/texts.py::format_search_results (Georgian bot):
+    имя может соответствовать НЕСКОЛЬКИМ разным telegram_user_id
+    одновременно, единого "внешнего" owner для заголовка может не быть,
+    поэтому больше нет отдельной "👤/🚗 {query}" шапки."""
     title = "🔎 Результат поиска" if len(blocks) == 1 else "🔎 Результаты поиска"
-    header_icon = "👤" if query_type == "username" else "🚗"
-    lines = [title, "", f"{header_icon} {query_display}", ""]
-    lines.append("\n\n".join(blocks))
-    return "\n".join(lines)
+    return "\n".join([title, "", "\n\n".join(blocks)])
 
 
 def format_search_pagination_footer(*, page: int, total_pages: int) -> str:

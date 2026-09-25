@@ -564,7 +564,7 @@ def owner_fine_cta_buttons(contact_username: str) -> list[list[Button]]:
 _SEARCH_BACK_CALLBACK = b"searchback"
 _SEARCH_NEW_CALLBACK = b"searchnew"
 _SEARCH_PAGE_PREFIX = b"searchpage:"
-_SEARCH_QUERY_TYPES = ("username", "car")
+_SEARCH_QUERY_TYPES = ("username", "car", "person")
 
 
 def encode_search_back_callback() -> bytes:

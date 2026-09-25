@@ -119,3 +119,16 @@ class TurkeyStatisticsService:
         telegram_user_id), без нового constructor-параметра в
         ConversationController."""
         return self._known_users.find_by_username(username)
+
+    def find_name(self, query: str) -> list[tuple[int, str | None, str | None, str | None]]:
+        """Прокси к TurkeyBotKnownUsersRepository.find_by_name() — см.
+        задачу "add name search to trusted bot search" (имя -> numeric
+        telegram_user_id, может быть НЕСКОЛЬКО совпадений — имена не
+        уникальны)."""
+        return self._known_users.find_by_name(query)
+
+    def get_known_profile(self, telegram_user_id: int) -> tuple[str | None, str | None, str | None] | None:
+        """Прокси к TurkeyBotKnownUsersRepository.get_profile() — см.
+        задачу п.7: Search result должен показывать имя ВМЕСТЕ с username,
+        не только username (см. get_known_username() выше)."""
+        return self._known_users.get_profile(telegram_user_id)

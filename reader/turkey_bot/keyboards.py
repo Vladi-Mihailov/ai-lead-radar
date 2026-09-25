@@ -389,7 +389,7 @@ def help_section_keyboard() -> list[list[Button]]:
 _SEARCH_BACK_CALLBACK = b"turkeysearchback"
 _SEARCH_NEW_CALLBACK = b"turkeysearchnew"
 _SEARCH_PAGE_PREFIX = b"turkeysearchpage:"
-_SEARCH_QUERY_TYPES = ("username", "car")
+_SEARCH_QUERY_TYPES = ("username", "car", "person")
 
 
 def encode_search_back_callback() -> bytes:

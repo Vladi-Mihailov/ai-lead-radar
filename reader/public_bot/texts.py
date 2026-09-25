@@ -496,15 +496,13 @@ def format_statistics(stats: BotStatistics) -> str:
 # ==== manager/trusted Search (см. задачу "manager/trusted Search") —
 # ТОЛЬКО manager/trusted-operator, self-service вообще не затронут ====
 
+# Компактный prompt (см. задачу "add name search to trusted bot search"
+# п.1: "не добавлять дополнительные пояснения") — заменяет прежний
+# развёрнутый вариант целиком.
 SEARCH_ENTRY_TEXT = (
     "🔎 Поиск\n\n"
-    "Введите:\n"
-    "• @username пользователя\n"
-    "или\n"
-    "• номер автомобиля\n\n"
-    "Например:\n"
-    "@Mihailov_vm\n"
-    "AA123BB"
+    "Введите имя, @логин или номер авто\n"
+    "Например: Иван, @Mihailov_vm, AA123BB"
 )
 SEARCH_BACK_LABEL = "↩️ Назад"
 SEARCH_NEW_LABEL = "🔎 Новый поиск"
@@ -513,6 +511,35 @@ SEARCH_MENU_LABEL = "↩️ В меню"
 
 def format_search_not_found(query: str) -> str:
     return f"🔎 Ничего не найдено\n\nПо запросу:\n{query}"
+
+
+def _full_name(first_name: str | None, last_name: str | None) -> str | None:
+    parts = [part for part in (first_name, last_name) if part]
+    return " ".join(parts) if parts else None
+
+
+def format_search_owner_display(
+    *, first_name: str | None, last_name: str | None, username: str | None,
+) -> str:
+    """Owner-строка Search-результата (см. задачу "add name search to
+    trusted bot search" п.7):
+      имя + username -> "Имя Фамилия (@username)";
+      только имя     -> "Имя Фамилия" (или просто "Имя", если фамилии нет);
+      только username -> "@username";
+      ничего         -> "—".
+    НИКОГДА "None"/"@None"/пустых скобок — та же гарантия, что и у
+    format_owner_username_button (manager car list), но с добавленным
+    именем и другим набором случаев, поэтому отдельная функция, а не
+    переиспользование той (задача явно требует Georgia/Turkey
+    fines/unified-логику и manager car list НЕ менять)."""
+    name = _full_name(first_name, last_name)
+    if name and username:
+        return f"{name} (@{username})"
+    if name:
+        return name
+    if username:
+        return f"@{username}"
+    return "—"
 
 
 def _format_search_amount(value: float) -> str:
@@ -553,27 +580,21 @@ def format_search_checked_at_line(checked_at: datetime) -> str:
     return f"Последняя проверка: {checked_at.strftime('%d.%m.%Y %H:%M')}"
 
 
-def format_search_results(
-    *,
-    query_type: str,
-    query_display: str,
-    blocks: list[str],
-) -> str:
-    """query_type — "username" (заголовок "👤 {query_display}", каждый
-    block начинается со своей "🚗 CAR_NUMBER") или "car" (заголовок
-    "🚗 {query_display}", каждый block начинается со своего
-    "👤 @username/—") — см. задачу п.6/п.11: username-search группирует
-    ПО ПОЛЬЗОВАТЕЛЮ (одна и та же машина не повторяется), car-search
-    группирует ПО НОМЕРУ (одна и та же машина, разные владельцы). len(blocks)
-    решает единственное/множественное число заголовка ("Результат"/
-    "Результаты") — сами blocks уже полностью готовы (см.
-    ConversationController._format_search_block), эта функция только
-    собирает их в одно сообщение."""
+def format_search_results(*, blocks: list[str]) -> str:
+    """Каждый block уже полностью самодостаточен — владелец (см.
+    format_search_owner_display) И машина вместе (см.
+    ConversationController._format_search_block) — единый формат
+    независимо от того, что искали (@username/username/имя/номер, см.
+    задачу "add name search to trusted bot search" п.5/п.6/п.7): один и
+    тот же человек может встретиться по имени ИЛИ username, а имя может
+    соответствовать НЕСКОЛЬКИМ разным telegram_user_id одновременно —
+    единого "внешнего" owner/car для заголовка может не быть вовсе,
+    поэтому больше нет отдельной "👤 {query}"/"🚗 {query}" шапки (см. более
+    раннюю реализацию) — каждая строка результата сама называет своего
+    владельца И свою машину. len(blocks) решает единственное/
+    множественное число заголовка ("Результат"/"Результаты")."""
     title = "🔎 Результат поиска" if len(blocks) == 1 else "🔎 Результаты поиска"
-    header_icon = "👤" if query_type == "username" else "🚗"
-    lines = [title, "", f"{header_icon} {query_display}", ""]
-    lines.append("\n\n".join(blocks))
-    return "\n".join(lines)
+    return "\n".join([title, "", "\n\n".join(blocks)])
 
 
 def format_search_pagination_footer(*, page: int, total_pages: int) -> str:

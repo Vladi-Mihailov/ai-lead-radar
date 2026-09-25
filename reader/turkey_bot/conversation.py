@@ -670,16 +670,16 @@ class ConversationController:
     # существующую production unified-total business logic"). ----
 
     def _parse_search_query(self, raw_text: str) -> tuple[str, str] | None:
-        """None — запрос не похож НИ на @username/username, НИ на номер
-        автомобиля (см. задачу п.3). Ведущий "@" — ВСЕГДА username,
-        однозначно. БЕЗ "@" — сначала пробуем normalize_plate (см. задачу:
+        """None — пустой запрос (см. задачу "add name search to trusted
+        bot search" п.3/п.5). Ведущий "@" — ВСЕГДА username, однозначно.
+        БЕЗ "@" — сначала пробуем normalize_plate (см. задачу:
         "переиспользовать СУЩЕСТВУЮЩУЮ normalization каждой страны, не
         создавать вторую реализацию") — похоже на валидный номер —
-        car-search; иначе — bare username (тот же принцип, что и у
-        Georgian bot _parse_search_query, но БЕЗ строгой валидации
-        формата — у Turkey нет своего normalize_telegram_username-
-        аналога, и задача его не требует; case-insensitive lookup в БД
-        сам по себе безопасно отсеивает мусор — просто "не найдено")."""
+        car-search; иначе — "person": НЕ различаем здесь username-без-@ и
+        имя (см. задачу п.5: "если надёжно автоматически отличить
+        невозможно — искать одновременно по username/name и объединять
+        результаты с dedup") — _format_search_results_reply сам пробует
+        ОБА lookup'а и объединяет по telegram_user_id."""
         stripped = raw_text.strip()
         if not stripped:
             return None
@@ -692,12 +692,19 @@ class ConversationController:
         if plate is not None:
             return "car", plate
 
-        username = stripped.strip()
-        return ("username", username) if username else None
+        return ("person", stripped) if stripped else None
 
-    def _format_search_block(self, hit: _SearchHit, *, query_type: str) -> str:
-        owner_username = self._owner_username_display(hit.owner_telegram_user_id)
-        owner_display = texts.format_owner_username_button(owner_username)
+    def _format_search_block(self, hit: _SearchHit) -> str:
+        """Блок ВСЕГДА показывает и владельца (имя+username, см. задачу
+        "add name search to trusted bot search" п.7), и машину — единый
+        формат независимо от того, что искали (см. texts.format_search_results
+        докстрок: имя может соответствовать НЕСКОЛЬКИМ разным
+        telegram_user_id, единого "внешнего" owner для заголовка нет)."""
+        profile = self._statistics.get_known_profile(hit.owner_telegram_user_id)
+        username, first_name, last_name = profile if profile is not None else (None, None, None)
+        owner_display = texts.format_search_owner_display(
+            first_name=first_name, last_name=last_name, username=username,
+        )
         subscription = self._subscriptions.get(
             telegram_user_id=hit.owner_telegram_user_id, plate=hit.car_number,
         )
@@ -706,7 +713,7 @@ class ConversationController:
             plate=hit.car_number, telegram_user_id=hit.owner_telegram_user_id,
         )
         return texts.format_search_block(
-            query_type=query_type, owner_display=owner_display, car_number=hit.car_number,
+            owner_display=owner_display, car_number=hit.car_number,
             monitoring_active=monitoring_active, unified_result=unified_result,
         )
 
@@ -724,20 +731,38 @@ class ConversationController:
                     search_result_shown=True, search_query_type=query_type, search_query=query,
                     search_page=0, search_total_pages=1,
                 )
-            owner_id, display_username = found
-            query_display = f"@{display_username}"
+            owner_id, _display_username = found
             all_hits = [
                 _SearchHit(car_id=car.id, owner_telegram_user_id=owner_id, car_number=car.car_number)
                 for car in self._garage.list_cars(owner_id)
             ]
+        elif query_type == "person":
+            # Bare текст — одновременно username-без-@ И имя (см. задачу
+            # п.5) — объединяем по telegram_user_id (см. задачу п.6:
+            # "имена не уникальны, показать ВСЕХ найденных пользователей";
+            # тот же union покрывает "один и тот же человек найден и по
+            # username, и по имени" — не задваивает его машины).
+            user_ids: set[int] = set()
+            found_by_username = self._statistics.find_username(query)
+            if found_by_username is not None:
+                user_ids.add(found_by_username[0])
+            for user_id, _username, _first_name, _last_name in self._statistics.find_name(query):
+                user_ids.add(user_id)
+
+            all_hits = []
+            for user_id in sorted(user_ids):
+                all_hits.extend(
+                    _SearchHit(car_id=car.id, owner_telegram_user_id=user_id, car_number=car.car_number)
+                    for car in self._garage.list_cars(user_id)
+                )
         else:
-            query_display = query
             all_hits = [
                 _SearchHit(car_id=car.id, owner_telegram_user_id=car.telegram_user_id, car_number=car.car_number)
                 for car in self._garage.list_by_car_number(query)
             ]
 
         if not all_hits:
+            query_display = f"@{query}" if query_type == "username" else query
             return BotReply(
                 text=texts.format_search_not_found(query_display),
                 search_result_shown=True, search_query_type=query_type, search_query=query,
@@ -748,8 +773,8 @@ class ConversationController:
         page = max(0, min(page, total_pages - 1))
         page_hits = all_hits[page * _SEARCH_PAGE_SIZE:page * _SEARCH_PAGE_SIZE + _SEARCH_PAGE_SIZE]
 
-        blocks = [self._format_search_block(hit, query_type=query_type) for hit in page_hits]
-        text = texts.format_search_results(query_type=query_type, query_display=query_display, blocks=blocks)
+        blocks = [self._format_search_block(hit) for hit in page_hits]
+        text = texts.format_search_results(blocks=blocks)
         if total_pages > 1:
             text += "\n\n" + texts.format_search_pagination_footer(page=page, total_pages=total_pages)
 

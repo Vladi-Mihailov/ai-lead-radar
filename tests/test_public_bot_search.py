@@ -110,9 +110,17 @@ class _Fixture:
             car_number=car_number, period_days=30, today=_today(),
         )
 
-    def record_known(self, *, telegram_user_id: int, username: str) -> None:
+    def record_known(
+        self,
+        *,
+        telegram_user_id: int,
+        username: str | None = None,
+        first_name: str | None = None,
+        last_name: str | None = None,
+    ) -> None:
         self.known_users_repository.record_seen(
             telegram_user_id=telegram_user_id, telegram_chat_id=telegram_user_id, telegram_username=username,
+            first_name=first_name, last_name=last_name,
         )
 
     def close(self):
@@ -228,6 +236,123 @@ async def test_search_by_username_is_case_insensitive(trusted_fx):
     # Отображается АКТУАЛЬНЫЙ known username (корректный регистр), не
     # введённый пользователем запрос as-is.
     assert "@AlenaOgir" in reply.text
+
+
+# ---- name search (см. задачу "add name search to trusted bot search") ----
+
+
+async def test_search_by_first_name(trusted_fx):
+    await trusted_fx.add_car(telegram_user_id=777, car_number="M295YB196")
+    trusted_fx.record_known(telegram_user_id=777, first_name="Иван")
+
+    reply = await _search(trusted_fx, "Иван")
+
+    assert reply.search_result_shown is True
+    assert "M295YB196" in reply.text
+    assert "👤 Иван" in reply.text
+
+
+async def test_search_by_first_name_is_case_insensitive(trusted_fx):
+    await trusted_fx.add_car(telegram_user_id=777, car_number="M295YB196")
+    trusted_fx.record_known(telegram_user_id=777, first_name="Иван")
+
+    reply = await _search(trusted_fx, "иВАН")
+
+    assert "M295YB196" in reply.text
+
+
+async def test_search_by_last_name(trusted_fx):
+    await trusted_fx.add_car(telegram_user_id=777, car_number="M295YB196")
+    trusted_fx.record_known(telegram_user_id=777, first_name="Иван", last_name="Иванов")
+
+    reply = await _search(trusted_fx, "Иванов")
+
+    assert "M295YB196" in reply.text
+    assert "👤 Иван Иванов" in reply.text
+
+
+async def test_search_by_full_name(trusted_fx):
+    await trusted_fx.add_car(telegram_user_id=777, car_number="M295YB196")
+    trusted_fx.record_known(telegram_user_id=777, first_name="Иван", last_name="Иванов")
+
+    reply = await _search(trusted_fx, "Иван Иванов")
+
+    assert "M295YB196" in reply.text
+
+
+async def test_search_by_full_name_is_case_insensitive(trusted_fx):
+    await trusted_fx.add_car(telegram_user_id=777, car_number="M295YB196")
+    trusted_fx.record_known(telegram_user_id=777, first_name="Иван", last_name="Иванов")
+
+    reply = await _search(trusted_fx, "иван иванов")
+
+    assert "M295YB196" in reply.text
+
+
+async def test_search_by_name_finds_two_different_users_with_same_name(trusted_fx):
+    """Имена НЕ уникальны (см. задачу п.6) — оба telegram_user_id
+    показываются, не только первый попавшийся."""
+    await trusted_fx.add_car(telegram_user_id=111, car_number="AA001AA")
+    trusted_fx.record_known(telegram_user_id=111, first_name="Иван", last_name="Иванов")
+    await trusted_fx.add_car(telegram_user_id=222, car_number="BB002BB")
+    trusted_fx.record_known(telegram_user_id=222, username="ivan2", first_name="Иван")
+
+    reply = await _search(trusted_fx, "Иван")
+
+    assert "AA001AA" in reply.text
+    assert "BB002BB" in reply.text
+    assert "🔎 Результаты поиска" in reply.text
+
+
+async def test_search_result_shows_name_and_username_together(trusted_fx):
+    await trusted_fx.add_car(telegram_user_id=777, car_number="M295YB196")
+    trusted_fx.record_known(telegram_user_id=777, username="ivanov_i", first_name="Иван", last_name="Иванов")
+
+    reply = await _search(trusted_fx, "Иван Иванов")
+
+    assert "👤 Иван Иванов (@ivanov_i)" in reply.text
+
+
+async def test_search_result_shows_name_without_username(trusted_fx):
+    await trusted_fx.add_car(telegram_user_id=777, car_number="M295YB196")
+    trusted_fx.record_known(telegram_user_id=777, first_name="Иван", last_name="Иванов")
+
+    reply = await _search(trusted_fx, "Иван Иванов")
+
+    assert "👤 Иван Иванов" in reply.text
+    assert "@" not in reply.text.split("👤 Иван Иванов")[1].split("\n")[0]
+
+
+async def test_search_result_shows_username_without_name(trusted_fx):
+    await trusted_fx.add_car(telegram_user_id=777, car_number="M295YB196")
+    trusted_fx.record_known(telegram_user_id=777, username="mihailov_vm")
+
+    reply = await _search(trusted_fx, "@mihailov_vm")
+
+    assert "👤 @mihailov_vm" in reply.text
+
+
+async def test_search_result_shows_dash_when_no_name_and_no_username(trusted_fx):
+    await trusted_fx.add_car(telegram_user_id=777, car_number="M295YB196")
+    # record_known НЕ вызывается вовсе.
+
+    reply = await _search(trusted_fx, "M295YB196")
+
+    assert "👤 —" in reply.text
+    assert "None" not in reply.text
+
+
+async def test_search_by_bare_username_without_at_still_works(trusted_fx):
+    """Регресс: bare username (без "@", не похожий на номер — с "_") по-
+    прежнему находится, теперь через объединённый username+name lookup
+    (см. задачу п.5/п.8: "не сломать существующий поиск")."""
+    await trusted_fx.add_car(telegram_user_id=777, car_number="M295YB196")
+    trusted_fx.record_known(telegram_user_id=777, username="mihailov_vm")
+
+    reply = await _search(trusted_fx, "mihailov_vm")
+
+    assert "M295YB196" in reply.text
+    assert "@mihailov_vm" in reply.text
 
 
 # ---- 9. normalized car search ----
@@ -415,6 +540,24 @@ async def test_search_pagination_across_many_cars(trusted_fx):
     assert clamped_high.search_page == 1
 
 
+async def test_name_search_pagination_does_not_lose_matched_users(trusted_fx):
+    """Пагинация не должна "терять" ни одного из НЕСКОЛЬКИХ разных
+    telegram_user_id, найденных по имени (см. задачу п.10/п.6) — все их
+    машины остаются доступны на каком-то page."""
+    for i in range(8):
+        await trusted_fx.add_car(telegram_user_id=1000 + i, car_number=f"I{i:03d}AA01")
+        trusted_fx.record_known(telegram_user_id=1000 + i, first_name="Иван")
+
+    await _open_search(trusted_fx)
+    page0 = await trusted_fx.controller.handle_text(
+        "Иван", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+    assert page0.search_query_type == "person"
+    assert page0.search_total_pages == 1  # 8 машин, PAGE_SIZE=10 -> одна страница
+    for i in range(8):
+        assert f"I{i:03d}AA01" in page0.text
+
+
 # ---- 19. forged callbacks denied ----
 
 
@@ -430,6 +573,27 @@ async def test_search_callbacks_reject_ordinary_user(trusted_fx):
     assert trusted_fx.controller.handle_search_back(
         chat_id=_ORDINARY_ID, telegram_user_id=_ORDINARY_ID,
     ) is None
+    assert await trusted_fx.controller.handle_search_page(
+        "person", "Иван", 0, telegram_user_id=_ORDINARY_ID,
+    ) is None
+
+
+async def test_ordinary_user_cannot_use_name_search(trusted_fx):
+    """Обычный пользователь не должен получить возможность искать людей
+    по имени (см. задачу п.9) — SEARCH_LABEL сам недоступен, и даже
+    forged conversation_state/callback для name-запроса отклоняются."""
+    await trusted_fx.add_car(telegram_user_id=777, car_number="M295YB196")
+    trusted_fx.record_known(telegram_user_id=777, first_name="Иван")
+
+    menu_reply = await trusted_fx.controller.handle_text(
+        texts.SEARCH_LABEL, chat_id=_ORDINARY_ID, telegram_user_id=_ORDINARY_ID, username=None,
+    )
+    assert menu_reply.search_prompt is False
+
+    forged_page = await trusted_fx.controller.handle_search_page(
+        "person", "Иван", 0, telegram_user_id=_ORDINARY_ID,
+    )
+    assert forged_page is None
 
 
 async def test_search_state_input_rejects_ordinary_user_with_hijacked_state(trusted_fx):

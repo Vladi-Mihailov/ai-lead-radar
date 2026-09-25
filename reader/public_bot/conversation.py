@@ -1383,19 +1383,20 @@ class ConversationController:
     # monitoring_task_id"), проверяются ОДИН раз, а не по разу на hit. ----
 
     def _parse_search_query(self, raw_text: str) -> tuple[str, str] | None:
-        """None — запрос не похож НИ на @username/username, НИ на номер
-        автомобиля (см. задачу п.3). Ведущий "@" — ВСЕГДА username (см.
-        задачу: "@username" в примере), однозначно, без попытки
-        интерпретировать как номер. БЕЗ "@" — сначала пробуем
-        normalize_car_number (см. задачу: "переиспользовать СУЩЕСТВУЮЩУЮ
-        normalization каждой страны, не создавать вторую реализацию") —
-        похоже на валидный номер (только [A-Z0-9] после нормализации) —
-        car-search; иначе — bare username (normalize_telegram_username,
-        та же функция, что и у trusted delegated Add Car flow). Порядок
+        """None — пустой запрос (см. задачу "add name search to trusted
+        bot search" п.3/п.5). Ведущий "@" — ВСЕГДА username, однозначно,
+        без попытки интерпретировать как номер/имя. БЕЗ "@" — сначала
+        пробуем normalize_car_number (см. задачу: "переиспользовать
+        СУЩЕСТВУЮЩУЮ normalization каждой страны, не создавать вторую
+        реализацию") — похоже на валидный номер — car-search; порядок
         ("сначала номер") — детерминированный, задокументированный выбор
-        для редкого случая, когда bare-username по форме совпадает с
-        валидным номером (например, короткий alphanumeric username без
-        "_")."""
+        для редкого случая, когда имя/bare-username по форме совпадает с
+        валидным номером (например, "IVAN"). Иначе — "person": НЕ
+        различаем здесь username-без-@ и имя (см. задачу п.5: "если
+        надёжно автоматически отличить невозможно — искать одновременно
+        по username/name и объединять результаты с dedup" — оба
+        интерпретируются как один и тот же bare-текст, _resolve_search_hits
+        сам пробует ОБА lookup'а и объединяет по telegram_user_id)."""
         stripped = raw_text.strip()
         if not stripped:
             return None
@@ -1414,11 +1415,7 @@ class ConversationController:
         else:
             return "car", car_number
 
-        try:
-            username = normalize_telegram_username(stripped)
-        except UsernameValidationError:
-            return None
-        return "username", username
+        return "person", stripped
 
     def _resolve_search_hits(self, query_type: str, query: str) -> list[_SearchHit]:
         if query_type == "username":
@@ -1434,6 +1431,30 @@ class ConversationController:
                 )
                 for s in subscriptions
             ]
+
+        if query_type == "person":
+            # Bare текст — одновременно username-без-@ И имя (см. задачу
+            # п.5) — объединяем по telegram_user_id (см. задачу п.6:
+            # "имена не уникальны, показать ВСЕХ найденных пользователей",
+            # тот же принцип покрывает и "один и тот же человек найден и
+            # по username, и по имени" — не задваиваем его машины).
+            user_ids: set[int] = set()
+            found_by_username = self._known_users.find_by_username(query)
+            if found_by_username is not None:
+                user_ids.add(found_by_username.telegram_user_id)
+            for known in self._known_users.find_by_name(query):
+                user_ids.add(known.telegram_user_id)
+
+            hits: list[_SearchHit] = []
+            for user_id in sorted(user_ids):
+                subscriptions = self._subscriptions.list_my_cars(user_id)
+                hits.extend(
+                    _SearchHit(
+                        task_id=s.monitoring_task_id, owner_telegram_user_id=user_id, car_number=s.car_number,
+                    )
+                    for s in subscriptions
+                )
+            return hits
 
         subscriptions = self._subscriptions.list_subscriptions_for_car(query)
         task_ids_with_subscription = {s.monitoring_task_id for s in subscriptions}
@@ -1481,22 +1502,31 @@ class ConversationController:
         self,
         hit: _SearchHit,
         *,
-        query_type: str,
         monitoring_active: bool,
         check_ok: bool,
         fines: list,
         checked_at: datetime,
     ) -> str:
+        """Каждый блок ВСЕГДА показывает и владельца, и машину (см. задачу
+        "add name search to trusted bot search" п.7) — единый формат
+        независимо от того, что искали: имя может соответствовать
+        НЕСКОЛЬКИМ разным telegram_user_id (см. класс docstring), поэтому
+        больше нет единого "внешнего" owner для всего сообщения — owner
+        называется в КАЖДОМ блоке отдельно (см. texts.format_search_results)."""
         # get() может вернуть None, даже если owner_telegram_user_id
         # задан (владелец известен по subscription, но НИ РАЗУ не писал
-        # ЭТОМУ боту) — format_owner_username_button() корректно даёт "—"
+        # ЭТОМУ боту) — format_search_owner_display() корректно даёт "—"
         # в обоих случаях (owner_telegram_user_id=None ИЛИ known=None).
         known = self._known_users.get(hit.owner_telegram_user_id) if hit.owner_telegram_user_id is not None else None
-        owner_username = known.telegram_username if known else None
-        owner_display = texts.format_owner_username_button(owner_username)
+        owner_display = texts.format_search_owner_display(
+            first_name=known.first_name if known else None,
+            last_name=known.last_name if known else None,
+            username=known.telegram_username if known else None,
+        )
 
         lines = [
-            f"🚗 {hit.car_number}" if query_type == "username" else f"👤 {owner_display}",
+            f"👤 {owner_display}",
+            f"🚗 {hit.car_number}",
             texts.format_search_money_line(check_ok=check_ok, fines=fines),
             texts.format_search_monitoring_line(monitoring_active=monitoring_active),
             texts.format_search_checked_at_line(checked_at),
@@ -1510,19 +1540,12 @@ class ConversationController:
         DB-запрос (дёшево) выполняется заново на КАЖДЫЙ page, live-проверка
         (дорого, сетевой запрос) — ТОЛЬКО для hits текущей страницы.
 
-        query_display для username — АКТУАЛЬНЫЙ known username (корректный
-        регистр из bot_known_users), НЕ введённый пользователем запрос
-        as-is (см. задачу п.5: "username — display/query поле, stable
-        identity — numeric") — "не найдено" fallback использует запрос
-        as-is (единственный доступный вариант, если пользователь неизвестен)."""
-        if query_type == "username":
-            known = self._known_users.find_by_username(query)
-            query_display = f"@{known.telegram_username}" if known else f"@{query}"
-        else:
-            query_display = query
-
+        "Не найдено" показывает query as-is (с "@", если explicit username-
+        поиск) — единственный доступный вариант, когда никто не найден
+        (нет "known" записи, из которой можно взять корректный регистр)."""
         all_hits = self._resolve_search_hits(query_type, query)
         if not all_hits:
+            query_display = f"@{query}" if query_type == "username" else query
             return BotReply(
                 text=texts.format_search_not_found(query_display),
                 search_result_shown=True,
@@ -1550,12 +1573,12 @@ class ConversationController:
             monitoring_active, check_ok, fines = task_checks[hit.task_id]
             blocks.append(
                 self._format_search_block(
-                    hit, query_type=query_type, monitoring_active=monitoring_active,
+                    hit, monitoring_active=monitoring_active,
                     check_ok=check_ok, fines=fines, checked_at=checked_at,
                 )
             )
 
-        text = texts.format_search_results(query_type=query_type, query_display=query_display, blocks=blocks)
+        text = texts.format_search_results(blocks=blocks)
         if total_pages > 1:
             text += "\n\n" + texts.format_search_pagination_footer(page=page, total_pages=total_pages)
 

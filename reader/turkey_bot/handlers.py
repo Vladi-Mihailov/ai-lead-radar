@@ -57,11 +57,17 @@ def register(
     сконфигурированном bot-mode TelegramClient (см.
     reader/turkey_bot/main.py)."""
 
-    def _record_known_user(telegram_user_id: int, telegram_chat_id: int, username: str | None) -> None:
+    def _record_known_user(
+        telegram_user_id: int,
+        telegram_chat_id: int,
+        username: str | None,
+        first_name: str | None = None,
+        last_name: str | None = None,
+    ) -> None:
         if known_users_repository is not None:
             known_users_repository.record_seen(
                 telegram_user_id=telegram_user_id, telegram_chat_id=telegram_chat_id,
-                telegram_username=username,
+                telegram_username=username, first_name=first_name, last_name=last_name,
             )
 
     @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
@@ -72,7 +78,9 @@ def register(
 
         sender = await event.get_sender()
         username = getattr(sender, "username", None) if sender is not None else None
-        _record_known_user(event.sender_id, event.chat_id, username)
+        first_name = getattr(sender, "first_name", None) if sender is not None else None
+        last_name = getattr(sender, "last_name", None) if sender is not None else None
+        _record_known_user(event.sender_id, event.chat_id, username, first_name, last_name)
         is_trusted = controller.is_trusted(event.sender_id)
 
         reply = await controller.handle_text(
@@ -84,7 +92,9 @@ def register(
     async def _on_callback(event: events.CallbackQuery.Event) -> None:
         sender = await event.get_sender()
         username = getattr(sender, "username", None) if sender is not None else None
-        _record_known_user(event.sender_id, event.chat_id, username)
+        first_name = getattr(sender, "first_name", None) if sender is not None else None
+        last_name = getattr(sender, "last_name", None) if sender is not None else None
+        _record_known_user(event.sender_id, event.chat_id, username, first_name, last_name)
         is_trusted = controller.is_trusted(event.sender_id)
 
         if event.data == CANCEL_CALLBACK_DATA:

@@ -121,13 +121,23 @@ class BotKnownUser:
     боту первым писать пользователю, который никогда не начинал с ним
     диалог — резолв username в id не гарантирует возможность доставки).
     Обновляется на КАЖДОЕ входящее событие (сообщение или callback),
-    независимо от его содержимого — см. reader/public_bot/handlers.py."""
+    независимо от его содержимого — см. reader/public_bot/handlers.py.
+
+    first_name/last_name — тот же принцип, что и telegram_username (см.
+    задачу "add name search to trusted bot search"): auto-captured
+    Telegram profile data из event.sender, обновляется на каждое событие
+    (COALESCE — не затирается NULL'ом, если Telegram вдруг не отдал имя
+    в конкретном событии), НИКОГДА не запрашивается вручную. None —
+    Telegram не сообщил (first_name у реальных пользователей практически
+    всегда есть, last_name — часто отсутствует)."""
 
     telegram_user_id: int
     telegram_chat_id: int
     telegram_username: str | None
     first_seen_at: datetime
     last_seen_at: datetime
+    first_name: str | None = None
+    last_name: str | None = None
 
 
 @dataclass(frozen=True)

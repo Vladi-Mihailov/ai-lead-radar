@@ -23,17 +23,36 @@ CREATE TABLE IF NOT EXISTS turkey_bot_known_users (
 )
 """
 
+# first_name/last_name (см. задачу "add name search to trusted bot
+# search") — additive ALTER TABLE, тот же приём, что и
+# reader/public_bot/known_users_repository.py::_COLUMN_MIGRATIONS — для
+# БД, созданных до появления этих колонок, добавляем их явно при
+# открытии, без удаления/пересоздания.
+_COLUMN_MIGRATIONS = {
+    "first_name": "ALTER TABLE turkey_bot_known_users ADD COLUMN first_name TEXT",
+    "last_name": "ALTER TABLE turkey_bot_known_users ADD COLUMN last_name TEXT",
+}
+
 _UPSERT = """
-INSERT INTO turkey_bot_known_users (telegram_user_id, telegram_chat_id, telegram_username, first_seen_at, last_seen_at)
-VALUES (:telegram_user_id, :telegram_chat_id, :telegram_username, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+INSERT INTO turkey_bot_known_users (
+    telegram_user_id, telegram_chat_id, telegram_username, first_seen_at, last_seen_at,
+    first_name, last_name
+)
+VALUES (
+    :telegram_user_id, :telegram_chat_id, :telegram_username, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+    :first_name, :last_name
+)
 ON CONFLICT(telegram_user_id) DO UPDATE SET
     telegram_chat_id = excluded.telegram_chat_id,
     telegram_username = COALESCE(excluded.telegram_username, turkey_bot_known_users.telegram_username),
+    first_name = COALESCE(excluded.first_name, turkey_bot_known_users.first_name),
+    last_name = COALESCE(excluded.last_name, turkey_bot_known_users.last_name),
     last_seen_at = CURRENT_TIMESTAMP
 """
 
 _SELECT = (
-    "SELECT telegram_user_id, telegram_chat_id, telegram_username, first_seen_at, last_seen_at "
+    "SELECT telegram_user_id, telegram_chat_id, telegram_username, first_seen_at, last_seen_at, "
+    "first_name, last_name "
     "FROM turkey_bot_known_users WHERE telegram_user_id = ?"
 )
 
@@ -52,6 +71,28 @@ _SELECT_BY_USERNAME = (
     "ORDER BY last_seen_at DESC LIMIT 1"
 )
 
+# Manager/trusted Search по имени (см. задачу "add name search to trusted
+# bot search" п.4/п.6, тот же приём, что и
+# reader/public_bot/known_users_repository.py::_SELECT_BY_NAME) — EXACT
+# normalized (TRIM+LOWER) match по first_name/last_name/полному имени,
+# ВСЕ совпавшие пользователи (имена не уникальны), не первый попавшийся.
+_SELECT_BY_NAME = """
+    SELECT telegram_user_id, telegram_username, first_name, last_name
+    FROM turkey_bot_known_users
+    WHERE LOWER(TRIM(first_name)) = LOWER(TRIM(:query))
+       OR LOWER(TRIM(last_name)) = LOWER(TRIM(:query))
+       OR LOWER(TRIM(COALESCE(first_name, '') || ' ' || COALESCE(last_name, ''))) = LOWER(TRIM(:query))
+    ORDER BY last_seen_at DESC
+"""
+
+
+def _unicode_lower(value: str | None) -> str | None:
+    """Заменяет встроенный SQLite LOWER() (см. __init__::create_function,
+    тот же приём, что и reader/public_bot/known_users_repository.py) — он
+    по умолчанию регистронезависим ТОЛЬКО для ASCII, кириллические имена
+    без этого не находились бы при разном регистре (см. _SELECT_BY_NAME)."""
+    return value.lower() if isinstance(value, str) else value
+
 
 class TurkeyBotKnownUsersRepository:
     def __init__(self, db_path: Path | str):
@@ -67,18 +108,34 @@ class TurkeyBotKnownUsersRepository:
         if not is_memory:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.create_function("LOWER", 1, _unicode_lower)
         self._conn.execute(_SCHEMA)
+        existing_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(turkey_bot_known_users)")}
+        for column, statement in _COLUMN_MIGRATIONS.items():
+            if column not in existing_columns:
+                self._conn.execute(statement)
         self._conn.commit()
 
     def record_seen(
-        self, *, telegram_user_id: int, telegram_chat_id: int, telegram_username: str | None,
+        self,
+        *,
+        telegram_user_id: int,
+        telegram_chat_id: int,
+        telegram_username: str | None,
+        first_name: str | None = None,
+        last_name: str | None = None,
     ) -> None:
+        """first_name/last_name — Default None сохраняет существующие
+        вызовы record_seen(...) без этих параметров (см. задачу: "не
+        сломать существующий поиск")."""
         self._conn.execute(
             _UPSERT,
             {
                 "telegram_user_id": telegram_user_id,
                 "telegram_chat_id": telegram_chat_id,
                 "telegram_username": telegram_username,
+                "first_name": first_name,
+                "last_name": last_name,
             },
         )
         self._conn.commit()
@@ -113,6 +170,28 @@ class TurkeyBotKnownUsersRepository:
         if row is None:
             return None
         return row[0], row[1]
+
+    def get_profile(self, telegram_user_id: int) -> tuple[str | None, str | None, str | None] | None:
+        """(telegram_username, first_name, last_name) ОДНОГО пользователя
+        — см. задачу "add name search to trusted bot search" п.7: Search
+        result должен показывать имя ВМЕСТЕ с username, не только
+        username (см. get_username() выше, который отдаёт ТОЛЬКО его).
+        None — пользователь никогда не писал ЭТОМУ боту вовсе (не путать
+        с "писал, но профиль пуст" — тогда все три поля None, но кортеж
+        не None)."""
+        row = self._conn.execute(_SELECT, (telegram_user_id,)).fetchone()
+        if row is None:
+            return None
+        return row[2], row[5], row[6]  # telegram_username, first_name, last_name
+
+    def find_by_name(self, query: str) -> list[tuple[int, str | None, str | None, str | None]]:
+        """(telegram_user_id, telegram_username, first_name, last_name)
+        для КАЖДОГО пользователя, чьё имя (first_name/last_name/полное
+        имя) EXACT-совпадает с query после TRIM+LOWER (см. _SELECT_BY_NAME,
+        задача п.4/п.6) — имена НЕ уникальны, возвращает ВСЕХ совпавших,
+        не первого попавшегося."""
+        rows = self._conn.execute(_SELECT_BY_NAME, {"query": query}).fetchall()
+        return [(user_id, username, first_name, last_name) for user_id, username, first_name, last_name in rows]
 
     def count_total(self) -> int:
         """Всего уникальных Telegram user id, когда-либо написавших ЭТОМУ

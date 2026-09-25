@@ -91,11 +91,17 @@ def register(
     (см. design report: единственный способ узнать, что боту можно
     что-либо доставить этому numeric id, — он уже хоть раз ему написал)."""
 
-    def _record_known_user(telegram_user_id: int, telegram_chat_id: int, username: str | None) -> None:
+    def _record_known_user(
+        telegram_user_id: int,
+        telegram_chat_id: int,
+        username: str | None,
+        first_name: str | None = None,
+        last_name: str | None = None,
+    ) -> None:
         if known_users_repository is not None:
             known_users_repository.record_seen(
                 telegram_user_id=telegram_user_id, telegram_chat_id=telegram_chat_id,
-                telegram_username=username,
+                telegram_username=username, first_name=first_name, last_name=last_name,
             )
 
     @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
@@ -105,7 +111,7 @@ def register(
             return
 
         username, first_name, last_name = await _sender_names(event)
-        _record_known_user(event.sender_id, event.chat_id, username)
+        _record_known_user(event.sender_id, event.chat_id, username, first_name, last_name)
         is_trusted = controller.is_trusted(event.sender_id)
 
         reply = await controller.handle_text(
@@ -123,7 +129,7 @@ def register(
     async def _on_callback(event: events.CallbackQuery.Event) -> None:
         data = event.data
         username, first_name, last_name = await _sender_names(event)
-        _record_known_user(event.sender_id, event.chat_id, username)
+        _record_known_user(event.sender_id, event.chat_id, username, first_name, last_name)
         is_trusted = controller.is_trusted(event.sender_id)
 
         wants_client = decode_add_client_decision_callback(data)
