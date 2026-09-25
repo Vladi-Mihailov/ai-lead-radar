@@ -40,6 +40,8 @@ from reader.public_bot.texts import (
     BACK_BUTTON_LABEL,
     CANCEL_BUTTON_LABEL,
     CHECK_NOW_LABEL,
+    DEBT_REFRESH_BUTTON_LABEL,
+    DEBT_REFRESH_CONFIRM_BUTTON_LABEL,
     DELETE_CAR_BUTTON_LABEL,
     DELETE_CAR_CONFIRM_BUTTON_LABEL,
     MY_CARS_LABEL,
@@ -528,6 +530,71 @@ def trusted_stop_confirm_keyboard(task_id: int, *, label: str) -> list[list[Butt
     return [[
         Button.inline(label, _TRUSTED_STOP_YES_PREFIX + str(task_id).encode("ascii")),
         Button.inline("Отмена", STOP_NO),
+    ]]
+
+
+# Trusted-manager "🔄 Обновить задолженности" (см. задачу "OPTIONAL DEBT
+# REFRESH") — без id/task_id вовсе: refresh всегда над ТЕКУЩИМ полным
+# списком известных штрафов (см. DebtRefreshService.list_debt_rows), а не
+# над каким-то конкретным выбором, поэтому payload — фиксированные
+# константы, тот же принцип, что и STOP_NO. Отдельные (не переиспользующие
+# _TRUSTED_STOP_*/STOP_NO) константы — коллизий по префиксу нет, но и по
+# смыслу это другой, независимый flow (см. reader/public_bot/conversation.py::
+# handle_debt_refresh_pick/handle_debt_refresh_confirm/handle_debt_refresh_cancel).
+_DEBT_REFRESH_PICK = b"debtrefreshpick"
+_DEBT_REFRESH_YES = b"debtrefreshyes"
+_DEBT_REFRESH_NO = b"debtrefreshno"
+# Пагинация itemized-списка "🚨 Известные штрафы" (см. задачу п.2) — тот же
+# принцип, что и _TRUSTED_TASKS_PAGE_PREFIX: page публичен, НЕ доказательство
+# авторизации (is_trusted() перепроверяется в handle_debt_list_page).
+_DEBT_LIST_PAGE_PREFIX = b"debtlistpage:"
+
+
+def decode_debt_refresh_pick_callback(data: bytes | None) -> bool:
+    return data == _DEBT_REFRESH_PICK
+
+
+def decode_debt_refresh_confirm_callback(data: bytes | None) -> bool:
+    return data == _DEBT_REFRESH_YES
+
+
+def decode_debt_refresh_cancel_callback(data: bytes | None) -> bool:
+    return data == _DEBT_REFRESH_NO
+
+
+def encode_debt_list_page_callback(page: int) -> bytes:
+    return _DEBT_LIST_PAGE_PREFIX + str(page).encode("ascii")
+
+
+def decode_debt_list_page_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _DEBT_LIST_PAGE_PREFIX)
+
+
+def debt_statistics_keyboard(*, page: int | None, total_pages: int | None) -> list[list[Button]]:
+    """Клавиатура ПОД сообщением 📊 Статистика, когда debt_refresh
+    доступен (см. BotReply.debt_refresh_available) — пагинация itemized-
+    списка (только если он не пуст И страниц больше одной, см.
+    total_pages) ПЛЮС кнопка проверки, одно сообщение, несколько строк
+    кнопок (Telegram допускает несколько рядов в одной inline-клавиатуре,
+    в отличие от одновременного reply+inline на одном сообщении, см.
+    ConversationController._format_statistics_reply)."""
+    rows: list[list[Button]] = []
+    if total_pages is not None and total_pages > 1 and page is not None:
+        back_page = max(0, page - 1)
+        next_page = min(total_pages - 1, page + 1)
+        rows.append([
+            Button.inline("◀️ Назад", encode_debt_list_page_callback(back_page)),
+            Button.inline(f"{page + 1} / {total_pages}", encode_debt_list_page_callback(page)),
+            Button.inline("Вперёд ▶️", encode_debt_list_page_callback(next_page)),
+        ])
+    rows.append([Button.inline(DEBT_REFRESH_BUTTON_LABEL, _DEBT_REFRESH_PICK)])
+    return rows
+
+
+def debt_refresh_confirm_keyboard() -> list[list[Button]]:
+    return [[
+        Button.inline(DEBT_REFRESH_CONFIRM_BUTTON_LABEL, _DEBT_REFRESH_YES),
+        Button.inline("❌ Отмена", _DEBT_REFRESH_NO),
     ]]
 
 

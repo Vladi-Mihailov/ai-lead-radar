@@ -38,6 +38,7 @@ from reader.public_bot.conversation import ConversationController  # noqa: E402
 from reader.public_bot.conversation_state_repository import (  # noqa: E402
     BotConversationStateRepository,
 )
+from reader.public_bot.debt_refresh_service import DebtRefreshService  # noqa: E402
 from reader.public_bot.delivery_repository import ClientFineDeliveryRepository  # noqa: E402
 from reader.public_bot.delivery_service import ClientDeliveryService  # noqa: E402
 from reader.public_bot.handlers import register  # noqa: E402
@@ -234,6 +235,13 @@ async def run() -> None:
         statistics_service = BotStatisticsService(
             known_users_repository, subscription_repository, detected_fine_repository,
         )
+        # Trusted-manager "🔄 Обновить задолженности" (см. задачу "OPTIONAL
+        # DEBT REFRESH") — переиспользует ТЕ ЖЕ task_repository/
+        # detected_fine_repository/check_service, что и всё остальное выше,
+        # никакой отдельной проверки police.ge не заводит.
+        debt_refresh_service = DebtRefreshService(
+            task_repository, detected_fine_repository, check_service,
+        )
         controller = ConversationController(
             conversation_state_repository,
             subscription_service,
@@ -242,6 +250,7 @@ async def run() -> None:
             tz=ZoneInfo(settings.fine_monitor.timezone),
             trusted_operator_user_ids=frozenset(settings.public_bot.trusted_operator_user_ids),
             payment_help_contact_username=settings.public_bot.payment_help_contact_username,
+            debt_refresh_service=debt_refresh_service,
         )
 
         register(client, controller, known_users_repository)

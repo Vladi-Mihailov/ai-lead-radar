@@ -88,12 +88,22 @@ from zoneinfo import ZoneInfo
 
 from reader.fines.validation import FineValidationError, normalize_car_number
 from reader.public_bot import texts
-from reader.public_bot.conversation_state_repository import BotConversationStateRepository
+from reader.public_bot.conversation_state_repository import (
+    BotConversationStateRepository,
+)
+from reader.public_bot.debt_refresh_service import (
+    DebtRefreshService,
+    DebtSummary,
+    RefreshAlreadyInProgressError,
+)
 from reader.public_bot.known_users_repository import BotKnownUsersRepository
 from reader.public_bot.owner_resolution import OwnerResolutionError
 from reader.public_bot.statistics_service import BotStatisticsService
 from reader.public_bot.subscription_service import SubscriptionService
-from reader.public_bot.validation import UsernameValidationError, normalize_telegram_username
+from reader.public_bot.validation import (
+    UsernameValidationError,
+    normalize_telegram_username,
+)
 
 STEP_AWAITING_CAR_NUMBER = "awaiting_car_number"
 STEP_AWAITING_CLIENT_DECISION = "awaiting_client_decision"
@@ -143,6 +153,11 @@ _MY_CARS_PAGE_SIZE = 10
 # manager screens" — та же величина, что и _TRUSTED_TASKS_PAGE_SIZE/
 # _MY_CARS_PAGE_SIZE выше.
 _SEARCH_PAGE_SIZE = 10
+
+# "🚨 Известные штрафы" itemized-список в 📊 Статистика (см. задачу
+# "OPTIONAL DEBT REFRESH" п.2) — та же величина 10/page, что и у всех
+# остальных manager-экранов выше.
+_DEBT_LIST_PAGE_SIZE = 10
 
 
 @dataclass(frozen=True)
@@ -287,6 +302,24 @@ class BotReply:
     cta_buttons: list[list[tuple[str, str]]] | None = None
     show_turkey_bot_link: bool = False
 
+    # Trusted-manager "🔄 Проверить авто со штрафами" (см. задачу "OPTIONAL
+    # DEBT REFRESH") — debt_refresh_available прикрепляет inline-клавиатуру
+    # (пагинация itemized-списка + сама кнопка проверки) ПОД сообщением 📊
+    # Статистика (см. handlers.py); debt_list_page/debt_list_total_pages —
+    # ТОЛЬКО когда есть хотя бы один известный штраф (см.
+    # _format_statistics_reply) — None означает "список пуст, пагинация не
+    # нужна", а не "первая страница". debt_refresh_confirm — промежуточный
+    # экран "Будет проверено автомобилей: N" с [✅ Подтвердить][❌ Отмена],
+    # тот же принцип двухшагового подтверждения, что и у
+    # trusted_stop_confirm_task_id выше — ПЕРВОЕ нажатие ничего не
+    # запускает, ни одного police.ge-запроса. is_trusted() перепроверяется
+    # заново на каждом шаге (см. handle_debt_refresh_pick/confirm/cancel/
+    # handle_debt_list_page).
+    debt_refresh_available: bool = False
+    debt_refresh_confirm: bool = False
+    debt_list_page: int | None = None
+    debt_list_total_pages: int | None = None
+
     # Manager/trusted Search (см. задачу "manager/trusted Search") —
     # ТОЛЬКО trusted_operator_user_ids, self-service вообще не видит эти
     # поля. search_prompt — экран ввода запроса (см. texts.SEARCH_ENTRY_TEXT/
@@ -322,10 +355,19 @@ class ConversationController:
         tz: ZoneInfo,
         trusted_operator_user_ids: frozenset[int] = frozenset(),
         payment_help_contact_username: str = "tplgee",
+        debt_refresh_service: DebtRefreshService | None = None,
     ):
         self._states = conversation_state_repository
         self._subscriptions = subscription_service
         self._statistics = statistics_service
+        # None — как и everywhere в проекте (см. FineTranslatorLike/
+        # OwnerUsernameResolverLike) — означает "фичи 🔄 Обновить
+        # задолженности вообще нет в этом сборке" (кнопка не показывается,
+        # см. _format_statistics_reply), а не ошибку. Существующие
+        # вызовы ConversationController(...) без этого параметра (тесты,
+        # см. задачу "минимальные изменения") продолжают работать бит в
+        # бит как раньше.
+        self._debt_refresh = debt_refresh_service
         # ТОЛЬКО для manager/trusted-operator "📋 Мои авто" — показать
         # auto-captured username владельца рядом с номером (см. задачу
         # "показывать владельца в manager car list"), см.
@@ -542,9 +584,129 @@ class ConversationController:
 
         return None
 
-    def _format_statistics_reply(self) -> BotReply:
+    def _format_statistics_reply(self, *, debt_page: int = 0) -> BotReply:
         stats = self._statistics.get_statistics(now=datetime.now(timezone.utc), tz=self._tz)
-        return BotReply(text=texts.format_statistics(stats), show_main_menu=True)
+        if self._debt_refresh is None:
+            # Фичи нет в этой сборке (см. конструктор) — прежнее поведение
+            # бит в бит: обычная reply-клавиатура главного меню.
+            return BotReply(text=texts.format_statistics(stats, debt=DebtSummary(0, 0.0)), show_main_menu=True)
+
+        # Inline-клавиатура (пагинация + кнопка проверки) и persistent
+        # reply-клавиатура главного меню — ДВА разных типа reply_markup в
+        # терминах Telegram API, оба на одном сообщении невозможны (см.
+        # тот же принцип, что и у search_prompt/search_result_shown ниже:
+        # они тоже не переустанавливают show_main_menu на своих экранах).
+        # Реально это не регрессия: persistent-клавиатура, once shown,
+        # остаётся видимой у пользователя, пока её явно не заменит другое
+        # сообщение — она не пропадает от того, что ЭТО сообщение её не
+        # переотправляет (см. handle_debt_refresh_cancel/confirm ниже —
+        # они возвращают show_main_menu=True отдельным сообщением).
+        debt = self._debt_refresh.get_debt_summary()
+        display_rows = self._debt_refresh.get_debt_rows_for_display()
+
+        text = texts.format_statistics(stats, debt=debt)
+        page: int | None = None
+        total_pages: int | None = None
+        if display_rows:
+            total_pages = -(-len(display_rows) // _DEBT_LIST_PAGE_SIZE)  # ceil division
+            page = max(0, min(debt_page, total_pages - 1))
+            start = page * _DEBT_LIST_PAGE_SIZE
+            page_rows = display_rows[start:start + _DEBT_LIST_PAGE_SIZE]
+            now = datetime.now(timezone.utc)
+            row_lines = [
+                texts.format_debt_row(
+                    car_number=row.car_number,
+                    owner_display=self._debt_row_owner_display(
+                        task_id=row.task_id, car_number=row.car_number,
+                    ),
+                    total_amount=row.total_amount,
+                    recency=texts.format_debt_recency(row.checked_at, now=now, tz=self._tz),
+                )
+                for row in page_rows
+            ]
+            section = texts.format_debt_list_section(row_lines, page=page, total_pages=total_pages)
+            text = f"{text}\n\n{section}"
+
+        return BotReply(
+            text=text, debt_refresh_available=True, debt_list_page=page, debt_list_total_pages=total_pages,
+        )
+
+    def _debt_row_owner_display(self, *, task_id: int, car_number: str) -> str:
+        """Владелец ОДНОЙ конкретной задачи (task_id), а не car_number
+        вообще (та же осторожность, что и у Turkey get_latest_for_owner —
+        один car_number может быть связан с несколькими разными задачами
+        мониторинга за свою историю). list_subscriptions_for_car() — уже
+        существующий источник Search (см. _resolve_search_hits) —
+        переиспользуется здесь, а не изобретается заново; фильтруем по
+        ИМЕННО этому task_id. Несколько подписчиков одной задачи (см.
+        задачу "OPTIONAL DEBT REFRESH" п.4: "task может иметь несколько
+        subscribers") — предпочитаем active-подписчика, иначе первого
+        найденного, для ОДНОЙ строки нужен ровно один владелец на показ."""
+        subscriptions = [
+            s for s in self._subscriptions.list_subscriptions_for_car(car_number)
+            if s.monitoring_task_id == task_id
+        ]
+        if not subscriptions:
+            return texts.format_search_owner_display(first_name=None, last_name=None, username=None)
+
+        chosen = next((s for s in subscriptions if s.status == "active"), subscriptions[0])
+        known = self._known_users.get(chosen.telegram_user_id)
+        return texts.format_search_owner_display(
+            first_name=known.first_name if known else None,
+            last_name=known.last_name if known else None,
+            username=known.telegram_username if known else None,
+        )
+
+    # ---- "🔄 Обновить задолженности" (см. задачу "OPTIONAL DEBT REFRESH") —
+    # trusted-manager-only, is_trusted() перепроверяется ЗАНОВО на каждом
+    # шаге по РЕАЛЬНОМУ telegram_user_id (см. остальные trusted-* методы
+    # этого класса) — доступность самой кнопки (debt_refresh_available)
+    # НЕ является доказательством авторизации сама по себе. ----
+
+    def handle_debt_list_page(self, page: int, *, telegram_user_id: int) -> BotReply | None:
+        """Пагинация itemized-списка "🚨 Известные штрафы" — page клампится
+        внутри _format_statistics_reply (тот же принцип, что и у
+        handle_trusted_tasks_page: forged/out-of-range page не ошибка, а
+        просто ближайшая валидная страница), ни одного police.ge-запроса."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+        return self._format_statistics_reply(debt_page=page)
+
+    def handle_debt_refresh_pick(self, *, telegram_user_id: int) -> BotReply:
+        """Первый шаг — ТОЛЬКО чтение (list_debt_rows(), см.
+        DebtRefreshService), ни одного police.ge-запроса (см. задачу п.11:
+        "сначала показать количество, не жать массово"). Пустой список —
+        сразу финальный ответ п.10, минуя экран подтверждения вовсе."""
+        if not self._is_trusted(telegram_user_id) or self._debt_refresh is None:
+            return BotReply(text=texts.CALLBACK_NOT_AUTHORIZED_TEXT, show_main_menu=True)
+
+        car_count = len(self._debt_refresh.list_debt_rows())
+        if car_count == 0:
+            return BotReply(text=texts.DEBT_REFRESH_NONE_TEXT, show_main_menu=True)
+
+        return BotReply(text=texts.format_debt_refresh_prompt(car_count), debt_refresh_confirm=True)
+
+    def handle_debt_refresh_cancel(self, *, telegram_user_id: int) -> BotReply:
+        if not self._is_trusted(telegram_user_id):
+            return BotReply(text=texts.CALLBACK_NOT_AUTHORIZED_TEXT, show_main_menu=True)
+        return BotReply(text=texts.DEBT_REFRESH_CANCELLED_TEXT, show_main_menu=True)
+
+    async def handle_debt_refresh_confirm(self, *, telegram_user_id: int) -> BotReply:
+        """Финальный шаг — is_trusted() и наличие DebtRefreshService
+        перепроверяются ЗАНОВО (см. handle_debt_refresh_pick). Защита от
+        повторного/параллельного нажатия — DebtRefreshService.refresh()
+        сам бросает RefreshAlreadyInProgressError, если предыдущий прогон
+        ещё не завершился (см. задачу п.11), а не отдельная проверка
+        здесь — единственный источник истины про "идёт ли уже refresh"."""
+        if not self._is_trusted(telegram_user_id) or self._debt_refresh is None:
+            return BotReply(text=texts.CALLBACK_NOT_AUTHORIZED_TEXT, show_main_menu=True)
+
+        try:
+            outcome = await self._debt_refresh.refresh()
+        except RefreshAlreadyInProgressError:
+            return BotReply(text=texts.DEBT_REFRESH_IN_PROGRESS_TEXT, show_main_menu=True)
+
+        return BotReply(text=texts.format_debt_refresh_summary(outcome), show_main_menu=True)
 
     def _format_trusted_tasks_page_reply(self, page: int) -> BotReply:
         """"📋 Мои авто" для trusted-оператора — ОДНА страница ВСЕХ

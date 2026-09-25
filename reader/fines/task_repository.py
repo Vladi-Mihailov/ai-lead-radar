@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS fine_monitoring_tasks (
     last_error          TEXT,
     archive_check_enabled INTEGER NOT NULL DEFAULT 0,
     next_archive_check_at TIMESTAMP,
-    monitoring_scope    TEXT NOT NULL DEFAULT 'operator'
+    monitoring_scope    TEXT NOT NULL DEFAULT 'operator',
+    last_successful_checked_at TIMESTAMP
 )
 """
 
@@ -59,6 +60,17 @@ _COLUMN_MIGRATIONS = {
         "ALTER TABLE fine_monitoring_tasks "
         "ADD COLUMN monitoring_scope TEXT NOT NULL DEFAULT 'operator'"
     ),
+    # Последний УСПЕШНЫЙ (last_check_status == 'ok') прогон check_task() —
+    # ОТДЕЛЬНО от last_checked_at (который перезаписывается и на ошибке
+    # тоже, см. record_check_result). Нужен manager "🔄 Обновить
+    # задолженности" (см. reader/public_bot/debt_refresh_service.py): при
+    # ERROR это поле НЕ трогается, поэтому оно всегда показывает момент
+    # последнего ДОСТОВЕРНОГО состояния, а не последней попытки. NULL для
+    # существующих строк — ни одна задача не считается "только что
+    # проверенной" сама по себе из-за миграции.
+    "last_successful_checked_at": (
+        "ALTER TABLE fine_monitoring_tasks ADD COLUMN last_successful_checked_at TIMESTAMP"
+    ),
 }
 
 _INSERT = """
@@ -75,7 +87,8 @@ _SELECT_FIELDS = """
     id, car_number, label, start_date, end_date, status,
     telegram_chat_id, created_by_user_id, created_at, updated_at,
     last_checked_at, last_check_status, last_error,
-    archive_check_enabled, next_archive_check_at, monitoring_scope
+    archive_check_enabled, next_archive_check_at, monitoring_scope,
+    last_successful_checked_at
 """
 
 _SELECT_BY_ID = f"SELECT {_SELECT_FIELDS} FROM fine_monitoring_tasks WHERE id = ?"
@@ -244,6 +257,7 @@ def _row_to_task(row) -> FineMonitoringTask:
         archive_check_enabled,
         next_archive_check_at,
         monitoring_scope,
+        last_successful_checked_at,
     ) = row
 
     return FineMonitoringTask(
@@ -265,6 +279,9 @@ def _row_to_task(row) -> FineMonitoringTask:
             datetime.fromisoformat(next_archive_check_at) if next_archive_check_at else None
         ),
         monitoring_scope=monitoring_scope,
+        last_successful_checked_at=(
+            datetime.fromisoformat(last_successful_checked_at) if last_successful_checked_at else None
+        ),
     )
 
 
@@ -403,6 +420,21 @@ class FineMonitoringTaskRepository:
                 "last_check_status": last_check_status,
                 "last_error": last_error,
             },
+        )
+        self._conn.commit()
+
+    def record_successful_check(self, task_id: int) -> None:
+        """Отдельно от record_check_result() выше — вызывается ТОЛЬКО
+        когда FineCheckService.check_task() реально вернул status=='ok'
+        (см. reader/public_bot/debt_refresh_service.py). При ERROR этот
+        метод НЕ вызывается вовсе, поэтому last_successful_checked_at
+        переживает последующие неудачные попытки без каких-либо условных
+        UPDATE (тот же приём "просто не трогать поле", что и у
+        FineCheckService._resolve_translation/detected_fines при ERROR)."""
+        self._conn.execute(
+            "UPDATE fine_monitoring_tasks SET last_successful_checked_at = CURRENT_TIMESTAMP "
+            "WHERE id = :task_id",
+            {"task_id": task_id},
         )
         self._conn.commit()
 

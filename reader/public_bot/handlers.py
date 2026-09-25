@@ -20,8 +20,14 @@ from reader.public_bot.keyboards import (
     car_delete_confirm_keyboard,
     car_detail_keyboard,
     check_now_options_keyboard,
+    debt_refresh_confirm_keyboard,
+    debt_statistics_keyboard,
     decode_add_client_decision_callback,
     decode_check_now_callback,
+    decode_debt_list_page_callback,
+    decode_debt_refresh_cancel_callback,
+    decode_debt_refresh_confirm_callback,
+    decode_debt_refresh_pick_callback,
     decode_my_car_delete_callback,
     decode_my_car_delete_cancel_callback,
     decode_my_car_delete_confirm_callback,
@@ -277,6 +283,31 @@ def register(
             await _send_reply(event, reply, prefer_edit=True, is_trusted=is_trusted)
             return
 
+        if decode_debt_refresh_pick_callback(data):
+            reply = controller.handle_debt_refresh_pick(telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        if decode_debt_refresh_confirm_callback(data):
+            # Как и handle_check_now_choice выше — event.answer() (снятие
+            # спиннера кнопки) сознательно ПОСЛЕ await живой проверки, не
+            # до (см. _answer_and_send), тот же уже установленный в этом
+            # файле принцип для единственного другого live-check callback'а.
+            reply = await controller.handle_debt_refresh_confirm(telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        if decode_debt_refresh_cancel_callback(data):
+            reply = controller.handle_debt_refresh_cancel(telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        debt_list_page = decode_debt_list_page_callback(data)
+        if debt_list_page is not None:
+            reply = controller.handle_debt_list_page(debt_list_page, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
         search_page = decode_search_page_callback(data)
         if search_page is not None:
             query_type, query, page = search_page
@@ -336,6 +367,10 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False, is_trusted: bo
         buttons = trusted_stop_confirm_keyboard(
             reply.trusted_stop_confirm_task_id, label=reply.trusted_stop_confirm_button_label,
         )
+    elif reply.debt_refresh_confirm:
+        buttons = debt_refresh_confirm_keyboard()
+    elif reply.debt_refresh_available:
+        buttons = debt_statistics_keyboard(page=reply.debt_list_page, total_pages=reply.debt_list_total_pages)
     elif reply.trusted_tasks_page is not None:
         buttons = trusted_tasks_page_keyboard(
             reply.trusted_tasks_page_options or [],

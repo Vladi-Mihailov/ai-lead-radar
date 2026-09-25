@@ -42,6 +42,13 @@ class FineMonitoringTask:
     # (миграция) и для существующих вызовов FineMonitoringTask(...)/
     # create(...) без этого параметра — см. FineMonitoringScope выше.
     monitoring_scope: FineMonitoringScope = "operator"
+    # Последний УСПЕШНЫЙ check_task() (см. reader/fines/task_repository.py::
+    # record_successful_check) — в отличие от last_checked_at, НЕ
+    # перезаписывается на ERROR (см. reader/public_bot/debt_refresh_service.py:
+    # "🔄 Обновить задолженности" — ERROR не должен стирать момент
+    # последнего достоверного состояния). Default None сохраняет
+    # существующие вызовы FineMonitoringTask(...) без правки.
+    last_successful_checked_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +85,23 @@ class DetectedFine:
     # как safe fallback, а не пустую строку/ошибку.
     place_ru: str | None = None
     violation_description_ru: str | None = None
+
+
+@dataclass(frozen=True)
+class TaskFineTotal:
+    """Сумма ВСЕХ когда-либо обнаруженных detected_fines одной задачи
+    мониторинга (см. reader/public_bot/debt_refresh_service.py — "🚨
+    Известные штрафы"). police.ge/наша БД НЕ отслеживают оплату (см.
+    reader/fines/payment_status.py: "research-only, NOT wired into
+    production" — задача, штраф из которой давно оплачен, продолжает
+    учитываться здесь навсегда). Поэтому это "известные штрафы", а НЕ
+    "текущий долг" — total_amount монотонно не убывает при повторных
+    проверках, может расти при появлении новых штрафов."""
+
+    task_id: int
+    car_number: str
+    total_amount: float
+    last_seen_at: datetime
 
 
 @dataclass(frozen=True)

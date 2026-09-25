@@ -6,8 +6,10 @@ reader/public_bot/keyboards.py (Telethon-кнопки), чтобы формул�
 """
 
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from reader.fines.models import FineMonitoringTask, NewFineEvent
+from reader.public_bot.debt_refresh_service import DebtSummary, RefreshOutcome
 from reader.public_bot.delivery_texts import format_check_now_fines_message
 from reader.public_bot.models import FineMonitoringSubscription
 from reader.public_bot.statistics_service import BotStatistics
@@ -474,10 +476,20 @@ def trusted_stop_confirm_button_label(subscriber_count: int) -> str:
     )
 
 
-def format_statistics(stats: BotStatistics) -> str:
+def format_statistics(stats: BotStatistics, *, debt: DebtSummary) -> str:
     """Trusted-operator-only "📊 Статистика" (см. design report) — все
-    значения уже посчитаны BotStatisticsService.get_statistics(), здесь
-    только форматирование."""
+    значения уже посчитаны BotStatisticsService.get_statistics()/
+    DebtRefreshService.get_debt_summary(), здесь только форматирование.
+
+    КРИТИЧНО (см. задачу): police.ge/наша БД НЕ отслеживают оплату штрафа
+    (см. reader/fines/payment_status.py — research-only, не подключён к
+    production) — эта сумма ВСЕГДА включает и уже оплаченные штрафы (см.
+    disclaimer ниже), поэтому здесь и везде в этом блоке НЕЛЬЗЯ
+    использовать "Текущая задолженность"/"Общая задолженность"/"Оплачено":
+    ни одно из этих слов не соответствует тому, что реально известно.
+    debt.car_count == 0 — блок всё равно показывается (с нулями), а не
+    скрывается: кнопка проверки остаётся доступной даже когда сейчас
+    известных штрафов нет (см. handle_debt_refresh_pick — п.10 задачи)."""
     return "\n".join([
         "📊 Статистика бота",
         "",
@@ -490,7 +502,90 @@ def format_statistics(stats: BotStatistics) -> str:
         f"⏸ Остановленных подписок: {stats.stopped_subscriptions}",
         "",
         f"🚨 Новых штрафов найдено сегодня: {stats.new_fines_today}",
+        "",
+        "🚨 Известные штрафы",
+        f"Автомобилей со штрафами: {debt.car_count}",
+        f"Общая сумма найденных штрафов: {_format_search_amount(debt.total_amount)}",
+        "",
+        "ℹ️ Оплаченные штрафы могут учитываться в сумме.",
     ])
+
+
+DEBT_REFRESH_BUTTON_LABEL = "🔄 Проверить авто со штрафами"
+DEBT_REFRESH_NONE_TEXT = "✅ Автомобилей с известными штрафами нет."
+DEBT_REFRESH_IN_PROGRESS_TEXT = "⏳ Проверка уже выполняется, подождите."
+DEBT_REFRESH_CANCELLED_TEXT = "Отменено."
+DEBT_REFRESH_CONFIRM_BUTTON_LABEL = "✅ Подтвердить"
+
+
+def format_debt_refresh_prompt(car_count: int) -> str:
+    return f"🔄 Будет проверено автомобилей: {car_count}"
+
+
+def format_debt_refresh_summary(outcome: RefreshOutcome) -> str:
+    """См. задачу п.4 — "Оплачено"/"Остался долг" НЕ используются (police.ge
+    не подтверждает оплату, см. модуль docstring): "нет новых штрафов" —
+    это не то же самое, что "штраф оплачен", а "найдены новые штрафы" —
+    не то же самое, что "долг вырос именно сейчас" — обе формулировки
+    описывают ТОЛЬКО то, что реально наблюдалось на этой проверке."""
+    lines = [
+        "🔄 Проверка завершена",
+        "",
+        f"Проверено: {outcome.checked}",
+        f"🚨 Найдены новые штрафы: {outcome.increased}",
+        f"✅ Без новых штрафов: {outcome.unchanged}",
+        f"⚠️ Не удалось проверить: {outcome.failed}",
+    ]
+    if outcome.failed_car_numbers:
+        lines.append("")
+        lines.append("Не удалось проверить: " + ", ".join(outcome.failed_car_numbers))
+    return "\n".join(lines)
+
+
+_DEBT_LIST_TITLE = "Автомобили со штрафами:"
+
+
+def format_debt_row(
+    *, car_number: str, owner_display: str, total_amount: float, recency: str,
+) -> str:
+    """"🚗 CAR — owner — amount ₾ · recency" (см. задачу п.2) —
+    owner_display строится вызывающим кодом через
+    format_search_owner_display (те же 4 случая, что и у Search: имя+
+    username/только username/только имя/ничего), recency — через
+    format_debt_recency ниже. НИКОГДА не помечаем строку как "долг"/
+    "задолженность" — это просто найденная сумма (см. модуль docstring
+    format_statistics)."""
+    amount_text = _format_search_amount(total_amount)
+    return f"🚗 {car_number} — {owner_display} — {amount_text} · {recency}"
+
+
+def format_debt_recency(checked_at: datetime, *, now: datetime, tz: ZoneInfo) -> str:
+    """"сегодня", если последняя достоверная проверка была тем же
+    business-днём (см. settings.fine_monitor.timezone — та же tz, что и у
+    остальной "📊 Статистика"), иначе "ДД.ММ" (см. задачу п.2 — точно
+    формат из примера, без года и без "N дней назад")."""
+    today = now.astimezone(tz).date()
+    checked_date = checked_at.astimezone(tz).date()
+    if checked_date == today:
+        return "сегодня"
+    return checked_date.strftime("%d.%m")
+
+
+def format_debt_list_section(row_lines: list[str], *, page: int, total_pages: int) -> str:
+    """[] row_lines -> "" (вызывающий код тогда не добавляет секцию вовсе,
+    см. ConversationController._format_statistics_reply) — итоговый
+    блок ВСЕГДА либо полностью присутствует, либо полностью отсутствует,
+    никогда не показывается "пустым". Пагинация (см. задачу п.2: "если не
+    помещается — pagination или безопасное разбиение") — тот же footer,
+    что и у Search (format_search_pagination_footer), показывается ТОЛЬКО
+    когда страниц больше одной."""
+    if not row_lines:
+        return ""
+    parts = [_DEBT_LIST_TITLE, "", "\n".join(row_lines)]
+    if total_pages > 1:
+        parts.append("")
+        parts.append(format_search_pagination_footer(page=page, total_pages=total_pages))
+    return "\n".join(parts)
 
 
 # ==== manager/trusted Search (см. задачу "manager/trusted Search") —

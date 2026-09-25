@@ -40,6 +40,10 @@ class _FakeReply:
         self.car_detail_subscription_id = None
         self.cta_buttons = None
         self.show_turkey_bot_link = show_turkey_bot_link
+        self.debt_refresh_available = False
+        self.debt_refresh_confirm = False
+        self.debt_list_page = None
+        self.debt_list_total_pages = None
 
 
 class _FakeEvent:
