@@ -63,6 +63,7 @@ from reader.turkey_bot.conversation import ConversationController
 from reader.turkey_bot.conversation_state_repository import (
     TurkeyConversationStateRepository,
 )
+from reader.turkey_bot.debt_refresh_service import TurkeyDebtRefreshService
 from reader.turkey_bot.gib.translation import TurkeyFineTranslationService
 from reader.turkey_bot.handlers import register
 from reader.turkey_bot.known_users_repository import (
@@ -201,6 +202,13 @@ async def run() -> None:
         default_gib_check_factory, default_avrasya_check_factory, default_kgm_check_factory,
         gib_translator=translator,
     )
+    # Trusted-manager "🔄 Проверить авто с задолженностью" (см. задачу
+    # "manual Turkey debt refresh") — переиспользует ТЕ ЖЕ garage_repository/
+    # run_repository/check_service/statistics_service, что и всё остальное
+    # выше, никакой отдельной GİB/Avrasya/KGM реализации не заводит.
+    debt_refresh_service = TurkeyDebtRefreshService(
+        garage_repository, run_repository, check_service, statistics_service,
+    )
 
     try:
         controller = ConversationController(
@@ -212,6 +220,7 @@ async def run() -> None:
             trusted_operator_user_ids=frozenset(settings.public_bot.trusted_operator_user_ids),
             tz=ZoneInfo(settings.fine_monitor.timezone),
             payment_help_contact_username=settings.public_bot.payment_help_contact_username,
+            debt_refresh_service=debt_refresh_service,
         )
 
         client = TelegramClient(str(_SESSION_PATH), api_id, api_hash)

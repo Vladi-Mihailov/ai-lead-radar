@@ -32,6 +32,10 @@ from reader.turkey_bot import texts
 from reader.turkey_bot.conversation_state_repository import (
     TurkeyConversationStateRepository,
 )
+from reader.turkey_bot.debt_refresh_service import (
+    TurkeyDebtRefreshService,
+    TurkeyRefreshAlreadyInProgressError,
+)
 from reader.turkey_bot.models import TurkeyUserCar
 from reader.turkey_bot.monitoring.scheduler_job import next_monitoring_slot
 from reader.turkey_bot.monitoring.subscription_repository import (
@@ -171,6 +175,19 @@ class BotReply:
     search_page: int | None = None
     search_total_pages: int | None = None
 
+    # Trusted-manager "🔄 Проверить авто с задолженностью" (см. задачу
+    # "manual Turkey debt refresh") — debt_refresh_available прикрепляет
+    # inline-кнопку (см. reader/turkey_bot/handlers.py::
+    # _first_message_buttons/_send_reply — та же логика "последнему из
+    # extra_texts, если они есть, иначе первому сообщению", что и у
+    # show_main_menu); debt_refresh_confirm_car_count — не None ТОЛЬКО на
+    # экране подтверждения "Будет проверено автомобилей: N" с [✅
+    # Проверить N авто][↩️ Отмена] — ПЕРВОЕ нажатие ничего не запускает, ни
+    # одного provider request. is_trusted() перепроверяется заново на
+    # каждом шаге (см. handle_debt_refresh_pick/confirm/cancel).
+    debt_refresh_available: bool = False
+    debt_refresh_confirm_car_count: int | None = None
+
 
 class ConversationController:
     def __init__(
@@ -185,6 +202,7 @@ class ConversationController:
         trusted_operator_user_ids: frozenset[int] = frozenset(),
         tz: ZoneInfo = _DEFAULT_TZ,
         payment_help_contact_username: str = "tplgee",
+        debt_refresh_service: TurkeyDebtRefreshService | None = None,
     ):
         self._states = conversation_state_repository
         self._garage = garage_repository
@@ -195,6 +213,13 @@ class ConversationController:
         self._trusted_operator_user_ids = frozenset(trusted_operator_user_ids)
         self._tz = tz
         self._payment_help_contact_username = payment_help_contact_username
+        # None — как и everywhere в проекте (см. Georgian bot
+        # SubscriptionService/OwnerUsernameResolverLike) — означает "фичи
+        # 🔄 Проверить авто с задолженностью вообще нет в этой сборке"
+        # (кнопка не показывается, см. handle_statistics). Существующие
+        # вызовы ConversationController(...) без этого параметра (тесты)
+        # продолжают работать бит в бит как раньше.
+        self._debt_refresh = debt_refresh_service
 
     def _debt_cta_buttons(self) -> tuple[tuple[str, str], ...]:
         """Та же destination (payment_help_contact_username), что и
@@ -651,7 +676,54 @@ class ConversationController:
             )
         debt_messages = texts.format_debt_list_messages(debt_lines)
 
-        return BotReply(text=stats_text, extra_texts=tuple(debt_messages), show_main_menu=True)
+        return BotReply(
+            text=stats_text, extra_texts=tuple(debt_messages), show_main_menu=True,
+            debt_refresh_available=self._debt_refresh is not None,
+        )
+
+    # ---- "🔄 Проверить авто с задолженностью" (см. задачу "manual Turkey
+    # debt refresh") — trusted-manager-only, is_trusted() перепроверяется
+    # ЗАНОВО на каждом шаге (см. остальные trusted-* методы этого класса) —
+    # доступность самой кнопки (debt_refresh_available) НЕ является
+    # доказательством авторизации сама по себе. ----
+
+    def handle_debt_refresh_pick(self, *, telegram_user_id: int) -> BotReply:
+        """Первый шаг — ТОЛЬКО чтение (list_candidates(), см.
+        TurkeyDebtRefreshService), ни одного provider-запроса (см. задачу
+        "FLOW": "до нажатия подтверждения НИКАКИХ provider requests").
+        Пустой список — сразу финальный ответ, минуя экран подтверждения
+        вовсе (см. задачу TESTS п.16)."""
+        if not self._is_trusted(telegram_user_id) or self._debt_refresh is None:
+            return BotReply(text=texts.SEARCH_NOT_AUTHORIZED_TEXT, show_main_menu=True)
+
+        car_count = len(self._debt_refresh.list_candidates())
+        if car_count == 0:
+            return BotReply(text=texts.DEBT_REFRESH_NONE_TEXT, show_main_menu=True)
+
+        return BotReply(text=texts.format_debt_refresh_prompt(car_count), debt_refresh_confirm_car_count=car_count)
+
+    def handle_debt_refresh_cancel(self, *, telegram_user_id: int) -> BotReply:
+        if not self._is_trusted(telegram_user_id):
+            return BotReply(text=texts.SEARCH_NOT_AUTHORIZED_TEXT, show_main_menu=True)
+        return BotReply(text=texts.DEBT_REFRESH_CANCELLED_TEXT, show_main_menu=True)
+
+    async def handle_debt_refresh_confirm(self, *, telegram_user_id: int) -> BotReply:
+        """Финальный шаг — is_trusted() и наличие TurkeyDebtRefreshService
+        перепроверяются ЗАНОВО (см. handle_debt_refresh_pick). Защита от
+        повторного/параллельного нажатия (см. задачу "CONCURRENCY") —
+        TurkeyDebtRefreshService.refresh() сам бросает
+        TurkeyRefreshAlreadyInProgressError, если предыдущий прогон ещё не
+        завершился — единственный источник истины про "идёт ли уже
+        refresh", а не отдельная проверка здесь."""
+        if not self._is_trusted(telegram_user_id) or self._debt_refresh is None:
+            return BotReply(text=texts.SEARCH_NOT_AUTHORIZED_TEXT, show_main_menu=True)
+
+        try:
+            outcome = await self._debt_refresh.refresh()
+        except TurkeyRefreshAlreadyInProgressError:
+            return BotReply(text=texts.DEBT_REFRESH_IN_PROGRESS_TEXT, show_main_menu=True)
+
+        return BotReply(text=texts.format_debt_refresh_summary(outcome), show_main_menu=True)
 
     def handle_stop_monitoring(self, *, chat_id: int) -> BotReply:
         """⛔ Остановить мониторинг — ТОЛЬКО Turkey test monitoring (своя

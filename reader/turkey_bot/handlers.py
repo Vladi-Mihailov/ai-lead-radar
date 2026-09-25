@@ -21,9 +21,14 @@ from reader.turkey_bot.keyboards import (
     car_card_keyboard,
     car_delete_confirm_keyboard,
     check_now_picker_keyboard,
+    debt_refresh_button_keyboard,
+    debt_refresh_confirm_keyboard,
     decode_car_action_callback,
     decode_car_open_by_plate_callback,
     decode_car_open_callback,
+    decode_debt_refresh_cancel_callback,
+    decode_debt_refresh_confirm_callback,
+    decode_debt_refresh_pick_callback,
     decode_help_callback,
     decode_manager_car_open_callback,
     decode_manager_car_toggle_callback,
@@ -235,6 +240,31 @@ def register(
             await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
             return
 
+        if decode_debt_refresh_pick_callback(event.data):
+            reply = controller.handle_debt_refresh_pick(telegram_user_id=event.sender_id)
+            await event.answer()
+            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            return
+
+        if decode_debt_refresh_confirm_callback(event.data):
+            # Немедленный event.answer() ДО (а не после) долгой live-
+            # проверки (см. задачу "TELEGRAM CALLBACK UX") — в отличие от
+            # остальных callback'ов этого файла: refresh может проверять
+            # много машин подряд (до 35 captcha-попыток на провайдера
+            # каждая, см. TurkeyDebtRefreshService._REFRESH_MAX_ATTEMPTS) —
+            # ждать этого перед снятием спиннера кнопки означало бы риск
+            # "зависшего" индикатора загрузки у менеджера.
+            await event.answer()
+            reply = await controller.handle_debt_refresh_confirm(telegram_user_id=event.sender_id)
+            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=False)
+            return
+
+        if decode_debt_refresh_cancel_callback(event.data):
+            reply = controller.handle_debt_refresh_cancel(telegram_user_id=event.sender_id)
+            await event.answer()
+            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            return
+
         await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
 
     logger.info("✔ Turkey bot handlers зарегистрированы")
@@ -294,6 +324,10 @@ def _first_message_buttons(reply: BotReply, *, is_trusted: bool, has_extra: bool
         return help_menu_keyboard()
     if reply.help_keyboard == "section":
         return help_section_keyboard()
+    if reply.debt_refresh_confirm_car_count is not None:
+        return debt_refresh_confirm_keyboard(reply.debt_refresh_confirm_car_count)
+    if reply.debt_refresh_available and not has_extra:
+        return debt_refresh_button_keyboard()
     if reply.show_main_menu and not has_extra:
         return main_menu_keyboard(is_trusted=is_trusted)
     return None
@@ -327,6 +361,8 @@ async def _send_reply(event, reply: BotReply, *, is_trusted: bool = False, prefe
         is_last = index == len(reply.extra_texts) - 1
         if is_last and reply.cta_buttons:
             extra_buttons = [[Button.url(label, url) for label, url in reply.cta_buttons]]
+        elif is_last and reply.debt_refresh_available:
+            extra_buttons = debt_refresh_button_keyboard()
         elif is_last and reply.show_main_menu:
             extra_buttons = main_menu_keyboard(is_trusted=is_trusted)
         else:

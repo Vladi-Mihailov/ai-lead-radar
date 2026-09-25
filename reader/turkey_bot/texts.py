@@ -21,6 +21,7 @@ from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from reader.turkey_bot.avrasya.models import AvrasyaDebtItem
+from reader.turkey_bot.debt_refresh_service import TurkeyRefreshOutcome
 from reader.turkey_bot.gib.models import GibFineRecord
 from reader.turkey_bot.kgm.models import KgmOperatorResult
 from reader.turkey_bot.models import TurkeyUserCar
@@ -815,6 +816,50 @@ def format_debt_list_messages(rows: list[str]) -> list[str]:
         messages.append("\n".join(current))
 
     return messages
+
+
+# ---- "🔄 Проверить авто с задолженностью" (см. задачу "manual Turkey
+# debt refresh") — trusted-manager-only, см. reader/turkey_bot/
+# debt_refresh_service.py ----
+
+DEBT_REFRESH_BUTTON_LABEL = "🔄 Проверить авто с задолженностью"
+DEBT_REFRESH_NONE_TEXT = "✅ Автомобилей с задолженностью нет."
+DEBT_REFRESH_IN_PROGRESS_TEXT = "⚠️ Проверка автомобилей уже выполняется."
+DEBT_REFRESH_CANCELLED_TEXT = "Отменено."
+
+
+def format_debt_refresh_prompt(car_count: int) -> str:
+    return f"🔄 Будет проверено автомобилей: {car_count}"
+
+
+def debt_refresh_confirm_button_label(car_count: int) -> str:
+    return f"✅ Проверить {car_count} авто"
+
+
+def format_debt_refresh_summary(outcome: TurkeyRefreshOutcome) -> str:
+    """См. задачу "RESULT"/"СЕМАНТИКА" — В ОТЛИЧИЕ от Georgia (см.
+    reader/public_bot/texts.py::format_debt_refresh_summary), Turkey
+    unified check — authoritative live-источник оплаты, поэтому здесь
+    "✅ Задолженность погашена"/"🚨 Задолженность осталась" — ЧЕСТНЫЕ
+    формулировки (не "оплачено"/"без изменений", как у Georgia, где
+    payment status неизвестен, см. TurkeyDebtRefreshService модуль
+    docstring). "⚠️ Не удалось проверить полностью" объединяет ERROR И
+    PARTIAL (см. задачу "PARTIAL": ни то, ни другое не гарантированно
+    полная проверка) — 💰 Было/Стало показываются, ТОЛЬКО если сумма
+    реально изменилась (см. задачу: "можно дополнительно показать")."""
+    lines = [
+        "🔄 Проверка завершена",
+        "",
+        f"Проверено автомобилей: {outcome.checked}",
+        f"✅ Задолженность погашена: {outcome.paid}",
+        f"🚨 Задолженность осталась: {outcome.remains}",
+        f"⚠️ Не удалось проверить полностью: {outcome.incomplete}",
+    ]
+    if outcome.total_before != outcome.total_after:
+        lines.append("")
+        lines.append(f"💰 Было: {_format_try_amount(outcome.total_before)}")
+        lines.append(f"💰 Стало: {_format_try_amount(outcome.total_after)}")
+    return "\n".join(lines)
 
 
 # ---- Unified check rendering (см. design report "Перестроить UX Turkey

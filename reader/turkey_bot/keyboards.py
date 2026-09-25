@@ -23,6 +23,7 @@ from reader.turkey_bot.texts import (
     BACK_LABEL,
     CANCEL_BUTTON_LABEL,
     CHECK_NOW_LABEL,
+    DEBT_REFRESH_BUTTON_LABEL,
     DELETE_CANCEL_LABEL,
     DELETE_CAR_CONFIRM_BUTTON_LABEL,
     DELETE_CAR_LABEL,
@@ -43,6 +44,7 @@ from reader.turkey_bot.texts import (
     SEARCH_MENU_LABEL,
     SEARCH_NEW_LABEL,
     STATISTICS_LABEL,
+    debt_refresh_confirm_button_label,
     format_car_button_label,
     format_manager_car_status_label,
 )
@@ -462,3 +464,39 @@ def search_result_keyboard(
         Button.inline(SEARCH_MENU_LABEL, encode_search_back_callback()),
     ])
     return rows
+
+
+# ==== "🔄 Проверить авто с задолженностью" (см. задачу "manual Turkey
+# debt refresh") — trusted-manager-only, is_trusted() перепроверяется
+# server-side в ConversationController.handle_debt_refresh_pick/confirm/
+# cancel на КАЖДЫЙ вызов (тот же принцип, что и у _SEARCH_*/_MANAGER_*
+# выше) — фиксированные callback'и без car_id/page (refresh всегда над
+# ТЕКУЩИМ полным debt-списком, см. TurkeyDebtRefreshService.
+# list_candidates(), а не над каким-то конкретным выбором). ====
+
+_DEBT_REFRESH_PICK_CALLBACK = b"turkeydebtrefreshpick"
+_DEBT_REFRESH_YES_CALLBACK = b"turkeydebtrefreshyes"
+_DEBT_REFRESH_NO_CALLBACK = b"turkeydebtrefreshno"
+
+
+def decode_debt_refresh_pick_callback(data: bytes | None) -> bool:
+    return data == _DEBT_REFRESH_PICK_CALLBACK
+
+
+def decode_debt_refresh_confirm_callback(data: bytes | None) -> bool:
+    return data == _DEBT_REFRESH_YES_CALLBACK
+
+
+def decode_debt_refresh_cancel_callback(data: bytes | None) -> bool:
+    return data == _DEBT_REFRESH_NO_CALLBACK
+
+
+def debt_refresh_button_keyboard() -> list[list[Button]]:
+    return [[Button.inline(DEBT_REFRESH_BUTTON_LABEL, _DEBT_REFRESH_PICK_CALLBACK)]]
+
+
+def debt_refresh_confirm_keyboard(car_count: int) -> list[list[Button]]:
+    return [[
+        Button.inline(debt_refresh_confirm_button_label(car_count), _DEBT_REFRESH_YES_CALLBACK),
+        Button.inline("↩️ Отмена", _DEBT_REFRESH_NO_CALLBACK),
+    ]]
