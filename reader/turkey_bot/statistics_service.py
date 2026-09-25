@@ -14,12 +14,15 @@ report) — новая unified-архитектура покрывает все 
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from reader.turkey_bot.known_users_repository import TurkeyBotKnownUsersRepository
+from reader.turkey_bot.models import TurkeyUserCar
 from reader.turkey_bot.monitoring.subscription_repository import (
     TurkeyMonitoringSubscriptionRepository,
 )
+from reader.turkey_bot.unified.models import OverallStatus
 from reader.turkey_bot.unified.run_repository import TurkeyCheckRunRepository
 
 _PROVIDERS = ("gib", "avrasya", "kgm")
@@ -35,14 +38,29 @@ class TurkeyStatistics:
     checks_today: int
     checks_7d: int
     checks_30d: int
-    checks_has_debt: int
-    checks_no_debt: int
-    checks_partial: int
-    checks_error: int
     manual_checks: int
     scheduled_checks: int
     active_monitoring_subscriptions: int
     provider_error_counts: dict[str, int]
+
+
+@dataclass(frozen=True)
+class TurkeyDebtRow:
+    """Одна строка "🚨 Задолженность по последней проверке" (см. задачу
+    "доработать 📊 Статистика Turkey bot") — ОДНА turkey_bot_user_cars
+    строка (car_id/owner_telegram_user_id — конкретная запись, НЕ просто
+    car_number, см. задачу п.8: "не склеивай разных владельцев только по
+    номеру"), с уже готовым authoritative total_amount её последней
+    ДОСТОВЕРНОЙ (не ERROR) проверки (см.
+    TurkeyCheckRunRepository.get_latest_reliable_for_owner) — никакого
+    пересчёта GİB+Avrasya+KGM здесь нет и не может быть."""
+
+    car_id: int
+    car_number: str
+    owner_telegram_user_id: int
+    total_amount: Decimal
+    is_partial: bool
+    checked_at: datetime
 
 
 def _business_day_start_utc(now: datetime, tz: ZoneInfo, *, days_back: int) -> datetime:
@@ -88,19 +106,57 @@ class TurkeyStatisticsService:
             checks_today=self._runs.count_since(today_start),
             checks_7d=self._runs.count_since(seven_days_start),
             checks_30d=self._runs.count_since(thirty_days_start),
-            checks_has_debt=self._runs.count_by_overall_status("has_debt"),
-            checks_no_debt=self._runs.count_by_overall_status("no_debt"),
-            checks_partial=self._runs.count_by_overall_status("partial"),
-            checks_error=self._runs.count_by_overall_status("error"),
             manual_checks=self._runs.count_by_initiator("manual"),
             scheduled_checks=self._runs.count_by_initiator_prefix("monitoring_"),
             active_monitoring_subscriptions=self._subscriptions.count_active(),
             provider_error_counts=provider_error_counts,
         )
 
-    def list_known_users(self) -> list[tuple[int, str | None]]:
-        """Прокси к TurkeyBotKnownUsersRepository.list_all()."""
-        return self._known_users.list_all()
+    def get_debt_rows(self, cars: list[TurkeyUserCar]) -> list[TurkeyDebtRow]:
+        """"🚨 Задолженность по последней проверке" (см. задачу "доработать
+        📊 Статистика Turkey bot") — ДЛЯ КАЖДОЙ переданной строки
+        turkey_bot_user_cars читает её последний ДОСТОВЕРНЫЙ (не ERROR)
+        unified-результат (см. TurkeyCheckRunRepository.
+        get_latest_reliable_for_owner — owner-specific, тот же принцип,
+        что и get_latest_for_owner у manager/trusted Search, см. задачу
+        п.8) — НИКАКИХ provider/network requests, только SQL reads поверх
+        уже сохранённых turkey_check_runs (см. задачу "КРИТИЧЕСКИ ВАЖНО:
+        никаких live check"). cars передаётся вызывающим кодом (см.
+        reader/turkey_bot/conversation.py::handle_statistics) — этот метод
+        сознательно не тянет TurkeyUserCarsRepository как ещё одну
+        constructor-зависимость (не менять существующую сигнатуру
+        TurkeyStatisticsService.__init__, у которой уже много вызывающих
+        мест).
+
+        Пропускает машину, если: 1) ни одной ДОСТОВЕРНОЙ проверки ещё не
+        было вовсе, 2) последняя достоверная проверка подтверждает 0 (нет
+        задолженности) — см. задачу: "latest SUCCESS с 0 debt не
+        включается". PARTIAL с total_amount > 0 включается, помеченным
+        (см. is_partial) — задача явно требует не выдавать частичную
+        сумму за гарантированно полную, но не скрывать её тоже.
+
+        Сортировка — по сумме DESC, при равенстве — по свежести проверки
+        DESC (см. задачу п.9) — никаких новых проверок ради сортировки,
+        только уже вычисленные значения."""
+        rows: list[TurkeyDebtRow] = []
+        for car in cars:
+            reliable = self._runs.get_latest_reliable_for_owner(
+                plate=car.car_number, telegram_user_id=car.telegram_user_id,
+            )
+            if reliable is None:
+                continue
+            overall_status, total_amount, checked_at = reliable
+            if total_amount <= 0:
+                continue
+            rows.append(
+                TurkeyDebtRow(
+                    car_id=car.id, car_number=car.car_number, owner_telegram_user_id=car.telegram_user_id,
+                    total_amount=total_amount, is_partial=(overall_status == OverallStatus.PARTIAL),
+                    checked_at=checked_at,
+                )
+            )
+        rows.sort(key=lambda row: (-row.total_amount, -row.checked_at.timestamp()))
+        return rows
 
     def get_known_username(self, telegram_user_id: int) -> str | None:
         """Прокси к TurkeyBotKnownUsersRepository.get_username() — ТОЛЬКО

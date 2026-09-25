@@ -201,6 +201,33 @@ class TurkeyCheckRunRepository:
             return None
         return self.get_run(row[0])
 
+    def get_latest_reliable_for_owner(
+        self, *, plate: str, telegram_user_id: int,
+    ) -> tuple[OverallStatus, Decimal, datetime] | None:
+        """(overall_status, total_amount, finished_at) последнего
+        ДОСТОВЕРНОГО (overall_status != ERROR) unified-check ИМЕННО этого
+        владельца этой машины — см. задачу "доработать 📊 Статистика
+        Turkey bot" п.4: "ERROR не должен стирать последнее известное
+        состояние" (тот же принцип, что и get_last_successful_provider_
+        result ниже, но на уровне ВСЕГО run, а не одного provider — для
+        Статистики достаточно уже готового authoritative total_amount,
+        детализация по provider не нужна, см. задачу п.6: "не суммируй
+        провайдеров сам"). (plate, telegram_user_id) — тот же составной
+        ключ, что и у get_latest_for_owner (manager/trusted Search) — turkey_
+        check_runs не имеет FK на turkey_bot_user_cars, пишущий код всегда
+        сохраняет владельца явно. None — ни одной ДОСТОВЕРНОЙ проверки для
+        этой пары ещё не было (либо вообще ни одной, либо все были ERROR)."""
+        row = self._conn.execute(
+            "SELECT overall_status, total_amount, finished_at FROM turkey_check_runs "
+            "WHERE plate = ? AND telegram_user_id = ? AND overall_status != 'error' "
+            "ORDER BY finished_at DESC, id DESC LIMIT 1",
+            (plate, telegram_user_id),
+        ).fetchone()
+        if row is None:
+            return None
+        overall_status, total_amount, finished_at = row
+        return OverallStatus(overall_status), Decimal(total_amount), datetime.fromisoformat(finished_at)
+
     def get_last_successful_provider_result(
         self, plate: str, provider: str,
     ) -> ProviderCheckResult | None:

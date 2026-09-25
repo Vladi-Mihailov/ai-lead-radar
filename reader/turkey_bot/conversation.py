@@ -25,6 +25,7 @@ reader/public_bot/conversation.py) — reader/turkey_bot/handlers.py
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from reader.turkey_bot import texts
@@ -615,12 +616,42 @@ class ConversationController:
     # report п.13) ----
 
     def handle_statistics(self, *, chat_id: int) -> BotReply:
+        """См. задачу "доработать 📊 Статистика Turkey bot" — ТОЛЬКО SQL
+        reads поверх уже сохранённых repositories (get_debt_rows/
+        get_known_profile), НИКАКИХ provider/network requests, НИКАКОГО
+        unified check (см. задачу "КРИТИЧЕСКИ ВАЖНО: НИКАКИХ LIVE CHECK")."""
         self._states.clear(chat_id)
-        stats = self._statistics.get_statistics(now=datetime.now(timezone.utc), tz=self._tz)
-        user_messages = texts.format_user_list_messages(self._statistics.list_known_users())
-        return BotReply(
-            text=texts.format_statistics(stats), extra_texts=tuple(user_messages), show_main_menu=True,
+        now = datetime.now(timezone.utc)
+        stats = self._statistics.get_statistics(now=now, tz=self._tz)
+
+        total_cars = self._garage.count_all()
+        cars = self._garage.list_all_page(offset=0, limit=total_cars) if total_cars else []
+        debt_rows = self._statistics.get_debt_rows(cars)
+
+        debt_total_amount = sum((row.total_amount for row in debt_rows), Decimal(0))
+        debt_has_partial = any(row.is_partial for row in debt_rows)
+        stats_text = texts.format_statistics(
+            stats, debt_car_count=len(debt_rows), debt_total_amount=debt_total_amount,
+            debt_has_partial=debt_has_partial,
         )
+
+        debt_lines = []
+        for row in debt_rows:
+            profile = self._statistics.get_known_profile(row.owner_telegram_user_id)
+            username, first_name, last_name = profile if profile is not None else (None, None, None)
+            owner_display = texts.format_search_owner_display(
+                first_name=first_name, last_name=last_name, username=username,
+            )
+            recency = texts.format_debt_recency(row.checked_at, now=now, tz=self._tz)
+            debt_lines.append(
+                texts.format_debt_row(
+                    car_number=row.car_number, owner_display=owner_display,
+                    total_amount=row.total_amount, is_partial=row.is_partial, recency=recency,
+                )
+            )
+        debt_messages = texts.format_debt_list_messages(debt_lines)
+
+        return BotReply(text=stats_text, extra_texts=tuple(debt_messages), show_main_menu=True)
 
     def handle_stop_monitoring(self, *, chat_id: int) -> BotReply:
         """⛔ Остановить мониторинг — ТОЛЬКО Turkey test monitoring (своя

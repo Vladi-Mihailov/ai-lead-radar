@@ -16,6 +16,7 @@ description) — тихий fallback на турецкий текст, если 
 не выполнялся (не пустая строка, не ошибка, см. conversation.py::
 _translate_fines)."""
 
+from datetime import datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -676,13 +677,36 @@ def format_has_debt_messages(plate: str, fines: tuple[GibFineRecord, ...]) -> li
     return _split_into_telegram_messages(blocks)
 
 
-def format_statistics(stats: TurkeyStatistics) -> str:
+def format_statistics(
+    stats: TurkeyStatistics, *, debt_car_count: int, debt_total_amount: Decimal, debt_has_partial: bool,
+) -> str:
     """См. reader/turkey_bot/statistics_service.py::
     TurkeyStatisticsService — теперь на основе unified-check (все три
     провайдера одинаково, см. design report "Перестроить UX Turkey test
     bot" п.13), плюс мониторинг-метрики (active_monitoring_subscriptions/
-    manual_checks/scheduled_checks/provider_error_counts)."""
+    manual_checks/scheduled_checks/provider_error_counts).
+
+    Список username УБРАН целиком (см. задачу "доработать 📊 Статистика
+    Turkey bot" п.1 — для просмотра конкретных пользователей есть
+    "🚗 Мои авто"/"🔎 Поиск", агрегаты 👥 Пользователи остаются как были).
+
+    Старый блок "🚨 С задолженностью: N / ✅ Без задолженности: N / ⚠️
+    Частично: N / ❌ Ошибка: N" УБРАН (см. задачу п.10) — он считал
+    ИСТОРИЧЕСКИЕ turkey_check_runs (сколько ПРОВЕРОК когда-либо имело
+    каждый статус, включая повторные проверки одной и той же машины), а
+    не текущее число машин с задолженностью — вводил в заблуждение как
+    "снимок текущего состояния". Заменён на честный
+    "🚨 Задолженность по последней проверке" (debt_car_count/
+    debt_total_amount — см. TurkeyStatisticsService.get_debt_rows(),
+    ТОЛЬКО последний ДОСТОВЕРНЫЙ, не-ERROR результат на машину) сразу
+    после блока 👥 Пользователи. debt_has_partial — хотя бы одна из машин
+    в списке PARTIAL (см. задачу п.5: "не выдавать PARTIAL-сумму за
+    гарантированно полную") — общая сумма тогда тоже помечается "≥",
+    т.к. частично неизвестна её точная величина."""
     provider_names = {"gib": "GİB", "avrasya": "Avrasya", "kgm": "KGM"}
+    debt_total_text = _format_try_amount(debt_total_amount)
+    if debt_has_partial:
+        debt_total_text = f"≥ {debt_total_text}"
     lines = [
         STATISTICS_LABEL,
         "",
@@ -692,6 +716,10 @@ def format_statistics(stats: TurkeyStatistics) -> str:
         f"Новых за 7 дней: {stats.new_users_7d}",
         f"Новых за 30 дней: {stats.new_users_30d}",
         "",
+        "🚨 Задолженность по последней проверке",
+        f"Автомобилей: {debt_car_count}",
+        f"Общая сумма: {debt_total_text}",
+        "",
         "🔎 Проверки",
         f"Всего: {stats.total_checks}",
         f"Сегодня: {stats.checks_today}",
@@ -699,11 +727,6 @@ def format_statistics(stats: TurkeyStatistics) -> str:
         f"За 30 дней: {stats.checks_30d}",
         f"Ручных: {stats.manual_checks}",
         f"По расписанию: {stats.scheduled_checks}",
-        "",
-        f"🚨 С задолженностью: {stats.checks_has_debt}",
-        f"✅ Без задолженности: {stats.checks_no_debt}",
-        f"⚠️ Частично (одна из служб недоступна): {stats.checks_partial}",
-        f"❌ Ошибка (ни одна служба не ответила): {stats.checks_error}",
         "",
         f"🔔 Активных подписок мониторинга: {stats.active_monitoring_subscriptions}",
         "",
@@ -714,42 +737,78 @@ def format_statistics(stats: TurkeyStatistics) -> str:
     return "\n".join(lines)
 
 
-def _format_user_line(index: int, telegram_user_id: int, telegram_username: str | None) -> str:
-    """@username, когда известен, иначе "ID: <telegram_user_id>" (см.
-    задачу) — НИКОГДА telegram_chat_id или что-либо ещё: сигнатура этой
-    функции физически не получает ничего, кроме этих двух значений."""
-    identity = f"@{telegram_username}" if telegram_username else f"ID: {telegram_user_id}"
-    return f"{index}. {identity}"
+def _days_word(n: int) -> str:
+    """Русское склонение "день/дня/дней" (см. format_debt_recency)."""
+    if 11 <= n % 100 <= 14:
+        return "дней"
+    last_digit = n % 10
+    if last_digit == 1:
+        return "день"
+    if 2 <= last_digit <= 4:
+        return "дня"
+    return "дней"
 
 
-def format_user_list_messages(users: list[tuple[int, str | None]]) -> list[str]:
-    """Список ВСЕХ известных пользователей (см. reader/turkey_bot/
-    known_users_repository.py::list_all — уже отсортирован
-    детерминированно). Возвращает СПИСОК сообщений (см. задачу: "Handle
-    Telegram's 4096-character limit safely... Do not truncate silently") -
-    заголовок только в первом сообщении, каждая строка — атомарная единица
-    (никогда не разрывается пополам), упаковка построчная (через "\\n", не
-    "\\n\\n" — список компактнее, чем блоки со штрафами)."""
-    header = f"👥 Пользователи ({len(users)}):"
-    if not users:
-        return [header]
+def format_debt_recency(checked_at: datetime, *, now: datetime, tz: ZoneInfo) -> str:
+    """"сегодня"/"вчера"/"N дней назад" (см. задачу "доработать 📊
+    Статистика Turkey bot" п.3: "не вводим временное ограничение... но
+    рядом обязательно показываем давность") — по business-timezone (та
+    же tz, что и "Новых сегодня/за 7 дней/за 30 дней" в остальной
+    статистике), а не UTC/Europe/Istanbul напрямую. Без верхнего предела
+    на days_ago — задача явно не просит переключаться на абсолютную дату
+    после какого-то порога, "N дней назад" остаётся честным для любого N."""
+    checked_date = checked_at.astimezone(tz).date()
+    today = now.astimezone(tz).date()
+    days_ago = (today - checked_date).days
+    if days_ago <= 0:
+        return "сегодня"
+    if days_ago == 1:
+        return "вчера"
+    return f"{days_ago} {_days_word(days_ago)} назад"
 
-    lines = [
-        _format_user_line(index, telegram_user_id, telegram_username)
-        for index, (telegram_user_id, telegram_username) in enumerate(users, start=1)
-    ]
 
+def format_debt_row(
+    *, car_number: str, owner_display: str, total_amount: Decimal, is_partial: bool, recency: str,
+) -> str:
+    """Одна строка "Автомобили с задолженностью:" (см. задачу п.2/п.5) —
+    total_amount — уже готовый authoritative unified total (см.
+    TurkeyDebtRow), НЕ пересчитывается здесь. is_partial добавляет "≥"
+    перед суммой и "· частично" в конце строки — та же гарантия, что и у
+    debt_has_partial в format_statistics: частичная сумма никогда не
+    выглядит как гарантированно полная."""
+    amount_text = _format_try_amount(total_amount)
+    if is_partial:
+        amount_text = f"≥ {amount_text}"
+    line = f"🚗 {car_number} — {owner_display} — {amount_text}"
+    if is_partial:
+        line += " · частично"
+    return f"{line} · {recency}"
+
+
+def format_debt_list_messages(rows: list[str]) -> list[str]:
+    """Список ВСЕХ автомобилей с задолженностью (см. задачу п.2/п.11:
+    "покажи ВСЕ, но безопасно относительно Telegram лимита, не обрезай
+    молча") — тот же packing-приём, что раньше использовался для списка
+    username (см. задачу п.1 — та функция удалена вместе со списком):
+    заголовок только в первом сообщении, каждая строка — атомарная
+    единица (никогда не разрывается пополам). [] — если задолженностей
+    нет вовсе (см. вызывающий код — тогда это сообщение не отправляется
+    вообще, а не пустой заголовок без единой строки)."""
+    if not rows:
+        return []
+
+    header = "Автомобили с задолженностью:"
     messages: list[str] = []
     current: list[str] = [header]
     current_len = len(header)
-    for line in lines:
-        addition = len(line) + 1  # +1 = "\n"
+    for row in rows:
+        addition = len(row) + 1  # +1 = "\n"
         if current_len + addition > _TELEGRAM_MESSAGE_LIMIT:
             messages.append("\n".join(current))
             current = []
             current_len = 0
-            addition = len(line)
-        current.append(line)
+            addition = len(row)
+        current.append(row)
         current_len += addition
 
     if current:
