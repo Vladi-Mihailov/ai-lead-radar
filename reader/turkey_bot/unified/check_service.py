@@ -49,6 +49,7 @@ DebtItem — fail-open (см. _check_gib): сбой перевода никог�
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 from collections.abc import Callable
 from dataclasses import replace
@@ -165,6 +166,22 @@ def _log_finished(plate: str, provider: str, mode: str, attempts_used: int, fina
         "Turkey unified check finished: plate=%s provider=%s mode=%s attempts_used=%d final_status=%s",
         plate, provider, mode, attempts_used, final_status,
     )
+
+
+def _collect_after_check(plate: str) -> None:
+    """См. задачу "reclaim Turkey OCR memory after checks" — offline A/B
+    (см. отчёт) установил: ни onnxruntime, ни OpenCV сами по себе не
+    удерживают память (изолированные тесты — рост RSS ~0 на 50 вызовов
+    каждый), а полный RapidOCR pipeline (новые тензоры + result-объекты
+    на каждый CAPTCHA-вызов) накапливает исключительно GC-collectible
+    память — Python-циклы, до которых обычный generational GC доходит
+    только на редких полных (gen2) проходах. Один explicit gc.collect()
+    сразу после ОДНОГО логического check() надёжно возвращает RSS почти
+    к baseline (см. отчёт: 822 MB -> 139 MB в offline-тесте). НЕ
+    вызывается внутри retry-цикла/на каждую отдельную CAPTCHA-попытку —
+    один логический check = один collect."""
+    collected = gc.collect()
+    logger.debug("Turkey unified check GC collected objects=%d (plate=%s)", collected, plate)
 
 
 def _error_result(provider: str, error_type: str, *, checked_at: datetime) -> ProviderCheckResult:
@@ -419,37 +436,49 @@ class UnifiedTurkeyCheckService:
         один момент времени в этом процессе может выполняться только ОДИН
         check() (одного автомобиля), но provider'ы ВНУТРИ этого одного
         check() по-прежнему запускаются параллельно через
-        asyncio.gather() ниже, без изменений."""
-        async with self._check_lock:
-            started_at = _now()
-            provider_names = providers if providers is not None else _ALL_PROVIDERS
-            checkers = {
-                "gib": self._check_gib,
-                "avrasya": self._check_avrasya,
-                "kgm": self._check_kgm,
-            }
-            results = await asyncio.gather(
-                *(checkers[name](plate, max_attempts=max_attempts, mode=mode) for name in provider_names),
-                return_exceptions=True,
-            )
-            providers_result = tuple(
-                result if isinstance(result, ProviderCheckResult)
-                else _error_result(provider_name, "internal_error", checked_at=_now())
-                for provider_name, result in zip(provider_names, results)
-            )
-            for provider_name, result in zip(provider_names, results):
-                if isinstance(result, Exception):
-                    logger.exception(
-                        "Turkey unified check: непойманное исключение в провайдере %s (plate=%s)",
-                        provider_name, plate, exc_info=result,
-                    )
-            finished_at = _now()
-            overall_status = derive_overall_status(providers_result)
-            return UnifiedCheckResult(
-                plate=plate, started_at=started_at, finished_at=finished_at,
-                overall_status=overall_status, total_amount=total_amount_for(providers_result),
-                providers=providers_result,
-            )
+        asyncio.gather() ниже, без изменений.
+
+        См. задачу "reclaim Turkey OCR memory after checks" — finally
+        гарантирует ОДИН explicit gc.collect() на success/provider-error/
+        partial-result путях И при отмене (CancelledError, например через
+        внешний asyncio.wait_for) — gc.collect() синхронный и ничего не
+        await'ит, поэтому безопасен на любом из этих путей. Результат уже
+        полностью построен и возвращён (return вычисляется ДО выполнения
+        finally) — gc.collect() не может инвалидировать то, что уже
+        возвращается вызывающему коду."""
+        try:
+            async with self._check_lock:
+                started_at = _now()
+                provider_names = providers if providers is not None else _ALL_PROVIDERS
+                checkers = {
+                    "gib": self._check_gib,
+                    "avrasya": self._check_avrasya,
+                    "kgm": self._check_kgm,
+                }
+                results = await asyncio.gather(
+                    *(checkers[name](plate, max_attempts=max_attempts, mode=mode) for name in provider_names),
+                    return_exceptions=True,
+                )
+                providers_result = tuple(
+                    result if isinstance(result, ProviderCheckResult)
+                    else _error_result(provider_name, "internal_error", checked_at=_now())
+                    for provider_name, result in zip(provider_names, results)
+                )
+                for provider_name, result in zip(provider_names, results):
+                    if isinstance(result, Exception):
+                        logger.exception(
+                            "Turkey unified check: непойманное исключение в провайдере %s (plate=%s)",
+                            provider_name, plate, exc_info=result,
+                        )
+                finished_at = _now()
+                overall_status = derive_overall_status(providers_result)
+                return UnifiedCheckResult(
+                    plate=plate, started_at=started_at, finished_at=finished_at,
+                    overall_status=overall_status, total_amount=total_amount_for(providers_result),
+                    providers=providers_result,
+                )
+        finally:
+            _collect_after_check(plate)
 
     async def _translate_gib_fines(
         self, fines: tuple[GibFineRecord, ...],

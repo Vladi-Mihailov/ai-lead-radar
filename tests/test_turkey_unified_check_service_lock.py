@@ -10,6 +10,7 @@ from decimal import Decimal
 
 import pytest
 
+import reader.turkey_bot.unified.check_service as check_service_module
 from reader.turkey_bot.avrasya.models import AvrasyaSubmitOutcome
 from reader.turkey_bot.gib.models import GibSubmitOutcome
 from reader.turkey_bot.gib.session import GibTransportError
@@ -205,9 +206,20 @@ async def test_lock_released_after_cancellation_same_service_instance():
 # ---- 7: providers inside ONE check still run concurrently ----
 
 
-async def test_providers_within_one_check_still_run_concurrently():
+async def test_providers_within_one_check_still_run_concurrently(monkeypatch):
     """asyncio.gather ВНУТРИ check() не менялся — все три провайдера
-    ОДНОГО check() всё ещё идут параллельно, а не последовательно."""
+    ОДНОГО check() всё ещё идут параллельно, а не последовательно.
+
+    gc.collect() (см. задачу "reclaim Turkey OCR memory after checks")
+    теперь всегда вызывается один раз в конце check() — это РЕАЛЬНЫЙ,
+    небесплатный вызов, чья длительность зависит от размера ВСЕЙ кучи
+    процесса (а не только этого теста), и в большом test suite (тысячи
+    тестов в одном pytest-процессе) может занимать заметно больше
+    времени, чем изолированно — что делает тайминг НЕПРЕДСКАЗУЕМЫМ и не
+    относящимся к тому, что этот тест реально проверяет (параллелизм
+    asyncio.gather провайдеров). Патчим его здесь no-op'ом, чтобы измерять
+    ТОЛЬКО concurrency, а не побочную GC-паузу."""
+    monkeypatch.setattr(check_service_module.gc, "collect", lambda: 0)
 
     class _SlowProvider:
         def __init__(self, outcome, delay: float):
