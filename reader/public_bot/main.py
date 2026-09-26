@@ -41,6 +41,7 @@ from reader.public_bot.conversation_state_repository import (  # noqa: E402
 from reader.public_bot.debt_refresh_service import DebtRefreshService  # noqa: E402
 from reader.public_bot.delivery_repository import ClientFineDeliveryRepository  # noqa: E402
 from reader.public_bot.delivery_service import ClientDeliveryService  # noqa: E402
+from reader.public_bot.full_check_service import FullCheckService  # noqa: E402
 from reader.public_bot.handlers import register  # noqa: E402
 from reader.public_bot.known_users_repository import BotKnownUsersRepository  # noqa: E402
 from reader.public_bot.statistics_service import BotStatisticsService  # noqa: E402
@@ -95,6 +96,30 @@ class _TelethonBotSender:
 
     async def send_message(self, chat_id: int, text: str, *, buttons: list[list] | None = None) -> None:
         await self._client.send_message(chat_id, text, buttons=buttons)
+
+
+class _TelethonProgressSender:
+    """Адаптер reader.public_bot.full_check_service.ProgressSenderLike (см.
+    задачу "add silent Georgia full database check command") — тот же
+    приём, что и _TelethonBotSender выше: второе Telegram-подключение не
+    заводится. edit() глотает любое исключение (сообщение могло быть
+    удалено пользователем, или Telegram вернул "message not modified") —
+    сбой progress-репортинга НЕ должен прерывать сам scan."""
+
+    def __init__(self, client: TelegramClient):
+        self._client = client
+
+    async def send(self, chat_id: int, text: str) -> int:
+        message = await self._client.send_message(chat_id, text)
+        return message.id
+
+    async def edit(self, chat_id: int, message_id: int, text: str) -> None:
+        try:
+            await self._client.edit_message(chat_id, message_id, text)
+        except Exception:
+            logger.warning(
+                "fine check-all: не удалось отредактировать progress-сообщение", exc_info=True,
+            )
 
 
 def read_bot_token() -> str:
@@ -240,6 +265,19 @@ async def run() -> None:
         # ТЕ ЖЕ task_repository/check_service, что и всё остальное выше,
         # никакой отдельной проверки police.ge не заводит.
         debt_refresh_service = DebtRefreshService(task_repository, check_service)
+
+        # Скрытая "fine check-all" (см. задачу "add silent Georgia full
+        # database check command") — ТОТ ЖЕ authoritative check_service, что
+        # и debt_refresh_service выше (см. задачу п.3: "не писать отдельный
+        # police.ge client/parser/check implementation") — единственное
+        # новое: progress-сообщение через уже подключённый client (см.
+        # _TelethonProgressSender). fine_admin_user_ids — settings.
+        # fine_monitor.allowed_user_ids (см. задачу п.6) — ОТДЕЛЬНЫЙ список
+        # от trusted_operator_user_ids ниже, намеренно не смешиваются.
+        full_check_service = FullCheckService(
+            task_repository, check_service, _TelethonProgressSender(client),
+        )
+
         controller = ConversationController(
             conversation_state_repository,
             subscription_service,
@@ -249,6 +287,8 @@ async def run() -> None:
             trusted_operator_user_ids=frozenset(settings.public_bot.trusted_operator_user_ids),
             payment_help_contact_username=settings.public_bot.payment_help_contact_username,
             debt_refresh_service=debt_refresh_service,
+            full_check_service=full_check_service,
+            fine_admin_user_ids=frozenset(settings.fine_monitor.allowed_user_ids),
         )
 
         register(client, controller, known_users_repository)

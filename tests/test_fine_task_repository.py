@@ -287,6 +287,37 @@ def test_count_all_counts_every_status(tmp_path):
         repo.close()
 
 
+def test_list_all_task_ids_includes_every_status_no_exclusion(tmp_path):
+    """"fine check-all" candidate selection (см. задачу "add silent
+    Georgia full database check command") — схема не содержит понятия
+    archived/deleted на уровне задачи (см. FullCheckService докстрок) —
+    active/completed/stopped ВСЕ должны попасть в список, ни один не
+    исключается."""
+    repo = _make_repo(tmp_path)
+    try:
+        ids = _make_active_tasks(repo, 3)
+        repo.set_status(ids[1], "stopped")
+        repo.set_status(ids[2], "completed")
+
+        result = repo.list_all_task_ids()
+
+        assert sorted(result) == sorted(ids)
+        assert result == sorted(result)  # ORDER BY id — детерминированно
+    finally:
+        repo.close()
+
+
+def test_list_all_task_ids_returns_plain_ints_not_full_rows(tmp_path):
+    repo = _make_repo(tmp_path)
+    try:
+        ids = _make_active_tasks(repo, 2)
+        result = repo.list_all_task_ids()
+        assert all(isinstance(i, int) for i in result)
+        assert set(result) == set(ids)
+    finally:
+        repo.close()
+
+
 def test_set_status_updates_status_and_updated_at(tmp_path):
     repo = _make_repo(tmp_path)
     try:

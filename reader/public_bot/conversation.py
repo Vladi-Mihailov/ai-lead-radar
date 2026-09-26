@@ -96,6 +96,10 @@ from reader.public_bot.debt_refresh_service import (
     DebtSummary,
     RefreshAlreadyInProgressError,
 )
+from reader.public_bot.full_check_service import (
+    FullCheckAlreadyInProgressError,
+    FullCheckService,
+)
 from reader.public_bot.known_users_repository import BotKnownUsersRepository
 from reader.public_bot.owner_resolution import OwnerResolutionError
 from reader.public_bot.statistics_service import BotStatisticsService
@@ -356,6 +360,8 @@ class ConversationController:
         trusted_operator_user_ids: frozenset[int] = frozenset(),
         payment_help_contact_username: str = "tplgee",
         debt_refresh_service: DebtRefreshService | None = None,
+        full_check_service: FullCheckService | None = None,
+        fine_admin_user_ids: frozenset[int] = frozenset(),
     ):
         self._states = conversation_state_repository
         self._subscriptions = subscription_service
@@ -368,6 +374,18 @@ class ConversationController:
         # см. задачу "минимальные изменения") продолжают работать бит в
         # бит как раньше.
         self._debt_refresh = debt_refresh_service
+        # "fine check-all" (см. задачу "add silent Georgia full database
+        # check command") — СКРЫТАЯ maintenance-команда, никогда не в
+        # keyboards.py/главном меню. fine_admin_user_ids — ОТДЕЛЬНЫЙ,
+        # уже существующий authoritative список (settings.fine_monitor.
+        # allowed_user_ids, см. reader/commands/fine.py/dispatcher.py) —
+        # СОЗНАТЕЛЬНО НЕ trusted_operator_user_ids/_is_trusted() (см. задачу
+        # п.6: "не придумывать новую auth систему" — переиспользуем именно
+        # этот, а не смешиваем с существующей trusted-моделью public_bot).
+        # full_check_service=None — тот же приём "фичи нет в этой сборке",
+        # что и у debt_refresh_service выше.
+        self._full_check = full_check_service
+        self._fine_admin_user_ids = frozenset(fine_admin_user_ids)
         # ТОЛЬКО для manager/trusted-operator "📋 Мои авто" — показать
         # auto-captured username владельца рядом с номером (см. задачу
         # "показывать владельца в manager car list"), см.
@@ -424,6 +442,58 @@ class ConversationController:
         include_statistics=...)), НЕ дублируя саму проверку trusted-
         статуса вне ConversationController."""
         return self._is_trusted(telegram_user_id)
+
+    def _is_fine_admin(self, telegram_user_id: int) -> bool:
+        """Авторизация ИСКЛЮЧИТЕЛЬНО для "fine check-all" (см. задачу) —
+        settings.fine_monitor.allowed_user_ids, СОЗНАТЕЛЬНО отдельный
+        список от _is_trusted()/trusted_operator_user_ids (см. __init__
+        докстрок)."""
+        return telegram_user_id in self._fine_admin_user_ids
+
+    async def _handle_full_check_command(
+        self, stripped_text: str, *, chat_id: int, telegram_user_id: int,
+    ) -> BotReply | None:
+        """"fine check-all"/"fine check-all confirm" (см. задачу "add
+        silent Georgia full database check command") — СКРЫТАЯ команда: не
+        пункт меню, не кнопка, ни разу не упомянута ни в одном UI-тексте
+        (см. reader/public_bot/keyboards.py — не импортирует ни одну из
+        этих констант). None — text не совпадает ни с одной из двух команд
+        вовсе (вызывающий код handle_text должен продолжить обычный
+        STEP-диспетчинг, а не трактовать None как отказ в доступе).
+
+        Unauthorized (не fine-admin ИЛИ фичи нет в этой сборке) — ТОЧНО
+        такой же ответ, что и у STATISTICS_LABEL/SEARCH_LABEL для не-
+        trusted (см. _handle_menu_label) — снаружи неотличимо от обычного
+        нераспознанного текста (см. задачу п.7: "не должна нигде
+        отображаться"), ни одного police.ge-запроса при этом не
+        выполняется."""
+        if stripped_text not in (texts.FULL_CHECK_COMMAND, texts.FULL_CHECK_CONFIRM_COMMAND):
+            return None
+
+        if self._full_check is None or not self._is_fine_admin(telegram_user_id):
+            return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
+
+        self._states.clear(chat_id)
+
+        if stripped_text == texts.FULL_CHECK_COMMAND:
+            # ТОЛЬКО чтение (см. задачу п.8: "первый ввод НЕ должен сразу
+            # начинать проверки") — ни одного provider-запроса.
+            candidate_count = len(self._full_check.list_candidate_task_ids())
+            return BotReply(
+                text=texts.format_full_check_preview(
+                    candidate_count, interval_seconds=self._full_check.inter_car_delay_seconds,
+                ),
+            )
+
+        # FULL_CHECK_CONFIRM_COMMAND — реально запускает live checks.
+        # Candidate set пересчитывается ЗАНОВО внутри run() (см.
+        # FullCheckService.list_candidate_task_ids() докстрок), не
+        # переиспользует превью выше.
+        try:
+            outcome = await self._full_check.run(chat_id=chat_id)
+        except FullCheckAlreadyInProgressError:
+            return BotReply(text=texts.FULL_CHECK_ALREADY_IN_PROGRESS_TEXT)
+        return BotReply(text=texts.format_full_check_summary(outcome))
 
     # ---- /start, главное меню, claim deep-link ----
 
@@ -880,6 +950,12 @@ class ConversationController:
         )
         if menu_reply is not None:
             return menu_reply
+
+        full_check_reply = await self._handle_full_check_command(
+            stripped, chat_id=chat_id, telegram_user_id=telegram_user_id,
+        )
+        if full_check_reply is not None:
+            return full_check_reply
 
         state = self._states.get(chat_id)
         if state is None or state.telegram_user_id != telegram_user_id:

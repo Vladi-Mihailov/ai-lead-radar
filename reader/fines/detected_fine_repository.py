@@ -68,12 +68,12 @@ INSERT INTO detected_fines (
     monitoring_task_id, car_number, external_fine_id, fingerprint,
     penalty_date, due_date, delivered_status, raw_data,
     violation_date, amount, place, violation_description,
-    place_ru, violation_description_ru
+    place_ru, violation_description_ru, notification_sent_at
 ) VALUES (
     :monitoring_task_id, :car_number, :external_fine_id, :fingerprint,
     :penalty_date, :due_date, :delivered_status, :raw_data,
     :violation_date, :amount, :place, :violation_description,
-    :place_ru, :violation_description_ru
+    :place_ru, :violation_description_ru, :notification_sent_at
 )
 """
 
@@ -291,7 +291,17 @@ class DetectedFineRepository:
         violation_description: str | None = None,
         place_ru: str | None = None,
         violation_description_ru: str | None = None,
+        notification_sent_at: datetime | None = None,
     ) -> DetectedFine:
+        """notification_sent_at — по умолчанию None (NULL), ПОЛНОСТЬЮ
+        сохраняет прежнее поведение всех существующих вызывающих кодов
+        (см. list_pending_notifications() — "новый штраф ждёт уведомления").
+        Передаётся НЕ-None ИСКЛЮЧИТЕЛЬНО "тихим" maintenance-сканом (см.
+        задачу "add silent Georgia full database check command" —
+        FineCheckService.check_task(..., notification_policy="silent")) —
+        строка тогда с рождения невидима для list_pending_notifications()
+        (WHERE notification_sent_at IS NULL), без единого изменения в
+        FineNotificationCoordinator/NotificationFlushJob."""
         try:
             cursor = self._conn.execute(
                 _INSERT,
@@ -310,6 +320,9 @@ class DetectedFineRepository:
                     "violation_description": violation_description,
                     "place_ru": place_ru,
                     "violation_description_ru": violation_description_ru,
+                    "notification_sent_at": (
+                        notification_sent_at.isoformat() if notification_sent_at else None
+                    ),
                 },
             )
         except sqlite3.IntegrityError:

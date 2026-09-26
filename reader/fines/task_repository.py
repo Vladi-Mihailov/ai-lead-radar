@@ -170,6 +170,19 @@ _SELECT_ALL_PAGE = f"""
 
 _COUNT_ALL = "SELECT COUNT(*) FROM fine_monitoring_tasks"
 
+# "fine check-all" (см. задачу "add silent Georgia full database check
+# command") — ВСЕ задачи, ЛЮБОГО status/monitoring_scope, без пагинации —
+# схема НЕ содержит понятия "archived"/"deleted" на уровне задачи (см.
+# archive_check_enabled/next_archive_check_at — это ПЛАНИРОВЩИК
+# редких повторных проверок для 'completed', а не soft-delete/сокрытие
+# строки), поэтому фильтровать по status здесь не нужно и не следует —
+# каждая строка этой таблицы уже является РЕАЛЬНЫМ, уникальным task_id
+# (fine_monitoring_subscriptions на выборку не влияет вовсе: несколько
+# подписок на одну задачу не создают вторую строку здесь). ORDER BY id —
+# детерминированный порядок между list_candidate_task_ids() (превью) и
+# повторным пересчётом непосредственно перед confirm (см. задачу п.8).
+_SELECT_ALL_TASK_IDS = "SELECT id FROM fine_monitoring_tasks ORDER BY id"
+
 _SELECT_DUE_FOR_ARCHIVE_CHECK = f"""
     SELECT {_SELECT_FIELDS} FROM fine_monitoring_tasks
     WHERE archive_check_enabled = 1
@@ -426,6 +439,16 @@ class FineMonitoringTaskRepository:
 
     def count_all(self) -> int:
         return self._conn.execute(_COUNT_ALL).fetchone()[0]
+
+    def list_all_task_ids(self) -> list[int]:
+        """"fine check-all" candidate selection (см. задачу) — ВСЕ task_id
+        этой таблицы, любого status (см. _SELECT_ALL_TASK_IDS выше) — ID
+        only, не полные FineMonitoringTask (тот же приём, что и у
+        DebtRefreshService.list_debt_rows(): вызывающий код перечитывает
+        каждую задачу свежей через get(task_id) непосредственно перед
+        проверкой, а не полагается на снимок, сделанный здесь)."""
+        rows = self._conn.execute(_SELECT_ALL_TASK_IDS).fetchall()
+        return [row[0] for row in rows]
 
     def set_status(self, task_id: int, status: FineTaskStatus) -> None:
         self._conn.execute(_UPDATE_STATUS, (status, task_id))

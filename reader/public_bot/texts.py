@@ -11,6 +11,7 @@ from datetime import date, datetime
 from reader.fines.models import FineMonitoringTask, NewFineEvent
 from reader.public_bot.debt_refresh_service import DebtSummary, RefreshOutcome
 from reader.public_bot.delivery_texts import format_check_now_fines_message
+from reader.public_bot.full_check_service import FullCheckOutcome
 from reader.public_bot.models import FineMonitoringSubscription
 from reader.public_bot.statistics_service import BotStatistics
 
@@ -709,3 +710,54 @@ def format_search_results(*, blocks: list[str]) -> str:
 
 def format_search_pagination_footer(*, page: int, total_pages: int) -> str:
     return f"Страница {page + 1} из {total_pages}"
+
+
+# ==== "fine check-all" (см. задачу "add silent Georgia full database check
+# command") — скрытая fine-admin-only maintenance-команда, НИГДЕ не
+# отображается (не в keyboards.py, не в главном меню) — эти константы сами
+# по себе НЕ делают команду видимой, только задают её точный текст ввода/
+# ответов. ====
+
+FULL_CHECK_COMMAND = "fine check-all"
+FULL_CHECK_CONFIRM_COMMAND = "fine check-all confirm"
+
+FULL_CHECK_ALREADY_IN_PROGRESS_TEXT = "⚠️ Полная проверка уже выполняется."
+
+
+def format_full_check_preview(candidate_count: int, *, interval_seconds: float) -> str:
+    """Экран ПЕРЕД запуском (см. задачу п.8) — НЕ начинает проверки сам по
+    себе; candidate_count — свежий, только что пересчитанный (см.
+    FullCheckService.list_candidate_task_ids(), вызывается заново
+    непосредственно перед confirm, см. задачу: "повторно пересчитать
+    candidate set")."""
+    interval_text = f"{interval_seconds:g}"
+    return (
+        "🔄 Полная проверка автомобилей\n\n"
+        f"Будет проверено: {candidate_count}\n"
+        f"Интервал: {interval_text} сек.\n\n"
+        "Для запуска:\n"
+        f"{FULL_CHECK_CONFIRM_COMMAND}"
+    )
+
+
+def _format_duration(seconds: float) -> str:
+    total_seconds = round(seconds)
+    minutes, secs = divmod(total_seconds, 60)
+    if minutes:
+        return f"{minutes} мин {secs} сек"
+    return f"{secs} сек"
+
+
+def format_full_check_summary(outcome: FullCheckOutcome) -> str:
+    """Итог оператору ПОСЛЕ завершения скана (см. задачу п.10) — НЕ
+    перечисляет номера машин (см. задачу: "не перечислять все номера в
+    Telegram") — только агрегированные счётчики."""
+    return (
+        "✅ Полная проверка завершена\n\n"
+        f"Всего: {outcome.total}\n"
+        f"Проверено успешно: {outcome.checked_ok}\n"
+        f"С задолженностью: {outcome.with_debt}\n"
+        f"Без задолженности: {outcome.without_debt}\n"
+        f"Не удалось проверить: {outcome.failed}\n"
+        f"Время выполнения: {_format_duration(outcome.duration_seconds)}"
+    )

@@ -336,6 +336,64 @@ def test_mark_notification_sent_updates_notification_sent_at(tmp_path):
         repo.close()
 
 
+def test_create_with_notification_sent_at_pre_set_is_invisible_to_pending(tmp_path):
+    """"fine check-all" silent scan (см. задачу "add silent Georgia full
+    database check command") — create(notification_sent_at=<now>) должен
+    сделать строку невидимой для list_pending_notifications() СРАЗУ, без
+    отдельного вызова mark_notification_sent()."""
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(tmp_path, db_path)
+
+    repo = DetectedFineRepository(db_path)
+    try:
+        now = datetime(2026, 9, 26, 12, 0, 0, tzinfo=timezone.utc)
+        fine = repo.create(
+            monitoring_task_id=task_id,
+            car_number="B957MA09",
+            external_fine_id="AB123456",
+            fingerprint="fp-silent",
+            penalty_date=None,
+            due_date=None,
+            delivered_status=None,
+            raw_data="{}",
+            notification_sent_at=now,
+        )
+        assert fine.notification_sent_at is not None
+
+        pending = repo.list_pending_notifications()
+        assert pending == []
+    finally:
+        repo.close()
+
+
+def test_create_without_notification_sent_at_keeps_default_pending_behavior(tmp_path):
+    """Регрессия: default (None) сохраняет ПРЕЖНЕЕ поведение для ЛЮБОГО
+    существующего вызывающего кода — новая строка ждёт уведомления, как и
+    раньше."""
+    db_path = tmp_path / "users.db"
+    task_id = _make_task(tmp_path, db_path)
+
+    repo = DetectedFineRepository(db_path)
+    try:
+        fine = repo.create(
+            monitoring_task_id=task_id,
+            car_number="B957MA09",
+            external_fine_id="AB123456",
+            fingerprint="fp-normal",
+            penalty_date=None,
+            due_date=None,
+            delivered_status=None,
+            raw_data="{}",
+        )
+        assert fine.notification_sent_at is None
+
+        pending = repo.list_pending_notifications()
+        assert len(pending) == 1
+        assert pending[0].fingerprint == "fp-normal"
+    finally:
+        repo.close()
+
+
 def test_get_stats_by_car_groups_and_sorts_by_count_desc(tmp_path):
     db_path = tmp_path / "users.db"
     task_repo = FineMonitoringTaskRepository(db_path)
