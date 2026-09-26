@@ -102,9 +102,6 @@ from reader.public_bot.full_check_service import (
 )
 from reader.public_bot.known_users_repository import BotKnownUsersRepository
 from reader.public_bot.owner_resolution import OwnerResolutionError
-from reader.public_bot.protocol_check_ephemeral_store import ProtocolCheckEphemeralStore
-from reader.public_bot.protocol_check_models import ProtocolCheckStatus
-from reader.public_bot.protocol_check_provider import ProtocolCheckProvider
 from reader.public_bot.statistics_service import BotStatisticsService
 from reader.public_bot.subscription_service import SubscriptionService
 from reader.public_bot.validation import (
@@ -122,20 +119,6 @@ STEP_AWAITING_TRUSTED_CHECK_NOW_CAR_NUMBER = "awaiting_trusted_check_now_car_num
 # Manager/trusted Search (см. задачу "manager/trusted Search") — ввод
 # @username/username/номера, см. _handle_search_query_input.
 STEP_AWAITING_SEARCH_QUERY = "awaiting_search_query"
-
-# "📸 Проверить протокол" (см. задачу) — one-shot lookup против
-# videos.police.ge, ОТДЕЛЬНЫЙ flow от Add Car/Мои авто/Проверить сейчас/
-# мониторинга (см. задачу п.10). Доступен ВСЕМ пользователям, не
-# trusted-gated. car_number (variant "🚗 По автомобилю", шаг 1) — единственное
-# несекретное значение этого flow, хранится как обычно, в persistent
-# payload (см. _handle_protocol_check_vehicle_car_number_input) — номер
-# техпаспорта/протокола/ID-TAX нарушителя НИКОГДА туда не попадают (см.
-# ProtocolCheckEphemeralStore и задачу п.4).
-STEP_PROTOCOL_CHECK_METHOD = "awaiting_protocol_check_method"
-STEP_PROTOCOL_CHECK_VEHICLE_CAR_NUMBER = "awaiting_protocol_check_vehicle_car_number"
-STEP_PROTOCOL_CHECK_VEHICLE_DOCUMENT = "awaiting_protocol_check_vehicle_document"
-STEP_PROTOCOL_CHECK_PROTOCOL_NUMBER = "awaiting_protocol_check_protocol_number"
-STEP_PROTOCOL_CHECK_PERSONAL_NUMBER = "awaiting_protocol_check_personal_number"
 
 PERIOD_CHOICES = (30, 90, 180, 365)
 
@@ -364,20 +347,6 @@ class BotReply:
     search_page: int | None = None
     search_total_pages: int | None = None
 
-    # "📸 Проверить протокол" (см. задачу) — protocol_check_method_prompt —
-    # экран выбора способа ([🚗 По автомобилю][📄 По протоколу][◀️ Назад]).
-    # protocol_check_back_target — "method"/"vehicle_step1"/"protocol_step1"
-    # — какую из ОДНОКНОПОЧНЫХ "◀️ Назад"-клавиатур приложить к экрану
-    # ввода очередного значения (см. reader/public_bot/handlers.py —
-    # единственное место, которое превращает это в реальную inline-
-    # клавиатуру, см. keyboards.py::protocol_check_back_to_*_keyboard).
-    # Оба поля взаимоисключающие с show_main_menu/остальными *_options полями
-    # выше — терминальные ответы этого flow (найдено/не найдено/ошибка/
-    # неизвестно) возвращают show_main_menu=True, как и у
-    # _handle_trusted_check_now_car_number_input.
-    protocol_check_method_prompt: bool = False
-    protocol_check_back_target: str | None = None
-
 
 class ConversationController:
     def __init__(
@@ -391,8 +360,6 @@ class ConversationController:
         trusted_operator_user_ids: frozenset[int] = frozenset(),
         payment_help_contact_username: str = "tplgee",
         debt_refresh_service: DebtRefreshService | None = None,
-        protocol_check_provider: ProtocolCheckProvider | None = None,
-        protocol_check_ephemeral_store: ProtocolCheckEphemeralStore | None = None,
         full_check_service: FullCheckService | None = None,
         fine_admin_user_ids: frozenset[int] = frozenset(),
     ):
@@ -407,16 +374,6 @@ class ConversationController:
         # см. задачу "минимальные изменения") продолжают работать бит в
         # бит как раньше.
         self._debt_refresh = debt_refresh_service
-        # "📸 Проверить протокол" (см. задачу) — None означает "фичи в этой
-        # сборке нет" (тот же приём, что и у debt_refresh_service выше) —
-        # существующие вызовы ConversationController(...) без этих
-        # параметров (тесты и т.п.) продолжают работать бит в бит как раньше.
-        # Кнопка в главном меню (см. reader/public_bot/keyboards.py) при
-        # этом ВСЕГДА видна — это НЕ trusted-only фича; отсутствие provider'а
-        # означает лишь защитный fallback-текст на последнем шаге (см.
-        # _format_protocol_check_result), а не скрытую кнопку.
-        self._protocol_check_provider = protocol_check_provider
-        self._protocol_check_ephemeral = protocol_check_ephemeral_store
         # "fine check-all" (см. задачу "add silent Georgia full database
         # check command") — СКРЫТАЯ maintenance-команда, никогда не в
         # keyboards.py/главном меню. fine_admin_user_ids — ОТДЕЛЬНЫЙ,
@@ -426,7 +383,7 @@ class ConversationController:
         # п.6: "не придумывать новую auth систему" — переиспользуем именно
         # этот, а не смешиваем с существующей trusted-моделью public_bot).
         # full_check_service=None — тот же приём "фичи нет в этой сборке",
-        # что и у debt_refresh_service/protocol_check_provider выше.
+        # что и у debt_refresh_service выше.
         self._full_check = full_check_service
         self._fine_admin_user_ids = frozenset(fine_admin_user_ids)
         # ТОЛЬКО для manager/trusted-operator "📋 Мои авто" — показать
@@ -470,20 +427,6 @@ class ConversationController:
             return None
         known = self._known_users.get(owner_id)
         return known.telegram_username if known else None
-
-    def _clear_state(self, chat_id: int) -> None:
-        """Единая точка очистки conversation_state — ВСЕГДА вместе с
-        ephemeral-состоянием "📸 Проверить протокол" (см. задачу п.9:
-        "Cancel/новый главный flow: очистить весь ephemeral protocol
-        state") — любой другой пункт меню/flow, начатый ДО завершения
-        protocol-check flow, должен делать sensitive-значение (номер
-        протокола) недостижимым, а не только повторное нажатие самой этой
-        кнопки. Используется ВЕЗДЕ в этом классе вместо прямого
-        self._states.clear(chat_id) — единственное место, которое нужно
-        было бы менять, появись у будущего flow своё ephemeral-состояние."""
-        self._states.clear(chat_id)
-        if self._protocol_check_ephemeral is not None:
-            self._protocol_check_ephemeral.clear(chat_id)
 
     def _is_trusted(self, telegram_user_id: int) -> bool:
         """Единственная проверка авторизации trusted-режима — ТОЛЬКО по
@@ -530,7 +473,7 @@ class ConversationController:
         if self._full_check is None or not self._is_fine_admin(telegram_user_id):
             return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
 
-        self._clear_state(chat_id)
+        self._states.clear(chat_id)
 
         if stripped_text == texts.FULL_CHECK_COMMAND:
             # ТОЛЬКО чтение (см. задачу п.8: "первый ввод НЕ должен сразу
@@ -558,7 +501,7 @@ class ConversationController:
         """/start — сбрасывает ЛЮБОЙ незавершённый диалог этого chat_id и
         показывает главное меню (см. design: "/start и повторное нажатие
         Добавить авто очищают старое незавершённое состояние")."""
-        self._clear_state(chat_id)
+        self._states.clear(chat_id)
         return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
 
     def _handle_start_command(
@@ -583,7 +526,7 @@ class ConversationController:
 
         if payload.startswith(_CLAIM_PAYLOAD_PREFIX):
             token = payload[len(_CLAIM_PAYLOAD_PREFIX):]
-            self._clear_state(chat_id)
+            self._states.clear(chat_id)
             outcome = self._subscriptions.claim(
                 token,
                 telegram_user_id=telegram_user_id,
@@ -633,20 +576,20 @@ class ConversationController:
         if stripped_text == texts.ADD_CAR_LABEL:
             # Любое незавершённое состояние этого chat_id отбрасывается —
             # новый flow начинается с чистого листа.
-            self._clear_state(chat_id)
+            self._states.clear(chat_id)
             self._states.set(
                 chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_CAR_NUMBER,
             )
             return BotReply(text=texts.CAR_NUMBER_PROMPT)
 
         if stripped_text == texts.MY_CARS_LABEL:
-            self._clear_state(chat_id)
+            self._states.clear(chat_id)
             if self._is_trusted(telegram_user_id):
                 return self._format_trusted_tasks_page_reply(0)
             return self._format_my_cars_page_reply(telegram_user_id, 0)
 
         if stripped_text == texts.CHECK_NOW_LABEL:
-            self._clear_state(chat_id)
+            self._states.clear(chat_id)
             if self._is_trusted(telegram_user_id):
                 # Ввод номера, НЕ список (см. design report: "искать
                 # автомобиль в списке неудобно") — ответ на следующее
@@ -659,7 +602,7 @@ class ConversationController:
             return self._build_check_now_picker_reply(telegram_user_id)
 
         if stripped_text == texts.STOP_LABEL:
-            self._clear_state(chat_id)
+            self._states.clear(chat_id)
             if not self._is_trusted(telegram_user_id):
                 # Для обычного пользователя эта кнопка больше не
                 # показывается в главном меню вовсе (см.
@@ -680,11 +623,11 @@ class ConversationController:
             # URL-кнопкой (см. BotReply.show_turkey_bot_link докстрок и
             # reader/public_bot/keyboards.py::turkey_bot_link_keyboard).
             # Доступно ВСЕМ пользователям одинаково, не trusted-gated.
-            self._clear_state(chat_id)
+            self._states.clear(chat_id)
             return BotReply(text=texts.TURKEY_BOT_LINK_TEXT, show_turkey_bot_link=True)
 
         if stripped_text == texts.STATISTICS_LABEL:
-            self._clear_state(chat_id)
+            self._states.clear(chat_id)
             if not self._is_trusted(telegram_user_id):
                 # Кнопка обычному пользователю никогда не показывается
                 # (см. main_menu_keyboard(include_statistics=...)), но
@@ -696,7 +639,7 @@ class ConversationController:
             return self._format_statistics_reply()
 
         if stripped_text == texts.SEARCH_LABEL:
-            self._clear_state(chat_id)
+            self._states.clear(chat_id)
             if not self._is_trusted(telegram_user_id):
                 # Manager/trusted Search (см. задачу) — та же защита, что и
                 # у STATISTICS_LABEL/STOP_LABEL выше: кнопка обычному
@@ -708,18 +651,6 @@ class ConversationController:
                 chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_SEARCH_QUERY,
             )
             return BotReply(text=texts.SEARCH_ENTRY_TEXT, search_prompt=True)
-
-        if stripped_text == texts.PROTOCOL_CHECK_LABEL:
-            # См. задачу "Проверить протокол" — доступно ВСЕМ пользователям
-            # (не trusted-gated), не привязано ни к одному существующему
-            # автомобилю/подписке этого пользователя (см. задачу п.10).
-            self._clear_state(chat_id)
-            if self._protocol_check_ephemeral is not None:
-                self._protocol_check_ephemeral.clear(chat_id)
-            self._states.set(
-                chat_id, telegram_user_id=telegram_user_id, step=STEP_PROTOCOL_CHECK_METHOD,
-            )
-            return BotReply(text=texts.PROTOCOL_CHECK_INTRO_TEXT, protocol_check_method_prompt=True)
 
         return None
 
@@ -1087,32 +1018,6 @@ class ConversationController:
                 stripped, chat_id=chat_id, telegram_user_id=telegram_user_id,
             )
 
-        if state.step == STEP_PROTOCOL_CHECK_METHOD:
-            # Тот же приём, что и у STEP_AWAITING_CLIENT_DECISION выше —
-            # метод выбирается ТОЛЬКО inline-кнопкой, текст на этом шаге
-            # просто повторно показывает экран выбора.
-            return BotReply(text=texts.PROTOCOL_CHECK_INTRO_TEXT, protocol_check_method_prompt=True)
-
-        if state.step == STEP_PROTOCOL_CHECK_VEHICLE_CAR_NUMBER:
-            return self._handle_protocol_check_vehicle_car_number_input(
-                stripped, chat_id=chat_id, telegram_user_id=telegram_user_id,
-            )
-
-        if state.step == STEP_PROTOCOL_CHECK_VEHICLE_DOCUMENT:
-            return await self._handle_protocol_check_vehicle_document_input(
-                stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, state_payload=state.payload,
-            )
-
-        if state.step == STEP_PROTOCOL_CHECK_PROTOCOL_NUMBER:
-            return self._handle_protocol_check_protocol_number_input(
-                stripped, chat_id=chat_id, telegram_user_id=telegram_user_id,
-            )
-
-        if state.step == STEP_PROTOCOL_CHECK_PERSONAL_NUMBER:
-            return await self._handle_protocol_check_personal_number_input(
-                stripped, chat_id=chat_id, telegram_user_id=telegram_user_id,
-            )
-
         if state.step == STEP_AWAITING_PERIOD:
             # Период выбирается ТОЛЬКО inline-кнопкой — текст на этом шаге
             # просто повторно показывает клавиатуру.
@@ -1183,7 +1088,7 @@ class ConversationController:
         чтобы можно было ввести номер заново без повторного нажатия
         "🔎 Проверить сейчас"."""
         if not self._is_trusted(telegram_user_id):
-            self._clear_state(chat_id)
+            self._states.clear(chat_id)
             return BotReply(text=texts.CALLBACK_NOT_AUTHORIZED_TEXT, show_main_menu=True)
 
         try:
@@ -1191,7 +1096,7 @@ class ConversationController:
         except FineValidationError as exc:
             return BotReply(text=f"❌ {exc.message}\n\n{texts.CAR_NUMBER_PROMPT}")
 
-        self._clear_state(chat_id)
+        self._states.clear(chat_id)
 
         outcome = await self._subscriptions.check_now_task_by_car_number(car_number)
         if outcome is None:
@@ -1222,7 +1127,7 @@ class ConversationController:
         payload = state.payload or {}
         car_number = payload.get("car_number")
         if not car_number:
-            self._clear_state(chat_id)
+            self._states.clear(chat_id)
             return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
 
         if wants_client:
@@ -1296,7 +1201,7 @@ class ConversationController:
             # Не должно происходить штатно (payload всегда заполняется к
             # моменту STEP_AWAITING_PERIOD) — но не падаем молча, если
             # состояние всё же оказалось повреждено/устарело.
-            self._clear_state(chat_id)
+            self._states.clear(chat_id)
             return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
 
         today = self._today()
@@ -1332,7 +1237,7 @@ class ConversationController:
             period_days=days,
             today=today,
         )
-        self._clear_state(chat_id)
+        self._states.clear(chat_id)
 
         return BotReply(
             text=texts.format_add_car_summary(
@@ -1357,10 +1262,10 @@ class ConversationController:
                 today=today,
             )
         except OwnerResolutionError:
-            self._clear_state(chat_id)
+            self._states.clear(chat_id)
             return BotReply(text=texts.OWNER_RESOLUTION_ERROR_TEXT, show_main_menu=True)
 
-        self._clear_state(chat_id)
+        self._states.clear(chat_id)
 
         return BotReply(
             text=texts.format_delegated_add_car_summary(
@@ -1385,7 +1290,7 @@ class ConversationController:
             period_days=days,
             today=today,
         )
-        self._clear_state(chat_id)
+        self._states.clear(chat_id)
 
         return BotReply(
             text=texts.format_delegated_add_car_without_client_summary(
@@ -1982,7 +1887,7 @@ class ConversationController:
         self, raw_text: str, *, chat_id: int, telegram_user_id: int,
     ) -> BotReply:
         if not self._is_trusted(telegram_user_id):
-            self._clear_state(chat_id)
+            self._states.clear(chat_id)
             return BotReply(text=texts.CALLBACK_NOT_AUTHORIZED_TEXT, show_main_menu=True)
 
         parsed = self._parse_search_query(raw_text)
@@ -1996,7 +1901,7 @@ class ConversationController:
             )
 
         query_type, query = parsed
-        self._clear_state(chat_id)
+        self._states.clear(chat_id)
         return await self._format_search_results_reply(query_type, query, 0)
 
     async def handle_search_page(
@@ -2022,236 +1927,5 @@ class ConversationController:
         любое незавершённое состояние Search."""
         if not self._is_trusted(telegram_user_id):
             return None
-        self._clear_state(chat_id)
+        self._states.clear(chat_id)
         return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
-
-    # ---- "📸 Проверить протокол" (см. задачу) — one-shot lookup против
-    # videos.police.ge, ОТДЕЛЬНЫЙ flow (см. класс docstring выше про
-    # is_trusted() — здесь его вообще нет: доступно всем одинаково, не
-    # trusted-gated). Владение диалогом проверяется тем же приёмом, что и у
-    # handle_add_client_decision — state.telegram_user_id == реальный
-    # telegram_user_id (никогда не что-либо из callback_data). ----
-
-    def handle_protocol_check_method(
-        self, method: str, *, chat_id: int, telegram_user_id: int,
-    ) -> BotReply | None:
-        """method — "vehicle"/"protocol" (см. reader/public_bot/
-        keyboards.py::decode_protocol_check_method_callback). None — нет
-        активного STEP_PROTOCOL_CHECK_METHOD ИМЕННО у этого
-        telegram_user_id в этом chat_id (handlers.py покажет
-        CALLBACK_NOT_AUTHORIZED_TEXT, тот же приём, что и везде в этом
-        классе)."""
-        state = self._states.get(chat_id)
-        if (
-            state is None
-            or state.step != STEP_PROTOCOL_CHECK_METHOD
-            or state.telegram_user_id != telegram_user_id
-        ):
-            return None
-
-        if method == "vehicle":
-            self._states.set(
-                chat_id, telegram_user_id=telegram_user_id, step=STEP_PROTOCOL_CHECK_VEHICLE_CAR_NUMBER,
-            )
-            return BotReply(
-                text=texts.PROTOCOL_CHECK_VEHICLE_CAR_NUMBER_PROMPT, protocol_check_back_target="method",
-            )
-
-        if method == "protocol":
-            self._states.set(
-                chat_id, telegram_user_id=telegram_user_id, step=STEP_PROTOCOL_CHECK_PROTOCOL_NUMBER,
-            )
-            return BotReply(
-                text=texts.PROTOCOL_CHECK_PROTOCOL_NUMBER_PROMPT, protocol_check_back_target="method",
-            )
-
-        return None
-
-    def handle_protocol_check_back_to_menu(self, *, chat_id: int, telegram_user_id: int) -> BotReply | None:
-        """"◀️ Назад" с экрана выбора способа — в главное меню (см. задачу
-        п.6: "из стартового экрана → Назад возвращает в главное меню")."""
-        state = self._states.get(chat_id)
-        if state is None or state.telegram_user_id != telegram_user_id:
-            return None
-        self._clear_state(chat_id)
-        if self._protocol_check_ephemeral is not None:
-            self._protocol_check_ephemeral.clear(chat_id)
-        return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
-
-    def handle_protocol_check_back_to_method(self, *, chat_id: int, telegram_user_id: int) -> BotReply | None:
-        """"◀️ Назад" с ввода ПЕРВОГО значения любого из вариантов — на
-        экран выбора способа (см. задачу п.6: "из первого input → Назад
-        возвращает к выбору способа проверки")."""
-        state = self._states.get(chat_id)
-        if state is None or state.telegram_user_id != telegram_user_id:
-            return None
-        # Sensitive-значение этого flow ещё не могло быть введено (это
-        # ПЕРВЫЙ шаг после выбора метода) — очищать нечего, но чистим
-        # defensively в любом случае (см. задачу п.6: "при Back обязательно
-        # очищать sensitive value, которое больше не требуется").
-        if self._protocol_check_ephemeral is not None:
-            self._protocol_check_ephemeral.clear(chat_id)
-        self._states.set(chat_id, telegram_user_id=telegram_user_id, step=STEP_PROTOCOL_CHECK_METHOD)
-        return BotReply(text=texts.PROTOCOL_CHECK_INTRO_TEXT, protocol_check_method_prompt=True)
-
-    def handle_protocol_check_back_to_vehicle_step1(
-        self, *, chat_id: int, telegram_user_id: int,
-    ) -> BotReply | None:
-        """"◀️ Назад" с ввода номера техпаспорта — на ввод номера
-        автомобиля (см. задачу п.6: "из второго input → Назад возвращает к
-        вводу первого значения"). car_number — НЕ sensitive, ничего
-        очищать не нужно (номер техпаспорта на этом шаге ещё не введён)."""
-        state = self._states.get(chat_id)
-        if state is None or state.telegram_user_id != telegram_user_id:
-            return None
-        self._states.set(chat_id, telegram_user_id=telegram_user_id, step=STEP_PROTOCOL_CHECK_VEHICLE_CAR_NUMBER)
-        return BotReply(
-            text=texts.PROTOCOL_CHECK_VEHICLE_CAR_NUMBER_PROMPT, protocol_check_back_target="method",
-        )
-
-    def handle_protocol_check_back_to_protocol_step1(
-        self, *, chat_id: int, telegram_user_id: int,
-    ) -> BotReply | None:
-        """"◀️ Назад" с ввода ID/TAX-номера нарушителя — на ввод номера
-        протокола. Номер протокола, введённый на первом шаге, больше не
-        нужен — обязательно очищаем ephemeral store (см. задачу п.6/п.4),
-        пользователь введёт его заново."""
-        state = self._states.get(chat_id)
-        if state is None or state.telegram_user_id != telegram_user_id:
-            return None
-        if self._protocol_check_ephemeral is not None:
-            self._protocol_check_ephemeral.clear(chat_id)
-        self._states.set(chat_id, telegram_user_id=telegram_user_id, step=STEP_PROTOCOL_CHECK_PROTOCOL_NUMBER)
-        return BotReply(
-            text=texts.PROTOCOL_CHECK_PROTOCOL_NUMBER_PROMPT, protocol_check_back_target="method",
-        )
-
-    def _handle_protocol_check_vehicle_car_number_input(
-        self, raw_text: str, *, chat_id: int, telegram_user_id: int,
-    ) -> BotReply:
-        try:
-            car_number = normalize_car_number(raw_text)
-        except FineValidationError as exc:
-            # Остаёмся на том же шаге — тот же UX, что и у
-            # _handle_car_number_input.
-            return BotReply(
-                text=f"❌ {exc.message}\n\n{texts.PROTOCOL_CHECK_VEHICLE_CAR_NUMBER_PROMPT}",
-                protocol_check_back_target="method",
-            )
-
-        # car_number — НЕ sensitive (см. задачу п.4: "разрешается хранить
-        # ... несекретные технические признаки") — обычный persistent
-        # payload, тот же приём, что и у Add Car flow.
-        self._states.set(
-            chat_id, telegram_user_id=telegram_user_id, step=STEP_PROTOCOL_CHECK_VEHICLE_DOCUMENT,
-            payload={"car_number": car_number},
-        )
-        return BotReply(
-            text=texts.PROTOCOL_CHECK_VEHICLE_DOCUMENT_PROMPT, protocol_check_back_target="vehicle_step1",
-        )
-
-    async def _handle_protocol_check_vehicle_document_input(
-        self, raw_text: str, *, chat_id: int, telegram_user_id: int, state_payload: dict | None,
-    ) -> BotReply:
-        """Номер техпаспорта — sensitive (см. задачу п.4): никогда не
-        попадает ни в persistent payload, ни в ephemeral store — живёт
-        ТОЛЬКО в локальной переменной этого вызова, используется и
-        отбрасывается в рамках одного await ниже."""
-        document_no = raw_text.strip().upper()
-        if not document_no:
-            return BotReply(
-                text=f"❌ Значение не может быть пустым.\n\n{texts.PROTOCOL_CHECK_VEHICLE_DOCUMENT_PROMPT}",
-                protocol_check_back_target="vehicle_step1",
-            )
-
-        payload = state_payload or {}
-        car_number = payload.get("car_number")
-        if not car_number:
-            self._clear_state(chat_id)
-            return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
-
-        # Состояние очищается ДО сетевого запроса (см. задачу п.4: "очищать
-        # ... насколько возможно при exception/finally") — независимо от
-        # исхода проверки ниже, этот flow для этого chat_id уже завершён.
-        self._clear_state(chat_id)
-        result = await self._run_protocol_check_vehicle(car_number=car_number, document_no=document_no)
-        return self._format_protocol_check_result(result)
-
-    def _handle_protocol_check_protocol_number_input(
-        self, raw_text: str, *, chat_id: int, telegram_user_id: int,
-    ) -> BotReply:
-        protocol_no = raw_text.strip()
-        if not protocol_no:
-            return BotReply(
-                text=f"❌ Значение не может быть пустым.\n\n{texts.PROTOCOL_CHECK_PROTOCOL_NUMBER_PROMPT}",
-                protocol_check_back_target="method",
-            )
-
-        # Sensitive — ТОЛЬКО ephemeral in-memory store (см. задачу п.4),
-        # НИКОГДА в persistent payload (см. ProtocolCheckEphemeralStore
-        # докстрок) — нужен на следующем шаге (ввод ID/TAX-номера), а
-        # BotConversationStateRepository для этого не подходит.
-        if self._protocol_check_ephemeral is not None:
-            self._protocol_check_ephemeral.set_protocol_number(chat_id, protocol_no)
-        self._states.set(chat_id, telegram_user_id=telegram_user_id, step=STEP_PROTOCOL_CHECK_PERSONAL_NUMBER)
-        return BotReply(
-            text=texts.PROTOCOL_CHECK_PERSONAL_NUMBER_PROMPT, protocol_check_back_target="protocol_step1",
-        )
-
-    async def _handle_protocol_check_personal_number_input(
-        self, raw_text: str, *, chat_id: int, telegram_user_id: int,
-    ) -> BotReply:
-        """ID/TAX-номер нарушителя — sensitive, никогда не попадает ни в
-        persistent payload, ни в ephemeral store — только локальная
-        переменная (тот же приём, что и у document_no выше)."""
-        personal_no = raw_text.strip().upper()
-        if not personal_no:
-            return BotReply(
-                text=f"❌ Значение не может быть пустым.\n\n{texts.PROTOCOL_CHECK_PERSONAL_NUMBER_PROMPT}",
-                protocol_check_back_target="protocol_step1",
-            )
-
-        protocol_no = (
-            self._protocol_check_ephemeral.pop_protocol_number(chat_id)
-            if self._protocol_check_ephemeral is not None else None
-        )
-        # Состояние (И ephemeral-значение — pop_protocol_number уже забыл
-        # его выше) очищаются ДО сетевого запроса, тот же приём, что и у
-        # vehicle-варианта.
-        self._clear_state(chat_id)
-        if not protocol_no:
-            # Ephemeral store потерял значение (restart процесса между
-            # шагами — см. задачу: "после restart процесса незавершённый
-            # flow может быть потерян — для MVP это нормально") — тот же
-            # STALE_DIALOG_TEXT, что и у остальных многошаговых flow.
-            return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
-
-        result = await self._run_protocol_check_protocol(protocol_no=protocol_no, personal_no=personal_no)
-        return self._format_protocol_check_result(result)
-
-    async def _run_protocol_check_vehicle(self, *, car_number: str, document_no: str):
-        if self._protocol_check_provider is None:
-            return None
-        return await self._protocol_check_provider.check_vehicle(car_number=car_number, document_no=document_no)
-
-    async def _run_protocol_check_protocol(self, *, protocol_no: str, personal_no: str):
-        if self._protocol_check_provider is None:
-            return None
-        return await self._protocol_check_provider.check_protocol(protocol_no=protocol_no, personal_no=personal_no)
-
-    def _format_protocol_check_result(self, result) -> BotReply:
-        """result — ProtocolCheckResult | None (None — provider вообще не
-        сконфигурирован в этой сборке, см. __init__). Ветка FOUND сегодня
-        недостижима через реальный provider (см. protocol_check_provider.py::
-        _parse_result, задача п.8), но обрабатывается здесь ради
-        расширяемости — когда появится реальный parser, ничего в этом
-        методе менять не придётся."""
-        if result is None:
-            return BotReply(text=texts.PROTOCOL_CHECK_UNAVAILABLE_TEXT, show_main_menu=True)
-        if result.status == ProtocolCheckStatus.NOT_FOUND:
-            return BotReply(text=texts.PROTOCOL_CHECK_NOT_FOUND_TEXT, show_main_menu=True)
-        if result.status == ProtocolCheckStatus.FOUND:
-            return BotReply(text=texts.PROTOCOL_CHECK_FOUND_TEXT, show_main_menu=True)
-        if result.status == ProtocolCheckStatus.UNKNOWN:
-            return BotReply(text=texts.PROTOCOL_CHECK_UNKNOWN_TEXT, show_main_menu=True)
-        return BotReply(text=texts.PROTOCOL_CHECK_ERROR_TEXT, show_main_menu=True)

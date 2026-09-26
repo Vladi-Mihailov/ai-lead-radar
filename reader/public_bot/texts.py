@@ -719,68 +719,6 @@ def format_search_pagination_footer(*, page: int, total_pages: int) -> str:
     return f"Страница {page + 1} из {total_pages}"
 
 
-# ==== "📸 Проверить протокол" (см. задачу) — Georgia-only, one-shot lookup
-# против videos.police.ge (НЕ police.ge/protocol, см. задачу п.5/п.10: "не
-# смешивать с текущим FineCheckService"/"не влиять на 📊 Статистика/🔎
-# Проверить сейчас/📋 Мои авто") — доступна ВСЕМ пользователям бота, не
-# trusted-gated (см. reader/public_bot/keyboards.py::main_menu_keyboard).
-# Номер техпаспорта/протокола/ID-TAX нарушителя — sensitive (см. задачу
-# п.4) — ни один текст здесь не подставляет их обратно пользователю
-# (результат — ТОЛЬКО фиксированные сообщения ниже, никогда echo введённых
-# значений). ====
-
-PROTOCOL_CHECK_LABEL = "📸 Проверить протокол"
-
-PROTOCOL_CHECK_INTRO_TEXT = (
-    "📸 Проверить протокол\n\n"
-    "Для проверки понадобятся данные одного из вариантов:\n\n"
-    "🚗 По автомобилю\n"
-    "• номер автомобиля\n"
-    "• номер техпаспорта\n\n"
-    "📄 По протоколу\n"
-    "• номер протокола\n"
-    "• ID или TAX номер нарушителя\n\n"
-    "Выберите способ проверки:"
-)
-
-PROTOCOL_CHECK_VEHICLE_METHOD_LABEL = "🚗 По автомобилю"
-PROTOCOL_CHECK_PROTOCOL_METHOD_LABEL = "📄 По протоколу"
-# Отдельная константа от BACK_BUTTON_LABEL ("⬅️ Назад")/SEARCH_BACK_LABEL
-# ("↩️ Назад") выше — задача явно specif'ит именно "◀️ Назад" для этого
-# flow (та же стрелка, что и у пагинации, см. keyboards.py — но здесь это
-# НЕ пагинация, отдельный смысл: "на один шаг назад").
-PROTOCOL_CHECK_BACK_LABEL = "◀️ Назад"
-
-PROTOCOL_CHECK_VEHICLE_CAR_NUMBER_PROMPT = "🚗 Введите номер автомобиля:"
-PROTOCOL_CHECK_VEHICLE_DOCUMENT_PROMPT = "📄 Введите номер техпаспорта:"
-PROTOCOL_CHECK_PROTOCOL_NUMBER_PROMPT = "📄 Введите номер протокола:"
-PROTOCOL_CHECK_PERSONAL_NUMBER_PROMPT = "👤 Введите ID или TAX номер нарушителя:"
-
-# NOT_FOUND — ТОЛЬКО когда provider подтвердил точный marker сайта (см.
-# reader/public_bot/protocol_check_provider.py) — никогда для
-# timeout/HTTP-ошибки/session-ошибки/неопознанного ответа (см. задачу п.7).
-PROTOCOL_CHECK_NOT_FOUND_TEXT = "✅ Протоколы по указанным данным не найдены."
-# ERROR — timeout/HTTP-ошибка/session-ошибка после повторной попытки (см.
-# reader/public_bot/protocol_check_provider.py) — НИКОГДА не показывается
-# как "не найдено" (см. задачу п.7/п.12).
-PROTOCOL_CHECK_ERROR_TEXT = "⚠️ Не удалось выполнить проверку. Попробуйте позже."
-# UNKNOWN/UNPARSED_SUCCESS — технически успешный ответ, но positive-
-# структура ещё не распознаётся (см. задачу п.8: "не придумывай CSS
-# selectors для FOUND") — raw HTML пользователю никогда не показывается.
-PROTOCOL_CHECK_UNKNOWN_TEXT = "⚠️ Ответ получен, но формат результата пока не удалось распознать."
-# FOUND — parser сегодня НИКОГДА не возвращает этот статус (см.
-# protocol_check_provider.py::_parse_result, задача п.8) — константа и
-# ветка обработки существуют для расширяемости, текст будет пересмотрен
-# вместе с реальным parser'ом, когда появится подтверждённый positive-пример.
-PROTOCOL_CHECK_FOUND_TEXT = "✅ Найдены протоколы по указанным данным."
-# provider вообще не сконфигурирован в этой сборке (см.
-# ConversationController.__init__ — protocol_check_provider=None по
-# умолчанию, тот же приём, что и у debt_refresh_service) — практически
-# недостижимо в production (reader/public_bot/main.py всегда его
-# конструирует), защитный fallback на случай неполной сборки/теста.
-PROTOCOL_CHECK_UNAVAILABLE_TEXT = "⚠️ Функция временно недоступна."
-
-
 # ==== "fine check-all" (см. задачу "add silent Georgia full database check
 # command") — скрытая fine-admin-only maintenance-команда, НИГДЕ не
 # отображается (не в keyboards.py, не в главном меню) — эти константы сами
