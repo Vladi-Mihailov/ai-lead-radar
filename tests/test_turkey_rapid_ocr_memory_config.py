@@ -1,11 +1,18 @@
-"""Тесты "reduce Turkey OCR memory pressure" (FIX 1) — production
-RapidOcrService (reader/turkey_bot/ocr/rapid_ocr.py, NOT the
-turkey_bot_test experimental clone) должен создавать свой RapidOCR engine
-с enable_cpu_mem_arena=True — READ-ONLY диагностика production OOM
-установила, что package default (enable_cpu_mem_arena: false) заставляет
-onnxruntime аллоцировать/освобождать тензоры через голый OS-аллокатор на
-КАЖДЫЙ session.run(), что фрагментирует/раздувает heap process-wide
-singleton-движка за весь его lifetime.
+"""Тесты "reduce Turkey OCR retained memory" — production RapidOcrService
+(reader/turkey_bot/ocr/rapid_ocr.py, NOT the turkey_bot_test experimental
+clone) должен создавать свой RapidOCR engine с explicit
+enable_cpu_mem_arena=False.
+
+История: предыдущая задача "reduce Turkey OCR memory pressure" включила
+enable_cpu_mem_arena=True (гипотеза: голый OS-allocator фрагментирует
+heap). Контролируемый offline A/B (см. отчёт "reduce Turkey OCR retained
+memory") ОПРОВЕРГ эту гипотезу — arena=True удерживает ~600-640 MB
+sustained RSS после одинаковой offline-нагрузки против ~130-150 MB при
+arena=False (арена переиспользует блоки внутри процесса, но НИКОГДА не
+возвращает их ОС; голый OS/CRT allocator реально освобождает страницы
+обратно ОС). Explicit False (а не просто отсутствие override) — чтобы
+поведение не зависело от будущего изменения package-default при апдейте
+rapidocr.
 
 Полностью локальные тесты — без HTTP, без CAPTCHA/GIB/Avrasya/KGM, без
 сети (модели идут в комплекте с пакетом rapidocr)."""
@@ -33,22 +40,24 @@ def _draw_text_png(text: str) -> bytes:
     return buf.getvalue()
 
 
-# ---- 1. Regression: production engine is created with the arena enabled ----
+# ---- 1. Regression: production engine is created with the arena disabled ----
 
 
-def test_production_engine_has_cpu_mem_arena_enabled():
+def test_production_engine_has_cpu_mem_arena_disabled():
     service = RapidOcrService()
     engine = service._get_engine()
 
-    assert engine.text_det.session.session.get_session_options().enable_cpu_mem_arena is True
-    assert engine.text_cls.session.session.get_session_options().enable_cpu_mem_arena is True
-    assert engine.text_rec.session.session.get_session_options().enable_cpu_mem_arena is True
+    assert engine.text_det.session.session.get_session_options().enable_cpu_mem_arena is False
+    assert engine.text_cls.session.session.get_session_options().enable_cpu_mem_arena is False
+    assert engine.text_rec.session.session.get_session_options().enable_cpu_mem_arena is False
 
 
-def test_only_the_arena_flag_changed_not_other_ocr_parameters():
+def test_explicit_false_matches_package_default_for_every_other_ocr_parameter():
     """См. задачу: "Не меняй никакие другие OCR параметры" — сравниваем
-    ПОЛНЫЙ набор session options между package-default и production
-    override, единственная разница — enable_cpu_mem_arena."""
+    ПОЛНЫЙ набор session options между package-default (arena=False,
+    неявно) и production explicit override (arena=False, явно) — должны
+    совпадать бит в бит, единственная разница — САМ факт explicit vs
+    implicit, не значение."""
     from rapidocr import RapidOCR
 
     default_engine = RapidOCR()
@@ -58,7 +67,7 @@ def test_only_the_arena_flag_changed_not_other_ocr_parameters():
     production_opts = production_engine.text_det.session.session.get_session_options()
 
     assert default_opts.enable_cpu_mem_arena is False
-    assert production_opts.enable_cpu_mem_arena is True
+    assert production_opts.enable_cpu_mem_arena is False
     assert default_opts.graph_optimization_level == production_opts.graph_optimization_level
     assert default_opts.intra_op_num_threads == production_opts.intra_op_num_threads
     assert default_opts.inter_op_num_threads == production_opts.inter_op_num_threads
@@ -72,7 +81,7 @@ def test_only_the_arena_flag_changed_not_other_ocr_parameters():
     assert default_engine.min_side_len == production_engine.min_side_len
 
 
-def test_engine_still_recognizes_text_correctly_after_arena_change():
+def test_engine_still_recognizes_text_correctly_with_arena_disabled():
     """Смысловая регрессия: сама точность/поведение распознавания не
     изменились — тот же самый тест, что и в tests/test_rapid_ocr_service.py
     (test-clone), но против production-модуля."""

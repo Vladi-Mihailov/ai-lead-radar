@@ -52,22 +52,27 @@ class RapidOcrService:
         if self._engine is None:
             from rapidocr import RapidOCR
 
-            # См. задачу "reduce Turkey OCR memory pressure" — READ-ONLY
-            # диагностика production OOM (turkeybot, ~2.9 GB peak на 3.7
-            # GiB VPS без swap) установила: RapidOCR — process-wide
-            # singleton (см. докстрок класса), поэтому его onnxruntime
-            # config.yaml по умолчанию отдаёт enable_cpu_mem_arena: false —
-            # КАЖДЫЙ session.run() (до 35 CAPTCHA-попыток × 3 провайдера,
-            # повторяется на каждый check за весь lifetime процесса) идёт
-            # через голый OS/CRT allocator вместо переиспользуемого arena,
-            # что фрагментирует и раздувает heap процесса без единого
-            # "утёкшего" Python-объекта. Единственный override — ТОЛЬКО
-            # этот один ключ (params, не отдельный config-файл — apply
-            # НАД пакетным default'ом, см. rapidocr.RapidOCR.__init__ /
-            # ParseParams.update_batch) — модели/thresholds/preprocessing/
-            # распознавание и CAPTCHA retry-логика этим не затронуты вовсе.
+            # См. задачу "reduce Turkey OCR retained memory" — предыдущая
+            # попытка (enable_cpu_mem_arena=True, задача "reduce Turkey
+            # OCR memory pressure") была РЕВЕРТНУТА: контролируемый
+            # offline A/B (см. отчёт) показал, что enable_cpu_mem_arena=
+            # True удерживает ~600-640 MB sustained RSS после одинаковой
+            # offline OCR-нагрузки против ~130-150 MB при False — арена
+            # переиспользует блоки ВНУТРИ процесса, но НИКОГДА не
+            # возвращает их ОС, а голый OS/CRT allocator (arena=False) для
+            # крупных Det-тензоров (~19.5 MB, фиксированный [1,3,736,2208]
+            # на КАЖДЫЙ вызов) реально освобождает страницы обратно ОС.
+            # На 3.7 GiB VPS без swap это решающий фактор — явное False
+            # (а не просто "не передавать params" = package default),
+            # чтобы поведение не зависело от будущего изменения
+            # package-default значения при апдейте rapidocr. Единственный
+            # override — ТОЛЬКО этот один ключ (params, не отдельный
+            # config-файл — apply НАД пакетным default'ом, см.
+            # rapidocr.RapidOCR.__init__ / ParseParams.update_batch) —
+            # модели/thresholds/preprocessing/распознавание и CAPTCHA
+            # retry-логика этим не затронуты вовсе.
             self._engine = RapidOCR(
-                params={"EngineConfig.onnxruntime.enable_cpu_mem_arena": True},
+                params={"EngineConfig.onnxruntime.enable_cpu_mem_arena": False},
             )
         return self._engine
 
