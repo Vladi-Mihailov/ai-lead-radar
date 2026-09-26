@@ -910,6 +910,72 @@ async def test_check_now_lists_own_car_and_returns_result(fx):
     assert result_reply.cta_buttons is None  # штрафов нет — CTA нечего показывать
 
 
+async def test_check_now_picker_not_empty_when_all_cars_are_stopped(fx):
+    """Production-regression (см. задачу "fix: allow manual checks for
+    stopped Georgia cars" п.11): пользователь, аналогичный реальному
+    production telegram_user_id=685137235 — ВСЕ его машины в "📋 Мои авто"
+    показывают OFF, включая дубликат subscription-строк на один и тот же
+    номер (E911EE95 в реальных данных). До фикса "🔎 Проверить сейчас"
+    показывал NO_ACTIONABLE_CARS_TEXT несмотря на 5 машин в "Мои авто" —
+    после фикса picker должен содержать все 5 (не деduплицированные)
+    записи."""
+    cars = ["B040CT43", "E911EE95", "O687KE761", "M295YB196"]
+    for i, car_number in enumerate(cars):
+        await fx.service.add_car(
+            telegram_user_id=1, telegram_chat_id=1, username="vlad",
+            first_name=None, last_name=None, car_number=car_number, period_days=30, today=_today(),
+        )
+
+    # Выключаем мониторинг у всех четырёх подписок ПЕРВЫМИ (partial unique
+    # index допускает только ОДНУ 'active' строку на (task, user) — вторую
+    # E911EE95-строку можно создать лишь ПОСЛЕ того, как первая уже не
+    # 'active').
+    for subscription in fx.subscription_repository.list_by_user(1):
+        fx.service.turn_off_car(subscription.id, telegram_user_id=1)
+
+    # Дубликат: вторая subscription-строка на ТОТ ЖЕ car_number/task, что и
+    # E911EE95 (см. production-пример — subscription_id 19 и 20, task 28) —
+    # тоже сразу выключаем, как и в production (обе строки 'stopped').
+    [e911_subscription] = [s for s in fx.subscription_repository.list_by_user(1) if s.car_number == "E911EE95"]
+    duplicate = fx.subscription_repository.create(
+        monitoring_task_id=e911_subscription.monitoring_task_id, car_number="E911EE95",
+        telegram_user_id=1, telegram_chat_id=1, telegram_username="vlad",
+        start_date=_today(), end_date=_today() + timedelta(days=30),
+    )
+    fx.service.turn_off_car(duplicate.id, telegram_user_id=1)
+
+    my_cars_reply = await fx.controller.handle_text(
+        texts.MY_CARS_LABEL, chat_id=1, telegram_user_id=1, username=None,
+    )
+    assert len(my_cars_reply.my_cars_page_options) == 5  # 4 машины + 1 дубликат E911EE95
+    for _subscription_id, label in my_cars_reply.my_cars_page_options:
+        assert "OFF" in label
+
+    pick_reply = await fx.controller.handle_text(
+        texts.CHECK_NOW_LABEL, chat_id=1, telegram_user_id=1, username=None,
+    )
+
+    # ГЛАВНОЕ: picker больше НЕ empty (до фикса здесь был бы
+    # NO_ACTIONABLE_CARS_TEXT, см. задачу ROOT CAUSE).
+    assert pick_reply.text != texts.NO_ACTIONABLE_CARS_TEXT
+    assert pick_reply.text == texts.CHECK_NOW_PICK_PROMPT
+    assert pick_reply.check_now_options is not None
+    assert len(pick_reply.check_now_options) == 5
+    picked_car_numbers = [car_number for _sub_id, car_number in pick_reply.check_now_options]
+    assert picked_car_numbers.count("E911EE95") == 2  # дубликат НЕ схлопнут в одну кнопку
+    for car_number in cars:
+        assert car_number in picked_car_numbers
+
+    # Каждый пункт (включая оба дубликата E911EE95) действительно выбираем.
+    for subscription_id, _car_number in pick_reply.check_now_options:
+        result_reply = await fx.controller.handle_check_now_choice(subscription_id, telegram_user_id=1)
+        assert result_reply is not None
+
+    # И мониторинг остаётся OFF после всех этих ручных проверок.
+    for subscription in fx.subscription_repository.list_by_user(1):
+        assert subscription.status == "stopped"
+
+
 async def test_check_now_rejects_subscription_belonging_to_another_user(fx):
     await fx.service.add_car(
         telegram_user_id=1, telegram_chat_id=1, username="alice",
@@ -2110,13 +2176,20 @@ async def test_forced_stop_does_not_leave_client_with_misleading_active_state(tr
     [(_subscription_id, label)] = client_reply.my_cars_page_options
     assert "ON" not in label
     assert "OFF" in label
-    # Клиент также больше не может действовать через 🔎 этой подпиской.
+    # См. задачу "fix: allow manual checks for stopped Georgia cars" —
+    # ПОСЛЕ этого фикса клиент по-прежнему МОЖЕТ вручную проверить свою
+    # машину через 🔎, даже если её мониторинг был forced-stop'нут
+    # trusted-оператором: OFF (независимо от того, кто его вызвал) значит
+    # только "автоматический мониторинг выключен", а не "нельзя проверить
+    # вручную" (см. AskUserQuestion в рамках этой задачи — сознательное
+    # решение distinguish self-service OFF от forced-stop НЕ делать).
     [subscription] = trusted_fx.subscription_repository.list_by_user(777)
     assert (
         trusted_fx.service.get_actionable_subscription(subscription.id, telegram_user_id=777) is not None
     )  # get_actionable_subscription не фильтрует по статусу — это ожидаемо
     actionable = trusted_fx.service.list_actionable_subscriptions(777, today=_today())
-    assert actionable == []  # но список для действий её больше не покажет
+    assert [s.id for s in actionable] == [subscription.id]
+    assert actionable[0].status == "stopped"
 
 
 def test_unrelated_user_forged_task_id_rejected_for_stop_pick(trusted_fx):

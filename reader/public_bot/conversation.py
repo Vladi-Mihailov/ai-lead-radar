@@ -802,9 +802,13 @@ class ConversationController:
     def _build_check_now_picker_reply(self, telegram_user_id: int) -> BotReply:
         """Список авто, с которыми telegram_user_id может действовать
         через 🔎 (свои + delegated, которые он создал, см.
-        SubscriptionService.list_actionable_subscriptions) — subscription_id
-        в кнопках, не car_number, чтобы не полагаться на уникальность
-        номера при последующей server-side проверке владения. Единственный
+        SubscriptionService.list_actionable_subscriptions) — включает
+        OFF/'stopped' машины (см. задачу "fix: allow manual checks for
+        stopped Georgia cars": OFF означает только "мониторинг выключен",
+        не "нельзя проверить вручную"), исключает только archived и
+        просроченные по end_date. subscription_id в кнопках, не
+        car_number, чтобы не полагаться на уникальность номера при
+        последующей server-side проверке владения. Единственный
         оставшийся потребитель этого picker'а (⛔ для обычного пользователя
         заменена car-centric ON/OFF, см. design report п.8)."""
         subscriptions = self._subscriptions.list_actionable_subscriptions(

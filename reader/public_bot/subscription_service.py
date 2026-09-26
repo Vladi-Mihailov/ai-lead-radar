@@ -115,11 +115,27 @@ class AddCarWithoutClientOutcome:
 
 _CLAIM_TOKEN_TTL = timedelta(days=7)
 
-# Подписки, с которыми пользователь ещё может что-то сделать через
-# 🔎 Проверить сейчас / ⛔ Остановить мониторинг (см. design report Stage 4,
-# раздел "UI completion") — активные ИЛИ ожидающие claim, но не
-# остановленные/истёкшие (те уже неактуальны для действия).
-_ACTIONABLE_STATUSES = ("active", "pending_claim")
+# Подписки, которые пользователь может вручную проверить через
+# "🔎 Проверить сейчас" (см. задачу "fix: allow manual checks for stopped
+# Georgia cars" — root cause: 'stopped' раньше исключался наравне с
+# archived/expired). 'stopped' (OFF) НАМЕРЕННО включён: OFF означает
+# только "автоматический мониторинг выключен", а НЕ "нельзя проверить
+# вручную" — это касается ЛЮБОГО источника 'stopped' (self-service ON/OFF
+# через turn_off_car, ИЛИ trusted force-stop через
+# stop_task_for_trusted_admin/stop_all_for_task — оба пишут ровно тот же
+# status, различить их по данным невозможно, и по этой же философии оба
+# должны оставлять ручную проверку доступной, см. design decision в
+# рамках этой задачи). end_date всё ещё проверяется отдельно
+# (list_actionable_subscriptions) — просроченный период остаётся
+# исключённым, как и 'archived'.
+#
+# ПЕРЕИМЕНОВАНО из _ACTIONABLE_STATUSES (см. задачу: "не расширяй общий
+# _ACTIONABLE_STATUSES, потому что он используется другими flow") — при
+# проверке оказалось, что list_actionable_subscriptions() ниже был
+# ЕДИНСТВЕННЫМ потребителем этой константы во всём проекте (см. отчёт),
+# поэтому переименование на месте не оставляет orphaned-константу и не
+# требует поддерживать две одинаковые.
+_CHECK_NOW_STATUSES = ("active", "pending_claim", "stopped")
 
 
 async def extend_client_bot_task_if_still_needed(
@@ -727,11 +743,23 @@ class SubscriptionService:
     def list_actionable_subscriptions(
         self, telegram_user_id: int, *, today: date,
     ) -> list[FineMonitoringSubscription]:
-        """Подписки, с которыми этот пользователь может действовать через
-        🔎/⛔ — свои (owner) плюс delegated, которые он создал (creator),
-        в статусе active/pending_claim и ещё не истёкшие. Дедуп по id — та
-        же строка МОЖЕТ оказаться и "своей", и "созданной им" одновременно
-        (trusted-оператор поставил машину на мониторинг для самого себя)."""
+        """Подписки, которые этот пользователь может вручную проверить
+        через "🔎 Проверить сейчас" — свои (owner) плюс delegated, которые
+        он создал (creator), в статусе active/pending_claim/stopped (см.
+        _CHECK_NOW_STATUSES — OFF НЕ исключает ручную проверку, только
+        фоновый мониторинг) и ещё не истёкшие (end_date >= today) —
+        archived и просроченные по дате по-прежнему исключены. Дедуп по
+        id — та же строка МОЖЕТ оказаться и "своей", и "созданной им"
+        одновременно (trusted-оператор поставил машину на мониторинг для
+        самого себя).
+
+        НЕ дедуплицирует по car_number/monitoring_task_id — если у
+        пользователя ЕСТЬ две отдельные subscription-строки на один и тот
+        же номер (см. production-пример E911EE95, задача "fix: allow
+        manual checks for stopped Georgia cars"), обе попадут в список
+        отдельными пунктами (тот же принцип, что и в "📋 Мои авто" — этот
+        метод показывает РЕАЛЬНЫЕ строки БД, не пытается угадать, какая
+        из двух "правильная")."""
         own = self._subscription_repository.list_by_user(telegram_user_id)
         managed = self._subscription_repository.list_managed_by_creator(telegram_user_id)
 
@@ -740,7 +768,7 @@ class SubscriptionService:
 
         return [
             s for s in combined
-            if s.status in _ACTIONABLE_STATUSES and s.end_date >= today
+            if s.status in _CHECK_NOW_STATUSES and s.end_date >= today
         ]
 
     def get_actionable_subscription(

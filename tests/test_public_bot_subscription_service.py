@@ -416,13 +416,29 @@ def test_turn_off_car_stops_active_subscription(fx):
     assert fx.subscription_repository.get(sub.id).status == "stopped"
 
 
-def test_turn_off_car_excludes_it_from_actionable_and_deliverable(fx):
-    """Явное требование: OFF исключается из фонового мониторинга/доставки."""
+def test_turn_off_car_excludes_it_from_deliverable(fx):
+    """Явное требование: OFF исключается из фонового мониторинга/доставки
+    (см. list_all_deliverable) — ЭТО не меняется задачей "fix: allow
+    manual checks for stopped Georgia cars"."""
     _task, sub = _make_client_car(fx)
     fx.service.turn_off_car(sub.id, telegram_user_id=1)
 
-    assert fx.service.list_actionable_subscriptions(1, today=date(2026, 9, 3)) == []
     assert fx.subscription_repository.list_all_deliverable(today=date(2026, 9, 3)) == []
+
+
+def test_turn_off_car_keeps_it_actionable_for_manual_check(fx):
+    """См. задачу "fix: allow manual checks for stopped Georgia cars" —
+    ROOT CAUSE был именно в том, что этот список раньше исключал 'stopped'
+    наравне с archived/expired. OFF означает только "автоматический
+    мониторинг выключен", а НЕ "нельзя проверить вручную" — до фикса эта
+    проверка возвращала [] (см. историю этого теста), теперь возвращает
+    подписку."""
+    _task, sub = _make_client_car(fx)
+    fx.service.turn_off_car(sub.id, telegram_user_id=1)
+
+    actionable = fx.service.list_actionable_subscriptions(1, today=date(2026, 9, 3))
+    assert [s.id for s in actionable] == [sub.id]
+    assert actionable[0].status == "stopped"
 
 
 def test_turn_off_car_rejects_wrong_user(fx):
@@ -894,7 +910,12 @@ async def test_list_actionable_subscriptions_combines_own_and_managed_without_du
     assert {s.id for s in actionable} == {own.subscription.id, delegated.subscription.id}
 
 
-def test_list_actionable_subscriptions_excludes_stopped_and_expired(fx):
+def test_list_actionable_subscriptions_excludes_expired_regardless_of_status(fx):
+    """Просроченный по end_date остаётся исключённым, ДАЖЕ если он ещё раз
+    "остановлен" поверх уже истёкшего периода (см. задачу "fix: allow
+    manual checks for stopped Georgia cars" п.1: end_date >= today
+    остаётся обязательным условием — 'stopped' само по себе больше НЕ
+    исключает, но expiry по дате исключает всегда)."""
     task = fx.task_repository.create(
         car_number="AA001AA", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
         telegram_chat_id=1, created_by_user_id=1, monitoring_scope="client_bot",
@@ -916,6 +937,30 @@ def test_list_actionable_subscriptions_excludes_stopped_and_expired(fx):
 
     assert actionable_for_expired_owner == []
     assert [s.id for s in actionable_for_active_owner] == [active.id]
+
+
+def test_list_actionable_subscriptions_excludes_archived(fx):
+    """'archived' ("🗑 Удалить автомобиль") остаётся исключённым — задача
+    явно требует "не включать: archived" (см. п.1)."""
+    _task, sub = _make_client_car(fx)
+    fx.subscription_repository.archive(sub.id)
+
+    assert fx.subscription_repository.get(sub.id).status == "archived"
+    assert fx.service.list_actionable_subscriptions(1, today=date(2026, 9, 3)) == []
+
+
+def test_list_actionable_subscriptions_includes_stopped_with_future_end_date(fx):
+    """Основной regression этой задачи: 'stopped' + end_date в будущем ->
+    selectable (в отличие от test_list_actionable_subscriptions_excludes_
+    expired_regardless_of_status выше, где 'stopped' накладывается на УЖЕ
+    истёкший период)."""
+    _task, sub = _make_client_car(fx, period_days=30, today=date(2026, 9, 3))
+    fx.subscription_repository.stop_by_owner_or_creator(sub.id, telegram_user_id=1)
+
+    actionable = fx.service.list_actionable_subscriptions(1, today=date(2026, 9, 3))
+
+    assert [s.id for s in actionable] == [sub.id]
+    assert actionable[0].status == "stopped"
 
 
 async def test_get_actionable_subscription_rejects_stranger(fx):
@@ -958,6 +1003,80 @@ async def test_check_now_returns_none_for_unauthorized_user(fx):
     result = await fx.service.check_now(outcome.subscription.id, telegram_user_id=999)
 
     assert result is None
+
+
+# ---- "fix: allow manual checks for stopped Georgia cars" — manual check
+# must NEVER re-enable monitoring (см. задачу п.3/п.5 тесты 8-9) ----
+
+
+async def test_check_now_on_stopped_car_succeeds_and_keeps_it_stopped(fx):
+    outcome = await fx.service.add_car(
+        telegram_user_id=42, telegram_chat_id=42, username="client",
+        first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+    )
+    fx.service.turn_off_car(outcome.subscription.id, telegram_user_id=42)
+    assert fx.subscription_repository.get(outcome.subscription.id).status == "stopped"
+
+    result = await fx.service.check_now(outcome.subscription.id, telegram_user_id=42)
+
+    assert result is not None
+    assert result.check_ok is True
+    # ГЛАВНОЕ требование: успешная ручная проверка НЕ включает мониторинг
+    # обратно — check_now()/check_task() никогда не пишут subscription.status.
+    assert fx.subscription_repository.get(outcome.subscription.id).status == "stopped"
+
+
+async def test_check_now_on_stopped_car_error_still_keeps_it_stopped(tmp_path):
+    from reader.fines.provider import FineProviderError
+
+    fixture = _Fixture(tmp_path)
+    try:
+        outcome = await fixture.service.add_car(
+            telegram_user_id=42, telegram_chat_id=42, username="client",
+            first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+        )
+        fixture.service.turn_off_car(outcome.subscription.id, telegram_user_id=42)
+
+        fixture.provider._error = FineProviderError("simulated")
+        result = await fixture.service.check_now(outcome.subscription.id, telegram_user_id=42)
+
+        assert result is not None
+        assert result.check_ok is False
+        assert fixture.subscription_repository.get(outcome.subscription.id).status == "stopped"
+    finally:
+        fixture.close()
+
+
+async def test_check_now_picker_shows_duplicate_subscriptions_for_same_car_as_separate_entries(fx):
+    """См. задачу п.5 — production-пример E911EE95: одна и та же машина
+    может иметь ДВЕ отдельные subscription-строки на один и тот же
+    monitoring_task_id, ОБЕ status='stopped' (partial unique index —
+    WHERE status='active' — намеренно НЕ ограничивает количество stopped-
+    строк одного (task, user), см. design report). list_actionable_
+    subscriptions() НЕ дедуплицирует по car_number/task_id (фиксируем
+    текущее поведение, см. задачу: "если не дедуплицирует — зафиксируй
+    текущее поведение и не расширяй scope")."""
+    outcome = await fx.service.add_car(
+        telegram_user_id=42, telegram_chat_id=42, username="client",
+        first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+    )
+    fx.service.turn_off_car(outcome.subscription.id, telegram_user_id=42)
+
+    # Вторая строка на ТОТ ЖЕ (task, user) — допустимо, т.к. первая уже
+    # 'stopped' (partial unique index её не видит), затем тоже стопается —
+    # ровно ДВЕ 'stopped' строки одного (task, user), как в production.
+    duplicate = fx.subscription_repository.create(
+        monitoring_task_id=outcome.task.id, car_number="AA001AA", telegram_user_id=42,
+        telegram_chat_id=42, telegram_username="client",
+        start_date=date(2026, 9, 3), end_date=date(2026, 10, 3),
+    )
+    fx.subscription_repository.stop_by_owner_or_creator(duplicate.id, telegram_user_id=42)
+
+    actionable = fx.service.list_actionable_subscriptions(42, today=date(2026, 9, 3))
+
+    assert {s.id for s in actionable} == {outcome.subscription.id, duplicate.id}
+    assert len(actionable) == 2  # обе строки — по одной кнопке на каждую, не одна общая
+    assert all(s.status == "stopped" for s in actionable)
 
 
 async def test_check_now_reports_new_fines_found(tmp_path):
