@@ -207,6 +207,24 @@ async def test_pick_shows_confirmation_without_any_provider_call(fx):
     assert reply.debt_refresh_confirm_car_count == 2
 
 
+async def test_pick_counts_unique_plates_not_owner_rows(fx):
+    """См. задачу "Turkey manager debt statistics aggregation" п.7 —
+    один и тот же plate у ДВУХ owners должен считаться ОДИН раз в
+    превью/кнопке ("Будет проверено автомобилей: 2", не 3), та же
+    grouping logic, что и refresh() (по car_number)."""
+    fx.add_car(telegram_user_id=1, car_number="AA001AA")
+    fx.add_car(telegram_user_id=2, car_number="AA001AA")  # тот же plate, другой owner
+    fx.add_car(telegram_user_id=3, car_number="BB002BB")
+    await fx.seed(telegram_user_id=1, plate="AA001AA", amount=Decimal(500))
+    await fx.seed(telegram_user_id=2, plate="AA001AA", amount=Decimal(500))
+    await fx.seed(telegram_user_id=3, plate="BB002BB", amount=Decimal(700))
+
+    reply = fx.controller.handle_debt_refresh_pick(telegram_user_id=_TRUSTED_ID)
+
+    assert reply.text == "🔄 Будет проверено автомобилей: 2"
+    assert reply.debt_refresh_confirm_car_count == 2
+
+
 # ---- 16. No debt cars -> ZERO provider calls ----
 
 
@@ -260,6 +278,92 @@ async def test_confirm_row_format_is_car_colon_owner_colon_amount():
 
     full_text = "\n".join((reply.text, *reply.extra_texts))
     assert "🚗 BB002BB: —: 1 800 ₺" in full_text
+
+
+async def test_confirm_display_aggregates_duplicate_plate_one_row_one_amount():
+    """См. задачу "Turkey manager debt statistics aggregation" — один
+    physical plate у двух owners показывается ОДНОЙ строкой после
+    refresh, owners через " | ", сумма один раз (не 2x)."""
+    fx = _Fixture(poison_check_service=False)
+    fx.add_car(telegram_user_id=1, car_number="BB002BB")
+    fx.add_car(telegram_user_id=2, car_number="BB002BB")
+    await fx.seed(telegram_user_id=1, plate="BB002BB", amount=Decimal(1000))
+    await fx.seed(telegram_user_id=2, plate="BB002BB", amount=Decimal(1000))
+    fx.check_service = _make_check_service(gib_amount=Decimal(1800))
+    fx.debt_refresh._check_service = fx.check_service
+
+    reply = await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
+
+    full_text = "\n".join((reply.text, *reply.extra_texts))
+    assert "Автомобилей: 1" in full_text
+    assert "Общая сумма: 1 800 ₺" in full_text
+    debt_row_line = next(line for line in full_text.splitlines() if line.startswith("🚗 BB002BB"))
+    assert debt_row_line == "🚗 BB002BB: — | —: 1 800 ₺"  # оба owner без known-профиля -> "—" x2, amount один раз
+    assert debt_row_line.count("1 800 ₺") == 1
+
+
+async def test_refresh_performs_one_provider_check_per_unique_plate_not_per_owner():
+    """См. задачу п.6: refresh() уже дедуплицирует по plate — этот тест
+    защищает именно это поведение от регрессии при доработке statistics/
+    display (см. задачу: "эту логику НЕ менять")."""
+    call_count = 0
+
+    class _CountingGibProvider:
+        def __init__(self, outcome):
+            self._outcome = outcome
+
+        async def start(self):
+            nonlocal call_count
+            call_count += 1
+            return CaptchaChallenge(image_id="cid", image_png=b"PNG")
+
+        async def submit(self, *, plate, image_id, captcha_code):
+            return self._outcome
+
+    fx = _Fixture(poison_check_service=False)
+    fx.add_car(telegram_user_id=1, car_number="CC003CC")
+    fx.add_car(telegram_user_id=2, car_number="CC003CC")
+    await fx.seed(telegram_user_id=1, plate="CC003CC", amount=Decimal(300))
+    await fx.seed(telegram_user_id=2, plate="CC003CC", amount=Decimal(300))
+
+    outcome = GibSubmitOutcome(kind="no_debt", messages=(), raw_data=None)
+    fx.check_service = UnifiedTurkeyCheckService(
+        lambda: (_FakeCloseable(), _CountingGibProvider(outcome)),
+        lambda: (_FakeCloseable(), _FakeAvrasyaProvider()),
+        lambda: (_FakeCloseable(), _FakeKgmProvider()),
+        captcha_resolver=_FakeCaptchaResolver(),
+    )
+    fx.debt_refresh._check_service = fx.check_service
+
+    await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
+
+    assert call_count == 1  # ОДИН provider-check на plate, не 2 (по числу owners)
+
+
+async def test_refresh_owner_specific_persistence_unchanged_for_duplicate_plate():
+    """См. задачу п.6/TESTS "owner-specific persistence remains
+    unchanged" — refresh() по-прежнему сохраняет ОТДЕЛЬНУЮ turkey_check_
+    runs-строку/update_last_result на КАЖДОГО owner общего plate (это
+    поведение debt_refresh_service.py НЕ менялось в этой задаче)."""
+    fx = _Fixture(poison_check_service=False)
+    fx.add_car(telegram_user_id=111, car_number="DD004DD")
+    fx.add_car(telegram_user_id=222, car_number="DD004DD")
+    await fx.seed(telegram_user_id=111, plate="DD004DD", amount=Decimal(400))
+    await fx.seed(telegram_user_id=222, plate="DD004DD", amount=Decimal(400))
+    fx.check_service = _make_check_service(gib_amount=Decimal(750))
+    fx.debt_refresh._check_service = fx.check_service
+
+    await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
+
+    car_111 = next(c for c in fx.garage.list_cars(111) if c.car_number == "DD004DD")
+    car_222 = next(c for c in fx.garage.list_cars(222) if c.car_number == "DD004DD")
+    assert car_111.last_total_amount == Decimal(750)
+    assert car_222.last_total_amount == Decimal(750)
+    run_111 = fx.runs.get_latest_for_owner(plate="DD004DD", telegram_user_id=111)
+    run_222 = fx.runs.get_latest_for_owner(plate="DD004DD", telegram_user_id=222)
+    assert run_111 is not None and run_222 is not None
+    assert run_111.total_amount == Decimal(750)
+    assert run_222.total_amount == Decimal(750)
 
 
 async def test_next_refresh_candidates_exclude_car_that_became_zero():

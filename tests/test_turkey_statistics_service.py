@@ -365,6 +365,91 @@ def test_debt_rows_sorted_by_amount_desc_then_recency():
     assert [r.car_number for r in rows] == ["BBB222", "CCC333", "AAA111"]
 
 
+# ---- get_debt_car_groups() (см. задачу "Turkey manager debt statistics aggregation") ----
+
+
+def test_debt_car_groups_one_plate_one_owner_matches_debt_rows():
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car = garage.add_car(telegram_user_id=1, car_number="34ABC123")
+    _save_debt_run(runs, telegram_user_id=1, plate="34ABC123", providers=(_debt_provider(ProviderStatus.HAS_DEBT, Decimal(500)),), days_ago=0)
+
+    groups = service.get_debt_car_groups([car])
+
+    assert len(groups) == 1
+    assert groups[0].car_number == "34ABC123"
+    assert groups[0].owner_telegram_user_ids == (1,)
+    assert groups[0].total_amount == Decimal(500)
+    assert groups[0].is_partial is False
+
+
+def test_debt_car_groups_one_plate_multiple_owners_collapse_to_one_row():
+    """См. задачу: H401HH95 у 3 owners -> ОДНА группа, не три, с суммой
+    физической машины РОВНО один раз (не 3x32664.50)."""
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car_a = garage.add_car(telegram_user_id=111, car_number="H401HH95")
+    car_b = garage.add_car(telegram_user_id=222, car_number="H401HH95")
+    car_c = garage.add_car(telegram_user_id=333, car_number="H401HH95")
+    for owner in (111, 222, 333):
+        _save_debt_run(
+            runs, telegram_user_id=owner, plate="H401HH95",
+            providers=(_debt_provider(ProviderStatus.HAS_DEBT, Decimal("32664.50")),), days_ago=0,
+        )
+
+    groups = service.get_debt_car_groups([car_a, car_b, car_c])
+
+    assert len(groups) == 1
+    assert groups[0].car_number == "H401HH95"
+    assert set(groups[0].owner_telegram_user_ids) == {111, 222, 333}
+    assert groups[0].total_amount == Decimal("32664.50")  # НЕ 97993.50 (3x)
+
+
+def test_debt_car_groups_uses_freshest_owner_result_not_sum():
+    """Если один из owners сделал свою собственную более свежую ручную
+    проверку с ДРУГОЙ суммой — группа берёт САМЫЙ СВЕЖИЙ результат, не
+    складывает старую и новую сумму."""
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car_a = garage.add_car(telegram_user_id=111, car_number="X773XP163")
+    car_b = garage.add_car(telegram_user_id=222, car_number="X773XP163")
+    _save_debt_run(runs, telegram_user_id=111, plate="X773XP163", providers=(_debt_provider(ProviderStatus.HAS_DEBT, Decimal(108)),), days_ago=1)
+    _save_debt_run(runs, telegram_user_id=222, plate="X773XP163", providers=(_debt_provider(ProviderStatus.HAS_DEBT, Decimal(108)),), days_ago=1)
+    # owner 222 позже сделал свою собственную более свежую ручную проверку —
+    # его own latest reliable теперь 50, а не 108; owner 111's latest reliable
+    # остаётся 108 (не перепроверял). Группа должна взять свежий (50), не
+    # 108+50=158.
+    _save_debt_run(runs, telegram_user_id=222, plate="X773XP163", providers=(_debt_provider(ProviderStatus.HAS_DEBT, Decimal(50)),), days_ago=0)
+
+    groups = service.get_debt_car_groups([car_a, car_b])
+
+    assert len(groups) == 1
+    assert groups[0].total_amount == Decimal(50)  # свежий результат owner 222, не 108+50
+
+
+def test_debt_car_groups_two_different_plates_sum_normally():
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car_a = garage.add_car(telegram_user_id=1, car_number="AAA111")
+    car_b = garage.add_car(telegram_user_id=2, car_number="BBB222")
+    _save_debt_run(runs, telegram_user_id=1, plate="AAA111", providers=(_debt_provider(ProviderStatus.HAS_DEBT, Decimal(100)),), days_ago=0)
+    _save_debt_run(runs, telegram_user_id=2, plate="BBB222", providers=(_debt_provider(ProviderStatus.HAS_DEBT, Decimal(500)),), days_ago=0)
+
+    groups = service.get_debt_car_groups([car_a, car_b])
+
+    assert len(groups) == 2
+    total = sum((g.total_amount for g in groups), Decimal(0))
+    assert total == Decimal(600)
+
+
+def test_debt_car_groups_sorted_by_amount_desc():
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car_a = garage.add_car(telegram_user_id=1, car_number="AAA111")
+    car_b = garage.add_car(telegram_user_id=2, car_number="BBB222")
+    _save_debt_run(runs, telegram_user_id=1, plate="AAA111", providers=(_debt_provider(ProviderStatus.HAS_DEBT, Decimal(100)),), days_ago=0)
+    _save_debt_run(runs, telegram_user_id=2, plate="BBB222", providers=(_debt_provider(ProviderStatus.HAS_DEBT, Decimal(500)),), days_ago=0)
+
+    groups = service.get_debt_car_groups([car_a, car_b])
+
+    assert [g.car_number for g in groups] == ["BBB222", "AAA111"]
+
+
 def test_debt_rows_needs_no_check_service_or_network_dependency():
     """get_debt_rows() читает ТОЛЬКО уже сохранённые repositories — сама
     сигнатура (cars, без check_service/provider) физически не может

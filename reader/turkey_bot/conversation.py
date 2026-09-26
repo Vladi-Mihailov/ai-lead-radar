@@ -667,23 +667,25 @@ class ConversationController:
         ВСЕГДА показывают один и тот же, только что построенный список."""
         total_cars = self._garage.count_all()
         cars = self._garage.list_all_page(offset=0, limit=total_cars) if total_cars else []
-        debt_rows = self._statistics.get_debt_rows(cars)
+        debt_groups = self._statistics.get_debt_car_groups(cars)
 
-        debt_total_amount = sum((row.total_amount for row in debt_rows), Decimal(0))
+        debt_total_amount = sum((group.total_amount for group in debt_groups), Decimal(0))
         debt_block = texts.format_debt_summary_block(
-            debt_car_count=len(debt_rows), debt_total_amount=debt_total_amount,
+            debt_car_count=len(debt_groups), debt_total_amount=debt_total_amount,
         )
 
         debt_lines = []
-        for row in debt_rows:
-            profile = self._statistics.get_known_profile(row.owner_telegram_user_id)
-            username, first_name, last_name = profile if profile is not None else (None, None, None)
-            owner_display = texts.format_search_owner_display(
-                first_name=first_name, last_name=last_name, username=username,
-            )
+        for group in debt_groups:
+            owner_displays = []
+            for owner_telegram_user_id in group.owner_telegram_user_ids:
+                profile = self._statistics.get_known_profile(owner_telegram_user_id)
+                username, first_name, last_name = profile if profile is not None else (None, None, None)
+                owner_displays.append(texts.format_search_owner_display(
+                    first_name=first_name, last_name=last_name, username=username,
+                ))
             debt_lines.append(
                 texts.format_debt_row(
-                    car_number=row.car_number, owner_display=owner_display, total_amount=row.total_amount,
+                    car_number=group.car_number, owner_displays=owner_displays, total_amount=group.total_amount,
                 )
             )
         debt_messages = texts.format_debt_list_messages(debt_lines)
@@ -700,11 +702,20 @@ class ConversationController:
         TurkeyDebtRefreshService), ни одного provider-запроса (см. задачу
         "FLOW": "до нажатия подтверждения НИКАКИХ provider requests").
         Пустой список — сразу финальный ответ, минуя экран подтверждения
-        вовсе (см. задачу TESTS п.16)."""
+        вовсе (см. задачу TESTS п.16).
+
+        car_count — см. задачу "Turkey manager debt statistics
+        aggregation" п.7: количество УНИКАЛЬНЫХ физических car_number, а
+        не "сырых" owner-строк (list_candidates() возвращает per-owner
+        TurkeyDebtRow, refresh() сам по себе уже дедуплицирует по plate,
+        см. TurkeyDebtRefreshService.refresh() — этот счётчик просто
+        приводит превью/кнопку к той же семантике, ничего в самом
+        refresh() не меняя)."""
         if not self._is_trusted(telegram_user_id) or self._debt_refresh is None:
             return BotReply(text=texts.SEARCH_NOT_AUTHORIZED_TEXT, show_main_menu=True)
 
-        car_count = len(self._debt_refresh.list_candidates())
+        candidates = self._debt_refresh.list_candidates()
+        car_count = len({row.car_number for row in candidates})
         if car_count == 0:
             return BotReply(text=texts.DEBT_REFRESH_NONE_TEXT, show_main_menu=True)
 

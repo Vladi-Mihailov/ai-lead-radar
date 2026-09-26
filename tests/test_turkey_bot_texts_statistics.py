@@ -90,7 +90,7 @@ def test_format_statistics_never_uses_partial_marker():
 
 def test_debt_row_is_car_colon_owner_colon_amount():
     line = texts.format_debt_row(
-        car_number="M295YB196", owner_display="@Mihailov_vm", total_amount=Decimal(2740),
+        car_number="M295YB196", owner_displays=["@Mihailov_vm"], total_amount=Decimal(2740),
     )
 
     assert line == "🚗 M295YB196: @Mihailov_vm: 2 740 ₺"
@@ -98,7 +98,7 @@ def test_debt_row_is_car_colon_owner_colon_amount():
 
 def test_debt_row_has_no_partial_marker_or_recency():
     line = texts.format_debt_row(
-        car_number="34ABC123", owner_display="@username", total_amount=Decimal(1250),
+        car_number="34ABC123", owner_displays=["@username"], total_amount=Decimal(1250),
     )
 
     assert line == "🚗 34ABC123: @username: 1 250 ₺"
@@ -106,6 +106,21 @@ def test_debt_row_has_no_partial_marker_or_recency():
     assert "частично" not in line
     assert " — " not in line
     assert "·" not in line
+
+
+def test_debt_row_multiple_owners_joined_with_pipe_and_amount_once():
+    """См. задачу "Turkey manager debt statistics aggregation" — один
+    physical plate у нескольких владельцев печатается ОДНОЙ строкой,
+    все owners через " | ", сумма — РОВНО один раз в конце (не
+    дублируется на каждого owner)."""
+    line = texts.format_debt_row(
+        car_number="H401HH95",
+        owner_displays=["V K (@vdhl29)", "Алена (@alenaogir)", "Иброхим (@ibrohim_abu_romadan)"],
+        total_amount=Decimal("32664.50"),
+    )
+
+    assert line == "🚗 H401HH95: V K (@vdhl29) | Алена (@alenaogir) | Иброхим (@ibrohim_abu_romadan): 32 664,50 ₺"
+    assert line.count("32 664,50 ₺") == 1
 
 
 # ---- format_debt_list_messages ----

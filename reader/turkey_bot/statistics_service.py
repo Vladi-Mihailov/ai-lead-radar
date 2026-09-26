@@ -63,6 +63,31 @@ class TurkeyDebtRow:
     checked_at: datetime
 
 
+@dataclass(frozen=True)
+class TurkeyDebtCarGroup:
+    """Одна строка "🚨 Задолженность по последней проверке", агрегированная
+    по УНИКАЛЬНОМУ car_number (см. задачу "Turkey manager debt statistics
+    aggregation") — один физический номер может принадлежать нескольким
+    владельцам (turkey_bot_user_cars допускает несколько строк с одним и
+    тем же car_number, см. get_debt_rows/TurkeyDebtRow докстрок), и раньше
+    debt-список показывал/суммировал его отдельно на КАЖДОГО owner —
+    визуально и в агрегате "Автомобилей"/"Общая сумма" одна и та же
+    задолженность физической машины дублировалась. Здесь — ровно одна
+    строка на car_number, total_amount/is_partial/checked_at — от САМОГО
+    СВЕЖЕГО (max checked_at) owner-specific результата в группе (owners
+    одного plate обычно получают ОДИН и тот же UnifiedCheckResult, см.
+    TurkeyDebtRefreshService.refresh() — "freshest" просто на случай, если
+    один из owners сделал свою собственную более позднюю ручную проверку)
+    — НИКОГДА не складывается арифметически между владельцами одной
+    машины (см. get_debt_car_groups)."""
+
+    car_number: str
+    owner_telegram_user_ids: tuple[int, ...]
+    total_amount: Decimal
+    is_partial: bool
+    checked_at: datetime
+
+
 def _business_day_start_utc(now: datetime, tz: ZoneInfo, *, days_back: int) -> datetime:
     """Начало "делового дня" (days_back дней назад от now) в указанной
     business-timezone, выраженное обратно в UTC — тот же приём, что и
@@ -157,6 +182,30 @@ class TurkeyStatisticsService:
             )
         rows.sort(key=lambda row: (-row.total_amount, -row.checked_at.timestamp()))
         return rows
+
+    def get_debt_car_groups(self, cars: list[TurkeyUserCar]) -> list[TurkeyDebtCarGroup]:
+        """См. TurkeyDebtCarGroup — группирует get_debt_rows() (per-owner,
+        НЕ изменяется — по-прежнему единственный источник правды для
+        owner-specific "Мои автомобили"/Search/refresh persistence) по
+        car_number. Один physical plate = одна строка, сумма НЕ
+        складывается между владельцами (см. TurkeyDebtCarGroup докстрок)."""
+        rows = self.get_debt_rows(cars)
+
+        groups: dict[str, list[TurkeyDebtRow]] = {}
+        for row in rows:
+            groups.setdefault(row.car_number, []).append(row)
+
+        result: list[TurkeyDebtCarGroup] = []
+        for car_number, owner_rows in groups.items():
+            freshest = max(owner_rows, key=lambda r: r.checked_at)
+            result.append(TurkeyDebtCarGroup(
+                car_number=car_number,
+                owner_telegram_user_ids=tuple(r.owner_telegram_user_id for r in owner_rows),
+                total_amount=freshest.total_amount, is_partial=freshest.is_partial,
+                checked_at=freshest.checked_at,
+            ))
+        result.sort(key=lambda group: (-group.total_amount, -group.checked_at.timestamp()))
+        return result
 
     def get_known_username(self, telegram_user_id: int) -> str | None:
         """Прокси к TurkeyBotKnownUsersRepository.get_username() — ТОЛЬКО

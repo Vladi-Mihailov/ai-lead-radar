@@ -757,15 +757,21 @@ def format_statistics(
     ])
 
 
-def format_debt_row(*, car_number: str, owner_display: str, total_amount: Decimal) -> str:
+def format_debt_row(*, car_number: str, owner_displays: list[str], total_amount: Decimal) -> str:
     """"🚗 CAR: owner: amount ₺" (см. задачу "manager Statistics / refresh
     для обоих ботов" п.1 — единый компактный формат, тот же, что и у
     Georgia, БЕЗ даты/checked_at/"сегодня"/"вчера"/"N дней назад" и БЕЗ
     " — "-разделителей/"≥"/"· частично"). total_amount — уже готовый
-    authoritative unified total (см. TurkeyDebtRow), НЕ пересчитывается
-    здесь."""
+    authoritative unified total (см. TurkeyDebtCarGroup), НЕ пересчитывается
+    здесь. owner_displays — см. задачу "Turkey manager debt statistics
+    aggregation": один физический car_number может принадлежать нескольким
+    владельцам — все перечисляются через " | " (single-owner case — тот
+    же самый вид строки, что и раньше, join одного элемента не меняет
+    текст), а amount печатается РОВНО один раз в конце (не дублируется на
+    каждого owner)."""
     amount_text = _format_try_amount(total_amount)
-    return f"🚗 {car_number}: {owner_display}: {amount_text}"
+    owners_text = " | ".join(owner_displays)
+    return f"🚗 {car_number}: {owners_text}: {amount_text}"
 
 
 def format_debt_list_messages(rows: list[str]) -> list[str]:
