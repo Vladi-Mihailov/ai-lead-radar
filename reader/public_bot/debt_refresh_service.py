@@ -39,7 +39,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from reader.fines.check_service import FineCheckService
-from reader.fines.models import FineTaskDebtSnapshot
+from reader.fines.models import FineCarDebtGroup, FineTaskDebtSnapshot
 from reader.fines.task_repository import FineMonitoringTaskRepository
 
 # См. задачу "guard Georgia debt against false zero results" п.5 — та же
@@ -113,52 +113,80 @@ class DebtRefreshService:
             car_count=len(rows), total_amount=sum(row.total_amount for row in rows),
         )
 
+    def list_debt_car_groups(self) -> list[FineCarDebtGroup]:
+        """См. задачу "Georgia debt deduplication by physical car_number" —
+        ТОЛЬКО чтение (та же гарантия, что и list_debt_rows() выше), один
+        physical car_number = одна группа (см.
+        FineMonitoringTaskRepository.list_debt_car_groups/FineCarDebtGroup)
+        — используется превью refresh (см. ConversationController.
+        handle_debt_refresh_pick) и "🚨 Штрафы по последней проверке" (см.
+        ConversationController._build_debt_section), той же группировкой,
+        что и сам refresh() ниже — превью не может разойтись с реальным
+        числом физических проверок."""
+        return self._task_repository.list_debt_car_groups()
+
     async def refresh(self) -> RefreshOutcome:
-        """Кандидаты — ТОЛЬКО tasks с известной (persisted) суммой > 0
-        (см. list_debt_rows()/list_tasks_with_known_debt()), по одному
-        police.ge-запросу на task_id — тот же authoritative
-        FineCheckService.check_task(), без вызова flush_pending() (см.
-        модульный докстрок про отсутствие уведомлений). check_task() САМ
-        персистит новое last_successful_total_amount при status=='ok' и
-        НИКОГДА не трогает его при ERROR — "сохранить старое достоверное
-        состояние" получается ПО ПОСТРОЕНИЮ, без отдельной ветки отката
-        здесь."""
+        """Кандидаты — УНИКАЛЬНЫЕ физические car_number с известной
+        (persisted) суммой > 0 (см. list_debt_car_groups() выше) — см.
+        задачу "Georgia debt deduplication by physical car_number": ОДИН
+        police.ge-запрос НА ФИЗИЧЕСКИЙ НОМЕР (не на task_id, как раньше),
+        через FineCheckService.check_plate_for_tasks() — тот же
+        authoritative writer (_finalize(), вызванный один раз НА ЗАДАЧУ
+        внутри check_plate_for_tasks), без вызова flush_pending() (см.
+        модульный докстрок про отсутствие уведомлений). ERROR никогда не
+        трогает last_successful_total_amount ни у одной задачи группы —
+        "сохранить старое достоверное состояние" получается ПО
+        ПОСТРОЕНИЮ, без отдельной ветки отката здесь (см.
+        check_plate_for_tasks() докстрок).
+
+        checked/failed считаются ПО ФИЗИЧЕСКИМ НОМЕРАМ (не по task_id) —
+        та же единица, что и в preview (см. list_debt_car_groups()), иначе
+        "Проверено: N" разошлось бы с "Будет проверено автомобилей: N"."""
         if self._in_progress:
             raise RefreshAlreadyInProgressError()
 
         self._in_progress = True
         try:
-            task_ids = [row.task_id for row in self.list_debt_rows()]
+            car_groups = self.list_debt_car_groups()
 
             failed = 0
             failed_car_numbers: list[str] = []
 
-            for index, task_id in enumerate(task_ids):
+            for index, group in enumerate(car_groups):
                 if index > 0:
                     # См. задачу п.5 — пауза МЕЖДУ РАЗНЫМИ машинами (не
                     # после последней, см. модульный докстрок про
                     # _INTER_CAR_DELAY_SECONDS) — mass refresh больше не
-                    # бьёт police.ge back-to-back без пауз.
+                    # бьёт police.ge back-to-back без пауз. Одна пауза на
+                    # ФИЗИЧЕСКИЙ номер (не на task_id) — дубликаты одного
+                    # car_number больше не удлиняют refresh лишними
+                    # паузами между собой (см. задачу Part 4).
                     await self._sleep(self._inter_car_delay_seconds)
 
-                task = self._task_repository.get(task_id)
-                if task is None:
-                    # Задача удалена конкурентно между чтением списка и
-                    # проверкой — просто пропускаем, не считаем ни успехом,
-                    # ни ошибкой (её больше нет вообще).
+                tasks = [
+                    task for task in (
+                        self._task_repository.get(task_id) for task_id in group.task_ids
+                    )
+                    if task is not None
+                ]
+                if not tasks:
+                    # ВСЕ задачи этого car_number удалены конкурентно между
+                    # чтением списка и проверкой — пропускаем физический
+                    # номер целиком, не считаем ни успехом, ни ошибкой (тот
+                    # же принцип, что и в старой per-task версии).
                     continue
 
-                result = await self._check_service.check_task(task)
-                if result.status == "error":
+                results = await self._check_service.check_plate_for_tasks(group.car_number, tasks)
+                # Одна внешняя проверка на физический номер -> ЛИБО все
+                # задачи группы "ok" (успешный fetch), ЛИБО все "error"
+                # (см. check_plate_for_tasks() докстрок) — смешанный исход
+                # для одной группы структурно невозможен.
+                if any(result.status == "error" for result in results.values()):
                     failed += 1
-                    failed_car_numbers.append(task.car_number)
-                # status == "ok": check_task() уже сам записал новое
-                # last_successful_total_amount (включая false-zero guard,
-                # см. reader/fines/check_service.py) — здесь ничего
-                # дополнительно персистить не нужно (см. модульный докстрок).
+                    failed_car_numbers.append(group.car_number)
 
             return RefreshOutcome(
-                checked=len(task_ids), failed=failed, failed_car_numbers=tuple(failed_car_numbers),
+                checked=len(car_groups), failed=failed, failed_car_numbers=tuple(failed_car_numbers),
             )
         finally:
             self._in_progress = False

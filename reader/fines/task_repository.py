@@ -3,6 +3,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from reader.fines.models import (
+    FineCarDebtGroup,
     FineMonitoringScope,
     FineMonitoringTask,
     FineTaskDebtSnapshot,
@@ -512,6 +513,33 @@ class FineMonitoringTaskRepository:
             )
             for row in rows
         ]
+
+    def list_debt_car_groups(self) -> list[FineCarDebtGroup]:
+        """См. задачу "Georgia debt deduplication by physical car_number" —
+        группирует list_tasks_with_known_debt() (per-task, НЕ меняется —
+        по-прежнему единственный источник правды для "Мои авто"/Search/
+        существующих тестов этого репозитория) по car_number. Один
+        physical plate = одна группа; total_amount/checked_at — от САМОЙ
+        СВЕЖЕЙ (max last_successful_checked_at) задачи группы, tie-break —
+        БОЛЬШИЙ task_id (см. FineCarDebtGroup докстрок) — НИКОГДА не
+        складывается между задачами одного car_number."""
+        rows = self.list_tasks_with_known_debt()
+
+        groups: dict[str, list[FineTaskDebtSnapshot]] = {}
+        for row in rows:
+            groups.setdefault(row.car_number, []).append(row)
+
+        result: list[FineCarDebtGroup] = []
+        for car_number, task_rows in groups.items():
+            freshest = max(task_rows, key=lambda r: (r.checked_at, r.task_id))
+            result.append(FineCarDebtGroup(
+                car_number=car_number,
+                task_ids=tuple(r.task_id for r in task_rows),
+                total_amount=freshest.total_amount,
+                checked_at=freshest.checked_at,
+            ))
+        result.sort(key=lambda group: (-group.total_amount, -group.checked_at.timestamp()))
+        return result
 
     def count_active(self) -> int:
         return self._conn.execute(_COUNT_ACTIVE).fetchone()[0]

@@ -117,6 +117,31 @@ class FineTaskDebtSnapshot:
 
 
 @dataclass(frozen=True)
+class FineCarDebtGroup:
+    """Одна строка "🚨 Штрафы по последней проверке", агрегированная по
+    УНИКАЛЬНОМУ физическому car_number (см. задачу "Georgia debt
+    deduplication by physical car_number") — один и тот же физический
+    номер может отслеживаться НЕСКОЛЬКИМИ fine_monitoring_tasks (разные
+    владельцы, либо один владелец с несколькими задачами на тот же
+    номер, см. production-находку P004XC163: task 892 + task 1381) — до
+    этой группировки "🚨 Штрафы по последней проверке" считал/суммировал
+    их как отдельные машины (см. FineTaskDebtSnapshot/
+    list_tasks_with_known_debt() — ОСТАЁТСЯ БЕЗ ИЗМЕНЕНИЙ, per-task
+    источник правды для "Мои авто"/Search/мониторинга).
+
+    total_amount/checked_at здесь — от САМОЙ СВЕЖЕЙ (max
+    last_successful_checked_at) задачи группы, tie-break — БОЛЬШИЙ
+    task_id (см. FineMonitoringTaskRepository.list_debt_car_groups) —
+    НИКОГДА не складывается арифметически между задачами одного
+    физического номера (100 ₾ + 200 ₾ -> 200 ₾, не 300 ₾)."""
+
+    car_number: str
+    task_ids: tuple[int, ...]
+    total_amount: float
+    checked_at: datetime
+
+
+@dataclass(frozen=True)
 class CarFineStats:
     """Одна строка статистики fine stats — сколько штрафов опубликовано
     по конкретному автомобилю (detected_fines, сгруппированные по

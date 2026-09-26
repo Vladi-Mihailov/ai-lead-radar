@@ -366,6 +366,177 @@ def test_debt_refresh_service_has_no_notification_dependency():
 # ---- защита от повторного/параллельного запуска ----
 
 
+# ---- Georgia debt deduplication by physical car_number (см. задачу) ----
+
+
+def _set_last_successful_checked_at(task_repository, task_id: int, iso_timestamp: str) -> None:
+    task_repository._conn.execute(
+        "UPDATE fine_monitoring_tasks SET last_successful_checked_at = ? WHERE id = ?",
+        (iso_timestamp, task_id),
+    )
+    task_repository._conn.commit()
+
+
+async def test_two_tasks_same_plate_result_in_exactly_one_external_check(fx):
+    """См. production-находку P004XC163 — 2 задачи на один car_number
+    должны дать ОДИН police.ge-запрос, не два."""
+    task_a = fx.make_task("KK011KK")
+    task_b = fx.make_task("KK011KK")
+    await fx.seed(task_a, amount=200, fingerprint="fp-a")
+    await fx.seed(task_b, amount=200, fingerprint="fp-a")
+    fx.provider.requested_plates.clear()
+
+    outcome = await fx.debt_refresh.refresh()
+
+    assert fx.provider.requested_plates == ["KK011KK"]
+    assert outcome.checked == 1  # физических номеров, не задач
+
+
+async def test_refresh_checked_counts_unique_plates_not_task_rows(fx):
+    task_a = fx.make_task("LL012LL")
+    task_b = fx.make_task("LL012LL")  # дубликат plate
+    task_c = fx.make_task("MM013MM")  # другой физический номер
+    await fx.seed(task_a, amount=100, fingerprint="fp-a")
+    await fx.seed(task_b, amount=100, fingerprint="fp-a")
+    await fx.seed(task_c, amount=50, fingerprint="fp-c")
+
+    outcome = await fx.debt_refresh.refresh()
+
+    assert outcome.checked == 2  # 2 физических номера, не 3 задачи
+
+
+async def test_duplicate_plate_persists_consistent_amount_to_all_tasks(fx):
+    """"one physical successful result -> all relevant task rows for that
+    plate receive consistent latest successful amount/state" (см. задачу
+    Part 4)."""
+    task_a = fx.make_task("NN014NN")
+    task_b = fx.make_task("NN014NN")
+    await fx.seed(task_a, amount=100, fingerprint="fp-1")
+    await fx.seed(task_b, amount=100, fingerprint="fp-1")
+    _set_amount(fx.provider, car_number="NN014NN", amount=300, fingerprint="fp-1")
+
+    await fx.debt_refresh.refresh()
+
+    refreshed_a = fx.task_repository.get(task_a.id)
+    refreshed_b = fx.task_repository.get(task_b.id)
+    assert refreshed_a.last_successful_total_amount == 300
+    assert refreshed_b.last_successful_total_amount == 300
+
+
+async def test_duplicate_plate_authoritative_amount_is_freshest_not_sum(fx):
+    """См. задачу Part "AUTHORITATIVE AMOUNT" — 100 ₾ at 10:00 + 200 ₾ at
+    11:00 -> группа = 200 ₾, НЕ 300 ₾."""
+    task_older = fx.make_task("OO015OO")
+    task_newer = fx.make_task("OO015OO")
+    await fx.seed(task_older, amount=100, fingerprint="fp-old")
+    await fx.seed(task_newer, amount=200, fingerprint="fp-new")
+    _set_last_successful_checked_at(fx.task_repository, task_older.id, "2026-09-26T10:00:00+00:00")
+    _set_last_successful_checked_at(fx.task_repository, task_newer.id, "2026-09-26T11:00:00+00:00")
+
+    groups = fx.debt_refresh.list_debt_car_groups()
+
+    assert len(groups) == 1
+    assert groups[0].total_amount == 200  # НЕ 300
+
+
+async def test_provider_error_preserves_previous_state_for_every_task_in_group(fx):
+    """См. задачу Part 5 — ERROR на физической проверке не должен трогать
+    last_successful_total_amount НИ У ОДНОЙ задачи группы."""
+    task_a = fx.make_task("PP016PP")
+    task_b = fx.make_task("PP016PP")
+    await fx.seed(task_a, amount=250, fingerprint="fp-1")
+    await fx.seed(task_b, amount=250, fingerprint="fp-1")
+    fx.provider.error_cars.add("PP016PP")
+
+    outcome = await fx.debt_refresh.refresh()
+
+    assert outcome.failed == 1
+    assert outcome.failed_car_numbers == ("PP016PP",)
+    refreshed_a = fx.task_repository.get(task_a.id)
+    refreshed_b = fx.task_repository.get(task_b.id)
+    assert refreshed_a.last_successful_total_amount == 250
+    assert refreshed_b.last_successful_total_amount == 250
+    assert refreshed_a.last_check_status == "error"
+    assert refreshed_b.last_check_status == "error"
+
+
+async def test_false_zero_confirmation_runs_once_not_per_task_for_duplicate_plate(fx):
+    """См. задачу Part 5 — false-zero corroboration должна сработать РОВНО
+    один раз на физический номер (один подозрительный + один
+    подтверждающий запрос), а НЕ независимо на каждую из 2 задач (что
+    дало бы 2 подозрительных + 2 подтверждающих = 4 запроса)."""
+    task_a = fx.make_task("QQ017QQ")
+    task_b = fx.make_task("QQ017QQ")
+    await fx.seed(task_a, amount=400, fingerprint="fp-1")
+    await fx.seed(task_b, amount=400, fingerprint="fp-1")
+
+    sleep_calls = 0
+
+    async def _counting_sleep(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+
+    fx.check_service._sleep = _counting_sleep
+
+    call_count = 0
+    search_calls: list[str] = []
+
+    async def _first_zero_then_positive(plate: str):
+        nonlocal call_count
+        call_count += 1
+        search_calls.append(plate)
+        if call_count == 1:
+            return []  # подозрительный 0 — предыдущая задолженность была 400
+        return [_record(car_number=plate, fingerprint="fp-1", amount=350)]
+
+    fx.provider.search_by_plate = _first_zero_then_positive
+
+    await fx.debt_refresh.refresh()
+
+    assert call_count == 2  # ОДИН подозрительный + ОДИН подтверждающий, не 4
+    assert search_calls == ["QQ017QQ", "QQ017QQ"]
+    assert sleep_calls == 1  # ОДНА false-zero пауза на физический номер, не 2
+    refreshed_a = fx.task_repository.get(task_a.id)
+    refreshed_b = fx.task_repository.get(task_b.id)
+    assert refreshed_a.last_successful_total_amount == 350
+    assert refreshed_b.last_successful_total_amount == 350
+
+
+async def test_active_and_completed_duplicate_plate_still_one_physical_check(fx):
+    """См. задачу Part 7 — НЕ меняем status-фильтрацию: если
+    active+completed задачи одного car_number СЕЙЧАС eligible (см.
+    list_tasks_with_known_debt() — без фильтра по status), группировка
+    всё равно должна дать ОДИН физический check (тот же сценарий, что и
+    production P004XC163: task 892 completed + task 1381 active)."""
+    task_active = fx.make_task("RR018RR")
+    task_completed = fx.make_task("RR018RR")
+    await fx.seed(task_active, amount=200, fingerprint="fp-1")
+    await fx.seed(task_completed, amount=200, fingerprint="fp-1")
+    fx.task_repository.set_status(task_completed.id, "completed")
+    fx.provider.requested_plates.clear()
+
+    outcome = await fx.debt_refresh.refresh()
+
+    assert fx.provider.requested_plates == ["RR018RR"]
+    assert outcome.checked == 1
+
+
+async def test_single_task_check_task_and_check_plate_for_tasks_agree(fx):
+    """См. задачу Part 9 п.15 — "ordinary single-task FineCheckService
+    behavior remains unchanged": check_plate_for_tasks() с ОДНОЙ задачей
+    должно дать ТОТ ЖЕ результат/persisted state, что и обычный
+    check_task() для этой же задачи."""
+    task = fx.make_task("SS019SS")
+    await fx.seed(task, amount=100, fingerprint="fp-1")
+    _set_amount(fx.provider, car_number="SS019SS", amount=175, fingerprint="fp-1")
+
+    results = await fx.check_service.check_plate_for_tasks("SS019SS", [fx.task_repository.get(task.id)])
+
+    assert results[task.id].status == "ok"
+    refreshed = fx.task_repository.get(task.id)
+    assert refreshed.last_successful_total_amount == 175
+
+
 async def test_concurrent_refresh_is_rejected(fx):
     task = fx.make_task("JJ010JJ")
     await fx.seed(task, amount=5)

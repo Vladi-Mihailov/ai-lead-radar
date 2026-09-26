@@ -527,3 +527,154 @@ async def test_cancel_returns_cancelled_text_without_checking_anything(fx):
 async def test_ordinary_user_cancel_is_still_authorized_checked(fx):
     reply = fx.controller.handle_debt_refresh_cancel(telegram_user_id=_ORDINARY_ID)
     assert reply.text == texts.CALLBACK_NOT_AUTHORIZED_TEXT
+
+
+# ---- Georgia debt deduplication by physical car_number (см. задачу) ----
+
+
+async def test_one_plate_one_task_shows_one_row(fx):
+    task = fx.make_task("TT001TT")
+    await fx.seed_debt(task, amount=200)
+    fx.add_subscription(task, telegram_user_id=1)
+    fx.record_known(telegram_user_id=1, username="alice")
+
+    reply = await fx.controller.handle_text(
+        texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert "Автомобилей: 1" in reply.text
+    assert "🚗 TT001TT: @alice: 200 ₾" in reply.text
+
+
+async def test_one_plate_two_tasks_same_owner_shows_one_row_owner_once(fx):
+    """См. production-находку P004XC163 — тот же telegram-владелец
+    добавил один и тот же номер дважды (две задачи) — владелец должен
+    показаться ОДИН раз, не дважды."""
+    task_a = fx.make_task("TT002TT")
+    task_b = fx.make_task("TT002TT")
+    await fx.seed_debt(task_a, amount=200, fingerprint="fp-a")
+    await fx.seed_debt(task_b, amount=200, fingerprint="fp-a")
+    fx.add_subscription(task_a, telegram_user_id=1)
+    fx.add_subscription(task_b, telegram_user_id=1)  # ТОТ ЖЕ owner
+    fx.record_known(telegram_user_id=1, username="bob")
+
+    reply = await fx.controller.handle_text(
+        texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert "Автомобилей: 1" in reply.text
+    row_line = next(line for line in reply.text.splitlines() if line.startswith("🚗 TT002TT"))
+    assert row_line == "🚗 TT002TT: @bob: 200 ₾"  # НЕ "@bob | @bob"
+
+
+async def test_one_plate_multiple_owners_joined_with_pipe_amount_once(fx):
+    task_a = fx.make_task("TT003TT")
+    task_b = fx.make_task("TT003TT")
+    await fx.seed_debt(task_a, amount=300, fingerprint="fp-a")
+    await fx.seed_debt(task_b, amount=300, fingerprint="fp-a")
+    fx.add_subscription(task_a, telegram_user_id=1)
+    fx.add_subscription(task_b, telegram_user_id=2)
+    fx.record_known(telegram_user_id=1, username="alice")
+    fx.record_known(telegram_user_id=2, username="carol")
+
+    reply = await fx.controller.handle_text(
+        texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    row_line = next(line for line in reply.text.splitlines() if line.startswith("🚗 TT003TT"))
+    assert row_line == "🚗 TT003TT: @alice | @carol: 300 ₾"
+    assert row_line.count("300 ₾") == 1
+
+
+async def test_two_different_plates_sum_normally(fx):
+    task_a = fx.make_task("TT004TT")
+    task_b = fx.make_task("TT005TT")
+    await fx.seed_debt(task_a, amount=100)
+    await fx.seed_debt(task_b, amount=250)
+
+    reply = await fx.controller.handle_text(
+        texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert "Автомобилей: 2" in reply.text
+    assert "Общая сумма: 350 ₾" in reply.text
+
+
+async def test_manager_summary_duplicate_task_rows_do_not_inflate_car_count_or_total(fx):
+    """См. production снимок: P004XC163 (2 tasks, 200 ₾ каждая) не должен
+    выглядеть как "2 автомобиля / 400 ₾"."""
+    task_a = fx.make_task("TT006TT")
+    task_b = fx.make_task("TT006TT")
+    await fx.seed_debt(task_a, amount=200, fingerprint="fp-a")
+    await fx.seed_debt(task_b, amount=200, fingerprint="fp-a")
+
+    reply = await fx.controller.handle_text(
+        texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert "Автомобилей: 1" in reply.text
+    assert "Общая сумма: 200 ₾" in reply.text  # НЕ 400 ₾
+
+
+async def test_refresh_preview_counts_unique_plates_for_duplicate_tasks(fx):
+    """raw debt rows=2 для одного и того же car_number -> preview должен
+    показать 1 автомобиль, не 2 (см. задачу Part 3)."""
+    task_a = fx.make_task("TT007TT")
+    task_b = fx.make_task("TT007TT")
+    await fx.seed_debt(task_a, amount=50, fingerprint="fp-a")
+    await fx.seed_debt(task_b, amount=50, fingerprint="fp-a")
+    fx.provider.requested_plates.clear()
+
+    reply = fx.controller.handle_debt_refresh_pick(telegram_user_id=_TRUSTED_ID)
+
+    assert reply.text == "🔄 Будет проверено автомобилей: 1"
+    assert fx.provider.requested_plates == []
+
+
+async def test_refresh_notification_eligibility_not_duplicated_by_fan_out_persistence(fx):
+    """См. задачу Part 6/Part 9 п.13 — refresh() для 2 задач одного
+    car_number с ОДНИМ новым штрафом должен создать РОВНО 2
+    detected_fines-строки (по одной на КАЖДУЮ задачу — та же независимая
+    per-task notification-семантика, что и при вызове check_task()
+    отдельно для каждой), НЕ 4 (не задваивается общим fetch) и НЕ 1 (не
+    теряется для второй задачи)."""
+    task_a = fx.make_task("TT008TT")
+    task_b = fx.make_task("TT008TT")
+    # Обе задачи уже видели fp-old (100 ₾) — остаются debt-кандидатами,
+    # чтобы refresh() их вообще выбрал.
+    await fx.seed_debt(task_a, amount=100, fingerprint="fp-old")
+    await fx.seed_debt(task_b, amount=100, fingerprint="fp-old")
+    # Новая проверка находит ДОПОЛНИТЕЛЬНЫЙ, ранее невиданный штраф fp-new —
+    # ГЕНУИННО новый для ОБЕИХ задач (ни одна ещё не видела fp-new).
+    fx.provider.records_by_car["TT008TT"] = [
+        _record(car_number="TT008TT", fingerprint="fp-old", amount=100),
+        _record(car_number="TT008TT", fingerprint="fp-new", amount=50),
+    ]
+
+    await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
+
+    rows = fx.detected_fine_repository._conn.execute(
+        "SELECT monitoring_task_id, notification_sent_at FROM detected_fines WHERE fingerprint = 'fp-new'",
+    ).fetchall()
+    assert len(rows) == 2  # ровно по одной строке на КАЖДУЮ задачу, не 4 и не 1
+    task_ids_with_new_fine = {row[0] for row in rows}
+    assert task_ids_with_new_fine == {task_a.id, task_b.id}
+    for _task_id, notification_sent_at in rows:
+        assert notification_sent_at is None  # обычная semantics "ждёт уведомления" — НЕ silent
+
+
+async def test_active_and_completed_duplicate_plate_shows_as_one_car(fx):
+    """См. задачу Part 7 — НЕ меняем status-фильтрацию, но группировка
+    должна дать ОДНУ карточку для active+completed дубля одного номера
+    (тот же сценарий, что и production P004XC163)."""
+    task_active = fx.make_task("TT009TT")
+    task_completed = fx.make_task("TT009TT")
+    await fx.seed_debt(task_active, amount=200, fingerprint="fp-a")
+    await fx.seed_debt(task_completed, amount=200, fingerprint="fp-a")
+    fx.task_repository.set_status(task_completed.id, "completed")
+
+    reply = await fx.controller.handle_text(
+        texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert "Автомобилей: 1" in reply.text

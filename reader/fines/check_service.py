@@ -24,10 +24,19 @@ from datetime import datetime, timezone
 from typing import Literal, Protocol
 
 from reader.fines.detected_fine_repository import DetectedFineRepository
-from reader.fines.models import CheckResult, FineMonitoringTask, NewFineEvent, ParsedFineRecord
+from reader.fines.models import (
+    CheckResult,
+    FineMonitoringTask,
+    NewFineEvent,
+    ParsedFineRecord,
+)
 from reader.fines.provider import FineProvider, FineProviderError
 from reader.fines.task_repository import FineMonitoringTaskRepository
-from reader.fines.translation import FineTranslationError, TranslatedFineText, contains_georgian
+from reader.fines.translation import (
+    FineTranslationError,
+    TranslatedFineText,
+    contains_georgian,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +68,20 @@ NotificationPolicy = Literal["normal", "silent"]
 
 def _elapsed_ms(started_at: float) -> int:
     return round((time.monotonic() - started_at) * 1000)
+
+
+def _pick_freshest_task(tasks: list[FineMonitoringTask]) -> FineMonitoringTask:
+    """См. FineCheckService.check_plate_for_tasks — та же freshness/tie-
+    break семантика, что и FineMonitoringTaskRepository.
+    list_debt_car_groups() (max last_successful_checked_at, tie-break —
+    БОЛЬШИЙ task.id), применённая к полным FineMonitoringTask вместо
+    FineTaskDebtSnapshot (это ОТДЕЛЬНЫЕ данные — group listing читается
+    ДО refresh, полные task-объекты запрашиваются ВНУТРИ refresh — но
+    правило выбора "самого свежего" должно быть идентичным)."""
+    return max(
+        tasks,
+        key=lambda t: (t.last_successful_checked_at or datetime.min.replace(tzinfo=timezone.utc), t.id),
+    )
 
 
 class FineTranslatorLike(Protocol):
@@ -219,6 +242,66 @@ class FineCheckService:
             # персистится.
 
         return await self._finalize(task, records, started_at, notification_policy=notification_policy)
+
+    async def check_plate_for_tasks(
+        self,
+        car_number: str,
+        tasks: list[FineMonitoringTask],
+        *,
+        notification_policy: NotificationPolicy = "normal",
+    ) -> dict[int, CheckResult]:
+        """См. задачу "Georgia debt deduplication by physical car_number" —
+        когда НЕСКОЛЬКО fine_monitoring_tasks делят один и тот же
+        car_number (production-находка: P004XC163, task 892 + task 1381),
+        manager debt refresh должен сделать РОВНО ОДИН внешний
+        police.ge-запрос (+ не более одного false-zero confirmation
+        запроса, см. check_task() докстрок) на физический номер, а НЕ по
+        одному на каждую задачу.
+
+        Persistence/detected_fines/translation/notification-семантика для
+        КАЖДОЙ задачи остаётся ПОЛНОСТЬЮ идентичной обычному check_task():
+        _finalize() вызывается РОВНО ОДИН РАЗ НА ЗАДАЧУ (как и раньше),
+        просто над уже ОБЩИМ, один раз полученным набором records, а не
+        над независимо запрошенным для каждой задачи — ни одна задача не
+        получает ни больше, ни меньше detected_fines-строк/уведомлений,
+        чем при вызове check_task() по отдельности для КАЖДОЙ (см. задачу
+        Part 6: "no duplicate/lost client notifications").
+
+        False-zero guard (см. check_task() докстрок) применяется ОДИН раз
+        для ВСЕЙ группы — "предыдущая известная задолженность" берётся у
+        САМОЙ СВЕЖЕЙ задачи (см. _pick_freshest_task, та же freshness/
+        tie-break семантика, что и list_debt_car_groups()), НЕ по каждой
+        задаче отдельно (см. задачу Part 5: "must NOT independently
+        perform the false-zero confirmation once per task").
+
+        Provider ERROR (на любом из двух возможных запросов) — КАЖДАЯ
+        задача группы получает СВОЙ error CheckResult (см. _record_error —
+        last_successful_* остаётся нетронутым, per-task, как и раньше);
+        успех — КАЖДАЯ задача получает результат _finalize() над одним и
+        тем же records (см. задачу: "all relevant task rows for that
+        plate receive consistent latest successful amount/state")."""
+        started_at = time.monotonic()
+
+        try:
+            records = await self._fetch(car_number)
+        except FineProviderError as exc:
+            return {task.id: self._record_error(task, exc, started_at) for task in tasks}
+
+        freshest_task = _pick_freshest_task(tasks)
+        previous_amount = freshest_task.last_successful_total_amount
+        candidate_total = sum((record.amount or 0.0) for record in records)
+
+        if previous_amount is not None and previous_amount > 0 and candidate_total == 0:
+            await self._sleep(self._zero_confirmation_delay_seconds)
+            try:
+                records = await self._fetch(car_number)
+            except FineProviderError as exc:
+                return {task.id: self._record_error(task, exc, started_at) for task in tasks}
+
+        return {
+            task.id: await self._finalize(task, records, started_at, notification_policy=notification_policy)
+            for task in tasks
+        }
 
     async def _fetch(self, car_number: str) -> list[ParsedFineRecord]:
         return await self._provider.search_by_plate(car_number)
