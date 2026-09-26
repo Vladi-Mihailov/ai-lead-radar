@@ -189,7 +189,7 @@ async def test_debt_owner_shown_with_name_only(fx):
     reply = await fx.controller.handle_text(texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
 
     full_text = "\n".join((reply.text, *reply.extra_texts))
-    assert "🚗 M295YB196 — Иван Иванов — 750 ₺" in full_text
+    assert "🚗 M295YB196: Иван Иванов: 750 ₺" in full_text
 
 
 async def test_debt_owner_shown_with_username_only(fx):
@@ -200,7 +200,7 @@ async def test_debt_owner_shown_with_username_only(fx):
     reply = await fx.controller.handle_text(texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
 
     full_text = "\n".join((reply.text, *reply.extra_texts))
-    assert "🚗 M295YB196 — @alenaogir — 1 250 ₺" in full_text
+    assert "🚗 M295YB196: @alenaogir: 1 250 ₺" in full_text
 
 
 async def test_debt_owner_shown_as_dash_when_neither(fx):
@@ -211,7 +211,7 @@ async def test_debt_owner_shown_as_dash_when_neither(fx):
     reply = await fx.controller.handle_text(texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
 
     full_text = "\n".join((reply.text, *reply.extra_texts))
-    assert "🚗 M295YB196 — — — 100 ₺" in full_text
+    assert "🚗 M295YB196: —: 100 ₺" in full_text
     assert "None" not in full_text
 
 

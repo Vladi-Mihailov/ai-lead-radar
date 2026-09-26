@@ -47,7 +47,6 @@ plate дал бы идентичный ответ.
 """
 
 from dataclasses import dataclass
-from decimal import Decimal
 
 from reader.turkey_bot.statistics_service import TurkeyDebtRow, TurkeyStatisticsService
 from reader.turkey_bot.unified.check_service import UnifiedTurkeyCheckService
@@ -66,20 +65,17 @@ _INITIATOR_MANAGER_REFRESH = "manager_refresh"
 
 @dataclass(frozen=True)
 class TurkeyRefreshOutcome:
-    """Итог одного прогона refresh() — см. задачу "RESULT". incomplete
+    """Итог одного прогона refresh() (см. задачу "manager Statistics /
+    refresh для обоих ботов" п.7) — НИКАКОЙ "погашена"/"осталась"/было-
+    стало-аналитики: манагеру нужен только факт "проверено/не удалось
+    проверить", а актуальный список — из заново перечитанного persisted
+    state (см. ConversationController._build_debt_section). failed
     объединяет ERROR И PARTIAL (см. модуль docstring/задачу "PARTIAL": ни
-    то, ни другое не является гарантированно полной проверкой) —
-    total_before/total_after — суммы по debt-списку ДО и ПОСЛЕ (см.
-    задачу: "если сумма изменилась, можно дополнительно показать было/
-    стало"), пересчитаны честно из БД, а не накоплены построчно во время
-    цикла (см. refresh())."""
+    то, ни другое не является гарантированно полной проверкой)."""
 
     checked: int
-    paid: int
-    remains: int
-    incomplete: int
-    total_before: Decimal
-    total_after: Decimal
+    failed: int
+    failed_car_numbers: tuple[str, ...] = ()
 
 
 class TurkeyRefreshAlreadyInProgressError(Exception):
@@ -123,37 +119,39 @@ class TurkeyDebtRefreshService:
         check, см. модуль docstring), сохраняет результат ОТДЕЛЬНО для
         КАЖДОГО owner этого plate (см. TurkeyCheckRunRepository.save() —
         уже поддерживает несколько сохранений одного result под разными
-        telegram_user_id), классифицирует по authoritative overall_status/
-        total_amount НОВОГО результата:
-          ERROR/PARTIAL -> incomplete (не гарантированно полная проверка,
-            предыдущее достоверное состояние НЕ считается погашенным —
-            get_latest_reliable_for_owner сама пропустит ERROR-строку и
-            вернёт прежний reliable результат; PARTIAL, наоборот, СТАНОВИТСЯ
-            новым reliable состоянием, как и везде в unified-архитектуре,
-            но помечается incomplete именно в ЭТОМ summary, см. задачу:
-            "summary должен честно показать, что проверка была неполной");
-          total_amount <= 0 (полный SUCCESS) -> paid;
-          total_amount > 0 (полный SUCCESS) -> remains."""
+        telegram_user_id). ERROR/PARTIAL -> failed (не гарантированно
+        полная проверка, см. задачу "PARTIAL"): для ERROR предыдущее
+        достоверное состояние НЕ считается стёртым — get_latest_reliable_
+        for_owner сама пропустит ERROR-строку и вернёт прежний reliable
+        результат; PARTIAL, наоборот, СТАНОВИТСЯ новым reliable состоянием,
+        как и везде в unified-архитектуре, но помечается failed именно в
+        ЭТОМ summary (см. задачу: "summary должен честно показать, что
+        проверка была неполной"). Актуальный список после refresh — заново
+        перечитанный persisted state (см. list_candidates()/
+        ConversationController._build_debt_section), не накапливается
+        здесь построчно."""
         if self._in_progress:
             raise TurkeyRefreshAlreadyInProgressError()
 
         self._in_progress = True
         try:
             candidates = self.list_candidates()
-            total_before = sum((row.total_amount for row in candidates), Decimal(0))
 
             by_plate: dict[str, list[TurkeyDebtRow]] = {}
             for row in candidates:
                 by_plate.setdefault(row.car_number, []).append(row)
 
-            paid = 0
-            remains = 0
-            incomplete = 0
+            failed = 0
+            failed_car_numbers: list[str] = []
 
             for plate, rows in by_plate.items():
                 result = await self._check_service.check(
                     plate, max_attempts=_REFRESH_MAX_ATTEMPTS, mode="manual",
                 )
+                is_failed = result.overall_status in (OverallStatus.ERROR, OverallStatus.PARTIAL)
+                if is_failed:
+                    failed += len(rows)
+                    failed_car_numbers.append(plate)
 
                 for row in rows:
                     self._runs.save(
@@ -166,18 +164,8 @@ class TurkeyDebtRefreshService:
                         overall_status=result.overall_status.value, total_amount=result.total_amount,
                     )
 
-                    if result.overall_status in (OverallStatus.ERROR, OverallStatus.PARTIAL):
-                        incomplete += 1
-                    elif result.total_amount <= 0:
-                        paid += 1
-                    else:
-                        remains += 1
-
-            total_after = sum((row.total_amount for row in self.list_candidates()), Decimal(0))
-
             return TurkeyRefreshOutcome(
-                checked=len(candidates), paid=paid, remains=remains, incomplete=incomplete,
-                total_before=total_before, total_after=total_after,
+                checked=len(candidates), failed=failed, failed_car_numbers=tuple(failed_car_numbers),
             )
         finally:
             self._in_progress = False

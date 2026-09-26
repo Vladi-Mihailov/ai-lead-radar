@@ -1,16 +1,12 @@
 """
 Тесты reader/turkey_bot/texts.py::format_statistics/format_debt_row/
-format_debt_recency/format_debt_list_messages (см. задачу "доработать
-📊 Статистика Turkey bot" — список username удалён целиком, старый
-misleading блок "С задолженностью/Без задолженности/Частично/Ошибка"
-(исторические turkey_check_runs, не текущее состояние, см. задачу п.10)
-заменён на "🚨 Задолженность по последней проверке")."""
+format_debt_list_messages (см. задачу "manager Statistics / refresh для
+обоих ботов") — единый компактный формат "🚗 CAR: OWNER: AMOUNT", БЕЗ
+даты/checked_at/"сегодня"/"вчера"/"≥"-пометки PARTIAL."""
 
 import sys
-from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -19,8 +15,6 @@ from reader.turkey_bot import texts
 from reader.turkey_bot.statistics_service import TurkeyStatistics
 
 _TELEGRAM_LIMIT = 4096
-_TZ = ZoneInfo("UTC")
-_NOW = datetime(2026, 9, 25, 12, 0, 0, tzinfo=timezone.utc)
 
 
 def _stats(**overrides) -> TurkeyStatistics:
@@ -35,17 +29,12 @@ def _stats(**overrides) -> TurkeyStatistics:
 
 
 def _format(stats, **debt_overrides) -> str:
-    defaults = {"debt_car_count": 0, "debt_total_amount": Decimal(0), "debt_has_partial": False}
+    defaults = {"debt_car_count": 0, "debt_total_amount": Decimal(0)}
     defaults.update(debt_overrides)
     return texts.format_statistics(stats, **defaults)
 
 
 def test_format_statistics_includes_all_core_numbers():
-    """См. задачу "Перенос Unified Turkey функционала в production" —
-    ПЕРЕНЕСЕНО из reader/turkey_bot_test/texts.py::format_statistics
-    (unified-архитектура: manual/scheduled/active_monitoring_subscriptions/
-    provider_error_counts — НОВЫЕ поля относительно старой GIB-only
-    версии)."""
     text = _format(_stats())
 
     assert "16" in text  # total_users
@@ -62,10 +51,6 @@ def test_format_statistics_includes_all_core_numbers():
 
 
 def test_format_statistics_shows_unified_monitoring_metrics():
-    """ОБРАТНОЕ прежнему test_format_statistics_does_not_mention_georgian_
-    only_concepts — эта задача ЯВНО требует monitoring ON/OFF/scheduler в
-    production (см. задачу п.1: "monitoring ON/OFF", "scheduler"),
-    поэтому "мониторинг"/"подписок" ТЕПЕРЬ ожидаемо присутствуют."""
     text = _format(_stats()).lower()
 
     assert "мониторинг" in text
@@ -73,16 +58,10 @@ def test_format_statistics_shows_unified_monitoring_metrics():
 
 
 def test_format_statistics_does_not_mention_username_list():
-    """См. задачу п.1: "Полностью убрать этот список пользователей" —
-    список @username больше НЕ формируется вообще, format_statistics —
-    единственная точка сборки текста, ей физически неоткуда взять
-    отдельные логины (format_user_list_messages удалена целиком)."""
     assert not hasattr(texts, "format_user_list_messages")
 
 
 def test_format_statistics_shows_debt_block_right_after_users():
-    """См. задачу п.2: "Сразу после блока 👥 Пользователи" + честная
-    замена старого misleading блока (см. задачу п.10)."""
     text = _format(_stats(), debt_car_count=3, debt_total_amount=Decimal(4500))
 
     users_pos = text.index("👥 Пользователи")
@@ -95,54 +74,38 @@ def test_format_statistics_shows_debt_block_right_after_users():
     assert "Без задолженности:" not in text
 
 
-def test_format_statistics_marks_total_as_partial_when_any_row_is_partial():
-    text = _format(_stats(), debt_car_count=1, debt_total_amount=Decimal(1250), debt_has_partial=True)
+def test_format_statistics_never_uses_partial_marker():
+    """См. задачу "manager Statistics / refresh для обоих ботов" п.1 —
+    "≥"-пометка PARTIAL больше НЕ показывается (PARTIAL по-прежнему
+    учитывается персистентно, см. TurkeyDebtRow.is_partial, просто больше
+    не выделяется визуально)."""
+    text = _format(_stats(), debt_car_count=1, debt_total_amount=Decimal(1250))
 
-    assert "Общая сумма: ≥ 1 250 ₺" in text
-
-
-# ---- format_debt_recency ----
-
-
-def test_debt_recency_today():
-    assert texts.format_debt_recency(_NOW, now=_NOW, tz=_TZ) == "сегодня"
+    assert "Общая сумма: 1 250 ₺" in text
+    assert "≥" not in text
 
 
-def test_debt_recency_yesterday():
-    from datetime import timedelta
-
-    assert texts.format_debt_recency(_NOW - timedelta(days=1), now=_NOW, tz=_TZ) == "вчера"
+# ---- format_debt_row: единый компактный формат CAR: OWNER: AMOUNT ----
 
 
-def test_debt_recency_plural_forms():
-    from datetime import timedelta
-
-    assert texts.format_debt_recency(_NOW - timedelta(days=2), now=_NOW, tz=_TZ) == "2 дня назад"
-    assert texts.format_debt_recency(_NOW - timedelta(days=5), now=_NOW, tz=_TZ) == "5 дней назад"
-    assert texts.format_debt_recency(_NOW - timedelta(days=18), now=_NOW, tz=_TZ) == "18 дней назад"
-    assert texts.format_debt_recency(_NOW - timedelta(days=21), now=_NOW, tz=_TZ) == "21 день назад"
-    assert texts.format_debt_recency(_NOW - timedelta(days=100), now=_NOW, tz=_TZ) == "100 дней назад"
-
-
-# ---- format_debt_row ----
-
-
-def test_debt_row_shows_car_owner_amount_and_recency():
+def test_debt_row_is_car_colon_owner_colon_amount():
     line = texts.format_debt_row(
         car_number="M295YB196", owner_display="@Mihailov_vm", total_amount=Decimal(2740),
-        is_partial=False, recency="сегодня",
     )
 
-    assert line == "🚗 M295YB196 — @Mihailov_vm — 2 740 ₺ · сегодня"
+    assert line == "🚗 M295YB196: @Mihailov_vm: 2 740 ₺"
 
 
-def test_debt_row_marks_partial_amount_and_label():
+def test_debt_row_has_no_partial_marker_or_recency():
     line = texts.format_debt_row(
         car_number="34ABC123", owner_display="@username", total_amount=Decimal(1250),
-        is_partial=True, recency="2 дня назад",
     )
 
-    assert line == "🚗 34ABC123 — @username — ≥ 1 250 ₺ · частично · 2 дня назад"
+    assert line == "🚗 34ABC123: @username: 1 250 ₺"
+    assert "≥" not in line
+    assert "частично" not in line
+    assert " — " not in line
+    assert "·" not in line
 
 
 # ---- format_debt_list_messages ----
@@ -152,16 +115,19 @@ def test_debt_list_empty_returns_no_messages():
     assert texts.format_debt_list_messages([]) == []
 
 
-def test_debt_list_header_and_order_preserved():
-    messages = texts.format_debt_list_messages(["🚗 A — @a — 100 ₺ · сегодня", "🚗 B — @b — 50 ₺ · вчера"])
+def test_debt_list_has_no_separate_header_and_preserves_order():
+    """См. задачу п.7 — пример показывает строки СРАЗУ после аггрегата,
+    без отдельного "Автомобили с задолженностью:"."""
+    messages = texts.format_debt_list_messages(["🚗 A: @a: 100 ₺", "🚗 B: @b: 50 ₺"])
 
     assert len(messages) == 1
-    assert messages[0].startswith("Автомобили с задолженностью:")
+    assert not messages[0].startswith("Автомобили")
+    assert messages[0] == "🚗 A: @a: 100 ₺\n🚗 B: @b: 50 ₺"
     assert messages[0].index("🚗 A") < messages[0].index("🚗 B")
 
 
 def test_long_debt_list_splits_safely_and_keeps_every_row():
-    rows = [f"🚗 CAR{i:04d} — @user{i} — {i} ₺ · сегодня" for i in range(500)]
+    rows = [f"🚗 CAR{i:04d}: @user{i}: {i} ₺" for i in range(500)]
 
     messages = texts.format_debt_list_messages(rows)
 
@@ -172,3 +138,26 @@ def test_long_debt_list_splits_safely_and_keeps_every_row():
     full_text = "\n".join(messages)
     for i in range(500):
         assert f"CAR{i:04d}" in full_text  # никто не потерян/не обрезан
+
+
+# ---- owner display name sanitization (задача п.2) ----
+
+
+def test_owner_display_sanitizes_dot_only_name():
+    display = texts.format_search_owner_display(first_name=".", last_name=None, username="Roma12312")
+    assert display == "@Roma12312"
+
+
+def test_owner_display_sanitizes_dash_and_underscore_names():
+    display = texts.format_search_owner_display(first_name="-", last_name="_", username="someone")
+    assert display == "@someone"
+
+
+def test_owner_display_keeps_real_name():
+    display = texts.format_search_owner_display(first_name="Иван", last_name="Иванов", username="ivan")
+    assert display == "Иван Иванов (@ivan)"
+
+
+def test_owner_display_dash_when_nothing_meaningful():
+    display = texts.format_search_owner_display(first_name=".", last_name="-", username=None)
+    assert display == "—"

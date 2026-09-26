@@ -1,12 +1,12 @@
 """Тесты ConversationController.handle_debt_refresh_pick/confirm/cancel/
-handle_debt_list_page и "🚨 Известные штрафы" в 📊 Статистика
-(@ProtocolGEbot, задача "OPTIONAL DEBT REFRESH") — сквозные, через
-РЕАЛЬНЫЙ ConversationController. Repository — настоящие (SQLite/tmp_path),
-FineProvider — лёгкий фейк.
+handle_debt_list_page и "🚨 Штрафы по последней проверке" в 📊 Статистика
+(@ProtocolGEbot, задача "manager Statistics / refresh для обоих ботов") —
+сквозные, через РЕАЛЬНЫЙ ConversationController. Repository — настоящие
+(SQLite/tmp_path), FineProvider — лёгкий фейк.
 """
 
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -62,6 +62,15 @@ def _record(*, car_number: str, fingerprint: str, amount: float) -> ParsedFineRe
     )
 
 
+def _set_amount(provider: _FakeProvider, *, car_number: str, amount: float, fingerprint: str) -> None:
+    if amount <= 0:
+        provider.records_by_car[car_number] = []
+    else:
+        provider.records_by_car[car_number] = [
+            _record(car_number=car_number, fingerprint=fingerprint, amount=amount)
+        ]
+
+
 class _Fixture:
     def __init__(self, tmp_path, *, with_debt_refresh: bool = True):
         self.db_path = tmp_path / "users.db"
@@ -83,7 +92,7 @@ class _Fixture:
             self.known_users_repository, self.subscription_repository, self.detected_fine_repository,
         )
         self.debt_refresh_service = (
-            DebtRefreshService(self.task_repository, self.detected_fine_repository, self.check_service)
+            DebtRefreshService(self.task_repository, self.check_service)
             if with_debt_refresh else None
         )
         self.controller = ConversationController(
@@ -117,22 +126,8 @@ class _Fixture:
         )
 
     async def seed_debt(self, task, *, amount: float, fingerprint: str = "fp-seed") -> None:
-        self.provider.records_by_car[task.car_number] = [
-            _record(car_number=task.car_number, fingerprint=fingerprint, amount=amount)
-        ]
+        _set_amount(self.provider, car_number=task.car_number, amount=amount, fingerprint=fingerprint)
         await self.check_service.check_task(task)
-
-    def backdate_last_successful_check(self, task_id: int, *, days_ago: int) -> None:
-        """Симулирует "проверено N дней назад" — record_successful_check()
-        сам всегда пишет CURRENT_TIMESTAMP, поэтому для теста recency
-        сдвигаем время назад напрямую в БД (та же техника, что и в
-        tests/test_turkey_bot_statistics_handler.py для finished_at)."""
-        when = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
-        self.task_repository._conn.execute(
-            "UPDATE fine_monitoring_tasks SET last_successful_checked_at = ? WHERE id = ?",
-            (when, task_id),
-        )
-        self.task_repository._conn.commit()
 
     def close(self):
         self.task_repository.close()
@@ -150,7 +145,7 @@ def fx(tmp_path):
     fixture.close()
 
 
-# ---- 📊 Статистика — компактный debt block (задача п.1) ----
+# ---- 📊 Статистика — compact debt block (задача п.1/п.12) ----
 
 
 async def test_statistics_shows_compact_debt_block_with_disclaimer(fx):
@@ -161,16 +156,25 @@ async def test_statistics_shows_compact_debt_block_with_disclaimer(fx):
         texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert "🚨 Известные штрафы" in reply.text
-    assert "Автомобилей со штрафами: 1" in reply.text
-    assert "Общая сумма найденных штрафов: 250 ₾" in reply.text
-    assert "ℹ️ Оплаченные штрафы могут учитываться в сумме." in reply.text
+    assert "🚨 Штрафы по последней проверке" in reply.text
+    assert "Автомобилей: 1" in reply.text
+    assert "Общая сумма: 250 ₾" in reply.text
     assert reply.debt_refresh_available is True
 
 
+async def test_statistics_open_makes_zero_provider_calls(fx):
+    task = fx.make_task("AA111AA")
+    await fx.seed_debt(task, amount=250)
+    fx.provider.requested_plates.clear()
+
+    await fx.controller.handle_text(
+        texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert fx.provider.requested_plates == []
+
+
 async def test_statistics_never_uses_misleading_debt_or_paid_wording(fx):
-    """См. задачу п.1 — police.ge не подтверждает оплату, поэтому этих
-    формулировок не должно быть нигде в тексте 📊 Статистика."""
     task = fx.make_task("AA111AA")
     await fx.seed_debt(task, amount=250)
 
@@ -203,30 +207,61 @@ async def test_ordinary_user_does_not_see_debt_block(fx):
         texts.STATISTICS_LABEL, chat_id=_ORDINARY_ID, telegram_user_id=_ORDINARY_ID, username=None,
     )
 
-    assert "Известные штрафы" not in reply.text
+    assert "Штрафы по последней проверке" not in reply.text
     assert reply.debt_refresh_available is False
 
 
-# ---- itemized-список (задача п.2) ----
+# ---- единый формат строки CAR: OWNER: AMOUNT (задача п.1/п.13) ----
 
 
-async def test_itemized_list_shows_all_known_debt_cars(fx):
-    task_a = fx.make_task("AA111AA")
-    task_b = fx.make_task("BB222BB")
-    await fx.seed_debt(task_a, amount=120)
-    await fx.seed_debt(task_b, amount=80)
+async def test_row_format_is_car_colon_owner_colon_amount(fx):
+    task = fx.make_task("AA111AA")
+    await fx.seed_debt(task, amount=800)
+    fx.add_subscription(task, telegram_user_id=1)
+    fx.record_known(telegram_user_id=1, username="ao777oa777")
 
     reply = await fx.controller.handle_text(
         texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert "Автомобили со штрафами:" in reply.text
-    assert "AA111AA" in reply.text
-    assert "BB222BB" in reply.text
+    assert "🚗 AA111AA: @ao777oa777: 800 ₾" in reply.text
 
 
-async def test_itemized_list_owner_display_name_and_username(fx):
+async def test_row_has_no_checked_at_date_or_today_yesterday_wording(fx):
+    task = fx.make_task("BB222BB")
+    await fx.seed_debt(task, amount=50)
+
+    reply = await fx.controller.handle_text(
+        texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    row_line = next(line for line in reply.text.splitlines() if line.startswith("🚗 BB222BB"))
+    assert "сегодня" not in row_line
+    assert "вчера" not in row_line
+    assert " — " not in row_line
+    assert "· " not in row_line
+    assert row_line == "🚗 BB222BB: —: 50 ₾"
+
+
+async def test_row_never_shows_repeated_dash_dash_dash(fx):
     task = fx.make_task("CC333CC")
+    await fx.seed_debt(task, amount=50)
+    # Ни add_subscription, ни record_known не вызываются вовсе.
+
+    reply = await fx.controller.handle_text(
+        texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert "🚗 CC333CC: —: 50 ₾" in reply.text
+    assert "— — —" not in reply.text
+    assert "None" not in reply.text
+
+
+# ---- owner display (задача п.2) ----
+
+
+async def test_owner_display_name_and_username(fx):
+    task = fx.make_task("DD444DD")
     await fx.seed_debt(task, amount=120)
     fx.add_subscription(task, telegram_user_id=1)
     fx.record_known(telegram_user_id=1, username="DamirTat", first_name="Дамир", last_name="Татаров")
@@ -235,11 +270,11 @@ async def test_itemized_list_owner_display_name_and_username(fx):
         texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert "🚗 CC333CC — Дамир Татаров (@DamirTat) — 120 ₾ · сегодня" in reply.text
+    assert "🚗 DD444DD: Дамир Татаров (@DamirTat): 120 ₾" in reply.text
 
 
-async def test_itemized_list_owner_display_username_only(fx):
-    task = fx.make_task("DD444DD")
+async def test_owner_display_username_only(fx):
+    task = fx.make_task("EE555EE")
     await fx.seed_debt(task, amount=50)
     fx.add_subscription(task, telegram_user_id=1)
     fx.record_known(telegram_user_id=1, username="DamirTat")
@@ -248,11 +283,11 @@ async def test_itemized_list_owner_display_username_only(fx):
         texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert "🚗 DD444DD — @DamirTat — 50 ₾ · сегодня" in reply.text
+    assert "🚗 EE555EE: @DamirTat: 50 ₾" in reply.text
 
 
-async def test_itemized_list_owner_display_name_only(fx):
-    task = fx.make_task("EE555EE")
+async def test_owner_display_name_only(fx):
+    task = fx.make_task("FF666FF")
     await fx.seed_debt(task, amount=50)
     fx.add_subscription(task, telegram_user_id=1)
     fx.record_known(telegram_user_id=1, first_name="Иван", last_name="Иванов")
@@ -261,69 +296,42 @@ async def test_itemized_list_owner_display_name_only(fx):
         texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert "🚗 EE555EE — Иван Иванов — 50 ₾ · сегодня" in reply.text
+    assert "🚗 FF666FF: Иван Иванов: 50 ₾" in reply.text
 
 
-async def test_itemized_list_owner_display_dash_when_neither(fx):
-    task = fx.make_task("FF666FF")
-    await fx.seed_debt(task, amount=50)
-    # Ни add_subscription, ни record_known не вызываются вовсе.
-
-    reply = await fx.controller.handle_text(
-        texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
-    )
-
-    assert "🚗 FF666FF — — — 50 ₾ · сегодня" in reply.text
-    assert "None" not in reply.text
-
-
-async def test_itemized_list_recency_absolute_date_when_not_today(fx):
+async def test_owner_display_dot_name_falls_back_to_username_only(fx):
+    """См. задачу п.2 — пример ". (@Roma12312)" должен стать "@Roma12312",
+    username при этом НЕ теряется."""
     task = fx.make_task("GG777GG")
-    await fx.seed_debt(task, amount=50)
-    fx.backdate_last_successful_check(task.id, days_ago=3)
+    await fx.seed_debt(task, amount=350)
+    fx.add_subscription(task, telegram_user_id=1)
+    fx.record_known(telegram_user_id=1, username="Roma12312", first_name=".")
 
     reply = await fx.controller.handle_text(
         texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    expected_date = (datetime.now(timezone.utc) - timedelta(days=3)).astimezone(_TBILISI).strftime("%d.%m")
-    assert f"🚗 GG777GG — — — 50 ₾ · {expected_date}" in reply.text
+    assert "🚗 GG777GG: @Roma12312: 350 ₾" in reply.text
+    assert ". (@Roma12312)" not in reply.text
 
 
-async def test_itemized_list_sorted_by_amount_desc(fx):
-    small = fx.make_task("HH888HH")
-    big = fx.make_task("II999II")
-    await fx.seed_debt(small, amount=10)
-    await fx.seed_debt(big, amount=500)
-
-    reply = await fx.controller.handle_text(
-        texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
-    )
-
-    assert reply.text.index("II999II") < reply.text.index("HH888HH")
-
-
-async def test_itemized_list_tie_break_by_more_recent_check_first(fx):
-    older = fx.make_task("JJ000JJ")
-    newer = fx.make_task("KK111KK")
-    await fx.seed_debt(older, amount=100)
-    await fx.seed_debt(newer, amount=100)
-    fx.backdate_last_successful_check(older.id, days_ago=5)
-    # newer оставлен "сегодня" (только что записан seed_debt через check_task,
-    # но у него нет last_successful_checked_at, т.к. seed_debt не вызывает
-    # DebtRefreshService — используется fallback last_seen_at, который тоже
-    # "сегодня").
+async def test_owner_display_dash_username_and_underscore_sanitized(fx):
+    task = fx.make_task("HH888HH")
+    await fx.seed_debt(task, amount=10)
+    fx.add_subscription(task, telegram_user_id=1)
+    fx.record_known(telegram_user_id=1, username="someone", first_name="-", last_name="_")
 
     reply = await fx.controller.handle_text(
         texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert reply.text.index("KK111KK") < reply.text.index("JJ000JJ")
+    assert "🚗 HH888HH: @someone: 10 ₾" in reply.text
+
+
+# ---- pagination продолжает работать (задача п.7/п.13) ----
 
 
 async def test_debt_list_pagination_does_not_exceed_telegram_limit(fx):
-    """35 машин -> 4 страницы по 10 (см. _DEBT_LIST_PAGE_SIZE) — ни одна
-    машина не теряется молча, каждое сообщение помещается в лимит."""
     for i in range(35):
         task = fx.make_task(f"P{i:04d}AA")
         await fx.seed_debt(task, amount=10 + i, fingerprint=f"fp-{i}")
@@ -334,8 +342,6 @@ async def test_debt_list_pagination_does_not_exceed_telegram_limit(fx):
     assert len(reply.text) <= 4096
     assert reply.debt_list_total_pages == 4
     assert reply.debt_list_page == 0
-    first_page_cars = sum(1 for i in range(35) if f"P{i:04d}AA" in reply.text)
-    assert first_page_cars == 10
 
     seen_cars: set[str] = set()
     for page in range(reply.debt_list_total_pages):
@@ -345,7 +351,7 @@ async def test_debt_list_pagination_does_not_exceed_telegram_limit(fx):
             plate = f"P{i:04d}AA"
             if plate in page_reply.text:
                 seen_cars.add(plate)
-    assert len(seen_cars) == 35  # ни одна машина не потеряна/не обрезана
+    assert len(seen_cars) == 35
 
 
 async def test_debt_list_page_ordinary_user_forbidden(fx):
@@ -366,7 +372,6 @@ async def test_pick_with_zero_debt_cars_makes_no_network_calls(fx):
     reply = fx.controller.handle_debt_refresh_pick(telegram_user_id=_TRUSTED_ID)
 
     assert reply.text == texts.DEBT_REFRESH_NONE_TEXT
-    assert "нет" in reply.text
     assert reply.debt_refresh_confirm is False
     assert fx.provider.requested_plates == []
 
@@ -385,15 +390,12 @@ async def test_pick_with_debt_cars_shows_count_prompt_without_checking(fx):
     assert fx.provider.requested_plates == []
 
 
-# ---- button label (задача п.3) ----
-
-
 def test_debt_refresh_button_label_reflects_new_wording():
     assert texts.DEBT_REFRESH_BUTTON_LABEL == "🔄 Проверить авто со штрафами"
     assert "задолженност" not in texts.DEBT_REFRESH_BUTTON_LABEL.lower()
 
 
-# ---- handle_debt_refresh_confirm / summary (задача п.4) ----
+# ---- handle_debt_refresh_confirm — result + stateful persistence (задача п.5/п.7/п.8) ----
 
 
 async def test_ordinary_user_cannot_confirm_debt_refresh(fx):
@@ -407,35 +409,56 @@ async def test_ordinary_user_cannot_confirm_debt_refresh(fx):
     assert fx.provider.requested_plates == []
 
 
-async def test_confirm_runs_refresh_and_returns_manager_summary(fx):
-    increased_task = fx.make_task("EE555EE")
-    unchanged_task = fx.make_task("FF666FF")
-    await fx.seed_debt(increased_task, amount=40, fingerprint="fp-1")
-    await fx.seed_debt(unchanged_task, amount=70, fingerprint="fp-2")
-    fx.provider.requested_plates.clear()  # seed_debt() сам дёрнул provider — не в счёт
-    # increased_task получит ещё один штраф на этой проверке.
-    fx.provider.records_by_car[increased_task.car_number] = [
-        _record(car_number=increased_task.car_number, fingerprint="fp-1", amount=40),
-        _record(car_number=increased_task.car_number, fingerprint="fp-1b", amount=15),
-    ]
+async def test_confirm_result_has_no_increased_unchanged_analytics(fx):
+    """См. задачу п.7 — refresh summary больше НЕ показывает "Найдены
+    новые штрафы"/"Без новых штрафов": только "Проверено"/"Не удалось
+    проверить"."""
+    task = fx.make_task("EE555EE")
+    await fx.seed_debt(task, amount=40, fingerprint="fp-1")
 
     reply = await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
 
     assert "🔄 Проверка завершена" in reply.text
-    assert "Проверено: 2" in reply.text
-    assert "🚨 Найдены новые штрафы: 1" in reply.text
-    assert "✅ Без новых штрафов: 1" in reply.text
+    assert "Проверено: 1" in reply.text
     assert "⚠️ Не удалось проверить: 0" in reply.text
+    assert "Найдены новые штрафы" not in reply.text
+    assert "Без новых штрафов" not in reply.text
     assert "Оплачено" not in reply.text
-    assert "Остался долг" not in reply.text
-    assert reply.show_main_menu is True
-    assert sorted(fx.provider.requested_plates) == ["EE555EE", "FF666FF"]
 
 
-async def test_confirm_lists_failed_car_numbers(fx):
+async def test_confirm_shows_updated_list_800_to_500(fx):
+    task = fx.make_task("FF666FF")
+    await fx.seed_debt(task, amount=800, fingerprint="fp-1")
+    _set_amount(fx.provider, car_number="FF666FF", amount=500, fingerprint="fp-1")
+
+    reply = await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
+
+    assert "🚨 Штрафы по последней проверке" in reply.text
+    assert "Автомобилей: 1" in reply.text
+    assert "Общая сумма: 500 ₾" in reply.text
+    assert "🚗 FF666FF: —: 500 ₾" in reply.text
+    assert "800" not in reply.text
+
+
+async def test_confirm_450_to_0_disappears_from_result_and_next_statistics(fx):
     task = fx.make_task("GG777GG")
-    await fx.seed_debt(task, amount=40)
-    fx.provider.records_by_car.pop(task.car_number, None)
+    await fx.seed_debt(task, amount=450, fingerprint="fp-1")
+    _set_amount(fx.provider, car_number="GG777GG", amount=0, fingerprint="fp-1")
+
+    confirm_reply = await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
+    assert "GG777GG" not in confirm_reply.text
+    assert "Автомобилей: 0" in confirm_reply.text
+
+    stats_reply = await fx.controller.handle_text(
+        texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+    assert "GG777GG" not in stats_reply.text
+    assert "Автомобилей: 0" in stats_reply.text
+
+
+async def test_error_preserves_previous_reliable_state_in_confirm_result(fx):
+    task = fx.make_task("HH888HH")
+    await fx.seed_debt(task, amount=2740, fingerprint="fp-1")
 
     class _ErrorProvider:
         async def search_by_plate(self, plate: str):
@@ -447,7 +470,8 @@ async def test_confirm_lists_failed_car_numbers(fx):
     reply = await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
 
     assert "⚠️ Не удалось проверить: 1" in reply.text
-    assert "GG777GG" in reply.text
+    assert "HH888HH" in reply.text  # упомянута в failed-списке
+    assert "🚗 HH888HH: —: 2740 ₾" in reply.text  # осталась в списке со СТАРОЙ суммой
 
 
 async def test_confirm_with_no_known_debt_checks_nothing(fx):
@@ -457,11 +481,32 @@ async def test_confirm_with_no_known_debt_checks_nothing(fx):
     assert fx.provider.requested_plates == []
 
 
+# ---- next-refresh candidate logic на уровне conversation (задача п.5/п.9) ----
+
+
+async def test_next_refresh_candidates_exclude_car_that_became_zero(fx):
+    task_a = fx.make_task("A1111AA")
+    task_b = fx.make_task("B2222BB")
+    await fx.seed_debt(task_a, amount=800, fingerprint="fp-a")
+    await fx.seed_debt(task_b, amount=450, fingerprint="fp-b")
+    _set_amount(fx.provider, car_number="A1111AA", amount=500, fingerprint="fp-a")
+    _set_amount(fx.provider, car_number="B2222BB", amount=0, fingerprint="fp-b")
+
+    await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
+
+    fx.provider.requested_plates.clear()
+    pick_reply = fx.controller.handle_debt_refresh_pick(telegram_user_id=_TRUSTED_ID)
+    assert "🔄 Будет проверено автомобилей: 1" in pick_reply.text
+
+    await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
+    assert fx.provider.requested_plates == ["A1111AA"]
+
+
 # ---- handle_debt_refresh_cancel ----
 
 
 async def test_cancel_returns_cancelled_text_without_checking_anything(fx):
-    task = fx.make_task("HH888HH")
+    task = fx.make_task("II999II")
     await fx.seed_debt(task, amount=40)
     fx.provider.requested_plates.clear()
 

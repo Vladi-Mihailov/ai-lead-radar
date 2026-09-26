@@ -236,6 +236,19 @@ class FineCheckService:
             current_fines.append(event)
 
         self._task_repository.record_check_result(task.id, last_check_status="ok", last_error=None)
+        # Единственная authoritative точка persistence "что показала
+        # последняя УСПЕШНАЯ проверка" (см. задачу "manager Statistics /
+        # refresh для обоих ботов" п.3/п.11) — current_fines, а НЕ
+        # detected_fines-история (см. FineMonitoringTaskRepository.
+        # record_successful_check/list_tasks_with_known_debt). ЛЮБОЙ
+        # вызывающий код (мониторинг/manual "Проверить сейчас"/Add Car/
+        # manager refresh) получает эту persistence бесплатно, без
+        # отдельной реализации в каждом из них. COALESCE(amount, 0) — тот
+        # же принцип, что и везде в проекте (fine без распознанной суммы
+        # не должен молча занижать сумму, но и не должен ронять всю
+        # проверку — редкий defensive-случай, см. reader/fines/parser.py).
+        total_amount = sum((fine.amount or 0.0) for fine in current_fines)
+        self._task_repository.record_successful_check(task.id, total_amount=total_amount)
 
         return CheckResult(
             status="ok",

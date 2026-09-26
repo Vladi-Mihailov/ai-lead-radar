@@ -44,11 +44,23 @@ class FineMonitoringTask:
     monitoring_scope: FineMonitoringScope = "operator"
     # Последний УСПЕШНЫЙ check_task() (см. reader/fines/task_repository.py::
     # record_successful_check) — в отличие от last_checked_at, НЕ
-    # перезаписывается на ERROR (см. reader/public_bot/debt_refresh_service.py:
-    # "🔄 Обновить задолженности" — ERROR не должен стирать момент
-    # последнего достоверного состояния). Default None сохраняет
-    # существующие вызовы FineMonitoringTask(...) без правки.
+    # перезаписывается на ERROR (см. задачу "manager Statistics / refresh
+    # для обоих ботов" — ERROR не должен стирать момент последнего
+    # достоверного состояния). Default None сохраняет существующие вызовы
+    # FineMonitoringTask(...) без правки.
     last_successful_checked_at: datetime | None = None
+    # Сумма ("что показала последняя УСПЕШНАЯ проверка") — ЕДИНСТВЕННЫЙ
+    # authoritative источник "🚨 Штрафы по последней проверке" (см. задачу).
+    # Пишется ИСКЛЮЧИТЕЛЬНО FineCheckService.check_task() (общий
+    # authoritative layer для ЛЮБОГО пути проверки — мониторинг/manual/
+    # Add Car/manager refresh, см. задачу п.11 "не реализовывать persistence
+    # отдельно в каждом handler"), НИКОГДА не вычисляется как сумма истории
+    # detected_fines (это отдельная, append-only history/dedup таблица, см.
+    # задачу п.3). ERROR никогда не трогает это поле — check_task() просто
+    # не доходит до записи при ошибке. None — ни одной успешной проверки
+    # ПОСЛЕ появления этого поля ещё не было (см. задачу п.10: миграция НЕ
+    # backfill'ит его из старой detected_fines-истории).
+    last_successful_total_amount: float | None = None
 
 
 @dataclass(frozen=True)
@@ -88,20 +100,20 @@ class DetectedFine:
 
 
 @dataclass(frozen=True)
-class TaskFineTotal:
-    """Сумма ВСЕХ когда-либо обнаруженных detected_fines одной задачи
-    мониторинга (см. reader/public_bot/debt_refresh_service.py — "🚨
-    Известные штрафы"). police.ge/наша БД НЕ отслеживают оплату (см.
-    reader/fines/payment_status.py: "research-only, NOT wired into
-    production" — задача, штраф из которой давно оплачен, продолжает
-    учитываться здесь навсегда). Поэтому это "известные штрафы", а НЕ
-    "текущий долг" — total_amount монотонно не убывает при повторных
-    проверках, может расти при появлении новых штрафов."""
+class FineTaskDebtSnapshot:
+    """Одна строка "🚨 Штрафы по последней проверке" — ЧТО ПОКАЗАЛА
+    последняя УСПЕШНАЯ проверка (см. FineMonitoringTask.
+    last_successful_total_amount/last_successful_checked_at,
+    FineMonitoringTaskRepository.list_tasks_with_known_debt()), а НЕ сумма
+    истории detected_fines. Может уменьшиться или стать 0 при следующей
+    успешной проверке (в этом случае задача просто не попадёт в
+    list_tasks_with_known_debt() снова) — в отличие от старой,
+    монотонно-неубывающей "известные штрафы"-модели."""
 
     task_id: int
     car_number: str
     total_amount: float
-    last_seen_at: datetime
+    checked_at: datetime
 
 
 @dataclass(frozen=True)

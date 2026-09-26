@@ -601,10 +601,27 @@ class ConversationController:
         # сообщение — она не пропадает от того, что ЭТО сообщение её не
         # переотправляет (см. handle_debt_refresh_cancel/confirm ниже —
         # они возвращают show_main_menu=True отдельным сообщением).
-        debt = self._debt_refresh.get_debt_summary()
-        display_rows = self._debt_refresh.get_debt_rows_for_display()
+        debt_text, page, total_pages = self._build_debt_section(debt_page=debt_page)
+        text = f"{texts.format_statistics_header(stats)}\n\n{debt_text}"
 
-        text = texts.format_statistics(stats, debt=debt)
+        return BotReply(
+            text=text, debt_refresh_available=True, debt_list_page=page, debt_list_total_pages=total_pages,
+        )
+
+    def _build_debt_section(self, *, debt_page: int = 0) -> tuple[str, int | None, int | None]:
+        """ВСЕГДА заново перечитывает persisted state из БД (см. задачу
+        п.8: "Statistics после refresh: заново query из DB, НЕ показывать
+        старый cached UI") — переиспользуется И обычным открытием 📊
+        Статистика (_format_statistics_reply), И результатом "🔄 Проверить
+        авто со штрафами" (см. handle_debt_refresh_confirm), поэтому обе
+        точки ВСЕГДА показывают один и тот же, только что построенный
+        список — self._debt_refresh НЕ None здесь гарантируется вызывающим
+        кодом (оба caller'а уже проверили это заранее)."""
+        assert self._debt_refresh is not None
+        debt = self._debt_refresh.get_debt_summary()
+        display_rows = self._debt_refresh.list_debt_rows()
+
+        text = texts.format_debt_summary_block(debt)
         page: int | None = None
         total_pages: int | None = None
         if display_rows:
@@ -612,7 +629,6 @@ class ConversationController:
             page = max(0, min(debt_page, total_pages - 1))
             start = page * _DEBT_LIST_PAGE_SIZE
             page_rows = display_rows[start:start + _DEBT_LIST_PAGE_SIZE]
-            now = datetime.now(timezone.utc)
             row_lines = [
                 texts.format_debt_row(
                     car_number=row.car_number,
@@ -620,16 +636,13 @@ class ConversationController:
                         task_id=row.task_id, car_number=row.car_number,
                     ),
                     total_amount=row.total_amount,
-                    recency=texts.format_debt_recency(row.checked_at, now=now, tz=self._tz),
                 )
                 for row in page_rows
             ]
             section = texts.format_debt_list_section(row_lines, page=page, total_pages=total_pages)
             text = f"{text}\n\n{section}"
 
-        return BotReply(
-            text=text, debt_refresh_available=True, debt_list_page=page, debt_list_total_pages=total_pages,
-        )
+        return text, page, total_pages
 
     def _debt_row_owner_display(self, *, task_id: int, car_number: str) -> str:
         """Владелец ОДНОЙ конкретной задачи (task_id), а не car_number
@@ -706,7 +719,17 @@ class ConversationController:
         except RefreshAlreadyInProgressError:
             return BotReply(text=texts.DEBT_REFRESH_IN_PROGRESS_TEXT, show_main_menu=True)
 
-        return BotReply(text=texts.format_debt_refresh_summary(outcome), show_main_menu=True)
+        # См. задачу п.8: "Statistics после refresh: заново query из DB,
+        # НЕ показывать старый cached UI" — _build_debt_section() читает
+        # persisted state ЗАНОВО (provider checks уже завершились и
+        # персистентны к этому моменту, см. DebtRefreshService.refresh()/
+        # FineCheckService.check_task()), поэтому здесь виден РОВНО тот
+        # же список, что покажет следующее открытие 📊 Статистика.
+        debt_text, page, total_pages = self._build_debt_section()
+        text = f"{texts.format_debt_refresh_summary(outcome)}\n\n{debt_text}"
+        return BotReply(
+            text=text, debt_refresh_available=True, debt_list_page=page, debt_list_total_pages=total_pages,
+        )
 
     def _format_trusted_tasks_page_reply(self, page: int) -> BotReply:
         """"📋 Мои авто" для trusted-оператора — ОДНА страница ВСЕХ

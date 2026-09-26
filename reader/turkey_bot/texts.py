@@ -16,7 +16,7 @@ description) — тихий fallback на турецкий текст, если 
 не выполнялся (не пустая строка, не ошибка, см. conversation.py::
 _translate_fines)."""
 
-from datetime import datetime
+import re
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -678,37 +678,15 @@ def format_has_debt_messages(plate: str, fines: tuple[GibFineRecord, ...]) -> li
     return _split_into_telegram_messages(blocks)
 
 
-def format_statistics(
-    stats: TurkeyStatistics, *, debt_car_count: int, debt_total_amount: Decimal, debt_has_partial: bool,
-) -> str:
-    """См. reader/turkey_bot/statistics_service.py::
-    TurkeyStatisticsService — теперь на основе unified-check (все три
-    провайдера одинаково, см. design report "Перестроить UX Turkey test
-    bot" п.13), плюс мониторинг-метрики (active_monitoring_subscriptions/
-    manual_checks/scheduled_checks/provider_error_counts).
-
-    Список username УБРАН целиком (см. задачу "доработать 📊 Статистика
-    Turkey bot" п.1 — для просмотра конкретных пользователей есть
-    "🚗 Мои авто"/"🔎 Поиск", агрегаты 👥 Пользователи остаются как были).
-
-    Старый блок "🚨 С задолженностью: N / ✅ Без задолженности: N / ⚠️
-    Частично: N / ❌ Ошибка: N" УБРАН (см. задачу п.10) — он считал
-    ИСТОРИЧЕСКИЕ turkey_check_runs (сколько ПРОВЕРОК когда-либо имело
-    каждый статус, включая повторные проверки одной и той же машины), а
-    не текущее число машин с задолженностью — вводил в заблуждение как
-    "снимок текущего состояния". Заменён на честный
-    "🚨 Задолженность по последней проверке" (debt_car_count/
-    debt_total_amount — см. TurkeyStatisticsService.get_debt_rows(),
-    ТОЛЬКО последний ДОСТОВЕРНЫЙ, не-ERROR результат на машину) сразу
-    после блока 👥 Пользователи. debt_has_partial — хотя бы одна из машин
-    в списке PARTIAL (см. задачу п.5: "не выдавать PARTIAL-сумму за
-    гарантированно полную") — общая сумма тогда тоже помечается "≥",
-    т.к. частично неизвестна её точная величина."""
-    provider_names = {"gib": "GİB", "avrasya": "Avrasya", "kgm": "KGM"}
-    debt_total_text = _format_try_amount(debt_total_amount)
-    if debt_has_partial:
-        debt_total_text = f"≥ {debt_total_text}"
-    lines = [
+def format_statistics_header(stats: TurkeyStatistics) -> str:
+    """"👥 Пользователи" — верхняя часть "📊 Статистика", ПЕРЕД debt-блоком
+    (см. format_debt_summary_block/format_statistics_footer ниже) —
+    вынесена отдельно, чтобы ConversationController мог переиспользовать
+    ТОЛЬКО debt-блок в результате "🔄 Проверить авто с задолженностью" (см.
+    задачу "manager Statistics / refresh для обоих ботов" п.7 — там НЕ
+    нужны 👥 Пользователи/🔎 Проверки, только сам факт проверки + актуальный
+    debt-блок)."""
+    return "\n".join([
         STATISTICS_LABEL,
         "",
         "👥 Пользователи",
@@ -716,11 +694,34 @@ def format_statistics(
         f"Новых сегодня: {stats.new_users_today}",
         f"Новых за 7 дней: {stats.new_users_7d}",
         f"Новых за 30 дней: {stats.new_users_30d}",
-        "",
+    ])
+
+
+def format_debt_summary_block(*, debt_car_count: int, debt_total_amount: Decimal) -> str:
+    """"🚨 Задолженность по последней проверке" (debt_car_count/
+    debt_total_amount — см. TurkeyStatisticsService.get_debt_rows(),
+    ТОЛЬКО последний ДОСТОВЕРНЫЙ, не-ERROR результат на машину).
+    Переиспользуется И обычным 📊 Статистика, И результатом "🔄 Проверить
+    авто с задолженностью" (см. ConversationController._build_debt_section)
+    — один и тот же блок в обоих местах. См. задачу "manager Statistics /
+    refresh для обоих ботов" — единый компактный формат для Georgia и
+    Turkey: БЕЗ "≥"-пометки PARTIAL (PARTIAL по-прежнему учитывается в
+    персистентном состоянии, см. get_debt_rows()/TurkeyDebtRow.is_partial,
+    просто больше не выделяется визуально)."""
+    return "\n".join([
         "🚨 Задолженность по последней проверке",
         f"Автомобилей: {debt_car_count}",
-        f"Общая сумма: {debt_total_text}",
-        "",
+        f"Общая сумма: {_format_try_amount(debt_total_amount)}",
+    ])
+
+
+def format_statistics_footer(stats: TurkeyStatistics) -> str:
+    """"🔎 Проверки"/подписки/ошибки провайдеров — НИЖНЯЯ часть "📊
+    Статистика", ПОСЛЕ debt-блока — НЕ показывается в результате "🔄
+    Проверить авто с задолженностью" (см. задачу п.7 — там только факт
+    проверки + debt-блок, без остальной статистики)."""
+    provider_names = {"gib": "GİB", "avrasya": "Avrasya", "kgm": "KGM"}
+    lines = [
         "🔎 Проверки",
         f"Всего: {stats.total_checks}",
         f"Сегодня: {stats.checks_today}",
@@ -738,73 +739,52 @@ def format_statistics(
     return "\n".join(lines)
 
 
-def _days_word(n: int) -> str:
-    """Русское склонение "день/дня/дней" (см. format_debt_recency)."""
-    if 11 <= n % 100 <= 14:
-        return "дней"
-    last_digit = n % 10
-    if last_digit == 1:
-        return "день"
-    if 2 <= last_digit <= 4:
-        return "дня"
-    return "дней"
-
-
-def format_debt_recency(checked_at: datetime, *, now: datetime, tz: ZoneInfo) -> str:
-    """"сегодня"/"вчера"/"N дней назад" (см. задачу "доработать 📊
-    Статистика Turkey bot" п.3: "не вводим временное ограничение... но
-    рядом обязательно показываем давность") — по business-timezone (та
-    же tz, что и "Новых сегодня/за 7 дней/за 30 дней" в остальной
-    статистике), а не UTC/Europe/Istanbul напрямую. Без верхнего предела
-    на days_ago — задача явно не просит переключаться на абсолютную дату
-    после какого-то порога, "N дней назад" остаётся честным для любого N."""
-    checked_date = checked_at.astimezone(tz).date()
-    today = now.astimezone(tz).date()
-    days_ago = (today - checked_date).days
-    if days_ago <= 0:
-        return "сегодня"
-    if days_ago == 1:
-        return "вчера"
-    return f"{days_ago} {_days_word(days_ago)} назад"
-
-
-def format_debt_row(
-    *, car_number: str, owner_display: str, total_amount: Decimal, is_partial: bool, recency: str,
+def format_statistics(
+    stats: TurkeyStatistics, *, debt_car_count: int, debt_total_amount: Decimal,
 ) -> str:
-    """Одна строка "Автомобили с задолженностью:" (см. задачу п.2/п.5) —
-    total_amount — уже готовый authoritative unified total (см.
-    TurkeyDebtRow), НЕ пересчитывается здесь. is_partial добавляет "≥"
-    перед суммой и "· частично" в конце строки — та же гарантия, что и у
-    debt_has_partial в format_statistics: частичная сумма никогда не
-    выглядит как гарантированно полная."""
+    """См. reader/turkey_bot/statistics_service.py::
+    TurkeyStatisticsService — теперь на основе unified-check (все три
+    провайдера одинаково, см. design report "Перестроить UX Turkey test
+    bot" п.13), плюс мониторинг-метрики.
+
+    Список username УБРАН целиком (см. задачу "доработать 📊 Статистика
+    Turkey bot" п.1 — для просмотра конкретных пользователей есть
+    "🚗 Мои авто"/"🔎 Поиск", агрегаты 👥 Пользователи остаются как были)."""
+    return "\n\n".join([
+        format_statistics_header(stats),
+        format_debt_summary_block(debt_car_count=debt_car_count, debt_total_amount=debt_total_amount),
+        format_statistics_footer(stats),
+    ])
+
+
+def format_debt_row(*, car_number: str, owner_display: str, total_amount: Decimal) -> str:
+    """"🚗 CAR: owner: amount ₺" (см. задачу "manager Statistics / refresh
+    для обоих ботов" п.1 — единый компактный формат, тот же, что и у
+    Georgia, БЕЗ даты/checked_at/"сегодня"/"вчера"/"N дней назад" и БЕЗ
+    " — "-разделителей/"≥"/"· частично"). total_amount — уже готовый
+    authoritative unified total (см. TurkeyDebtRow), НЕ пересчитывается
+    здесь."""
     amount_text = _format_try_amount(total_amount)
-    if is_partial:
-        amount_text = f"≥ {amount_text}"
-    line = f"🚗 {car_number} — {owner_display} — {amount_text}"
-    if is_partial:
-        line += " · частично"
-    return f"{line} · {recency}"
+    return f"🚗 {car_number}: {owner_display}: {amount_text}"
 
 
 def format_debt_list_messages(rows: list[str]) -> list[str]:
-    """Список ВСЕХ автомобилей с задолженностью (см. задачу п.2/п.11:
-    "покажи ВСЕ, но безопасно относительно Telegram лимита, не обрезай
-    молча") — тот же packing-приём, что раньше использовался для списка
-    username (см. задачу п.1 — та функция удалена вместе со списком):
-    заголовок только в первом сообщении, каждая строка — атомарная
-    единица (никогда не разрывается пополам). [] — если задолженностей
-    нет вовсе (см. вызывающий код — тогда это сообщение не отправляется
-    вообще, а не пустой заголовок без единой строки)."""
+    """Список ВСЕХ автомобилей с задолженностью (см. задачу п.7: "если
+    список большой — сохранить существующую pagination") — тот же
+    packing-приём, что и раньше: каждая строка — атомарная единица
+    (никогда не разрывается пополам). БЕЗ отдельного заголовка (см.
+    задачу п.7 — пример показывает строки СРАЗУ после аггрегата, без
+    "Автомобили с задолженностью:"). [] — если задолженностей нет вовсе
+    (см. вызывающий код — тогда это сообщение не отправляется вообще)."""
     if not rows:
         return []
 
-    header = "Автомобили с задолженностью:"
     messages: list[str] = []
-    current: list[str] = [header]
-    current_len = len(header)
+    current: list[str] = []
+    current_len = 0
     for row in rows:
-        addition = len(row) + 1  # +1 = "\n"
-        if current_len + addition > _TELEGRAM_MESSAGE_LIMIT:
+        addition = len(row) + (1 if current else 0)  # +1 = "\n", кроме первой строки сообщения
+        if current and current_len + addition > _TELEGRAM_MESSAGE_LIMIT:
             messages.append("\n".join(current))
             current = []
             current_len = 0
@@ -837,28 +817,23 @@ def debt_refresh_confirm_button_label(car_count: int) -> str:
 
 
 def format_debt_refresh_summary(outcome: TurkeyRefreshOutcome) -> str:
-    """См. задачу "RESULT"/"СЕМАНТИКА" — В ОТЛИЧИЕ от Georgia (см.
-    reader/public_bot/texts.py::format_debt_refresh_summary), Turkey
-    unified check — authoritative live-источник оплаты, поэтому здесь
-    "✅ Задолженность погашена"/"🚨 Задолженность осталась" — ЧЕСТНЫЕ
-    формулировки (не "оплачено"/"без изменений", как у Georgia, где
-    payment status неизвестен, см. TurkeyDebtRefreshService модуль
-    docstring). "⚠️ Не удалось проверить полностью" объединяет ERROR И
-    PARTIAL (см. задачу "PARTIAL": ни то, ни другое не гарантированно
-    полная проверка) — 💰 Было/Стало показываются, ТОЛЬКО если сумма
-    реально изменилась (см. задачу: "можно дополнительно показать")."""
+    """См. задачу "manager Statistics / refresh для обоих ботов" п.7 —
+    БЕЗ "Задолженность погашена"/"Задолженность осталась"/Было-Стало-
+    аналитики: только факт проверки, актуальный список — заново
+    построенный "🚨 Задолженность по последней проверке" блок (см.
+    ConversationController._build_debt_section), склеиваемый вызывающим
+    кодом ПОСЛЕ этого текста, а не здесь (тот же принцип, что и у Georgia,
+    см. reader/public_bot/texts.py::format_debt_refresh_summary — единый
+    формат результата для обеих стран)."""
     lines = [
         "🔄 Проверка завершена",
         "",
-        f"Проверено автомобилей: {outcome.checked}",
-        f"✅ Задолженность погашена: {outcome.paid}",
-        f"🚨 Задолженность осталась: {outcome.remains}",
-        f"⚠️ Не удалось проверить полностью: {outcome.incomplete}",
+        f"Проверено: {outcome.checked}",
+        f"⚠️ Не удалось проверить: {outcome.failed}",
     ]
-    if outcome.total_before != outcome.total_after:
+    if outcome.failed_car_numbers:
         lines.append("")
-        lines.append(f"💰 Было: {_format_try_amount(outcome.total_before)}")
-        lines.append(f"💰 Стало: {_format_try_amount(outcome.total_after)}")
+        lines.append("Не удалось проверить: " + ", ".join(outcome.failed_car_numbers))
     return "\n".join(lines)
 
 
@@ -1073,8 +1048,26 @@ def format_search_not_found(query: str) -> str:
     return f"🔎 Ничего не найдено\n\nПо запросу:\n{query}"
 
 
+# Telegram first_name/last_name иногда содержит placeholder-мусор вместо
+# реального имени (см. задачу "manager Statistics / refresh для обоих
+# ботов" п.2, тот же принцип, что и у reader/public_bot/texts.py::
+# _sanitize_name_part) — ТОЛЬКО пунктуация/whitespace, без единой буквы/
+# цифры, не является человеческим именем и не должно показываться как имя
+# (username при этом НЕ теряется).
+_MEANINGLESS_NAME_RE = re.compile(r"^[\s.\-_]*$")
+
+
+def _sanitize_name_part(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped or _MEANINGLESS_NAME_RE.fullmatch(stripped):
+        return None
+    return stripped
+
+
 def _full_name(first_name: str | None, last_name: str | None) -> str | None:
-    parts = [part for part in (first_name, last_name) if part]
+    parts = [part for part in (_sanitize_name_part(first_name), _sanitize_name_part(last_name)) if part]
     return " ".join(parts) if parts else None
 
 

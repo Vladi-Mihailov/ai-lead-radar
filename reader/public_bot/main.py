@@ -235,13 +235,11 @@ async def run() -> None:
         statistics_service = BotStatisticsService(
             known_users_repository, subscription_repository, detected_fine_repository,
         )
-        # Trusted-manager "🔄 Обновить задолженности" (см. задачу "OPTIONAL
-        # DEBT REFRESH") — переиспользует ТЕ ЖЕ task_repository/
-        # detected_fine_repository/check_service, что и всё остальное выше,
+        # Trusted-manager "🔄 Проверить авто со штрафами" (см. задачу
+        # "manager Statistics / refresh для обоих ботов") — переиспользует
+        # ТЕ ЖЕ task_repository/check_service, что и всё остальное выше,
         # никакой отдельной проверки police.ge не заводит.
-        debt_refresh_service = DebtRefreshService(
-            task_repository, detected_fine_repository, check_service,
-        )
+        debt_refresh_service = DebtRefreshService(task_repository, check_service)
         controller = ConversationController(
             conversation_state_repository,
             subscription_service,

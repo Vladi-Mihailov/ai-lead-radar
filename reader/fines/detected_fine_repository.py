@@ -2,7 +2,7 @@ import sqlite3
 from datetime import date, datetime
 from pathlib import Path
 
-from reader.fines.models import CarFineStats, DetectedFine, TaskFineTotal
+from reader.fines.models import CarFineStats, DetectedFine
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS detected_fines (
@@ -105,24 +105,6 @@ _SELECT_STATS_BY_CAR = """
     FROM detected_fines
     GROUP BY car_number
     ORDER BY fine_count DESC
-"""
-
-# "🚨 Известные штрафы" (см. TaskFineTotal про то, почему это НЕ "текущий
-# долг") — car_number функционально зависит от monitoring_task_id (одна
-# задача = один номер на всё время жизни, см. FineMonitoringTaskRepository),
-# MIN() здесь только чтобы явно сообщить SQLite намерение, а не потому что
-# значения могут отличаться. HAVING > 0, а не WHERE amount > 0 в подзапросе —
-# сумма считается по ВСЕМ строкам задачи, ноль/NULL amount просто не вносит
-# вклад (COALESCE), задачи с исключительно нулевыми/NULL amount не попадают
-# в список вовсе (см. задачу п.1-2: "только tasks с last_known_total_amount
-# > 0"). ORDER BY total DESC — тот же принцип сортировки, что и у Turkey
-# debt list (самые крупные долги первыми).
-_SELECT_TASK_TOTALS = """
-    SELECT monitoring_task_id, MIN(car_number), SUM(COALESCE(amount, 0)) AS total, MAX(last_seen_at)
-    FROM detected_fines
-    GROUP BY monitoring_task_id
-    HAVING total > 0
-    ORDER BY total DESC
 """
 
 # COALESCE(:new, old) — backfill, никогда не затирает уже сохранённое
@@ -277,38 +259,6 @@ class DetectedFineRepository:
         SQLite, а не в Python."""
         rows = self._conn.execute(_SELECT_STATS_BY_CAR).fetchall()
         return [CarFineStats(car_number=row[0], fine_count=row[1]) for row in rows]
-
-    def list_task_totals(self) -> list[TaskFineTotal]:
-        """См. TaskFineTotal и _SELECT_TASK_TOTALS — только задачи с
-        суммой > 0, отсортированные по убыванию суммы. Единственный
-        источник для reader/public_bot/debt_refresh_service.py: и для
-        "🚨 Известные штрафы" в 📊 Статистика, и для того, какие task_id
-        подлежат проверке по "🔄 Обновить задолженности" (один и тот же
-        запрос — задача, ушедшая из этого списка после проверки, должна
-        так же честно исчезнуть из блока статистики, без отдельной
-        логики)."""
-        rows = self._conn.execute(_SELECT_TASK_TOTALS).fetchall()
-        return [
-            TaskFineTotal(
-                task_id=row[0], car_number=row[1], total_amount=row[2],
-                last_seen_at=datetime.fromisoformat(row[3]),
-            )
-            for row in rows
-        ]
-
-    def sum_amount_for_task(self, task_id: int) -> float:
-        """Та же величина, что и TaskFineTotal.total_amount для этой
-        задачи (см. list_task_totals), но по ОДНОЙ задаче — используется
-        reader/public_bot/debt_refresh_service.py::refresh() до/после
-        check_task(), чтобы не пересчитывать GROUP BY по всей таблице на
-        каждую проверяемую машину. 0.0, если у задачи вообще нет
-        detected_fines (не HAVING > 0 — здесь ноль сам по себе валидный,
-        осмысленный ответ, а не "не нашли")."""
-        row = self._conn.execute(
-            "SELECT SUM(COALESCE(amount, 0)) FROM detected_fines WHERE monitoring_task_id = ?",
-            (task_id,),
-        ).fetchone()
-        return row[0] if row and row[0] is not None else 0.0
 
     def count_first_detected_since(self, since: datetime) -> int:
         """Сколько ГЕНУИННО новых штрафов обнаружено начиная с since — по

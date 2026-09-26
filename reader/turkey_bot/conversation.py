@@ -646,18 +646,32 @@ class ConversationController:
         get_known_profile), НИКАКИХ provider/network requests, НИКАКОГО
         unified check (см. задачу "КРИТИЧЕСКИ ВАЖНО: НИКАКИХ LIVE CHECK")."""
         self._states.clear(chat_id)
-        now = datetime.now(timezone.utc)
-        stats = self._statistics.get_statistics(now=now, tz=self._tz)
+        stats = self._statistics.get_statistics(now=datetime.now(timezone.utc), tz=self._tz)
+        debt_block, debt_messages = self._build_debt_section()
+        stats_text = (
+            f"{texts.format_statistics_header(stats)}\n\n{debt_block}\n\n{texts.format_statistics_footer(stats)}"
+        )
 
+        return BotReply(
+            text=stats_text, extra_texts=tuple(debt_messages), show_main_menu=True,
+            debt_refresh_available=self._debt_refresh is not None,
+        )
+
+    def _build_debt_section(self) -> tuple[str, list[str]]:
+        """ВСЕГДА заново перечитывает persisted state из БД (см. задачу
+        "manager Statistics / refresh для обоих ботов" п.8: "Statistics
+        после refresh: заново query из DB, НЕ показывать старый cached
+        UI") — переиспользуется И обычным открытием 📊 Статистика
+        (handle_statistics), И результатом "🔄 Проверить авто с
+        задолженностью" (handle_debt_refresh_confirm), поэтому обе точки
+        ВСЕГДА показывают один и тот же, только что построенный список."""
         total_cars = self._garage.count_all()
         cars = self._garage.list_all_page(offset=0, limit=total_cars) if total_cars else []
         debt_rows = self._statistics.get_debt_rows(cars)
 
         debt_total_amount = sum((row.total_amount for row in debt_rows), Decimal(0))
-        debt_has_partial = any(row.is_partial for row in debt_rows)
-        stats_text = texts.format_statistics(
-            stats, debt_car_count=len(debt_rows), debt_total_amount=debt_total_amount,
-            debt_has_partial=debt_has_partial,
+        debt_block = texts.format_debt_summary_block(
+            debt_car_count=len(debt_rows), debt_total_amount=debt_total_amount,
         )
 
         debt_lines = []
@@ -667,19 +681,13 @@ class ConversationController:
             owner_display = texts.format_search_owner_display(
                 first_name=first_name, last_name=last_name, username=username,
             )
-            recency = texts.format_debt_recency(row.checked_at, now=now, tz=self._tz)
             debt_lines.append(
                 texts.format_debt_row(
-                    car_number=row.car_number, owner_display=owner_display,
-                    total_amount=row.total_amount, is_partial=row.is_partial, recency=recency,
+                    car_number=row.car_number, owner_display=owner_display, total_amount=row.total_amount,
                 )
             )
         debt_messages = texts.format_debt_list_messages(debt_lines)
-
-        return BotReply(
-            text=stats_text, extra_texts=tuple(debt_messages), show_main_menu=True,
-            debt_refresh_available=self._debt_refresh is not None,
-        )
+        return debt_block, debt_messages
 
     # ---- "🔄 Проверить авто с задолженностью" (см. задачу "manual Turkey
     # debt refresh") — trusted-manager-only, is_trusted() перепроверяется
@@ -723,7 +731,17 @@ class ConversationController:
         except TurkeyRefreshAlreadyInProgressError:
             return BotReply(text=texts.DEBT_REFRESH_IN_PROGRESS_TEXT, show_main_menu=True)
 
-        return BotReply(text=texts.format_debt_refresh_summary(outcome), show_main_menu=True)
+        # См. задачу п.8: "Statistics после refresh: заново query из DB,
+        # НЕ показывать старый cached UI" — _build_debt_section() читает
+        # persisted state ЗАНОВО (provider checks уже завершились и
+        # персистентны к этому моменту, см. TurkeyDebtRefreshService.
+        # refresh()), поэтому здесь виден РОВНО тот же список, что покажет
+        # следующее открытие 📊 Статистика.
+        debt_block, debt_messages = self._build_debt_section()
+        text = f"{texts.format_debt_refresh_summary(outcome)}\n\n{debt_block}"
+        return BotReply(
+            text=text, extra_texts=tuple(debt_messages), show_main_menu=True, debt_refresh_available=True,
+        )
 
     def handle_stop_monitoring(self, *, chat_id: int) -> BotReply:
         """⛔ Остановить мониторинг — ТОЛЬКО Turkey test monitoring (своя

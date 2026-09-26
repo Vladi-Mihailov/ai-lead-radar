@@ -214,24 +214,63 @@ async def test_confirm_without_debt_service_falls_back_safely(tmp_path):
     assert reply.text == texts.SEARCH_NOT_AUTHORIZED_TEXT
 
 
-# ---- Confirm actually runs a real (fake) check + honest summary ----
+# ---- Confirm actually runs a real (fake) check + honest, stateful result ----
 
 
-async def test_confirm_runs_refresh_and_returns_summary_with_before_after():
+async def test_confirm_runs_refresh_and_returns_simplified_summary():
+    """См. задачу "manager Statistics / refresh для обоих ботов" п.7 —
+    БЕЗ "Задолженность погашена"/"Задолженность осталась"/Было-Стало:
+    только "Проверено"/"Не удалось проверить" + заново построенный
+    debt-блок."""
     fx = _Fixture(poison_check_service=False)
     fx.add_car(telegram_user_id=1, car_number="AA001AA")
     await fx.seed(telegram_user_id=1, plate="AA001AA", amount=Decimal(2740))
-    # check_service по умолчанию возвращает no_debt для GİB -> "погашена".
+    # check_service по умолчанию возвращает no_debt для GİB -> машина погашена.
 
     reply = await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
 
     assert "🔄 Проверка завершена" in reply.text
-    assert "Проверено автомобилей: 1" in reply.text
-    assert "✅ Задолженность погашена: 1" in reply.text
-    assert "🚨 Задолженность осталась: 0" in reply.text
-    assert "⚠️ Не удалось проверить полностью: 0" in reply.text
-    assert "💰 Было: 2 740 ₺" in reply.text
-    assert "💰 Стало: 0" in reply.text
+    assert "Проверено: 1" in reply.text
+    assert "⚠️ Не удалось проверить: 0" in reply.text
+    assert "Задолженность погашена" not in reply.text
+    assert "Задолженность осталась" not in reply.text
+    assert "Было" not in reply.text
+    assert "Стало" not in reply.text
+    assert "🚨 Задолженность по последней проверке" in reply.text
+    assert "Автомобилей: 0" in reply.text
+    assert "AA001AA" not in reply.text
+
+
+async def test_confirm_row_format_is_car_colon_owner_colon_amount():
+    fx = _Fixture(poison_check_service=False)
+    fx.add_car(telegram_user_id=1, car_number="BB002BB")
+    await fx.seed(telegram_user_id=1, plate="BB002BB", amount=Decimal(1000))
+    fx.check_service = _make_check_service(gib_amount=Decimal(1800))
+    fx.debt_refresh._check_service = fx.check_service
+
+    reply = await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
+
+    full_text = "\n".join((reply.text, *reply.extra_texts))
+    assert "🚗 BB002BB: —: 1 800 ₺" in full_text
+
+
+async def test_next_refresh_candidates_exclude_car_that_became_zero():
+    """См. задачу п.5/п.9 — после refresh (2740 -> 0) следующий pick
+    должен предложить проверить на 1 меньше машину, а следующий confirm —
+    её не трогать вовсе."""
+    fx = _Fixture(poison_check_service=False)
+    fx.add_car(telegram_user_id=1, car_number="AA001AA")
+    fx.add_car(telegram_user_id=2, car_number="BB002BB")
+    await fx.seed(telegram_user_id=1, plate="AA001AA", amount=Decimal(2740))
+    await fx.seed(telegram_user_id=2, plate="BB002BB", amount=Decimal(500))
+    # check_service по умолчанию возвращает no_debt для GİB -> обе "погашены"
+    # на первом refresh (это ОК для этого теста — важен именно факт, что
+    # AA001AA больше не кандидат на втором refresh).
+
+    await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
+
+    pick_reply = fx.controller.handle_debt_refresh_pick(telegram_user_id=_TRUSTED_ID)
+    assert pick_reply.text == texts.DEBT_REFRESH_NONE_TEXT
 
 
 # ---- 18. Statistics after refresh reflects updated persisted data ----

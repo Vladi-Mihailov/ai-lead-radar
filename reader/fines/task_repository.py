@@ -2,7 +2,12 @@ import sqlite3
 from datetime import date, datetime
 from pathlib import Path
 
-from reader.fines.models import FineMonitoringScope, FineMonitoringTask, FineTaskStatus
+from reader.fines.models import (
+    FineMonitoringScope,
+    FineMonitoringTask,
+    FineTaskDebtSnapshot,
+    FineTaskStatus,
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS fine_monitoring_tasks (
@@ -22,7 +27,8 @@ CREATE TABLE IF NOT EXISTS fine_monitoring_tasks (
     archive_check_enabled INTEGER NOT NULL DEFAULT 0,
     next_archive_check_at TIMESTAMP,
     monitoring_scope    TEXT NOT NULL DEFAULT 'operator',
-    last_successful_checked_at TIMESTAMP
+    last_successful_checked_at TIMESTAMP,
+    last_successful_total_amount REAL
 )
 """
 
@@ -71,6 +77,19 @@ _COLUMN_MIGRATIONS = {
     "last_successful_checked_at": (
         "ALTER TABLE fine_monitoring_tasks ADD COLUMN last_successful_checked_at TIMESTAMP"
     ),
+    # Сумма последней УСПЕШНОЙ проверки (см. задачу "manager Statistics /
+    # refresh для обоих ботов" п.3/п.10) — authoritative источник "🚨
+    # Штрафы по последней проверке", пишется ТОЛЬКО FineCheckService.
+    # check_task(). NULL для существующих строк ПРИНЦИПИАЛЬНО — миграция
+    # намеренно НЕ backfill'ит его из старой detected_fines-суммы (задача
+    # явно требует "не выдавать старую historical detected_fines-историю
+    # за latest successful snapshot"): такие задачи просто не появятся в
+    # debt-списке, пока не пройдут свою следующую обычную (мониторинг/
+    # manual/refresh) успешную проверку — без отдельного backfill-скрипта
+    # и без массовых principal checks.
+    "last_successful_total_amount": (
+        "ALTER TABLE fine_monitoring_tasks ADD COLUMN last_successful_total_amount REAL"
+    ),
 }
 
 _INSERT = """
@@ -88,7 +107,7 @@ _SELECT_FIELDS = """
     telegram_chat_id, created_by_user_id, created_at, updated_at,
     last_checked_at, last_check_status, last_error,
     archive_check_enabled, next_archive_check_at, monitoring_scope,
-    last_successful_checked_at
+    last_successful_checked_at, last_successful_total_amount
 """
 
 _SELECT_BY_ID = f"SELECT {_SELECT_FIELDS} FROM fine_monitoring_tasks WHERE id = ?"
@@ -258,6 +277,7 @@ def _row_to_task(row) -> FineMonitoringTask:
         next_archive_check_at,
         monitoring_scope,
         last_successful_checked_at,
+        last_successful_total_amount,
     ) = row
 
     return FineMonitoringTask(
@@ -282,6 +302,7 @@ def _row_to_task(row) -> FineMonitoringTask:
         last_successful_checked_at=(
             datetime.fromisoformat(last_successful_checked_at) if last_successful_checked_at else None
         ),
+        last_successful_total_amount=last_successful_total_amount,
     )
 
 
@@ -423,20 +444,51 @@ class FineMonitoringTaskRepository:
         )
         self._conn.commit()
 
-    def record_successful_check(self, task_id: int) -> None:
-        """Отдельно от record_check_result() выше — вызывается ТОЛЬКО
-        когда FineCheckService.check_task() реально вернул status=='ok'
-        (см. reader/public_bot/debt_refresh_service.py). При ERROR этот
-        метод НЕ вызывается вовсе, поэтому last_successful_checked_at
-        переживает последующие неудачные попытки без каких-либо условных
-        UPDATE (тот же приём "просто не трогать поле", что и у
-        FineCheckService._resolve_translation/detected_fines при ERROR)."""
+    def record_successful_check(self, task_id: int, *, total_amount: float) -> None:
+        """Отдельно от record_check_result() выше — вызывается ИСКЛЮЧИТЕЛЬНО
+        из FineCheckService.check_task(), ЕДИНСТВЕННОГО authoritative
+        layer'а (см. задачу "manager Statistics / refresh для обоих ботов"
+        п.11), КОГДА проверка реально завершилась status=='ok' — это
+        покрывает ЛЮБОЙ путь проверки (мониторинг/manual "Проверить
+        сейчас"/Add Car/manager refresh) без отдельной реализации
+        persistence в каждом из них. При ERROR этот метод НЕ вызывается
+        вовсе, поэтому last_successful_checked_at/
+        last_successful_total_amount переживают последующие неудачные
+        попытки без каких-либо условных UPDATE (тот же приём "просто не
+        трогать поле", что и у FineCheckService._resolve_translation/
+        detected_fines при ERROR). total_amount — "что показала ЭТА
+        успешная проверка" (сумма current_fines, см. check_task()), а НЕ
+        сумма истории detected_fines — может быть меньше, больше или
+        0 по сравнению с прошлым значением (задача явно требует "не
+        монотонно неубывающая история")."""
         self._conn.execute(
-            "UPDATE fine_monitoring_tasks SET last_successful_checked_at = CURRENT_TIMESTAMP "
-            "WHERE id = :task_id",
-            {"task_id": task_id},
+            "UPDATE fine_monitoring_tasks SET last_successful_checked_at = CURRENT_TIMESTAMP, "
+            "last_successful_total_amount = :total_amount WHERE id = :task_id",
+            {"task_id": task_id, "total_amount": total_amount},
         )
         self._conn.commit()
+
+    def list_tasks_with_known_debt(self) -> list[FineTaskDebtSnapshot]:
+        """"🚨 Штрафы по последней проверке" (см. задачу) — ТОЛЬКО задачи,
+        у которых последняя УСПЕШНАЯ проверка показала total_amount > 0
+        (см. last_successful_total_amount) — НЕ сумма истории
+        detected_fines. NULL (ни одной успешной проверки ПОСЛЕ появления
+        этого поля ещё не было, см. задачу п.10 про миграцию) и <= 0 —
+        не кандидаты, тот же принцип, что и у Turkey get_debt_rows.
+        Отсортировано по убыванию суммы средствами SQLite."""
+        rows = self._conn.execute(
+            "SELECT id, car_number, last_successful_total_amount, last_successful_checked_at "
+            "FROM fine_monitoring_tasks "
+            "WHERE last_successful_total_amount IS NOT NULL AND last_successful_total_amount > 0 "
+            "ORDER BY last_successful_total_amount DESC, last_successful_checked_at DESC"
+        ).fetchall()
+        return [
+            FineTaskDebtSnapshot(
+                task_id=row[0], car_number=row[1], total_amount=row[2],
+                checked_at=datetime.fromisoformat(row[3]),
+            )
+            for row in rows
+        ]
 
     def count_active(self) -> int:
         return self._conn.execute(_COUNT_ACTIVE).fetchone()[0]
