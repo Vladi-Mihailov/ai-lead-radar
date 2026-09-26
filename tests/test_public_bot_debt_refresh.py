@@ -43,6 +43,12 @@ _CHAT_ID = -100999
 _USER_ID = 111
 
 
+async def _instant_sleep(_seconds: float) -> None:
+    """См. tests/test_debt_refresh_service.py — та же замена реального
+    asyncio.sleep для false-zero confirmation/inter-car delay (см. задачу
+    "guard Georgia debt against false zero results")."""
+
+
 class _FakeProvider(FineProvider):
     def __init__(self):
         self.records_by_car: dict[str, list[ParsedFineRecord]] = {}
@@ -83,6 +89,7 @@ class _Fixture:
         self.provider = _FakeProvider()
         self.check_service = FineCheckService(
             self.provider, self.task_repository, self.detected_fine_repository,
+            sleep=_instant_sleep,
         )
         self.subscription_service = SubscriptionService(
             self.task_repository, self.subscription_repository,
@@ -92,7 +99,7 @@ class _Fixture:
             self.known_users_repository, self.subscription_repository, self.detected_fine_repository,
         )
         self.debt_refresh_service = (
-            DebtRefreshService(self.task_repository, self.check_service)
+            DebtRefreshService(self.task_repository, self.check_service, sleep=_instant_sleep)
             if with_debt_refresh else None
         )
         self.controller = ConversationController(

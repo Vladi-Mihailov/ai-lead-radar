@@ -42,6 +42,14 @@ _CHAT_ID = -100999
 _USER_ID = 111
 
 
+async def _instant_sleep(_seconds: float) -> None:
+    """Тестовая замена реального asyncio.sleep (см. задачу "guard Georgia
+    debt against false zero results" — false-zero confirmation delay/
+    inter-car delay инжектируются, а не хардкодятся) — иначе КАЖДЫЙ тест,
+    гоняющий сценарий "800 -> 0"/несколько машин, реально ждал бы по 5
+    секунд."""
+
+
 class _FakeProvider(FineProvider):
     """records_by_car/error_cars МУТИРУЮТСЯ вызывающим тестом между
     вызовами check_task() (например, "сначала 800, потом 500, потом 0")."""
@@ -87,8 +95,11 @@ class _Fixture:
         self.provider = _FakeProvider()
         self.check_service = FineCheckService(
             self.provider, self.task_repository, self.detected_fine_repository,
+            sleep=_instant_sleep,
         )
-        self.debt_refresh = DebtRefreshService(self.task_repository, self.check_service)
+        self.debt_refresh = DebtRefreshService(
+            self.task_repository, self.check_service, sleep=_instant_sleep,
+        )
 
     def make_task(self, car_number: str):
         return self.task_repository.create(
@@ -339,9 +350,13 @@ def test_debt_refresh_service_has_no_notification_dependency():
     """DebtRefreshService физически не может разослать уведомление
     "просто потому что менеджер нажал refresh" — у него нет параметра
     конструктора ни для NotificationService, ни для
-    FineNotificationCoordinator."""
+    FineNotificationCoordinator. inter_car_delay_seconds/sleep (см. задачу
+    "guard Georgia debt against false zero results" п.5) — технический
+    throttle между машинами, не notification-механизм."""
     params = list(inspect.signature(DebtRefreshService.__init__).parameters)
-    assert params == ["self", "task_repository", "check_service"]
+    assert params == [
+        "self", "task_repository", "check_service", "inter_car_delay_seconds", "sleep",
+    ]
 
     import reader.public_bot.debt_refresh_service as module
     assert not hasattr(module, "NotificationService")

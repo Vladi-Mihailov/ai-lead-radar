@@ -34,11 +34,21 @@ refresh, останется в detected_fines с notification_sent_at IS NULL и
 check_now_task() (см. design report), не новый случай.
 """
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from reader.fines.check_service import FineCheckService
 from reader.fines.models import FineTaskDebtSnapshot
 from reader.fines.task_repository import FineMonitoringTaskRepository
+
+# См. задачу "guard Georgia debt against false zero results" п.5 — та же
+# пауза, что и false-zero confirmation delay в FineCheckService (см.
+# reader/fines/check_service.py), но здесь она РАЗДЕЛЯЕТ РАЗНЫЕ машины
+# (не connection ко второй попытке для ОДНОЙ машины) — mass refresh
+# перестаёт бить police.ge back-to-back без пауз, что и создавало условия
+# для false-empty ответов под нагрузкой (см. production incident).
+_INTER_CAR_DELAY_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -74,10 +84,15 @@ class DebtRefreshService:
         self,
         task_repository: FineMonitoringTaskRepository,
         check_service: FineCheckService,
+        *,
+        inter_car_delay_seconds: float = _INTER_CAR_DELAY_SECONDS,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ):
         self._task_repository = task_repository
         self._check_service = check_service
         self._in_progress = False
+        self._inter_car_delay_seconds = inter_car_delay_seconds
+        self._sleep = sleep
 
     def is_in_progress(self) -> bool:
         return self._in_progress
@@ -118,7 +133,14 @@ class DebtRefreshService:
             failed = 0
             failed_car_numbers: list[str] = []
 
-            for task_id in task_ids:
+            for index, task_id in enumerate(task_ids):
+                if index > 0:
+                    # См. задачу п.5 — пауза МЕЖДУ РАЗНЫМИ машинами (не
+                    # после последней, см. модульный докстрок про
+                    # _INTER_CAR_DELAY_SECONDS) — mass refresh больше не
+                    # бьёт police.ge back-to-back без пауз.
+                    await self._sleep(self._inter_car_delay_seconds)
+
                 task = self._task_repository.get(task_id)
                 if task is None:
                     # Задача удалена конкурентно между чтением списка и
@@ -131,8 +153,9 @@ class DebtRefreshService:
                     failed += 1
                     failed_car_numbers.append(task.car_number)
                 # status == "ok": check_task() уже сам записал новое
-                # last_successful_total_amount — здесь ничего дополнительно
-                # персистить не нужно (см. модульный докстрок).
+                # last_successful_total_amount (включая false-zero guard,
+                # см. reader/fines/check_service.py) — здесь ничего
+                # дополнительно персистить не нужно (см. модульный докстрок).
 
             return RefreshOutcome(
                 checked=len(task_ids), failed=failed, failed_car_numbers=tuple(failed_car_numbers),

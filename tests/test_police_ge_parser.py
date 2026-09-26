@@ -154,16 +154,26 @@ def test_results_not_a_list_is_rejected():
         )
 
 
-def test_non_dict_entries_in_results_are_skipped():
+def test_non_dict_entries_in_results_raise_parse_error():
+    """См. задачу "guard Georgia debt against false zero results" п.6 —
+    молчаливый пропуск не-объектных элементов мог превратить
+    results=[garbage] в SUCCESS(0), неотличимый от настоящего "штрафов
+    нет" — теперь это FineParseError, а не тихо укороченный список."""
     raw = {
         "success": True,
         "data": {"results": ["not-a-dict", {"protocolAuto": "AA001AA", "protocolNo": "X1"}]},
     }
 
+    with pytest.raises(FineParseError):
+        parse_search_response(raw, car_number="AA001AA")
+
+
+def test_genuinely_empty_results_list_is_still_a_valid_zero_candidate():
+    raw = {"success": True, "data": {"results": []}}
+
     records = parse_search_response(raw, car_number="AA001AA")
 
-    assert len(records) == 1
-    assert records[0].external_fine_id == "X1"
+    assert records == []
 
 
 def test_fingerprint_is_deterministic_for_same_stable_fields():

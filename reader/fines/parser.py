@@ -101,8 +101,15 @@ def parse_search_response(raw: Any, *, car_number: str) -> list[ParsedFineRecord
     if not isinstance(results, list):
         raise FineParseError("Некорректный формат ответа police.ge: data.results не список")
 
-    return [
-        _parse_entry(entry, fallback_car_number=car_number)
-        for entry in results
-        if isinstance(entry, dict)
-    ]
+    # См. задачу "guard Georgia debt against false zero results" п.6 —
+    # НЕ отбрасывать молча не-объектные элементы (это могло превратить
+    # results=[garbage] в SUCCESS(0) неотличимо от настоящего "штрафов
+    # нет"). Настоящий results=[] по-прежнему валиден и означает zero
+    # candidate — см. FineCheckService.check_task() false-zero guard,
+    # который решает, authoritative ли этот ноль.
+    if any(not isinstance(entry, dict) for entry in results):
+        raise FineParseError(
+            "Некорректный формат ответа police.ge: data.results содержит не-объектные элементы"
+        )
+
+    return [_parse_entry(entry, fallback_car_number=car_number) for entry in results]
