@@ -33,6 +33,7 @@ from reader.public_bot.texts import (  # noqa: E402
     ADD_CAR_LABEL,
     CHECK_NOW_LABEL,
     MY_CARS_LABEL,
+    PROTOCOL_CHECK_LABEL,
     SEARCH_LABEL,
     STATISTICS_LABEL,
     TURKEY_BOT_LINK_LABEL,
@@ -58,12 +59,16 @@ def test_main_menu_keyboard_without_trusted_buttons_by_default():
 def test_main_menu_keyboard_ordinary_user_is_a_2x2_layout():
     """Явное требование задачи "унификация UI":
     ROW 1: ➕ Добавить авто | 📋 Мои авто
-    ROW 2: 🔎 Проверить сейчас | 🇹🇷 Штрафы Турции"""
+    ROW 2: 🔎 Проверить сейчас | 🇹🇷 Штрафы Турции
+    ROW 3 — "📸 Проверить протокол" (см. задачу "Проверить протокол") —
+    отдельная строка, добавленная ПОСЛЕ существующего 2x2, ничего в нём не
+    меняя (см. reader/public_bot/keyboards.py::main_menu_keyboard)."""
     keyboard = main_menu_keyboard(is_trusted=False)
 
-    assert len(keyboard) == 2
+    assert len(keyboard) == 3
     assert [b.button.text for b in keyboard[0]] == [ADD_CAR_LABEL, MY_CARS_LABEL]
     assert [b.button.text for b in keyboard[1]] == [CHECK_NOW_LABEL, TURKEY_BOT_LINK_LABEL]
+    assert [b.button.text for b in keyboard[2]] == [PROTOCOL_CHECK_LABEL]
 
 
 def test_main_menu_keyboard_includes_trusted_buttons_for_trusted_operator():
@@ -77,13 +82,15 @@ def test_main_menu_keyboard_includes_trusted_buttons_for_trusted_operator():
 def test_main_menu_keyboard_manager_puts_statistics_and_search_in_one_row():
     """См. задачу "manager/trusted Search": ROW 3 = 📊 Статистика |
     🔎 Поиск (одна строка, не две отдельные) — заменяет бывшую "⛔
-    Остановить мониторинг"."""
+    Остановить мониторинг". ROW 4 — "📸 Проверить протокол" (см. задачу
+    "Проверить протокол") — видна ОДИНАКОВО trusted/обычным пользователям."""
     keyboard = main_menu_keyboard(is_trusted=True)
 
-    assert len(keyboard) == 3
+    assert len(keyboard) == 4
     assert [b.button.text for b in keyboard[0]] == [ADD_CAR_LABEL, MY_CARS_LABEL]
     assert [b.button.text for b in keyboard[1]] == [CHECK_NOW_LABEL, TURKEY_BOT_LINK_LABEL]
     assert [b.button.text for b in keyboard[2]] == [STATISTICS_LABEL, SEARCH_LABEL]
+    assert [b.button.text for b in keyboard[3]] == [PROTOCOL_CHECK_LABEL]
 
 
 def test_main_menu_keyboard_does_not_change_ordinary_user_buttons():

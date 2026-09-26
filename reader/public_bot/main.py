@@ -23,32 +23,45 @@ from zoneinfo import ZoneInfo
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-import httpx  # noqa: E402
-from dotenv import load_dotenv  # noqa: E402
-from telethon import TelegramClient  # noqa: E402
+import httpx
+from dotenv import load_dotenv
+from telethon import TelegramClient
 
-from reader.fines.check_service import FineCheckService  # noqa: E402
-from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
-from reader.fines.police_ge_provider import PoliceGeProvider  # noqa: E402
-from reader.fines.police_ge_session import PoliceGeSession  # noqa: E402
-from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
-from reader.fines.translation import FineTranslationService  # noqa: E402
-from reader.logging_setup import setup_logging  # noqa: E402
-from reader.public_bot.conversation import ConversationController  # noqa: E402
-from reader.public_bot.conversation_state_repository import (  # noqa: E402
+from reader.fines.check_service import FineCheckService
+from reader.fines.detected_fine_repository import DetectedFineRepository
+from reader.fines.police_ge_provider import PoliceGeProvider
+from reader.fines.police_ge_session import PoliceGeSession
+from reader.fines.task_repository import FineMonitoringTaskRepository
+from reader.fines.translation import FineTranslationService
+from reader.logging_setup import setup_logging
+from reader.public_bot.conversation import ConversationController
+from reader.public_bot.conversation_state_repository import (
     BotConversationStateRepository,
 )
-from reader.public_bot.debt_refresh_service import DebtRefreshService  # noqa: E402
-from reader.public_bot.delivery_repository import ClientFineDeliveryRepository  # noqa: E402
-from reader.public_bot.delivery_service import ClientDeliveryService  # noqa: E402
-from reader.public_bot.full_check_service import FullCheckService  # noqa: E402
-from reader.public_bot.handlers import register  # noqa: E402
-from reader.public_bot.known_users_repository import BotKnownUsersRepository  # noqa: E402
-from reader.public_bot.statistics_service import BotStatisticsService  # noqa: E402
-from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
-from reader.public_bot.subscription_service import SubscriptionService  # noqa: E402
-from reader.settings import ConfigError, load_settings  # noqa: E402
-from reader.users.repository import UserRepository  # noqa: E402
+from reader.public_bot.debt_refresh_service import DebtRefreshService
+from reader.public_bot.delivery_repository import (
+    ClientFineDeliveryRepository,
+)
+from reader.public_bot.delivery_service import ClientDeliveryService
+from reader.public_bot.full_check_service import FullCheckService
+from reader.public_bot.handlers import register
+from reader.public_bot.known_users_repository import (
+    BotKnownUsersRepository,
+)
+from reader.public_bot.protocol_check_ephemeral_store import (
+    ProtocolCheckEphemeralStore,
+)
+from reader.public_bot.protocol_check_provider import (
+    ProtocolCheckProvider,
+)
+from reader.public_bot.protocol_check_session import VideosPoliceGeSession
+from reader.public_bot.statistics_service import BotStatisticsService
+from reader.public_bot.subscription_repository import (
+    FineSubscriptionRepository,
+)
+from reader.public_bot.subscription_service import SubscriptionService
+from reader.settings import ConfigError, load_settings
+from reader.users.repository import UserRepository
 
 # Bot identity switch (см. audit report): @GEShtrafbot -> @ProtocolGEbot —
 # НОВЫЙ, отдельно зарегистрированный bot (новый token, новый bot ID), а не
@@ -82,6 +95,12 @@ _POLICE_GE_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
+# "📸 Проверить протокол" (см. задачу) — ОТДЕЛЬНЫЙ внешний сайт от
+# police.ge/protocol (см. _POLICE_GE_USER_AGENT выше) — свой
+# httpx.AsyncClient, пинится на этот base_url (тот же приём "один
+# httpx.AsyncClient на внешний сайт", что и у http_client ниже, см. run()).
+_VIDEOS_POLICE_GE_BASE_URL = "https://videos.police.ge"
+_VIDEOS_POLICE_GE_REQUEST_TIMEOUT = 15.0
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +230,10 @@ async def run() -> None:
         base_url="https://police.ge/protocol/",
         headers={"User-Agent": _POLICE_GE_USER_AGENT},
     )
+    videos_police_ge_http_client = httpx.AsyncClient(
+        base_url=_VIDEOS_POLICE_GE_BASE_URL,
+        headers={"User-Agent": _POLICE_GE_USER_AGENT},
+    )
 
     try:
         # Тот же PoliceGeSession/PoliceGeProvider/FineCheckService, что и у
@@ -266,6 +289,19 @@ async def run() -> None:
         # никакой отдельной проверки police.ge не заводит.
         debt_refresh_service = DebtRefreshService(task_repository, check_service)
 
+        # "📸 Проверить протокол" (см. задачу) — ОТДЕЛЬНЫЙ сайт
+        # (videos.police.ge, не police.ge/protocol), поэтому отдельная
+        # сессия/провайдер, НЕ переиспользующие FineCheckService (см.
+        # задачу п.5: "не смешивать с текущим FineCheckService").
+        # Ephemeral store — единственное состояние этого процесса,
+        # сознательно НЕ переживающее restart (см. модуль docstring
+        # protocol_check_ephemeral_store.py).
+        videos_police_ge_session = VideosPoliceGeSession(
+            videos_police_ge_http_client, request_timeout=_VIDEOS_POLICE_GE_REQUEST_TIMEOUT,
+        )
+        protocol_check_provider = ProtocolCheckProvider(videos_police_ge_session)
+        protocol_check_ephemeral_store = ProtocolCheckEphemeralStore()
+
         # Скрытая "fine check-all" (см. задачу "add silent Georgia full
         # database check command") — ТОТ ЖЕ authoritative check_service, что
         # и debt_refresh_service выше (см. задачу п.3: "не писать отдельный
@@ -287,6 +323,8 @@ async def run() -> None:
             trusted_operator_user_ids=frozenset(settings.public_bot.trusted_operator_user_ids),
             payment_help_contact_username=settings.public_bot.payment_help_contact_username,
             debt_refresh_service=debt_refresh_service,
+            protocol_check_provider=protocol_check_provider,
+            protocol_check_ephemeral_store=protocol_check_ephemeral_store,
             full_check_service=full_check_service,
             fine_admin_user_ids=frozenset(settings.fine_monitor.allowed_user_ids),
         )
@@ -318,6 +356,7 @@ async def run() -> None:
         ])
     finally:
         await http_client.aclose()
+        await videos_police_ge_http_client.aclose()
         task_repository.close()
         detected_fine_repository.close()
         user_repository.close()

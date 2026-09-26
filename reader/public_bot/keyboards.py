@@ -45,6 +45,10 @@ from reader.public_bot.texts import (
     DELETE_CAR_BUTTON_LABEL,
     DELETE_CAR_CONFIRM_BUTTON_LABEL,
     MY_CARS_LABEL,
+    PROTOCOL_CHECK_BACK_LABEL,
+    PROTOCOL_CHECK_LABEL,
+    PROTOCOL_CHECK_PROTOCOL_METHOD_LABEL,
+    PROTOCOL_CHECK_VEHICLE_METHOD_LABEL,
     SEARCH_BACK_LABEL,
     SEARCH_LABEL,
     SEARCH_MENU_LABEL,
@@ -125,13 +129,20 @@ def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
     reader/public_bot/conversation.py::_handle_menu_label) и отвечает
     ОТДЕЛЬНЫМ сообщением с inline URL-кнопкой (см.
     turkey_bot_link_keyboard() ниже) — НЕ отправляется автоматически при
-    показе главного меню."""
+    показе главного меню.
+
+    "📸 Проверить протокол" (PROTOCOL_CHECK_LABEL, см. задачу "Проверить
+    протокол") — ОТДЕЛЬНАЯ, последняя строка, видна ВСЕМ пользователям
+    одинаково (НЕ trusted-gated, в отличие от SEARCH_LABEL/
+    STATISTICS_LABEL выше) — не привязана ни к какому существующему
+    автомобилю/подписке, поэтому не занимает место рядом с ними."""
     rows = [
         [Button.text(ADD_CAR_LABEL, resize=True), Button.text(MY_CARS_LABEL, resize=True)],
         [Button.text(CHECK_NOW_LABEL, resize=True), Button.text(TURKEY_BOT_LINK_LABEL, resize=True)],
     ]
     if is_trusted:
         rows.append([Button.text(STATISTICS_LABEL, resize=True), Button.text(SEARCH_LABEL, resize=True)])
+    rows.append([Button.text(PROTOCOL_CHECK_LABEL, resize=True)])
     return rows
 
 
@@ -709,3 +720,74 @@ def search_result_keyboard(
         Button.inline(SEARCH_MENU_LABEL, encode_search_back_callback()),
     ])
     return rows
+
+
+# ==== "📸 Проверить протокол" (см. задачу) — Georgia-only, не привязан ни
+# к одному существующему автомобилю/подписке (см. задачу п.10) —
+# callback_data несёт ТОЛЬКО выбор метода/направление "назад", никогда
+# sensitive-значения (номер техпаспорта/протокола/ID-TAX нарушителя) — те
+# вообще никогда не попадают ни в один callback_data (вводятся текстом, см.
+# reader/public_bot/conversation.py). ====
+
+_PROTOCOL_CHECK_METHOD_VEHICLE = b"pchk:method:vehicle"
+_PROTOCOL_CHECK_METHOD_PROTOCOL = b"pchk:method:protocol"
+_PROTOCOL_CHECK_BACK_TO_MENU = b"pchk:back:menu"
+_PROTOCOL_CHECK_BACK_TO_METHOD = b"pchk:back:method"
+_PROTOCOL_CHECK_BACK_TO_VEHICLE_STEP1 = b"pchk:back:v1"
+_PROTOCOL_CHECK_BACK_TO_PROTOCOL_STEP1 = b"pchk:back:p1"
+
+
+def protocol_check_method_keyboard() -> list[list[Button]]:
+    """Экран выбора способа проверки (см. задачу п.1) — [🚗 По
+    автомобилю][📄 По протоколу] отдельными строками + [◀️ Назад] в главное
+    меню."""
+    return [
+        [Button.inline(PROTOCOL_CHECK_VEHICLE_METHOD_LABEL, _PROTOCOL_CHECK_METHOD_VEHICLE)],
+        [Button.inline(PROTOCOL_CHECK_PROTOCOL_METHOD_LABEL, _PROTOCOL_CHECK_METHOD_PROTOCOL)],
+        [Button.inline(PROTOCOL_CHECK_BACK_LABEL, _PROTOCOL_CHECK_BACK_TO_MENU)],
+    ]
+
+
+def decode_protocol_check_method_callback(data: bytes | None) -> str | None:
+    """"vehicle"/"protocol" — None для чего угодно ещё (вызывающий код
+    должен пробовать следующий decode_*, см. тот же принцип, что и у
+    decode_add_client_decision_callback)."""
+    if data == _PROTOCOL_CHECK_METHOD_VEHICLE:
+        return "vehicle"
+    if data == _PROTOCOL_CHECK_METHOD_PROTOCOL:
+        return "protocol"
+    return None
+
+
+def decode_protocol_check_back_to_menu_callback(data: bytes | None) -> bool:
+    return data == _PROTOCOL_CHECK_BACK_TO_MENU
+
+
+def decode_protocol_check_back_to_method_callback(data: bytes | None) -> bool:
+    return data == _PROTOCOL_CHECK_BACK_TO_METHOD
+
+
+def decode_protocol_check_back_to_vehicle_step1_callback(data: bytes | None) -> bool:
+    return data == _PROTOCOL_CHECK_BACK_TO_VEHICLE_STEP1
+
+
+def decode_protocol_check_back_to_protocol_step1_callback(data: bytes | None) -> bool:
+    return data == _PROTOCOL_CHECK_BACK_TO_PROTOCOL_STEP1
+
+
+def protocol_check_back_to_method_keyboard() -> list[list[Button]]:
+    """Экраны ввода ПЕРВОГО значения обоих вариантов (номер автомобиля/
+    номер протокола, см. задачу п.6: "из первого input → Назад возвращает
+    к выбору способа проверки") — единственная кнопка."""
+    return [[Button.inline(PROTOCOL_CHECK_BACK_LABEL, _PROTOCOL_CHECK_BACK_TO_METHOD)]]
+
+
+def protocol_check_back_to_vehicle_step1_keyboard() -> list[list[Button]]:
+    """Экран ввода номера техпаспорта (см. задачу п.6: "из второго input →
+    Назад возвращает к вводу первого значения")."""
+    return [[Button.inline(PROTOCOL_CHECK_BACK_LABEL, _PROTOCOL_CHECK_BACK_TO_VEHICLE_STEP1)]]
+
+
+def protocol_check_back_to_protocol_step1_keyboard() -> list[list[Button]]:
+    """Экран ввода ID/TAX-номера нарушителя (см. задачу п.6)."""
+    return [[Button.inline(PROTOCOL_CHECK_BACK_LABEL, _PROTOCOL_CHECK_BACK_TO_PROTOCOL_STEP1)]]

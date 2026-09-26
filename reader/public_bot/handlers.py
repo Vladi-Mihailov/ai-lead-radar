@@ -36,6 +36,11 @@ from reader.public_bot.keyboards import (
     decode_my_car_turn_on_callback,
     decode_my_cars_page_callback,
     decode_period_callback,
+    decode_protocol_check_back_to_menu_callback,
+    decode_protocol_check_back_to_method_callback,
+    decode_protocol_check_back_to_protocol_step1_callback,
+    decode_protocol_check_back_to_vehicle_step1_callback,
+    decode_protocol_check_method_callback,
     decode_search_back_callback,
     decode_search_new_callback,
     decode_search_page_callback,
@@ -49,6 +54,10 @@ from reader.public_bot.keyboards import (
     main_menu_keyboard,
     my_cars_page_keyboard,
     period_choice_keyboard,
+    protocol_check_back_to_method_keyboard,
+    protocol_check_back_to_protocol_step1_keyboard,
+    protocol_check_back_to_vehicle_step1_keyboard,
+    protocol_check_method_keyboard,
     search_entry_keyboard,
     search_result_keyboard,
     trusted_stop_confirm_keyboard,
@@ -327,6 +336,42 @@ def register(
             await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
+        protocol_check_method = decode_protocol_check_method_callback(data)
+        if protocol_check_method is not None:
+            reply = controller.handle_protocol_check_method(
+                protocol_check_method, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        if decode_protocol_check_back_to_menu_callback(data):
+            reply = controller.handle_protocol_check_back_to_menu(
+                chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        if decode_protocol_check_back_to_method_callback(data):
+            reply = controller.handle_protocol_check_back_to_method(
+                chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        if decode_protocol_check_back_to_vehicle_step1_callback(data):
+            reply = controller.handle_protocol_check_back_to_vehicle_step1(
+                chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        if decode_protocol_check_back_to_protocol_step1_callback(data):
+            reply = controller.handle_protocol_check_back_to_protocol_step1(
+                chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
         await event.answer("Неизвестная или устаревшая кнопка", alert=True)
 
     # Bot identity switch (см. audit report) — @ProtocolGEbot.
@@ -428,6 +473,14 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False, is_trusted: bo
             query_type=reply.search_query_type, query=reply.search_query,
             page=reply.search_page, total_pages=reply.search_total_pages,
         )
+    elif reply.protocol_check_method_prompt:
+        buttons = protocol_check_method_keyboard()
+    elif reply.protocol_check_back_target == "method":
+        buttons = protocol_check_back_to_method_keyboard()
+    elif reply.protocol_check_back_target == "vehicle_step1":
+        buttons = protocol_check_back_to_vehicle_step1_keyboard()
+    elif reply.protocol_check_back_target == "protocol_step1":
+        buttons = protocol_check_back_to_protocol_step1_keyboard()
 
     if prefer_edit:
         try:
