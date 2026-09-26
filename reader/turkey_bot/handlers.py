@@ -10,6 +10,7 @@ ConversationController перепроверяет заново на КАЖДОМ
 import logging
 
 from telethon import Button, TelegramClient, events
+from telethon.errors.rpcerrorlist import QueryIdInvalidError
 
 from reader.turkey_bot.conversation import BotReply, ConversationController
 from reader.turkey_bot.keyboards import (
@@ -154,6 +155,36 @@ def register(
         car_action = decode_car_action_callback(event.data)
         if car_action is not None:
             action, car_id = car_action
+            if action == "check":
+                # "check" запускает UnifiedTurkeyCheckService целиком
+                # (GİB+Avrasya+KGM, до 35 CAPTCHA-попыток на провайдера) —
+                # это 9-34+ секунд реального времени (см. диагностику
+                # "QueryIdInvalidError после долгой manual check"). К
+                # моменту завершения Telegram callback-query токен уже
+                # истекает, и event.answer() ПОСЛЕ проверки бросает
+                # QueryIdInvalidError, которая (будучи непойманной) рушила
+                # весь handler ДО _send_reply — итоговый ответ терялся,
+                # хотя проверка успешно завершалась. Поэтому ack делаем
+                # СРАЗУ, до начала проверки (тот же приём, что и у
+                # debt_refresh_confirm выше), и ловим ИМЕННО ожидаемый
+                # QueryIdInvalidError — остальные Telegram-ошибки не
+                # маскируем.
+                try:
+                    await event.answer()
+                except QueryIdInvalidError:
+                    pass
+                reply = await controller.handle_car_action(
+                    action, car_id, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+                )
+                if reply is None:
+                    # Ответ уже отправлен выше (event.answer() нельзя
+                    # вызвать дважды) — та же "неизвестная кнопка" ситуация
+                    # (car_id удалён/чужой), но обычным сообщением вместо
+                    # alert-попапа.
+                    await event.respond(UNKNOWN_BUTTON_TEXT)
+                    return
+                await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=False)
+                return
             reply = await controller.handle_car_action(
                 action, car_id, chat_id=event.chat_id, telegram_user_id=event.sender_id,
             )
@@ -163,13 +194,12 @@ def register(
             await event.answer()
             # my-cars/card/toggle/delete flow -> редактируем СУЩЕСТВУЮЩЕЕ
             # сообщение (см. задачу п.5: "не создавать новое сообщение без
-            # необходимости... повторить Georgian bot pattern") — "check"/
-            # "history" дают полноценный отчёт (unified-проверка/история),
-            # для них новое сообщение уместнее (тот же принцип, что и в
-            # Georgian bot, где 🔎 Проверить сейчас — отдельный, не
-            # car-card, flow) — back_to_car_id всё равно даёт путь назад
-            # к карточке (см. _first_message_buttons).
-            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=action not in ("check", "history"))
+            # необходимости... повторить Georgian bot pattern") — "history"
+            # даёт полноценный отчёт (та же логика, что раньше объединяла
+            # его с "check": новое сообщение уместнее, чем правка карточки)
+            # — back_to_car_id всё равно даёт путь назад к карточке (см.
+            # _first_message_buttons).
+            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=action != "history")
             return
 
         # manager/trusted-operator "🚗 Мои автомобили" (см. задачу
