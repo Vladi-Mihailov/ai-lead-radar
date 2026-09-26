@@ -41,6 +41,13 @@ pytestmark = pytest.mark.asyncio
 _TZ = ZoneInfo("UTC")
 
 
+async def _instant_sleep(_seconds: float) -> None:
+    """Тестовая замена реального asyncio.sleep (см. задачу "reduce Turkey
+    OCR memory pressure" — inter-car delay инжектируется, а не
+    хардкодится) — иначе тесты с несколькими машинами реально ждали бы по
+    2 секунды на каждую."""
+
+
 class _FakeCloseable:
     async def aclose(self) -> None:
         pass
@@ -159,6 +166,7 @@ class _Fixture:
         self.check_service = check_service or _make_check_service()
         self.debt_refresh = TurkeyDebtRefreshService(
             self.garage, self.runs, self.check_service, self.statistics,
+            sleep=_instant_sleep,
         )
 
     def close(self) -> None:
@@ -372,8 +380,14 @@ async def test_duplicate_plate_multiple_owners_one_check_two_saved_runs(fx):
 
 
 def test_debt_refresh_service_has_no_notification_dependency():
+    """inter_car_delay_seconds/sleep (см. задачу "reduce Turkey OCR
+    memory pressure") — технический throttle между машинами, не
+    notification-механизм."""
     params = list(inspect.signature(TurkeyDebtRefreshService.__init__).parameters)
-    assert params == ["self", "garage_repository", "run_repository", "check_service", "statistics_service"]
+    assert params == [
+        "self", "garage_repository", "run_repository", "check_service", "statistics_service",
+        "inter_car_delay_seconds", "sleep",
+    ]
 
     import reader.turkey_bot.debt_refresh_service as module
     assert not hasattr(module, "TurkeyMonitoringService")
@@ -517,3 +531,88 @@ async def test_next_refresh_candidates_survive_restart(tmp_path):
         assert checked_plates == ["A3333AA"]
     finally:
         fx.close()
+
+
+# ---- FIX 3: inter-car delay (задача "reduce Turkey OCR memory
+# pressure" TESTS п.10-12) ----
+
+
+class _SleepLog:
+    """Записывает КАЖДЫЙ await sleep(...) — не ждёт реально ни секунды."""
+
+    def __init__(self):
+        self.calls: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+
+
+async def test_debt_refresh_has_2_second_delay_between_different_cars():
+    fx = _Fixture()
+    fx.add_car(telegram_user_id=1, car_number="AA001AA")
+    fx.add_car(telegram_user_id=2, car_number="BB002BB")
+    fx.add_car(telegram_user_id=3, car_number="CC003CC")
+    await fx.seed(telegram_user_id=1, plate="AA001AA", amount=Decimal(100))
+    await fx.seed(telegram_user_id=2, plate="BB002BB", amount=Decimal(200))
+    await fx.seed(telegram_user_id=3, plate="CC003CC", amount=Decimal(300))
+
+    sleep_log = _SleepLog()
+    fx.debt_refresh = TurkeyDebtRefreshService(
+        fx.garage, fx.runs, fx.check_service, fx.statistics, sleep=sleep_log,
+    )
+
+    outcome = await fx.debt_refresh.refresh()
+
+    assert outcome.checked == 3
+    # Ровно 2 паузы по 2.0 сек — между car1-car2 и car2-car3.
+    assert sleep_log.calls == [2.0, 2.0]
+
+
+async def test_debt_refresh_no_trailing_delay_after_last_car():
+    fx = _Fixture()
+    fx.add_car(telegram_user_id=1, car_number="AA001AA")
+    await fx.seed(telegram_user_id=1, plate="AA001AA", amount=Decimal(100))
+
+    sleep_log = _SleepLog()
+    fx.debt_refresh = TurkeyDebtRefreshService(
+        fx.garage, fx.runs, fx.check_service, fx.statistics, sleep=sleep_log,
+    )
+
+    await fx.debt_refresh.refresh()
+
+    assert sleep_log.calls == []  # единственная машина — вообще без паузы
+
+
+async def test_one_failed_car_does_not_permanently_hold_lock_or_break_refresh():
+    """Один ERROR-автомобиль не должен ни остановить refresh для
+    остальных, ни оставить что-либо (lock/delay-состояние) сломанным для
+    следующего вызова refresh()."""
+    fx = _Fixture()
+    fx.add_car(telegram_user_id=1, car_number="AA001AA")
+    fx.add_car(telegram_user_id=2, car_number="BB002BB")
+    await fx.seed(telegram_user_id=1, plate="AA001AA", amount=Decimal(100))
+    await fx.seed(telegram_user_id=2, plate="BB002BB", amount=Decimal(200))
+
+    # Все ТРИ провайдера падают transport_error -> overall_status=ERROR
+    # (не PARTIAL) -> предыдущее достоверное состояние (100/200) остаётся
+    # НЕТРОНУТЫМ (см. модульный докстрок) -> обе машины остаются
+    # candidates для follow-up refresh ниже.
+    fx.debt_refresh._check_service = _make_check_service(
+        gib_error=True, avrasya_error=True, kgm_error=True,
+    )
+    sleep_log = _SleepLog()
+    fx.debt_refresh = TurkeyDebtRefreshService(
+        fx.garage, fx.runs, fx.debt_refresh._check_service, fx.statistics, sleep=sleep_log,
+    )
+
+    outcome = await fx.debt_refresh.refresh()
+
+    assert outcome.checked == 2
+    assert outcome.failed == 2  # обе машины делят один и тот же (сломанный) check_service
+    assert sleep_log.calls == [2.0]  # пауза между двумя машинами всё равно произошла
+
+    # Follow-up refresh на том же instance не виснет и не блокируется.
+    assert fx.debt_refresh.is_in_progress() is False
+    fx.debt_refresh._check_service = _make_check_service(gib=Decimal(50))
+    outcome2 = await fx.debt_refresh.refresh()
+    assert outcome2.checked == 2

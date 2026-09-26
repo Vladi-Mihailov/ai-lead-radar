@@ -44,6 +44,12 @@ _ORDINARY_ID = 685137235
 _TZ = ZoneInfo("UTC")
 
 
+async def _instant_sleep(_seconds: float) -> None:
+    """См. tests/test_turkey_debt_refresh_service.py — та же замена
+    реального asyncio.sleep для inter-car delay (см. задачу "reduce
+    Turkey OCR memory pressure")."""
+
+
 class _FakeCloseable:
     async def aclose(self) -> None:
         pass
@@ -126,7 +132,9 @@ class _Fixture:
         # пройдёт.
         self.check_service = _make_check_service(poison=poison_check_service)
         self.debt_refresh = (
-            TurkeyDebtRefreshService(self.garage, self.runs, self.check_service, self.statistics)
+            TurkeyDebtRefreshService(
+                self.garage, self.runs, self.check_service, self.statistics, sleep=_instant_sleep,
+            )
             if with_debt_refresh else None
         )
         self.controller = ConversationController(

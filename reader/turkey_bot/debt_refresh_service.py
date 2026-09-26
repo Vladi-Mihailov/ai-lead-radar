@@ -46,6 +46,8 @@ for_owner), результат ОДНОГО provider-check переисполь�
 plate дал бы идентичный ответ.
 """
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from reader.turkey_bot.statistics_service import TurkeyDebtRow, TurkeyStatisticsService
@@ -61,6 +63,15 @@ from reader.turkey_bot.user_cars_repository import TurkeyUserCarsRepository
 # "manual" (никакой новой CAPTCHA/OCR/bypass-логики, см. задачу).
 _REFRESH_MAX_ATTEMPTS = 35
 _INITIATOR_MANAGER_REFRESH = "manager_refresh"
+
+# См. задачу "reduce Turkey OCR memory pressure" — READ-ONLY диагностика
+# production OOM установила: mass refresh может гонять 20+ машин подряд
+# БЕЗ паузы, каждая — до 35 CAPTCHA-попыток × 3 провайдера через process-
+# wide RapidOCR singleton, что не даёт allocator'у ни единого шанса
+# "остыть" между машинами. Пауза здесь — ТОЛЬКО между РАЗНЫМИ машинами
+# (не после последней) — provider retry delays (throttle ВНУТРИ одного
+# check(), см. AvrasyaSession._throttle) НЕ меняются вовсе.
+_INTER_CAR_DELAY_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -92,12 +103,17 @@ class TurkeyDebtRefreshService:
         run_repository: TurkeyCheckRunRepository,
         check_service: UnifiedTurkeyCheckService,
         statistics_service: TurkeyStatisticsService,
+        *,
+        inter_car_delay_seconds: float = _INTER_CAR_DELAY_SECONDS,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ):
         self._garage = garage_repository
         self._runs = run_repository
         self._check_service = check_service
         self._statistics = statistics_service
         self._in_progress = False
+        self._inter_car_delay_seconds = inter_car_delay_seconds
+        self._sleep = sleep
 
     def is_in_progress(self) -> bool:
         return self._in_progress
@@ -144,7 +160,12 @@ class TurkeyDebtRefreshService:
             failed = 0
             failed_car_numbers: list[str] = []
 
-            for plate, rows in by_plate.items():
+            for index, (plate, rows) in enumerate(by_plate.items()):
+                if index > 0:
+                    # См. модульный докстрок про _INTER_CAR_DELAY_SECONDS —
+                    # пауза МЕЖДУ РАЗНЫМИ машинами, не после последней.
+                    await self._sleep(self._inter_car_delay_seconds)
+
                 result = await self._check_service.check(
                     plate, max_attempts=_REFRESH_MAX_ATTEMPTS, mode="manual",
                 )

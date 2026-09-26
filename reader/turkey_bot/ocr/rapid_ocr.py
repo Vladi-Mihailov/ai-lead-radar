@@ -52,7 +52,23 @@ class RapidOcrService:
         if self._engine is None:
             from rapidocr import RapidOCR
 
-            self._engine = RapidOCR()
+            # См. задачу "reduce Turkey OCR memory pressure" — READ-ONLY
+            # диагностика production OOM (turkeybot, ~2.9 GB peak на 3.7
+            # GiB VPS без swap) установила: RapidOCR — process-wide
+            # singleton (см. докстрок класса), поэтому его onnxruntime
+            # config.yaml по умолчанию отдаёт enable_cpu_mem_arena: false —
+            # КАЖДЫЙ session.run() (до 35 CAPTCHA-попыток × 3 провайдера,
+            # повторяется на каждый check за весь lifetime процесса) идёт
+            # через голый OS/CRT allocator вместо переиспользуемого arena,
+            # что фрагментирует и раздувает heap процесса без единого
+            # "утёкшего" Python-объекта. Единственный override — ТОЛЬКО
+            # этот один ключ (params, не отдельный config-файл — apply
+            # НАД пакетным default'ом, см. rapidocr.RapidOCR.__init__ /
+            # ParseParams.update_batch) — модели/thresholds/preprocessing/
+            # распознавание и CAPTCHA retry-логика этим не затронуты вовсе.
+            self._engine = RapidOCR(
+                params={"EngineConfig.onnxruntime.enable_cpu_mem_arena": True},
+            )
         return self._engine
 
     def recognize(self, image: str | Path | bytes | np.ndarray) -> list[OcrResult]:
