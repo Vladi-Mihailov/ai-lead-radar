@@ -378,6 +378,50 @@ def register(
     logger.info("✔ @ProtocolGEbot handlers зарегистрированы")
 
 
+# Production bug (см. журнал): event.respond(reply.text, ...) падал с
+# telethon.errors.rpcerrorlist.MessageTooLongError — police.ge-запрос
+# успевал завершиться (HTTP 200), но СГЕНЕРИРОВАННЫЙ текст ответа
+# превышал предел Telegram (реальный лимит — 4096 символов) — консервативный
+# запас ниже реального лимита (не 4096 ровно), т.к. Telethon/Telegram
+# считают длину уже ПОСЛЕ собственной обработки entities/markdown, где
+# точный запас неочевиден. Генерик-хелпер — общий для ЛЮБОГО BotReply
+# (см. задачу: "not specific to one plate or 'Проверить сейчас'"), не
+# знает ничего про police.ge/FineCheckService/бизнес-логику.
+_TELEGRAM_SAFE_TEXT_LIMIT = 3900
+
+
+def _split_telegram_text(text: str, *, limit: int = _TELEGRAM_SAFE_TEXT_LIMIT) -> list[str]:
+    """Режет text на куски <= limit символов, НИКОГДА не теряя и не
+    дублируя ни одного символа ("".join(_split_telegram_text(text)) ==
+    text всегда, см. тесты). Предпочитает границы строк (см. задачу:
+    "Prefer splitting at newline boundaries first") — splitlines(keepends=
+    True) сохраняет исходные символы конца строки ровно как они были, что
+    и даёт лёгкое "join без потерь". Если ОДНА строка сама по себе длиннее
+    limit (см. задачу п.2: "hard-split it safely") — режется жёстко, по
+    limit символов, без попытки угадать "красивую" границу внутри неё."""
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        if len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            for start in range(0, len(line), limit):
+                chunks.append(line[start:start + limit])
+            continue
+        if current and len(current) + len(line) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current += line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 async def _answer_and_send(event, reply, *, is_trusted: bool = False) -> None:
     """Общий хвост для callback'ов, которые могут вернуть None (=
     подписка не найдена/не принадлежит этому пользователю, см.
@@ -482,17 +526,32 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False, is_trusted: bo
     elif reply.protocol_check_back_target == "protocol_step1":
         buttons = protocol_check_back_to_protocol_step1_keyboard()
 
+    # См. _split_telegram_text() докстрок про MessageTooLongError —
+    # короткий reply.text (подавляющее большинство случаев) даёт РОВНО
+    # один chunk, и поведение ниже бит в бит совпадает с прежним
+    # (один edit/respond, buttons на нём одном). buttons вешаются ТОЛЬКО
+    # на ПОСЛЕДНИЙ chunk (см. задачу: "так что normal navigation/menu
+    # remains below the result") — предыдущие chunks идут без кнопок.
+    chunks = _split_telegram_text(reply.text)
+    last_index = len(chunks) - 1
+
+    send_from = 0
     if prefer_edit:
         try:
-            await event.edit(reply.text, buttons=buttons)
-            return
+            await event.edit(chunks[0], buttons=buttons if last_index == 0 else None)
+            send_from = 1
         except Exception:
             # Сообщение с кнопками могло стать недоступным для редактирования
             # (например, Telegram ограничивает срок редактирования) —
-            # результат всё равно должен дойти до пользователя.
+            # результат всё равно должен дойти до пользователя. send_from
+            # остаётся 0 — весь текст (включая chunks[0]) уходит через
+            # respond ниже, ничего не потеряно и не задвоено (edit выше
+            # либо не отправил ничего вовсе, либо сам упал с исключением
+            # до применения).
             logger.warning(
                 "Не удалось отредактировать сообщение @ProtocolGEbot, отправляю новое",
                 exc_info=True,
             )
 
-    await event.respond(reply.text, buttons=buttons)
+    for index in range(send_from, len(chunks)):
+        await event.respond(chunks[index], buttons=buttons if index == last_index else None)
