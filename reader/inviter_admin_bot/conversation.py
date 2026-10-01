@@ -38,6 +38,13 @@ class BotReply:
     account_card_enabled: bool | None = None
     limit_choice_account_id: int | None = None
     limits_choice_account_id: int | None = None
+    # (campaign_id, label, enabled) — список "📣 Кампании".
+    campaigns_page_options: list[tuple[int, str, bool]] | None = None
+    # Экран одной кампании: id + enabled + есть ли у неё пул лидов
+    # (только тогда показывается "🔄 Обновить лиды").
+    campaign_card_id: int | None = None
+    campaign_card_enabled: bool | None = None
+    campaign_card_has_pool: bool = False
 
 
 def _looks_like_phone(text: str) -> bool:
@@ -94,17 +101,18 @@ class AdminBotController:
         if stripped == texts.ADD_ACCOUNT_LABEL:
             self._states.set(chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_PHONE)
             return BotReply(text=texts.PHONE_PROMPT, show_cancel_button=True)
-        if stripped == texts.START_LABEL:
-            self._service.set_global_enabled(True)
-            return BotReply(text=texts.GLOBAL_ENABLED_TEXT, show_main_menu=True)
-        if stripped == texts.PAUSE_LABEL:
-            self._service.set_global_enabled(False)
-            return BotReply(text=texts.GLOBAL_PAUSED_TEXT, show_main_menu=True)
+        # Глобальные ▶️ Запустить/⏸ Приостановить заменены включением
+        # каждой кампании отдельно (см. 📣 Кампании) — эти тексты больше не
+        # обрабатываются как команды (см. runtime_state_repository.py про
+        # перенос прежней глобальной паузы в кампании).
+        if stripped == texts.CAMPAIGNS_LABEL:
+            return self._format_campaigns_reply()
         if stripped == texts.STATUS_LABEL:
             return BotReply(
                 text=texts.format_account_statuses(
                     self._service.list_account_statuses(),
                     inviter_enabled=self._service.is_global_enabled(),
+                    campaigns=self._service.list_campaigns(),
                 ),
                 show_main_menu=True,
             )
@@ -366,6 +374,67 @@ class AdminBotController:
             text=texts.format_auth_failed(outcome.error_summary or "Не удалось начать переавторизацию."),
             account_card_id=account_id, account_card_enabled=account.enabled,
         )
+
+    # ---- 📣 Кампании ----
+
+    def _format_campaigns_reply(self) -> BotReply:
+        entries = self._service.list_campaigns()
+        if not entries:
+            return BotReply(text=texts.format_campaigns_list(entries), show_main_menu=True)
+        return BotReply(
+            text=texts.format_campaigns_list(entries),
+            campaigns_page_options=[(e.id, e.label, e.enabled) for e in entries],
+        )
+
+    def _campaign_card_reply(self, campaign_id: int, *, prefix: str | None = None) -> BotReply:
+        stats = self._service.campaign_stats(campaign_id)
+        if stats is None:
+            return BotReply(text=texts.CAMPAIGN_NOT_FOUND_TEXT, show_main_menu=True)
+        text = texts.format_campaign_card(stats)
+        if prefix:
+            text = f"{prefix}\n\n{text}"
+        return BotReply(
+            text=text, campaign_card_id=stats.campaign_id,
+            campaign_card_enabled=stats.enabled, campaign_card_has_pool=stats.has_pool,
+        )
+
+    def handle_campaigns_back(self, *, telegram_user_id: int) -> BotReply:
+        if not self.is_trusted(telegram_user_id):
+            return self._denied()
+        return self._format_campaigns_reply()
+
+    def handle_campaign_open(self, campaign_id: int, *, telegram_user_id: int) -> BotReply:
+        if not self.is_trusted(telegram_user_id):
+            return self._denied()
+        return self._campaign_card_reply(campaign_id)
+
+    def handle_campaign_set_enabled(
+        self, campaign_id: int, enabled: bool, *, telegram_user_id: int,
+    ) -> BotReply:
+        """▶️/⏸ — ТОЛЬКО эта кампания; явное целевое состояние (а не
+        toggle), поэтому повторное нажатие устаревшей кнопки безопасно."""
+        if not self.is_trusted(telegram_user_id):
+            return self._denied()
+        if self._service.set_campaign_enabled(campaign_id, enabled) is None:
+            return BotReply(text=texts.CAMPAIGN_NOT_FOUND_TEXT, show_main_menu=True)
+        return self._campaign_card_reply(campaign_id)
+
+    def handle_campaign_stats(self, campaign_id: int, *, telegram_user_id: int) -> BotReply:
+        if not self.is_trusted(telegram_user_id):
+            return self._denied()
+        stats = self._service.campaign_stats(campaign_id)
+        if stats is None:
+            return BotReply(text=texts.CAMPAIGN_NOT_FOUND_TEXT, show_main_menu=True)
+        return BotReply(
+            text=texts.format_campaign_stats(stats), campaign_card_id=stats.campaign_id,
+            campaign_card_enabled=stats.enabled, campaign_card_has_pool=stats.has_pool,
+        )
+
+    async def handle_campaign_refresh(self, campaign_id: int, *, telegram_user_id: int) -> BotReply:
+        if not self.is_trusted(telegram_user_id):
+            return self._denied()
+        outcome = await self._service.refresh_campaign_leads(campaign_id)
+        return self._campaign_card_reply(campaign_id, prefix=texts.format_lead_refresh(outcome))
 
     async def _handle_sync_all(self) -> BotReply:
         summary = await self._service.sync_all_accounts(self._sync_client_factory)

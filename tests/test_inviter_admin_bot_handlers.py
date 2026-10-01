@@ -55,8 +55,10 @@ async def test_main_menu_reply_attaches_main_menu_keyboard():
     labels = _labels(event.calls[0]["buttons"])
     assert texts.ACCOUNTS_LABEL in labels
     assert texts.ADD_ACCOUNT_LABEL in labels
-    assert texts.START_LABEL in labels
-    assert texts.PAUSE_LABEL in labels
+    assert texts.CAMPAIGNS_LABEL in labels
+    # Глобальные ▶️/⏸ заменены включением по кампаниям.
+    assert texts.START_LABEL not in labels
+    assert texts.PAUSE_LABEL not in labels
     assert texts.HELP_LABEL in labels
 
 

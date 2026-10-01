@@ -114,7 +114,9 @@ def test_parse_args_add_campaign_defaults():
     assert args.name == "Страхование"
     assert args.keyword == "страх"
     assert args.target_chat == "@tplgee"
-    assert args.enabled is True
+    # Не передан — "не менять" у существующей кампании, выключена у новой
+    # (кампания никогда не включается неявно).
+    assert args.enabled is None
 
 
 def test_parse_args_sync_accounts():

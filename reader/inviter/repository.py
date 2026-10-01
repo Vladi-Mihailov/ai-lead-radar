@@ -85,9 +85,34 @@ CREATE TABLE IF NOT EXISTS invite_campaigns (
     keyword      TEXT NOT NULL,
     target_chat  TEXT NOT NULL,
     enabled      BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    slug             TEXT,
+    display_name     TEXT,
+    source_chats     TEXT,
+    source_title     TEXT,
+    match_rule       TEXT,
+    lead_max_age_days INTEGER
 )
 """
+
+# Мультикампании (см. InviteCampaign) — те же additive ALTER TABLE, что и
+# для остальных таблиц: существующая строка кампании получает NULL во всех
+# новых колонках, что означает ровно прежнее поведение (источник не
+# ограничен, slug/display_name не заданы). Ни одна существующая строка не
+# переписывается.
+_INVITE_CAMPAIGNS_COLUMN_MIGRATIONS = {
+    "slug": "ALTER TABLE invite_campaigns ADD COLUMN slug TEXT",
+    "display_name": "ALTER TABLE invite_campaigns ADD COLUMN display_name TEXT",
+    "source_chats": "ALTER TABLE invite_campaigns ADD COLUMN source_chats TEXT",
+    "source_title": "ALTER TABLE invite_campaigns ADD COLUMN source_title TEXT",
+    "match_rule": "ALTER TABLE invite_campaigns ADD COLUMN match_rule TEXT",
+    "lead_max_age_days": "ALTER TABLE invite_campaigns ADD COLUMN lead_max_age_days INTEGER",
+}
+
+_INVITE_CAMPAIGNS_SLUG_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_invite_campaigns_slug "
+    "ON invite_campaigns(slug) WHERE slug IS NOT NULL"
+)
 
 _USER_CAMPAIGN_INVITES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS user_campaign_invites (
@@ -151,6 +176,21 @@ def _parse_keywords_column(raw: str | None) -> list[str]:
     return [kw.strip() for kw in raw.split(",") if kw.strip()]
 
 
+def _parse_source_chats(raw: str | None) -> tuple[str, ...]:
+    """invite_campaigns.source_chats — тот же запятая-разделённый формат,
+    что и users.keywords: "@sadahlo" или числовой id. Идентификаторы
+    резолвятся через Telethon в момент сканирования (см.
+    reader/inviter/lead_pool.py), здесь НЕ угадываются."""
+    if not raw:
+        return ()
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _format_source_chats(chats) -> str | None:
+    items = [str(chat).strip() for chat in chats or () if str(chat).strip()]
+    return ", ".join(items) if items else None
+
+
 def _parse_previous_names(raw: str | None) -> list[str]:
     """telegram_accounts.previous_names хранится в том же
     запятая-разделённом формате, что и users.keywords (см.
@@ -199,15 +239,85 @@ def _format_previous_names(names: list[str]) -> str | None:
 # успешно. 'invited' сохранён для обратной совместимости со строками,
 # записанными до перехода на жизненный цикл pending -> joined (см. задачу
 # про подтверждение реального вступления, а не успешного RPC).
-_CANDIDATES_BASE_WHERE = """
-    u.access_hash IS NOT NULL
+# Два вида кампаний (см. InviteCampaign.source_chats):
+#
+# 1. source_chats NULL/'' — ВСЕ кампании, существовавшие до мультикампаний
+#    (Грузия): ровно прежнее правило — keyword кампании должен быть ТОЧНЫМ
+#    токеном users.keywords (агрегат совпадений KeywordMatcher по всем
+#    группам). Не меняется ни на символ.
+# 2. source_chats задан — кандидаты берутся ТОЛЬКО из пула лидов этой
+#    кампании (campaign_leads, см. reader/inviter/lead_pool.py), собранного
+#    сканированием истории именно этих чатов; status='new' — лид пригоден
+#    (не бот/не удалён/не участник target по результатам сканирования).
+#    users.keywords для таких кампаний не используется вовсе — пул уже
+#    отфильтрован по keyword и источнику при сборе.
+#
+# Остальные условия (access_hash, is_bot) — общие для обоих видов.
+#
+# _LEADS_WHERE — "лид кампании" без учёта истории приглашений: используется
+# и как основа _CANDIDATES_BASE_WHERE, и сам по себе для статистики (см.
+# count_leads()).
+# Для кампаний с пулом username/access_hash, увиденные при сканировании
+# источника, хранятся в campaign_leads, а не дописываются в общую таблицу
+# users (иначе пользователи с keyword Грузии, у которых в users не было
+# username/access_hash, стали бы НОВЫМИ кандидатами Грузии — см.
+# reader/inviter/lead_pool.py _ensure_user_row). users по-прежнему
+# приоритетнее; значение из пула — только если в users его нет. Для
+# кампаний без пула подзапрос всегда NULL — выражения сводятся ровно к
+# прежним u.username/u.access_hash/u.last_seen_at.
+_LEAD_COLUMN = "(SELECT l.{column} FROM campaign_leads l WHERE l.campaign_id = c.id AND l.user_id = u.user_id)"
+_EFFECTIVE_USERNAME = f"COALESCE(NULLIF(u.username, ''), {_LEAD_COLUMN.format(column='username')})"
+_EFFECTIVE_ACCESS_HASH = f"COALESCE(u.access_hash, {_LEAD_COLUMN.format(column='access_hash')})"
+_EFFECTIVE_ORDER = f"COALESCE({_LEAD_COLUMN.format(column='last_message_at')}, u.last_seen_at)"
+
+_LEADS_WHERE = f"""
+    {_EFFECTIVE_ACCESS_HASH} IS NOT NULL
     AND (u.is_bot IS NULL OR u.is_bot = 0)
-    AND (', ' || u.keywords || ', ') LIKE ('%, ' || c.keyword || ', %')
+    AND (
+        (
+            (c.source_chats IS NULL OR c.source_chats = '')
+            AND (', ' || u.keywords || ', ') LIKE ('%, ' || c.keyword || ', %')
+        )
+        OR (
+            c.source_chats IS NOT NULL AND c.source_chats <> ''
+            AND EXISTS (
+                SELECT 1 FROM campaign_leads l
+                WHERE l.campaign_id = c.id AND l.user_id = u.user_id AND l.status = 'new'
+                  -- lead_max_age_days: по ПОСЛЕДНЕМУ совпавшему сообщению
+                  -- (last_message_at хранится ISO-строкой UTC, сравнение
+                  -- строк того же формата).
+                  AND (
+                      c.lead_max_age_days IS NULL
+                      OR l.last_message_at >= strftime(
+                          '%Y-%m-%dT%H:%M:%S', 'now', '-' || c.lead_max_age_days || ' days'
+                      )
+                  )
+            )
+        )
+    )
+"""
+
+# Дедупликация — по-прежнему в первую очередь в рамках ЭТОЙ кампании
+# (uci.campaign_id = :campaign_id): запись другой кампании сама по себе НЕ
+# исключает пользователя (тот же user_id может быть лидом и Грузии, и
+# Армении). Дополнительно: успешное приглашение ('invited'/'pending'/
+# 'joined') ДРУГОЙ кампании с тем же target_chat тоже исключает — защита от
+# повторного приглашения одного человека в одну и ту же группу, если две
+# кампании когда-нибудь будут вести в один target (для единственной
+# кампании с данным target_chat ничего не меняется). 'invalid' другой
+# кампании не переносится — он остаётся решением только своей кампании.
+_CANDIDATES_BASE_WHERE = _LEADS_WHERE + """
     AND NOT EXISTS (
         SELECT 1 FROM user_campaign_invites uci
+        LEFT JOIN invite_campaigns oc ON oc.id = uci.campaign_id
         WHERE uci.user_id = u.user_id
-          AND uci.campaign_id = :campaign_id
-          AND uci.status IN ('invited', 'pending', 'joined', 'invalid')
+          AND (
+              (uci.campaign_id = :campaign_id
+               AND uci.status IN ('invited', 'pending', 'joined', 'invalid'))
+              OR (uci.campaign_id <> :campaign_id
+                  AND uci.status IN ('invited', 'pending', 'joined')
+                  AND LOWER(oc.target_chat) = LOWER(c.target_chat))
+          )
     )
 """
 
@@ -220,7 +330,7 @@ _CANDIDATES_BASE_WHERE = """
 # candidate физически не подготовить ни для одного нового аккаунта
 # ("... не известен этому аккаунту и не имеет username для резолва") —
 # поэтому не выбираем его вовсе, а не проваливаем каждую попытку.
-_USERNAME_FILTER = "u.username IS NOT NULL AND TRIM(u.username) <> ''"
+_USERNAME_FILTER = f"{_EFFECTIVE_USERNAME} IS NOT NULL AND TRIM({_EFFECTIVE_USERNAME}) <> ''"
 
 _CANDIDATES_WHERE = f"{_CANDIDATES_BASE_WHERE} AND {_USERNAME_FILTER}"
 
@@ -243,12 +353,32 @@ JOIN invite_campaigns c ON c.id = :campaign_id
 WHERE {_CANDIDATES_BASE_WHERE}
 """
 
+_COUNT_LEADS = f"""
+SELECT COUNT(*)
+FROM users u
+JOIN invite_campaigns c ON c.id = :campaign_id
+WHERE {_LEADS_WHERE}
+"""
+
+# Статистика кампании по пользователям: для каждого user_id берётся его
+# ПОСЛЕДНЯЯ запись в этой кампании (повторная попытка после 'failed' —
+# новая строка, см. InviterService._record_invite_result), чтобы один
+# человек не считался одновременно и failed, и joined.
+_CAMPAIGN_STATUS_COUNTS = """
+SELECT status, COUNT(*)
+FROM user_campaign_invites
+WHERE id IN (
+    SELECT MAX(id) FROM user_campaign_invites WHERE campaign_id = :campaign_id GROUP BY user_id
+)
+GROUP BY status
+"""
+
 _SELECT_CANDIDATES = f"""
-SELECT u.user_id, u.username, u.keywords, u.access_hash, u.last_seen_at, u.is_bot
+SELECT u.user_id, {_EFFECTIVE_USERNAME}, u.keywords, {_EFFECTIVE_ACCESS_HASH}, u.last_seen_at, u.is_bot
 FROM users u
 JOIN invite_campaigns c ON c.id = :campaign_id
 WHERE {_CANDIDATES_WHERE}
-ORDER BY u.last_seen_at DESC
+ORDER BY {_EFFECTIVE_ORDER} DESC
 LIMIT :limit
 """
 
@@ -526,22 +656,60 @@ class InviteCampaignRepository:
     пользователей по keyword и сама отправка приглашений реализуются в
     service.py, когда появится сама логика приглашений."""
 
-    _UPDATABLE_COLUMNS = ("name", "keyword", "target_chat", "enabled")
+    _UPDATABLE_COLUMNS = (
+        "name", "keyword", "target_chat", "enabled",
+        "slug", "display_name", "source_chats", "source_title",
+        "match_rule", "lead_max_age_days",
+    )
 
     def __init__(self, db_path: Path):
         self._conn = _connect(db_path)
         self._conn.execute(_INVITE_CAMPAIGNS_SCHEMA)
+        self._migrate_missing_columns()
+        self._conn.execute(_INVITE_CAMPAIGNS_SLUG_INDEX_SQL)
         self._conn.commit()
 
+    def _migrate_missing_columns(self) -> None:
+        existing_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(invite_campaigns)")
+        }
+        for column, statement in _INVITE_CAMPAIGNS_COLUMN_MIGRATIONS.items():
+            if column not in existing_columns:
+                self._conn.execute(statement)
+
     def create(
-        self, *, name: str, keyword: str, target_chat: str, enabled: bool = True,
+        self,
+        *,
+        name: str,
+        keyword: str,
+        target_chat: str,
+        enabled: bool = True,
+        slug: str | None = None,
+        display_name: str | None = None,
+        source_chats: tuple[str, ...] | list[str] = (),
+        source_title: str | None = None,
+        match_rule: str | None = None,
+        lead_max_age_days: int | None = None,
     ) -> InviteCampaign:
         cursor = self._conn.execute(
             """
-            INSERT INTO invite_campaigns (name, keyword, target_chat, enabled)
-            VALUES (:name, :keyword, :target_chat, :enabled)
+            INSERT INTO invite_campaigns (
+                name, keyword, target_chat, enabled,
+                slug, display_name, source_chats, source_title,
+                match_rule, lead_max_age_days
+            ) VALUES (
+                :name, :keyword, :target_chat, :enabled,
+                :slug, :display_name, :source_chats, :source_title,
+                :match_rule, :lead_max_age_days
+            )
             """,
-            {"name": name, "keyword": keyword, "target_chat": target_chat, "enabled": enabled},
+            {
+                "name": name, "keyword": keyword, "target_chat": target_chat, "enabled": enabled,
+                "slug": slug, "display_name": display_name,
+                "source_chats": _format_source_chats(source_chats),
+                "source_title": source_title,
+                "match_rule": match_rule, "lead_max_age_days": lead_max_age_days,
+            },
         )
         self._conn.commit()
 
@@ -556,6 +724,8 @@ class InviteCampaignRepository:
             raise ValueError(f"Неизвестные поля для обновления: {sorted(unknown)}")
 
         if fields:
+            if "source_chats" in fields:
+                fields["source_chats"] = _format_source_chats(fields["source_chats"])
             assignments = ", ".join(f"{column} = :{column}" for column in fields)
             self._conn.execute(
                 f"UPDATE invite_campaigns SET {assignments} WHERE id = :id",
@@ -571,17 +741,30 @@ class InviteCampaignRepository:
     def get(self, campaign_id: int) -> InviteCampaign | None:
         row = self._conn.execute(
             """
-            SELECT id, name, keyword, target_chat, enabled, created_at
+            SELECT id, name, keyword, target_chat, enabled, created_at,
+                   slug, display_name, source_chats, source_title, match_rule, lead_max_age_days
             FROM invite_campaigns WHERE id = ?
             """,
             (campaign_id,),
         ).fetchone()
         return _row_to_campaign(row) if row else None
 
+    def get_by_slug(self, slug: str) -> InviteCampaign | None:
+        row = self._conn.execute(
+            """
+            SELECT id, name, keyword, target_chat, enabled, created_at,
+                   slug, display_name, source_chats, source_title, match_rule, lead_max_age_days
+            FROM invite_campaigns WHERE slug = ?
+            """,
+            (slug,),
+        ).fetchone()
+        return _row_to_campaign(row) if row else None
+
     def list(self) -> list[InviteCampaign]:
         rows = self._conn.execute(
             """
-            SELECT id, name, keyword, target_chat, enabled, created_at
+            SELECT id, name, keyword, target_chat, enabled, created_at,
+                   slug, display_name, source_chats, source_title, match_rule, lead_max_age_days
             FROM invite_campaigns ORDER BY id
             """
         ).fetchall()
@@ -592,7 +775,10 @@ class InviteCampaignRepository:
 
 
 def _row_to_campaign(row) -> InviteCampaign:
-    id_, name, keyword, target_chat, enabled, created_at = row
+    (
+        id_, name, keyword, target_chat, enabled, created_at,
+        slug, display_name, source_chats, source_title, match_rule, lead_max_age_days,
+    ) = row
     return InviteCampaign(
         id=id_,
         name=name,
@@ -600,6 +786,12 @@ def _row_to_campaign(row) -> InviteCampaign:
         target_chat=target_chat,
         enabled=bool(enabled),
         created_at=_parse_datetime(created_at),
+        slug=slug,
+        display_name=display_name,
+        source_chats=_parse_source_chats(source_chats),
+        source_title=source_title,
+        match_rule=match_rule,
+        lead_max_age_days=lead_max_age_days,
     )
 
 
@@ -622,6 +814,11 @@ class UserCampaignInviteRepository:
 
     def __init__(self, db_path: Path):
         UserRepository(db_path).close()
+        # campaign_leads (пул лидов кампаний с source_chats) читается в
+        # _LEADS_WHERE — тот же приём, что и для users выше.
+        from reader.inviter.lead_pool import CampaignLeadRepository
+
+        CampaignLeadRepository(db_path).close()
         self._conn = _connect(db_path)
         self._conn.execute(_USER_CAMPAIGN_INVITES_SCHEMA)
         self._migrate_missing_columns()
@@ -748,6 +945,21 @@ class UserCampaignInviteRepository:
         подготовить к приглашению из-за отсутствия username."""
         row = self._conn.execute(_COUNT_FOUND_CANDIDATES, {"campaign_id": campaign_id}).fetchone()
         return row[0]
+
+    def count_leads(self, campaign_id: int) -> int:
+        """"Лидов найдено" для статистики кампании (см.
+        reader/inviter_admin_bot/) — пользователи, подходящие кампании по
+        keyword/источнику/access_hash/не-бот, НЕЗАВИСИМО от истории
+        приглашений и наличия username (см. _LEADS_WHERE)."""
+        row = self._conn.execute(_COUNT_LEADS, {"campaign_id": campaign_id}).fetchone()
+        return row[0]
+
+    def status_counts(self, campaign_id: int) -> dict[str, int]:
+        """{status: число пользователей} по ПОСЛЕДНЕЙ записи каждого
+        пользователя в этой кампании (см. _CAMPAIGN_STATUS_COUNTS) — только
+        фактические данные user_campaign_invites, без каких-либо оценок."""
+        rows = self._conn.execute(_CAMPAIGN_STATUS_COUNTS, {"campaign_id": campaign_id}).fetchall()
+        return {status: count for status, count in rows}
 
     def count_today_joined(self, account_id: int) -> int:
         """Сколько раз ЭТОТ account_id получил ДЕЙСТВИТЕЛЬНО подтверждённое

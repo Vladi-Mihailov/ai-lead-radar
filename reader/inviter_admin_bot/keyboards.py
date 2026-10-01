@@ -16,15 +16,18 @@ from reader.inviter_admin_bot.texts import (
     ACCOUNTS_LABEL,
     ADD_ACCOUNT_LABEL,
     BACK_BUTTON_LABEL,
+    CAMPAIGN_DISABLE_LABEL,
+    CAMPAIGN_ENABLE_LABEL,
+    CAMPAIGN_REFRESH_LABEL,
+    CAMPAIGN_STATS_LABEL,
+    CAMPAIGNS_LABEL,
     CANCEL_BUTTON_LABEL,
     CHANGE_LIMIT_LABEL,
     CHECK_SYNC_LABEL,
     HELP_LABEL,
     LIMIT_PROMPT_CHOICES,
     MANUAL_LIMIT_LABEL,
-    PAUSE_LABEL,
     REAUTHORIZE_LABEL,
-    START_LABEL,
     STATUS_LABEL,
     SYNC_LABEL,
     TURN_OFF_ACCOUNT_LABEL,
@@ -39,6 +42,15 @@ _ACCOUNT_LIMIT_MANUAL_PREFIX = b"acc_limitmanual:"
 _ACCOUNT_SYNC_PREFIX = b"acc_sync:"
 _ACCOUNT_REAUTH_PREFIX = b"acc_reauth:"
 ACCOUNTS_BACK = b"accounts_back"
+
+# 📣 Кампании — callback_data несёт только публичный campaign id (тот же
+# принцип, что и для аккаунтов: авторизация — server-side на каждом вызове).
+_CAMPAIGN_OPEN_PREFIX = b"camp_open:"
+_CAMPAIGN_ON_PREFIX = b"camp_on:"
+_CAMPAIGN_OFF_PREFIX = b"camp_off:"
+_CAMPAIGN_STATS_PREFIX = b"camp_stats:"
+_CAMPAIGN_REFRESH_PREFIX = b"camp_refresh:"
+CAMPAIGNS_BACK = b"campaigns_back"
 
 # Третья кнопка каждой строки "👤 Аккаунты" — "USED / LIMIT" (см. задачу
 # "объедини экраны 👤 Аккаунты и ⚙️ Лимиты": бывший отдельный экран "⚙️
@@ -168,10 +180,75 @@ def decode_account_reauthorize_callback(data: bytes | None) -> int | None:
     return _decode_id(data, _ACCOUNT_REAUTH_PREFIX)
 
 
+def encode_campaign_open_callback(campaign_id: int) -> bytes:
+    return _encode_id(_CAMPAIGN_OPEN_PREFIX, campaign_id)
+
+
+def decode_campaign_open_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _CAMPAIGN_OPEN_PREFIX)
+
+
+def encode_campaign_enable_callback(campaign_id: int) -> bytes:
+    return _encode_id(_CAMPAIGN_ON_PREFIX, campaign_id)
+
+
+def decode_campaign_enable_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _CAMPAIGN_ON_PREFIX)
+
+
+def encode_campaign_disable_callback(campaign_id: int) -> bytes:
+    return _encode_id(_CAMPAIGN_OFF_PREFIX, campaign_id)
+
+
+def decode_campaign_disable_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _CAMPAIGN_OFF_PREFIX)
+
+
+def encode_campaign_stats_callback(campaign_id: int) -> bytes:
+    return _encode_id(_CAMPAIGN_STATS_PREFIX, campaign_id)
+
+
+def decode_campaign_stats_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _CAMPAIGN_STATS_PREFIX)
+
+
+def encode_campaign_refresh_callback(campaign_id: int) -> bytes:
+    return _encode_id(_CAMPAIGN_REFRESH_PREFIX, campaign_id)
+
+
+def decode_campaign_refresh_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _CAMPAIGN_REFRESH_PREFIX)
+
+
+def campaigns_page_keyboard(entries: list[tuple[int, str, bool]]) -> list[list[Button]]:
+    """entries — (campaign_id, label, enabled). Одна кнопка на кампанию —
+    открывает её экран; включение/выключение — только на экране кампании
+    (явные ▶️/⏸ с разными callback'ами: повторное нажатие устаревшей кнопки
+    не переключает состояние обратно)."""
+    return [
+        [Button.inline(f"{'🟢' if enabled else '🔴'} {label}", encode_campaign_open_callback(campaign_id))]
+        for campaign_id, label, enabled in entries
+    ]
+
+
+def campaign_card_keyboard(campaign_id: int, *, enabled: bool, has_pool: bool) -> list[list[Button]]:
+    toggle = (
+        Button.inline(CAMPAIGN_DISABLE_LABEL, encode_campaign_disable_callback(campaign_id))
+        if enabled
+        else Button.inline(CAMPAIGN_ENABLE_LABEL, encode_campaign_enable_callback(campaign_id))
+    )
+    rows = [[toggle]]
+    if has_pool:
+        rows.append([Button.inline(CAMPAIGN_REFRESH_LABEL, encode_campaign_refresh_callback(campaign_id))])
+    rows.append([Button.inline(CAMPAIGN_STATS_LABEL, encode_campaign_stats_callback(campaign_id))])
+    rows.append([Button.inline(BACK_BUTTON_LABEL, CAMPAIGNS_BACK)])
+    return rows
+
+
 def main_menu_keyboard() -> list[list[Button]]:
     return [
+        [Button.text(CAMPAIGNS_LABEL, resize=True)],
         [Button.text(ACCOUNTS_LABEL, resize=True), Button.text(ADD_ACCOUNT_LABEL, resize=True)],
-        [Button.text(START_LABEL, resize=True), Button.text(PAUSE_LABEL, resize=True)],
         [Button.text(STATUS_LABEL, resize=True), Button.text(SYNC_LABEL, resize=True)],
         [Button.text(HELP_LABEL, resize=True)],
     ]

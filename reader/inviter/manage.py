@@ -14,6 +14,38 @@
     python -m reader.inviter.manage add-campaign --name "Страхование" \
         --keyword страх --target-chat @tplgee
 
+Мультикампании (см. InviteCampaign): --slug — стабильный идентификатор
+кампании; запись ищется сначала по --slug, затем по --name (так slug
+присваивается уже существующей кампании без создания второй). --enabled/
+--no-enabled НЕ обязателен: если не передан, у существующей кампании
+enabled не меняется, а новая создаётся ВЫКЛЮЧЕННОЙ (кампания никогда не
+включается неявно). Присвоить slug/подпись существующей кампании Грузии,
+не меняя её keyword/target/enabled:
+
+    python -m reader.inviter.manage add-campaign --slug ge_insurance \
+        --name "Страхование" --display-name "🇬🇪 Грузия — страховка" \
+        --keyword страх --target-chat @tplgee
+
+Кампания с ограничением по источнику (лиды — только из пула, собранного
+сканированием истории источника, см. reader/inviter/lead_pool.py):
+
+    python -m reader.inviter.manage add-campaign --slug am_insurance_sadakhlo \
+        --name "Армения — Садахло" --display-name "🇦🇲 Армения — Садахло" \
+        --keyword страх --source-chat @sadahlo --source-title @sadahlo \
+        --target-chat @osagoarmen
+
+    python -m reader.inviter.manage list-campaigns
+    python -m reader.inviter.manage resolve-chat @sadahlo @osagoarmen
+
+Пул лидов (по умолчанию DRY RUN — ничего не пишет в БД, только читает
+Telegram и сохраняет CSV-превью); --import — явная идемпотентная запись
+пула и checkpoint'а:
+
+    python -m reader.inviter.manage build-lead-pool --campaign am_insurance_sadakhlo
+    python -m reader.inviter.manage build-lead-pool --campaign am_insurance_sadakhlo --import
+
+    python -m reader.inviter.manage set-campaign-enabled --campaign am_insurance_sadakhlo --enabled
+
 Повторный запуск с теми же --name обновляет уже существующую запись, а не
 создаёт вторую. Это касается и всех остальных полей add-account, включая
 --verify-membership: при обновлении нужно передавать ПОЛНЫЙ набор значений
@@ -87,11 +119,26 @@ from reader.inviter.identity import (  # noqa: E402
     reconcile_account_identity,
     resolve_duplicate_group,
 )
+from reader.inviter.lead_pool import (  # noqa: E402
+    MATCH_RULES,
+    CampaignLeadRepository,
+    format_recency_report,
+    format_summary,
+    import_scan,
+    known_campaign_user_ids,
+    load_checkpoints,
+    recency_cutoff,
+    recency_report,
+    scan_campaign_sources,
+    summarize_scan,
+    write_preview_csv,
+)
 from reader.inviter.models import InviteCampaign, TelegramAccount  # noqa: E402
 from reader.inviter.repository import (  # noqa: E402
     InviteCampaignRepository,
     TelegramAccountRepository,
 )
+from reader.users.repository import UserRepository  # noqa: E402
 from reader.settings import ConfigError, Settings, load_settings  # noqa: E402
 from reader.time_display import format_tbilisi  # noqa: E402
 
@@ -149,7 +196,84 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     add_campaign.add_argument("--name", required=True, help='Например, "Страхование".')
     add_campaign.add_argument("--keyword", required=True)
     add_campaign.add_argument("--target-chat", required=True, help='Например, "@tplgee".')
-    add_campaign.add_argument("--enabled", action=argparse.BooleanOptionalAction, default=True)
+    add_campaign.add_argument(
+        "--enabled", action=argparse.BooleanOptionalAction, default=None,
+        help=(
+            "Не передан — enabled существующей кампании не меняется, новая "
+            "создаётся выключенной."
+        ),
+    )
+    add_campaign.add_argument("--slug", default=None, help='Стабильный id кампании, например "ge_insurance".')
+    add_campaign.add_argument("--display-name", default=None, help="Подпись в admin-боте.")
+    add_campaign.add_argument(
+        "--source-chat", action="append", default=None, dest="source_chats",
+        help=(
+            "Ограничить источник лидов этим чатом (@username или числовой id; "
+            "можно несколько раз). Не передан — у существующей кампании не "
+            "меняется (у новой — без ограничения, как у Грузии)."
+        ),
+    )
+    add_campaign.add_argument("--source-title", default=None, help="Подпись источника в admin-боте.")
+    add_campaign.add_argument(
+        "--match-rule", choices=MATCH_RULES, default=None,
+        help="Правило совпадения для пула лидов (не передан — не меняется). См. InviteCampaign.match_rule.",
+    )
+    add_campaign.add_argument(
+        "--lead-max-age-days", type=int, default=None,
+        help=(
+            "Кандидат — только если ПОСЛЕДНЕЕ совпавшее сообщение не старше N дней "
+            "(0 — снять ограничение; не передан — не меняется)."
+        ),
+    )
+
+    subparsers.add_parser("list-campaigns", help="Показать все кампании инвайтера.")
+
+    set_enabled = subparsers.add_parser(
+        "set-campaign-enabled", help="Включить/выключить ОДНУ кампанию (по --campaign slug или id).",
+    )
+    set_enabled.add_argument("--campaign", required=True)
+    set_enabled.add_argument("--enabled", action=argparse.BooleanOptionalAction, required=True)
+
+    resolve_chat = subparsers.add_parser(
+        "resolve-chat",
+        help=(
+            "Только чтение: резолвит @username/ссылку через сессию чтения истории "
+            "(session_name_sync) и печатает marked peer id/тип/название."
+        ),
+    )
+    resolve_chat.add_argument("chats", nargs="+")
+
+    build_pool = subparsers.add_parser(
+        "build-lead-pool",
+        help=(
+            "Пул лидов кампании с --source-chat: сканирует историю источника "
+            "(после checkpoint), по умолчанию DRY RUN (без записи в БД)."
+        ),
+    )
+    build_pool.add_argument("--campaign", required=True, help="slug или id кампании.")
+    build_pool.add_argument(
+        "--import", dest="do_import", action="store_true",
+        help="Записать пул/checkpoint в БД (идемпотентно). Без него — только превью.",
+    )
+    build_pool.add_argument(
+        "--preview-out", default=None,
+        help="Путь CSV-превью (по умолчанию data/output/lead_pool/<slug>_<время>.csv).",
+    )
+    build_pool.add_argument(
+        "--recency-report", action="store_true",
+        help="Дополнительно вывести сравнение окон давности 30/90/180 дней/2026/вся история.",
+    )
+    build_pool.add_argument(
+        "--max-age-days", type=int, default=None,
+        help="Окно давности ТОЛЬКО для этого превью (кампания не меняется).",
+    )
+    build_pool.add_argument(
+        "--membership-account-id", type=int, default=None,
+        help=(
+            "Проверять участников target_chat сессией этого аккаунта инвайтера "
+            "(по умолчанию — той же сессией чтения истории)."
+        ),
+    )
 
     subparsers.add_parser(
         "sync-accounts",
@@ -223,22 +347,161 @@ def ensure_campaign(
     name: str,
     keyword: str,
     target_chat: str,
-    enabled: bool,
+    enabled: bool | None = None,
+    slug: str | None = None,
+    display_name: str | None = None,
+    source_chats: list[str] | None = None,
+    source_title: str | None = None,
+    match_rule: str | None = None,
+    lead_max_age_days: int | None = None,
 ) -> InviteCampaign:
-    """Идемпотентно: если кампания с таким name уже есть — обновляет её,
-    иначе создаёт новую. Ни при каких повторных вызовах не плодит дубликаты."""
+    """Идемпотентно: ищет кампанию по slug (если передан), затем по name —
+    обновляет найденную, иначе создаёт новую. Ни при каких повторных
+    вызовах не плодит дубликаты.
+
+    None у enabled/slug/display_name/source_chats/source_title — "не
+    менять" для существующей кампании (enabled=None у новой — выключена:
+    кампания никогда не включается неявно). lead_max_age_days=0 — снять
+    ограничение давности (NULL)."""
     repository = InviteCampaignRepository(db_path)
     try:
-        existing = next((c for c in repository.list() if c.name == name), None)
+        existing = repository.get_by_slug(slug) if slug else None
+        if existing is None:
+            existing = next((c for c in repository.list() if c.name == name), None)
         if existing is None:
             return repository.create(
-                name=name, keyword=keyword, target_chat=target_chat, enabled=enabled,
+                name=name, keyword=keyword, target_chat=target_chat, enabled=bool(enabled),
+                slug=slug, display_name=display_name, source_chats=source_chats or (),
+                source_title=source_title, match_rule=match_rule,
+                lead_max_age_days=lead_max_age_days or None,
             )
-        return repository.update(
-            existing.id, name=name, keyword=keyword, target_chat=target_chat, enabled=enabled,
-        )
+        fields = {"name": name, "keyword": keyword, "target_chat": target_chat}
+        optional = {
+            "enabled": enabled, "slug": slug, "display_name": display_name,
+            "source_chats": source_chats, "source_title": source_title, "match_rule": match_rule,
+        }
+        fields.update({key: value for key, value in optional.items() if value is not None})
+        if lead_max_age_days is not None:
+            fields["lead_max_age_days"] = lead_max_age_days or None
+        return repository.update(existing.id, **fields)
     finally:
         repository.close()
+
+
+def find_campaign(repository: InviteCampaignRepository, ref: str) -> InviteCampaign | None:
+    """--campaign: slug или числовой id."""
+    campaign = repository.get_by_slug(ref)
+    if campaign is None and ref.isdigit():
+        campaign = repository.get(int(ref))
+    return campaign
+
+
+def set_campaign_enabled(db_path, ref: str, enabled: bool) -> InviteCampaign:
+    repository = InviteCampaignRepository(db_path)
+    try:
+        campaign = find_campaign(repository, ref)
+        if campaign is None:
+            raise ConfigError(f"Кампания '{ref}' не найдена.")
+        return repository.update(campaign.id, enabled=enabled)
+    finally:
+        repository.close()
+
+
+def _format_campaign_line(campaign: InviteCampaign) -> str:
+    source = ", ".join(campaign.source_chats) if campaign.source_chats else "все группы (users.keywords)"
+    return (
+        f"id={campaign.id} slug={campaign.slug or '—'} {campaign.label}: "
+        f"keyword={campaign.keyword}, match_rule={campaign.match_rule or 'substring'}, "
+        f"lead_max_age_days={campaign.lead_max_age_days or '—'}, source={source}, "
+        f"target_chat={campaign.target_chat}, enabled={campaign.enabled}"
+    )
+
+
+def _build_history_client(settings: Settings) -> TelegramClient:
+    """Та же сессия, что и у reader/sync_users.py (чтение истории групп)."""
+    return TelegramClient(
+        str(settings.telegram.session_path_sync), settings.telegram.api_id, settings.telegram.api_hash,
+        receive_updates=False,
+    )
+
+
+async def resolve_chats(client, refs: list[str]) -> list[str]:
+    """Только чтение — get_entity, ничего не отправляет."""
+    lines = []
+    for ref in refs:
+        try:
+            entity = await client.get_entity(ref)
+        except Exception as exc:
+            lines.append(f"{ref}: НЕ НАЙДЕН ({type(exc).__name__}: {exc})")
+            continue
+        from telethon import utils
+
+        lines.append(
+            f"{ref}: peer_id={utils.get_peer_id(entity)} raw_id={entity.id} "
+            f"type={type(entity).__name__} megagroup={getattr(entity, 'megagroup', None)} "
+            f"username=@{getattr(entity, 'username', None)} title={getattr(entity, 'title', None)!r}"
+        )
+    return lines
+
+
+async def build_lead_pool(
+    db_path,
+    campaign_ref: str,
+    *,
+    client,
+    member_client=None,
+    do_import: bool = False,
+    preview_out: Path | None = None,
+    now=None,
+    max_age_days: int | None = None,
+    with_recency_report: bool = False,
+):
+    """DRY RUN (do_import=False): читает Telegram, считает превью, пишет
+    CSV — в БД НИЧЕГО не пишет. do_import=True — дополнительно
+    import_scan() (идемпотентно). Ни в одном режиме не включает кампанию и
+    не создаёт user_campaign_invites."""
+    from datetime import datetime, timezone
+
+    now = now or datetime.now(timezone.utc)
+    campaign_repository = InviteCampaignRepository(db_path)
+    try:
+        campaign = find_campaign(campaign_repository, campaign_ref)
+    finally:
+        campaign_repository.close()
+    if campaign is None:
+        raise ConfigError(f"Кампания '{campaign_ref}' не найдена.")
+    if not campaign.source_chats:
+        raise ConfigError(
+            f"У кампании '{campaign.label}' не задан --source-chat — пул лидов не применяется "
+            "(такая кампания берёт кандидатов из users.keywords)."
+        )
+
+    lead_repository = CampaignLeadRepository(db_path)
+    try:
+        checkpoints = load_checkpoints(lead_repository, campaign)
+        result = await scan_campaign_sources(client, campaign, checkpoints, member_client=member_client)
+        known = known_campaign_user_ids(db_path, campaign.id)
+        summary = summarize_scan(
+            result, known_user_ids=known, since=recency_cutoff(campaign, now, max_age_days),
+        )
+        report = recency_report(result, known_user_ids=known, now=now) if with_recency_report else None
+        if preview_out is None:
+            stamp = now.strftime("%Y%m%d_%H%M%S")
+            preview_out = PROJECT_ROOT / "data" / "output" / "lead_pool" / f"{campaign.slug or campaign.id}_{stamp}.csv"
+        preview_path = write_preview_csv(summary.rows, preview_out)
+
+        outcome = None
+        if do_import:
+            user_repository = UserRepository(db_path)
+            try:
+                outcome = import_scan(result, lead_repository, user_repository, now=now)
+            finally:
+                user_repository.close()
+        if with_recency_report:
+            return campaign, result, summary, preview_path, outcome, checkpoints, report
+        return campaign, result, summary, preview_path, outcome, checkpoints
+    finally:
+        lead_repository.close()
 
 
 @dataclass(frozen=True)
@@ -384,6 +647,56 @@ def _format_current_old_line(account: TelegramAccount) -> str:
     )
 
 
+async def _run_resolve_chat(settings: Settings, refs: list[str]) -> None:
+    client = _build_history_client(settings)
+    await client.start(phone=settings.telegram.phone)
+    try:
+        for line in await resolve_chats(client, refs):
+            print(line)
+    finally:
+        await client.disconnect()
+
+
+async def _run_build_lead_pool(settings: Settings, args) -> None:
+    client = _build_history_client(settings)
+    await client.start(phone=settings.telegram.phone)
+    member_client = None
+    try:
+        if args.membership_account_id is not None:
+            accounts = TelegramAccountRepository(settings.app.users_db_file)
+            try:
+                account = accounts.get(args.membership_account_id)
+            finally:
+                accounts.close()
+            if account is None:
+                raise ConfigError(f"Аккаунт {args.membership_account_id} не найден.")
+            member_client = _build_sync_client_factory(settings)(account)
+            await member_client.connect()
+
+        campaign, _result, summary, preview_path, outcome, checkpoints, report = await build_lead_pool(
+            settings.app.users_db_file, args.campaign, client=client, member_client=member_client,
+            do_import=args.do_import,
+            preview_out=Path(args.preview_out) if args.preview_out else None,
+            max_age_days=args.max_age_days, with_recency_report=True,
+        )
+        mode = "IMPORT" if args.do_import else "DRY RUN"
+        print(format_summary(campaign, summary, mode=mode))
+        if args.recency_report:
+            print()
+            print(format_recency_report(report, target_checked=summary.target_checked))
+        print()
+        print(f"Checkpoint (last_message_id до прогона): {checkpoints or 'нет — вся история'}")
+        print(f"Preview CSV: {preview_path}")
+        if outcome is not None:
+            print(f"Записано лидов: {outcome.leads_written}, помечено already_member: {outcome.members_marked}")
+        else:
+            print("DRY RUN: в БД ничего не записано, кампания не включена, приглашения не отправлялись.")
+    finally:
+        if member_client is not None:
+            await member_client.disconnect()
+        await client.disconnect()
+
+
 def main() -> None:
     args = _parse_args(sys.argv[1:])
     try:
@@ -411,13 +724,28 @@ def main() -> None:
             campaign = ensure_campaign(
                 settings.app.users_db_file,
                 name=args.name, keyword=args.keyword, target_chat=args.target_chat,
-                enabled=args.enabled,
+                enabled=args.enabled, slug=args.slug, display_name=args.display_name,
+                source_chats=args.source_chats, source_title=args.source_title,
+                match_rule=args.match_rule, lead_max_age_days=args.lead_max_age_days,
             )
-            print(
-                f"✔ Кампания готова: {campaign.name} (id={campaign.id}, "
-                f"keyword={campaign.keyword}, target_chat={campaign.target_chat}, "
-                f"enabled={campaign.enabled})"
-            )
+            print(f"✔ Кампания готова: {_format_campaign_line(campaign)}")
+        elif args.command == "list-campaigns":
+            repository = InviteCampaignRepository(settings.app.users_db_file)
+            try:
+                campaigns = repository.list()
+            finally:
+                repository.close()
+            if not campaigns:
+                print("Кампаний нет.")
+            for campaign in campaigns:
+                print(_format_campaign_line(campaign))
+        elif args.command == "set-campaign-enabled":
+            campaign = set_campaign_enabled(settings.app.users_db_file, args.campaign, args.enabled)
+            print(f"✔ {_format_campaign_line(campaign)}")
+        elif args.command == "resolve-chat":
+            asyncio.run(_run_resolve_chat(settings, args.chats))
+        elif args.command == "build-lead-pool":
+            asyncio.run(_run_build_lead_pool(settings, args))
         elif args.command == "sync-accounts":
             results = asyncio.run(
                 sync_accounts(

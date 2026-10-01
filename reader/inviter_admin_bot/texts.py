@@ -5,6 +5,9 @@
 from reader.inviter_admin_bot.models import (
     AccountCard,
     AccountStatusEntry,
+    CampaignListEntry,
+    CampaignStats,
+    LeadRefreshOutcome,
     StatusSnapshot,
     SyncSummary,
 )
@@ -20,6 +23,15 @@ PAUSE_LABEL = "⏸ Приостановить"
 STATUS_LABEL = "📊 Статус"
 SYNC_LABEL = "🔄 Синхронизировать"
 HELP_LABEL = "ℹ️ Справка"
+CAMPAIGNS_LABEL = "📣 Кампании"
+
+CAMPAIGNS_HEADER = "📣 Кампании приглашений"
+NO_CAMPAIGNS_TEXT = "Кампаний пока нет."
+CAMPAIGN_ENABLE_LABEL = "▶️ Включить приглашения"
+CAMPAIGN_DISABLE_LABEL = "⏸ Выключить приглашения"
+CAMPAIGN_REFRESH_LABEL = "🔄 Обновить лиды"
+CAMPAIGN_STATS_LABEL = "📊 Статистика"
+CAMPAIGN_NOT_FOUND_TEXT = "⚠️ Кампания не найдена — откройте список заново через «📣 Кампании»."
 
 TURN_OFF_ACCOUNT_LABEL = "⏸ Отключить"
 TURN_ON_ACCOUNT_LABEL = "▶️ Включить"
@@ -60,12 +72,10 @@ OLD_ACCOUNT_TOGGLE_BLOCKED_TEXT = (
 HELP_TEXT = (
     "ℹ️ Inviter Admin Bot\n"
     "\n"
-    "▶️ Запустить\n"
-    "Включает автоматические приглашения глобально.\n"
-    "\n"
-    "⏸ Приостановить\n"
-    "Останавливает автоматические приглашения. Аккаунты и настройки "
-    "сохраняются.\n"
+    "📣 Кампании\n"
+    "Список кампаний приглашений. Каждая кампания включается и "
+    "выключается отдельно — выключение одной не останавливает другие. "
+    "Аккаунты и их лимиты общие для всех кампаний.\n"
     "\n"
     "👤 Аккаунты\n"
     "Управление отдельными Telegram-аккаунтами. У каждого аккаунта три "
@@ -89,7 +99,7 @@ HELP_TEXT = (
     "\n"
     "Чтобы аккаунт реально использовался для приглашений, одновременно "
     "должны выполняться условия:\n"
-    "1. Автоприглашение глобально включено.\n"
+    "1. Кампания включена 🟢.\n"
     "2. Аккаунт включён 🟢.\n"
     "3. Нет активной блокировки.\n"
     "4. Дневной/часовой лимит не исчерпан."
@@ -203,7 +213,12 @@ def format_sync_one_result(result) -> str:
     return f"🔴 {result.display_name}\n{reason}"
 
 
-def format_account_statuses(entries: list[AccountStatusEntry], *, inviter_enabled: bool) -> str:
+def format_account_statuses(
+    entries: list[AccountStatusEntry],
+    *,
+    inviter_enabled: bool,
+    campaigns: list[CampaignListEntry] | None = None,
+) -> str:
     """"📊 Статус" — статус КАЖДОГО аккаунта инвайтера (см. design:
     "прежде всего статус КАЖДОГО Telegram-аккаунта"). enabled и is_blocked
     показаны ОТДЕЛЬНЫМИ строками, никогда не смешиваются в одно значение
@@ -226,6 +241,13 @@ def format_account_statuses(entries: list[AccountStatusEntry], *, inviter_enable
     аккаунт")."""
     auto_state = "▶️ включено" if inviter_enabled else "⏸ приостановлено"
     header = f"{STATUS_ACCOUNTS_HEADER}\n\nАвтоприглашение: {auto_state}"
+    if campaigns is not None:
+        # Мультикампании: состояние каждой кампании вместо одной глобальной
+        # строки; глобальная пауза показывается, только если она реально
+        # активна (см. runtime_state_repository.py — бот её больше не ставит).
+        header = f"{STATUS_ACCOUNTS_HEADER}\n\n{format_campaigns_summary_line(campaigns)}"
+        if not inviter_enabled:
+            header += "\n⏸ Глобальная пауза инвайтера активна"
 
     if not entries:
         return f"{header}\n\n{NO_ACCOUNTS_TEXT}"
@@ -286,3 +308,92 @@ def format_status(snapshot: StatusSnapshot) -> str:
             lines.append(f"{item.display_name}\n{item.reason}")
 
     return "\n".join(lines)
+
+
+def _campaign_state(enabled: bool) -> str:
+    return "🟢 Включена" if enabled else "🔴 Выключена"
+
+
+def format_campaigns_list(entries: list[CampaignListEntry]) -> str:
+    if not entries:
+        return f"{CAMPAIGNS_HEADER}\n\n{NO_CAMPAIGNS_TEXT}"
+    blocks = [f"{entry.label}\n{_campaign_state(entry.enabled)}" for entry in entries]
+    return CAMPAIGNS_HEADER + "\n\n" + "\n\n".join(blocks)
+
+
+def _recency_line(stats: CampaignStats) -> list[str]:
+    if not stats.lead_max_age_days:
+        return []
+    return [f"Давность лидов: последнее сообщение не старше {stats.lead_max_age_days} дн."]
+
+
+def format_campaign_card(stats: CampaignStats) -> str:
+    state = "🟢 Приглашения включены" if stats.enabled else "🔴 Приглашения выключены"
+    return "\n".join([
+        stats.label,
+        "",
+        f"Источник: {stats.source}",
+        f"Фильтр: {stats.keyword}",
+        f"Цель: {stats.target_chat}",
+        *_recency_line(stats),
+        "",
+        f"Найдено лидов: {stats.leads_found}",
+        f"Ожидают приглашения: {stats.awaiting}",
+        f"Приглашено: {stats.joined}",
+        f"Пропущено: {stats.skipped}",
+        f"Ошибки: {stats.failed}",
+        "",
+        state,
+    ])
+
+
+def format_campaign_stats(stats: CampaignStats) -> str:
+    lines = [
+        f"📊 {stats.label}",
+        "",
+        f"Статус: {_campaign_state(stats.enabled)}",
+        f"Источник: {stats.source}",
+        f"Фильтр: {stats.keyword}",
+        f"Цель: {stats.target_chat}",
+        *_recency_line(stats),
+        "",
+        f"Найдено лидов: {stats.leads_found}",
+        f"Ожидают приглашения: {stats.awaiting}",
+        f"Отправлено, ждут вступления: {stats.sent_pending}",
+        f"Приглашено (вступили): {stats.joined}",
+        f"Пропущено: {stats.skipped}",
+        f"  не вступили после приглашения: {stats.not_joined}",
+        f"  невозможно пригласить (invalid): {stats.invalid}",
+        f"  без username: {stats.without_username}",
+    ]
+    if stats.has_pool:
+        lines += [
+            f"  уже в группе: {stats.pool_already_member}",
+            f"  боты: {stats.pool_bots}",
+            f"  удалённые аккаунты: {stats.pool_deleted}",
+        ]
+    lines.append(f"Ошибки: {stats.failed}")
+    if stats.has_pool:
+        lines += ["", f"Последнее сканирование: {_fmt_dt(stats.last_scan_at)}"]
+    return "\n".join(lines)
+
+
+def format_lead_refresh(outcome: LeadRefreshOutcome) -> str:
+    if not outcome.ok:
+        return f"⚠️ Лиды не обновлены.\n{outcome.reason}"
+    return (
+        "🔄 Лиды обновлены\n\n"
+        f"Новых сообщений: {outcome.messages_scanned}\n"
+        f"Совпадений: {outcome.matching_messages}\n"
+        f"Новых пользователей: {outcome.new_users}"
+    )
+
+
+def format_campaigns_summary_line(entries: list[CampaignListEntry]) -> str:
+    """Строка "Кампании" вверху "📊 Статус" — вместо прежнего глобального
+    "Автоприглашение: ..." (включение теперь по кампаниям)."""
+    if not entries:
+        return "Кампании: —"
+    return "Кампании:\n" + "\n".join(
+        f"{'🟢' if e.enabled else '🔴'} {e.label}" for e in entries
+    )

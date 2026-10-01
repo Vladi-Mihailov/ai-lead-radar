@@ -53,6 +53,22 @@ class InviterRuntimeState:
     updated_at: datetime
 
 
+# Мультикампании (см. reader/inviter/models.py InviteCampaign): admin-бот
+# теперь включает/выключает КАЖДУЮ кампанию отдельно
+# (invite_campaigns.enabled — worker и так учитывает его, см.
+# InviterWorker._enabled_pairs) вместо одного глобального ▶️/⏸. Чтобы
+# фактическое состояние не изменилось при переходе, один раз (маркер
+# per_campaign_since) глобальная пауза переносится в кампании: если
+# inviter_enabled был 0 — все СУЩЕСТВУЮЩИЕ кампании получают enabled=0, а
+# inviter_enabled становится 1 (то, что раньше было "глобально на паузе",
+# теперь "каждая кампания выключена" — эффективно то же самое). Если
+# inviter_enabled был 1 — кампании не трогаются вовсе. Повторные открытия
+# ничего не делают (маркер уже задан). inviter_enabled сам по себе
+# остаётся и по-прежнему учитывается worker'ом — просто admin-бот его
+# больше не переключает.
+_MIGRATE_ADD_MARKER = "ALTER TABLE inviter_runtime_state ADD COLUMN per_campaign_since TIMESTAMP"
+
+
 class InviterRuntimeStateRepository:
     """Единственная строка (id=1) — тот же принцип single-row-settings-
     table, что и у reader/turkey_bot (см. subscription_repository-подобные
@@ -63,7 +79,27 @@ class InviterRuntimeStateRepository:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute(_SCHEMA)
         self._conn.execute(_ENSURE_ROW)
+        self._migrate_global_pause_to_campaigns()
         self._conn.commit()
+
+    def _migrate_global_pause_to_campaigns(self) -> None:
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(inviter_runtime_state)")}
+        if "per_campaign_since" not in columns:
+            self._conn.execute(_MIGRATE_ADD_MARKER)
+        enabled, marker = self._conn.execute(
+            "SELECT inviter_enabled, per_campaign_since FROM inviter_runtime_state WHERE id = 1"
+        ).fetchone()
+        if marker is not None:
+            return
+        has_campaigns = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='invite_campaigns'"
+        ).fetchone()
+        if not enabled and has_campaigns:
+            self._conn.execute("UPDATE invite_campaigns SET enabled = 0")
+        self._conn.execute(
+            "UPDATE inviter_runtime_state SET inviter_enabled = 1, "
+            "per_campaign_since = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = 1"
+        )
 
     def get(self) -> InviterRuntimeState:
         row = self._conn.execute(_SELECT).fetchone()

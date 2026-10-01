@@ -9,3 +9,6 @@ data/output/*.jsonl
 data/*.db
 data/*.db-wal
 data/*.db-shm
+
+# Превью пула лидов кампаний (reader/inviter/manage.py build-lead-pool) — username/имена.
+data/output/lead_pool/

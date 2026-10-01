@@ -394,25 +394,28 @@ async def test_phone_code_and_password_never_land_in_conversation_state_payload(
     assert secret_code not in (raw_row[0] or "")
 
 
-# ---- 13. global inviter pause/resume ----
+# ---- 13. global inviter pause/resume (заменены включением по кампаниям) ----
 
 
-async def test_pause_and_start_toggle_global_state(fx):
+async def test_legacy_global_start_pause_texts_no_longer_toggle_global_state(fx):
+    """▶️ Запустить/⏸ Приостановить убраны из меню — включение теперь по
+    кампаниям (см. 📣 Кампании). Набранный вручную старый текст ничего не
+    переключает и просто возвращает главное меню."""
     pause_reply = await fx.controller.handle_text(texts.PAUSE_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
-    assert pause_reply.text == texts.GLOBAL_PAUSED_TEXT
-    assert fx.service.is_global_enabled() is False
+    assert pause_reply.text == texts.MAIN_MENU_TEXT
+    assert fx.service.is_global_enabled() is True
 
     start_reply = await fx.controller.handle_text(texts.START_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
-    assert start_reply.text == texts.GLOBAL_ENABLED_TEXT
+    assert start_reply.text == texts.MAIN_MENU_TEXT
     assert fx.service.is_global_enabled() is True
 
 
 async def test_status_screen_shows_pause_state(fx):
-    await fx.controller.handle_text(texts.PAUSE_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+    fx.service.set_global_enabled(False)
 
     reply = await fx.controller.handle_text(texts.STATUS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
 
-    assert "приостановлено" in reply.text
+    assert "Глобальная пауза инвайтера активна" in reply.text
 
 
 # ---- 👤 Аккаунты: третья кнопка "USED / LIMIT" (см. задачу "объедини
@@ -597,7 +600,7 @@ async def test_account_enabled_icon_independent_of_global_pause(fx):
     🟢 у включённого аккаунта."""
     _make_account(fx, name="@vvz982", telegram_user_id=1, enabled=True)
 
-    await fx.controller.handle_text(texts.PAUSE_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+    fx.service.set_global_enabled(False)
     accounts_reply = await fx.controller.handle_text(texts.ACCOUNTS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
 
     enabled_by_name = {name: enabled for _id, name, enabled, _used, _limit in accounts_reply.accounts_page_options}
@@ -605,13 +608,13 @@ async def test_account_enabled_icon_independent_of_global_pause(fx):
 
     status_reply = await fx.controller.handle_text(texts.STATUS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
     assert "🟢 @vvz982" in status_reply.text  # тоже не 🔴/⚪ из-за глобальной паузы
-    assert "Автоприглашение: ⏸ приостановлено" in status_reply.text
+    assert "Глобальная пауза инвайтера активна" in status_reply.text
 
 
 async def test_global_pause_does_not_change_account_enabled_flag(fx):
     account = _make_account(fx, enabled=True)
 
-    await fx.controller.handle_text(texts.PAUSE_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+    fx.service.set_global_enabled(False)
 
     assert fx.accounts.get(account.id).enabled is True
 
@@ -626,10 +629,11 @@ async def test_help_screen_accessible_to_trusted_admin(fx):
     assert reply.show_main_menu is True
 
 
-async def test_help_screen_explains_global_vs_account_state(fx):
+async def test_help_screen_explains_campaign_vs_account_state(fx):
     reply = await fx.controller.handle_text(texts.HELP_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
 
-    assert "глобально" in reply.text
+    assert texts.CAMPAIGNS_LABEL in reply.text
+    assert "Кампания включена" in reply.text
     assert "🟢" in reply.text and "⚪" in reply.text and "🔴" in reply.text
     assert "3 / 15" in reply.text
 

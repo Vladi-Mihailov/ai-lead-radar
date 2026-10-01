@@ -30,6 +30,7 @@ from reader.inviter_admin_bot.conversation_state_repository import (
     AdminBotConversationStateRepository,
 )
 from reader.inviter_admin_bot.handlers import register
+from reader.inviter.lead_pool import CampaignLeadRepository
 from reader.inviter_admin_bot.service import InviterAdminService
 from reader.logging_setup import setup_logging
 from reader.settings import ConfigError, Settings, load_settings
@@ -83,6 +84,7 @@ async def run() -> None:
     invite_repository = UserCampaignInviteRepository(settings.app.users_db_file)
     runtime_state_repository = InviterRuntimeStateRepository(settings.app.users_db_file)
     conversation_state_repository = AdminBotConversationStateRepository(settings.app.users_db_file)
+    lead_repository = CampaignLeadRepository(settings.app.users_db_file)
 
     account_client_factory = _build_account_client_factory(settings)
 
@@ -91,6 +93,12 @@ async def run() -> None:
         db_path=settings.app.users_db_file,
         trusted_admin_user_ids=frozenset(settings.inviter_admin_bot.trusted_admin_user_ids),
         worker_poll_interval_seconds=settings.inviter.worker.poll_interval_seconds,
+        lead_repository=lead_repository,
+        # "🔄 Обновить лиды" — та же сессия чтения истории, что и у
+        # reader/sync_users.py (не сессия аккаунтов инвайтера, которыми
+        # параллельно пользуется worker); только connect(), без
+        # интерактивной авторизации.
+        lead_scan_client_factory=lambda: account_client_factory(str(settings.telegram.session_path_sync)),
     )
     auth_coordinator = AccountAuthCoordinator(
         account_client_factory, account_repository, sessions_dir=_ACCOUNT_SESSIONS_DIR,
@@ -113,6 +121,7 @@ async def run() -> None:
         invite_repository.close()
         runtime_state_repository.close()
         conversation_state_repository.close()
+        lead_repository.close()
 
 
 def main() -> None:

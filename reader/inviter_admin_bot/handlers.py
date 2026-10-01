@@ -12,9 +12,17 @@ from telethon import TelegramClient, events
 from reader.inviter_admin_bot.conversation import AdminBotController
 from reader.inviter_admin_bot.keyboards import (
     ACCOUNTS_BACK,
+    CAMPAIGNS_BACK,
     account_card_keyboard,
     accounts_page_keyboard,
+    campaign_card_keyboard,
+    campaigns_page_keyboard,
     cancel_keyboard,
+    decode_campaign_disable_callback,
+    decode_campaign_enable_callback,
+    decode_campaign_open_callback,
+    decode_campaign_refresh_callback,
+    decode_campaign_stats_callback,
     decode_account_limit_callback,
     decode_account_limit_manual_callback,
     decode_account_limit_value_callback,
@@ -51,6 +59,42 @@ def register(client: TelegramClient, controller: AdminBotController) -> None:
         if data == ACCOUNTS_BACK:
             reply = controller.handle_accounts_back(telegram_user_id=event.sender_id)
             await _answer_and_send(event, reply)
+            return
+
+        if data == CAMPAIGNS_BACK:
+            reply = controller.handle_campaigns_back(telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply)
+            return
+
+        campaign_id = decode_campaign_open_callback(data)
+        if campaign_id is not None:
+            reply = controller.handle_campaign_open(campaign_id, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply)
+            return
+
+        campaign_id = decode_campaign_enable_callback(data)
+        if campaign_id is not None:
+            reply = controller.handle_campaign_set_enabled(campaign_id, True, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply)
+            return
+
+        campaign_id = decode_campaign_disable_callback(data)
+        if campaign_id is not None:
+            reply = controller.handle_campaign_set_enabled(campaign_id, False, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply)
+            return
+
+        campaign_id = decode_campaign_stats_callback(data)
+        if campaign_id is not None:
+            reply = controller.handle_campaign_stats(campaign_id, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply)
+            return
+
+        campaign_id = decode_campaign_refresh_callback(data)
+        if campaign_id is not None:
+            await event.answer("🔄 Обновляем лиды...")
+            reply = await controller.handle_campaign_refresh(campaign_id, telegram_user_id=event.sender_id)
+            await _send_reply(event, reply, prefer_edit=True)
             return
 
         account_id = decode_account_open_callback(data)
@@ -146,6 +190,13 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False) -> None:
         buttons = limit_choice_keyboard(reply.limit_choice_account_id)
     elif reply.limits_choice_account_id is not None:
         buttons = limits_value_choice_keyboard(reply.limits_choice_account_id)
+    elif getattr(reply, "campaigns_page_options", None) is not None:
+        buttons = campaigns_page_keyboard(reply.campaigns_page_options)
+    elif getattr(reply, "campaign_card_id", None) is not None:
+        buttons = campaign_card_keyboard(
+            reply.campaign_card_id, enabled=bool(reply.campaign_card_enabled),
+            has_pool=bool(getattr(reply, "campaign_card_has_pool", False)),
+        )
 
     if reply.text == ACCESS_DENIED_TEXT:
         buttons = None

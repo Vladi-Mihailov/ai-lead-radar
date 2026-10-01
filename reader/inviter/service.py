@@ -855,7 +855,7 @@ class InviterService:
         self._max_successful_invites = max_successful_invites
         self._successful_invites_count = 0
 
-    async def run(self, *, execute: bool = False) -> None:
+    async def run(self, *, execute: bool = False, only_campaign_id: int | None = None) -> None:
         """execute=False (по умолчанию) — только dry-run, без единого
         изменения в Telegram (см. _dry_run_account). execute=True — реальные
         приглашения (см. _execute_account); включается только явным
@@ -880,7 +880,17 @@ class InviterService:
           возникает: к моменту выборки для второго аккаунта первый уже
           записал свои результаты, и NOT EXISTS в select_candidates() их
           исключает."""
-        campaigns = [c for c in self._campaign_repository.list() if c.enabled]
+        # only_campaign_id (см. reader/inviter/main.py --campaign) — dry-run
+        # ОДНОЙ кампании, в т.ч. выключенной (только чтение, чтобы оценить
+        # кампанию до её включения). С execute=True выключенная кампания
+        # по-прежнему никогда не обрабатывается.
+        if only_campaign_id is not None:
+            campaigns = [
+                c for c in self._campaign_repository.list()
+                if c.id == only_campaign_id and (c.enabled or not execute)
+            ]
+        else:
+            campaigns = [c for c in self._campaign_repository.list() if c.enabled]
         accounts = [a for a in self._account_repository.list() if a.enabled]
 
         if not accounts:

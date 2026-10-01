@@ -106,13 +106,24 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "вместе с --execute."
         ),
     )
+    parser.add_argument(
+        "--campaign",
+        default=None,
+        metavar="SLUG_OR_ID",
+        help=(
+            "Только для dry-run: обработать ОДНУ кампанию (slug или id), в т.ч. "
+            "выключенную — без единого изменения в Telegram."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.worker and args.test:
         parser.error("--worker и --test нельзя использовать одновременно.")
+    if args.campaign and (args.execute or args.worker):
+        parser.error("--campaign допустим только в режиме dry-run.")
     return args
 
 
-async def run(*, execute: bool = False, test: bool = False) -> None:
+async def run(*, execute: bool = False, test: bool = False, campaign_ref: str | None = None) -> None:
     """Поднимает инфраструктуру инвайтера (репозитории + миграции БД) и
     делегирует запуск InviterService — отбор кандидатов и, при execute=True,
     реальные приглашения (см. service.py). execute=False (по умолчанию) —
@@ -143,6 +154,16 @@ async def run(*, execute: bool = False, test: bool = False) -> None:
         len(invite_repository.list()),
     )
 
+    only_campaign_id = None
+    if campaign_ref is not None:
+        campaign = campaign_repository.get_by_slug(campaign_ref)
+        if campaign is None and campaign_ref.isdigit():
+            campaign = campaign_repository.get(int(campaign_ref))
+        if campaign is None:
+            raise ConfigError(f"Кампания '{campaign_ref}' не найдена.")
+        only_campaign_id = campaign.id
+        logger.info("Только кампания: %s (id=%d, enabled=%s)", campaign.label, campaign.id, campaign.enabled)
+
     notifier = _build_operator_notifier(settings)
     await notifier.start()
 
@@ -154,7 +175,7 @@ async def run(*, execute: bool = False, test: bool = False) -> None:
             user_repository=user_repository,
             max_successful_invites=TEST_MODE_MAX_SUCCESSFUL_INVITES if test else None,
         )
-        await service.run(execute=execute)
+        await service.run(execute=execute, only_campaign_id=only_campaign_id)
     finally:
         await notifier.close()
         account_repository.close()
@@ -246,7 +267,7 @@ def main() -> None:
         if args.worker:
             asyncio.run(run_worker())
         else:
-            asyncio.run(run(execute=args.execute, test=args.test))
+            asyncio.run(run(execute=args.execute, test=args.test, campaign_ref=args.campaign))
     except ConfigError as exc:
         print(f"Ошибка запуска: {exc}", file=sys.stderr)
         sys.exit(1)

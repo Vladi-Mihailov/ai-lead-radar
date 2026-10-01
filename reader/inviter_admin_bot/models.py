@@ -182,3 +182,68 @@ class NewAccountDraft:
 
     phone: str
     fields: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CampaignListEntry:
+    """Одна строка "📣 Кампании" — id (callback_data), подпись
+    (InviteCampaign.label) и enabled ЭТОЙ кампании."""
+
+    id: int
+    label: str
+    enabled: bool
+
+
+@dataclass(frozen=True)
+class CampaignStats:
+    """Экран кампании/"📊 Статистика" — только фактические данные
+    UserCampaignInviteRepository/CampaignLeadRepository (см.
+    service.py::campaign_stats), никаких оценок.
+
+    leads_found — для кампании с пулом (source_chats) — все записи пула
+    (любой статус), иначе — пользователи, подходящие по keyword
+    (count_leads). awaiting — сейчас в очереди инвайтера (count_candidates).
+    sent_pending/joined/not_joined/invalid/failed — по ПОСЛЕДНЕЙ записи
+    каждого пользователя в user_campaign_invites этой кампании.
+    skipped = invalid + not_joined + без username + (для пула) bot/deleted/
+    already_member."""
+
+    campaign_id: int
+    label: str
+    enabled: bool
+    keyword: str
+    target_chat: str
+    source: str
+    has_pool: bool
+    leads_found: int
+    awaiting: int
+    sent_pending: int
+    joined: int
+    not_joined: int
+    invalid: int
+    failed: int
+    without_username: int
+    pool_bots: int = 0
+    pool_deleted: int = 0
+    pool_already_member: int = 0
+    last_scan_at: datetime | None = None
+    lead_max_age_days: int | None = None
+
+    @property
+    def skipped(self) -> int:
+        return (
+            self.invalid + self.not_joined + self.without_username
+            + self.pool_bots + self.pool_deleted + self.pool_already_member
+        )
+
+
+@dataclass(frozen=True)
+class LeadRefreshOutcome:
+    """Итог "🔄 Обновить лиды" — ok=False с reason, если обновление не
+    выполнялось (нет первичного импорта/нет сессии/ошибка Telegram)."""
+
+    ok: bool
+    reason: str | None = None
+    messages_scanned: int = 0
+    matching_messages: int = 0
+    new_users: int = 0

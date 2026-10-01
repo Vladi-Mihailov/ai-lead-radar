@@ -17,6 +17,15 @@ from reader.inviter.identity import (
     fetch_telegram_identity,
     reconcile_account_identity,
 )
+from reader.inviter.lead_pool import (
+    LEAD_STATUS_ALREADY_MEMBER,
+    LEAD_STATUS_BOT,
+    LEAD_STATUS_DELETED,
+    CampaignLeadRepository,
+    import_scan,
+    load_checkpoints,
+    scan_campaign_sources,
+)
 from reader.inviter.manage import resolve_all_duplicates, sync_accounts
 from reader.inviter.models import TelegramAccount
 from reader.inviter.repository import (
@@ -26,12 +35,16 @@ from reader.inviter.repository import (
 )
 from reader.inviter.runtime_state_repository import InviterRuntimeStateRepository
 from reader.inviter_admin_bot.auth import TelethonAuthClientLike
+from reader.users.repository import UserRepository
 from reader.inviter_admin_bot.models import (
     AccountCard,
     AccountListEntry,
     AccountStatusEntry,
     AccountUsage,
     AttentionItem,
+    CampaignListEntry,
+    CampaignStats,
+    LeadRefreshOutcome,
     StatusSnapshot,
     SyncAccountOutcome,
     SyncSummary,
@@ -104,6 +117,8 @@ class InviterAdminService:
         db_path: Path,
         trusted_admin_user_ids: frozenset[int] = frozenset(),
         worker_poll_interval_seconds: int = 600,
+        lead_repository: CampaignLeadRepository | None = None,
+        lead_scan_client_factory: Callable[[], object] | None = None,
     ):
         self._accounts = account_repository
         self._campaigns = campaign_repository
@@ -117,6 +132,11 @@ class InviterAdminService:
         self._db_path = db_path
         self._trusted_admin_user_ids = frozenset(trusted_admin_user_ids)
         self._worker_poll_interval_seconds = worker_poll_interval_seconds
+        # Пул лидов кампаний с source_chats (см. reader/inviter/lead_pool.py).
+        self._leads = lead_repository or CampaignLeadRepository(db_path)
+        # Клиент чтения истории для "🔄 Обновить лиды" (та же сессия, что и
+        # у sync_users.py, см. main.py); None — обновление недоступно.
+        self._lead_scan_client_factory = lead_scan_client_factory
 
     # ---- доступ (см. design "ДОСТУП К ADMIN BOT") ----
 
@@ -291,6 +311,108 @@ class InviterAdminService:
 
     def is_global_enabled(self) -> bool:
         return self._runtime_state.get().inviter_enabled
+
+    # ---- 📣 Кампании (каждая включается/выключается независимо) ----
+
+    def list_campaigns(self) -> list[CampaignListEntry]:
+        return [CampaignListEntry(c.id, c.label, c.enabled) for c in self._campaigns.list()]
+
+    def get_campaign(self, campaign_id: int):
+        return self._campaigns.get(campaign_id)
+
+    def set_campaign_enabled(self, campaign_id: int, enabled: bool):
+        """Меняет enabled ТОЛЬКО этой кампании (invite_campaigns.enabled) —
+        остальные кампании не затрагиваются."""
+        if self._campaigns.get(campaign_id) is None:
+            return None
+        return self._campaigns.update(campaign_id, enabled=enabled)
+
+    def campaign_stats(self, campaign_id: int) -> CampaignStats | None:
+        campaign = self._campaigns.get(campaign_id)
+        if campaign is None:
+            return None
+        statuses = self._invites.status_counts(campaign_id)
+        awaiting = self._invites.count_candidates(campaign_id)
+        without_username = self._invites.count_found_candidates(campaign_id) - awaiting
+        has_pool = bool(campaign.source_chats)
+        pool = self._leads.status_counts(campaign_id) if has_pool else {}
+        checkpoints = self._leads.list_checkpoints(campaign_id) if has_pool else []
+        last_scan_at = max((cp.last_scan_at for cp in checkpoints if cp.last_scan_at), default=None)
+        return CampaignStats(
+            campaign_id=campaign.id,
+            label=campaign.label,
+            enabled=campaign.enabled,
+            keyword=campaign.keyword,
+            target_chat=campaign.target_chat,
+            source=campaign.source_title or (", ".join(campaign.source_chats) if has_pool else "все группы"),
+            has_pool=has_pool,
+            leads_found=sum(pool.values()) if has_pool else self._invites.count_leads(campaign_id),
+            awaiting=awaiting,
+            sent_pending=statuses.get("pending", 0),
+            joined=statuses.get("joined", 0) + statuses.get("invited", 0),
+            not_joined=statuses.get("not_joined", 0),
+            invalid=statuses.get("invalid", 0),
+            failed=statuses.get("failed", 0),
+            without_username=without_username,
+            pool_bots=pool.get(LEAD_STATUS_BOT, 0),
+            pool_deleted=pool.get(LEAD_STATUS_DELETED, 0),
+            pool_already_member=pool.get(LEAD_STATUS_ALREADY_MEMBER, 0),
+            last_scan_at=last_scan_at,
+            lead_max_age_days=campaign.lead_max_age_days,
+        )
+
+    async def refresh_campaign_leads(self, campaign_id: int) -> LeadRefreshOutcome:
+        """"🔄 Обновить лиды" — ТОЛЬКО сообщения новее checkpoint'а пула
+        (см. reader/inviter/lead_pool.py). Первичный импорт истории
+        намеренно НЕ выполняется отсюда: его сначала проверяют по DRY RUN
+        превью (manage.py build-lead-pool) и импортируют явно. Ничего не
+        отправляет в Telegram и не включает кампанию."""
+        campaign = self._campaigns.get(campaign_id)
+        if campaign is None:
+            return LeadRefreshOutcome(ok=False, reason="Кампания не найдена.")
+        if not campaign.source_chats:
+            return LeadRefreshOutcome(
+                ok=False, reason="У этой кампании нет пула лидов — кандидаты берутся из общей базы.",
+            )
+        checkpoints = load_checkpoints(self._leads, campaign)
+        if any(ref not in checkpoints for ref in campaign.source_chats):
+            return LeadRefreshOutcome(
+                ok=False,
+                reason=(
+                    "Первичный импорт пула ещё не выполнен. Сначала проверьте превью "
+                    "(manage.py build-lead-pool) и импортируйте его явно (--import)."
+                ),
+            )
+        if self._lead_scan_client_factory is None:
+            return LeadRefreshOutcome(ok=False, reason="Сессия чтения истории не настроена.")
+
+        client = self._lead_scan_client_factory()
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                return LeadRefreshOutcome(ok=False, reason="Сессия чтения истории не авторизована.")
+            known_before = self._leads.known_user_ids(campaign_id)
+            result = await scan_campaign_sources(client, campaign, checkpoints)
+            user_repository = UserRepository(self._db_path)
+            try:
+                import_scan(result, self._leads, user_repository, now=datetime.now(timezone.utc))
+            finally:
+                user_repository.close()
+        except Exception as exc:
+            logger.warning("Обновление лидов кампании %s не удалось: %s", campaign_id, type(exc).__name__)
+            return LeadRefreshOutcome(ok=False, reason=f"Ошибка Telegram: {type(exc).__name__}")
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                logger.warning("Обновление лидов: disconnect() не удался.")
+
+        return LeadRefreshOutcome(
+            ok=True,
+            messages_scanned=result.messages_scanned,
+            matching_messages=result.matching_messages,
+            new_users=len(set(result.observations) - known_before),
+        )
 
     # ---- 📊 Статус ----
 

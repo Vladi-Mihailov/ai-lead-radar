@@ -94,7 +94,38 @@ class TelegramAccount:
 class InviteCampaign:
     """Кампания приглашений: пользователи, у которых сохранён keyword,
     приглашаются в target_chat. Подбор пользователей по keyword и сама
-    отправка приглашений — за пределами этого этапа (см. service.py)."""
+    отправка приглашений — за пределами этого этапа (см. service.py).
+
+    Несколько кампаний работают независимо (см. задачу про Грузию/Армению):
+    каждая со своим enabled, своим target_chat и своей историей
+    user_campaign_invites (по campaign_id).
+
+    slug — стабильный внешний идентификатор (например, "ge_insurance"),
+    для CLI/dry-run; None — у кампаний, созданных до его появления, пока
+    оператор явно не присвоит его (см. reader/inviter/manage.py
+    add-campaign --slug). display_name — подпись в admin-боте ("🇬🇪 Грузия —
+    страховка"); None — показывается name (name по-прежнему используется в
+    операторских отчётах инвайтера, не меняется).
+
+    source_chats — пустой кортеж (по умолчанию, как у всех кампаний до
+    этого изменения) — источник не ограничен: кандидаты берутся из
+    users.keywords по ВСЕМ группам, ровно как раньше (точный токен
+    keyword). Непустой ("@sadahlo") — кандидаты берутся ТОЛЬКО из пула
+    лидов этой кампании (campaign_leads), собранного сканированием истории
+    этих чатов (см. reader/inviter/lead_pool.py). source_title — подпись
+    источника для admin-бота.
+
+    match_rule — правило совпадения keyword с текстом при сборе пула (см.
+    reader/inviter/lead_pool.py campaign_match_words): None/"substring" —
+    семантика KeywordMatcher (подстрока), "ru_insurance" — только слова с
+    корнем keyword и страховой морфологией (страхов-/страху-), без
+    "Астрахань"/"канистрах"/"на свой страх и риск"/"перестраховаться".
+    Применяется ТОЛЬКО к кампаниям с пулом; Грузии не касается.
+
+    lead_max_age_days — None: давность не ограничена. Иначе кандидатом
+    становится только лид, у которого ПОСЛЕДНЕЕ совпавшее сообщение не
+    старше N дней (скользящее окно, см. _LEADS_WHERE). Лиды старше в пуле
+    остаются, просто не выбираются."""
 
     id: int
     name: str
@@ -102,6 +133,16 @@ class InviteCampaign:
     target_chat: str
     enabled: bool
     created_at: datetime
+    slug: str | None = None
+    display_name: str | None = None
+    source_chats: tuple[str, ...] = ()
+    source_title: str | None = None
+    match_rule: str | None = None
+    lead_max_age_days: int | None = None
+
+    @property
+    def label(self) -> str:
+        return self.display_name or self.name
 
 
 @dataclass(frozen=True)
