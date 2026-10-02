@@ -70,6 +70,16 @@ def _elapsed_ms(started_at: float) -> int:
     return round((time.monotonic() - started_at) * 1000)
 
 
+def _records_total(records: list[ParsedFineRecord]) -> float:
+    """COALESCE(amount, 0) — тот же принцип, что и везде в проекте (штраф без
+    распознанной суммы не должен ронять проверку, см. reader/fines/parser.py)."""
+    return sum((record.amount or 0.0) for record in records)
+
+
+def _format_amount(value: float) -> str:
+    return f"{value:g}"
+
+
 def _pick_freshest_task(tasks: list[FineMonitoringTask]) -> FineMonitoringTask:
     """См. FineCheckService.check_plate_for_tasks — та же freshness/tie-
     break семантика, что и FineMonitoringTaskRepository.
@@ -209,38 +219,16 @@ class FineCheckService:
         started_at = time.monotonic()
 
         try:
-            records = await self._fetch(task.car_number)
+            records = await self._fetch_trusted(task.car_number, [task])
         except FineProviderError as exc:
+            # Ошибка первого ИЛИ подтверждающего запроса — предыдущее
+            # достоверное состояние (last_successful_*) остаётся
+            # НЕТРОНУТЫМ: record_successful_check здесь не вызывается вовсе.
             return self._record_error(task, exc, started_at)
 
-        previous_amount = task.last_successful_total_amount
-        candidate_total = sum((record.amount or 0.0) for record in records)
-
-        if previous_amount is not None and previous_amount > 0 and candidate_total == 0:
-            # Suspicious zero (см. докстрок метода) — НЕ персистим этот
-            # результат вовсе, ни как ok, ни как error: task.last_successful_*
-            # должны продолжать отражать предыдущее достоверное состояние
-            # ровно до тех пор, пока подтверждающий запрос не даст финальный
-            # ответ (см. задачу п.7: "DB между двумя запросами должна
-            # продолжать содержать последнее достоверное positive состояние").
-            await self._sleep(self._zero_confirmation_delay_seconds)
-            try:
-                records = await self._fetch(task.car_number)
-            except FineProviderError as exc:
-                # Confirmation сама завершилась ошибкой — предыдущее
-                # достоверное состояние (last_successful_total_amount/
-                # last_successful_checked_at) остаётся НЕТРОНУТЫМ (см.
-                # задачу п.9) — record_successful_check здесь НЕ вызывается
-                # вовсе, ни с 0, ни с previous_amount: repository просто не
-                # трогает эти поля на error-пути (тот же принцип "не
-                # трогать поле", что и везде в этом методе).
-                return self._record_error(task, exc, started_at)
-            # records теперь — ЛИБО подтверждённый настоящий 0 (car A),
-            # ЛИБО исправленное положительное значение (car B) — в обоих
-            # случаях именно ЭТОТ набор становится единственным финальным
-            # результатом ниже, первая (подозрительная) попытка нигде не
-            # персистится.
-
+        # Snapshot принятого результата — ДО медленной обработки штрафов
+        # (перевод/detected_fines), см. _persist_snapshot.
+        self._persist_snapshot(task, records)
         return await self._finalize(task, records, started_at, notification_policy=notification_policy)
 
     async def check_plate_for_tasks(
@@ -283,20 +271,15 @@ class FineCheckService:
         started_at = time.monotonic()
 
         try:
-            records = await self._fetch(car_number)
+            records = await self._fetch_trusted(car_number, tasks)
         except FineProviderError as exc:
             return {task.id: self._record_error(task, exc, started_at) for task in tasks}
 
-        freshest_task = _pick_freshest_task(tasks)
-        previous_amount = freshest_task.last_successful_total_amount
-        candidate_total = sum((record.amount or 0.0) for record in records)
-
-        if previous_amount is not None and previous_amount > 0 and candidate_total == 0:
-            await self._sleep(self._zero_confirmation_delay_seconds)
-            try:
-                records = await self._fetch(car_number)
-            except FineProviderError as exc:
-                return {task.id: self._record_error(task, exc, started_at) for task in tasks}
+        # Snapshot для ВСЕЙ группы сразу — до медленной обработки штрафов
+        # первой же задачи (иначе остальные задачи группы оставались бы со
+        # старым snapshot всё время обработки предыдущих).
+        for task in tasks:
+            self._persist_snapshot(task, records)
 
         return {
             task.id: await self._finalize(task, records, started_at, notification_policy=notification_policy)
@@ -305,6 +288,72 @@ class FineCheckService:
 
     async def _fetch(self, car_number: str) -> list[ParsedFineRecord]:
         return await self._provider.search_by_plate(car_number)
+
+    async def _fetch_trusted(
+        self, car_number: str, tasks: list[FineMonitoringTask],
+    ) -> list[ParsedFineRecord]:
+        """Единственная реализация false-zero guard для check_task() и
+        check_plate_for_tasks(): запрос к provider и, если результат —
+        подозрительный ноль (см. _zero_needs_confirmation), ОДИН
+        подтверждающий запрос после паузы; итоговый набор records — тот,
+        что вернул последний запрос. FineProviderError любого из запросов
+        поднимается — вызывающий код записывает error, НЕ трогая
+        last_successful_*."""
+        records = await self._fetch(car_number)
+        first_count = len(records)
+        total = _records_total(records)
+        confirmation = False
+
+        if total == 0 and self._zero_needs_confirmation(tasks):
+            confirmation = True
+            await self._sleep(self._zero_confirmation_delay_seconds)
+            records = await self._fetch(car_number)
+            logger.info(
+                "Georgia zero confirmation plate=%s first_count=%d second_count=%d second_total=%s",
+                car_number, first_count, len(records), _format_amount(_records_total(records)),
+            )
+            total = _records_total(records)
+
+        logger.info(
+            "Georgia fine check plate=%s result_count=%d total=%s zero_confirmation=%s",
+            car_number, len(records), _format_amount(total), confirmation,
+        )
+        return records
+
+    def _zero_needs_confirmation(self, tasks: list[FineMonitoringTask]) -> bool:
+        """Нулевой результат НЕ принимается сразу, если есть положительное
+        свидетельство долга — по СВЕЖЕМУ состоянию из БД, а не по объекту
+        task в памяти (параллельная проверка того же номера могла только что
+        сохранить положительный snapshot — production P099XO36):
+
+        - есть сохранённый snapshot (last_successful_total_amount не NULL) —
+          решает он, как и раньше: > 0 -> подтверждать; подтверждённый 0 —
+          авторитетен (без повторного запроса на каждой проверке);
+        - snapshot ещё не сохранён ни у одной задачи (новая задача, первая
+          проверка ещё идёт) — подтверждать, если у задачи уже есть строки
+          detected_fines. Только как "свидетельство", не как сумма долга.
+
+        Для группы (check_plate_for_tasks) — snapshot самой свежей задачи
+        (та же _pick_freshest_task-семантика), detected_fines — любой."""
+        fresh = [self._task_repository.get(task.id) or task for task in tasks]
+        with_snapshot = [task for task in fresh if task.last_successful_total_amount is not None]
+        if with_snapshot:
+            return _pick_freshest_task(with_snapshot).last_successful_total_amount > 0
+        return any(self._detected_fine_repository.has_detected_fines(task.id) for task in fresh)
+
+    def _persist_snapshot(self, task: FineMonitoringTask, records: list[ParsedFineRecord]) -> None:
+        """"Что показала эта успешная проверка" — сумма ровно принятого
+        набора records (после false-zero guard). Сохраняется СРАЗУ после
+        получения результата, до перевода/detected_fines/уведомлений (см.
+        _finalize): иначе всё время медленной обработки (минуты для
+        машины с десятком штрафов) snapshot оставался старым/NULL, и
+        параллельная проверка того же номера не могла распознать
+        подозрительный ноль (production P099XO36). Сбой последующей
+        обработки (перевод — fail-open, уведомления — отдельный пайплайн)
+        этот snapshot не отменяет: он отражает ответ provider'а, а не
+        результат уведомления."""
+        self._task_repository.record_check_result(task.id, last_check_status="ok", last_error=None)
+        self._task_repository.record_successful_check(task.id, total_amount=_records_total(records))
 
     def _record_error(self, task: FineMonitoringTask, exc: FineProviderError, started_at: float) -> CheckResult:
         error_message = str(exc)
@@ -448,21 +497,8 @@ class FineCheckService:
             new_fines.append(event)
             current_fines.append(event)
 
-        self._task_repository.record_check_result(task.id, last_check_status="ok", last_error=None)
-        # Единственная authoritative точка persistence "что показала
-        # последняя УСПЕШНАЯ проверка" (см. задачу "manager Statistics /
-        # refresh для обоих ботов" п.3/п.11) — current_fines, а НЕ
-        # detected_fines-история (см. FineMonitoringTaskRepository.
-        # record_successful_check/list_tasks_with_known_debt). ЛЮБОЙ
-        # вызывающий код (мониторинг/manual "Проверить сейчас"/Add Car/
-        # manager refresh) получает эту persistence бесплатно, без
-        # отдельной реализации в каждом из них. COALESCE(amount, 0) — тот
-        # же принцип, что и везде в проекте (fine без распознанной суммы
-        # не должен молча занижать сумму, но и не должен ронять всю
-        # проверку — редкий defensive-случай, см. reader/fines/parser.py).
-        total_amount = sum((fine.amount or 0.0) for fine in current_fines)
-        self._task_repository.record_successful_check(task.id, total_amount=total_amount)
-
+        # Snapshot (record_check_result/record_successful_check) уже сохранён
+        # ДО этого цикла — см. _persist_snapshot.
         return CheckResult(
             status="ok",
             new_fines=new_fines,

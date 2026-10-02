@@ -236,6 +236,18 @@ class DetectedFineRepository:
         ).fetchone()
         return _row_to_fine(row) if row else None
 
+    def has_detected_fines(self, monitoring_task_id: int) -> bool:
+        """Есть ли у задачи ХОТЬ ОДНА строка detected_fines — используется
+        ТОЛЬКО как "есть ли положительное свидетельство" для false-zero
+        guard (см. FineCheckService._zero_needs_confirmation), когда у
+        задачи ещё нет ни одного сохранённого успешного snapshot. НЕ
+        текущая задолженность и не сумма — detected_fines это история."""
+        row = self._conn.execute(
+            "SELECT 1 FROM detected_fines WHERE monitoring_task_id = ? LIMIT 1",
+            (monitoring_task_id,),
+        ).fetchone()
+        return row is not None
+
     def list_by_car_number(self, car_number: str) -> list[DetectedFine]:
         """Все обнаруженные штрафы конкретного номера — используется client
         delivery poller'ом (см. reader/public_bot/delivery_service.py) для
