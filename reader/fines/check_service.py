@@ -31,6 +31,7 @@ from reader.fines.models import (
     ParsedFineRecord,
 )
 from reader.fines.provider import FineProvider, FineProviderError
+from reader.fines.suppression import is_fine_output_suppressed
 from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.fines.translation import (
     FineTranslationError,
@@ -215,8 +216,22 @@ class FineCheckService:
         запрос идёт напрямую через self._provider (см. _fetch()), а
         persistence/detected_fines/notification-логика (см. _finalize())
         выполняется РОВНО ОДИН раз, над финальным набором records, кто бы
-        их ни предоставил — первая или вторая попытка."""
+        их ни предоставил — первая или вторая попытка.
+
+        Denylisted car_number (см. reader/fines/suppression.py) — ПЕРВАЯ
+        проверка в методе, ДО провайдера, ДО false-zero guard и ДО snapshot:
+        провайдер вообще не вызывается, task_repository/detected_fine_repository
+        не трогаются вовсе — last_check_status/last_successful_*/detected_fines
+        остаются РОВНО такими, какими были (см. задачу: "не изменять
+        historical records без необходимости"). Это гарантирует ЛЮБОМУ
+        вызывающему коду (мониторинг/manual/Add Car/manager refresh/
+        операторские команды/fine check-all — см. check_plate_for_tasks()
+        ниже про тот же guard для группового пути) одинаковое поведение без
+        отдельной реализации в каждом из них."""
         started_at = time.monotonic()
+
+        if is_fine_output_suppressed(task.car_number):
+            return self._suppressed_result()
 
         try:
             records = await self._fetch_trusted(task.car_number, [task])
@@ -267,8 +282,22 @@ class FineCheckService:
         last_successful_* остаётся нетронутым, per-task, как и раньше);
         успех — КАЖДАЯ задача получает результат _finalize() над одним и
         тем же records (см. задачу: "all relevant task rows for that
-        plate receive consistent latest successful amount/state")."""
+        plate receive consistent latest successful amount/state").
+
+        Denylisted car_number (см. check_task() докстрок/reader/fines/
+        suppression.py) — тот же guard, ДО провайдера, ОДИН раз для ВСЕЙ
+        группы: КАЖДАЯ задача группы получает _suppressed_result(), ни один
+        внешний запрос не выполняется. Используется DebtRefreshService.
+        refresh() — но на практике не ожидается сработать там вовсе:
+        list_debt_car_groups() (см. FineMonitoringTaskRepository) уже сам
+        исключает denylisted car_number из кандидатов, см. докстрок
+        list_tasks_with_known_debt(); guard здесь — страховка на случай
+        будущего вызывающего кода, который решит передать car_number не
+        через эту выборку."""
         started_at = time.monotonic()
+
+        if is_fine_output_suppressed(car_number):
+            return {task.id: self._suppressed_result() for task in tasks}
 
         try:
             records = await self._fetch_trusted(car_number, tasks)
@@ -354,6 +383,23 @@ class FineCheckService:
         результат уведомления."""
         self._task_repository.record_check_result(task.id, last_check_status="ok", last_error=None)
         self._task_repository.record_successful_check(task.id, total_amount=_records_total(records))
+
+    @staticmethod
+    def _suppressed_result() -> CheckResult:
+        """Denylisted car_number (см. reader/fines/suppression.py,
+        check_task()/check_plate_for_tasks() докстроки) — ни provider, ни
+        repository здесь не вызываются вовсе (см. вызывающие методы выше),
+        duration_ms=0 честно отражает "работа не выполнялась". status=
+        'suppressed' — единственный сигнал вызывающему коду показать
+        нейтральное "недоступно" вместо "штрафов не найдено" (см. задачу:
+        "не лгать про отсутствие штрафов") — на практике ЛЮБОЙ существующий
+        вызывающий код, уже трактующий "status != 'ok'" как "показать
+        нечего" (см. SubscriptionService.check_now*/CheckNowOutcome.
+        check_ok), получает корректное безопасное поведение автоматически."""
+        return CheckResult(
+            status="suppressed", new_fines=[], current_fines=[],
+            error_message=None, total_fines_found=0, duration_ms=0,
+        )
 
     def _record_error(self, task: FineMonitoringTask, exc: FineProviderError, started_at: float) -> CheckResult:
         error_message = str(exc)

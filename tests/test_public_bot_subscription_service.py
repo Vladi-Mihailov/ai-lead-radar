@@ -994,6 +994,34 @@ async def test_check_now_uses_existing_check_service_and_dedup(fx):
     assert fx.provider.requested_plates == ["AA001AA", "AA001AA"]
 
 
+async def test_check_now_suppressed_plate_never_calls_provider_and_shows_no_fines(tmp_path):
+    """Manual "🔎 Проверить сейчас" для denylisted номера (см. reader/fines/
+    suppression.py) — ни одного provider-запроса, outcome.check_ok=False
+    (texts.format_check_now_result() тогда покажет уже существующий
+    generic-unavailable текст, а не ложное "штрафов не найдено")."""
+    fixture = _Fixture(tmp_path)
+    try:
+        # add_car() само по себе уже не должно дёрнуть provider для
+        # denylisted номера (см. SubscriptionService.add_car -> check_task).
+        outcome = await fixture.service.add_car(
+            telegram_user_id=42, telegram_chat_id=42, username="client",
+            first_name=None, last_name=None, car_number="O687KE761", period_days=30,
+            today=date(2026, 9, 3),
+        )
+        assert fixture.provider.requested_plates == []
+        assert outcome.check_ok is False
+
+        fixture.provider._records_by_car["O687KE761"] = [_record(car_number="O687KE761", fingerprint="fp-canary")]
+        result = await fixture.service.check_now(outcome.subscription.id, telegram_user_id=42)
+
+        assert result is not None
+        assert result.check_ok is False
+        assert result.fines == []
+        assert fixture.provider.requested_plates == []
+    finally:
+        fixture.close()
+
+
 async def test_check_now_returns_none_for_unauthorized_user(fx):
     outcome = await fx.service.add_car(
         telegram_user_id=42, telegram_chat_id=42, username="client",
@@ -1216,6 +1244,56 @@ async def test_check_now_task_returns_none_for_inactive_task(fx):
     result = await fx.service.check_now_task(task.id)
 
     assert result is None
+
+
+# ---- denylisted car_number (см. reader/fines/suppression.py, задача про
+# приватность конкретного автомобиля) — trusted/admin task-level check_now
+# не должен раскрывать штрафы ДАЖЕ доверенному оператору ----
+
+
+async def test_check_now_task_suppressed_for_trusted_admin_never_calls_provider(fx):
+    task = fx.task_repository.create(
+        car_number="O687KE761", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    fx.provider._records_by_car["O687KE761"] = [_record(car_number="O687KE761", fingerprint="fp-canary")]
+
+    result = await fx.service.check_now_task(task.id)
+
+    assert result is not None
+    assert result.car_number == "O687KE761"
+    assert result.check_ok is False
+    assert result.fines == []
+    assert fx.provider.requested_plates == []
+
+
+async def test_check_now_task_for_search_suppressed_for_trusted_admin_never_calls_provider(fx):
+    task = fx.task_repository.create(
+        car_number="O687KE761", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    fx.provider._records_by_car["O687KE761"] = [_record(car_number="O687KE761", fingerprint="fp-canary")]
+
+    result = await fx.service.check_now_task_for_search(task.id)
+
+    assert result is not None
+    assert result.check_ok is False
+    assert result.fines == []
+    assert fx.provider.requested_plates == []
+
+
+async def test_check_now_task_still_works_for_unrelated_plate_for_trusted_admin(fx):
+    """Regression (см. задачу п.12)."""
+    task = fx.task_repository.create(
+        car_number="P004XC163", label=None, start_date=date(2026, 8, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+
+    result = await fx.service.check_now_task(task.id)
+
+    assert result is not None
+    assert result.check_ok is True
+    assert fx.provider.requested_plates == ["P004XC163"]
 
 
 # ---- count_active_tasks / list_active_tasks_page (📋 Мои авто pagination,

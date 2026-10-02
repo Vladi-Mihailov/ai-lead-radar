@@ -249,6 +249,75 @@ async def test_fine_job_checks_multiple_tasks(tmp_path):
         fine_repo.close()
 
 
+# ---- denylisted car_number (см. reader/fines/suppression.py, задача про
+# приватность конкретного автомобиля) — scheduled monitoring must never
+# notify, even when the provider reports a brand-new fine ----
+
+
+async def test_scheduled_monitoring_never_notifies_for_suppressed_plate(tmp_path):
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    try:
+        task_repo.create(
+            car_number="O687KE761", label=None,
+            start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+
+        provider = _FakeProvider({"O687KE761": [_record(car_number="O687KE761")]})
+        notification_service = _FakeNotificationService()
+        job = _make_job(task_repo, fine_repo, provider, notification_service)
+
+        await job.run(_MID_PERIOD)
+
+        # Provider вообще не вызван (короткое замыкание в check_task()) —
+        # ни одной detected_fines-строки не создано, flush_pending() нечего
+        # отправлять.
+        assert provider.requested_plates == []
+        assert fine_repo.list_by_car_number("O687KE761") == []
+        assert notification_service.notify_calls == []
+
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_scheduled_monitoring_still_notifies_for_unrelated_plate(tmp_path):
+    """Regression (см. задачу п.12) — соседняя задача в том же прогоне
+    FineJob продолжает проверяться и уведомлять как раньше."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    try:
+        task_repo.create(
+            car_number="O687KE761", label=None,
+            start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+        task_repo.create(
+            car_number="P004XC163", label=None,
+            start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+
+        provider = _FakeProvider({
+            "O687KE761": [_record(car_number="O687KE761", fingerprint="fp-suppressed")],
+            "P004XC163": [_record(car_number="P004XC163", fingerprint="fp-unrelated")],
+        })
+        notification_service = _FakeNotificationService()
+        job = _make_job(task_repo, fine_repo, provider, notification_service)
+
+        await job.run(_MID_PERIOD)
+
+        assert provider.requested_plates == ["P004XC163"]
+        assert len(notification_service.notify_calls) == 1
+        notified_cars = {event.car_number for event in notification_service.notify_calls[0]}
+        assert notified_cars == {"P004XC163"}
+
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
 async def test_task_before_start_date_is_not_checked(tmp_path):
     task_repo = _make_task_repo(tmp_path)
     fine_repo = _make_fine_repo(tmp_path)

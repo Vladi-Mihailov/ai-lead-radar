@@ -218,6 +218,46 @@ async def test_ordinary_user_does_not_see_debt_block(fx):
     assert reply.debt_refresh_available is False
 
 
+# ---- denylisted car_number (см. reader/fines/suppression.py, задача про
+# приватность конкретного автомобиля) — 📊 Статистика не должна показать
+# задолженность по этому номеру, даже если она была записана ДО появления
+# denylist'а ----
+
+
+async def test_statistics_does_not_show_debt_row_for_suppressed_plate(fx):
+    task = fx.make_task("O687KE761")
+    # Симулирует задолженность, персистентную ДО появления denylist'а —
+    # прямой repository-вызов, не check_task() (который сейчас уже
+    # отказался бы её туда записать).
+    fx.task_repository.record_successful_check(task.id, total_amount=98765)
+
+    reply = await fx.controller.handle_text(
+        texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert "O687KE761" not in reply.text
+    assert "98765" not in reply.text
+    # Агрегат честно показывает "0 машин/0 ₾" — denylisted задолженность не
+    # просто скрыта из построчного списка, а полностью исключена из
+    # list_debt_car_groups(), из которого строится и сам агрегат.
+    assert "Автомобилей: 0" in reply.text
+    assert "Общая сумма: 0 ₾" in reply.text
+
+
+async def test_statistics_still_shows_unrelated_plate_debt_alongside_suppressed_one(fx):
+    suppressed_task = fx.make_task("O687KE761")
+    fx.task_repository.record_successful_check(suppressed_task.id, total_amount=98765)
+    unrelated_task = fx.make_task("P004XC163")
+    await fx.seed_debt(unrelated_task, amount=40)
+
+    reply = await fx.controller.handle_text(
+        texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert "O687KE761" not in reply.text
+    assert "🚗 P004XC163: —: 40 ₾" in reply.text
+
+
 # ---- единый формат строки CAR: OWNER: AMOUNT (задача п.1/п.13) ----
 
 

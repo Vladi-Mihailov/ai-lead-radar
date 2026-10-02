@@ -112,6 +112,61 @@ class _Fixture:
         self.delivery_repository.close()
 
 
+# ---- denylisted car_number (см. reader/fines/suppression.py, задача про
+# приватность конкретного автомобиля) — даже УЖЕ существующий detected_fines
+# (например, с ДО появления denylist'а) не должен доставляться клиенту ----
+
+
+async def test_suppressed_plate_fine_is_never_delivered_to_owner(tmp_path):
+    now = _now()
+    fx = _Fixture(tmp_path)
+    try:
+        task_id = fx.make_task("O687KE761")
+        fx.make_fine(task_id, "O687KE761", amount=98765.0)
+        fx.subscription_repository.create(
+            monitoring_task_id=task_id, car_number="O687KE761",
+            telegram_user_id=777, telegram_chat_id=777, telegram_username="owner",
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+        )
+
+        result = await fx.service.run_once(now=now)
+
+        assert result.delivered == 0
+        assert result.failed == 0
+        assert fx.sender.sent == []
+    finally:
+        fx.close()
+
+
+async def test_unrelated_plate_still_delivered_while_suppressed_one_is_skipped(tmp_path):
+    now = _now()
+    fx = _Fixture(tmp_path)
+    try:
+        suppressed_task_id = fx.make_task("O687KE761")
+        fx.make_fine(suppressed_task_id, "O687KE761", amount=98765.0)
+        fx.subscription_repository.create(
+            monitoring_task_id=suppressed_task_id, car_number="O687KE761",
+            telegram_user_id=777, telegram_chat_id=777, telegram_username="owner",
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+        )
+
+        unrelated_task_id = fx.make_task("P004XC163")
+        fx.make_fine(unrelated_task_id, "P004XC163", amount=40.0)
+        fx.subscription_repository.create(
+            monitoring_task_id=unrelated_task_id, car_number="P004XC163",
+            telegram_user_id=778, telegram_chat_id=778, telegram_username="owner2",
+            start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+        )
+
+        result = await fx.service.run_once(now=now)
+
+        assert result.delivered == 1
+        assert fx.sender.sent == [(778, fx.sender.sent[0][1])]
+        assert "98765" not in fx.sender.sent[0][1]
+    finally:
+        fx.close()
+
+
 # ---- базовая доставка ----
 
 

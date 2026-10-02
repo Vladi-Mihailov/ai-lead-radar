@@ -287,7 +287,14 @@ class NewFineEvent:
         )
 
 
-CheckStatus = Literal["ok", "error"]
+# "suppressed" (см. reader/fines/suppression.py) — car_number в жёстком
+# denylist: FineCheckService отказался вызывать provider/трогать
+# persistence вовсе (см. check_service.py::_suppressed_result). Отличается
+# от "error" намеренно — это не сбой, а осознанный отказ показывать
+# результат, но ЛЮБОЙ вызывающий код, уже трактующий "status != 'ok'" как
+# "нечего показать" (см. SubscriptionService.check_now* и т.п.), получает
+# корректное поведение автоматически, без отдельной ветки.
+CheckStatus = Literal["ok", "error", "suppressed"]
 
 
 @dataclass(frozen=True)

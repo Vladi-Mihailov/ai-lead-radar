@@ -9,6 +9,7 @@ from reader.fines.models import (
     FineTaskDebtSnapshot,
     FineTaskStatus,
 )
+from reader.fines.suppression import is_fine_output_suppressed
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS fine_monitoring_tasks (
@@ -499,7 +500,18 @@ class FineMonitoringTaskRepository:
         detected_fines. NULL (ни одной успешной проверки ПОСЛЕ появления
         этого поля ещё не было, см. задачу п.10 про миграцию) и <= 0 —
         не кандидаты, тот же принцип, что и у Turkey get_debt_rows.
-        Отсортировано по убыванию суммы средствами SQLite."""
+        Отсортировано по убыванию суммы средствами SQLite.
+
+        Denylisted car_number (см. reader/fines/suppression.py) —
+        отфильтрован ЗДЕСЬ, постфильтром в Python (единая точка сравнения
+        для всех read-путей проекта, не продублированная в SQL). Покрывает
+        и "🚨 Штрафы по последней проверке" в 📊 Статистика, и список
+        кандидатов для "🔄 Обновить задолженности" (см. list_debt_car_groups()
+        ниже, построенный ИЗ этого метода) — задача с уже сохранённым
+        положительным last_successful_total_amount (с ДО появления
+        denylist'а) больше не всплывает ни в одном из этих мест, без
+        удаления самой строки из БД (см. задачу: "не изменять historical
+        records")."""
         rows = self._conn.execute(
             "SELECT id, car_number, last_successful_total_amount, last_successful_checked_at "
             "FROM fine_monitoring_tasks "
@@ -512,6 +524,7 @@ class FineMonitoringTaskRepository:
                 checked_at=datetime.fromisoformat(row[3]),
             )
             for row in rows
+            if not is_fine_output_suppressed(row[1])
         ]
 
     def list_debt_car_groups(self) -> list[FineCarDebtGroup]:

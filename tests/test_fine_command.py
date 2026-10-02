@@ -1982,6 +1982,79 @@ async def test_fine_check_uses_shared_pending_notification_mechanism(tmp_path):
         fx.close()
 
 
+# ---- denylisted car_number (см. reader/fines/suppression.py, задача про
+# приватность конкретного автомобиля) — даже оператор ("fine add"/"fine
+# check"/"fine update-all"/"fine stats") не должен увидеть штрафы этого
+# номера ----
+
+
+async def test_fine_add_suppressed_plate_shows_generic_unavailable_not_a_lie(tmp_path):
+    fx = _Fixture(tmp_path, records_by_car={"O687KE761": [_record(car_number="O687KE761", fingerprint="fp-canary")]})
+    try:
+        result = await fx.command.handle(_ctx(["add", "O687KE761", "01.08.2026", "31.08.2026"]))
+
+        assert fx.provider.requested_plates == []
+        # Переиспользует уже существующий "не удалось проверить" текст, а
+        # не лжёт "новых штрафов нет".
+        assert "не удалось" in result.text
+        assert "новых штрафов нет" not in result.text
+        assert fx.notification_service.notify_calls == []
+    finally:
+        fx.close()
+
+
+async def test_fine_check_suppressed_plate_raises_neutral_command_error(tmp_path):
+    fx = _Fixture(tmp_path, records_by_car={"O687KE761": [_record(car_number="O687KE761", fingerprint="fp-canary")]})
+    try:
+        await fx.command.handle(_ctx(["add", "O687KE761"]))
+        fx.provider.requested_plates.clear()
+
+        with pytest.raises(CommandError) as exc_info:
+            await fx.command.handle(_ctx(["check", "O687KE761"]))
+
+        assert "недоступна" in exc_info.value.message
+        assert fx.provider.requested_plates == []
+    finally:
+        fx.close()
+
+
+async def test_fine_update_all_excludes_suppressed_plate_from_checked_count(tmp_path):
+    fx = _Fixture(tmp_path, records_by_car={
+        "O687KE761": [_record(car_number="O687KE761", fingerprint="fp-canary")],
+        "P004XC163": [_record(car_number="P004XC163", fingerprint="fp-real")],
+    })
+    try:
+        await fx.command.handle(_ctx(["add", "O687KE761"]))
+        await fx.command.handle(_ctx(["add", "P004XC163"]))
+        fx.provider.requested_plates.clear()
+
+        result = await fx.command.handle(_ctx(["update-all"]))
+
+        assert "P004XC163" in fx.provider.requested_plates
+        assert "O687KE761" not in fx.provider.requested_plates
+        assert "Всего: 2" in result.text
+        assert "Проверено: 1" in result.text
+    finally:
+        fx.close()
+
+
+async def test_fine_stats_excludes_suppressed_plate_row(tmp_path):
+    fx = _Fixture(tmp_path, records_by_car={
+        "O687KE761": [_record(car_number="O687KE761", fingerprint="fp-canary")],
+        "P004XC163": [_record(car_number="P004XC163", fingerprint="fp-real")],
+    })
+    try:
+        await fx.command.handle(_ctx(["add", "O687KE761"]))
+        await fx.command.handle(_ctx(["add", "P004XC163"]))
+
+        result = await fx.command.handle(_ctx(["stats"]))
+
+        assert "O687KE761" not in result.text
+        assert "P004XC163" in result.text
+    finally:
+        fx.close()
+
+
 async def test_fine_check_does_not_duplicate_already_notified_fine_on_repeat(tmp_path):
     fx = _Fixture(tmp_path, records_by_car={"AA001AA": [_record(car_number="AA001AA", fingerprint="fp-1")]})
     try:

@@ -262,6 +262,41 @@ async def test_all_statuses_and_states_are_selected_and_checked(tmp_path):
     assert updated_completed.last_check_status == "ok"
 
 
+# ---- denylisted car_number (см. reader/fines/suppression.py, задача про
+# приватность конкретного автомобиля) — "fine check-all" должен пропустить
+# номер безопасно, не трогая provider и не искажая остальные агрегаты ----
+
+
+async def test_full_check_skips_suppressed_plate_without_calling_provider(tmp_path):
+    fx = _Fixture(tmp_path)
+    suppressed_task = fx.make_task("O687KE761")
+    unrelated_task = fx.make_task("P004XC163")
+    fx.provider.script("O687KE761", [[_fine(car_number="O687KE761", fingerprint="fp-canary", amount=98765)]])
+    fx.provider.script("P004XC163", [[_fine(car_number="P004XC163", fingerprint="fp-real", amount=40)]])
+
+    reply = await fx.send(texts.FULL_CHECK_CONFIRM_COMMAND)
+
+    # Провайдер вообще не вызван для denylisted номера.
+    assert fx.provider.requested_plates == ["P004XC163"]
+    assert "98765" not in reply.text
+    assert "O687KE761" not in reply.text
+
+    # "Всего" по-прежнему 2 (реальное число задач), но ни checked_ok, ни
+    # with_debt/without_debt, ни failed не учитывают suppressed-задачу —
+    # только unrelated_task вносит вклад в checked_ok/with_debt.
+    assert "Всего: 2" in reply.text
+    assert "Проверено успешно: 1" in reply.text
+    assert "С задолженностью: 1" in reply.text
+    assert "Без задолженности: 0" in reply.text
+    assert "Не удалось проверить: 0" in reply.text
+
+    updated_suppressed = fx.task_repository.get(suppressed_task.id)
+    assert updated_suppressed.last_check_status is None
+    assert updated_suppressed.last_successful_total_amount is None
+    updated_unrelated = fx.task_repository.get(unrelated_task.id)
+    assert updated_unrelated.last_successful_total_amount == 40
+
+
 # ---- 11. duplicate subscriptions sharing task -> checked once ----
 
 async def test_task_with_multiple_subscriptions_checked_exactly_once(tmp_path):

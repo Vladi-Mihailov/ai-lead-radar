@@ -154,7 +154,7 @@ class FullCheckService:
                 if result.status == "error":
                     failed += 1
                     failed_car_numbers.append(task.car_number)
-                else:
+                elif result.status == "ok":
                     checked_ok += 1
                     updated = self._task_repository.get(task_id)
                     amount = (updated.last_successful_total_amount or 0.0) if updated else 0.0
@@ -162,6 +162,12 @@ class FullCheckService:
                         with_debt += 1
                     else:
                         without_debt += 1
+                # "suppressed" (см. reader/fines/suppression.py) — denylisted
+                # car_number, намеренно не учитывается НИ В ОДНОМ счётчике
+                # (не checked_ok/with_debt/without_debt, и не failed) — "total"
+                # по-прежнему отражает реальное число task_id (см. задачу:
+                # "suppressed plate skipped/redacted safely"), без искажения
+                # остальных агрегатов устаревшим/неактуальным состоянием.
 
                 done = index + 1
                 if done % self._progress_every == 0 or done == total:

@@ -23,6 +23,7 @@ from telethon.errors import FloodWaitError
 
 from reader.fines.detected_fine_repository import DetectedFineRepository
 from reader.fines.models import DetectedFine
+from reader.fines.suppression import is_fine_output_suppressed
 from reader.public_bot.delivery_repository import ClientFineDeliveryRepository, RecipientRole
 from reader.public_bot.delivery_texts import (
     format_owner_fine_message,
@@ -149,6 +150,14 @@ class ClientDeliveryService:
 
         subscriptions = self._subscription_repository.list_all_deliverable(today=today)
         for subscription in subscriptions:
+            if is_fine_output_suppressed(subscription.car_number):
+                # Denylisted car_number (см. reader/fines/suppression.py) —
+                # пропускается целиком, ДО чтения detected_fines: на случай,
+                # если для него уже есть persisted штрафы с ДО появления
+                # denylist'а (FineCheckService больше не создаёт новых, см.
+                # check_service.py), этот поллер — единственный путь
+                # клиентской доставки, независимый от notification_sent_at.
+                continue
             fines = self._detected_fine_repository.list_by_car_number(subscription.car_number)
             for fine in fines:
                 for role in _applicable_roles(subscription):

@@ -490,6 +490,38 @@ async def test_search_fine_with_unknown_amount_shows_unknown_not_zero(trusted_fx
     assert "💰 Штрафы: 0 ₾" not in reply.text
 
 
+# ---- denylisted car_number (см. reader/fines/suppression.py, задача про
+# приватность конкретного автомобиля) — даже trusted/manager Search не
+# должен показать сумму/штрафы для этого номера ----
+
+
+async def test_search_suppressed_plate_shows_unknown_not_zero_or_leaked_amount(trusted_fx):
+    await trusted_fx.add_car(telegram_user_id=777, car_number="O687KE761")
+    trusted_fx.provider.records_by_car["O687KE761"] = [
+        _record("O687KE761", amount=98765.0, fingerprint="fp-canary"),
+    ]
+
+    reply = await _search(trusted_fx, "O687KE761")
+
+    assert "💰 Штрафы: неизвестно" in reply.text
+    assert "98765" not in reply.text
+    assert "💰 Штрафы: 0 ₾" not in reply.text
+
+
+async def test_search_unrelated_plate_still_works_when_suppressed_plate_exists(trusted_fx):
+    """Regression (см. задачу п.12) — наличие denylisted номера в БД не
+    влияет на Search по другому номеру."""
+    await trusted_fx.add_car(telegram_user_id=777, car_number="O687KE761")
+    await trusted_fx.add_car(telegram_user_id=778, car_number="P004XC163")
+    trusted_fx.provider.records_by_car["P004XC163"] = [
+        _record("P004XC163", amount=40.0, fingerprint="fp-real"),
+    ]
+
+    reply = await _search(trusted_fx, "P004XC163")
+
+    assert "💰 Штрафы: 40 ₾" in reply.text
+
+
 # ---- 17. not found ----
 
 

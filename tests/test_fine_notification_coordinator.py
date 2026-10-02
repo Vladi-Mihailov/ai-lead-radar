@@ -140,6 +140,83 @@ async def test_flush_pending_leaves_failed_fines_pending_for_next_call(tmp_path)
         fine_repo.close()
 
 
+# ---- denylisted car_number (см. reader/fines/suppression.py) — defense in
+# depth: даже УЖЕ существующая pending detected_fines-строка (например, с
+# ДО появления denylist'а) никогда не уведомляет оператора ----
+
+
+async def test_flush_pending_never_notifies_for_suppressed_car_number(tmp_path):
+    task_repo, fine_repo = _make_repos(tmp_path)
+    try:
+        task = task_repo.create(
+            car_number="O687KE761", label=None,
+            start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+        fine_repo.create(
+            monitoring_task_id=task.id, car_number="O687KE761",
+            external_fine_id="A1", fingerprint="fp-1",
+            penalty_date=None, due_date=None, delivered_status="Не вручено",
+            raw_data="{}",
+        )
+
+        notification_service = _FakeNotificationService()
+        coordinator = FineNotificationCoordinator(fine_repo, task_repo, notification_service)
+
+        result = await coordinator.flush_pending()
+
+        assert notification_service.notify_calls == []
+        assert result.delivered_event_ids == []
+        assert result.failed_event_ids == []
+        # Строка остаётся pending (не удалена, не помечена отправленной) —
+        # см. задачу: "не изменять/не удалять historical records".
+        updated = fine_repo.get_by_fingerprint(task.id, "fp-1")
+        assert updated.notification_sent_at is None
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_flush_pending_notifies_unrelated_car_while_suppressed_one_is_skipped(tmp_path):
+    task_repo, fine_repo = _make_repos(tmp_path)
+    try:
+        suppressed_task = task_repo.create(
+            car_number="O687KE761", label=None,
+            start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+        fine_repo.create(
+            monitoring_task_id=suppressed_task.id, car_number="O687KE761",
+            external_fine_id="A1", fingerprint="fp-suppressed",
+            penalty_date=None, due_date=None, delivered_status="Не вручено",
+            raw_data="{}",
+        )
+        unrelated_task = task_repo.create(
+            car_number="P004XC163", label=None,
+            start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+        unrelated_fine = fine_repo.create(
+            monitoring_task_id=unrelated_task.id, car_number="P004XC163",
+            external_fine_id="A2", fingerprint="fp-unrelated",
+            penalty_date=None, due_date=None, delivered_status="Не вручено",
+            raw_data="{}",
+        )
+
+        notification_service = _FakeNotificationService()
+        coordinator = FineNotificationCoordinator(fine_repo, task_repo, notification_service)
+
+        result = await coordinator.flush_pending()
+
+        assert len(notification_service.notify_calls) == 1
+        sent_event = notification_service.notify_calls[0][0]
+        assert sent_event.detected_fine_id == unrelated_fine.id
+        assert result.delivered_event_ids == [unrelated_fine.id]
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
 # ---- car_owner_display: car_number -> users.car_numbers -> users ----
 
 

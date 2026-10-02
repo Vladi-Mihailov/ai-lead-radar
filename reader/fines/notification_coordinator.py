@@ -8,6 +8,7 @@ from typing import Protocol
 
 from reader.fines.detected_fine_repository import DetectedFineRepository
 from reader.fines.models import FineMonitoringTask, NewFineEvent
+from reader.fines.suppression import is_fine_output_suppressed
 from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.notifications.base import NotificationResult, NotificationService
 from reader.users.models import TelegramUserInfo
@@ -80,6 +81,15 @@ class FineNotificationCoordinator:
         проходе и оставшиеся с прошлых неудачных попыток одновременно (один
         и тот же признак, отдельной ветки для "повтора" не требуется)."""
         pending = self._detected_fine_repository.list_pending_notifications()
+        # Denylisted car_number (см. reader/fines/suppression.py) —
+        # исключён здесь на случай, если для него уже существует
+        # detected_fines-строка с notification_sent_at IS NULL, созданная
+        # ДО появления denylist'а (FineCheckService больше не создаёт новых
+        # таких строк вовсе, см. check_service.py, но старые не удаляются,
+        # см. задачу "не изменять historical records"). Такая строка
+        # остаётся pending навсегда — безвредно, просто никогда не
+        # отправляется ни одному оператору.
+        pending = [fine for fine in pending if not is_fine_output_suppressed(fine.car_number)]
         if not pending:
             return NotificationResult(delivered_event_ids=[], failed_event_ids=[])
 

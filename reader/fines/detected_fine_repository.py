@@ -3,6 +3,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from reader.fines.models import CarFineStats, DetectedFine
+from reader.fines.suppression import is_fine_output_suppressed
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS detected_fines (
@@ -268,9 +269,20 @@ class DetectedFineRepository:
     def get_stats_by_car(self) -> list[CarFineStats]:
         """Количество опубликованных штрафов по каждому автомобилю (fine
         stats) — сгруппировано и отсортировано по убыванию средствами
-        SQLite, а не в Python."""
+        SQLite, а не в Python.
+
+        Denylisted car_number (см. reader/fines/suppression.py) исключён
+        постфильтром в Python — "fine stats" читает УЖЕ persisted
+        detected_fines напрямую, в обход FineCheckService, поэтому строки,
+        созданные ДО появления denylist'а, без этого фильтра продолжали бы
+        показывать количество штрафов оператору (см. задачу: "trusted/admin
+        suppression тоже применяется")."""
         rows = self._conn.execute(_SELECT_STATS_BY_CAR).fetchall()
-        return [CarFineStats(car_number=row[0], fine_count=row[1]) for row in rows]
+        return [
+            CarFineStats(car_number=row[0], fine_count=row[1])
+            for row in rows
+            if not is_fine_output_suppressed(row[0])
+        ]
 
     def count_first_detected_since(self, since: datetime) -> int:
         """Сколько ГЕНУИННО новых штрафов обнаружено начиная с since — по

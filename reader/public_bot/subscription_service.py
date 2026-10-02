@@ -94,6 +94,12 @@ class CheckNowOutcome:
     check_ok: bool
     fines: list[NewFineEvent]
     is_owner: bool
+    # True — проверка этого номера недоступна в принципе (FineCheckService
+    # вернул status='suppressed', см. reader/fines/suppression.py): вместо
+    # "не удалось, попробуйте позже" показывается нейтральное "недоступна"
+    # (см. texts.format_check_now_result) — без штрафов, без суммы и без
+    # упоминания причины.
+    unavailable: bool = False
 
 
 @dataclass(frozen=True)
@@ -817,6 +823,7 @@ class SubscriptionService:
             car_number=subscription.car_number,
             check_ok=check_result.status == "ok",
             fines=check_result.current_fines if check_result.status == "ok" else [],
+            unavailable=check_result.status == "suppressed",
             is_owner=subscription.telegram_user_id == telegram_user_id,
         )
 
@@ -980,6 +987,7 @@ class SubscriptionService:
             car_number=task.car_number,
             check_ok=check_result.status == "ok",
             fines=check_result.current_fines if check_result.status == "ok" else [],
+            unavailable=check_result.status == "suppressed",
             is_owner=False,  # task-level admin — всегда trusted-оператор, не владелец
         )
 
@@ -1016,6 +1024,7 @@ class SubscriptionService:
             car_number=task.car_number,
             check_ok=check_result.status == "ok",
             fines=check_result.current_fines if check_result.status == "ok" else [],
+            unavailable=check_result.status == "suppressed",
             is_owner=False,
         )
 

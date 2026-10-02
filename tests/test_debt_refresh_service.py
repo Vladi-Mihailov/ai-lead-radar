@@ -150,6 +150,44 @@ async def test_zero_debt_car_is_not_included_or_checked(fx):
     assert fx.provider.requested_plates == []
 
 
+# ---- denylisted car_number (см. reader/fines/suppression.py, задача про
+# приватность конкретного автомобиля) ----
+
+
+async def test_suppressed_plate_with_preexisting_debt_is_excluded_from_candidates_and_never_checked(fx):
+    """Симулирует положительную задолженность, сохранённую ДО появления
+    denylist'а (прямой UPDATE через repository, а не через check_task(),
+    который сейчас уже отказался бы её туда записать) — refresh() не
+    должен ни показать её в списке, ни сделать по ней ни одного внешнего
+    запроса."""
+    suppressed_task = fx.make_task("O687KE761")
+    fx.task_repository.record_successful_check(suppressed_task.id, total_amount=250)
+
+    assert fx.debt_refresh.list_debt_rows() == []
+    assert fx.debt_refresh.list_debt_car_groups() == []
+
+    outcome = await fx.debt_refresh.refresh()
+
+    assert outcome.checked == 0
+    assert fx.provider.requested_plates == []
+
+
+async def test_refresh_still_checks_unrelated_plate_while_suppressed_one_is_excluded(fx):
+    suppressed_task = fx.make_task("O687KE761")
+    fx.task_repository.record_successful_check(suppressed_task.id, total_amount=250)
+    unrelated_task = fx.make_task("P004XC163")
+    await fx.seed(unrelated_task, amount=40)
+    fx.provider.requested_plates.clear()
+
+    groups = fx.debt_refresh.list_debt_car_groups()
+    assert [g.car_number for g in groups] == ["P004XC163"]
+
+    outcome = await fx.debt_refresh.refresh()
+
+    assert outcome.checked == 1
+    assert fx.provider.requested_plates == ["P004XC163"]
+
+
 async def test_only_tasks_with_known_positive_debt_are_checked(fx):
     debt_task = fx.make_task("BB002BB")
     fx.make_task("CC003CC")  # никогда не проверялась вовсе
