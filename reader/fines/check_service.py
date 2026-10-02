@@ -389,13 +389,11 @@ class FineCheckService:
         """Denylisted car_number (см. reader/fines/suppression.py,
         check_task()/check_plate_for_tasks() докстроки) — ни provider, ни
         repository здесь не вызываются вовсе (см. вызывающие методы выше),
-        duration_ms=0 честно отражает "работа не выполнялась". status=
-        'suppressed' — единственный сигнал вызывающему коду показать
-        нейтральное "недоступно" вместо "штрафов не найдено" (см. задачу:
-        "не лгать про отсутствие штрафов") — на практике ЛЮБОЙ существующий
-        вызывающий код, уже трактующий "status != 'ok'" как "показать
-        нечего" (см. SubscriptionService.check_now*/CheckNowOutcome.
-        check_ok), получает корректное безопасное поведение автоматически."""
+        duration_ms=0 честно отражает "работа не выполнялась". Пустые
+        current_fines/new_fines и total_fines_found=0 — снаружи такой
+        результат показывается ровно как успешная проверка без штрафов (см.
+        CheckResult.shows_as_ok): suppression остаётся невидимой, а реальные
+        данные не выходят ни в один ответ."""
         return CheckResult(
             status="suppressed", new_fines=[], current_fines=[],
             error_message=None, total_fines_found=0, duration_ms=0,

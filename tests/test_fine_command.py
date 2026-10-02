@@ -1988,32 +1988,32 @@ async def test_fine_check_uses_shared_pending_notification_mechanism(tmp_path):
 # номера ----
 
 
-async def test_fine_add_suppressed_plate_shows_generic_unavailable_not_a_lie(tmp_path):
+async def test_fine_add_suppressed_plate_looks_like_plate_without_fines(tmp_path):
     fx = _Fixture(tmp_path, records_by_car={"O687KE761": [_record(car_number="O687KE761", fingerprint="fp-canary")]})
     try:
         result = await fx.command.handle(_ctx(["add", "O687KE761", "01.08.2026", "31.08.2026"]))
 
         assert fx.provider.requested_plates == []
-        # Переиспользует уже существующий "не удалось проверить" текст, а
-        # не лжёт "новых штрафов нет".
-        assert "не удалось" in result.text
-        assert "новых штрафов нет" not in result.text
+        # Снаружи — ровно как обычный автомобиль без штрафов.
+        assert "новых штрафов нет" in result.text
+        assert "не удалось" not in result.text and "недоступна" not in result.text
         assert fx.notification_service.notify_calls == []
     finally:
         fx.close()
 
 
-async def test_fine_check_suppressed_plate_raises_neutral_command_error(tmp_path):
+async def test_fine_check_suppressed_plate_looks_like_plate_without_fines(tmp_path):
     fx = _Fixture(tmp_path, records_by_car={"O687KE761": [_record(car_number="O687KE761", fingerprint="fp-canary")]})
     try:
         await fx.command.handle(_ctx(["add", "O687KE761"]))
         fx.provider.requested_plates.clear()
 
-        with pytest.raises(CommandError) as exc_info:
-            await fx.command.handle(_ctx(["check", "O687KE761"]))
+        result = await fx.command.handle(_ctx(["check", "O687KE761"]))
 
-        assert "недоступна" in exc_info.value.message
+        assert "Найдено штрафов: 0" in result.text and "Новых: 0" in result.text
+        assert "недоступна" not in result.text
         assert fx.provider.requested_plates == []
+        assert fx.notification_service.notify_calls == []
     finally:
         fx.close()
 

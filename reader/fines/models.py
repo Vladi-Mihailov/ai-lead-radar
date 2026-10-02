@@ -312,3 +312,14 @@ class CheckResult:
     error_message: str | None
     total_fines_found: int
     duration_ms: int
+
+
+    @property
+    def shows_as_ok(self) -> bool:
+        """Как результат выглядит СНАРУЖИ (бот/операторские команды):
+        status='suppressed' (denylisted номер, см. reader/fines/suppression.py)
+        показывается ровно как успешная проверка без штрафов — current_fines/
+        new_fines у такого результата всегда пусты, total_fines_found=0
+        (см. FineCheckService._suppressed_result), поэтому никакие реальные
+        данные не выходят наружу, а сам факт suppression невидим."""
+        return self.status in ("ok", "suppressed")

@@ -108,22 +108,22 @@ async def test_unsuppressed_transient_zero_with_previous_positive_is_confirmed(f
     text = await _check_now_text(fx, _NORMAL)
 
     assert fx.provider.requested_plates == [_NORMAL, _NORMAL]  # подтверждающий запрос
-    assert "штрафов не найдено" not in text and texts.CHECK_NOW_UNAVAILABLE_TEXT not in text
+    assert "штрафов не найдено" not in text
     assert fx.tasks.get(task.id).last_successful_total_amount == 150.0
 
 
 # 2. suppressed plate: nothing escapes, whatever the provider would return
 
 
-async def test_suppressed_plate_never_calls_provider_and_shows_neutral_unavailable(fx):
+async def test_suppressed_plate_never_calls_provider_and_looks_like_no_fines(fx):
     fx.make_task(_SUPPRESSED)
     fx.provider.script(_SUPPRESSED, [[_fine(_SUPPRESSED, 0, _CANARY)]])
 
     text = await _check_now_text(fx, _SUPPRESSED)
 
     assert fx.provider.requested_plates == []
-    assert text == texts.CHECK_NOW_UNAVAILABLE_TEXT
-    assert "штрафов не найдено" not in text and "98765" not in text and _SUPPRESSED not in text
+    assert text == f"🔎 {_SUPPRESSED}: штрафов не найдено"  # тот же стандартный текст, что и у любого номера
+    assert "98765" not in text and "недоступн" not in text
     assert fx.fines.list_by_car_number(_SUPPRESSED) == []
 
 
@@ -139,7 +139,7 @@ async def test_suppressed_plate_with_history_does_not_leak_and_history_is_preser
     text = await _check_now_text(fx, _SUPPRESSED)
 
     assert fx.provider.requested_plates == [] and fx.sleep_log.calls == []  # ...but no request/confirmation
-    assert "98765" not in text and text == texts.CHECK_NOW_UNAVAILABLE_TEXT
+    assert "98765" not in text and text == f"🔎 {_SUPPRESSED}: штрафов не найдено"
     assert all(s.car_number != _SUPPRESSED for s in fx.fines.get_stats_by_car())
     assert len(fx.fines.list_by_car_number(_SUPPRESSED)) == 1  # история НЕ удалена
 
@@ -225,3 +225,65 @@ def test_turkey_code_does_not_use_georgia_suppression():
     ]
     assert turkey_files
     assert not [p for p in turkey_files if "is_fine_output_suppressed" in p.read_text(encoding="utf-8")]
+
+
+# ---- invisible suppression: identical to an ordinary car without fines ----
+
+
+async def _add_car(fx, plate: str, user_id: int):
+    return await fx.service.add_car(
+        telegram_user_id=user_id, telegram_chat_id=user_id, username=None, first_name=None, last_name=None,
+        car_number=plate, period_days=30, today=date(2026, 10, 2),
+    )
+
+
+def _summary(outcome) -> str:
+    return texts.format_add_car_summary(
+        car_number=outcome.subscription.car_number, start_date=outcome.subscription.start_date,
+        end_date=outcome.subscription.end_date, check_ok=outcome.check_ok, new_fines_count=outcome.new_fines_count,
+    )
+
+
+async def test_owner_add_car_and_check_now_identical_to_car_without_fines(fx):
+    fx.provider.script(_SUPPRESSED, [[_fine(_SUPPRESSED, 0, _CANARY)]])  # would leak if ever requested
+    fx.provider.script(_NORMAL, [[]])                                      # genuinely no fines
+
+    suppressed_add, normal_add = await _add_car(fx, _SUPPRESSED, 42), await _add_car(fx, _NORMAL, 43)
+    suppressed_now = await fx.service.check_now(suppressed_add.subscription.id, telegram_user_id=42)
+    normal_now = await fx.service.check_now(normal_add.subscription.id, telegram_user_id=43)
+
+    assert fx.provider.requested_plates == [_NORMAL, _NORMAL]   # O687KE761 never requested
+    assert _summary(suppressed_add) == _summary(normal_add).replace(_NORMAL, _SUPPRESSED)
+    assert texts.format_check_now_result(suppressed_now) == f"🔎 {_SUPPRESSED}: штрафов не найдено"
+    assert texts.format_check_now_result(normal_now) == f"🔎 {_NORMAL}: штрафов не найдено"
+    for text in (_summary(suppressed_add), texts.format_check_now_result(suppressed_now)):
+        assert "98765" not in text
+        assert not any(word in text.lower() for word in ("недоступн", "исключ", "suppress", "не удалось"))
+
+
+async def test_trusted_check_now_and_search_line_identical_to_car_without_fines(fx):
+    suppressed_task = fx.make_task(_SUPPRESSED)
+    fx.seed_snapshot(suppressed_task, _CANARY)  # historical positive debt must not surface
+    fx.add_history(suppressed_task)
+    fx.make_task(_NORMAL)
+    fx.provider.script(_NORMAL, [[]])
+
+    trusted = await fx.service.check_now_task_by_car_number(_SUPPRESSED)
+    search = await fx.service.check_now_task_for_search(suppressed_task.id)
+    normal_search = await fx.service.check_now_task_for_search(fx.tasks.get_active_by_car_number(_NORMAL)[0].id)
+
+    assert texts.format_check_now_result(trusted) == f"🔎 {_SUPPRESSED}: штрафов не найдено"
+    line = texts.format_search_money_line(check_ok=search.check_ok, fines=search.fines)
+    assert line == texts.format_search_money_line(check_ok=normal_search.check_ok, fines=normal_search.fines)
+    assert line == "💰 Штрафы: 0 ₾" and "98765" not in line
+    assert fx.provider.requested_plates == [_NORMAL]
+    assert len(fx.fines.list_by_car_number(_SUPPRESSED)) == 1  # history untouched
+
+
+def test_no_special_suppression_wording_left_in_bot_texts():
+    source = (PROJECT_ROOT / "reader" / "public_bot" / "texts.py").read_text(encoding="utf-8")
+    assert "CHECK_NOW_UNAVAILABLE_TEXT" not in source
+    assert "Проверка штрафов для этого автомобиля недоступна" not in source
+    fine_source = (PROJECT_ROOT / "reader" / "commands" / "fine.py").read_text(encoding="utf-8")
+    assert "Проверка штрафов для этого автомобиля недоступна" not in fine_source
+    assert "проверка недоступна" not in fine_source

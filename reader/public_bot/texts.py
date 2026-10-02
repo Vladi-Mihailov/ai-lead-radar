@@ -113,13 +113,6 @@ _TRUSTED_STOP_CONFIRM_BUTTON_NO_CLIENTS = "⛔ Остановить"
 _TRUSTED_STOP_CONFIRM_BUTTON_WITH_CLIENTS = "⛔ Остановить для всех"
 
 
-# Нейтральный ответ manual "🔎 Проверить сейчас" для номера, проверка
-# которого недоступна (см. CheckNowOutcome.unavailable/reader/fines/
-# suppression.py): не "штрафов не найдено" (это была бы ложь) и не
-# "попробуйте позже" (повтор не поможет); причина не раскрывается.
-CHECK_NOW_UNAVAILABLE_TEXT = "⚠️ Проверка штрафов для этого автомобиля недоступна."
-
-
 def format_check_now_result(outcome) -> str:
     """outcome: reader.public_bot.subscription_service.CheckNowOutcome.
     Без технической детали ошибки в тексте клиенту (см. design: та же
@@ -131,8 +124,6 @@ def format_check_now_result(outcome) -> str:
     прошлой проверки: "новых штрафов нет" здесь принципиально не
     показывается — outcome.fines это ВСЕ штрафы из ответа police.ge на
     этой проверке, новые и уже известные (см. CheckResult.current_fines)."""
-    if getattr(outcome, "unavailable", False):
-        return CHECK_NOW_UNAVAILABLE_TEXT
     if not outcome.check_ok:
         return f"⚠️ Проверить штрафы для {outcome.car_number} сейчас не удалось. Попробуйте позже."
     if not outcome.fines:

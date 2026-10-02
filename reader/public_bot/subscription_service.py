@@ -94,12 +94,6 @@ class CheckNowOutcome:
     check_ok: bool
     fines: list[NewFineEvent]
     is_owner: bool
-    # True — проверка этого номера недоступна в принципе (FineCheckService
-    # вернул status='suppressed', см. reader/fines/suppression.py): вместо
-    # "не удалось, попробуйте позже" показывается нейтральное "недоступна"
-    # (см. texts.format_check_now_result) — без штрафов, без суммы и без
-    # упоминания причины.
-    unavailable: bool = False
 
 
 @dataclass(frozen=True)
@@ -269,8 +263,8 @@ class SubscriptionService:
         return AddCarOutcome(
             task=task,
             subscription=subscription,
-            check_ok=check_result.status == "ok",
-            new_fines_count=len(check_result.new_fines) if check_result.status == "ok" else 0,
+            check_ok=check_result.shows_as_ok,
+            new_fines_count=len(check_result.new_fines) if check_result.shows_as_ok else 0,
         )
 
     # ---- trusted-operator delegated flow ----
@@ -364,8 +358,8 @@ class SubscriptionService:
             task=task,
             subscription=subscription,
             pending_claim=pending,
-            check_ok=check_result.status == "ok",
-            new_fines_count=len(check_result.new_fines) if check_result.status == "ok" else 0,
+            check_ok=check_result.shows_as_ok,
+            new_fines_count=len(check_result.new_fines) if check_result.shows_as_ok else 0,
             claim_link=claim_link,
         )
 
@@ -413,8 +407,8 @@ class SubscriptionService:
 
         return AddCarWithoutClientOutcome(
             task=task,
-            check_ok=check_result.status == "ok",
-            new_fines_count=len(check_result.new_fines) if check_result.status == "ok" else 0,
+            check_ok=check_result.shows_as_ok,
+            new_fines_count=len(check_result.new_fines) if check_result.shows_as_ok else 0,
         )
 
     def claim(
@@ -821,9 +815,8 @@ class SubscriptionService:
 
         return CheckNowOutcome(
             car_number=subscription.car_number,
-            check_ok=check_result.status == "ok",
-            fines=check_result.current_fines if check_result.status == "ok" else [],
-            unavailable=check_result.status == "suppressed",
+            check_ok=check_result.shows_as_ok,
+            fines=check_result.current_fines if check_result.shows_as_ok else [],
             is_owner=subscription.telegram_user_id == telegram_user_id,
         )
 
@@ -985,9 +978,8 @@ class SubscriptionService:
 
         return CheckNowOutcome(
             car_number=task.car_number,
-            check_ok=check_result.status == "ok",
-            fines=check_result.current_fines if check_result.status == "ok" else [],
-            unavailable=check_result.status == "suppressed",
+            check_ok=check_result.shows_as_ok,
+            fines=check_result.current_fines if check_result.shows_as_ok else [],
             is_owner=False,  # task-level admin — всегда trusted-оператор, не владелец
         )
 
@@ -1022,9 +1014,8 @@ class SubscriptionService:
 
         return CheckNowOutcome(
             car_number=task.car_number,
-            check_ok=check_result.status == "ok",
-            fines=check_result.current_fines if check_result.status == "ok" else [],
-            unavailable=check_result.status == "suppressed",
+            check_ok=check_result.shows_as_ok,
+            fines=check_result.current_fines if check_result.shows_as_ok else [],
             is_owner=False,
         )
 

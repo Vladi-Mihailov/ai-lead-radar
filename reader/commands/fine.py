@@ -341,16 +341,6 @@ class FineCommand(Command):
             return _ImmediateCheckOutcome(
                 ok=False, new_fines_count=0, error_message=check_result.error_message,
             )
-        if check_result.status == "suppressed":
-            # Denylisted car_number (см. reader/fines/suppression.py) —
-            # переиспользует уже существующую ok=False ветку/текст ("но
-            # проверить штрафы сейчас не удалось") вместо отдельного
-            # сообщения: снаружи неотличимо от обычного сбоя проверки, не
-            # раскрывает сам факт denylist'а (см. задачу), и не лжёт про
-            # "новых штрафов нет".
-            return _ImmediateCheckOutcome(
-                ok=False, new_fines_count=0, error_message="проверка недоступна",
-            )
 
         # Тот же механизм доставки, что и у FineJob/fine check — тем же
         # самым координатором, а не копией логики.
@@ -712,15 +702,6 @@ class FineCommand(Command):
 
             if result.status == "error":
                 raise CommandError(f"❌ Ошибка проверки: {result.error_message}")
-            if result.status == "suppressed":
-                # Denylisted car_number (см. reader/fines/suppression.py) —
-                # нейтральный отказ, БЕЗ единой цифры (найдено/новых) для
-                # этого номера, даже оператору (см. задачу: "trusted/admin
-                # suppression тоже применяется"). Все задачи этого номера
-                # денylisted одинаково — прерываем сразу, не продолжая цикл
-                # по остальным (обычно их и так ровно одна, см. комментарий
-                # в _handle_stop).
-                raise CommandError("⚠️ Проверка штрафов для этого автомобиля недоступна.")
 
             total_fines_found += result.total_fines_found
             total_new_fines += len(result.new_fines)

@@ -503,9 +503,11 @@ async def test_search_suppressed_plate_shows_unknown_not_zero_or_leaked_amount(t
 
     reply = await _search(trusted_fx, "O687KE761")
 
-    assert "💰 Штрафы: неизвестно" in reply.text
+    # Снаружи — как обычный автомобиль без штрафов (suppression невидима),
+    # реальная сумма не выходит наружу.
+    assert "💰 Штрафы: 0 ₾" in reply.text
     assert "98765" not in reply.text
-    assert "💰 Штрафы: 0 ₾" not in reply.text
+    assert "неизвестно" not in reply.text
 
 
 async def test_search_unrelated_plate_still_works_when_suppressed_plate_exists(trusted_fx):

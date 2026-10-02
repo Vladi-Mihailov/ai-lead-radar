@@ -996,8 +996,9 @@ async def test_check_now_uses_existing_check_service_and_dedup(fx):
 
 async def test_check_now_suppressed_plate_never_calls_provider_and_shows_no_fines(tmp_path):
     """Manual "🔎 Проверить сейчас" для denylisted номера (см. reader/fines/
-    suppression.py) — ни одного provider-запроса, outcome.check_ok=False
-    (texts.format_check_now_result() тогда покажет уже существующий
+    suppression.py) — ни одного provider-запроса; снаружи — ровно как
+    успешная проверка без штрафов (check_ok=True, fines=[], см.
+    CheckResult.shows_as_ok; texts.format_check_now_result() покажет обычный
     generic-unavailable текст, а не ложное "штрафов не найдено")."""
     fixture = _Fixture(tmp_path)
     try:
@@ -1009,13 +1010,13 @@ async def test_check_now_suppressed_plate_never_calls_provider_and_shows_no_fine
             today=date(2026, 9, 3),
         )
         assert fixture.provider.requested_plates == []
-        assert outcome.check_ok is False
+        assert outcome.check_ok is True
 
         fixture.provider._records_by_car["O687KE761"] = [_record(car_number="O687KE761", fingerprint="fp-canary")]
         result = await fixture.service.check_now(outcome.subscription.id, telegram_user_id=42)
 
         assert result is not None
-        assert result.check_ok is False
+        assert result.check_ok is True
         assert result.fines == []
         assert fixture.provider.requested_plates == []
     finally:
@@ -1262,7 +1263,7 @@ async def test_check_now_task_suppressed_for_trusted_admin_never_calls_provider(
 
     assert result is not None
     assert result.car_number == "O687KE761"
-    assert result.check_ok is False
+    assert result.check_ok is True
     assert result.fines == []
     assert fx.provider.requested_plates == []
 
@@ -1277,7 +1278,7 @@ async def test_check_now_task_for_search_suppressed_for_trusted_admin_never_call
     result = await fx.service.check_now_task_for_search(task.id)
 
     assert result is not None
-    assert result.check_ok is False
+    assert result.check_ok is True
     assert result.fines == []
     assert fx.provider.requested_plates == []
 
