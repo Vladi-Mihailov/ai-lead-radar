@@ -135,6 +135,11 @@ CREATE TABLE IF NOT EXISTS user_campaign_invites (
 # repository.py — тот же приём для users.is_bot/access_hash/...).
 _USER_CAMPAIGN_INVITES_COLUMN_MIGRATIONS = {
     "verified_at": "ALTER TABLE user_campaign_invites ADD COLUMN verified_at TIMESTAMP",
+    # Политика повторов (см. UserCampaignInvite.failure_kind/next_attempt_at
+    # и reader/inviter/service.py _classify_invite_error) — additive, NULL у
+    # уже существующих строк (= прежнее поведение для них).
+    "failure_kind": "ALTER TABLE user_campaign_invites ADD COLUMN failure_kind TEXT",
+    "next_attempt_at": "ALTER TABLE user_campaign_invites ADD COLUMN next_attempt_at TIMESTAMP",
 }
 
 _USER_CAMPAIGN_INVITES_INDEXES = (
@@ -146,6 +151,8 @@ _USER_CAMPAIGN_INVITES_INDEXES = (
     "ON user_campaign_invites (account_id)",
     "CREATE INDEX IF NOT EXISTS idx_user_campaign_invites_status "
     "ON user_campaign_invites (status)",
+    "CREATE INDEX IF NOT EXISTS idx_user_campaign_invites_user_campaign "
+    "ON user_campaign_invites (user_id, campaign_id)",
 )
 
 
@@ -319,6 +326,31 @@ _CANDIDATES_BASE_WHERE = _LEADS_WHERE + """
                   AND LOWER(oc.target_chat) = LOWER(c.target_chat))
           )
     )
+    -- Backoff (см. UserCampaignInvite.next_attempt_at): после неудачной
+    -- попытки кандидат не возвращается в очередь ЭТОЙ кампании до
+    -- next_attempt_at — вместо повторной попытки на каждом тике.
+    AND NOT EXISTS (
+        SELECT 1 FROM user_campaign_invites rb
+        WHERE rb.user_id = u.user_id
+          AND rb.campaign_id = :campaign_id
+          AND rb.next_attempt_at IS NOT NULL
+          AND rb.next_attempt_at > strftime('%Y-%m-%dT%H:%M:%S', 'now')
+    )
+    -- Аккаунт, который уже не смог резолвить identity кандидата
+    -- (failure_kind='unresolved'), его больше не выбирает — у другого
+    -- аккаунта кандидат может быть в кэше (см. задачу: @andrey/@Magomed были
+    -- приглашены другим аккаунтом после десятков неудач). :account_id NULL —
+    -- выборка без привязки к аккаунту (статистика/dry-run).
+    AND (
+        :account_id IS NULL
+        OR NOT EXISTS (
+            SELECT 1 FROM user_campaign_invites ra
+            WHERE ra.user_id = u.user_id
+              AND ra.campaign_id = :campaign_id
+              AND ra.account_id = :account_id
+              AND ra.failure_kind = 'unresolved'
+        )
+    )
 """
 
 # username IS NOT NULL/не пуст — обязателен: если candidate не известен
@@ -437,11 +469,31 @@ WHERE account_id = :account_id
 # отправкой и проверкой).
 _SELECT_PENDING = """
 SELECT id, user_id, campaign_id, account_id, status, error,
-       invited_at, verified_at, created_at, updated_at
+       invited_at, verified_at, created_at, updated_at, failure_kind, next_attempt_at
 FROM user_campaign_invites
 WHERE account_id = :account_id AND campaign_id = :campaign_id AND status = 'pending'
 ORDER BY id
 """
+
+# Строки next_attempt_at хранятся в том же формате, что и
+# strftime('%Y-%m-%dT%H:%M:%S', 'now') в _CANDIDATES_BASE_WHERE (UTC, без
+# смещения) — сравнение строк корректно.
+_RETRY_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"
+
+
+def _format_retry_timestamp(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc)
+    return value.strftime(_RETRY_TIMESTAMP_FORMAT)
+
+
+def _parse_retry_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def _row_to_candidate(row) -> InviteCandidate:
@@ -810,7 +862,9 @@ class UserCampaignInviteRepository:
     её схемы/ALTER-логики) — как и остальные таблицы проекта, users
     подхватывает актуальную схему автоматически, без ручных правок SQLite."""
 
-    _UPDATABLE_COLUMNS = ("account_id", "status", "error", "invited_at", "verified_at")
+    _UPDATABLE_COLUMNS = (
+        "account_id", "status", "error", "invited_at", "verified_at", "failure_kind", "next_attempt_at",
+    )
 
     def __init__(self, db_path: Path):
         UserRepository(db_path).close()
@@ -847,13 +901,17 @@ class UserCampaignInviteRepository:
         error: str | None = None,
         invited_at: datetime | None = None,
         verified_at: datetime | None = None,
+        failure_kind: str | None = None,
+        next_attempt_at: datetime | None = None,
     ) -> UserCampaignInvite:
         cursor = self._conn.execute(
             """
             INSERT INTO user_campaign_invites (
-                user_id, campaign_id, account_id, status, error, invited_at, verified_at
+                user_id, campaign_id, account_id, status, error, invited_at, verified_at,
+                failure_kind, next_attempt_at
             ) VALUES (
-                :user_id, :campaign_id, :account_id, :status, :error, :invited_at, :verified_at
+                :user_id, :campaign_id, :account_id, :status, :error, :invited_at, :verified_at,
+                :failure_kind, :next_attempt_at
             )
             """,
             {
@@ -864,6 +922,8 @@ class UserCampaignInviteRepository:
                 "error": error,
                 "invited_at": _isoformat(invited_at),
                 "verified_at": _isoformat(verified_at),
+                "failure_kind": failure_kind,
+                "next_attempt_at": _format_retry_timestamp(next_attempt_at),
             },
         )
         self._conn.commit()
@@ -883,6 +943,8 @@ class UserCampaignInviteRepository:
                 fields["invited_at"] = _isoformat(fields["invited_at"])
             if "verified_at" in fields:
                 fields["verified_at"] = _isoformat(fields["verified_at"])
+            if "next_attempt_at" in fields:
+                fields["next_attempt_at"] = _format_retry_timestamp(fields["next_attempt_at"])
             assignments = ", ".join(f"{column} = :{column}" for column in fields)
             self._conn.execute(
                 f"UPDATE user_campaign_invites "
@@ -900,7 +962,7 @@ class UserCampaignInviteRepository:
         row = self._conn.execute(
             """
             SELECT id, user_id, campaign_id, account_id, status, error,
-                   invited_at, verified_at, created_at, updated_at
+                   invited_at, verified_at, created_at, updated_at, failure_kind, next_attempt_at
             FROM user_campaign_invites WHERE id = ?
             """,
             (invite_id,),
@@ -911,7 +973,7 @@ class UserCampaignInviteRepository:
         rows = self._conn.execute(
             """
             SELECT id, user_id, campaign_id, account_id, status, error,
-                   invited_at, verified_at, created_at, updated_at
+                   invited_at, verified_at, created_at, updated_at, failure_kind, next_attempt_at
             FROM user_campaign_invites ORDER BY id
             """
         ).fetchall()
@@ -933,7 +995,9 @@ class UserCampaignInviteRepository:
         (access_hash есть, username есть и не пуст, is_bot не равен 1,
         keyword кампании — среди их keywords, ещё не приглашены для этой
         кампании) — без учёта limit, см. select_candidates()."""
-        row = self._conn.execute(_COUNT_CANDIDATES, {"campaign_id": campaign_id}).fetchone()
+        row = self._conn.execute(
+            _COUNT_CANDIDATES, {"campaign_id": campaign_id, "account_id": None},
+        ).fetchone()
         return row[0]
 
     def count_found_candidates(self, campaign_id: int) -> int:
@@ -943,7 +1007,9 @@ class UserCampaignInviteRepository:
         count_found_candidates() - count_candidates() — сколько
         подходящих по остальным условиям пользователей физически нельзя
         подготовить к приглашению из-за отсутствия username."""
-        row = self._conn.execute(_COUNT_FOUND_CANDIDATES, {"campaign_id": campaign_id}).fetchone()
+        row = self._conn.execute(
+            _COUNT_FOUND_CANDIDATES, {"campaign_id": campaign_id, "account_id": None},
+        ).fetchone()
         return row[0]
 
     def count_leads(self, campaign_id: int) -> int:
@@ -1020,7 +1086,31 @@ class UserCampaignInviteRepository:
         ).fetchone()
         return row[0]
 
-    def select_candidates(self, campaign_id: int, *, limit: int) -> list[InviteCandidate]:
+    def count_failures(self, user_id: int, campaign_id: int, failure_kind: str) -> int:
+        """Сколько неудачных попыток этого рода уже было у пользователя в
+        кампании — основа экспоненциального backoff (см.
+        reader/inviter/service.py _next_attempt_delay)."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM user_campaign_invites "
+            "WHERE user_id = ? AND campaign_id = ? AND status = 'failed' AND failure_kind = ?",
+            (user_id, campaign_id, failure_kind),
+        ).fetchone()
+        return row[0]
+
+    def unresolved_account_ids(self, user_id: int, campaign_id: int) -> set[int]:
+        """Аккаунты, которые уже не смогли резолвить identity пользователя в
+        этой кампании (failure_kind='unresolved')."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT account_id FROM user_campaign_invites "
+            "WHERE user_id = ? AND campaign_id = ? AND failure_kind = 'unresolved' "
+            "AND account_id IS NOT NULL",
+            (user_id, campaign_id),
+        ).fetchall()
+        return {row[0] for row in rows}
+
+    def select_candidates(
+        self, campaign_id: int, *, limit: int, account_id: int | None = None,
+    ) -> list[InviteCandidate]:
         """Кандидаты на приглашение в кампанию campaign_id: keywords
         содержит keyword кампании, access_hash задан и username задан и не
         пуст (иначе приглашающий аккаунт, которому candidate не известен,
@@ -1036,7 +1126,7 @@ class UserCampaignInviteRepository:
         записей в user_campaign_invites не создаёт и не изменяет (см.
         service.py)."""
         rows = self._conn.execute(
-            _SELECT_CANDIDATES, {"campaign_id": campaign_id, "limit": limit}
+            _SELECT_CANDIDATES, {"campaign_id": campaign_id, "limit": limit, "account_id": account_id},
         ).fetchall()
         return [_row_to_candidate(row) for row in rows]
 
@@ -1047,7 +1137,7 @@ class UserCampaignInviteRepository:
 def _row_to_invite(row) -> UserCampaignInvite:
     (
         id_, user_id, campaign_id, account_id, status, error,
-        invited_at, verified_at, created_at, updated_at,
+        invited_at, verified_at, created_at, updated_at, failure_kind, next_attempt_at,
     ) = row
     return UserCampaignInvite(
         id=id_,
@@ -1060,4 +1150,6 @@ def _row_to_invite(row) -> UserCampaignInvite:
         verified_at=_parse_datetime(verified_at),
         created_at=_parse_datetime(created_at),
         updated_at=_parse_datetime(updated_at),
+        failure_kind=failure_kind,
+        next_attempt_at=_parse_retry_timestamp(next_attempt_at),
     )

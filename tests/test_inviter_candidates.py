@@ -32,6 +32,7 @@ from telethon.errors import (  # noqa: E402
     UserNotParticipantError,
     UsernameNotOccupiedError,
     UserPrivacyRestrictedError,
+    UserBlockedError,
 )
 from telethon.tl.functions.channels import InviteToChannelRequest  # noqa: E402
 from telethon.tl.functions.messages import AddChatUserRequest, GetHistoryRequest  # noqa: E402
@@ -3546,13 +3547,15 @@ def test_execute_creates_failed_record_on_rpc_error(tmp_path):
     db_path = _setup_db(tmp_path)
     campaign, account = _setup_single_candidate_campaign(db_path)
 
-    # UserPrivacyRestrictedError — пример SKIP_USER-ошибки, касающейся
-    # только этого кандидата (см. _classify_invite_error). PeerFloodError/
+    # UserBlockedError — пример SKIP_USER-ошибки, касающейся только этого
+    # кандидата, состояние которого может измениться (failure_kind=
+    # user_state — повтор с backoff, см. _classify_invite_error).
+    # UserPrivacyRestrictedError теперь терминальная ('invalid'). PeerFloodError/
     # ChatAdminRequiredError и т.п. останавливают аккаунт — см.
     # test_execute_peer_flood_stops_account_and_notifies_operator/
     # test_execute_chat_admin_required_stops_account_and_notifies_operator.
     client_factory = _make_client_factory(
-        call_errors={"Основной": [UserPrivacyRestrictedError(request=GetHistoryRequest)]},
+        call_errors={"Основной": [UserBlockedError(request=GetHistoryRequest)]},
     )
 
     asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True))
@@ -3567,8 +3570,9 @@ def test_execute_creates_failed_record_on_rpc_error(tmp_path):
         assert invite.account_id == account.id
         assert invite.status == "failed"
         assert invite.error  # непустая причина
-        assert invite.error == str(UserPrivacyRestrictedError(request=GetHistoryRequest))
+        assert invite.error == str(UserBlockedError(request=GetHistoryRequest))
         assert invite.invited_at is None
+        assert invite.failure_kind == "user_state" and invite.next_attempt_at is not None
     finally:
         invite_repository.close()
 
@@ -3725,7 +3729,7 @@ def test_execute_sends_account_and_campaign_notifications_with_correct_counts(tm
     # т.п., у которых теперь особое поведение остановки аккаунта, см.
     # test_execute_peer_flood_stops_account_and_notifies_operator).
     client_factory = _make_client_factory(
-        call_errors={"account_1": [None, UserAlreadyParticipantError(request=GetHistoryRequest), UserPrivacyRestrictedError(request=GetHistoryRequest)]},
+        call_errors={"account_1": [None, UserAlreadyParticipantError(request=GetHistoryRequest), UserBlockedError(request=GetHistoryRequest)]},
     )
     notifier = _FakeOperatorNotifier()
 
@@ -3746,9 +3750,10 @@ def test_execute_sends_account_and_campaign_notifications_with_correct_counts(tm
     assert "⏳ Ожидают подтверждения: 0" in account_message
     assert "🚫 Недоступны (invalid): 0" in account_message
     assert "❌ Ошибок: 1" in account_message
-    # 3-й кандидат получил UserPrivacyRestrictedError (status='failed') —
-    # не исключается из будущей выборки, поэтому остаётся кандидатом.
-    assert "Осталось кандидатов: 1" in account_message
+    # 3-й кандидат получил UserBlockedError (status='failed',
+    # failure_kind=user_state) — он в backoff (next_attempt_at) и НЕ
+    # возвращается в очередь сразу же, поэтому оставшихся кандидатов 0.
+    assert "Осталось кандидатов: 0" in account_message
 
     assert '📊 Итоги кампании "ОСАГО"' in campaign_message
     assert "Аккаунтов обработано: 1" in campaign_message
@@ -3757,7 +3762,7 @@ def test_execute_sends_account_and_campaign_notifications_with_correct_counts(tm
     assert "⏳ Ожидают подтверждения: 0" in campaign_message
     assert "🚫 Недоступны: 0" in campaign_message
     assert "❌ Ошибок: 1" in campaign_message
-    assert "Осталось кандидатов: 1" in campaign_message
+    assert "Осталось кандидатов: 0" in campaign_message
 
 
 def test_execute_campaign_notification_includes_found_vs_processable_summary(tmp_path):
@@ -3873,7 +3878,7 @@ def test_execute_aggregates_stats_across_multiple_accounts_in_campaign_summary(t
     client_factory = _make_client_factory(
         call_errors={
             "account_1": [None, None],
-            "account_2": [UserPrivacyRestrictedError(request=GetHistoryRequest), None],
+            "account_2": [UserBlockedError(request=GetHistoryRequest), None],
         },
     )
     notifier = _FakeOperatorNotifier()
@@ -3889,10 +3894,9 @@ def test_execute_aggregates_stats_across_multiple_accounts_in_campaign_summary(t
     assert "✅ Подтверждено участников: 3" in campaign_message
     assert "⏳ Ожидают подтверждения: 0" in campaign_message
     assert "❌ Ошибок: 1" in campaign_message
-    # Кандидат с UserPrivacyRestrictedError (status='failed') не
-    # исключается из будущей выборки — остаётся ровно один "оставшийся"
-    # кандидат.
-    assert "Осталось кандидатов: 1" in campaign_message
+    # Кандидат с UserBlockedError (status='failed', failure_kind=user_state)
+    # в backoff — не возвращается в очередь сразу же.
+    assert "Осталось кандидатов: 0" in campaign_message
 
 
 def test_notify_failure_does_not_stop_service(tmp_path):
@@ -4143,15 +4147,23 @@ def test_humanize_error_falls_back_to_str_for_unmapped_exception():
             InviteErrorAction.SKIP_USER, "failed", "errors",
         ),
         (
+            # Настройка приватности самого пользователя ("кто может добавлять
+            # меня в группы") — постоянная, как и UserNotMutualContactError:
+            # раньше 'failed' и повтор на каждом тике.
             UserPrivacyRestrictedError(request=GetHistoryRequest),
-            InviteErrorAction.SKIP_USER, "failed", "errors",
+            InviteErrorAction.SKIP_USER, "invalid", "invalid",
         ),
         (
             UserChannelsTooMuchError(request=GetHistoryRequest),
             InviteErrorAction.SKIP_USER, "failed", "errors",
         ),
         (
+            # Исключён (забанен) в target — повтор не поможет.
             UserKickedError(request=GetHistoryRequest),
+            InviteErrorAction.SKIP_USER, "invalid", "invalid",
+        ),
+        (
+            UserBlockedError(request=GetHistoryRequest),
             InviteErrorAction.SKIP_USER, "failed", "errors",
         ),
         (
@@ -4228,7 +4240,7 @@ def test_classify_invite_error_stop_account_has_operator_message():
     stop = _classify_invite_error(PeerFloodError(request=GetHistoryRequest))
     assert stop.operator_message == "Telegram временно ограничил приглашения (Too many requests)."
 
-    skip = _classify_invite_error(UserPrivacyRestrictedError(request=GetHistoryRequest))
+    skip = _classify_invite_error(UserBlockedError(request=GetHistoryRequest))
     assert skip.operator_message == ""
 
 
@@ -4340,7 +4352,7 @@ def test_pause_between_invites_happens_after_each_outcome_regardless_of_result(t
             "Основной": [
                 None,
                 UserAlreadyParticipantError(request=GetHistoryRequest),
-                UserPrivacyRestrictedError(request=GetHistoryRequest),
+                UserBlockedError(request=GetHistoryRequest),
             ],
         },
     )
@@ -5753,7 +5765,7 @@ def test_execute_test_mode_errors_and_already_participant_do_not_count_toward_li
             "account_1": [
                 UserAlreadyParticipantError(request=GetHistoryRequest),
                 UserChannelsTooMuchError(request=GetHistoryRequest),
-                UserPrivacyRestrictedError(request=GetHistoryRequest),
+                UserBlockedError(request=GetHistoryRequest),
                 None,
                 None,
                 None,
@@ -5862,7 +5874,9 @@ def test_execute_test_mode_stop_still_sends_correct_final_stats_notifications(tm
     assert "⏳ Ожидают подтверждения: 3" in account_notifications[0]
     assert "🚫 Недоступны (invalid): 0" in account_notifications[0]
     assert "❌ Ошибок: 1" in account_notifications[0]
-    assert "Осталось кандидатов: 6" in account_notifications[0]
+    # 5, а не 6: кандидат с UserChannelsTooMuchError теперь в backoff
+    # (failure_kind=user_state) и не возвращается в очередь сразу же.
+    assert "Осталось кандидатов: 5" in account_notifications[0]
 
     campaign_notifications = [m for m in notifier.sent if "Итоги кампании" in m]
     assert len(campaign_notifications) == 1
@@ -5872,7 +5886,7 @@ def test_execute_test_mode_stop_still_sends_correct_final_stats_notifications(tm
     assert "❌ Ошибок: 1" in campaign_notifications[0]
     # 10 подходящих кандидатов всего - 4 со статусом 'pending'/'joined' в БД
     # (3 pending + 1 joined) = 6 осталось.
-    assert "Осталось кандидатов: 6" in campaign_notifications[0]
+    assert "Осталось кандидатов: 5" in campaign_notifications[0]
 
 
 # ---- отсутствие .session-файла — понятный лог, без исключений, без попыток ----

@@ -205,3 +205,15 @@ class UserCampaignInvite:
     verified_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    # failure_kind — только для status='failed' (см. reader/inviter/service.py
+    # _classify_invite_error): "unresolved" — ЭТОТ аккаунт не смог резолвить
+    # identity кандидата ни одним путём (кандидат больше не выбирается ЭТИМ
+    # аккаунтом; когда так провалились ВСЕ активные аккаунты — 'invalid');
+    # "transient" — временный/неизвестный сбой; "user_state" — состояние
+    # пользователя, которое может измениться (слишком много каналов и т.п.);
+    # "account" — проблема аккаунта (FloodWait и т.п.), кандидат не
+    # штрафуется. next_attempt_at — до этого момента кандидат НЕ выбирается
+    # в этой кампании (backoff, см. _CANDIDATES_BASE_WHERE). NULL у всех
+    # строк, записанных до появления этих полей.
+    failure_kind: str | None = None
+    next_attempt_at: datetime | None = None

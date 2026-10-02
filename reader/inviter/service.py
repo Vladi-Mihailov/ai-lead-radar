@@ -31,6 +31,7 @@ from telethon.errors import (
     UserIdInvalidError,
     UserIsBotError,
     UserKickedError,
+    UsernameInvalidError,
     UsernameNotOccupiedError,
     UserNotMutualContactError,
     UserNotParticipantError,
@@ -39,7 +40,7 @@ from telethon.errors import (
 )
 from telethon.tl.functions.channels import InviteToChannelRequest
 from telethon.tl.functions.messages import AddChatUserRequest
-from telethon.tl.types import Channel, ChannelForbidden, InputPeerUser, User
+from telethon.tl.types import Channel, ChannelForbidden, Chat, ChatForbidden, InputPeerUser, User
 
 from reader.inviter.identity import (
     AccountIdentityMismatchError,
@@ -232,7 +233,23 @@ TelegramClientFactory = Callable[[TelegramAccount], DryRunTelegramClient]
 class _CandidateUnresolvableError(Exception):
     """candidate не известен текущему аккаунту и не может быть резолвлен
     (см. InviterService._resolve_input_peer) — не Telethon-ошибка, поэтому
-    отдельный класс, не пересекающийся с их иерархией (RPCError и т.п.)."""
+    отдельный класс, не пересекающийся с их иерархией (RPCError и т.п.).
+
+    kind — "unresolved": КАЖДЫЙ путь резолва (username/сохранённый
+    access_hash) ответил "такого объекта нет" (_IDENTITY_NOT_FOUND_ERROR_TYPES)
+    — ЭТОТ аккаунт identity не найдёт и в следующий раз; "transient" — хотя
+    бы один путь упал временной/неизвестной ошибкой (сеть, RPC-сбой) —
+    результат не достоверен. См. _classify_invite_error."""
+
+    def __init__(self, message: str, *, kind: str = "transient"):
+        super().__init__(message)
+        self.kind = kind
+
+
+class _ResolvedNonUserError(ValueError):
+    """username/identity указывает НЕ на пользователя (например, username
+    теперь занят каналом — см. production "Cannot cast InputPeerChannel to
+    any kind of InputUser") — для приглашения identity не найдена."""
 
 
 class _CandidateIsBotError(Exception):
@@ -303,7 +320,66 @@ _CONFIRMED_PERMANENT_IDENTITY_ERROR_TYPES = (
 # существующий механизм, не вводим новый статус/поле.
 _PERMANENT_CANDIDATE_ERROR_TYPES = (
     UserNotMutualContactError,
+    # Те же per-user постоянные состояния — раньше были в
+    # _SKIP_USER_ERROR_TYPES (status='failed', выбирался заново на каждом
+    # тике бесконечно): пользователь запретил приглашения в группы
+    # (настройка приватности самого пользователя), исключён из target
+    # (бан в target_chat), удалён/деактивирован.
+    UserPrivacyRestrictedError,
+    UserKickedError,
+    UserDeactivatedError,
+    UserDeactivatedBanError,
+    InputUserDeactivatedError,
 )
+
+# "Такого объекта нет" при резолве — РЕАЛЬНЫЕ исключения, которые отдаёт
+# Telethon 1.44 (см. telethon/client/users.py), а не только RPC-классы:
+#   - ValueError('No user has "x" as username') — Telethon сам оборачивает
+#     UsernameNotOccupiedError в ValueError (поэтому прежний фикс,
+#     ожидавший UsernameNotOccupiedError, на пути get_entity("@x") не
+#     срабатывал никогда); ValueError('Cannot find any entity ...');
+#   - KeyError(user_id) — get_entity(InputPeerUser(id, access_hash)):
+#     GetUsersRequest вернул ПУСТОЙ список (access_hash не валиден для этого
+#     аккаунта), Telethon делает id_entity[id] -> KeyError; str(exc) — просто
+#     "873077267" (production @Margosha_070/@richmove77: 118/111 попыток);
+#   - _ResolvedNonUserError — username принадлежит каналу/чату;
+#   - RPC-ошибки, явно отвергающие identity.
+_IDENTITY_NOT_FOUND_ERROR_TYPES = (
+    ValueError,
+    KeyError,
+    UsernameNotOccupiedError,
+    UsernameInvalidError,
+    UserIdInvalidError,
+    PeerIdInvalidError,
+)
+
+# Политика повторов для status='failed' (см. _next_attempt_delay и
+# UserCampaignInvite.failure_kind/next_attempt_at). Неудачная попытка
+# никогда не возвращает кандидата в очередь сразу же:
+#   - unresolved: этот аккаунт кандидата больше не выбирает вовсе; другим
+#     аккаунтам — не раньше чем через _UNRESOLVED_RETRY_DELAY; когда
+#     провалились ВСЕ активные аккаунты — 'invalid' (терминально);
+#   - transient: экспоненциально от _TRANSIENT_RETRY_BASE до _TRANSIENT_RETRY_CAP;
+#   - user_state: то же от _USER_STATE_RETRY_BASE до _USER_STATE_RETRY_CAP;
+#   - account: кандидат не штрафуется (аккаунт сам блокируется blocked_until).
+_UNRESOLVED_RETRY_DELAY = timedelta(minutes=30)
+_TRANSIENT_RETRY_BASE = timedelta(hours=1)
+_TRANSIENT_RETRY_CAP = timedelta(days=7)
+_USER_STATE_RETRY_BASE = timedelta(days=3)
+_USER_STATE_RETRY_CAP = timedelta(days=30)
+# not_joined (приглашение принято Telegram, но участие не подтвердилось) —
+# повторное приглашение не раньше, чем через неделю.
+_NOT_JOINED_RETRY_DELAY = timedelta(days=7)
+
+
+def _next_attempt_delay(failure_kind: str | None, previous_failures: int) -> timedelta | None:
+    if failure_kind == "unresolved":
+        return _UNRESOLVED_RETRY_DELAY
+    if failure_kind == "transient":
+        return min(_TRANSIENT_RETRY_BASE * (2 ** min(previous_failures, 16)), _TRANSIENT_RETRY_CAP)
+    if failure_kind == "user_state":
+        return min(_USER_STATE_RETRY_BASE * (2 ** min(previous_failures, 16)), _USER_STATE_RETRY_CAP)
+    return None
 
 
 def _format_username(username: str | None) -> str:
@@ -570,22 +646,26 @@ class InviteErrorClassification:
     blocked_reason: str = "flood_wait"
     mark_as_bot: bool = False
     mark_verified_now: bool = False
+    # Только для db_status='failed' — см. _next_attempt_delay.
+    failure_kind: str | None = None
 
 
-# Проблема только в конкретном кандидате (устарел/удалён/заблокировал этот
-# аккаунт/настройки приватности и т.п.) — риска для самого аккаунта нет.
-# UserNotMutualContactError сюда НЕ входит — см. _PERMANENT_CANDIDATE_ERROR_TYPES
-# выше (постоянная ошибка, не транзиентная).
-_SKIP_USER_ERROR_TYPES = (
-    UserPrivacyRestrictedError,
+# Проблема только в конкретном кандидате, но его состояние МОЖЕТ
+# измениться (вышел из части каналов/разблокировал) — риска для аккаунта
+# нет, повтор с длинным backoff (failure_kind="user_state"). Постоянные
+# per-user состояния (приватность, бан в target, удалённый аккаунт, не
+# взаимный контакт) — в _PERMANENT_CANDIDATE_ERROR_TYPES (status='invalid').
+_USER_STATE_ERROR_TYPES = (
     UserChannelsTooMuchError,
+    UserBlockedError,
+)
+
+# Отказ identity на отправке, ДО повторной попытки со stored access_hash
+# (см. _invite_candidate) — сюда попадают только если повторная попытка не
+# применялась; результат не достоверен -> transient.
+_SKIP_USER_ERROR_TYPES = (
     UserIdInvalidError,
     PeerIdInvalidError,
-    UserDeactivatedError,
-    UserDeactivatedBanError,
-    InputUserDeactivatedError,
-    UserKickedError,
-    UserBlockedError,
 )
 
 # Telegram подтвердил RPC-ошибкой, что кандидат — бот (см. также
@@ -655,16 +735,18 @@ def _classify_invite_error(exc: Exception) -> InviteErrorClassification:
     if isinstance(exc, _CandidateUnresolvableError):
         return InviteErrorClassification(
             InviteErrorAction.SKIP_USER, db_status="failed", stat_field="errors",
+            failure_kind=exc.kind,
         )
     if isinstance(exc, FloodWaitError):
         if exc.seconds >= _MAX_TOLERABLE_FLOOD_WAIT_SECONDS:
             return InviteErrorClassification(
                 InviteErrorAction.STOP_ACCOUNT, db_status="failed", stat_field=None,
                 operator_message=_humanize_error(exc), wait_seconds=exc.seconds,
+                failure_kind="account",
             )
         return InviteErrorClassification(
             InviteErrorAction.RETRY_LATER, db_status="failed", stat_field=None,
-            wait_seconds=exc.seconds,
+            wait_seconds=exc.seconds, failure_kind="account",
         )
     if isinstance(exc, PeerFloodError):
         # См. _PEER_FLOOD_COOLDOWN_SECONDS — Telegram не даёт точное время,
@@ -677,6 +759,7 @@ def _classify_invite_error(exc: Exception) -> InviteErrorClassification:
             operator_message=_humanize_error(exc),
             wait_seconds=_PEER_FLOOD_COOLDOWN_SECONDS,
             blocked_reason="peer_flood",
+            failure_kind="account",
         )
     if isinstance(exc, _BOT_ERROR_TYPES):
         return InviteErrorClassification(
@@ -687,23 +770,32 @@ def _classify_invite_error(exc: Exception) -> InviteErrorClassification:
         return InviteErrorClassification(
             InviteErrorAction.SKIP_USER, db_status="invalid", stat_field="invalid",
         )
+    if isinstance(exc, _USER_STATE_ERROR_TYPES):
+        return InviteErrorClassification(
+            InviteErrorAction.SKIP_USER, db_status="failed", stat_field="errors",
+            failure_kind="user_state",
+        )
     if isinstance(exc, _SKIP_USER_ERROR_TYPES):
         return InviteErrorClassification(
             InviteErrorAction.SKIP_USER, db_status="failed", stat_field="errors",
+            failure_kind="transient",
         )
     if isinstance(exc, _STOP_ACCOUNT_ERROR_TYPES):
         return InviteErrorClassification(
             InviteErrorAction.STOP_ACCOUNT, db_status="failed", stat_field="errors",
-            operator_message=_humanize_error(exc),
+            operator_message=_humanize_error(exc), failure_kind="account",
         )
     if isinstance(exc, RPCError):
+        # Нераспознанная RPC-ошибка: аккаунт останавливается (как раньше), а
+        # кандидат получает transient backoff — она может быть и специфичной
+        # для него, тогда повтор на каждом тике повторял бы её бесконечно.
         return InviteErrorClassification(
             InviteErrorAction.STOP_ACCOUNT, db_status="failed", stat_field="errors",
-            operator_message=_humanize_error(exc),
+            operator_message=_humanize_error(exc), failure_kind="transient",
         )
     return InviteErrorClassification(
         InviteErrorAction.FATAL, db_status="failed", stat_field="errors",
-        operator_message=_humanize_error(exc),
+        operator_message=_humanize_error(exc), failure_kind="transient",
     )
 
 
@@ -1425,7 +1517,7 @@ class InviterService:
         вызывающий код (_execute_account) тогда не выполняет ни проверку
         pending, ни волну добора."""
         raw_candidates = self._invite_repository.select_candidates(
-            campaign.id, limit=limit + len(attempted_user_ids),
+            campaign.id, limit=limit + len(attempted_user_ids), account_id=account.id,
         )
         candidates = [c for c in raw_candidates if c.user_id not in attempted_user_ids][:limit]
         logger.info(_format_candidates_block(campaign, account, candidates, found))
@@ -1515,8 +1607,10 @@ class InviterService:
                 user_ref = await client.get_input_entity(invite.user_id)
                 await client.get_permissions(target_entity, user_ref)
             except UserNotParticipantError:
+                now = datetime.now(timezone.utc)
                 self._invite_repository.update(
-                    invite.id, status="not_joined", verified_at=datetime.now(timezone.utc),
+                    invite.id, status="not_joined", verified_at=now,
+                    next_attempt_at=now + _NOT_JOINED_RETRY_DELAY,
                 )
                 continue
             except ChatAdminRequiredError:
@@ -1705,6 +1799,14 @@ class InviterService:
         см. classification.operator_message), иначе False."""
         classification = _classify_invite_error(exc)
         raw_text = str(exc)
+        db_status, stat_field, next_attempt_at = self._apply_retry_policy(
+            classification, campaign, account, candidate,
+        )
+        if db_status == "invalid" and classification.db_status != "invalid":
+            raw_text = (
+                f"{raw_text} | identity не резолвится НИ ОДНИМ активным аккаунтом "
+                f"(failure_kind=unresolved у всех) — терминально для этой кампании"
+            )
 
         if classification.mark_as_bot:
             self._mark_user_as_bot(candidate.user_id)
@@ -1718,22 +1820,29 @@ class InviterService:
                 account, classification.wait_seconds, classification.blocked_reason,
             )
 
-        log_fn = logger.info if classification.db_status in ("joined", "invalid") else logger.warning
+        log_fn = logger.info if db_status in ("joined", "invalid") else logger.warning
+        retry_note = (
+            f"\nfailure_kind: {classification.failure_kind}, next attempt not before: "
+            f"{format_tbilisi(next_attempt_at)}"
+            if db_status == "failed" and next_attempt_at is not None else ""
+        )
         log_fn(
             _format_execute_block(
                 account, user_label, campaign.target_chat,
-                status=classification.db_status, reason=raw_text,
+                status=db_status, reason=raw_text + retry_note,
             ),
             exc_info=exc if classification.action == InviteErrorAction.FATAL else None,
         )
         self._record_invite_result(
             campaign, account, candidate,
-            status=classification.db_status,
-            error=None if classification.db_status == "joined" else raw_text,
+            status=db_status,
+            error=None if db_status == "joined" else raw_text,
             verified_at=datetime.now(timezone.utc) if classification.mark_verified_now else None,
+            failure_kind=classification.failure_kind if db_status in ("failed", "invalid") else None,
+            next_attempt_at=next_attempt_at,
         )
-        if classification.stat_field is not None:
-            setattr(stats, classification.stat_field, getattr(stats, classification.stat_field) + 1)
+        if stat_field is not None:
+            setattr(stats, stat_field, getattr(stats, stat_field) + 1)
 
         if classification.action == InviteErrorAction.RETRY_LATER:
             await asyncio.sleep(classification.wait_seconds)
@@ -1755,6 +1864,38 @@ class InviterService:
         # SKIP_USER — этот кандидат обработан, продолжаем тем же аккаунтом.
         await self._pause_between_invites()
         return False
+
+    def _apply_retry_policy(
+        self,
+        classification: InviteErrorClassification,
+        campaign: InviteCampaign,
+        account: TelegramAccount,
+        candidate: InviteCandidate,
+    ) -> tuple[str, str | None, datetime | None]:
+        """(db_status, stat_field, next_attempt_at) для записи результата —
+        единственное место, где 'failed' получает backoff и где
+        'unresolved' эскалируется в терминальный 'invalid' (см.
+        _next_attempt_delay). Всё по (пользователь, кампания) — состояние
+        одной кампании не влияет на другую."""
+        if classification.db_status != "failed":
+            return classification.db_status, classification.stat_field, None
+
+        kind = classification.failure_kind
+        now = datetime.now(timezone.utc)
+        if kind == "unresolved":
+            tried = self._invite_repository.unresolved_account_ids(candidate.user_id, campaign.id)
+            tried.add(account.id)
+            active = {a.id for a in self._account_repository.list() if a.enabled and not a.is_old}
+            if active and active <= tried:
+                return "invalid", "invalid", None
+            return "failed", classification.stat_field, now + _UNRESOLVED_RETRY_DELAY
+
+        previous = (
+            self._invite_repository.count_failures(candidate.user_id, campaign.id, kind)
+            if kind in ("transient", "user_state") else 0
+        )
+        delay = _next_attempt_delay(kind, previous)
+        return "failed", classification.stat_field, (now + delay) if delay is not None else None
 
     async def _resolve_input_peer(
         self, client: DryRunTelegramClient, candidate: InviteCandidate,
@@ -1839,47 +1980,56 @@ class InviterService:
             return input_peer
 
         entity = None
-        last_exc: Exception | None = None
+        # Ошибка КАЖДОГО пути резолва сохраняется (раньше последняя
+        # затирала предыдущие — в production в error оставался только
+        # KeyError fallback-пути, без причины отказа по username).
+        step_errors: list[tuple[str, Exception]] = []
+
+        async def resolve(step: str, ref):
+            try:
+                found = await client.get_entity(ref)
+            except (FloodWaitError, PeerFloodError):
+                raise
+            except Exception as exc:
+                step_errors.append((step, exc))
+                return None
+            if isinstance(found, (Channel, ChannelForbidden, Chat, ChatForbidden)):
+                step_errors.append((step, _ResolvedNonUserError(
+                    f"{ref} — {type(found).__name__}, а не пользователь",
+                )))
+                return None
+            return found
 
         if input_peer is None:
             if candidate.username:
-                try:
-                    entity = await client.get_entity(f"@{candidate.username}")
-                except (FloodWaitError, PeerFloodError):
-                    raise
-                except Exception as exc:
-                    last_exc = exc
+                entity = await resolve("username", f"@{candidate.username}")
         else:
             # candidate.is_bot is None — статус неизвестен, убеждаемся перед
             # отправкой приглашения (см. докстрок выше).
-            try:
-                entity = await client.get_entity(input_peer)
-            except (FloodWaitError, PeerFloodError):
-                raise
-            except Exception as exc:
-                last_exc = exc
+            entity = await resolve("id_cache", input_peer)
 
         if entity is None:
-            try:
-                fallback_peer = InputPeerUser(
-                    user_id=candidate.user_id, access_hash=candidate.access_hash,
-                )
-                entity = await client.get_entity(fallback_peer)
-                last_exc = None
-            except (FloodWaitError, PeerFloodError):
-                raise
-            except Exception as exc:
-                last_exc = exc
+            entity = await resolve(
+                "stored_access_hash",
+                InputPeerUser(user_id=candidate.user_id, access_hash=candidate.access_hash),
+            )
 
         if entity is None:
+            details = "; ".join(f"{step}: {type(exc).__name__}: {exc}" for step, exc in step_errors)
             reason = (
                 f"{candidate.user_id} ({_format_username(candidate.username)}): "
                 f"не резолвится ни одним известным способом (id-кэш/username/"
-                f"сохранённый access_hash) этим аккаунтом: {last_exc}"
+                f"сохранённый access_hash) этим аккаунтом: {details}"
             )
+            last_exc = step_errors[-1][1] if step_errors else None
             if isinstance(last_exc, _CONFIRMED_PERMANENT_IDENTITY_ERROR_TYPES):
                 raise _CandidatePermanentlyInvalidError(reason) from last_exc
-            raise _CandidateUnresolvableError(reason) from last_exc
+            not_found = bool(step_errors) and all(
+                isinstance(exc, _IDENTITY_NOT_FOUND_ERROR_TYPES) for _step, exc in step_errors
+            )
+            raise _CandidateUnresolvableError(
+                reason, kind="unresolved" if not_found else "transient",
+            ) from last_exc
 
         if isinstance(entity, User):
             self._update_user_access_hash(entity)
@@ -1980,6 +2130,8 @@ class InviterService:
         status: str,
         error: str | None = None,
         verified_at: datetime | None = None,
+        failure_kind: str | None = None,
+        next_attempt_at: datetime | None = None,
     ) -> None:
         """invited_at — момент, когда InviteToChannelRequest/AddChatUserRequest
         был принят Telegram (status='pending'/'joined' — оба начинаются
@@ -1994,6 +2146,8 @@ class InviterService:
             error=error,
             invited_at=datetime.now(timezone.utc) if status in ("pending", "joined") else None,
             verified_at=verified_at,
+            failure_kind=failure_kind,
+            next_attempt_at=next_attempt_at,
         )
 
     async def _notify_account_result(
