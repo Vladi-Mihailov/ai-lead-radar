@@ -105,17 +105,20 @@ class _Fixture:
 
 # ---- 1/2: кнопка есть в Georgia, нет в Turkey ----
 
-def test_georgia_menu_contains_protocol_check_button():
+def test_georgia_menu_hides_protocol_check_button():
+    """Кнопка скрыта из главного меню (ordinary и trusted); сам flow не
+    удалён — текст кнопки по-прежнему открывает его (см. тесты ниже, которые
+    входят во flow через handle_text(texts.PROTOCOL_CHECK_LABEL))."""
     # Button.text(...) — reply-кнопка, обёрнута: реальный label — на
     # button.button.text (см. tests/test_public_bot_keyboards.py, тот же
     # приём инспекции reply-клавиатуры).
     rows = main_menu_keyboard(is_trusted=False)
     labels = [row_button.button.text for row in rows for row_button in row]
-    assert texts.PROTOCOL_CHECK_LABEL in labels
+    assert texts.PROTOCOL_CHECK_LABEL not in labels
 
     trusted_rows = main_menu_keyboard(is_trusted=True)
     trusted_labels = [row_button.button.text for row in trusted_rows for row_button in row]
-    assert texts.PROTOCOL_CHECK_LABEL in trusted_labels
+    assert texts.PROTOCOL_CHECK_LABEL not in trusted_labels
 
 
 def test_turkey_menu_unchanged_no_protocol_check_button():

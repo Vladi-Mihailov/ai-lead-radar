@@ -48,7 +48,6 @@ from reader.public_bot.texts import (
     MY_CARS_LABEL,
     OSAGO_LABEL,
     PROTOCOL_CHECK_BACK_LABEL,
-    PROTOCOL_CHECK_LABEL,
     PROTOCOL_CHECK_PROTOCOL_METHOD_LABEL,
     PROTOCOL_CHECK_VEHICLE_METHOD_LABEL,
     SEARCH_BACK_LABEL,
@@ -133,21 +132,17 @@ def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
     turkey_bot_link_keyboard() ниже) — НЕ отправляется автоматически при
     показе главного меню.
 
-    "📸 Проверить протокол" (PROTOCOL_CHECK_LABEL, см. задачу "Проверить
-    протокол") — ОТДЕЛЬНАЯ, последняя строка, видна ВСЕМ пользователям
-    одинаково (НЕ trusted-gated, в отличие от SEARCH_LABEL/
-    STATISTICS_LABEL выше) — не привязана ни к какому существующему
-    автомобилю/подписке, поэтому не занимает место рядом с ними."""
+    "📸 Проверить протокол" (PROTOCOL_CHECK_LABEL) в меню БОЛЬШЕ НЕ
+    показывается (скрыта); сам flow не удалён — текст этой кнопки по-прежнему
+    распознаётся в ConversationController._handle_menu_label."""
     rows = [
         [Button.text(ADD_CAR_LABEL, resize=True), Button.text(MY_CARS_LABEL, resize=True)],
         [Button.text(CHECK_NOW_LABEL, resize=True), Button.text(TURKEY_BOT_LINK_LABEL, resize=True)],
     ]
     if is_trusted:
         rows.append([Button.text(STATISTICS_LABEL, resize=True), Button.text(SEARCH_LABEL, resize=True)])
-    rows.append([Button.text(PROTOCOL_CHECK_LABEL, resize=True)])
-    # "ℹ️ Справка" | "🛡 ОСАГО Грузия" — последняя строка, видна ВСЕМ
-    # (как и "📸 Проверить протокол"); обе распознаются как текст в
-    # ConversationController._handle_menu_label.
+    # "ℹ️ Справка" | "🛡 ОСАГО Грузия" — последняя строка, видна ВСЕМ;
+    # обе распознаются как текст в ConversationController._handle_menu_label.
     rows.append([Button.text(HELP_LABEL, resize=True), Button.text(OSAGO_LABEL, resize=True)])
     return rows
 

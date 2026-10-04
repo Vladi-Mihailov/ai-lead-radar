@@ -60,8 +60,9 @@ def test_menu_has_help_and_osago_as_last_row(is_trusted):
     # Существующие кнопки на месте (по одному разу), новые не дублируются.
     labels = [label for row in rows for label in row]
     for label in (texts.ADD_CAR_LABEL, texts.MY_CARS_LABEL, texts.CHECK_NOW_LABEL,
-                  texts.TURKEY_BOT_LINK_LABEL, texts.PROTOCOL_CHECK_LABEL, *_NEW_LABELS):
+                  texts.TURKEY_BOT_LINK_LABEL, *_NEW_LABELS):
         assert labels.count(label) == 1
+    assert texts.PROTOCOL_CHECK_LABEL not in labels  # hidden from the menu
     assert (texts.STATISTICS_LABEL in labels) is is_trusted
     assert (texts.SEARCH_LABEL in labels) is is_trusted
 
@@ -88,10 +89,19 @@ async def test_help_shows_help_text_with_main_menu(fx):
 
 def test_help_text_covers_every_section():
     assert texts.HELP_TEXT.startswith("ℹ️ Справка\n\nВ боте можно:")
-    for section in (texts.ADD_CAR_LABEL, texts.MY_CARS_LABEL, texts.CHECK_NOW_LABEL, texts.PROTOCOL_CHECK_LABEL,
+    for section in (texts.ADD_CAR_LABEL, texts.MY_CARS_LABEL, texts.CHECK_NOW_LABEL,
                     texts.TURKEY_BOT_LINK_LABEL, texts.OSAGO_LABEL, "@ProtocolTRbot"):
         assert section in texts.HELP_TEXT
-    assert texts.HELP_TEXT.endswith("Для начала выберите нужный раздел в меню ниже.")
+    assert texts.PROTOCOL_CHECK_LABEL not in texts.HELP_TEXT  # hidden feature: not advertised
+    assert texts.HELP_TEXT == (
+        "ℹ️ Справка\n\n"
+        "В боте можно:\n\n"
+        "• ➕ Добавить авто — сохранить автомобиль и получать уведомления о новых штрафах.\n"
+        "• 📋 Мои авто — посмотреть сохранённые автомобили, включить или выключить мониторинг.\n"
+        "• 🔎 Проверить сейчас — проверить штрафы прямо сейчас.\n"
+        "• 🇹🇷 Штрафы Турции — штрафы и платные дороги Турции в нашем боте @ProtocolTRbot.\n"
+        "• 🛡 ОСАГО Грузия — оформить страховку для поездки по Грузии."
+    )
 
 
 async def test_help_works_for_trusted_operator(trusted_fx):
