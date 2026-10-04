@@ -1,7 +1,8 @@
 import logging
+from typing import Protocol
 
 from reader.core.engine import MatchEngine
-from reader.core.models import LeadEvent, Message
+from reader.core.models import LeadEvent, Message, ScenarioMatch
 from reader.sinks.base import BaseSink
 from reader.sources.base import BaseSource
 from reader.users.car_numbers import extract_car_numbers
@@ -11,6 +12,10 @@ from reader.users.repository import UserRepository
 logger = logging.getLogger(__name__)
 
 
+class DmObserverLike(Protocol):
+    def observe(self, message: Message, matches: list[ScenarioMatch]) -> None: ...
+
+
 class Pipeline:
     def __init__(
         self,
@@ -18,11 +23,17 @@ class Pipeline:
         engine: MatchEngine,
         sinks: list[BaseSink],
         user_repository: UserRepository,
+        *,
+        dm_observer: "DmObserverLike | None" = None,
     ):
         self._source = source
         self._engine = engine
         self._sinks = sinks
         self._user_repository = user_repository
+        # ЛС-кампании (reader/dm_campaigns/observer.py): видит КАЖДОЕ
+        # сообщение отслеживаемой группы (буфер контекста + кандидаты). None —
+        # pipeline ведёт себя ровно как раньше.
+        self._dm_observer = dm_observer
 
     async def run(self) -> None:
         await self._source.start()
@@ -47,7 +58,18 @@ class Pipeline:
                     )
 
     async def _process(self, message: Message) -> None:
-        matches = self._engine.evaluate(message)
+        all_matches = self._engine.evaluate(message)
+        # Существующий lead-поток (users.keywords, sinks) видит только
+        # сценарии forward_leads=true — ровно как до появления ЛС-кампаний.
+        matches = [m for m in all_matches if m.forward_leads]
+
+        if self._dm_observer is not None:
+            # Побочная функциональность, как и users-кэш ниже: сбой здесь не
+            # должен мешать основной обработке сообщения.
+            try:
+                self._dm_observer.observe(message, all_matches)
+            except Exception:
+                logger.exception("dm_outreach: не удалось обработать сообщение %s", message.id)
 
         if matches and message.sender_id is not None:
             # Локальная база пользователей — побочный эффект, не часть

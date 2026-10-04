@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 class _ResolvedGroup:
     entity: Any
     title: str
+    # Group.identifier из groups.yaml (username или id) — стабильный ключ
+    # группы для dm_campaigns.source_chats (см. Message.chat_identifier).
+    identifier: str | None = None
 
 
 class TelegramSource(BaseSource):
@@ -167,6 +170,7 @@ class TelegramSource(BaseSource):
             self._resolved[utils.get_peer_id(entity)] = _ResolvedGroup(
                 entity=entity,
                 title=title,
+                identifier=str(group.identifier),
             )
 
             logger.info("✔ Подключена группа %s", title)
@@ -485,6 +489,8 @@ class TelegramSource(BaseSource):
             text=text,
             date=event.date,
             link=self._build_link(event.chat_id, event.id, resolved),
+            chat_identifier=resolved.identifier if resolved else None,
+            reply_to_msg_id=_reply_to_msg_id(event),
         )
 
         if self._debug_events:
@@ -522,3 +528,12 @@ class TelegramSource(BaseSource):
     async def stop(self) -> None:
         await self._client.disconnect()
         logger.info("Отключено от Telegram")
+
+
+def _reply_to_msg_id(event) -> int | None:
+    """id сообщения, на которое отвечает event (MessageReplyHeader.
+    reply_to_msg_id); None — не ответ. getattr — устойчивость к fake-
+    событиям/другим версиям Telethon, сам объект не сохраняется."""
+    reply_to = getattr(getattr(event, "message", None), "reply_to", None)
+    value = getattr(reply_to, "reply_to_msg_id", None)
+    return value if isinstance(value, int) else None

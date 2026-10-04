@@ -326,6 +326,26 @@ class InviterAdminBotSettings(BaseModel):
     trusted_admin_user_ids: list[int] = Field(default_factory=list)
 
 
+class DmOutreachSettings(BaseModel):
+    """ЛС-кампании, Phase 2 (reader/dm_campaigns/): генерация ЧЕРНОВИКОВ в
+    процессе Reader, ничего не отправляется. Секция dm_outreach в
+    config.yaml необязательна — значения по умолчанию ниже; включение
+    конкретной кампании — только через admin-бот (dm_campaigns.enabled).
+    OPENAI_API_KEY — общий (settings.ocr.openai_api_key), второй не заводится."""
+
+    model: str = "gpt-5-mini"
+    # Сколько ждать после вопроса, чтобы собрать ответы других участников.
+    context_wait_seconds: int = Field(default=180, ge=0)
+    recent_message_retention_hours: float = Field(default=48, gt=0)
+    # Окно свежих сообщений по теме (граница/бензин).
+    fresh_context_hours: float = Field(default=3, gt=0)
+    max_context_messages: int = Field(default=5, ge=0, le=20)
+    max_evidence_messages: int = Field(default=15, ge=0, le=50)
+    draft_processor_interval_seconds: float = Field(default=30, gt=0)
+    # drafting дольше этого — процесс упал посреди генерации, вернуть в очередь.
+    drafting_recovery_seconds: float = Field(default=600, gt=0)
+
+
 class Settings(BaseModel):
     telegram: TelegramSettings
     app: AppSettings
@@ -336,6 +356,7 @@ class Settings(BaseModel):
     lead_ai: LeadAiSettings = Field(default_factory=LeadAiSettings)
     public_bot: PublicBotSettings = Field(default_factory=PublicBotSettings)
     inviter_admin_bot: InviterAdminBotSettings = Field(default_factory=InviterAdminBotSettings)
+    dm_outreach: DmOutreachSettings = Field(default_factory=DmOutreachSettings)
 
 
 def load_settings(config_path: Path) -> Settings:
@@ -383,6 +404,7 @@ def load_settings(config_path: Path) -> Settings:
     lead_ai_raw = raw.get("lead_ai", {})
     public_bot_raw = raw.get("public_bot", {})
     inviter_admin_bot_raw = raw.get("inviter_admin_bot", {})
+    dm_outreach_raw = raw.get("dm_outreach") or {}
 
     # payment_bank/policy_period — LEGACY (см. reader/settings.py::
     # CheckoutSettings): формат по-прежнему валидируется, чтобы не молча
@@ -578,6 +600,7 @@ def load_settings(config_path: Path) -> Settings:
                     inviter_admin_bot_raw.get("trusted_admin_user_ids", [])
                 ),
             ),
+            dm_outreach=DmOutreachSettings(**dm_outreach_raw),
         )
     except (KeyError, ValueError) as exc:
         raise ConfigError(
