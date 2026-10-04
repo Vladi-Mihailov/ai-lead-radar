@@ -163,6 +163,12 @@ class InviteCandidate:
     # InviterService._resolve_input_peer — только для None делается
     # дополнительная проверка перед отправкой приглашения).
     is_bot: bool | None = None
+    # Сообщение лида в источнике пула кампании (campaign_leads.source_ref/
+    # last_message_id; для кампаний без пула — None): по нему приглашающий
+    # аккаунт резолвит candidate без username (InputPeerUserFromMessage, см.
+    # InviterService._resolve_input_peer).
+    source_ref: str | None = None
+    source_message_id: int | None = None
 
 
 @dataclass(frozen=True)

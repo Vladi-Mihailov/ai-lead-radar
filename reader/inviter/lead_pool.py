@@ -842,7 +842,7 @@ def format_summary(campaign: InviteCampaign, summary: ScanSummary, *, mode: str)
         f"Bots: {summary.bots}",
         f"Deleted accounts: {summary.deleted}",
         f"Eligible new leads: {summary.eligible}",
-        f"Eligible but no username (inviter cannot resolve them): {summary.eligible_without_username}",
+        f"Eligible without username (resolved via their source message): {summary.eligible_without_username}",
         f"Older than recency window: {summary.too_old}",
         f"False-positive users excluded by match_rule: {summary.false_positive_users}",
         f"Eligible by number of matching messages: {distribution}",

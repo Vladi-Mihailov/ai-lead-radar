@@ -40,7 +40,15 @@ from telethon.errors import (
 )
 from telethon.tl.functions.channels import InviteToChannelRequest
 from telethon.tl.functions.messages import AddChatUserRequest
-from telethon.tl.types import Channel, ChannelForbidden, Chat, ChatForbidden, InputPeerUser, User
+from telethon.tl.types import (
+    Channel,
+    ChannelForbidden,
+    Chat,
+    ChatForbidden,
+    InputPeerUser,
+    InputPeerUserFromMessage,
+    User,
+)
 
 from reader.inviter.identity import (
     AccountIdentityMismatchError,
@@ -474,8 +482,8 @@ def _format_campaign_summary_notification(
     БЕЗ фильтра по username (UserCampaignInviteRepository.
     count_found_candidates()); found_processable — то же самое, но С этим
     фильтром (count_candidates(), как и раньше). Разница между ними — те,
-    кого нашли, но подготовить к приглашению физически нельзя (нет
-    username для резолва этим аккаунтом, см.
+    кого нашли, но подготовить к приглашению физически нельзя (нет ни
+    username, ни сообщения в источнике пула для резолва этим аккаунтом, см.
     InviterService._resolve_input_peer) — считается прямо здесь, простым
     вычитанием двух уже посчитанных в SQL чисел, а не перебором
     пользователей в Python.
@@ -1912,9 +1920,15 @@ class InviterService:
            отношений, например контактов, может дорезолвить и без явного
            общего чата; в остальном чистый локальный lookup).
         2. Если не известен и есть username — резолвим этим же аккаунтом
-           через client.get_entity(username): единственный надёжный способ
-           получить access_hash, валидный именно для этого аккаунта, без
-           общего чата с candidate.
+           через client.get_entity(username): надёжный способ получить
+           access_hash, валидный именно для этого аккаунта, без общего чата
+           с candidate.
+        3. Если по username не вышло (или его нет), но известно сообщение
+           лида в источнике пула (candidate.source_ref/source_message_id) —
+           client.get_entity(InputPeerUserFromMessage(источник, msg_id,
+           user_id)): Telegram сам отдаёт access_hash для ЭТОГО аккаунта
+           (production: лиды Армении без username резолвятся так, а чужой
+           access_hash читающего аккаунта — нет, KeyError).
 
         Отдельного хранилища access_hash "на аккаунт" не требуется —
         Telethon сам кэширует результат в .session-файле ЭТОГО аккаунта
@@ -2003,6 +2017,8 @@ class InviterService:
         if input_peer is None:
             if candidate.username:
                 entity = await resolve("username", f"@{candidate.username}")
+            if entity is None and candidate.source_ref and candidate.source_message_id:
+                entity = await self._resolve_from_source_message(client, candidate, step_errors, resolve)
         else:
             # candidate.is_bot is None — статус неизвестен, убеждаемся перед
             # отправкой приглашения (см. докстрок выше).
@@ -2019,7 +2035,7 @@ class InviterService:
             reason = (
                 f"{candidate.user_id} ({_format_username(candidate.username)}): "
                 f"не резолвится ни одним известным способом (id-кэш/username/"
-                f"сохранённый access_hash) этим аккаунтом: {details}"
+                f"сообщение в источнике/сохранённый access_hash) этим аккаунтом: {details}"
             )
             last_exc = step_errors[-1][1] if step_errors else None
             if isinstance(last_exc, _CONFIRMED_PERMANENT_IDENTITY_ERROR_TYPES):
@@ -2039,6 +2055,22 @@ class InviterService:
                 )
 
         return InputPeerUser(user_id=entity.id, access_hash=entity.access_hash)
+
+    @staticmethod
+    async def _resolve_from_source_message(client, candidate: InviteCandidate, step_errors, resolve):
+        """Шаг 3 _resolve_input_peer: candidate по его сообщению в источнике
+        пула. Ошибка резолва самого источника — такая же ошибка шага (в
+        step_errors), FloodWait/PeerFlood поднимаются как и в resolve()."""
+        try:
+            source_peer = await client.get_input_entity(candidate.source_ref)
+        except (FloodWaitError, PeerFloodError):
+            raise
+        except Exception as exc:
+            step_errors.append(("source_message", exc))
+            return None
+        return await resolve("source_message", InputPeerUserFromMessage(
+            peer=source_peer, msg_id=candidate.source_message_id, user_id=candidate.user_id,
+        ))
 
     def _update_user_access_hash(self, entity: User) -> None:
         """Сохраняет свежий access_hash (и username/is_bot, если реально

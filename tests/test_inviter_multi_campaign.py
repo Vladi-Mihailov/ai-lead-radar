@@ -336,8 +336,9 @@ def test_bots_deleted_and_target_members_are_not_actionable(tmp_path):
         assert statuses == {
             101: "new", 102: "new", 103: "new", 104: "bot", 105: "deleted", _TARGET_MEMBER_ID: "already_member",
         }
-        # 103 без username — общий фильтр инвайтера (не может резолвить).
-        assert sorted(c.user_id for c in invites.select_candidates(am.id, limit=50)) == [101, 102]
+        # 103 без username — резолвится приглашающим аккаунтом по своему
+        # сообщению в источнике (InputPeerUserFromMessage) и остаётся кандидатом.
+        assert sorted(c.user_id for c in invites.select_candidates(am.id, limit=50)) == [101, 102, 103]
     finally:
         leads.close()
         invites.close()
@@ -470,7 +471,7 @@ def test_same_user_not_reselected_within_one_campaign(tmp_path):
     try:
         invites.create(user_id=101, campaign_id=am.id, status="pending")
         # 7001 здесь не помечен участником (список участников target не передан).
-        assert {c.user_id for c in invites.select_candidates(am.id, limit=50)} == {102, _TARGET_MEMBER_ID}
+        assert {c.user_id for c in invites.select_candidates(am.id, limit=50)} == {102, 103, _TARGET_MEMBER_ID}
     finally:
         invites.close()
 
@@ -768,9 +769,10 @@ def test_campaign_statistics_are_campaign_specific(tmp_path):
     finally:
         bot.close()
 
-    assert (am.leads_found, am.awaiting, am.sent_pending, am.joined, am.failed) == (6, 1, 1, 0, 0)
-    assert (am.pool_bots, am.pool_deleted, am.pool_already_member, am.without_username) == (1, 1, 1, 1)
-    assert am.skipped == 4
+    # 103 без username, но с сообщением в источнике — ждёт приглашения.
+    assert (am.leads_found, am.awaiting, am.sent_pending, am.joined, am.failed) == (6, 2, 1, 0, 0)
+    assert (am.pool_bots, am.pool_deleted, am.pool_already_member, am.without_username) == (1, 1, 1, 0)
+    assert am.skipped == 3
     assert (ge.leads_found, ge.awaiting, ge.joined, ge.failed) == (2, 1, 1, 1)
     assert ge.has_pool is False
 

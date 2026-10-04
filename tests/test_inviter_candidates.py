@@ -36,7 +36,15 @@ from telethon.errors import (  # noqa: E402
 )
 from telethon.tl.functions.channels import InviteToChannelRequest  # noqa: E402
 from telethon.tl.functions.messages import AddChatUserRequest, GetHistoryRequest  # noqa: E402
-from telethon.tl.types import Channel, ChannelForbidden, Chat, InputPeerUser, User  # noqa: E402
+from telethon.tl.types import (  # noqa: E402
+    Channel,
+    ChannelForbidden,
+    Chat,
+    InputPeerChannel,
+    InputPeerUser,
+    InputPeerUserFromMessage,
+    User,
+)
 
 from reader.inviter.repository import (  # noqa: E402
     InviteCampaignRepository,
@@ -274,7 +282,12 @@ class _FakeTelegramClient:
         # Проверка is_bot (см. InviterService._resolve_input_peer) вызывает
         # get_entity(input_peer) — InputPeerUser, а не строка/id, поэтому
         # ключом в entity_responses для такого вызова служит сам user_id.
+        # Резолв по сообщению в источнике пула (InputPeerUserFromMessage) —
+        # ключ ("from_message", user_id); по умолчанию Telegram выдаёт
+        # access_hash, валидный для ЭТОГО аккаунта (отличный от сохранённого).
         lookup_key = entity.user_id if isinstance(entity, InputPeerUser) else entity
+        if isinstance(entity, InputPeerUserFromMessage):
+            lookup_key = ("from_message", entity.user_id)
         if lookup_key in self._entity_responses:
             response = self._entity_responses[lookup_key]
             if isinstance(response, Exception):
@@ -288,10 +301,16 @@ class _FakeTelegramClient:
             # бота конкретно (см. test_execute_test_mode_* и соседние про
             # is_bot — они настраивают это явно).
             return User(id=entity.user_id, access_hash=entity.access_hash, bot=False, first_name="Test")
+        if isinstance(entity, InputPeerUserFromMessage):
+            return User(id=entity.user_id, access_hash=entity.user_id * 7, bot=False, first_name="Test")
         return self._target_entity
 
     async def get_input_entity(self, user_id):
         self.get_input_entity_calls.append(user_id)
+        if isinstance(user_id, str):
+            # Источник пула ("@sadahlo") — публичный чат, резолвится всегда;
+            # get_input_entity_error моделирует только "кандидат не в кэше".
+            return InputPeerChannel(channel_id=1555971043, access_hash=1)
         if self._get_input_entity_error is not None:
             raise self._get_input_entity_error
         return InputPeerUser(user_id=user_id, access_hash=user_id)

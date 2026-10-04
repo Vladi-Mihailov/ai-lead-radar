@@ -353,18 +353,29 @@ _CANDIDATES_BASE_WHERE = _LEADS_WHERE + """
     )
 """
 
-# username IS NOT NULL/не пуст — обязателен: если candidate не известен
-# приглашающему аккаунту (InviterService._resolve_input_peer:
-# client.get_input_entity() не нашёл его в кэше ЭТОГО аккаунта — а
-# access_hash в users.db получен ДРУГИМ, читающим, аккаунтом и для
-# приглашающего часто невалиден), единственный способ его всё же
-# резолвить — client.get_entity("@username"). Без username такой
-# candidate физически не подготовить ни для одного нового аккаунта
-# ("... не известен этому аккаунту и не имеет username для резолва") —
-# поэтому не выбираем его вовсе, а не проваливаем каждую попытку.
+# Identity, по которой ПРИГЛАШАЮЩИЙ аккаунт может резолвить candidate
+# (InviterService._resolve_input_peer), обязательна: access_hash в users.db
+# получен ДРУГИМ, читающим, аккаунтом и для приглашающего, как правило,
+# невалиден (production: GetUsers -> пустой ответ -> KeyError), поэтому
+# одного user_id + access_hash недостаточно. Годится одно из:
+# - username — client.get_entity("@username");
+# - сообщение лида в источнике пула (campaign_leads.source_ref +
+#   last_message_id) — InputPeerUserFromMessage: Telegram сам выдаёт
+#   access_hash, валидный для ЭТОГО аккаунта (проверено на production для
+#   лидов Армении без username). Для кампаний без пула подзапросы всегда
+#   NULL — условие сводится ровно к прежнему "username обязателен".
+# Без обоих candidate физически не подготовить ни для одного нового
+# аккаунта — не выбираем его вовсе, а не проваливаем каждую попытку.
+_EFFECTIVE_SOURCE_REF = _LEAD_COLUMN.format(column="source_ref")
+_EFFECTIVE_SOURCE_MESSAGE_ID = _LEAD_COLUMN.format(column="last_message_id")
 _USERNAME_FILTER = f"{_EFFECTIVE_USERNAME} IS NOT NULL AND TRIM({_EFFECTIVE_USERNAME}) <> ''"
+_SOURCE_MESSAGE_FILTER = (
+    f"{_EFFECTIVE_SOURCE_REF} IS NOT NULL AND TRIM({_EFFECTIVE_SOURCE_REF}) <> '' "
+    f"AND {_EFFECTIVE_SOURCE_MESSAGE_ID} IS NOT NULL"
+)
+_RESOLVABLE_IDENTITY_FILTER = f"(({_USERNAME_FILTER}) OR ({_SOURCE_MESSAGE_FILTER}))"
 
-_CANDIDATES_WHERE = f"{_CANDIDATES_BASE_WHERE} AND {_USERNAME_FILTER}"
+_CANDIDATES_WHERE = f"{_CANDIDATES_BASE_WHERE} AND {_RESOLVABLE_IDENTITY_FILTER}"
 
 _COUNT_CANDIDATES = f"""
 SELECT COUNT(*)
@@ -375,8 +386,9 @@ WHERE {_CANDIDATES_WHERE}
 
 # "Всего найдено" для операторского отчёта (см.
 # InviterService._notify_campaign_result) — те же условия, что и
-# count_candidates(), но БЕЗ фильтра по username, чтобы можно было
-# показать, сколько кандидатов отсеялось именно из-за его отсутствия
+# count_candidates(), но БЕЗ фильтра по резолвимой identity (username/
+# сообщение в источнике), чтобы можно было показать, сколько кандидатов
+# отсеялось именно из-за её отсутствия
 # (found_total - count_candidates()).
 _COUNT_FOUND_CANDIDATES = f"""
 SELECT COUNT(*)
@@ -406,7 +418,8 @@ GROUP BY status
 """
 
 _SELECT_CANDIDATES = f"""
-SELECT u.user_id, {_EFFECTIVE_USERNAME}, u.keywords, {_EFFECTIVE_ACCESS_HASH}, u.last_seen_at, u.is_bot
+SELECT u.user_id, {_EFFECTIVE_USERNAME}, u.keywords, {_EFFECTIVE_ACCESS_HASH}, u.last_seen_at, u.is_bot,
+       {_EFFECTIVE_SOURCE_REF}, {_EFFECTIVE_SOURCE_MESSAGE_ID}
 FROM users u
 JOIN invite_campaigns c ON c.id = :campaign_id
 WHERE {_CANDIDATES_WHERE}
@@ -497,7 +510,7 @@ def _parse_retry_timestamp(value: str | None) -> datetime | None:
 
 
 def _row_to_candidate(row) -> InviteCandidate:
-    user_id, username, keywords, access_hash, last_seen_at, is_bot = row
+    user_id, username, keywords, access_hash, last_seen_at, is_bot, source_ref, source_message_id = row
     return InviteCandidate(
         user_id=user_id,
         username=username,
@@ -505,6 +518,8 @@ def _row_to_candidate(row) -> InviteCandidate:
         access_hash=access_hash,
         last_seen_at=_parse_datetime(last_seen_at),
         is_bot=None if is_bot is None else bool(is_bot),
+        source_ref=source_ref or None,
+        source_message_id=source_message_id,
     )
 
 
@@ -992,9 +1007,10 @@ class UserCampaignInviteRepository:
 
     def count_candidates(self, campaign_id: int) -> int:
         """Сколько пользователей подходят кампании campaign_id прямо сейчас
-        (access_hash есть, username есть и не пуст, is_bot не равен 1,
-        keyword кампании — среди их keywords, ещё не приглашены для этой
-        кампании) — без учёта limit, см. select_candidates()."""
+        (access_hash есть, есть резолвимая identity — username или
+        сообщение в источнике пула, is_bot не равен 1, keyword кампании —
+        среди их keywords, ещё не приглашены для этой кампании) — без
+        учёта limit, см. select_candidates()."""
         row = self._conn.execute(
             _COUNT_CANDIDATES, {"campaign_id": campaign_id, "account_id": None},
         ).fetchone()
@@ -1002,11 +1018,12 @@ class UserCampaignInviteRepository:
 
     def count_found_candidates(self, campaign_id: int) -> int:
         """То же самое, что count_candidates(), но БЕЗ фильтра по
-        username — "всего найдено" для операторского отчёта (см.
+        резолвимой identity — "всего найдено" для операторского отчёта (см.
         InviterService._notify_campaign_result). Разница
         count_found_candidates() - count_candidates() — сколько
         подходящих по остальным условиям пользователей физически нельзя
-        подготовить к приглашению из-за отсутствия username."""
+        подготовить к приглашению из-за отсутствия username и сообщения
+        в источнике."""
         row = self._conn.execute(
             _COUNT_FOUND_CANDIDATES, {"campaign_id": campaign_id, "account_id": None},
         ).fetchone()
@@ -1112,10 +1129,10 @@ class UserCampaignInviteRepository:
         self, campaign_id: int, *, limit: int, account_id: int | None = None,
     ) -> list[InviteCandidate]:
         """Кандидаты на приглашение в кампанию campaign_id: keywords
-        содержит keyword кампании, access_hash задан и username задан и не
-        пуст (иначе приглашающий аккаунт, которому candidate не известен,
-        не сможет его резолвить вовсе — см. InviterService._resolve_input_peer
-        и требование задачи о фильтрации по username), is_bot не равен 1
+        содержит keyword кампании, access_hash задан и есть identity,
+        резолвимая приглашающим аккаунтом — username либо сообщение лида в
+        источнике пула (см. _RESOLVABLE_IDENTITY_FILTER и
+        InviterService._resolve_input_peer), is_bot не равен 1
         (Telegram-боты приглашаются с ChatAdminRequiredError — отсеиваем их
         заранее, см. _CANDIDATES_BASE_WHERE; is_bot=NULL, для строк без
         этого признака, не исключается), ещё нет записи со status IN
