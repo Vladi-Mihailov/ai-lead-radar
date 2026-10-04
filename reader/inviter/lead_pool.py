@@ -51,6 +51,7 @@ from pathlib import Path
 from telethon import utils
 from telethon.tl.types import User
 
+from reader.insurance_matching import ru_insurance_words as _ru_insurance_words
 from reader.inviter.models import InviteCampaign
 from reader.scenarios import KeywordMatcher, Scenario
 from reader.users.models import TelegramUserInfo
@@ -432,30 +433,6 @@ def matched_word_forms(text: str, keyword: str) -> list[str]:
     if not normalized_keyword:
         return []
     return re.findall(rf"\w*{re.escape(normalized_keyword)}\w*", (text or "").lower().strip())
-
-
-def _ru_insurance_words(text: str, keyword: str) -> list[str]:
-    """Слова (целиком, по границам слова), где keyword — корень со
-    страховой морфологией: за корнем идёт "ов…" (страховка, страхование,
-    застрахован, автостраховка, медстраховка, страховщик) или "у" + ещё
-    буквы (страхуйтесь, застрахуй). Любая приставка допустима (за-, авто-,
-    мед-), КРОМЕ "пере-": "перестраховаться"/"перестраховка" в источнике —
-    идиома "подстраховаться" (проверено по реальным сообщениям @sadahlo),
-    а не страхование. Не совпадают: "Астрахань"/"астрахани" ("страх" +
-    "ань"), "канистрах" (ничего после корня), голое "страх"/"страха"/
-    "страхом" ("на свой страх и риск" — страх, а не страховка)."""
-    root = keyword.lower().strip()
-    if not root:
-        return []
-    pattern = re.compile(rf"\w*{re.escape(root)}(?:ов\w*|у\w+)")
-    words = []
-    for word in re.findall(r"\w+", (text or "").lower()):
-        if not pattern.fullmatch(word):
-            continue
-        if word[: word.find(root)].endswith("пере"):
-            continue
-        words.append(word)
-    return words
 
 
 def campaign_match_words(campaign: InviteCampaign, text: str) -> list[str]:

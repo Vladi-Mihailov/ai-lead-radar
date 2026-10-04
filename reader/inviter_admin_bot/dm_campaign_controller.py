@@ -17,7 +17,7 @@ import logging
 from collections.abc import Callable
 from datetime import datetime, timezone
 
-from reader.dm_campaigns.models import DmCampaign, normalize_list_input
+from reader.dm_campaigns.models import DmCampaign, normalize_list_input, same_chat_identifier
 from reader.dm_campaigns.repository import DmCampaignRepository
 from reader.groups import Group
 from reader.inviter.models import TelegramAccount
@@ -68,10 +68,6 @@ def _group_label(group: Group) -> str:
     return group.title or (f"@{group.username}" if group.username else str(group.id))
 
 
-def _same_source(a: str, b: str) -> bool:
-    return a.strip().lstrip("@").lower() == b.strip().lstrip("@").lower()
-
-
 class DmCampaignController:
     def __init__(
         self,
@@ -119,7 +115,7 @@ class DmCampaignController:
         groups = self._groups()
         labels = []
         for source in campaign.source_chats:
-            group = next((g for g in groups if _same_source(str(g.identifier), source)), None)
+            group = next((g for g in groups if same_chat_identifier(str(g.identifier), source)), None)
             labels.append(_group_label(group) if group else f"{source} (нет в groups.yaml)")
         return labels
 
@@ -152,7 +148,7 @@ class DmCampaignController:
         shown: list[str] = []
         for group in self._groups():
             ident = str(group.identifier)
-            is_selected = any(_same_source(ident, s) for s in selected)
+            is_selected = any(same_chat_identifier(ident, s) for s in selected)
             try:
                 data = cb.encode(cb.ACTION_SOURCE_TOGGLE, campaign.id, source=ident)
             except ValueError:
@@ -163,7 +159,7 @@ class DmCampaignController:
         # Выбранные ранее, но уже отсутствующие в groups.yaml — показываем,
         # чтобы их можно было снять, а не прятать молча.
         for source in selected:
-            if any(_same_source(source, s) for s in shown):
+            if any(same_chat_identifier(source, s) for s in shown):
                 continue
             try:
                 data = cb.encode(cb.ACTION_SOURCE_TOGGLE, campaign.id, source=source)
@@ -274,13 +270,13 @@ class DmCampaignController:
 
     def _toggle_source(self, campaign: DmCampaign, source: str) -> BotReply:
         selected = list(campaign.source_chats)
-        existing = next((s for s in selected if _same_source(s, source)), None)
+        existing = next((s for s in selected if same_chat_identifier(s, source)), None)
         if existing is not None:
             selected.remove(existing)
         else:
             # Добавить можно только группу, которая реально есть в
             # groups.yaml — callback_data не доверяем.
-            group = next((g for g in self._groups() if _same_source(str(g.identifier), source)), None)
+            group = next((g for g in self._groups() if same_chat_identifier(str(g.identifier), source)), None)
             if group is None:
                 return self._sources_reply(campaign, notice=texts.STALE_BUTTON_TEXT)
             selected.append(str(group.identifier))

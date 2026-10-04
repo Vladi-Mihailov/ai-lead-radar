@@ -28,6 +28,13 @@ from reader.commands.fine import FineCommand  # noqa: E402
 from reader.commands.insurance_ocr import InsuranceOcrCommand  # noqa: E402
 from reader.core.engine import MatchEngine  # noqa: E402
 from reader.core.pipeline import Pipeline  # noqa: E402
+from reader.dm_campaigns.context import DmContextBuilder  # noqa: E402
+from reader.dm_campaigns.draft_service import DmDraftService  # noqa: E402
+from reader.dm_campaigns.observer import DmOutreachObserver  # noqa: E402
+from reader.dm_campaigns.outreach_repository import DmOutreachRepository  # noqa: E402
+from reader.dm_campaigns.processor import DmDraftProcessor  # noqa: E402
+from reader.dm_campaigns.recent_messages import RecentMessageRepository  # noqa: E402
+from reader.dm_campaigns.repository import DmCampaignRepository  # noqa: E402
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
 from reader.fines.notification_coordinator import FineNotificationCoordinator  # noqa: E402
@@ -35,7 +42,7 @@ from reader.fines.police_ge_provider import PoliceGeProvider  # noqa: E402
 from reader.fines.police_ge_session import PoliceGeSession  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
 from reader.fines.translation import FineTranslationService  # noqa: E402
-from reader.groups import GroupLoadError, load_groups  # noqa: E402
+from reader.groups import Group, GroupLoadError, load_groups  # noqa: E402
 from reader.jobs.archive_fine_job import ArchiveFineJob  # noqa: E402
 from reader.jobs.fine_job import FineJob  # noqa: E402
 from reader.jobs.notification_flush_job import NotificationFlushJob  # noqa: E402
@@ -50,7 +57,12 @@ from reader.public_bot.subscription_repository import FineSubscriptionRepository
 from reader.public_bot.subscription_service import (  # noqa: E402
     extend_client_bot_task_if_still_needed,
 )
-from reader.scenarios import KeywordMatcher, ScenarioLoadError, load_scenarios  # noqa: E402
+from reader.scenarios import (  # noqa: E402
+    KeywordMatcher,
+    Scenario,
+    ScenarioLoadError,
+    load_scenarios,
+)
 from reader.settings import ConfigError, Settings, load_settings  # noqa: E402
 from reader.sinks.console_sink import ConsoleSink  # noqa: E402
 from reader.sinks.file_sink import FileSink  # noqa: E402
@@ -402,6 +414,49 @@ def build_lead_ai_sink(settings: Settings, source: TelegramSource) -> LeadAiSink
     return LeadAiSink(source.client, lead_ai.recipient, service)
 
 
+def build_dm_outreach_components(
+    settings: Settings, scenarios: list[Scenario], groups: list[Group],
+) -> tuple[DmOutreachObserver, DmDraftProcessor, list] | None:
+    """ЛС-кампании, Phase 2 — только ЧЕРНОВИКИ (см. reader/dm_campaigns/):
+    наблюдатель для Pipeline + фоновый обработчик черновиков, в том же
+    процессе и на той же users.db, без Telegram-отправки. Чистая сборка без
+    await (тот же приём, что и build_lead_ai_sink). None — нет
+    OPENAI_API_KEY: функциональность не поднимается вовсе (кандидаты без
+    генерации копились бы бесполезно). Третий элемент — репозитории для
+    закрытия в run().
+
+    Само наличие компонентов ничего не запускает: пока ни одна кампания не
+    включена в admin-боте (dm_campaigns.enabled), наблюдатель не пишет ни
+    буфер, ни кандидатов, а обработчику нечего обрабатывать."""
+    if not settings.ocr.openai_api_key:
+        logger.info("dm_outreach disabled (OPENAI_API_KEY не задан)")
+        return None
+    dm = settings.dm_outreach
+    db_path = settings.app.users_db_file
+    campaign_repository = DmCampaignRepository(db_path)
+    outreach_repository = DmOutreachRepository(db_path)
+    recent_repository = RecentMessageRepository(db_path)
+    observer = DmOutreachObserver(
+        campaign_repository, outreach_repository, recent_repository,
+        context_wait_seconds=dm.context_wait_seconds,
+    )
+    context_builder = DmContextBuilder(
+        recent_repository, scenarios,
+        group_titles={str(g.identifier): g.title for g in groups if g.title},
+        max_context_messages=dm.max_context_messages,
+        fresh_context_hours=dm.fresh_context_hours,
+        max_evidence_messages=dm.max_evidence_messages,
+    )
+    processor = DmDraftProcessor(
+        outreach_repository, campaign_repository, recent_repository, context_builder,
+        DmDraftService(api_key=settings.ocr.openai_api_key, model=dm.model),
+        interval_seconds=dm.draft_processor_interval_seconds,
+        drafting_recovery_seconds=dm.drafting_recovery_seconds,
+        retention_hours=dm.recent_message_retention_hours,
+    )
+    return observer, processor, [campaign_repository, outreach_repository, recent_repository]
+
+
 def resolve_telegram_sink_recipients(
     forward_to: list[int | str], lead_ai_recipient: int | str | None,
 ) -> list[int | str]:
@@ -615,12 +670,17 @@ async def run() -> None:
     else:
         logger.info("Lead AI анализ отключён (lead_ai.enabled=false либо не настроен)")
 
-    pipeline = Pipeline(source, engine, sinks, user_repository)
+    dm_components = build_dm_outreach_components(settings, scenarios, groups)
+    dm_observer = dm_components[0] if dm_components else None
+    pipeline = Pipeline(source, engine, sinks, user_repository, dm_observer=dm_observer)
 
     # Reader (Pipeline.run() — авторизует и подключает единственный
     # TelegramClient) и мониторинг штрафов работают в одном event loop'е,
     # параллельно, без второго подключения к Telegram.
     background: list = [pipeline.run()]
+    if dm_components is not None:
+        # Обработчик черновиков ЛС-кампаний — тот же процесс, без Telegram.
+        background.append(dm_components[1].run_forever())
 
     fine_task_repository = None
     detected_fine_repository = None
@@ -665,6 +725,8 @@ async def run() -> None:
         await _run_concurrently(background)
     finally:
         user_repository.close()
+        for repository in (dm_components[2] if dm_components else []):
+            repository.close()
         if fine_task_repository is not None:
             fine_task_repository.close()
         if detected_fine_repository is not None:

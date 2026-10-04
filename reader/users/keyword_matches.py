@@ -27,6 +27,9 @@ def unique_keywords(matches: list[ScenarioMatch]) -> list[str]:
     car_border_crossing (см. модуль-докстрок выше). Реальные matched_
     keywords при этом никуда не пропадают — тег добавляется ДОПОЛНИТЕЛЬНО,
     после них."""
+    # Сценарии forward_leads=false (только для ЛС-кампаний, например fuel)
+    # в users.keywords не попадают — см. ScenarioMatch.forward_leads.
+    matches = [match for match in matches if match.forward_leads]
     seen: set[str] = set()
     result: list[str] = []
     for match in matches:

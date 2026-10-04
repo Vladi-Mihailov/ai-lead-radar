@@ -15,6 +15,12 @@ class Scenario:
     name: str
     enabled: bool
     keywords: tuple[str, ...]
+    # forward_leads: false — совпадение не уходит в существующий lead-поток
+    # (менеджерам/users.keywords), только в ЛС-кампании (см. fuel).
+    forward_leads: bool = True
+    # Дополнительные термины ТОЛЬКО для отбора свежего контекста ЛС-черновика
+    # (reader/dm_campaigns/context.py), на detection не влияют.
+    context_keywords: tuple[str, ...] = ()
 
 
 def load_scenarios(path: Path) -> list[Scenario]:
@@ -46,6 +52,8 @@ def load_scenarios(path: Path) -> list[Scenario]:
                 name=name,
                 enabled=entry.get("enabled", True),
                 keywords=tuple(keywords),
+                forward_leads=bool(entry.get("forward_leads", True)),
+                context_keywords=tuple(entry.get("context_keywords") or ()),
             )
         )
 
@@ -73,5 +81,8 @@ class KeywordMatcher:
         for scenario in self._scenarios:
             hits = [kw for kw in scenario.keywords if _normalize(kw) in normalized]
             if hits:
-                results.append(ScenarioMatch(scenario_name=scenario.name, matched_keywords=hits))
+                results.append(ScenarioMatch(
+                    scenario_name=scenario.name, matched_keywords=hits,
+                    forward_leads=scenario.forward_leads,
+                ))
         return results

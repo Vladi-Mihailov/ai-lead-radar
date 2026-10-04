@@ -76,3 +76,19 @@ def normalize_text_input(raw: str | None) -> str | None:
         return None
     text = raw.strip()
     return text or None
+
+
+def same_chat_identifier(a: str, b: str) -> bool:
+    """Сравнение идентификаторов групп из groups.yaml: регистр и ведущий
+    "@" не важны (Telegram username регистронезависим)."""
+    return a.strip().lstrip("@").lower() == b.strip().lstrip("@").lower()
+
+
+def source_chat_allowed(campaign: DmCampaign, chat_identifier: str | None) -> bool:
+    """Пустой source_chats — все отслеживаемые группы; иначе только
+    перечисленные (сравнение по Group.identifier, не по числовому chat_id)."""
+    if not campaign.source_chats:
+        return True
+    if not chat_identifier:
+        return False
+    return any(same_chat_identifier(chat_identifier, source) for source in campaign.source_chats)
