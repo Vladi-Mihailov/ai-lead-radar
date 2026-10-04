@@ -915,11 +915,11 @@ class InviterService:
     задачи про "Too many requests").
 
     В режиме execute=True после каждого обработанного аккаунта и после
-    каждой кампании оператору отправляется краткая статистика (см.
-    InviteStats/_notify_account_result/_notify_campaign_result) через
-    notifier (см. OperatorNotifierLike) — тем же существующим механизмом
-    уведомлений, что и у остального приложения, просто отдельным
-    подключением (см. reader/inviter/main.py). Сбой уведомления не
+    каждой кампании краткая статистика пишется в лог (см.
+    InviteStats/_notify_account_result/_notify_campaign_result). Оператору
+    через notifier (см. OperatorNotifierLike, reader/inviter/main.py)
+    отправляется ТОЛЬКО остановка аккаунта из-за ограничения Telegram
+    (STOP_ACCOUNT, см. _handle_invite_error). Сбой уведомления не
     прерывает сами приглашения (см. _safe_notify)."""
 
     def __init__(
@@ -1864,9 +1864,16 @@ class InviterService:
                     f"Аккаунт заблокирован до "
                     f"{format_tbilisi(account.blocked_until)}."
                 )
-            await self._safe_notify(
-                _format_account_stopped_notification(account, operator_message)
-            )
+            text = _format_account_stopped_notification(account, operator_message)
+            # Оператору — ТОЛЬКО ограничение аккаунта со стороны Telegram
+            # (STOP_ACCOUNT: FloodWait, PeerFlood, нет прав/доступа к target,
+            # любая другая RPC-ошибка, останавливающая аккаунт). FATAL — не
+            # Telegram-ошибка (сбой кода/сети): только в лог (выше — с
+            # трассировкой).
+            if classification.action == InviteErrorAction.STOP_ACCOUNT:
+                await self._safe_notify(text)
+            else:
+                logger.warning(text)
             return True
 
         # SKIP_USER — этот кандидат обработан, продолжаем тем же аккаунтом.
@@ -2186,16 +2193,17 @@ class InviterService:
         self, campaign: InviteCampaign, account: TelegramAccount, stats: InviteStats,
         elapsed_seconds: float,
     ) -> None:
+        # Рутинный отчёт — только в лог: оператору отправляются лишь
+        # ограничения аккаунта со стороны Telegram (см. _handle_invite_error).
         remaining = self._invite_repository.count_candidates(campaign.id)
-        await self._safe_notify(
-            _format_account_notification(campaign, account, stats, remaining, elapsed_seconds)
-        )
+        logger.info(_format_account_notification(campaign, account, stats, remaining, elapsed_seconds))
 
     async def _notify_campaign_result(
         self, campaign: InviteCampaign, accounts_processed: int, stats: InviteStats, remaining: int,
         elapsed_seconds: float, found_total: int, found_processable: int, accounts_blocked: int = 0,
     ) -> None:
-        await self._safe_notify(
+        # Рутинный отчёт — только в лог (см. _notify_account_result).
+        logger.info(
             _format_campaign_summary_notification(
                 campaign, accounts_processed, stats, remaining, elapsed_seconds,
                 found_total, found_processable, accounts_blocked,

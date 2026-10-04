@@ -6,8 +6,10 @@ InviterService.run().
 """
 
 import asyncio
+import logging
 import sqlite3
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -392,6 +394,32 @@ def _make_client_factory(
         return client
 
     return factory
+
+
+@contextmanager
+def _capture_reports():
+    """Рутинные отчёты инвайтера (по аккаунту — "📨 Кампания...", итоговый
+    по кампании — начинается с разделителя "====...") оператору больше НЕ
+    отправляются, только пишутся в лог reader.inviter.service — собираем их
+    оттуда в список (в порядке записи)."""
+    captured: list[str] = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record):
+            message = record.getMessage()
+            if message.startswith(("📨 Кампания", "=" * 32)):
+                captured.append(message)
+
+    handler = _Handler(level=logging.INFO)
+    service_logger = logging.getLogger("reader.inviter.service")
+    previous_level = service_logger.level
+    service_logger.addHandler(handler)
+    service_logger.setLevel(logging.INFO)
+    try:
+        yield captured
+    finally:
+        service_logger.removeHandler(handler)
+        service_logger.setLevel(previous_level)
 
 
 class _FakeOperatorNotifier:
@@ -2045,13 +2073,15 @@ def test_execute_verify_membership_false_still_reports_pending_in_summary(tmp_pa
     campaign, account = _setup_single_candidate_campaign(db_path, verify_membership=False)
 
     notifier = _FakeOperatorNotifier()
-    asyncio.run(
-        _run_service(
-            db_path, client_factory=_make_client_factory(), execute=True, notifier=notifier,
+    with _capture_reports() as reports:
+        asyncio.run(
+            _run_service(
+                db_path, client_factory=_make_client_factory(), execute=True, notifier=notifier,
+            )
         )
-    )
+    assert notifier.sent == []  # рутинные отчёты — только в лог, не оператору
 
-    account_report = next(t for t in notifier.sent if "Аккаунт:" in t)
+    account_report = next(t for t in reports if "Аккаунт:" in t)
     assert "Ожидают подтверждения: 1" in account_report
 
 
@@ -3752,11 +3782,13 @@ def test_execute_sends_account_and_campaign_notifications_with_correct_counts(tm
     )
     notifier = _FakeOperatorNotifier()
 
-    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier))
+    with _capture_reports() as reports:
+        asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier))
+    assert notifier.sent == []  # рутинные отчёты — только в лог, не оператору
 
-    # Ровно два уведомления: по аккаунту и итоговое по кампании, в этом порядке.
-    assert len(notifier.sent) == 2
-    account_message, campaign_message = notifier.sent
+    # Ровно два отчёта (в логе): по аккаунту и итоговый по кампании, в этом порядке.
+    assert len(reports) == 2
+    account_message, campaign_message = reports
 
     # user 1 отправлен и подтверждён (get_permissions успешна по
     # умолчанию), user 2 подтверждён немедленно (UserAlreadyParticipantError),
@@ -3809,10 +3841,12 @@ def test_execute_campaign_notification_includes_found_vs_processable_summary(tmp
     notifier = _FakeOperatorNotifier()
     client_factory = _make_client_factory()
 
-    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier))
+    with _capture_reports() as reports:
+        asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier))
+    assert notifier.sent == []  # рутинные отчёты — только в лог, не оператору
 
-    assert len(notifier.sent) == 2
-    _account_message, campaign_message = notifier.sent
+    assert len(reports) == 2
+    _account_message, campaign_message = reports
 
     assert "📋 Кампания: ОСАГО" in campaign_message
     # 3 подходят по keyword/access_hash, но только 1 (ivan) — с username.
@@ -3858,9 +3892,11 @@ def test_execute_flood_wait_excluded_from_error_count_in_notification(tmp_path, 
 
     monkeypatch.setattr(service_module.asyncio, "sleep", fake_sleep)
 
-    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier))
+    with _capture_reports() as reports:
+        asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier))
+    assert notifier.sent == []  # рутинные отчёты — только в лог, не оператору
 
-    account_message = notifier.sent[0]
+    account_message = reports[0]
     assert "✅ Подтверждено участников: 1" in account_message
     assert "❌ Ошибок: 0" in account_message  # FloodWait не считается ошибкой
 
@@ -3902,11 +3938,13 @@ def test_execute_aggregates_stats_across_multiple_accounts_in_campaign_summary(t
     )
     notifier = _FakeOperatorNotifier()
 
-    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier))
+    with _capture_reports() as reports:
+        asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier))
+    assert notifier.sent == []  # рутинные отчёты — только в лог, не оператору
 
     # 2 уведомления по аккаунтам + 1 итоговое по кампании.
-    assert len(notifier.sent) == 3
-    campaign_message = notifier.sent[-1]
+    assert len(reports) == 3
+    campaign_message = reports[-1]
 
     assert "Аккаунтов обработано: 2" in campaign_message
     assert "📤 Отправлено приглашений: 3" in campaign_message  # 2 (account_1) + 1 (account_2)
@@ -3919,35 +3957,38 @@ def test_execute_aggregates_stats_across_multiple_accounts_in_campaign_summary(t
 
 
 def test_notify_failure_does_not_stop_service(tmp_path):
-    """Сбой отправки уведомления оператору не должен мешать самим
-    приглашениям — запись в user_campaign_invites всё равно создаётся."""
+    """Сбой отправки уведомления оператору (об ограничении аккаунта — других
+    уведомлений больше нет) не должен мешать обработке — результат
+    приглашения всё равно записывается, сервис не падает."""
     db_path = _setup_db(tmp_path)
     campaign, account = _setup_single_candidate_campaign(db_path)
 
     notifier = _FakeOperatorNotifier(raise_error=RuntimeError("сеть недоступна"))
+    client_factory = _make_client_factory(call_errors={account.name: [PeerFloodError(request=GetHistoryRequest)]})
 
-    asyncio.run(_run_service(db_path, client_factory=_make_client_factory(), execute=True, notifier=notifier))
+    asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier))
 
     invite_repository = UserCampaignInviteRepository(db_path)
     try:
         invites = invite_repository.list()
         assert len(invites) == 1
-        assert invites[0].status == "joined"
+        assert invites[0].status == "failed"
     finally:
         invite_repository.close()
 
     # Уведомление было ПОПЫТАНО (иначе сбой было бы неоткуда взять).
-    assert len(notifier.sent) >= 1
+    assert len(notifier.sent) == 1 and notifier.sent[0].startswith("⚠️")
 
 
 # ---- баг: итоговая статистика по кампании пропадала целиком, если у -----
 # ---- OperatorNotifier не было получателей (или он вообще отсутствовал) --
 
 
-def test_execute_campaign_summary_logged_and_sent_when_notifier_succeeds(tmp_path, caplog):
-    """Уведомитель успешно отправляет — итоговый отчёт по кампании и
-    попадает в лог (logger.info), и реально уходит оператору, и это ровно
-    один и тот же текст (см. _safe_notify)."""
+def test_execute_successful_invite_logs_reports_but_sends_no_notification(tmp_path, caplog):
+    """Успешное приглашение: отчёты по аккаунту и итоговый по кампании
+    (количество приглашённых/прогресс) пишутся в лог, но оператору НЕ
+    отправляется ничего — Telegram-уведомления только об ограничениях
+    аккаунта."""
     db_path = _setup_db(tmp_path)
     _setup_single_candidate_campaign(db_path)
 
@@ -3960,21 +4001,28 @@ def test_execute_campaign_summary_logged_and_sent_when_notifier_succeeds(tmp_pat
             )
         )
 
-    campaign_notifications = [m for m in notifier.sent if "Итоги кампании" in m]
-    assert len(campaign_notifications) == 1
-    assert campaign_notifications[0] in caplog.text
+    assert notifier.sent == []
+    assert "📤 Отправлено приглашений: 1" in caplog.text
+    assert "Итоги кампании" in caplog.text
 
 
-def test_execute_campaign_summary_logged_when_no_recipients_found(tmp_path, caplog):
-    """Уведомитель поднят, но получателей нет — OperatorNotifier.notify_text()
-    возвращает False (не бросает исключение), как настоящий "Нет ни
-    одного получателя уведомлений оператора" (см. задачу про баг) —
-    итоговый отчёт по кампании всё равно должен появиться в логе, а не
-    потеряться целиком."""
+def test_execute_no_candidates_cycle_sends_no_notification(tmp_path, caplog):
+    """Цикл без кандидатов (пул исчерпан, "0 приглашено") — итоговый отчёт
+    по кампании только в логе, оператору ничего."""
     db_path = _setup_db(tmp_path)
-    _setup_single_candidate_campaign(db_path)
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=5,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
 
-    notifier = _FakeOperatorNotifier(deliver=False)
+    notifier = _FakeOperatorNotifier()
 
     with caplog.at_level("INFO", logger="reader.inviter.service"):
         asyncio.run(
@@ -3983,11 +4031,46 @@ def test_execute_campaign_summary_logged_when_no_recipients_found(tmp_path, capl
             )
         )
 
-    # Отправка была ПОПЫТАНА (иначе не узнали бы, что доставки не было) —
-    # и по аккаунту, и по кампании.
-    assert len(notifier.sent) == 2
+    assert notifier.sent == []
     assert "Итоги кампании" in caplog.text
-    assert "не доставлено" in caplog.text
+    assert "Всего найдено: 0" in caplog.text
+
+
+def test_execute_user_level_failures_send_no_notification(tmp_path, caplog):
+    """Ошибки, касающиеся только кандидата (не резолвится/invalid/приватность/
+    бот/временная), и короткий FloodWait (RETRY_LATER) — только в лог."""
+    db_path = _setup_db(tmp_path)
+    for user_id in range(1, 6):
+        _seed_user(db_path, user_id, keywords=["осаго"], access_hash=user_id,
+                   last_seen_at=_BASE_TIME + timedelta(days=user_id))
+    campaign_repository = InviteCampaignRepository(db_path)
+    account_repository = TelegramAccountRepository(db_path)
+    try:
+        campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
+        account_repository.create(
+            name="account_1", phone="+995500000001", session_name="acc1",
+            session_path="acc1.session", daily_limit=10,
+        )
+    finally:
+        campaign_repository.close()
+        account_repository.close()
+
+    client_factory = _make_client_factory(
+        call_errors={"account_1": [
+            UserPrivacyRestrictedError(request=GetHistoryRequest),
+            UserBlockedError(request=GetHistoryRequest),
+            UserIdInvalidError(request=GetHistoryRequest),
+            FloodWaitError(request=GetHistoryRequest, capture=3),
+            None,
+        ]},
+    )
+    notifier = _FakeOperatorNotifier()
+
+    with caplog.at_level("INFO", logger="reader.inviter.service"):
+        asyncio.run(_run_service(db_path, client_factory=client_factory, execute=True, notifier=notifier))
+
+    assert notifier.sent == []
+    assert "Итоги кампании" in caplog.text
 
 
 def test_execute_campaign_summary_logged_when_notifier_absent(tmp_path, caplog):
@@ -4279,12 +4362,14 @@ def test_notifications_include_elapsed_time_without_changing_other_lines(tmp_pat
     # ровно те же примеры длительности, что в самой задаче.
     _patch_monotonic_sequence(monkeypatch, service_module, [0.0, 0.0, 108.0, 397.0])
 
-    asyncio.run(
-        _run_service(db_path, client_factory=_make_client_factory(), execute=True, notifier=notifier)
-    )
+    with _capture_reports() as reports:
+        asyncio.run(
+            _run_service(db_path, client_factory=_make_client_factory(), execute=True, notifier=notifier)
+        )
+    assert notifier.sent == []  # рутинные отчёты — только в лог, не оператору
 
-    assert len(notifier.sent) == 2
-    account_message, campaign_message = notifier.sent
+    assert len(reports) == 2
+    account_message, campaign_message = reports
 
     assert "Время выполнения: 00:01:48" in account_message
     assert "Время выполнения: 00:06:37" in campaign_message
@@ -4327,11 +4412,13 @@ def test_elapsed_time_uses_monotonic_not_wall_clock(tmp_path, monkeypatch):
 
     _patch_monotonic_sequence(monkeypatch, service_module, [0.0, 0.0, 4500.0, 4500.0])
 
-    asyncio.run(
-        _run_service(db_path, client_factory=_make_client_factory(), execute=True, notifier=notifier)
-    )
+    with _capture_reports() as reports:
+        asyncio.run(
+            _run_service(db_path, client_factory=_make_client_factory(), execute=True, notifier=notifier)
+        )
+    assert notifier.sent == []  # рутинные отчёты — только в лог, не оператору
 
-    account_message = notifier.sent[0]
+    account_message = reports[0]
     assert "Время выполнения: 01:15:00" in account_message
 
 
@@ -4557,6 +4644,9 @@ def test_execute_peer_flood_stops_account_and_notifies_operator(tmp_path):
 
     stop_notifications = [m for m in notifier.sent if m.startswith("⚠️")]
     assert len(stop_notifications) == 1
+    # Ограничение аккаунта — ЕДИНСТВЕННОЕ, что уходит оператору (рутинные
+    # отчёты по аккаунту/кампании — только в лог).
+    assert notifier.sent == stop_notifications
     assert "Аккаунт: account_2" in stop_notifications[0]
     assert "Telegram временно ограничил приглашения (Too many requests)." in stop_notifications[0]
     assert "Работа аккаунта остановлена." in stop_notifications[0]
@@ -4767,12 +4857,39 @@ def test_execute_unexpected_non_rpc_exception_is_fatal_and_stops_account(tmp_pat
     client = created_clients[0]
     assert len(client.call_requests) == 1  # второй кандидат не тронут
 
-    stop_notifications = [m for m in notifier.sent if m.startswith("⚠️")]
-    assert len(stop_notifications) == 1
-    assert "Аккаунт: account_2" in stop_notifications[0]
+    # Не ограничение со стороны Telegram — оператору не отправляется, только
+    # в лог (с трассировкой + текст остановки аккаунта).
+    assert notifier.sent == []
+    assert "Аккаунт: account_2" in caplog.text and "Работа аккаунта остановлена." in caplog.text
 
     fatal_records = [r for r in caplog.records if r.exc_info is not None]
     assert len(fatal_records) == 1
+
+
+@pytest.mark.parametrize("error", [
+    PeerFloodError(request=GetHistoryRequest),
+    FloodWaitError(request=GetHistoryRequest, capture=3600),
+    ChatAdminRequiredError(request=GetHistoryRequest),
+    ChatWriteForbiddenError(request=GetHistoryRequest),
+    # Нераспознанная RPC-ошибка, останавливающая аккаунт (так приходят,
+    # например, USER_RESTRICTED/USER_BANNED_IN_CHANNEL).
+    RPCError(request=GetHistoryRequest, message="USER_RESTRICTED", code=400),
+], ids=["peer_flood", "long_flood_wait", "chat_admin_required", "chat_write_forbidden", "unknown_rpc"])
+def test_execute_account_level_telegram_restriction_notifies_operator(tmp_path, error):
+    """Ограничение/блокировка самого аккаунта со стороны Telegram
+    (STOP_ACCOUNT) — единственное, что отправляется оператору."""
+    db_path = _setup_db(tmp_path)
+    _campaign, account = _setup_single_candidate_campaign(db_path)
+    notifier = _FakeOperatorNotifier()
+
+    asyncio.run(_run_service(
+        db_path, client_factory=_make_client_factory(call_errors={account.name: [error]}),
+        execute=True, notifier=notifier,
+    ))
+
+    assert len(notifier.sent) == 1
+    assert notifier.sent[0].startswith("⚠️")
+    assert "Работа аккаунта остановлена." in notifier.sent[0]
 
 
 def test_execute_flood_wait_at_or_above_threshold_stops_account_and_notifies_operator(
@@ -5862,12 +5979,14 @@ def test_execute_test_mode_stop_still_sends_correct_final_stats_notifications(tm
     )
     notifier = _FakeOperatorNotifier()
 
-    asyncio.run(
-        _run_service(
-            db_path, client_factory=client_factory, execute=True, notifier=notifier,
-            max_successful_invites=3,
+    with _capture_reports() as reports:
+        asyncio.run(
+            _run_service(
+                db_path, client_factory=client_factory, execute=True, notifier=notifier,
+                max_successful_invites=3,
+            )
         )
-    )
+    assert notifier.sent == []  # рутинные отчёты — только в лог, не оператору
 
     client = created_clients[0]
     assert len(client.call_requests) == 5  # candidates 6..10 не тронуты
@@ -5886,7 +6005,7 @@ def test_execute_test_mode_stop_still_sends_correct_final_stats_notifications(tm
     # pending для этого аккаунта (см. _execute_account) — 3 успешные
     # отправки (candidates 10,7,6) остаются 'pending', 1 подтверждён
     # немедленно (candidate 9, UserAlreadyParticipantError).
-    account_notifications = [m for m in notifier.sent if m.startswith("📨")]
+    account_notifications = [m for m in reports if m.startswith("📨")]
     assert len(account_notifications) == 1
     assert "📤 Отправлено приглашений: 3" in account_notifications[0]
     assert "✅ Подтверждено участников: 1" in account_notifications[0]
@@ -5897,7 +6016,7 @@ def test_execute_test_mode_stop_still_sends_correct_final_stats_notifications(tm
     # (failure_kind=user_state) и не возвращается в очередь сразу же.
     assert "Осталось кандидатов: 5" in account_notifications[0]
 
-    campaign_notifications = [m for m in notifier.sent if "Итоги кампании" in m]
+    campaign_notifications = [m for m in reports if "Итоги кампании" in m]
     assert len(campaign_notifications) == 1
     assert "📤 Отправлено приглашений: 3" in campaign_notifications[0]
     assert "✅ Подтверждено участников: 1" in campaign_notifications[0]
