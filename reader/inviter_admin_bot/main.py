@@ -16,6 +16,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from dotenv import load_dotenv
 from telethon import TelegramClient
 
+from reader.dm_campaigns.repository import DmCampaignRepository
+from reader.groups import load_groups
 from reader.inviter.repository import (
     InviteCampaignRepository,
     TelegramAccountRepository,
@@ -29,6 +31,7 @@ from reader.inviter_admin_bot.conversation import AdminBotController
 from reader.inviter_admin_bot.conversation_state_repository import (
     AdminBotConversationStateRepository,
 )
+from reader.inviter_admin_bot.dm_campaign_controller import DmCampaignController
 from reader.inviter_admin_bot.handlers import register
 from reader.inviter.lead_pool import CampaignLeadRepository
 from reader.inviter_admin_bot.service import InviterAdminService
@@ -103,9 +106,19 @@ async def run() -> None:
     auth_coordinator = AccountAuthCoordinator(
         account_client_factory, account_repository, sessions_dir=_ACCOUNT_SESSIONS_DIR,
     )
+    # "✉️ ЛС-кампании" — только конфигурация (Phase 1): те же users.db и
+    # telegram_accounts, группы — из того же groups.yaml, что и у Reader
+    # (перечитывается на каждом открытии экрана, без перезапуска бота).
+    dm_campaign_repository = DmCampaignRepository(settings.app.users_db_file)
+    dm_campaigns = DmCampaignController(
+        dm_campaign_repository, account_repository, conversation_state_repository,
+        is_trusted=service.is_trusted,
+        groups_provider=lambda: load_groups(settings.app.groups_file),
+    )
     controller = AdminBotController(
         service, auth_coordinator, conversation_state_repository,
         sync_client_factory=lambda account: account_client_factory(account.session_path),
+        dm_campaigns=dm_campaigns,
     )
 
     client = TelegramClient(str(_SESSION_PATH), settings.telegram.api_id, settings.telegram.api_hash)
@@ -122,6 +135,7 @@ async def run() -> None:
         runtime_state_repository.close()
         conversation_state_repository.close()
         lead_repository.close()
+        dm_campaign_repository.close()
 
 
 def main() -> None:

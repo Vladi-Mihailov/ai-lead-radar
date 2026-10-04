@@ -7,7 +7,7 @@ Identity — ВСЕГДА event.sender_id (numeric), никогда не usernam
 
 import logging
 
-from telethon import TelegramClient, events
+from telethon import Button, TelegramClient, events
 
 from reader.inviter_admin_bot.conversation import AdminBotController
 from reader.inviter_admin_bot.keyboards import (
@@ -55,6 +55,13 @@ def register(client: TelegramClient, controller: AdminBotController) -> None:
     @client.on(events.CallbackQuery(func=lambda e: e.is_private))
     async def _on_callback(event: events.CallbackQuery.Event) -> None:
         data = event.data
+
+        # "✉️ ЛС-кампании" — собственный namespace dmc_ (см.
+        # dm_campaign_callbacks.py); None — не наш callback.
+        dm_reply = controller.handle_dm_callback(data, chat_id=event.chat_id, telegram_user_id=event.sender_id)
+        if dm_reply is not None:
+            await _answer_and_send(event, dm_reply)
+            return
 
         if data == ACCOUNTS_BACK:
             reply = controller.handle_accounts_back(telegram_user_id=event.sender_id)
@@ -178,8 +185,11 @@ async def _answer_and_send(event, reply) -> None:
 
 async def _send_reply(event, reply, *, prefer_edit: bool = False) -> None:
     buttons = None
+    inline_rows = getattr(reply, "inline_rows", None)
     if reply.show_main_menu:
         buttons = main_menu_keyboard()
+    elif inline_rows is not None:
+        buttons = [[Button.inline(label, data) for label, data in row] for row in inline_rows]
     elif reply.show_cancel_button:
         buttons = cancel_keyboard()
     elif reply.accounts_page_options is not None:

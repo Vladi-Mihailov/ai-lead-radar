@@ -12,6 +12,7 @@ MVP: список аккаунтов БЕЗ пагинации (см. design rep
 
 from telethon import Button
 
+from reader.inviter_admin_bot.dm_campaign_texts import DM_CAMPAIGNS_LABEL
 from reader.inviter_admin_bot.texts import (
     ACCOUNTS_LABEL,
     ADD_ACCOUNT_LABEL,
@@ -247,7 +248,7 @@ def campaign_card_keyboard(campaign_id: int, *, enabled: bool, has_pool: bool) -
 
 def main_menu_keyboard() -> list[list[Button]]:
     return [
-        [Button.text(CAMPAIGNS_LABEL, resize=True)],
+        [Button.text(CAMPAIGNS_LABEL, resize=True), Button.text(DM_CAMPAIGNS_LABEL, resize=True)],
         [Button.text(ACCOUNTS_LABEL, resize=True), Button.text(ADD_ACCOUNT_LABEL, resize=True)],
         [Button.text(STATUS_LABEL, resize=True), Button.text(SYNC_LABEL, resize=True)],
         [Button.text(HELP_LABEL, resize=True)],

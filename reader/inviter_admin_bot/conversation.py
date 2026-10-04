@@ -12,8 +12,10 @@ callback_data публичны и НЕ являются доказательст
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from reader.inviter.models import TelegramAccount
+from reader.inviter_admin_bot import dm_campaign_texts as dm_texts
 from reader.inviter_admin_bot import texts
 from reader.inviter_admin_bot.auth import AccountAuthCoordinator, TelethonAuthClientLike
 from reader.inviter_admin_bot.conversation_state_repository import (
@@ -26,6 +28,19 @@ STEP_AWAITING_PHONE = "awaiting_phone"
 STEP_AWAITING_CODE = "awaiting_code"
 STEP_AWAITING_PASSWORD = "awaiting_password"
 STEP_AWAITING_MANUAL_LIMIT = "awaiting_manual_limit"
+
+# Шаги FSM раздела "✉️ ЛС-кампании" — те же строки, что и
+# dm_campaign_controller.STEP_AWAITING_DM_* (продублированы здесь, т.к.
+# dm_campaign_controller импортирует BotReply из этого модуля).
+DM_STEPS = frozenset({
+    "awaiting_dm_guideline",
+    "awaiting_dm_resources",
+    "awaiting_dm_follow_up_guideline",
+    "awaiting_dm_account_limit",
+})
+
+if TYPE_CHECKING:
+    from reader.inviter_admin_bot.dm_campaign_controller import DmCampaignController
 
 
 @dataclass
@@ -45,6 +60,10 @@ class BotReply:
     campaign_card_id: int | None = None
     campaign_card_enabled: bool | None = None
     campaign_card_has_pool: bool = False
+    # "✉️ ЛС-кампании" (см. dm_campaign_controller.py): inline-кнопки,
+    # описанные данными [(подпись, callback_data)] — handlers.py строит из
+    # них Button, контроллер о Telethon не знает.
+    inline_rows: list[list[tuple[str, bytes]]] | None = None
 
 
 def _looks_like_phone(text: str) -> bool:
@@ -63,10 +82,14 @@ class AdminBotController:
         state_repository: AdminBotConversationStateRepository,
         *,
         sync_client_factory: Callable[[TelegramAccount], TelethonAuthClientLike],
+        dm_campaigns: "DmCampaignController | None" = None,
     ):
         self._service = service
         self._auth = auth_coordinator
         self._states = state_repository
+        # None — раздел "✉️ ЛС-кампании" не подключён (поведение бота
+        # полностью прежнее), см. dm_campaign_controller.py.
+        self._dm_campaigns = dm_campaigns
         # sync_one_account()/sync_all_accounts() (InviterAdminService) —
         # тот же client_factory(account) приём инъекции, что и у
         # InviterService/reader/inviter/manage.py::sync_accounts (см.
@@ -78,6 +101,13 @@ class AdminBotController:
 
     def is_trusted(self, telegram_user_id: int) -> bool:
         return self._service.is_trusted(telegram_user_id)
+
+    def handle_dm_callback(self, data: bytes | None, *, chat_id: int, telegram_user_id: int) -> BotReply | None:
+        """None — не callback раздела "✉️ ЛС-кампании" (или раздел не
+        подключён); права проверяет сам DmCampaignController."""
+        if self._dm_campaigns is None:
+            return None
+        return self._dm_campaigns.handle_callback(data, chat_id=chat_id, telegram_user_id=telegram_user_id)
 
     def _denied(self) -> BotReply:
         return BotReply(text=texts.ACCESS_DENIED_TEXT)
@@ -107,6 +137,9 @@ class AdminBotController:
         # перенос прежней глобальной паузы в кампании).
         if stripped == texts.CAMPAIGNS_LABEL:
             return self._format_campaigns_reply()
+        if self._dm_campaigns is not None and stripped == dm_texts.DM_CAMPAIGNS_LABEL:
+            self._states.clear(chat_id)
+            return self._dm_campaigns.handle_menu(telegram_user_id=telegram_user_id)
         if stripped == texts.STATUS_LABEL:
             return BotReply(
                 text=texts.format_account_statuses(
@@ -131,6 +164,10 @@ class AdminBotController:
                 return await self._handle_password_input(stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, payload=state.payload)
             if state.step == STEP_AWAITING_MANUAL_LIMIT:
                 return self._handle_manual_limit_input(stripped, state.payload or {})
+            if self._dm_campaigns is not None and state.step in DM_STEPS:
+                return self._dm_campaigns.handle_state_input(
+                    state, text, chat_id=chat_id, telegram_user_id=telegram_user_id,
+                )
 
         return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
 
