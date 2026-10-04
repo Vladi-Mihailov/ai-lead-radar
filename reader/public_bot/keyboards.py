@@ -44,7 +44,9 @@ from reader.public_bot.texts import (
     DEBT_REFRESH_CONFIRM_BUTTON_LABEL,
     DELETE_CAR_BUTTON_LABEL,
     DELETE_CAR_CONFIRM_BUTTON_LABEL,
+    HELP_LABEL,
     MY_CARS_LABEL,
+    OSAGO_LABEL,
     PROTOCOL_CHECK_BACK_LABEL,
     PROTOCOL_CHECK_LABEL,
     PROTOCOL_CHECK_PROTOCOL_METHOD_LABEL,
@@ -143,6 +145,10 @@ def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
     if is_trusted:
         rows.append([Button.text(STATISTICS_LABEL, resize=True), Button.text(SEARCH_LABEL, resize=True)])
     rows.append([Button.text(PROTOCOL_CHECK_LABEL, resize=True)])
+    # "ℹ️ Справка" | "🛡 ОСАГО Грузия" — последняя строка, видна ВСЕМ
+    # (как и "📸 Проверить протокол"); обе распознаются как текст в
+    # ConversationController._handle_menu_label.
+    rows.append([Button.text(HELP_LABEL, resize=True), Button.text(OSAGO_LABEL, resize=True)])
     return rows
 
 

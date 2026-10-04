@@ -721,6 +721,20 @@ class ConversationController:
             )
             return BotReply(text=texts.PROTOCOL_CHECK_INTRO_TEXT, protocol_check_method_prompt=True)
 
+        if stripped_text == texts.HELP_LABEL:
+            self._clear_state(chat_id)
+            return BotReply(text=texts.HELP_TEXT, show_main_menu=True)
+
+        if stripped_text == texts.OSAGO_LABEL:
+            # Только переход в @OSAGO24GEbot (inline URL-кнопка через
+            # существующий cta_buttons, см. handlers._send_reply) — никакой
+            # логики оформления страховки в этом боте нет.
+            self._clear_state(chat_id)
+            return BotReply(
+                text=texts.OSAGO_LINK_TEXT,
+                cta_buttons=[[(texts.OSAGO_LINK_BUTTON_LABEL, texts.OSAGO_BOT_URL)]],
+            )
+
         return None
 
     def _format_statistics_reply(self, *, debt_page: int = 0) -> BotReply:
