@@ -61,7 +61,21 @@ _TELEGRAM_ACCOUNTS_COLUMN_MIGRATIONS = {
     # аккаунта в reader/inviter_admin_bot/, ни один существующий вызывающий
     # код его не читает/не обязан задавать (NULL — обратная совместимость).
     "last_synced_at": "ALTER TABLE telegram_accounts ADD COLUMN last_synced_at TIMESTAMP",
+    # Phase 3A: независимые права аккаунта (см. TelegramAccount). Default 0 —
+    # новый/неизвестный аккаунт НЕ получает ни ЛС, ни инвайты молча.
+    # is_premium — NULL = неизвестно (живой сессией не проверялось).
+    "can_send_dm": "ALTER TABLE telegram_accounts ADD COLUMN can_send_dm INTEGER NOT NULL DEFAULT 0",
+    "can_invite_to_groups": (
+        "ALTER TABLE telegram_accounts ADD COLUMN can_invite_to_groups INTEGER NOT NULL DEFAULT 0"
+    ),
+    "is_premium": "ALTER TABLE telegram_accounts ADD COLUMN is_premium INTEGER",
 }
+
+# БЕЗ backfill: при добавлении колонок ВСЕ аккаунты (и старые, и новые)
+# получают 0 — никакое право не выдаётся молча. Реальный inviter pool
+# получает can_invite_to_groups=1 только явной, проверяемой командой
+# "python -m reader.inviter.manage set-capabilities ... --apply" (или в
+# admin-боте с подтверждением).
 
 # DB-level защита от повторения production-дублей (см. задачу про id=6/7,
 # id=8/9: тот же telegram_user_id, два CURRENT (is_old=0) одновременно
@@ -533,7 +547,7 @@ class TelegramAccountRepository:
         "daily_limit", "enabled", "last_used_at",
         "blocked_until", "blocked_reason", "verify_membership",
         "telegram_user_id", "is_old", "old_reason", "previous_names",
-        "last_synced_at",
+        "last_synced_at", "can_send_dm", "can_invite_to_groups", "is_premium",
     )
 
     def __init__(self, db_path: Path):
@@ -603,15 +617,22 @@ class TelegramAccountRepository:
         is_old: bool = False,
         old_reason: str | None = None,
         previous_names: list[str] | None = None,
+        can_send_dm: bool = False,
+        can_invite_to_groups: bool = False,
+        is_premium: bool | None = None,
     ) -> TelegramAccount:
+        """can_send_dm/can_invite_to_groups — False по умолчанию: новый
+        аккаунт не получает ни одного права молча (Phase 3A)."""
         cursor = self._conn.execute(
             """
             INSERT INTO telegram_accounts (
                 name, phone, session_name, session_path, daily_limit, enabled,
-                verify_membership, telegram_user_id, is_old, old_reason, previous_names
+                verify_membership, telegram_user_id, is_old, old_reason, previous_names,
+                can_send_dm, can_invite_to_groups, is_premium
             ) VALUES (
                 :name, :phone, :session_name, :session_path, :daily_limit, :enabled,
-                :verify_membership, :telegram_user_id, :is_old, :old_reason, :previous_names
+                :verify_membership, :telegram_user_id, :is_old, :old_reason, :previous_names,
+                :can_send_dm, :can_invite_to_groups, :is_premium
             )
             """,
             {
@@ -626,6 +647,9 @@ class TelegramAccountRepository:
                 "is_old": is_old,
                 "old_reason": old_reason,
                 "previous_names": _format_previous_names(previous_names or []),
+                "can_send_dm": int(bool(can_send_dm)),
+                "can_invite_to_groups": int(bool(can_invite_to_groups)),
+                "is_premium": None if is_premium is None else int(bool(is_premium)),
             },
         )
         self._conn.commit()
@@ -667,7 +691,7 @@ class TelegramAccountRepository:
             SELECT id, name, phone, session_name, session_path, daily_limit,
                    enabled, created_at, last_used_at, blocked_until, blocked_reason,
                    verify_membership, telegram_user_id, is_old, old_reason, previous_names,
-                   last_synced_at
+                   last_synced_at, can_send_dm, can_invite_to_groups, is_premium
             FROM telegram_accounts WHERE id = ?
             """,
             (account_id,),
@@ -680,7 +704,7 @@ class TelegramAccountRepository:
             SELECT id, name, phone, session_name, session_path, daily_limit,
                    enabled, created_at, last_used_at, blocked_until, blocked_reason,
                    verify_membership, telegram_user_id, is_old, old_reason, previous_names,
-                   last_synced_at
+                   last_synced_at, can_send_dm, can_invite_to_groups, is_premium
             FROM telegram_accounts ORDER BY id
             """
         ).fetchall()
@@ -695,7 +719,7 @@ def _row_to_account(row) -> TelegramAccount:
         id_, name, phone, session_name, session_path, daily_limit,
         enabled, created_at, last_used_at, blocked_until, blocked_reason,
         verify_membership, telegram_user_id, is_old, old_reason, previous_names,
-        last_synced_at,
+        last_synced_at, can_send_dm, can_invite_to_groups, is_premium,
     ) = row
     return TelegramAccount(
         id=id_,
@@ -715,6 +739,9 @@ def _row_to_account(row) -> TelegramAccount:
         old_reason=old_reason,
         previous_names=_parse_previous_names(previous_names),
         last_synced_at=_parse_datetime(last_synced_at),
+        can_send_dm=bool(can_send_dm),
+        can_invite_to_groups=bool(can_invite_to_groups),
+        is_premium=None if is_premium is None else bool(is_premium),
     )
 
 

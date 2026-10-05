@@ -184,6 +184,21 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
 
+    set_caps = subparsers.add_parser(
+        "set-capabilities",
+        help=(
+            "Phase 3A: явно задать права аккаунта (ЛС / инвайты) по id. Без --apply — "
+            "только показывает было/будет. Не указанное право не меняется."
+        ),
+    )
+    set_caps.add_argument("--account-id", type=int, required=True, action="append",
+                          help="id из list-accounts; можно указать несколько раз.")
+    set_caps.add_argument("--invite", action=argparse.BooleanOptionalAction, default=None,
+                          help="can_invite_to_groups (--invite / --no-invite).")
+    set_caps.add_argument("--dm", action=argparse.BooleanOptionalAction, default=None,
+                          help="can_send_dm (--dm / --no-dm).")
+    set_caps.add_argument("--apply", action="store_true")
+
     subparsers.add_parser(
         "list-accounts",
         help="Показать все аккаунты инвайтера и их флаги (enabled, verify_membership, daily_limit, blocked_until).",
@@ -643,7 +658,8 @@ def _format_current_old_line(account: TelegramAccount) -> str:
     suffix = f" (previously: {', '.join(account.previous_names)})" if account.previous_names else ""
     return (
         f"id={account.id} {account.name} TG_ID={account.telegram_user_id} "
-        f"{state} enabled={int(account.enabled)}{suffix}"
+        f"{state} enabled={int(account.enabled)} invite={int(account.can_invite_to_groups)} "
+        f"dm={int(account.can_send_dm)}{suffix}"
     )
 
 
@@ -697,6 +713,39 @@ async def _run_build_lead_pool(settings: Settings, args) -> None:
         await client.disconnect()
 
 
+def set_capabilities(db_path, account_ids: list[int], *, invite: bool | None, dm: bool | None,
+                     apply: bool) -> list[str]:
+    """Phase 3A: меняет ТОЛЬКО can_invite_to_groups/can_send_dm указанных
+    аккаунтов (None — не трогать). OLD-запись никогда не получает право
+    (fail-closed). Без apply — ничего не пишет, только было/будет."""
+    if invite is None and dm is None:
+        raise SystemExit("Укажите --invite/--no-invite и/или --dm/--no-dm")
+    repository = TelegramAccountRepository(db_path)
+    lines = []
+    try:
+        for account_id in account_ids:
+            account = repository.get(account_id)
+            if account is None:
+                raise SystemExit(f"Аккаунт id={account_id} не найден")
+            if account.is_old and (invite or dm):
+                raise SystemExit(f"id={account_id} {account.name} — OLD-запись, права не выдаются")
+            fields = {}
+            if invite is not None:
+                fields["can_invite_to_groups"] = invite
+            if dm is not None:
+                fields["can_send_dm"] = dm
+            after = repository.update(account_id, **fields) if apply else None
+            lines.append(
+                f"{'APPLIED' if apply else 'DRY RUN'} id={account_id} {account.name}: "
+                f"invite {int(account.can_invite_to_groups)}->{int(fields.get('can_invite_to_groups', account.can_invite_to_groups))} "
+                f"dm {int(account.can_send_dm)}->{int(fields.get('can_send_dm', account.can_send_dm))}"
+                + (f" (stored: invite={int(after.can_invite_to_groups)} dm={int(after.can_send_dm)})" if after else "")
+            )
+    finally:
+        repository.close()
+    return lines
+
+
 def main() -> None:
     args = _parse_args(sys.argv[1:])
     try:
@@ -714,6 +763,11 @@ def main() -> None:
                 f"daily_limit={account.daily_limit}, enabled={account.enabled}, "
                 f"verify_membership={account.verify_membership})"
             )
+        elif args.command == "set-capabilities":
+            for line in set_capabilities(
+                settings.app.users_db_file, args.account_id, invite=args.invite, dm=args.dm, apply=args.apply,
+            ):
+                print(line)
         elif args.command == "list-accounts":
             accounts = list_accounts(settings.app.users_db_file)
             if not accounts:

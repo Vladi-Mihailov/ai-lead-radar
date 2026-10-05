@@ -528,6 +528,20 @@ def _format_account_stopped_notification(account: TelegramAccount, reason: str) 
     )
 
 
+def _invite_capability_denied(account: TelegramAccount) -> bool:
+    """Серверная защита Phase 3A: аккаунт без can_invite_to_groups (например,
+    DM-only аккаунт менеджера) не приглашает НИКОГДА — даже если его
+    передали во внутренний метод напрямую, в обход отбора в run()/worker.
+    Отказ безопасный: ни подключения, ни RPC, ни записи в историю."""
+    if account.can_invite_to_groups:
+        return False
+    logger.warning(
+        "[INVITER] Аккаунт %s (id=%s) без права инвайтов (can_invite_to_groups=0) — пропущен",
+        account.name, account.id,
+    )
+    return True
+
+
 def _is_blocked_by_flood_wait(account: TelegramAccount, now: datetime) -> bool:
     """enabled=False (аккаунт отключён оператором) и blocked_until
     (временное ограничение самого Telegram, см. _persist_flood_wait_block)
@@ -991,7 +1005,9 @@ class InviterService:
             ]
         else:
             campaigns = [c for c in self._campaign_repository.list() if c.enabled]
-        accounts = [a for a in self._account_repository.list() if a.enabled]
+        # Только аккаунты с правом инвайтов (Phase 3A): DM-only аккаунты сюда
+        # не попадают ни в обычном, ни в тестовом (--test) прогоне.
+        accounts = [a for a in self._account_repository.list() if a.enabled and a.can_invite_to_groups]
 
         if not accounts:
             return
@@ -1090,6 +1106,8 @@ class InviterService:
         просто попробует этот же (campaign, account) снова в следующий
         свой черёд по кругу (см. задачу: "никаких искусственных попыток
         догнать пропущенную квоту")."""
+        if _invite_capability_denied(account):
+            return None
         hourly_sent = self._invite_repository.count_recent_sent(
             account.id, datetime.now(timezone.utc) - timedelta(hours=1),
         )
@@ -1115,6 +1133,8 @@ class InviterService:
         одного аккаунта (например, обрыв подключения) не должно прерывать
         обработку остальных аккаунтов (см. InviterService.run()), поэтому
         любая ошибка здесь только логируется."""
+        if _invite_capability_denied(account):
+            return
         if not candidates:
             return
 
@@ -1326,6 +1346,8 @@ class InviterService:
         ВСЕГДА текущее фактическое число pending в БД для этого аккаунта и
         кампании (а не накопленный счётчик), независимо от того, как
         далеко продвинулось выполнение в этот раз."""
+        if _invite_capability_denied(account):
+            return None
         now = datetime.now(timezone.utc)
         if _is_blocked_by_flood_wait(account, now):
             logger.info(_format_blocked_account_message(account, now))
@@ -1900,7 +1922,10 @@ class InviterService:
         if kind == "unresolved":
             tried = self._invite_repository.unresolved_account_ids(candidate.user_id, campaign.id)
             tried.add(account.id)
-            active = {a.id for a in self._account_repository.list() if a.enabled and not a.is_old}
+            active = {
+                a.id for a in self._account_repository.list()
+                if a.enabled and not a.is_old and a.can_invite_to_groups
+            }
             if active and active <= tried:
                 return "invalid", "invalid", None
             return "failed", classification.stat_field, now + _UNRESOLVED_RETRY_DELAY

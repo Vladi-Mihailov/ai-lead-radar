@@ -453,6 +453,7 @@ def build_dm_outreach_components(
         interval_seconds=dm.draft_processor_interval_seconds,
         drafting_recovery_seconds=dm.drafting_recovery_seconds,
         retention_hours=dm.recent_message_retention_hours,
+        group_resource_regions={str(g.identifier): g.resource_region for g in groups},
     )
     return observer, processor, [campaign_repository, outreach_repository, recent_repository]
 
