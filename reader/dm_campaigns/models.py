@@ -23,6 +23,16 @@ MAX_LIST_ITEM_LENGTH = 100
 DAILY_LIMIT_MIN = 1
 DAILY_LIMIT_MAX = 50
 
+# Режим кампании. manual — каждый черновик проходит через оператора
+# (✅ Отправить / ✏️ Изменить / ⏭ Пропустить в inviter_admin_bot). auto —
+# зарезервированное будущее значение: сейчас НЕ реализовано и не может быть
+# установлено (см. DmCampaignRepository.set_mode). Ни один режим сам по себе
+# ничего не отправляет — отправки в Telegram в коде пока нет вовсе.
+MODE_MANUAL = "manual"
+MODE_AUTO = "auto"
+CAMPAIGN_MODES = (MODE_MANUAL, MODE_AUTO)
+IMPLEMENTED_MODES = frozenset({MODE_MANUAL})
+
 
 @dataclass(frozen=True)
 class DmCampaign:
@@ -44,6 +54,7 @@ class DmCampaign:
     follow_up_guideline: str | None
     created_at: datetime
     updated_at: datetime
+    mode: str = MODE_MANUAL
 
 
 @dataclass(frozen=True)

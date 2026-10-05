@@ -10,12 +10,16 @@ UNIQUE(source_chat_id, source_message_id) — ГЛОБАЛЬНЫЙ, не по к
 не создают второй кандидат).
 
 Статусы Phase 2: pending_context, drafting, draft, filtered, failed.
+Ручной режим (оператор в inviter_admin_bot): draft -> approved | skipped —
+атомарно (UPDATE ... WHERE status='draft', rowcount): один черновик не
+может быть обработан дважды. approved — только решение оператора: отправки
+в Telegram здесь нет (появится вместе с выбором отправителя, Phase 3B).
 Время — ISO-строки UTC (тот же формат, что и в recent_messages.py)."""
 
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from reader.dm_campaigns.recent_messages import format_time, parse_time
@@ -26,6 +30,12 @@ STATUS_DRAFTING = "drafting"
 STATUS_DRAFT = "draft"
 STATUS_FILTERED = "filtered"
 STATUS_FAILED = "failed"
+STATUS_APPROVED = "approved"
+STATUS_SKIPPED = "skipped"
+
+# Предел текста черновика после правки оператором (лимит сообщения
+# Telegram — 4096, оставлен запас).
+MAX_EDITED_TEXT = 3500
 
 _SCHEMA = (
     """
@@ -70,7 +80,8 @@ _COLUMNS = (
     "source_message_at, source_link, source_reply_to_msg_id, recipient_user_id, recipient_username, "
     "source_text, status, draft_after_at, attempts, context_json, primary_text, follow_up_text, "
     "evidence_strength, used_context_refs_json, filter_reason, error_kind, error, created_at, "
-    "updated_at, generated_at, sendability, contact_require_premium"
+    "updated_at, generated_at, sendability, contact_require_premium, original_primary_text, edited_by, "
+    "edited_at, reviewed_by, reviewed_at, operator_notified_at"
 )
 
 # Аддитивные колонки для таблиц, созданных до Phase 2.6 (строки-старожилы
@@ -78,6 +89,15 @@ _COLUMNS = (
 _COLUMN_MIGRATIONS = (
     ("sendability", "TEXT NOT NULL DEFAULT 'unresolved'"),
     ("contact_require_premium", "INTEGER"),
+    # Ручной режим: исходный AI-текст (заполняется при первой правке),
+    # кто/когда правил, кто/когда одобрил или пропустил (telegram user id
+    # оператора), когда карточка разослана операторам.
+    ("original_primary_text", "TEXT"),
+    ("edited_by", "INTEGER"),
+    ("edited_at", "TEXT"),
+    ("reviewed_by", "INTEGER"),
+    ("reviewed_at", "TEXT"),
+    ("operator_notified_at", "TEXT"),
 )
 
 # Сколько раз кандидат может быть забран обработчиком (включая повторы
@@ -121,6 +141,12 @@ class DmOutreach:
     # хранится: он привязан к читающему аккаунту и отправителю бесполезен.
     sendability: str = SENDABILITY_UNRESOLVED
     contact_require_premium: bool | None = None
+    original_primary_text: str | None = None
+    edited_by: int | None = None
+    edited_at: datetime | None = None
+    reviewed_by: int | None = None
+    reviewed_at: datetime | None = None
+    operator_notified_at: datetime | None = None
 
 
 def _opt_time(value: str | None) -> datetime | None:
@@ -133,7 +159,8 @@ def _row(row) -> DmOutreach:
         source_message_at, source_link, source_reply_to_msg_id, recipient_user_id, recipient_username,
         source_text, status, draft_after_at, attempts, context_json, primary_text, follow_up_text,
         evidence_strength, used_context_refs_json, filter_reason, error_kind, error, created_at,
-        updated_at, generated_at, sendability, contact_require_premium,
+        updated_at, generated_at, sendability, contact_require_premium, original_primary_text, edited_by,
+        edited_at, reviewed_by, reviewed_at, operator_notified_at,
     ) = row
     return DmOutreach(
         id=id_, campaign_id=campaign_id, source_chat_id=source_chat_id,
@@ -150,6 +177,9 @@ def _row(row) -> DmOutreach:
         generated_at=_opt_time(generated_at),
         sendability=sendability or SENDABILITY_UNRESOLVED,
         contact_require_premium=None if contact_require_premium is None else bool(contact_require_premium),
+        original_primary_text=original_primary_text, edited_by=edited_by, edited_at=_opt_time(edited_at),
+        reviewed_by=reviewed_by, reviewed_at=_opt_time(reviewed_at),
+        operator_notified_at=_opt_time(operator_notified_at),
     )
 
 
@@ -167,6 +197,14 @@ class DmOutreachRepository:
         for column, definition in _COLUMN_MIGRATIONS:
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE dm_outreach ADD COLUMN {column} {definition}")
+        if "operator_notified_at" not in existing:
+            # Один раз, при появлении ручного режима: строки, созданные ДО
+            # него, считаются уже разосланными — после деплоя операторам не
+            # прилетает накопленный backlog (в очереди "🆕 Новые" они видны).
+            self._conn.execute(
+                "UPDATE dm_outreach SET operator_notified_at = ? WHERE operator_notified_at IS NULL",
+                (format_time(datetime.now(timezone.utc)),),
+            )
         self._conn.commit()
 
     def insert_candidate(
@@ -281,6 +319,73 @@ class DmOutreachRepository:
             outreach_id, now, status=STATUS_FAILED, error_kind=error_kind,
             error=(error or "")[:_MAX_ERROR] or None, context_json=context_json,
         )
+
+    # ---- ручной режим: очередь оператора ----
+
+    def list_by_status(self, status: str, *, limit: int = 10) -> list[DmOutreach]:
+        """Новые сверху (по id)."""
+        rows = self._conn.execute(
+            f"SELECT {_COLUMNS} FROM dm_outreach WHERE status = ? ORDER BY id DESC LIMIT ?", (status, limit),
+        ).fetchall()
+        return [_row(row) for row in rows]
+
+    def count_by_status(self, status: str) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM dm_outreach WHERE status = ?", (status,)).fetchone()[0]
+
+    def _review(self, outreach_id: int, status: str, operator_id: int, now: datetime) -> bool:
+        cursor = self._conn.execute(
+            "UPDATE dm_outreach SET status = ?, reviewed_by = ?, reviewed_at = ?, updated_at = ? "
+            "WHERE id = ? AND status = ?",
+            (status, operator_id, format_time(now), format_time(now), outreach_id, STATUS_DRAFT),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
+
+    def approve(self, outreach_id: int, *, operator_id: int, now: datetime) -> bool:
+        """draft -> approved атомарно; False — черновик уже обработан (или
+        его нет). Ничего не отправляет."""
+        return self._review(outreach_id, STATUS_APPROVED, operator_id, now)
+
+    def skip(self, outreach_id: int, *, operator_id: int, now: datetime) -> bool:
+        """draft -> skipped атомарно; False — черновик уже обработан."""
+        return self._review(outreach_id, STATUS_SKIPPED, operator_id, now)
+
+    def edit_primary_text(self, outreach_id: int, text: str, *, operator_id: int, now: datetime) -> bool:
+        """Заменяет видимый пользователю primary_text; исходный AI-текст
+        сохраняется в original_primary_text при ПЕРВОЙ правке и больше не
+        перезаписывается. Только для status='draft'."""
+        cleaned = (text or "").strip()
+        if not cleaned:
+            raise ValueError("Пустой текст.")
+        if len(cleaned) > MAX_EDITED_TEXT:
+            raise ValueError(f"Текст длиннее {MAX_EDITED_TEXT} символов.")
+        cursor = self._conn.execute(
+            "UPDATE dm_outreach SET original_primary_text = COALESCE(original_primary_text, primary_text), "
+            "primary_text = ?, edited_by = ?, edited_at = ?, updated_at = ? WHERE id = ? AND status = ?",
+            (cleaned, operator_id, format_time(now), format_time(now), outreach_id, STATUS_DRAFT),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
+
+    def claim_unnotified_drafts(self, *, now: datetime, generated_after: datetime, limit: int) -> list[DmOutreach]:
+        """Черновики, ещё не разосланные операторам (и не старше
+        generated_after) — помечаются operator_notified_at атомарно по
+        одному: при нескольких рассыльщиках каждый получит свои строки."""
+        rows = self._conn.execute(
+            f"SELECT {_COLUMNS} FROM dm_outreach WHERE status = ? AND operator_notified_at IS NULL "
+            "AND generated_at >= ? ORDER BY id LIMIT ?",
+            (STATUS_DRAFT, format_time(generated_after), limit),
+        ).fetchall()
+        claimed = []
+        for row in rows:
+            cursor = self._conn.execute(
+                "UPDATE dm_outreach SET operator_notified_at = ? WHERE id = ? AND operator_notified_at IS NULL",
+                (format_time(now), row[0]),
+            )
+            if cursor.rowcount == 1:
+                claimed.append(_row(row))
+        self._conn.commit()
+        return claimed
 
     def status_counts(self) -> dict[str, int]:
         return dict(self._conn.execute("SELECT status, COUNT(*) FROM dm_outreach GROUP BY status").fetchall())

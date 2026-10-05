@@ -16,6 +16,7 @@ Group.identifier, что использует Reader)."""
 import logging
 from collections.abc import Callable
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from reader.dm_campaigns.models import DmCampaign, normalize_list_input, same_chat_identifier
 from reader.dm_campaigns.repository import DmCampaignRepository
@@ -24,6 +25,8 @@ from reader.inviter.models import TelegramAccount
 from reader.inviter.repository import TelegramAccountRepository
 from reader.inviter_admin_bot import dm_campaign_callbacks as cb
 from reader.inviter_admin_bot import dm_campaign_texts as texts
+from reader.inviter_admin_bot import dm_draft_callbacks as draft_cb
+from reader.inviter_admin_bot.dm_draft_texts import DRAFTS_LABEL
 from reader.inviter_admin_bot.conversation import BotReply
 from reader.inviter_admin_bot.conversation_state_repository import (
     AdminBotConversationStateRepository,
@@ -32,12 +35,16 @@ from reader.inviter_admin_bot.conversation_state_repository import (
 from reader.inviter_admin_bot.texts import ACCESS_DENIED_TEXT
 from reader.time_display import format_tbilisi
 
+if TYPE_CHECKING:
+    from reader.inviter_admin_bot.dm_draft_controller import DmDraftController
+
 logger = logging.getLogger(__name__)
 
 STEP_AWAITING_DM_GUIDELINE = "awaiting_dm_guideline"
 STEP_AWAITING_DM_RESOURCES = "awaiting_dm_resources"
 STEP_AWAITING_DM_FOLLOW_UP = "awaiting_dm_follow_up_guideline"
 STEP_AWAITING_DM_ACCOUNT_LIMIT = "awaiting_dm_account_limit"
+STEP_AWAITING_DM_DRAFT_EDIT = "awaiting_dm_draft_edit"  # обрабатывает DmDraftController
 
 # conversation.DM_STEPS — то, по чему AdminBotController передаёт ввод
 # сюда; обязан совпадать с шагами выше (проверяется тестом).
@@ -77,8 +84,11 @@ class DmCampaignController:
         *,
         is_trusted: Callable[[int], bool],
         groups_provider: Callable[[], list[Group]],
+        drafts: "DmDraftController | None" = None,
     ):
         self._repository = repository
+        # "📨 Черновики" (ручная проверка черновиков); None — раздела нет.
+        self._drafts = drafts
         self._accounts = account_repository
         self._states = state_repository
         self._is_trusted = is_trusted
@@ -106,6 +116,8 @@ class DmCampaignController:
             [(f"{texts.state_icon(c.enabled)} {c.title}", cb.encode(cb.ACTION_OPEN, c.id))]
             for c in campaigns
         ]
+        if self._drafts is not None:
+            rows.append([(DRAFTS_LABEL, draft_cb.MENU)])
         return BotReply(text=text, inline_rows=rows)
 
     def _not_found(self) -> BotReply:
@@ -222,7 +234,9 @@ class DmCampaignController:
     def handle_callback(self, data: bytes, *, chat_id: int, telegram_user_id: int) -> BotReply | None:
         """None — это не callback раздела ЛС-кампаний (handlers.py
         продолжит обычную цепочку). Повреждённый/неизвестный dmc_-callback —
-        "кнопка устарела" и список кампаний."""
+        "кнопка устарела" и список кампаний. dmd_ — "📨 Черновики"."""
+        if self._drafts is not None and draft_cb.is_draft_callback(data):
+            return self._drafts.handle_callback(data, chat_id=chat_id, telegram_user_id=telegram_user_id)
         if not cb.is_dm_callback(data):
             return None
         if not self._is_trusted(telegram_user_id):
@@ -336,6 +350,11 @@ class DmCampaignController:
     ) -> BotReply:
         if not self._is_trusted(telegram_user_id):
             return self._denied()
+        if state.step == STEP_AWAITING_DM_DRAFT_EDIT:
+            if self._drafts is None:
+                self._states.clear(chat_id)
+                return self._list_reply(prefix=texts.STALE_BUTTON_TEXT)
+            return self._drafts.handle_state_input(state, text, chat_id=chat_id, telegram_user_id=telegram_user_id)
         payload = state.payload or {}
         campaign = self._repository.get_campaign(payload.get("campaign_id")) if payload.get("campaign_id") else None
         if campaign is None:

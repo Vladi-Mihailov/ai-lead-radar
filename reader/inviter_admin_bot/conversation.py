@@ -37,6 +37,7 @@ DM_STEPS = frozenset({
     "awaiting_dm_resources",
     "awaiting_dm_follow_up_guideline",
     "awaiting_dm_account_limit",
+    "awaiting_dm_draft_edit",
 })
 
 if TYPE_CHECKING:

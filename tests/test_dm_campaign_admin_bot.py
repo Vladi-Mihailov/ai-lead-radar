@@ -191,7 +191,10 @@ def test_dm_steps_match_conversation_routing():
         dm_campaign_controller.STEP_AWAITING_DM_RESOURCES,
         dm_campaign_controller.STEP_AWAITING_DM_FOLLOW_UP,
         dm_campaign_controller.STEP_AWAITING_DM_ACCOUNT_LIMIT,
+        dm_campaign_controller.STEP_AWAITING_DM_DRAFT_EDIT,
     }
+    from reader.inviter_admin_bot.dm_draft_controller import STEP_AWAITING_DM_DRAFT_EDIT
+    assert STEP_AWAITING_DM_DRAFT_EDIT == dm_campaign_controller.STEP_AWAITING_DM_DRAFT_EDIT
 
 
 # ---- карточка / вкл-выкл ----

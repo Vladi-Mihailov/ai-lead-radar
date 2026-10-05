@@ -141,7 +141,9 @@ class DmDraftProcessor:
         # вопроса (исходное сообщение + то, на что оно отвечает), см. resources.py.
         region = self._group_regions.get((row.source_chat_identifier or "").lstrip("@").lower(), REGION_UNKNOWN)
         intent_text = " ".join([row.source_text] + [i.text for i in context.discussion if i.ref.startswith("R")])
-        resources = allowed_resources(campaign.resources, resource_region=region, intent_text=intent_text)
+        resources = allowed_resources(
+            campaign.resources, resource_region=region, intent_text=intent_text, campaign_key=campaign.key,
+        )
 
         started = time.monotonic()
         try:

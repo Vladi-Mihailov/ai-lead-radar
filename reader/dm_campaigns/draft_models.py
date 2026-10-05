@@ -64,6 +64,16 @@ _TROUBLESHOOTING_RE = re.compile(
 )
 
 
+# Вычисленный относительный возраст ("35 минут назад", "за последний час") —
+# устареет, пока оператор проверяет черновик: такой черновик отклоняется.
+_RELATIVE_TIME_RE = re.compile(
+    r"(?<!\w)(?:~?\s*\d+(?:\s*[–—-]\s*\d+)?\s*(?:мин\.?|минут\w*|ч\.|час\w*)|минут\w*|час(?:а|ов)?|полчаса"
+    r"|полтора\s+часа)\s+назад"
+    r"|за\s+последн\w*\s+[^.!?\n]{0,20}?(?:мин\.?|минут\w*|час\w*|полчаса|полтора\s+часа)",
+    re.IGNORECASE,
+)
+
+
 def _strip_ref_groups(text: str, valid_refs: frozenset[str]) -> str:
     def drop(match: re.Match) -> str:
         refs = re.findall(_REF, match.group(0))
@@ -82,6 +92,8 @@ def _text_problem(text: str, valid_refs: frozenset[str]) -> str | None:
         return "context_mention"
     if _TROUBLESHOOTING_RE.search(text):
         return "unsupported_troubleshooting"
+    if _RELATIVE_TIME_RE.search(text):
+        return "relative_time"
     return None
 
 
