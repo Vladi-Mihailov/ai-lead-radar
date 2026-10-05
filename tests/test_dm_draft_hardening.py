@@ -180,7 +180,9 @@ async def test_every_sendability_reaches_draft_without_sender(env, username, pre
     conn = sqlite3.connect(path)
     columns = {r[1] for r in conn.execute("PRAGMA table_info(dm_outreach)")}
     conn.close()
-    assert not {"sender_account_id", "assigned_sender", "sender_session", "access_hash"} & (columns | set(vars(row)))
+    assert not {"assigned_sender", "sender_session", "access_hash"} & (columns | set(vars(row)))
+    # Phase 3C: sender_account_id — аудит отправки; у черновика отправитель не назначен.
+    assert row.sender_account_id is None
 
 
 async def test_leaked_refs_from_the_model_never_become_a_stored_draft(env):

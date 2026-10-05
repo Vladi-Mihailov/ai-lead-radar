@@ -313,6 +313,13 @@ class DmCampaignController:
             return self._accounts_reply(campaign, notice="⚠️ Не удалось сохранить.")
         return self._accounts_reply(campaign)
 
+    async def handle_send(self, data: bytes, *, telegram_user_id: int) -> BotReply | None:
+        """"✅ Да, отправить" — единственный путь к реальной отправке ЛС
+        (асинхронно, см. handlers.py). None — не этот callback."""
+        if self._drafts is None or not draft_cb.is_send_callback(data):
+            return None
+        return await self._drafts.handle_send(data, telegram_user_id=telegram_user_id)
+
     # ---- FSM ----
 
     def _start_text_step(

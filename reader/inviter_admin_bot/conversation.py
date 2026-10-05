@@ -115,6 +115,13 @@ class AdminBotController:
             return None
         return self._dm_campaigns.handle_callback(data, chat_id=chat_id, telegram_user_id=telegram_user_id)
 
+    async def handle_dm_send(self, data: bytes | None, *, telegram_user_id: int) -> BotReply | None:
+        """"✅ Да, отправить" (реальная отправка ЛС); None — не этот callback
+        или раздел не подключён. Права проверяет DmDraftController."""
+        if self._dm_campaigns is None or not data:
+            return None
+        return await self._dm_campaigns.handle_send(data, telegram_user_id=telegram_user_id)
+
     def _denied(self) -> BotReply:
         return BotReply(text=texts.ACCESS_DENIED_TEXT)
 

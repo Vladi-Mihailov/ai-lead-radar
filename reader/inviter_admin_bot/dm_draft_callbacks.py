@@ -1,10 +1,14 @@
-"""callback_data раздела "📨 Черновики" (ручная проверка ЛС-черновиков) —
-собственный namespace "dmd_", не пересекающийся с "dmc_" (настройки
-ЛС-кампаний) и остальными префиксами inviter_admin_bot.
+"""callback_data раздела "📨 Черновики" (ручная проверка и отправка
+ЛС-черновиков) — собственный namespace "dmd_", не пересекающийся с "dmc_"
+(настройки ЛС-кампаний) и остальными префиксами inviter_admin_bot.
 
 callback_data несёт только id строки dm_outreach / ключ очереди — права
 оператора и текущий статус черновика проверяются server-side на каждом
-нажатии (см. DmDraftController): сам callback авторизацией не является."""
+нажатии (см. DmDraftController): сам callback авторизацией не является.
+
+ok — "✅ Отправить" (только проверки + экран подтверждения, без сети);
+send — "✅ Да, отправить" (единственный callback, ведущий к Telegram RPC;
+обрабатывается асинхронно, см. handlers.py)."""
 
 from dataclasses import dataclass
 
@@ -15,17 +19,21 @@ MENU = b"dmd_menu"
 ACTION_QUEUE = "q"
 ACTION_OPEN = "open"
 ACTION_APPROVE = "ok"
+ACTION_SEND = "send"
 ACTION_EDIT = "edit"
 ACTION_SKIP = "skip"
 
 QUEUE_NEW = "new"
-QUEUE_APPROVED = "approved"
+QUEUE_SENT = "sent"
+QUEUE_NOT_SENT = "notsent"
 QUEUE_SKIPPED = "skipped"
 QUEUE_FAILED = "failed"
-QUEUES = (QUEUE_NEW, QUEUE_APPROVED, QUEUE_SKIPPED, QUEUE_FAILED)
+QUEUE_APPROVED = "approved"  # решения до Phase 3C — не отправлялись и не отправляются
+QUEUES = (QUEUE_NEW, QUEUE_SENT, QUEUE_NOT_SENT, QUEUE_SKIPPED, QUEUE_FAILED, QUEUE_APPROVED)
 
-_WITH_ID = frozenset({ACTION_OPEN, ACTION_APPROVE, ACTION_EDIT, ACTION_SKIP})
+_WITH_ID = frozenset({ACTION_OPEN, ACTION_APPROVE, ACTION_SEND, ACTION_EDIT, ACTION_SKIP})
 _PREFIX = "dmd_"
+_SEND_PREFIX = f"{_PREFIX}{ACTION_SEND}:".encode("ascii")
 
 
 @dataclass(frozen=True)
@@ -37,6 +45,10 @@ class DraftCallback:
 
 def is_draft_callback(data: bytes | None) -> bool:
     return bool(data) and data.startswith(_PREFIX.encode("ascii"))
+
+
+def is_send_callback(data: bytes | None) -> bool:
+    return bool(data) and data.startswith(_SEND_PREFIX)
 
 
 def encode(action: str, *, outreach_id: int | None = None, queue: str | None = None) -> bytes:
