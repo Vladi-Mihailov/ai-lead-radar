@@ -344,6 +344,11 @@ class DmOutreachSettings(BaseModel):
     draft_processor_interval_seconds: float = Field(default=30, gt=0)
     # drafting дольше этого — процесс упал посреди генерации, вернуть в очередь.
     drafting_recovery_seconds: float = Field(default=600, gt=0)
+    # Phase 3C (ручная отправка оператором): одному человеку — не чаще раза
+    # в N дней по ВСЕМ ЛС-кампаниям; и общий потолок успешных ЛС на аккаунт
+    # отправителя за скользящие 24 ч (NULL-лимит кампании — не "без лимита").
+    recipient_cooldown_days: float = Field(default=7, gt=0)
+    sender_daily_cap: int = Field(default=5, ge=1, le=50)
 
 
 class Settings(BaseModel):

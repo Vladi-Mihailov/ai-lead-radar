@@ -185,13 +185,15 @@ async def test_premium_required_candidate_reaches_draft_without_assigned_sender(
     assert await processor.run_once() == 1
     done = outreach.get(row.id)
     assert (done.status, done.filter_reason, done.sendability) == (STATUS_DRAFT, None, SENDABILITY_PREMIUM_REQUIRED)
-    # Phase 2.6: sender не назначается -- ни поля в модели, ни колонки в БД.
+    # Phase 2.6: sender не назначается черновику; access_hash/сессии не хранятся
+    # нигде. Phase 3C: sender_account_id — только аудит отправки (у draft — None).
     fields = set(vars(done))
     conn = sqlite3.connect(path)
     columns = {r[1] for r in conn.execute("PRAGMA table_info(dm_outreach)")}
     conn.close()
-    for forbidden in ("sender_account_id", "assigned_sender", "sender_session", "access_hash"):
+    for forbidden in ("assigned_sender", "sender_session", "access_hash"):
         assert forbidden not in fields and forbidden not in columns
+    assert done.sender_account_id is None
 
 
 # ---- Phase 3 contract: premium_required -> Premium sender only ----

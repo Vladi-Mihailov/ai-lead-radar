@@ -106,7 +106,8 @@ def test_new_draft_appears_in_operator_queue(env):
 
     menu = section.handle_callback(cb.MENU, chat_id=CHAT, telegram_user_id=ADMIN)
     assert "🆕 Новые: 1" in menu.text
-    assert _buttons(menu)[:4] == ["🆕 Новые (1)", "✅ Одобренные (0)", "⏭ Пропущенные (0)", "❌ Ошибки (0)"]
+    assert _buttons(menu)[:6] == ["🆕 Новые (1)", "📤 Отправленные (0)", "⚠️ Не отправлено (0)",
+                                  "⏭ Пропущенные (0)", "❌ Ошибки (0)", "🗄 Одобрены до отправки (не отправлялись) (0)"]
 
     queue = section.handle_callback(cb.encode(cb.ACTION_QUEUE, queue=cb.QUEUE_NEW), chat_id=CHAT, telegram_user_id=ADMIN)
     assert any(label.startswith(f"#{row_id} ") for label in _buttons(queue))
@@ -136,15 +137,15 @@ def test_card_hides_recipient_ids_and_context_refs(env):
 # ---- действия оператора ----
 
 
-def test_trusted_operator_can_approve_without_sending(env):
-    _, campaigns, outreach, _, _, section, clock = env
+def test_approve_without_send_service_sends_nothing(env):
+    """Без подключённого DmSendService "✅ Отправить" ничего не отправляет и
+    статус не меняет (отправка — только через сервис, см. test_dm_send.py)."""
+    _, campaigns, outreach, _, _, section, _ = env
     row_id = _draft(campaigns, outreach)
-    clock.now = T0 + timedelta(minutes=5)
     reply = _press(section, cb.ACTION_APPROVE, row_id)
+    assert texts.NOT_SENT_TEXT in reply.text and "отправка не подключена" in reply.text
     row = outreach.get(row_id)
-    assert (row.status, row.reviewed_by, row.reviewed_at) == (STATUS_APPROVED, ADMIN, clock.now)
-    assert reply.text.startswith(texts.APPROVED_TEXT) and texts.NOT_SENT_NOTE in reply.text
-    assert texts.APPROVE_LABEL not in _buttons(reply)  # больше нечего нажимать
+    assert (row.status, row.sender_account_id, row.send_started_at) == (STATUS_DRAFT, None, None)
 
 
 def test_trusted_operator_can_skip_and_it_leaves_new_queue(env):
@@ -218,15 +219,15 @@ def test_edit_input_rechecks_trust(env):
 # ---- атомарность / повторные нажатия ----
 
 
-def test_double_approve_is_prevented(env):
+def test_double_skip_is_prevented(env):
     _, campaigns, outreach, _, _, section, clock = env
     row_id = _draft(campaigns, outreach)
-    _press(section, cb.ACTION_APPROVE, row_id, user=ADMIN)
+    _press(section, cb.ACTION_SKIP, row_id, user=ADMIN)
     clock.now = T0 + timedelta(minutes=1)
-    second = _press(section, cb.ACTION_APPROVE, row_id, user=ADMIN2)
+    second = _press(section, cb.ACTION_SKIP, row_id, user=ADMIN2)
     assert second.text.startswith(texts.ALREADY_PROCESSED_TEXT)
     row = outreach.get(row_id)
-    assert (row.status, row.reviewed_by, row.reviewed_at) == (STATUS_APPROVED, ADMIN, T0)
+    assert (row.status, row.reviewed_by, row.reviewed_at) == (STATUS_SKIPPED, ADMIN, T0)
 
 
 def test_approve_after_skip_is_rejected(env):
@@ -237,11 +238,15 @@ def test_approve_after_skip_is_rejected(env):
     assert outreach.get(row_id).status == STATUS_SKIPPED
 
 
-def test_skip_after_approve_is_rejected(env):
+def test_legacy_approved_row_cannot_be_skipped_or_sent(env):
+    """approved — решение до Phase 3C: ни ⏭, ни ✅ его не меняют."""
     _, campaigns, outreach, _, _, section, _ = env
     row_id = _draft(campaigns, outreach)
-    _press(section, cb.ACTION_APPROVE, row_id)
+    assert outreach.approve(row_id, operator_id=ADMIN, now=T0)
     assert _press(section, cb.ACTION_SKIP, row_id, user=ADMIN2).text.startswith(texts.ALREADY_PROCESSED_TEXT)
+    assert _press(section, cb.ACTION_APPROVE, row_id, user=ADMIN2).text.startswith(texts.ALREADY_PROCESSED_TEXT)
+    card = _press(section, cb.ACTION_OPEN, row_id)
+    assert texts.LEGACY_APPROVED_NOTE in card.text and texts.APPROVE_LABEL not in _buttons(card)
     assert outreach.get(row_id).status == STATUS_APPROVED
 
 
@@ -358,12 +363,17 @@ def test_manual_mode_never_auto_sends(env):
         campaigns.set_enabled(campaigns.get_campaign_by_key(key).id, True)
     ids = [_draft(campaigns, outreach, key=k, message_id=i) for i, k in enumerate(("insurance", "fuel", "border_queue"), 1)]
     assert [outreach.get(i).status for i in ids] == [STATUS_DRAFT] * 3
-    source = "\n".join(
-        (PROJECT_ROOT / "reader" / "inviter_admin_bot" / name).read_text(encoding="utf-8")
-        for name in ("dm_draft_controller.py", "dm_draft_notifier.py", "dm_draft_texts.py")
-    ) + (PROJECT_ROOT / "reader" / "dm_campaigns" / "outreach_repository.py").read_text(encoding="utf-8")
-    for forbidden in ("send_message", "forward_messages", "SendMessageRequest", "InputPeerUser"):
-        assert forbidden not in source
+    # Phase 3C: единственный модуль с send_message — send_service.py; его не
+    # импортирует ни процесс Reader (генерация), ни рассыльщик карточек.
+    root = PROJECT_ROOT / "reader"
+    for path in (root / "inviter_admin_bot" / "dm_draft_notifier.py", root / "dm_campaigns" / "outreach_repository.py",
+                 root / "dm_campaigns" / "processor.py", root / "dm_campaigns" / "observer.py", root / "main.py"):
+        source = path.read_text(encoding="utf-8")
+        for forbidden in ("send_message(", "forward_messages", "SendMessageRequest", "import send_service",
+                          "dm_campaigns.send_service import", "DmSendService"):
+            assert forbidden not in source, (path.name, forbidden)
+    controller = (root / "inviter_admin_bot" / "dm_draft_controller.py").read_text(encoding="utf-8")
+    assert controller.count("self._send.send(") == 1  # только в handle_send после подтверждения
 
 
 # ---- @tplgee: только по теме автострахования вне insurance ----

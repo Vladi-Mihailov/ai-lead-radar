@@ -10,6 +10,7 @@ import logging
 from telethon import Button, TelegramClient, events
 
 from reader.inviter_admin_bot.conversation import AdminBotController
+from reader.inviter_admin_bot.dm_draft_callbacks import is_send_callback
 from reader.inviter_admin_bot.keyboards import (
     ACCOUNTS_BACK,
     CAMPAIGNS_BACK,
@@ -59,6 +60,15 @@ def register(client: TelegramClient, controller: AdminBotController) -> None:
     @client.on(events.CallbackQuery(func=lambda e: e.is_private))
     async def _on_callback(event: events.CallbackQuery.Event) -> None:
         data = event.data
+
+        # "✅ Да, отправить" — реальная отправка ЛС (Telegram RPC, может
+        # занять несколько секунд): сначала answer, потом результат.
+        if is_send_callback(data):
+            await event.answer("⏳ Отправляем...")
+            send_reply = await controller.handle_dm_send(data, telegram_user_id=event.sender_id)
+            if send_reply is not None:
+                await _send_reply(event, send_reply, prefer_edit=True)
+            return
 
         # "✉️ ЛС-кампании" — собственный namespace dmc_ (см.
         # dm_campaign_callbacks.py); None — не наш callback.

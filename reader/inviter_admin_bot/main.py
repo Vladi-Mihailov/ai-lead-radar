@@ -18,6 +18,11 @@ from telethon import Button, TelegramClient
 
 from reader.dm_campaigns.outreach_repository import DmOutreachRepository
 from reader.dm_campaigns.repository import DmCampaignRepository
+from reader.dm_campaigns.send_service import DmSendService
+from reader.dm_campaigns.sender_client import build_sender_client_factory, build_session_exists
+from reader.dm_campaigns.sender_state import DmSenderStateRepository
+from datetime import timedelta
+
 from reader.groups import load_groups
 from reader.inviter.repository import (
     InviteCampaignRepository,
@@ -115,11 +120,28 @@ async def run() -> None:
     # (перечитывается на каждом открытии экрана, без перезапуска бота).
     dm_campaign_repository = DmCampaignRepository(settings.app.users_db_file)
     # "📨 Черновики" — ручная проверка ЛС-черновиков оператором (✅/✏️/⏭).
-    # ✅ только переводит черновик в approved: отправки ЛС в коде нет.
+    # Phase 3C: реальная отправка ТОЛЬКО по "✅ Да, отправить" trusted-
+    # оператора (DmSendService), фонового отправителя нет.
     dm_outreach_repository = DmOutreachRepository(settings.app.users_db_file)
+    dm_sender_states = DmSenderStateRepository(settings.app.users_db_file)
+    dm_send_service = DmSendService(
+        dm_outreach_repository, dm_campaign_repository, account_repository, dm_sender_states,
+        client_factory=build_sender_client_factory(settings.telegram.api_id, settings.telegram.api_hash, PROJECT_ROOT),
+        session_exists=build_session_exists(PROJECT_ROOT),
+        recipient_cooldown=timedelta(days=settings.dm_outreach.recipient_cooldown_days),
+        sender_daily_cap=settings.dm_outreach.sender_daily_cap,
+    )
+
+    def dm_sender_label(account_id: int) -> str | None:
+        account = account_repository.get(account_id)
+        if account is None:
+            return None
+        return account.name if account.name.startswith("@") else f"аккаунт #{account.id}"
+
     dm_drafts = DmDraftController(
         dm_outreach_repository, dm_campaign_repository, conversation_state_repository,
         is_trusted=service.is_trusted, back_callback=dm_campaign_callbacks.LIST,
+        send_service=dm_send_service, sender_label=dm_sender_label,
     )
     dm_campaigns = DmCampaignController(
         dm_campaign_repository, account_repository, conversation_state_repository,
@@ -154,6 +176,7 @@ async def run() -> None:
         if notifier_task is not None:
             notifier_task.cancel()
         dm_outreach_repository.close()
+        dm_sender_states.close()
         account_repository.close()
         campaign_repository.close()
         invite_repository.close()
