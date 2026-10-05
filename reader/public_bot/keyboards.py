@@ -137,13 +137,16 @@ def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
     распознаётся в ConversationController._handle_menu_label."""
     rows = [
         [Button.text(ADD_CAR_LABEL, resize=True), Button.text(MY_CARS_LABEL, resize=True)],
-        [Button.text(CHECK_NOW_LABEL, resize=True), Button.text(TURKEY_BOT_LINK_LABEL, resize=True)],
+        # ОСАГО выше, межстрановой переход на штрафы ниже (см. задачу
+        # "swap OSAGO and cross-country fines button positions") -- чисто
+        # порядок кнопок, ни один handler/URL/текст не менялся.
+        [Button.text(CHECK_NOW_LABEL, resize=True), Button.text(OSAGO_LABEL, resize=True)],
     ]
     if is_trusted:
         rows.append([Button.text(STATISTICS_LABEL, resize=True), Button.text(SEARCH_LABEL, resize=True)])
-    # "ℹ️ Справка" | "🛡 ОСАГО Грузия" — последняя строка, видна ВСЕМ;
+    # "ℹ️ Справка" | "🇹🇷 Штрафы Турции" — последняя строка, видна ВСЕМ;
     # обе распознаются как текст в ConversationController._handle_menu_label.
-    rows.append([Button.text(HELP_LABEL, resize=True), Button.text(OSAGO_LABEL, resize=True)])
+    rows.append([Button.text(HELP_LABEL, resize=True), Button.text(TURKEY_BOT_LINK_LABEL, resize=True)])
     return rows
 
 

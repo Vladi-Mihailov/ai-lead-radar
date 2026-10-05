@@ -59,17 +59,17 @@ def test_main_menu_keyboard_without_trusted_buttons_by_default():
 
 
 def test_main_menu_keyboard_ordinary_user_is_a_2x2_layout():
-    """Явное требование задачи "унификация UI":
+    """См. задачу "swap OSAGO and cross-country fines button positions":
     ROW 1: ➕ Добавить авто | 📋 Мои авто
-    ROW 2: 🔎 Проверить сейчас | 🇹🇷 Штрафы Турции
-    ROW 3 — "ℹ️ Справка" | "🛡 ОСАГО Грузия", последняя строка.
+    ROW 2: 🔎 Проверить сейчас | 🛡 ОСАГО Грузия
+    ROW 3 — "ℹ️ Справка" | "🇹🇷 Штрафы Турции", последняя строка.
     "📸 Проверить протокол" в меню скрыта (flow не удалён)."""
     keyboard = main_menu_keyboard(is_trusted=False)
 
     assert len(keyboard) == 3
     assert [b.button.text for b in keyboard[0]] == [ADD_CAR_LABEL, MY_CARS_LABEL]
-    assert [b.button.text for b in keyboard[1]] == [CHECK_NOW_LABEL, TURKEY_BOT_LINK_LABEL]
-    assert [b.button.text for b in keyboard[2]] == [HELP_LABEL, OSAGO_LABEL]
+    assert [b.button.text for b in keyboard[1]] == [CHECK_NOW_LABEL, OSAGO_LABEL]
+    assert [b.button.text for b in keyboard[2]] == [HELP_LABEL, TURKEY_BOT_LINK_LABEL]
     assert PROTOCOL_CHECK_LABEL not in _labels(keyboard)
 
 
@@ -84,15 +84,16 @@ def test_main_menu_keyboard_includes_trusted_buttons_for_trusted_operator():
 def test_main_menu_keyboard_manager_puts_statistics_and_search_in_one_row():
     """См. задачу "manager/trusted Search": ROW 3 = 📊 Статистика |
     🔎 Поиск (одна строка, не две отдельные) — заменяет бывшую "⛔
-    Остановить мониторинг". ROW 4 — "ℹ️ Справка" | "🛡 ОСАГО Грузия", тоже
-    для всех. "📸 Проверить протокол" в меню скрыта (flow не удалён)."""
+    Остановить мониторинг". ROW 2/ROW 4 OSAGO/Turkey order swapped per
+    задача "swap OSAGO and cross-country fines button positions".
+    "📸 Проверить протокол" в меню скрыта (flow не удалён)."""
     keyboard = main_menu_keyboard(is_trusted=True)
 
     assert len(keyboard) == 4
     assert [b.button.text for b in keyboard[0]] == [ADD_CAR_LABEL, MY_CARS_LABEL]
-    assert [b.button.text for b in keyboard[1]] == [CHECK_NOW_LABEL, TURKEY_BOT_LINK_LABEL]
+    assert [b.button.text for b in keyboard[1]] == [CHECK_NOW_LABEL, OSAGO_LABEL]
     assert [b.button.text for b in keyboard[2]] == [STATISTICS_LABEL, SEARCH_LABEL]
-    assert [b.button.text for b in keyboard[3]] == [HELP_LABEL, OSAGO_LABEL]
+    assert [b.button.text for b in keyboard[3]] == [HELP_LABEL, TURKEY_BOT_LINK_LABEL]
     assert PROTOCOL_CHECK_LABEL not in _labels(keyboard)
 
 

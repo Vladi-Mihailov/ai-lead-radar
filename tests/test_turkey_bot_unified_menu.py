@@ -24,24 +24,26 @@ def test_regular_user_menu_has_no_manager_row():
     texts_grid = _button_texts(rows)
 
     assert texts_grid[0] == [ADD_CAR_LABEL, MY_CARS_LABEL]
-    assert texts_grid[1] == [CHECK_NOW_LABEL, GEORGIAN_BOT_LINK_LABEL]
+    assert texts_grid[1] == [CHECK_NOW_LABEL, OSAGO_TR_LABEL]
     flat = [label for row in texts_grid for label in row]
     assert STATISTICS_LABEL not in flat
     assert STOP_MONITORING_LABEL not in flat
     assert HELP_LABEL in flat
+    assert GEORGIAN_BOT_LINK_LABEL in flat
 
 
 def test_manager_menu_has_statistics_and_search_row():
     """См. задачу "manager/trusted Search" — новый макет: ROW2
     checknow/search (заменяет бывшую stop_monitoring), ROW3
-    statistics/georgian."""
+    statistics/osago (см. задачу "swap OSAGO and cross-country fines
+    button positions" -- OSAGO/georgian order swapped)."""
     rows = main_menu_keyboard(is_trusted=True)
     texts_grid = _button_texts(rows)
 
     assert texts_grid[0] == [ADD_CAR_LABEL, MY_CARS_LABEL]
     assert texts_grid[1] == [CHECK_NOW_LABEL, SEARCH_LABEL]
-    assert texts_grid[2] == [STATISTICS_LABEL, GEORGIAN_BOT_LINK_LABEL]
-    assert texts_grid[3] == [HELP_LABEL, OSAGO_TR_LABEL]
+    assert texts_grid[2] == [STATISTICS_LABEL, OSAGO_TR_LABEL]
+    assert texts_grid[3] == [HELP_LABEL, GEORGIAN_BOT_LINK_LABEL]
     flat = [label for row in texts_grid for label in row]
     assert STOP_MONITORING_LABEL not in flat
 
