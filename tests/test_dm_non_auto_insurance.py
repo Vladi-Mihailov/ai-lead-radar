@@ -85,12 +85,14 @@ def _observe(observer, text, message_id):
 
 
 @pytest.mark.parametrize("text,status,reason", [
-    ("Добрый день, подскажите мед страховка нужна?", STATUS_FILTERED, FILTER_NON_AUTO_INSURANCE),
+    # Экспертный режим insurance: у кампании есть утверждённый ответ про
+    # медстраховку — такой вопрос больше НЕ отсекается до OpenAI.
+    ("Добрый день, подскажите мед страховка нужна?", STATUS_PENDING_CONTEXT, None),
     ("Нужно ли ОСАГО и медстраховка?", STATUS_PENDING_CONTEXT, None),
     ("Страховка на машину и медицинская страховка — где оформить?", STATUS_PENDING_CONTEXT, None),
     ("Где оформить ОСАГО на границе?", STATUS_PENDING_CONTEXT, None),
 ])
-def test_observer_filters_pure_medical_before_openai(env, text, status, reason):
+def test_observer_keeps_medical_and_auto_insurance_questions(env, text, status, reason):
     outreach, observer = env
     _observe(observer, text, message_id=1)
     (row,) = outreach.list_all()

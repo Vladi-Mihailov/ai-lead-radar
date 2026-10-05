@@ -35,14 +35,14 @@ class DmDraftService:
         self._client = client if client is not None else AsyncOpenAI(api_key=api_key)
         self._model = model
 
-    async def generate(self, user_text: str) -> DmDraftOutput:
+    async def generate(self, user_text: str, *, instructions: str = SYSTEM_PROMPT) -> DmDraftOutput:
         attempt = 0
         while True:
             attempt += 1
             try:
                 response = await self._client.responses.parse(
                     model=self._model,
-                    instructions=SYSTEM_PROMPT,
+                    instructions=instructions,
                     input=[{"role": "user", "content": user_text}],
                     text_format=DmDraftOutput,
                 )

@@ -4,7 +4,8 @@
 - Ресурсы кампании (например, @tplgee для insurance) — как раньше, из
   настроек кампании.
 - @ProtocolGEbot / @ProtocolTRbot — ТОЛЬКО контекстно: GE-группа + вопрос
-  про штрафы → @ProtocolGEbot; TR-группа + штрафы/платные дороги/HGS →
+  про штрафы (или любой вопрос кампании insurance — штраф за отсутствие
+  автостраховки) → @ProtocolGEbot; TR-группа + штрафы/платные дороги/HGS →
   @ProtocolTRbot. region am или unknown — ни один из них. Даже если
   менеджер добавил Protocol-бота в ресурсы кампании, без подходящих
   resource_region и смысла он из разрешённых убирается (не рекламный хвост).
@@ -35,7 +36,10 @@ RESOURCE_HINTS = {
         "онлайн-оформление автостраховки (ОСАГО) для поездки в Грузию/Турцию; это НЕ источник "
         "новостей, очередей на границе или наличия топлива"
     ),
-    PROTOCOL_GE: "может прислать штраф, как только он появится в базе (сроки появления не обещать)",
+    PROTOCOL_GE: (
+        "отслеживание грузинских штрафов: бот присылает информацию, когда штраф появляется в базе "
+        "(сроки появления не обещать)"
+    ),
     PROTOCOL_TR: (
         "может прислать штрафы и начисления по платным дорогам, как только они появятся в базе "
         "(сроки появления не обещать)"
@@ -55,8 +59,10 @@ def has_toll_intent(text: str) -> bool:
     return bool(_TOLL_RE.search(text or ""))
 
 
-def contextual_resource(*, resource_region: str, intent_text: str) -> str | None:
-    if resource_region == "ge" and has_fine_intent(intent_text):
+def contextual_resource(*, resource_region: str, intent_text: str, campaign_key: str | None = None) -> str | None:
+    # insurance в GE-группе: вопрос о страховке — это и вопрос о штрафе за её
+    # отсутствие (утверждённый факт кампании), поэтому @ProtocolGEbot уместен.
+    if resource_region == "ge" and (has_fine_intent(intent_text) or campaign_key == INSURANCE_CAMPAIGN_KEY):
         return PROTOCOL_GE
     if resource_region == "tr" and (has_fine_intent(intent_text) or has_toll_intent(intent_text)):
         return PROTOCOL_TR
@@ -76,5 +82,7 @@ def allowed_resources(
         r for r in campaign_resources
         if _handle(r) not in _PROTOCOL_HANDLES and (insurance_ok or _handle(r) != _handle(TPLGEE))
     ]
-    extra = contextual_resource(resource_region=resource_region or REGION_UNKNOWN, intent_text=intent_text)
+    extra = contextual_resource(
+        resource_region=resource_region or REGION_UNKNOWN, intent_text=intent_text, campaign_key=campaign_key,
+    )
     return tuple(base + [extra]) if extra else tuple(base)

@@ -383,7 +383,7 @@ def test_manual_mode_never_auto_sends(env):
     ("fuel", "Где сейчас есть 95-й перед Ларсом?", ()),
     ("border_queue", "Что сейчас на Ларсе?", ()),
     ("border_queue", "Большая очередь? И где оформить страховку на машину?", (TPLGEE,)),
-    ("insurance", "Где оформить?", (TPLGEE,)),
+    ("insurance", "Где оформить?", (TPLGEE, "@ProtocolGEbot")),  # insurance в GE: штраф за отсутствие полиса
     (None, "Что сейчас на Ларсе?", ()),
 ])
 def test_tplgee_only_when_insurance_is_relevant(key, text, expected):
