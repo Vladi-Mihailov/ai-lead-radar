@@ -14,8 +14,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from dotenv import load_dotenv
-from telethon import TelegramClient
+from telethon import Button, TelegramClient
 
+from reader.dm_campaigns.outreach_repository import DmOutreachRepository
 from reader.dm_campaigns.repository import DmCampaignRepository
 from reader.groups import load_groups
 from reader.inviter.repository import (
@@ -31,7 +32,10 @@ from reader.inviter_admin_bot.conversation import AdminBotController
 from reader.inviter_admin_bot.conversation_state_repository import (
     AdminBotConversationStateRepository,
 )
+from reader.inviter_admin_bot import dm_campaign_callbacks
 from reader.inviter_admin_bot.dm_campaign_controller import DmCampaignController
+from reader.inviter_admin_bot.dm_draft_controller import DmDraftController
+from reader.inviter_admin_bot.dm_draft_notifier import DmDraftNotifier
 from reader.inviter_admin_bot.handlers import register
 from reader.inviter.lead_pool import CampaignLeadRepository
 from reader.inviter_admin_bot.service import InviterAdminService
@@ -110,10 +114,18 @@ async def run() -> None:
     # telegram_accounts, группы — из того же groups.yaml, что и у Reader
     # (перечитывается на каждом открытии экрана, без перезапуска бота).
     dm_campaign_repository = DmCampaignRepository(settings.app.users_db_file)
+    # "📨 Черновики" — ручная проверка ЛС-черновиков оператором (✅/✏️/⏭).
+    # ✅ только переводит черновик в approved: отправки ЛС в коде нет.
+    dm_outreach_repository = DmOutreachRepository(settings.app.users_db_file)
+    dm_drafts = DmDraftController(
+        dm_outreach_repository, dm_campaign_repository, conversation_state_repository,
+        is_trusted=service.is_trusted, back_callback=dm_campaign_callbacks.LIST,
+    )
     dm_campaigns = DmCampaignController(
         dm_campaign_repository, account_repository, conversation_state_repository,
         is_trusted=service.is_trusted,
         groups_provider=lambda: load_groups(settings.app.groups_file),
+        drafts=dm_drafts,
     )
     controller = AdminBotController(
         service, auth_coordinator, conversation_state_repository,
@@ -124,11 +136,24 @@ async def run() -> None:
     client = TelegramClient(str(_SESSION_PATH), settings.telegram.api_id, settings.telegram.api_hash)
     register(client, controller)
 
+    async def send_to_operator(operator_id: int, reply) -> None:
+        buttons = [[Button.inline(label, data) for label, data in row] for row in reply.inline_rows or []] or None
+        await client.send_message(operator_id, reply.text, buttons=buttons)
+
+    notifier = DmDraftNotifier(
+        dm_outreach_repository, dm_drafts, send_to_operator,
+        settings.inviter_admin_bot.trusted_admin_user_ids,
+    )
+    notifier_task = None
     try:
         await client.start(bot_token=token)
         logger.info("✔ Inviter admin bot подключён")
+        notifier_task = asyncio.create_task(notifier.run_forever())
         await client.run_until_disconnected()
     finally:
+        if notifier_task is not None:
+            notifier_task.cancel()
+        dm_outreach_repository.close()
         account_repository.close()
         campaign_repository.close()
         invite_repository.close()

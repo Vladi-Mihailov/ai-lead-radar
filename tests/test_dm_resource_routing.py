@@ -50,7 +50,9 @@ INSURANCE_Q = "Сколько стоит страховка и где оформ
 ], ids=["ge_fine", "ge_insurance", "ge_toll", "tr_fine", "tr_toll_hgs", "tr_toll_word", "tr_insurance",
         "am_fine", "unknown_fine", "none_fine"])
 def test_allowed_resources(country, text, expected):
-    assert allowed_resources(CAMPAIGN_RESOURCES, resource_region=country, intent_text=text) == expected
+    assert allowed_resources(
+        CAMPAIGN_RESOURCES, resource_region=country, intent_text=text, campaign_key="insurance",
+    ) == expected
 
 
 def test_campaign_listed_protocol_bot_is_not_a_blanket_permission():

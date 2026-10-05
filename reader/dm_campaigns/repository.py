@@ -21,11 +21,14 @@ from datetime import datetime
 from pathlib import Path
 
 from reader.dm_campaigns.models import (
+    CAMPAIGN_MODES,
     DAILY_LIMIT_MAX,
     DAILY_LIMIT_MIN,
+    IMPLEMENTED_MODES,
     MAX_GUIDELINE_LENGTH,
     MAX_LIST_ITEM_LENGTH,
     MAX_LIST_ITEMS,
+    MODE_MANUAL,
     DmCampaign,
     DmCampaignAccount,
     normalize_text_input,
@@ -69,6 +72,12 @@ SEED_CAMPAIGNS = (
     ("insurance", "🛡 Страховка", "insurance"),
 )
 
+# Аддитивные колонки dm_campaigns. mode: существующие и новые кампании
+# получают 'manual' (DEFAULT) — ни одна не начинает отправлять сама.
+_DM_CAMPAIGNS_COLUMN_MIGRATIONS = (
+    ("mode", f"TEXT NOT NULL DEFAULT '{MODE_MANUAL}'"),
+)
+
 _SEED = (
     "INSERT OR IGNORE INTO dm_campaigns (key, title, scenario_name, enabled) "
     "VALUES (?, ?, ?, 0)"
@@ -76,7 +85,7 @@ _SEED = (
 
 _CAMPAIGN_COLUMNS = (
     "id, key, title, enabled, scenario_name, ai_guideline, resources, source_chats, "
-    "fresh_context_chats, follow_up_enabled, follow_up_guideline, created_at, updated_at"
+    "fresh_context_chats, follow_up_enabled, follow_up_guideline, created_at, updated_at, mode"
 )
 
 
@@ -128,7 +137,7 @@ def _validate_text(text: str | None) -> str | None:
 def _row_to_campaign(row) -> DmCampaign:
     (
         id_, key, title, enabled, scenario_name, ai_guideline, resources, source_chats,
-        fresh_context_chats, follow_up_enabled, follow_up_guideline, created_at, updated_at,
+        fresh_context_chats, follow_up_enabled, follow_up_guideline, created_at, updated_at, mode,
     ) = row
     return DmCampaign(
         id=id_,
@@ -144,6 +153,7 @@ def _row_to_campaign(row) -> DmCampaign:
         follow_up_guideline=follow_up_guideline,
         created_at=_parse_datetime(created_at),
         updated_at=_parse_datetime(updated_at),
+        mode=mode or MODE_MANUAL,
     )
 
 
@@ -152,6 +162,10 @@ class DmCampaignRepository:
         self._conn = _connect(db_path)
         self._conn.execute(_DM_CAMPAIGNS_SCHEMA)
         self._conn.execute(_DM_CAMPAIGN_ACCOUNTS_SCHEMA)
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(dm_campaigns)")}
+        for column, definition in _DM_CAMPAIGNS_COLUMN_MIGRATIONS:
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE dm_campaigns ADD COLUMN {column} {definition}")
         self._conn.executemany(_SEED, SEED_CAMPAIGNS)
         self._conn.commit()
 
@@ -188,6 +202,15 @@ class DmCampaignRepository:
 
     def set_enabled(self, campaign_id: int, enabled: bool) -> DmCampaign | None:
         return self._update(campaign_id, enabled=int(bool(enabled)))
+
+    def set_mode(self, campaign_id: int, mode: str) -> DmCampaign | None:
+        """auto — допустимое по схеме, но НЕ реализованное значение:
+        установить его нельзя, пока нет автоматической отправки."""
+        if mode not in CAMPAIGN_MODES:
+            raise ValueError(f"Неизвестный режим кампании: {mode!r}")
+        if mode not in IMPLEMENTED_MODES:
+            raise ValueError(f"Режим {mode!r} ещё не реализован — доступен только ручной режим.")
+        return self._update(campaign_id, mode=mode)
 
     def update_guideline(self, campaign_id: int, text: str | None) -> DmCampaign | None:
         return self._update(campaign_id, ai_guideline=_validate_text(text))

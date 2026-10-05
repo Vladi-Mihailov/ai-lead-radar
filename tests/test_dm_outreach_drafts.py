@@ -506,7 +506,7 @@ async def test_pipeline_end_to_end_border_draft(env):
         (1, STATUS_PENDING_CONTEXT), (2, STATUS_PENDING_CONTEXT), (3, STATUS_PENDING_CONTEXT)]
     assert recent.count() == 4
 
-    service = _FakeService(_out(primary_message="Несколько участников пишут, что очередь около двух часов. Страховку можно оформить через @tplgee.",
+    service = _FakeService(_out(primary_message="Несколько участников пишут, что очередь около двух часов.",
                                 evidence_strength="several_consistent", used_context_refs=["S1", "A1"]))
     clock.now = T0 + timedelta(minutes=4)
     await _processor(env, service, clock).run_once()
@@ -517,6 +517,9 @@ async def test_pipeline_end_to_end_border_draft(env):
     assert done.used_context_refs == ("S1", "A1")
     prompt = next(text for text in service.calls if "Сколько очередь" in text.split("ORIGINAL MESSAGE (USER)\n")[1][:60])
     assert "n_distinct_senders=" in prompt and "555" not in prompt and "ivan" not in prompt
+    # @tplgee стоит в ресурсах кампании, но вопрос не про страховку — в промпт он не попадает.
+    resources_block = prompt.split("ALLOWED PROMOTED RESOURCES\n")[1].split("\n\n")[0]
+    assert "@tplgee" not in resources_block
 
 
 async def test_pipeline_campaigns_off_lead_flow_unchanged_no_dm(env):
