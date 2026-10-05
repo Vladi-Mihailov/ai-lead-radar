@@ -232,7 +232,9 @@ def test_same_event_twice_gives_one_candidate(env):
     assert len(outreach.list_all()) == 1 and recent.count() == 1
 
 
-@pytest.mark.parametrize("sender_id,username,reason", [(None, "ivan", "no_sender_id"), (555, None, "no_username")])
+# Phase 2.6: отсутствие @username больше НЕ фильтрует (см.
+# tests/test_dm_outreach_sendability.py) — остаётся только no_sender_id.
+@pytest.mark.parametrize("sender_id,username,reason", [(None, "ivan", "no_sender_id")])
 def test_sender_filters(env, sender_id, username, reason):
     campaigns, outreach, _, _, _ = env
     campaigns.set_enabled(campaigns.get_campaign_by_key("fuel").id, True)
