@@ -20,6 +20,9 @@ class _FakeReply:
         self.accounts_page_options = None
         self.account_card_id = None
         self.account_card_enabled = None
+        self.account_card_dm = False
+        self.account_card_invite = False
+        self.invite_confirm_account_id = None
         self.limit_choice_account_id = None
         self.limits_choice_account_id = None
         for key, value in fields.items():

@@ -28,7 +28,7 @@ from reader.dm_campaigns.outreach_repository import (
 from reader.dm_campaigns.recent_messages import RecentMessageRepository
 from reader.dm_campaigns.repository import DmCampaignRepository
 from reader.dm_campaigns.sendability import assess_sendability
-from reader.insurance_matching import is_insurance_text
+from reader.insurance_matching import is_insurance_text, is_non_auto_insurance_text
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,9 @@ INSURANCE_SCENARIO = "insurance"
 
 FILTER_SOURCE_CHAT = "source_chat_not_allowed"
 FILTER_INSURANCE_PREFILTER = "insurance_prefilter_rejected"
+# Только медицинская/туристическая страховка без автомобильного намерения —
+# не целевой лид insurance; отсекается до OpenAI.
+FILTER_NON_AUTO_INSURANCE = "non_auto_insurance"
 FILTER_NO_SENDER_ID = "no_sender_id"
 # Больше не присваивается (Phase 2.6: @username не обязателен); остаётся
 # как значение filter_reason у строк, созданных раньше.
@@ -125,6 +128,8 @@ class DmOutreachObserver:
             return FILTER_SOURCE_CHAT
         if campaign.scenario_name == INSURANCE_SCENARIO and not is_insurance_text(message.text):
             return FILTER_INSURANCE_PREFILTER
+        if campaign.scenario_name == INSURANCE_SCENARIO and is_non_auto_insurance_text(message.text):
+            return FILTER_NON_AUTO_INSURANCE
         return None
 
     def _insert(self, message: Message, campaign: DmCampaign, status: str, filter_reason: str | None) -> None:

@@ -55,3 +55,16 @@ def sender_meets_requirements(sendability: str, *, sender_is_premium: bool) -> b
     if sendability == SENDABILITY_PREMIUM_REQUIRED:
         return sender_is_premium
     return True
+
+
+def dm_sender_eligible(account, sendability: str) -> bool:
+    """Phase 3A — предусловия будущего DM sender selector (account —
+    reader.inviter.models.TelegramAccount): только can_send_dm=True, и для
+    premium_required — только is_premium=True (None = неизвестно = не
+    Premium). Право инвайтов (can_invite_to_groups) здесь НЕ учитывается и
+    ничего не даёт. Allowlist кампании, дневной лимит ЛС, FloodWait/
+    PeerFlood, lease сессии, доступность sender и исходной группы — задача
+    самого selector (ещё не реализован)."""
+    if not getattr(account, "can_send_dm", False):
+        return False
+    return sender_meets_requirements(sendability, sender_is_premium=getattr(account, "is_premium", None) is True)

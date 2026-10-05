@@ -44,3 +44,28 @@ def is_insurance_text(text: str) -> bool:
     if ru_insurance_words(lowered, INSURANCE_ROOT):
         return True
     return any(term in lowered for term in INSURANCE_TERMS)
+
+
+# Только для ЛС-кампании insurance (инвайтер это не использует): вопрос лишь
+# про медицинскую/туристическую страховку — не наш автомобильный лид.
+_MEDICAL_INSURANCE_RE = re.compile(
+    r"мед\w*\.?\s*страх|медстрах|медицинск\w*\s+страх|страх\w*\s+(?:для\s+)?здоровь"
+    r"|туристическ\w*\s+страх|(?:travel\s+)?(?:health|medical)\s+insurance",
+    re.IGNORECASE,
+)
+_AUTO_INSURANCE_RE = re.compile(
+    r"осаго|каско|автострах|green\s*card|зел[её]н\w*\s+карт"
+    r"|страх\w*\s+(?:\w+\s+){0,2}(?:авто|машин|автомобил|тачк)"
+    r"|(?:авто|машин|автомобил|тачк)\w*\s+(?:\w+\s+){0,2}страх"
+    r"|(?:vehicle|car|motor|auto)\s+insurance",
+    re.IGNORECASE,
+)
+
+
+def is_non_auto_insurance_text(text: str) -> bool:
+    """True — в тексте ТОЛЬКО медицинская/туристическая страховка и нет
+    автомобильного намерения (ОСАГО/КАСКО/автостраховка/страховка машины/
+    зелёная карта/vehicle insurance). Смешанный вопрос («нужно ли ОСАГО и
+    медстраховка?») — False: автомобильный интерес есть."""
+    lowered = text or ""
+    return bool(_MEDICAL_INSURANCE_RE.search(lowered)) and not _AUTO_INSURANCE_RE.search(lowered)

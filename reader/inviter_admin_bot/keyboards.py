@@ -25,7 +25,13 @@ from reader.inviter_admin_bot.texts import (
     CANCEL_BUTTON_LABEL,
     CHANGE_LIMIT_LABEL,
     CHECK_SYNC_LABEL,
+    DM_DISABLE_LABEL,
+    DM_ENABLE_LABEL,
     HELP_LABEL,
+    INVITE_CONFIRM_NO_LABEL,
+    INVITE_CONFIRM_YES_LABEL,
+    INVITE_DISABLE_LABEL,
+    INVITE_ENABLE_LABEL,
     LIMIT_PROMPT_CHOICES,
     MANUAL_LIMIT_LABEL,
     REAUTHORIZE_LABEL,
@@ -42,6 +48,11 @@ _ACCOUNT_LIMIT_VALUE_PREFIX = b"acc_limitval:"
 _ACCOUNT_LIMIT_MANUAL_PREFIX = b"acc_limitmanual:"
 _ACCOUNT_SYNC_PREFIX = b"acc_sync:"
 _ACCOUNT_REAUTH_PREFIX = b"acc_reauth:"
+# Phase 3A: права аккаунта. acc_inv: — переключить инвайты (включение
+# ведёт на подтверждение), acc_invok: — подтверждённое включение.
+_ACCOUNT_DM_TOGGLE_PREFIX = b"acc_dm:"
+_ACCOUNT_INVITE_TOGGLE_PREFIX = b"acc_inv:"
+_ACCOUNT_INVITE_CONFIRM_PREFIX = b"acc_invok:"
 ACCOUNTS_BACK = b"accounts_back"
 
 # 📣 Кампании — callback_data несёт только публичный campaign id (тот же
@@ -93,6 +104,30 @@ def encode_account_toggle_callback(account_id: int) -> bytes:
 
 def decode_account_toggle_callback(data: bytes | None) -> int | None:
     return _decode_id(data, _ACCOUNT_TOGGLE_PREFIX)
+
+
+def encode_account_dm_toggle_callback(account_id: int) -> bytes:
+    return _encode_id(_ACCOUNT_DM_TOGGLE_PREFIX, account_id)
+
+
+def decode_account_dm_toggle_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _ACCOUNT_DM_TOGGLE_PREFIX)
+
+
+def encode_account_invite_toggle_callback(account_id: int) -> bytes:
+    return _encode_id(_ACCOUNT_INVITE_TOGGLE_PREFIX, account_id)
+
+
+def decode_account_invite_toggle_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _ACCOUNT_INVITE_TOGGLE_PREFIX)
+
+
+def encode_account_invite_confirm_callback(account_id: int) -> bytes:
+    return _encode_id(_ACCOUNT_INVITE_CONFIRM_PREFIX, account_id)
+
+
+def decode_account_invite_confirm_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _ACCOUNT_INVITE_CONFIRM_PREFIX)
 
 
 def encode_account_limit_callback(account_id: int) -> bytes:
@@ -292,7 +327,9 @@ def limits_value_choice_keyboard(account_id: int) -> list[list[Button]]:
     return rows
 
 
-def account_card_keyboard(account_id: int, *, enabled: bool) -> list[list[Button]]:
+def account_card_keyboard(
+    account_id: int, *, enabled: bool, can_send_dm: bool = False, can_invite: bool = False,
+) -> list[list[Button]]:
     toggle_row = (
         [Button.inline(TURN_OFF_ACCOUNT_LABEL, encode_account_toggle_callback(account_id))]
         if enabled
@@ -300,10 +337,23 @@ def account_card_keyboard(account_id: int, *, enabled: bool) -> list[list[Button
     )
     return [
         toggle_row,
+        [Button.inline(DM_DISABLE_LABEL if can_send_dm else DM_ENABLE_LABEL,
+                       encode_account_dm_toggle_callback(account_id))],
+        [Button.inline(INVITE_DISABLE_LABEL if can_invite else INVITE_ENABLE_LABEL,
+                       encode_account_invite_toggle_callback(account_id))],
         [Button.inline(CHANGE_LIMIT_LABEL, encode_account_limit_callback(account_id))],
         [Button.inline(CHECK_SYNC_LABEL, encode_account_sync_callback(account_id))],
         [Button.inline(REAUTHORIZE_LABEL, encode_account_reauthorize_callback(account_id))],
         [Button.inline(BACK_BUTTON_LABEL, ACCOUNTS_BACK)],
+    ]
+
+
+def invite_confirm_keyboard(account_id: int) -> list[list[Button]]:
+    """Подтверждение включения инвайтов; «❌ Отмена» — назад на карточку,
+    ничего не меняя."""
+    return [
+        [Button.inline(INVITE_CONFIRM_YES_LABEL, encode_account_invite_confirm_callback(account_id))],
+        [Button.inline(INVITE_CONFIRM_NO_LABEL, encode_account_open_callback(account_id))],
     ]
 
 

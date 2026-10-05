@@ -26,6 +26,8 @@ from reader.dm_campaigns.models import source_chat_allowed
 from reader.dm_campaigns.outreach_repository import MAX_ATTEMPTS, DmOutreach, DmOutreachRepository
 from reader.dm_campaigns.recent_messages import RecentMessageRepository
 from reader.dm_campaigns.repository import DmCampaignRepository
+from reader.dm_campaigns.resources import allowed_resources
+from reader.groups import REGION_UNKNOWN
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,7 @@ class DmDraftProcessor:
         drafting_recovery_seconds: float,
         retention_hours: float,
         generation_timeout_seconds: float = 90.0,
+        group_resource_regions: dict[str, str] | None = None,
         clock: Callable[[], datetime] = _utcnow,
         monotonic: Callable[[], float] = time.monotonic,
     ):
@@ -66,6 +69,8 @@ class DmDraftProcessor:
         self._recovery = timedelta(seconds=drafting_recovery_seconds)
         self._retention = timedelta(hours=retention_hours)
         self._timeout = generation_timeout_seconds
+        # identifier группы (lower, без @) -> resource_region из groups.yaml.
+        self._group_regions = {k.lstrip("@").lower(): v for k, v in (group_resource_regions or {}).items()}
         self._clock = clock
         self._monotonic = monotonic
         self._last_cleanup: float | None = None
@@ -132,11 +137,16 @@ class DmDraftProcessor:
             return True
         context_json = context.to_json()
         meta = context.metadata
+        # Страновые ресурсы — только по resource_region группы и смыслу
+        # вопроса (исходное сообщение + то, на что оно отвечает), см. resources.py.
+        region = self._group_regions.get((row.source_chat_identifier or "").lstrip("@").lower(), REGION_UNKNOWN)
+        intent_text = " ".join([row.source_text] + [i.text for i in context.discussion if i.ref.startswith("R")])
+        resources = allowed_resources(campaign.resources, resource_region=region, intent_text=intent_text)
 
         started = time.monotonic()
         try:
             output = await asyncio.wait_for(
-                self._service.generate(build_user_text(row, campaign, context)), timeout=self._timeout,
+                self._service.generate(build_user_text(row, campaign, context, allowed_resources=resources)), timeout=self._timeout,
             )
         except asyncio.CancelledError:
             raise
@@ -165,7 +175,7 @@ class DmDraftProcessor:
             valid_refs=context.refs,
             fresh_context_used=context.fresh_context_used,
             n_distinct_senders=meta.n_distinct_senders if meta else 0,
-            allowed_resources=campaign.resources,
+            allowed_resources=resources,
         )
         finished = self._clock()
         if decision.kind == "filtered":

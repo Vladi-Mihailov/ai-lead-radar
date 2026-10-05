@@ -209,6 +209,27 @@ class InviterAdminService:
             return account
         return self._accounts.update(account_id, enabled=not account.enabled)
 
+    def toggle_can_send_dm(self, account_id: int) -> TelegramAccount | None:
+        """📩 ЛС: меняет ТОЛЬКО can_send_dm. is_old — fail-closed (аккаунт
+        возвращается без изменений, как и у toggle_enabled)."""
+        account = self._accounts.get(account_id)
+        if account is None:
+            return None
+        if account.is_old:
+            return account
+        return self._accounts.update(account_id, can_send_dm=not account.can_send_dm)
+
+    def set_can_invite_to_groups(self, account_id: int, value: bool) -> TelegramAccount | None:
+        """👥 Инвайты: меняет ТОЛЬКО can_invite_to_groups (включение
+        вызывается только после подтверждения в conversation.py). is_old —
+        fail-closed: OLD-запись никогда не получает право инвайтов."""
+        account = self._accounts.get(account_id)
+        if account is None:
+            return None
+        if account.is_old:
+            return account
+        return self._accounts.update(account_id, can_invite_to_groups=bool(value))
+
     def set_daily_limit(self, account_id: int, value: int) -> TelegramAccount | None:
         if value < 1:
             raise ValueError("daily_limit должен быть положительным числом")

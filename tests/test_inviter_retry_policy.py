@@ -86,7 +86,7 @@ def _accounts(db_path, names, *, daily_limit=10):
     try:
         return [
             repo.create(
-                name=name, phone=f"+99550000{i:04d}", session_name=name, session_path=f"{name}.session",
+                name=name, phone=f"+99550000{i:04d}", session_name=name, can_invite_to_groups=True, session_path=f"{name}.session",
                 daily_limit=daily_limit, verify_membership=False,
             )
             for i, name in enumerate(names)
@@ -218,7 +218,7 @@ def test_disabled_or_old_accounts_do_not_block_terminal_escalation(tmp_path):
     _accounts(db_path, ["acc1"])
     repo = TelegramAccountRepository(db_path)
     try:
-        repo.create(name="off", phone="+1", session_name="off", session_path="off.session", enabled=False)
+        repo.create(name="off", phone="+1", session_name="off", can_invite_to_groups=True, session_path="off.session", enabled=False)
     finally:
         repo.close()
 

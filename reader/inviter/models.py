@@ -88,6 +88,15 @@ class TelegramAccount:
     old_reason: str | None = None
     previous_names: list[str] = field(default_factory=list)
     last_synced_at: datetime | None = None
+    # Phase 3A: НЕЗАВИСИМЫЕ права аккаунта (не заменяют enabled):
+    # can_invite_to_groups — аккаунт может использоваться инвайтером
+    # (выбор, retry, ротация — только при True, см. InviterService);
+    # can_send_dm — аккаунт может участвовать в будущем DM sender selector
+    # (см. reader/dm_campaigns/sendability.py::dm_sender_eligible).
+    # is_premium — Telegram Premium; None — неизвестно (не проверялось).
+    can_send_dm: bool = False
+    can_invite_to_groups: bool = False
+    is_premium: bool | None = None
 
 
 @dataclass(frozen=True)

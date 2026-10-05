@@ -71,7 +71,7 @@ def test_run_one_tick_cycles_through_accounts_round_robin(tmp_path):
         for name in ("Account1", "Account2", "Account3"):
             account_repository.create(
                 name=name, phone="+995500000001", session_name=name.lower(),
-                session_path=f"{name.lower()}.session",
+                can_invite_to_groups=True, session_path=f"{name.lower()}.session",
             )
 
         service = _FakeWorkerService()
@@ -97,10 +97,10 @@ def test_run_one_tick_processes_campaign_account_cross_product(tmp_path):
         campaign_repository.create(name="CampaignA", keyword="осаго", target_chat="@a")
         campaign_repository.create(name="CampaignB", keyword="каско", target_chat="@b")
         account_repository.create(
-            name="Account1", phone="+995500000001", session_name="a1", session_path="a1.session",
+            name="Account1", phone="+995500000001", session_name="a1", can_invite_to_groups=True, session_path="a1.session",
         )
         account_repository.create(
-            name="Account2", phone="+995500000002", session_name="a2", session_path="a2.session",
+            name="Account2", phone="+995500000002", session_name="a2", can_invite_to_groups=True, session_path="a2.session",
         )
 
         service = _FakeWorkerService()
@@ -127,11 +127,11 @@ def test_run_one_tick_skips_disabled_accounts_and_campaigns(tmp_path):
         campaign_repository.create(name="Disabled", keyword="осаго", target_chat="@t2", enabled=False)
         account_repository.create(
             name="EnabledAcc", phone="+995500000001", session_name="a1",
-            session_path="a1.session", enabled=True,
+            can_invite_to_groups=True, session_path="a1.session", enabled=True,
         )
         account_repository.create(
             name="DisabledAcc", phone="+995500000002", session_name="a2",
-            session_path="a2.session", enabled=False,
+            can_invite_to_groups=True, session_path="a2.session", enabled=False,
         )
 
         service = _FakeWorkerService()
@@ -155,7 +155,7 @@ def test_run_one_tick_passes_configured_hourly_limit(tmp_path):
     try:
         campaign_repository.create(name="Campaign", keyword="осаго", target_chat="@t")
         account_repository.create(
-            name="Account1", phone="+995500000001", session_name="a1", session_path="a1.session",
+            name="Account1", phone="+995500000001", session_name="a1", can_invite_to_groups=True, session_path="a1.session",
         )
 
         service = _FakeWorkerService()
@@ -194,7 +194,7 @@ def test_run_one_tick_picks_up_newly_enabled_account_without_restart(tmp_path):
     try:
         campaign_repository.create(name="Campaign", keyword="осаго", target_chat="@t")
         account_repository.create(
-            name="Account1", phone="+995500000001", session_name="a1", session_path="a1.session",
+            name="Account1", phone="+995500000001", session_name="a1", can_invite_to_groups=True, session_path="a1.session",
         )
 
         service = _FakeWorkerService()
@@ -202,7 +202,7 @@ def test_run_one_tick_picks_up_newly_enabled_account_without_restart(tmp_path):
 
         asyncio.run(worker.run_one_tick())
         account_repository.create(
-            name="Account2", phone="+995500000002", session_name="a2", session_path="a2.session",
+            name="Account2", phone="+995500000002", session_name="a2", can_invite_to_groups=True, session_path="a2.session",
         )
         asyncio.run(worker.run_one_tick())
         asyncio.run(worker.run_one_tick())
@@ -228,7 +228,7 @@ def test_worker_spaces_same_account_attempts_by_poll_interval_times_pair_count(t
         for name in ("Account1", "Account2", "Account3"):
             account_repository.create(
                 name=name, phone="+995500000001", session_name=name.lower(),
-                session_path=f"{name.lower()}.session",
+                can_invite_to_groups=True, session_path=f"{name.lower()}.session",
             )
 
         poll_interval = 0.05
@@ -290,7 +290,7 @@ def test_new_worker_instance_after_restart_attempts_only_one_pair_not_a_burst(tm
         for name in ("Account1", "Account2", "Account3"):
             account_repository.create(
                 name=name, phone="+995500000001", session_name=name.lower(),
-                session_path=f"{name.lower()}.session",
+                can_invite_to_groups=True, session_path=f"{name.lower()}.session",
             )
 
         service_before_crash = _FakeWorkerService()
@@ -328,7 +328,7 @@ def test_run_one_tick_without_runtime_state_repository_behaves_exactly_as_before
     try:
         campaign_repository.create(name="Campaign", keyword="осаго", target_chat="@t")
         account_repository.create(
-            name="Account1", phone="+995500000001", session_name="a1", session_path="a1.session",
+            name="Account1", phone="+995500000001", session_name="a1", can_invite_to_groups=True, session_path="a1.session",
         )
         service = _FakeWorkerService()
         worker = _make_worker(service, campaign_repository, account_repository)
@@ -350,7 +350,7 @@ def test_run_one_tick_skips_invitations_when_globally_paused(tmp_path):
     try:
         campaign_repository.create(name="Campaign", keyword="осаго", target_chat="@t")
         account_repository.create(
-            name="Account1", phone="+995500000001", session_name="a1", session_path="a1.session",
+            name="Account1", phone="+995500000001", session_name="a1", can_invite_to_groups=True, session_path="a1.session",
         )
         runtime_state_repository.set_enabled(False)
 
@@ -407,7 +407,7 @@ def test_run_one_tick_resumes_invitations_after_re_enabling(tmp_path):
     try:
         campaign_repository.create(name="Campaign", keyword="осаго", target_chat="@t")
         account_repository.create(
-            name="Account1", phone="+995500000001", session_name="a1", session_path="a1.session",
+            name="Account1", phone="+995500000001", session_name="a1", can_invite_to_groups=True, session_path="a1.session",
         )
         runtime_state_repository.set_enabled(False)
 
@@ -443,7 +443,7 @@ def test_run_forever_stops_promptly_when_shutdown_requested_during_wait(tmp_path
     try:
         campaign_repository.create(name="Campaign", keyword="осаго", target_chat="@t")
         account_repository.create(
-            name="Account1", phone="+995500000001", session_name="a1", session_path="a1.session",
+            name="Account1", phone="+995500000001", session_name="a1", can_invite_to_groups=True, session_path="a1.session",
         )
 
         service = _FakeWorkerService()
@@ -478,7 +478,7 @@ def test_run_forever_finishes_in_flight_tick_before_stopping(tmp_path):
     try:
         campaign_repository.create(name="Campaign", keyword="осаго", target_chat="@t")
         account_repository.create(
-            name="Account1", phone="+995500000001", session_name="a1", session_path="a1.session",
+            name="Account1", phone="+995500000001", session_name="a1", can_invite_to_groups=True, session_path="a1.session",
         )
 
         service = _FakeWorkerService(delay=0.05)

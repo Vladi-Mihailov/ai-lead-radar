@@ -51,6 +51,11 @@ class BotReply:
     accounts_page_options: list[tuple[int, str, bool, int, int]] | None = None
     account_card_id: int | None = None
     account_card_enabled: bool | None = None
+    # Phase 3A: текущие права аккаунта для кнопок карточки (📩 ЛС / 👥 Инвайты).
+    account_card_dm: bool = False
+    account_card_invite: bool = False
+    # Экран подтверждения включения инвайтов для этого аккаунта.
+    invite_confirm_account_id: int | None = None
     limit_choice_account_id: int | None = None
     limits_choice_account_id: int | None = None
     # (campaign_id, label, enabled) — список "📣 Кампании".
@@ -255,6 +260,7 @@ class AdminBotController:
         return BotReply(
             text=texts.format_limit_updated(account.name, value),
             account_card_id=account.id, account_card_enabled=account.enabled,
+            account_card_dm=account.can_send_dm, account_card_invite=account.can_invite_to_groups,
         )
 
     def _accounts_page_options(self) -> list[tuple[int, str, bool, int, int]]:
@@ -280,6 +286,7 @@ class AdminBotController:
         return BotReply(
             text=texts.format_account_card(card),
             account_card_id=account_id, account_card_enabled=card.account.enabled,
+            account_card_dm=card.account.can_send_dm, account_card_invite=card.account.can_invite_to_groups,
         )
 
     def handle_accounts_back(self, *, telegram_user_id: int) -> BotReply:
@@ -301,6 +308,46 @@ class AdminBotController:
             return BotReply(text=texts.OLD_ACCOUNT_TOGGLE_BLOCKED_TEXT, show_main_menu=True)
         return self._format_accounts_reply()
 
+    # ---- Phase 3A: права аккаунта (📩 ЛС / 👥 Инвайты) ----
+
+    def handle_account_dm_toggle(self, account_id: int, *, telegram_user_id: int) -> BotReply:
+        if not self.is_trusted(telegram_user_id):
+            return self._denied()
+        account = self._service.toggle_can_send_dm(account_id)
+        return self._card_after_capability_change(account_id, account, telegram_user_id)
+
+    def handle_account_invite_toggle(self, account_id: int, *, telegram_user_id: int) -> BotReply:
+        """Выключение инвайтов — сразу; включение — только через экран
+        подтверждения (handle_account_invite_confirm)."""
+        if not self.is_trusted(telegram_user_id):
+            return self._denied()
+        card = self._service.account_card(account_id)
+        if card is None:
+            return BotReply(text=texts.ACTION_FAILED_TEXT, show_main_menu=True)
+        if card.account.is_old:
+            return BotReply(text=texts.OLD_ACCOUNT_CAPABILITY_BLOCKED_TEXT, show_main_menu=True)
+        if not card.account.can_invite_to_groups:
+            return BotReply(
+                text=f"{card.display_name}\n\n{texts.INVITE_CONFIRM_TEXT}", invite_confirm_account_id=account_id,
+            )
+        account = self._service.set_can_invite_to_groups(account_id, False)
+        return self._card_after_capability_change(account_id, account, telegram_user_id)
+
+    def handle_account_invite_confirm(self, account_id: int, *, telegram_user_id: int) -> BotReply:
+        if not self.is_trusted(telegram_user_id):
+            return self._denied()
+        account = self._service.set_can_invite_to_groups(account_id, True)
+        return self._card_after_capability_change(account_id, account, telegram_user_id)
+
+    def _card_after_capability_change(
+        self, account_id: int, account: TelegramAccount | None, telegram_user_id: int,
+    ) -> BotReply:
+        if account is None:
+            return BotReply(text=texts.ACTION_FAILED_TEXT, show_main_menu=True)
+        if account.is_old:
+            return BotReply(text=texts.OLD_ACCOUNT_CAPABILITY_BLOCKED_TEXT, show_main_menu=True)
+        return self.handle_account_open(account_id, telegram_user_id=telegram_user_id)
+
     def handle_account_limit_open(self, account_id: int, *, telegram_user_id: int) -> BotReply:
         if not self.is_trusted(telegram_user_id):
             return self._denied()
@@ -321,6 +368,7 @@ class AdminBotController:
         return BotReply(
             text=texts.format_limit_updated(account.name, value),
             account_card_id=account.id, account_card_enabled=account.enabled,
+            account_card_dm=account.can_send_dm, account_card_invite=account.can_invite_to_groups,
         )
 
     def handle_account_limit_manual_prompt(
@@ -387,7 +435,10 @@ class AdminBotController:
         card = self._service.account_card(account_id)
         text = texts.format_sync_one_result(outcome)
         if card is not None:
-            return BotReply(text=text, account_card_id=account_id, account_card_enabled=card.account.enabled)
+            return BotReply(
+                text=text, account_card_id=account_id, account_card_enabled=card.account.enabled,
+                account_card_dm=card.account.can_send_dm, account_card_invite=card.account.can_invite_to_groups,
+            )
         return BotReply(text=text, show_main_menu=True)
 
     async def handle_account_reauthorize(
@@ -410,6 +461,7 @@ class AdminBotController:
         return BotReply(
             text=texts.format_auth_failed(outcome.error_summary or "Не удалось начать переавторизацию."),
             account_card_id=account_id, account_card_enabled=account.enabled,
+            account_card_dm=account.can_send_dm, account_card_invite=account.can_invite_to_groups,
         )
 
     # ---- 📣 Кампании ----

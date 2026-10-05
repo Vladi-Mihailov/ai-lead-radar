@@ -18,11 +18,9 @@ from reader.inviter_admin_bot.keyboards import (
     campaign_card_keyboard,
     campaigns_page_keyboard,
     cancel_keyboard,
-    decode_campaign_disable_callback,
-    decode_campaign_enable_callback,
-    decode_campaign_open_callback,
-    decode_campaign_refresh_callback,
-    decode_campaign_stats_callback,
+    decode_account_dm_toggle_callback,
+    decode_account_invite_confirm_callback,
+    decode_account_invite_toggle_callback,
     decode_account_limit_callback,
     decode_account_limit_manual_callback,
     decode_account_limit_value_callback,
@@ -30,9 +28,15 @@ from reader.inviter_admin_bot.keyboards import (
     decode_account_reauthorize_callback,
     decode_account_sync_callback,
     decode_account_toggle_callback,
+    decode_campaign_disable_callback,
+    decode_campaign_enable_callback,
+    decode_campaign_open_callback,
+    decode_campaign_refresh_callback,
+    decode_campaign_stats_callback,
     decode_limits_manual_callback,
     decode_limits_open_callback,
     decode_limits_value_callback,
+    invite_confirm_keyboard,
     limit_choice_keyboard,
     limits_value_choice_keyboard,
     main_menu_keyboard,
@@ -107,6 +111,26 @@ def register(client: TelegramClient, controller: AdminBotController) -> None:
         account_id = decode_account_open_callback(data)
         if account_id is not None:
             reply = controller.handle_account_open(account_id, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply)
+            return
+
+        # Phase 3A: права аккаунта (📩 ЛС / 👥 Инвайты; включение инвайтов —
+        # через подтверждение). Авторизация — в controller на каждом вызове.
+        account_id = decode_account_dm_toggle_callback(data)
+        if account_id is not None:
+            reply = controller.handle_account_dm_toggle(account_id, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply)
+            return
+
+        account_id = decode_account_invite_confirm_callback(data)
+        if account_id is not None:
+            reply = controller.handle_account_invite_confirm(account_id, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply)
+            return
+
+        account_id = decode_account_invite_toggle_callback(data)
+        if account_id is not None:
+            reply = controller.handle_account_invite_toggle(account_id, telegram_user_id=event.sender_id)
             await _answer_and_send(event, reply)
             return
 
@@ -194,8 +218,13 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False) -> None:
         buttons = cancel_keyboard()
     elif reply.accounts_page_options is not None:
         buttons = accounts_page_keyboard(reply.accounts_page_options)
+    elif reply.invite_confirm_account_id is not None:
+        buttons = invite_confirm_keyboard(reply.invite_confirm_account_id)
     elif reply.account_card_id is not None:
-        buttons = account_card_keyboard(reply.account_card_id, enabled=bool(reply.account_card_enabled))
+        buttons = account_card_keyboard(
+            reply.account_card_id, enabled=bool(reply.account_card_enabled),
+            can_send_dm=reply.account_card_dm, can_invite=reply.account_card_invite,
+        )
     elif reply.limit_choice_account_id is not None:
         buttons = limit_choice_keyboard(reply.limit_choice_account_id)
     elif reply.limits_choice_account_id is not None:

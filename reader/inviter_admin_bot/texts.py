@@ -35,6 +35,19 @@ CAMPAIGN_NOT_FOUND_TEXT = "⚠️ Кампания не найдена — от�
 
 TURN_OFF_ACCOUNT_LABEL = "⏸ Отключить"
 TURN_ON_ACCOUNT_LABEL = "▶️ Включить"
+# Phase 3A: независимые права аккаунта. Подпись кнопки — ДЕЙСТВИЕ, которое
+# она выполнит (а не текущее состояние; оно — в тексте карточки). Включение
+# инвайтов — только через подтверждение.
+DM_DISABLE_LABEL = "🚫 Выключить ЛС"
+DM_ENABLE_LABEL = "✅ Разрешить ЛС"
+INVITE_DISABLE_LABEL = "🚫 Запретить инвайты"
+INVITE_ENABLE_LABEL = "✅ Разрешить инвайты"
+INVITE_CONFIRM_TEXT = "Разрешить этому аккаунту приглашать пользователей в группы?"
+INVITE_CONFIRM_YES_LABEL = "✅ Да, разрешить"
+INVITE_CONFIRM_NO_LABEL = "❌ Отмена"
+OLD_ACCOUNT_CAPABILITY_BLOCKED_TEXT = (
+    "⚠️ Это архивная (OLD) запись аккаунта — права ЛС/инвайтов для неё не меняются."
+)
 CHANGE_LIMIT_LABEL = "⚙️ Изменить лимит"
 CHECK_SYNC_LABEL = "🔄 Проверить / синхронизировать"
 REAUTHORIZE_LABEL = "🔐 Переавторизовать"
@@ -129,6 +142,12 @@ def _fmt_dt_short(value) -> str:
     return format_tbilisi(value, fmt="%d.%m %H:%M", suffix=None) if value is not None else "—"
 
 
+def _premium_label(is_premium: bool | None) -> str:
+    if is_premium is None:
+        return "неизвестно"
+    return "да" if is_premium else "нет"
+
+
 def format_account_card(card: AccountCard) -> str:
     """Карточка аккаунта (см. design "Карточка аккаунта") — "Session"/
     "Авторизация" — ДВА разных, независимых индикатора: Session — .session
@@ -152,6 +171,11 @@ def format_account_card(card: AccountCard) -> str:
         f"Авторизация: {auth_icon}",
         f"Активен: {active_icon}",
         "",
+        f"📩 ЛС: {'✅' if account.can_send_dm else '❌'}",
+        f"👥 Инвайты: {'✅' if account.can_invite_to_groups else '❌'}",
+        f"⭐ Premium: {_premium_label(account.is_premium)}",
+        "",
+        f"Лимит инвайтов: {card.usage.daily_limit} в день",
         f"Сегодня: {card.usage.sent_today} / {card.usage.daily_limit}",
         f"Осталось: {card.usage.remaining}",
         "",

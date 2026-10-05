@@ -168,7 +168,10 @@ def _seed_duplicate_pair_raw(db_path, *, primary, duplicate):
                 enabled BOOLEAN NOT NULL DEFAULT TRUE,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 last_used_at TIMESTAMP, telegram_user_id INTEGER,
-                is_old INTEGER NOT NULL DEFAULT 0
+                is_old INTEGER NOT NULL DEFAULT 0,
+                -- Phase 3A: это inviter-аккаунты — право инвайтов задано явно
+                -- (миграция без backfill никому его не выдаёт).
+                can_invite_to_groups INTEGER NOT NULL DEFAULT 1
             )
             """
         )
@@ -938,7 +941,7 @@ def test_service_run_selects_up_to_daily_limit_per_account(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account_repository.create(
             name="acc1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=2,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=2,
         )
     finally:
         campaign_repository.close()
@@ -969,7 +972,7 @@ def test_service_run_ignores_disabled_campaigns_and_accounts(tmp_path):
         )
         account_repository.create(
             name="acc-disabled", phone="+995500000002", session_name="acc2",
-            session_path="acc2.session", enabled=False,
+            can_invite_to_groups=True, session_path="acc2.session", enabled=False,
         )
         assert disabled_campaign.enabled is False
     finally:
@@ -1010,15 +1013,15 @@ def test_service_run_distributes_candidates_sequentially_without_overlap(tmp_pat
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account_repository.create(
             name="Account1", phone="+995500000001", session_name="a1",
-            session_path="a1.session", daily_limit=3,
+            can_invite_to_groups=True, session_path="a1.session", daily_limit=3,
         )
         account_repository.create(
             name="Account2", phone="+995500000002", session_name="a2",
-            session_path="a2.session", daily_limit=3,
+            can_invite_to_groups=True, session_path="a2.session", daily_limit=3,
         )
         account_repository.create(
             name="Account3", phone="+995500000003", session_name="a3",
-            session_path="a3.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="a3.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -1073,15 +1076,15 @@ def test_service_run_handles_insufficient_candidates_without_overlap(tmp_path, m
         # daily_limit 3 + 3 + 2 = 8, кандидатов всего 4.
         account_repository.create(
             name="Account1", phone="+995500000001", session_name="a1",
-            session_path="a1.session", daily_limit=3,
+            can_invite_to_groups=True, session_path="a1.session", daily_limit=3,
         )
         account_repository.create(
             name="Account2", phone="+995500000002", session_name="a2",
-            session_path="a2.session", daily_limit=3,
+            can_invite_to_groups=True, session_path="a2.session", daily_limit=3,
         )
         account_repository.create(
             name="Account3", phone="+995500000003", session_name="a3",
-            session_path="a3.session", daily_limit=2,
+            can_invite_to_groups=True, session_path="a3.session", daily_limit=2,
         )
     finally:
         campaign_repository.close()
@@ -1124,7 +1127,7 @@ def test_service_run_logs_candidates_block(tmp_path, caplog):
         campaign_repository.create(name="ОСАГО осень", keyword="осаго", target_chat="@t")
         account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -1162,7 +1165,7 @@ def test_dry_run_logs_ready_for_each_candidate_and_disconnects(tmp_path, monkeyp
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -1215,7 +1218,7 @@ def test_dry_run_logs_failed_when_target_chat_not_found(tmp_path, monkeypatch):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@missing_chat")
         account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -1266,11 +1269,11 @@ def test_dry_run_continues_with_other_accounts_when_one_fails_to_connect(tmp_pat
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="Плохой", phone="+995500000001", session_name="bad",
-            session_path="bad.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="bad.session", daily_limit=5,
         )
         account_repository.create(
             name="Хороший", phone="+995500000002", session_name="good",
-            session_path="good.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="good.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -1323,7 +1326,7 @@ def _setup_single_candidate_campaign(db_path, *, daily_limit=5, is_bot=None, ver
         campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account = account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=daily_limit,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=daily_limit,
             verify_membership=verify_membership,
         )
         return campaign, account
@@ -1386,11 +1389,11 @@ def test_execute_broken_connect_does_not_select_candidates_for_that_account(tmp_
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="broken", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
         account_repository.create(
             name="works", phone="+995500000002", session_name="acc2",
-            session_path="acc2.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc2.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -1443,11 +1446,11 @@ def test_execute_target_chat_not_found_does_not_select_candidates_for_that_accou
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="broken", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
         account_repository.create(
             name="works", phone="+995500000002", session_name="acc2",
-            session_path="acc2.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc2.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -1491,7 +1494,7 @@ def test_execute_missing_session_does_not_select_candidates(tmp_path, monkeypatc
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="no_session", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -1546,7 +1549,7 @@ def test_execute_daily_limit_subtracts_already_successful_invites_today(tmp_path
         campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account = account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -1603,7 +1606,7 @@ def test_execute_skips_account_entirely_when_daily_limit_already_reached(tmp_pat
         campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account = account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=3,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=3,
         )
     finally:
         campaign_repository.close()
@@ -1652,7 +1655,7 @@ def test_execute_daily_limit_is_global_per_account_across_campaigns(tmp_path):
         campaign_repository.create(name="Каско", keyword="каско", target_chat="@target_chat")
         account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=1,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=1,
         )
     finally:
         campaign_repository.close()
@@ -1716,7 +1719,7 @@ def test_execute_remaining_budget_accounts_for_pending_reservations(
         campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account = account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=daily_limit,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=daily_limit,
         )
     finally:
         campaign_repository.close()
@@ -1777,7 +1780,7 @@ def test_execute_top_up_remaining_also_accounts_for_pending_after_verification(t
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=24,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=24,
         )
     finally:
         campaign_repository.close()
@@ -1907,7 +1910,7 @@ def test_execute_verify_chat_admin_required_leaves_pending_alive_and_aggregates_
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account = account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=total_users, verify_membership=True,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=total_users, verify_membership=True,
         )
     finally:
         campaign_repository.close()
@@ -2133,7 +2136,7 @@ def test_worker_picks_up_verify_membership_change_without_restart(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account = account_repository.create(
             name="acc1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=24, verify_membership=True,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=24, verify_membership=True,
         )
 
         worker = InviterWorker(
@@ -2206,7 +2209,7 @@ def test_execute_waits_long_interval_before_verifying_when_sent_at_threshold(tmp
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=20,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=20,
         )
     finally:
         campaign_repository.close()
@@ -2248,7 +2251,7 @@ def test_execute_top_up_wave_matches_daily_limit_example_from_task(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=24,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=24,
         )
     finally:
         campaign_repository.close()
@@ -2309,7 +2312,7 @@ def test_execute_top_up_wave_does_not_repeat_if_still_short_after_it(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=10,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=10,
         )
     finally:
         campaign_repository.close()
@@ -2348,7 +2351,7 @@ def test_execute_peer_flood_during_main_wave_skips_verification_and_top_up(tmp_p
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=10,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=10,
         )
     finally:
         campaign_repository.close()
@@ -2913,7 +2916,7 @@ def test_execute_skips_confirmed_bot_before_sending_invite_request(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -2974,7 +2977,7 @@ def test_execute_marks_bot_via_rpc_error_as_defense_in_depth(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -3031,7 +3034,7 @@ def test_andrey_username_not_found_with_no_fallback_becomes_permanently_invalid(
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -3078,11 +3081,11 @@ def test_andrey_permanently_invalid_not_selected_by_next_account(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
         account_repository.create(
             name="account_2", phone="+995500000002", session_name="acc2",
-            session_path="acc2.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc2.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -3161,11 +3164,11 @@ def test_mutual_contact_invalid_not_selected_by_next_account(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
         account_repository.create(
             name="account_2", phone="+995500000002", session_name="acc2",
-            session_path="acc2.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc2.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -3213,7 +3216,7 @@ def test_valid_candidate_processed_after_permanent_invalid_same_account(tmp_path
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -3258,7 +3261,7 @@ def test_divanauto_invalid_object_id_retries_with_stored_access_hash_and_succeed
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -3302,7 +3305,7 @@ def test_divanauto_invalid_object_id_retry_also_fails_becomes_permanently_invali
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -3348,7 +3351,7 @@ def test_divanauto_retry_flood_wait_is_not_permanent_invalid(tmp_path, monkeypat
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -3400,7 +3403,7 @@ def test_permanent_invalid_does_not_increase_daily_or_hourly_counters(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account = account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -3453,7 +3456,7 @@ async def test_worker_reaches_next_eligible_candidate_in_same_call_after_invalid
         campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account = account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -3555,7 +3558,7 @@ def test_execute_peer_flood_during_resolution_stops_account(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_2", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -3637,7 +3640,7 @@ def test_execute_flood_wait_records_failed_sleeps_and_continues(tmp_path, monkey
         campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account = account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -3766,7 +3769,7 @@ def test_execute_sends_account_and_campaign_notifications_with_correct_counts(tm
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -3832,7 +3835,7 @@ def test_execute_campaign_notification_includes_found_vs_processable_summary(tmp
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -3874,7 +3877,7 @@ def test_execute_flood_wait_excluded_from_error_count_in_notification(tmp_path, 
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -3917,11 +3920,11 @@ def test_execute_aggregates_stats_across_multiple_accounts_in_campaign_summary(t
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=2,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=2,
         )
         account_repository.create(
             name="account_2", phone="+995500000002", session_name="acc2",
-            session_path="acc2.session", daily_limit=2,
+            can_invite_to_groups=True, session_path="acc2.session", daily_limit=2,
         )
     finally:
         campaign_repository.close()
@@ -4016,7 +4019,7 @@ def test_execute_no_candidates_cycle_sends_no_notification(tmp_path, caplog):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -4049,7 +4052,7 @@ def test_execute_user_level_failures_send_no_notification(tmp_path, caplog):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=10,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=10,
         )
     finally:
         campaign_repository.close()
@@ -4445,7 +4448,7 @@ def test_pause_between_invites_happens_after_each_outcome_regardless_of_result(t
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -4507,7 +4510,7 @@ def test_warm_up_account_pauses_once_after_connect_not_per_candidate(tmp_path, m
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="Основной", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -4606,7 +4609,7 @@ def test_execute_peer_flood_stops_account_and_notifies_operator(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_2", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -4737,7 +4740,7 @@ def test_execute_chat_admin_required_stops_account_and_notifies_operator(tmp_pat
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_2", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -4793,7 +4796,7 @@ def test_execute_unrecognized_rpc_error_stops_account_by_default(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_2", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -4836,7 +4839,7 @@ def test_execute_unexpected_non_rpc_exception_is_fatal_and_stops_account(tmp_pat
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_2", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -4908,7 +4911,7 @@ def test_execute_flood_wait_at_or_above_threshold_stops_account_and_notifies_ope
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_2", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -4975,7 +4978,7 @@ def test_execute_flood_wait_below_threshold_waits_and_continues_account(tmp_path
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -5073,7 +5076,7 @@ def test_execute_flood_wait_mid_wave_stops_account_and_persists_block(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account = account_repository.create(
             name="account_flood", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -5190,7 +5193,7 @@ def test_worker_skips_account_on_next_tick_after_peer_flood(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account = account_repository.create(
             name="acc1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=24,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=24,
         )
 
         worker = InviterWorker(
@@ -5252,11 +5255,11 @@ def test_execute_peer_flood_on_one_account_does_not_stop_other_accounts(tmp_path
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account_repository.create(
             name="account_flood", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
         account_repository.create(
             name="account_ok", phone="+995500000002", session_name="acc2",
-            session_path="acc2.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc2.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -5329,7 +5332,7 @@ def test_execute_flood_wait_stop_skips_verification_and_top_up_wave(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_flood", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -5373,7 +5376,7 @@ def test_execute_flood_wait_below_threshold_still_persists_blocked_until(tmp_pat
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account = account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -5512,17 +5515,17 @@ def test_is_blocked_by_flood_wait_expiry_logic_unaffected_by_display_change(tmp_
     account_repository = TelegramAccountRepository(db_path=tmp_path / "inviter.db")
     try:
         active = account_repository.create(
-            name="active", phone="+995500000001", session_name="a1", session_path="a1.session",
+            name="active", phone="+995500000001", session_name="a1", can_invite_to_groups=True, session_path="a1.session",
         )
         active = account_repository.update(active.id, blocked_until=now + timedelta(hours=1))
 
         expired = account_repository.create(
-            name="expired", phone="+995500000002", session_name="a2", session_path="a2.session",
+            name="expired", phone="+995500000002", session_name="a2", can_invite_to_groups=True, session_path="a2.session",
         )
         expired = account_repository.update(expired.id, blocked_until=now - timedelta(hours=1))
 
         not_blocked = account_repository.create(
-            name="free", phone="+995500000003", session_name="a3", session_path="a3.session",
+            name="free", phone="+995500000003", session_name="a3", can_invite_to_groups=True, session_path="a3.session",
         )
     finally:
         account_repository.close()
@@ -5629,11 +5632,11 @@ def test_execute_one_blocked_account_does_not_block_next_account(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         blocked_account = account_repository.create(
             name="blocked", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
         account_repository.create(
             name="works", phone="+995500000002", session_name="acc2",
-            session_path="acc2.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc2.session", daily_limit=5,
         )
         account_repository.update(
             blocked_account.id,
@@ -5693,7 +5696,7 @@ def test_worker_attempt_disconnect_failure_after_connect_failure_does_not_crash(
         campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account = account_repository.create(
             name="acc1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=24,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=24,
         )
 
         with caplog.at_level("WARNING", logger="reader.inviter.service"):
@@ -5731,11 +5734,11 @@ def test_execute_account_with_broken_connect_and_disconnect_does_not_block_next_
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="broken", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=5,
         )
         account_repository.create(
             name="works", phone="+995500000002", session_name="acc2",
-            session_path="acc2.session", daily_limit=5,
+            can_invite_to_groups=True, session_path="acc2.session", daily_limit=5,
         )
     finally:
         campaign_repository.close()
@@ -5822,11 +5825,11 @@ def test_execute_test_mode_stops_after_exactly_n_successful_invites(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=20,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=20,
         )
         account_repository.create(
             name="account_2", phone="+995500000002", session_name="acc2",
-            session_path="acc2.session", daily_limit=20,
+            can_invite_to_groups=True, session_path="acc2.session", daily_limit=20,
         )
     finally:
         campaign_repository.close()
@@ -5889,7 +5892,7 @@ def test_execute_test_mode_errors_and_already_participant_do_not_count_toward_li
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=6,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=6,
         )
     finally:
         campaign_repository.close()
@@ -5958,7 +5961,7 @@ def test_execute_test_mode_stop_still_sends_correct_final_stats_notifications(tm
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="account_1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=10,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=10,
         )
     finally:
         campaign_repository.close()
@@ -6036,7 +6039,7 @@ def test_default_session_checker_reflects_real_file_presence(tmp_path):
     try:
         account = account_repository.create(
             name="@vladimihailov", phone="+995500000001", session_name="vladimihailov",
-            session_path=str(tmp_path / "vladimihailov"), daily_limit=1,
+            can_invite_to_groups=True, session_path=str(tmp_path / "vladimihailov"), daily_limit=1,
         )
     finally:
         account_repository.close()
@@ -6056,7 +6059,7 @@ def test_format_missing_session_message_includes_account_and_expected_path(tmp_p
     try:
         account = account_repository.create(
             name="@vladimihailov", phone="+995500000001", session_name="vladimihailov",
-            session_path="data/sessions/vladimihailov", daily_limit=1,
+            can_invite_to_groups=True, session_path="data/sessions/vladimihailov", daily_limit=1,
         )
     finally:
         account_repository.close()
@@ -6088,7 +6091,7 @@ def test_execute_missing_session_logs_message_and_skips_account_without_error(tm
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="@vladimihailov", phone="+995500000001", session_name="vladimihailov",
-            session_path="data/sessions/vladimihailov", daily_limit=1,
+            can_invite_to_groups=True, session_path="data/sessions/vladimihailov", daily_limit=1,
         )
     finally:
         campaign_repository.close()
@@ -6133,7 +6136,7 @@ def test_dry_run_missing_session_logs_message_and_skips_account_without_error(tm
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="@vladimihailov", phone="+995500000001", session_name="vladimihailov",
-            session_path="data/sessions/vladimihailov", daily_limit=1,
+            can_invite_to_groups=True, session_path="data/sessions/vladimihailov", daily_limit=1,
         )
     finally:
         campaign_repository.close()
@@ -6174,11 +6177,11 @@ def test_missing_session_only_skips_the_affected_account(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@target_chat")
         account_repository.create(
             name="Без сессии", phone="+995500000001", session_name="no-session",
-            session_path="data/sessions/no-session", daily_limit=1,
+            can_invite_to_groups=True, session_path="data/sessions/no-session", daily_limit=1,
         )
         account_repository.create(
             name="С сессией", phone="+995500000002", session_name="has-session",
-            session_path="data/sessions/has-session", daily_limit=1,
+            can_invite_to_groups=True, session_path="data/sessions/has-session", daily_limit=1,
         )
     finally:
         campaign_repository.close()
@@ -6241,7 +6244,7 @@ def test_worker_attempt_sends_at_most_one_invite_even_with_daily_headroom(tmp_pa
         campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account = account_repository.create(
             name="acc1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=24,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=24,
         )
 
         stats = asyncio.run(service.run_one_worker_attempt(campaign, account, hourly_limit=2))
@@ -6271,7 +6274,7 @@ def test_worker_attempt_skips_account_when_hourly_limit_already_reached(tmp_path
         campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account = account_repository.create(
             name="acc1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=24,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=24,
         )
         now = datetime.now(timezone.utc)
         invite_repository.create(
@@ -6311,7 +6314,7 @@ def test_worker_attempt_second_call_within_hour_is_skipped(tmp_path):
         campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account = account_repository.create(
             name="acc1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=24,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=24,
         )
 
         first = asyncio.run(service.run_one_worker_attempt(campaign, account, hourly_limit=1))
@@ -6343,7 +6346,7 @@ def test_worker_attempt_hourly_limit_persists_across_new_service_instance(tmp_pa
         campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account = account_repository.create(
             name="acc1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=24,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=24,
         )
 
         before = asyncio.run(
@@ -6389,7 +6392,7 @@ def test_worker_attempt_respects_blocked_until(tmp_path):
         campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account = account_repository.create(
             name="acc1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=24,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=24,
         )
         account = account_repository.update(
             account.id,
@@ -6422,7 +6425,7 @@ def test_worker_attempt_respects_daily_limit_even_when_hourly_limit_allows(tmp_p
         campaign = campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account = account_repository.create(
             name="acc1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=1,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=1,
         )
         now = datetime.now(timezone.utc)
         invite_repository.create(
@@ -6459,7 +6462,7 @@ def test_execute_fills_empty_telegram_user_id_from_get_me(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account = account_repository.create(
             name="acc1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=1,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=1,
         )
     finally:
         campaign_repository.close()
@@ -6501,7 +6504,7 @@ def test_execute_matching_telegram_user_id_proceeds_normally(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account = account_repository.create(
             name="acc1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=1, telegram_user_id=555,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=1, telegram_user_id=555,
         )
     finally:
         campaign_repository.close()
@@ -6545,7 +6548,7 @@ def test_execute_updates_name_when_username_changes_but_tg_id_same(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account = account_repository.create(
             name="@alena_ogi", phone="+995500000001", session_name="alenaogir",
-            session_path="alenaogir.session", daily_limit=1, telegram_user_id=6557324579,
+            can_invite_to_groups=True, session_path="alenaogir.session", daily_limit=1, telegram_user_id=6557324579,
         )
     finally:
         campaign_repository.close()
@@ -6587,7 +6590,7 @@ def test_execute_syncs_phone_when_changed(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account = account_repository.create(
             name="acc1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=1, telegram_user_id=555,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=1, telegram_user_id=555,
         )
     finally:
         campaign_repository.close()
@@ -6623,7 +6626,7 @@ def test_execute_keeps_existing_phone_when_get_me_phone_is_empty(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account = account_repository.create(
             name="acc1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=1, telegram_user_id=555,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=1, telegram_user_id=555,
         )
     finally:
         campaign_repository.close()
@@ -6660,7 +6663,7 @@ def test_execute_skips_account_when_stored_tg_id_does_not_match_session(tmp_path
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account = account_repository.create(
             name="acc1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=1, telegram_user_id=111,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=1, telegram_user_id=111,
         )
     finally:
         campaign_repository.close()
@@ -6822,7 +6825,7 @@ def test_execute_skips_account_when_session_not_authorized(tmp_path, caplog):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account = account_repository.create(
             name="acc1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=1,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=1,
         )
     finally:
         campaign_repository.close()
@@ -6872,7 +6875,7 @@ def test_dry_run_does_not_perform_identity_check(tmp_path):
         campaign_repository.create(name="ОСАГО", keyword="осаго", target_chat="@t")
         account = account_repository.create(
             name="acc1", phone="+995500000001", session_name="acc1",
-            session_path="acc1.session", daily_limit=1, telegram_user_id=111,
+            can_invite_to_groups=True, session_path="acc1.session", daily_limit=1, telegram_user_id=111,
         )
     finally:
         campaign_repository.close()

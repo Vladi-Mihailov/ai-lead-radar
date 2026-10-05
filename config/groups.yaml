@@ -1,6 +1,11 @@
+# resource_region: ge / tr / am — какие страновые ресурсы ЛС-кампаний
+# (например, @ProtocolGEbot / @ProtocolTRbot) разрешены для лидов этой
+# группы. Это не физическая страна группы. Не указано — unknown: страновые
+# ресурсы для такой группы не разрешаются.
 groups:
   # Публичная группа/канал — предпочтительно указывать username
   - username: "VerhniyLars"
+    resource_region: "ge"
     title: "Верхний Ларс"
     enabled: true
 
@@ -9,31 +14,38 @@ groups:
     enabled: true
 
   - username: "Sadahlo"
+    resource_region: "am"
     title: "Садахло"
     enabled: true
 
   - username: "sarpi_ge"
+    resource_region: "tr"
     title: "Сарпи"
     enabled: true
 
   - username: "verkhniy_lars_dariali"
+    resource_region: "ge"
     title: "КПП Грузии Дариали"
     enabled: true
 
   - username: "geolars"
+    resource_region: "ge"
     title: "Верхний Ларс Сегодня"
     enabled: true
 
   - username: "tbilisi14"
+    resource_region: "ge"
     title: "Тбилиси чат"
     enabled: true
 
 
   - username: "mytbilisi_chat"
+    resource_region: "ge"
     title: "ТБИЛИСИ ЧАТ | Грузия"
     enabled: true
 
   - username: "grusia1"
+    resource_region: "ge"
     title: "Грузия"
     enabled: true
 
@@ -41,30 +53,37 @@ groups:
 
 
   - username: "expats_georgia"
+    resource_region: "ge"
     title: "Expats Georgia"
     enabled: true
 
   - username: "saburtalo_tbi"
+    resource_region: "ge"
     title: "Saburtalo Tbilisi"
     enabled: true
 
   - username: "vake_tbi"
+    resource_region: "ge"
     title: "Vake Tbilisi"
     enabled: true
 
   - username: "svoi_tbilisi"
+    resource_region: "ge"
     title: "Свои Тбилиси"
     enabled: true
 
   - username: "mybatumi_chat"
+    resource_region: "ge"
     title: "Батуми чат"
     enabled: true
 
   - username: "batumi_people"
+    resource_region: "ge"
     title: "Batumi People"
     enabled: true
 
   - username: "georgia_auto"
+    resource_region: "ge"
     title: "Georgia Auto"
     enabled: true
 
@@ -72,6 +91,7 @@ groups:
   # (см. reader/sources/telegram_source.py::_resolve_groups), а не
   # выдуман здесь без реального обращения к Telegram.
   - username: "banks_ge"
+    resource_region: "ge"
     enabled: true
 
   # Турция (см. задачу) — title не указан намеренно: резолвится сам при
@@ -79,33 +99,43 @@ groups:
   # _resolve_groups — group.title or entity.title or entity.username or
   # entity.id), а не выдуман здесь без реального обращения к Telegram.
   - username: "turtsiab"
+    resource_region: "tr"
     enabled: false
 
   - username: "russiansinturkey_antalya"
+    resource_region: "tr"
     enabled: false
 
   - username: "russiansinturkey_stambul"
+    resource_region: "tr"
     enabled: false
 
   - username: "russiansinturkey_all"
+    resource_region: "tr"
     enabled: false
 
   - username: "istanbul_ru"
+    resource_region: "tr"
     enabled: false
 
   - username: "stambuli"
+    resource_region: "tr"
     enabled: false
 
   - username: "chat_istambul_help"
+    resource_region: "tr"
     enabled: false
 
   - username: "nedvizhkaalaniya"
+    resource_region: "tr"
     enabled: false
 
   - username: "russianturkiyeruss"
+    resource_region: "tr"
     enabled: false
 
   - username: "turkey_ourantalya"
+    resource_region: "tr"
     enabled: false
 
   # Приватная группа — только по числовому id.

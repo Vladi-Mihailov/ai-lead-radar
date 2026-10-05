@@ -139,5 +139,6 @@ class InviterWorker:
 
     def _enabled_pairs(self):
         campaigns = [c for c in self._campaign_repository.list() if c.enabled]
-        accounts = [a for a in self._account_repository.list() if a.enabled]
+        # Только аккаунты с правом инвайтов (Phase 3A) — DM-only не ротируются.
+        accounts = [a for a in self._account_repository.list() if a.enabled and a.can_invite_to_groups]
         return [(campaign, account) for campaign in campaigns for account in accounts]

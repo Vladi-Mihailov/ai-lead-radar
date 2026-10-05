@@ -5,6 +5,7 @@
 from reader.dm_campaigns.context import DraftContext
 from reader.dm_campaigns.models import DmCampaign
 from reader.dm_campaigns.outreach_repository import DmOutreach
+from reader.dm_campaigns.resources import RESOURCE_HINTS
 
 SYSTEM_PROMPT = (
     "Ты помогаешь менеджеру подготовить ЧЕРНОВИК личного сообщения человеку, "
@@ -97,8 +98,15 @@ def _items_block(items) -> str:
     return "\n".join(lines) if lines else "нет"
 
 
-def build_user_text(outreach: DmOutreach, campaign: DmCampaign, context: DraftContext) -> str:
-    resources = "\n".join(campaign.resources) if campaign.resources else "нет (ничего не рекламировать)"
+def build_user_text(
+    outreach: DmOutreach, campaign: DmCampaign, context: DraftContext,
+    *, allowed_resources: tuple[str, ...] | None = None,
+) -> str:
+    """allowed_resources — уже отобранные по стране группы и смыслу
+    вопроса (см. reader/dm_campaigns/resources.py); None — ресурсы кампании."""
+    items = campaign.resources if allowed_resources is None else allowed_resources
+    lines = [f"{r} — {RESOURCE_HINTS[r]}" if r in RESOURCE_HINTS else r for r in items]
+    resources = "\n".join(lines) if lines else "нет (ничего не рекламировать)"
     sections = [
         f"CAMPAIGN\n{campaign.title} ({campaign.key})",
         f"CAMPAIGN RULES\n{_CAMPAIGN_RULES.get(campaign.key, 'нет')}",

@@ -99,7 +99,7 @@ def _create_account(db_path, name="acc1", daily_limit=10):
     try:
         return repo.create(
             name=name, phone="+995500000001", session_name=name,
-            session_path=f"{name}.session", daily_limit=daily_limit,
+            can_invite_to_groups=True, session_path=f"{name}.session", daily_limit=daily_limit,
         )
     finally:
         repo.close()

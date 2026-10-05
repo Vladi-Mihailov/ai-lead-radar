@@ -86,7 +86,7 @@ def _accounts(db_path, names):
     repo = TelegramAccountRepository(db_path)
     try:
         return [
-            repo.create(name=n, phone=f"+99550000{i:04d}", session_name=n, session_path=f"{n}.session",
+            repo.create(name=n, phone=f"+99550000{i:04d}", session_name=n, can_invite_to_groups=True, session_path=f"{n}.session",
                         daily_limit=10, verify_membership=False)
             for i, n in enumerate(names)
         ]
