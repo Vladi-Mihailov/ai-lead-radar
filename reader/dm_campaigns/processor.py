@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 
 from reader.dm_campaigns.context import DmContextBuilder
 from reader.dm_campaigns.draft_models import normalize_draft
-from reader.dm_campaigns.draft_prompt import build_user_text
+from reader.dm_campaigns.draft_prompt import EXPERT_CAMPAIGNS, build_user_text, system_prompt_for
 from reader.dm_campaigns.draft_service import DmDraftService, DmDraftServiceError
 from reader.dm_campaigns.models import source_chat_allowed
 from reader.dm_campaigns.outreach_repository import MAX_ATTEMPTS, DmOutreach, DmOutreachRepository
@@ -148,7 +148,11 @@ class DmDraftProcessor:
         started = time.monotonic()
         try:
             output = await asyncio.wait_for(
-                self._service.generate(build_user_text(row, campaign, context, allowed_resources=resources)), timeout=self._timeout,
+                self._service.generate(
+                    build_user_text(row, campaign, context, allowed_resources=resources),
+                    instructions=system_prompt_for(campaign.key),
+                ),
+                timeout=self._timeout,
             )
         except asyncio.CancelledError:
             raise
@@ -178,6 +182,7 @@ class DmDraftProcessor:
             fresh_context_used=context.fresh_context_used,
             n_distinct_senders=meta.n_distinct_senders if meta else 0,
             allowed_resources=resources,
+            expert=campaign.key in EXPERT_CAMPAIGNS,
         )
         finished = self._clock()
         if decision.kind == "filtered":

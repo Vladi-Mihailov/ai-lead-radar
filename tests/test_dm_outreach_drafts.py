@@ -309,9 +309,11 @@ class _FakeService:
         self.error = error
         self.delay = delay
         self.calls = []
+        self.instructions = []
 
-    async def generate(self, user_text):
+    async def generate(self, user_text, *, instructions=None):
         self.calls.append(user_text)
+        self.instructions.append(instructions)
         if self.delay:
             await asyncio.sleep(self.delay)
         if self.error:

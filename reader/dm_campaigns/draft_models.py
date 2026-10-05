@@ -74,6 +74,66 @@ _RELATIVE_TIME_RE = re.compile(
 )
 
 
+# Экспертный режим (insurance): оговорки, пересказ группы и ссылки на неё как
+# на источник, уточнение уже названного направления — черновик отклоняется.
+_EXPERT_HEDGING_RE = re.compile(
+    r"в\s+(?:этой\s+|нашей\s+|той\s+)?(?:группе|чате)\s+(?:пишут|писали|говорят|сообщают|советуют)"
+    r"|сообщени\w*\s+(?:в|из)\s+(?:этой\s+)?(?:групп|чат)\w*"
+    r"|участник\w*\s+(?:групп|чат)\w*|(?:люди|участники)\s+(?:пишут|говорят)"
+    r"|точно\s+(?:подтвердить|сказать|ответить)\s+не\s+могу|не\s+могу\s+(?:точно\s+)?(?:подтвердить|гарантировать)"
+    r"|не\s+хочу\s+вводить\s+в\s+заблуждение|ориентируйтесь\s+на\s+официальн"
+    r"|(?:уточните|проверьте|сверьтесь)\s+(?:\w+\s+){0,2}(?:в|на|по|с)\s+официальн|официальн\w*\s+источник"
+    r"|попробуйте\s+уточнить|(?<!\w)возможно(?!\w)|(?<!\w)наверное(?!\w)|не\s+подскажу",
+    re.IGNORECASE,
+)
+_EXPERT_CLARIFY_RE = re.compile(
+    r"какую\s+(?:именно\s+)?границ|какое\s+(?:именно\s+)?направлени|в\s+какую\s+сторону"
+    r"|о\s+какой\s+(?:именно\s+)?границ|(?:уточните|подскажите),?\s+(?:пожалуйста,?\s+)?(?:какую|какое|куда|о\s+как)",
+    re.IGNORECASE,
+)
+
+
+# Утверждения, которые бизнес отозвал как неподтверждённые ("на практике
+# не проверяют", момент/место оформления штрафа): модель могла взять их из
+# сообщений группы — такой черновик отклоняется.
+_EXPERT_RETRACTED_RE = re.compile(
+    r"(?:на\s+практике|пока|никогда|обычно|сейчас)\s+(?:\w+\s+){0,2}не\s+(?:проверя|спрашива|смотр)"
+    r"|при\s+выезде\s+(?:\w+\s+){0,3}(?:оформля|выписыва|наклад)\w*\s+штраф"
+    r"|штраф\w*\s+(?:\w+\s+){0,3}(?:оформля|выписыва)\w*\s+при\s+выезде",
+    re.IGNORECASE,
+)
+
+
+# Стиль живого менеджера: тяжёлые юридические обороты из фактов и раздутые
+# ответы (больше 3 предложений) до оператора не доходят. Мягкие предпочтения
+# ("автостраховка" вместо "гражданская автостраховка") — только в prompt:
+# отклонённый черновик — потерянный лид.
+_EXPERT_LEGALESE_RE = re.compile(
+    r"зарегистрированн\w*\s+за\s+пределами"
+    r"|(?:весь|всего)\s+период\w*\s+(?:нахождени|пребывани)|в\s+соответствии\s+с\s+законодательств"
+    r"|по\s+грузинскому\s+законодательству",
+    re.IGNORECASE,
+)
+MAX_EXPERT_SENTENCES = 3
+
+
+def _expert_problem(text: str) -> str | None:
+    if _EXPERT_HEDGING_RE.search(text):
+        return "expert_hedging_or_group_reference"
+    if _EXPERT_RETRACTED_RE.search(text):
+        return "unapproved_claim"
+    if _EXPERT_CLARIFY_RE.search(text):
+        return "unnecessary_clarification"
+    if _EXPERT_LEGALESE_RE.search(text):
+        return "legalese"
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s.strip()]
+    if len(sentences) > MAX_EXPERT_SENTENCES:
+        return "too_long"
+    if sentences and all("@" in s for s in sentences):
+        return "ad_only_answer"
+    return None
+
+
 def _strip_ref_groups(text: str, valid_refs: frozenset[str]) -> str:
     def drop(match: re.Match) -> str:
         refs = re.findall(_REF, match.group(0))
@@ -105,6 +165,7 @@ def normalize_draft(
     fresh_context_used: bool,
     n_distinct_senders: int,
     allowed_resources: tuple[str, ...],
+    expert: bool = False,
 ) -> DraftDecision:
     if not output.should_generate:
         return DraftDecision(kind="filtered")
@@ -130,9 +191,26 @@ def normalize_draft(
         return DraftDecision(kind="invalid", error="empty_primary_message")
 
     refs = tuple(dict.fromkeys(ref.strip() for ref in output.used_context_refs if ref and ref.strip()))
+    if expert:
+        # Экспертный режим отвечает по фактам кампании: ссылки на сообщения —
+        # лишь метаданные; чужие метки ("CAMPAIGN_GUIDELINE") отбрасываются, а
+        # не губят черновик (в самом тексте метки по-прежнему запрещены выше).
+        refs = tuple(ref for ref in refs if ref in valid_refs)
     unknown = [ref for ref in refs if ref not in valid_refs]
     if unknown:
         return DraftDecision(kind="invalid", error=f"unknown_context_refs:{','.join(unknown[:5])}")
+
+    # Экспертный режим (insurance): без оговорок/пересказа группы, не только
+    # реклама, и КАЖДЫЙ разрешённый ресурс упомянут (наши ресурсы обязательны).
+    if expert:
+        for text in (primary, follow_up):
+            problem = _expert_problem(text) if text else None
+            if problem:
+                return DraftDecision(kind="invalid", error=problem)
+        handles = _handles(primary)
+        missing = [r for r in allowed_resources if r.strip().lstrip("@").lower() not in handles]
+        if missing:
+            return DraftDecision(kind="invalid", error=f"missing_resource:{','.join(missing[:5])}")
 
     # Рекламировать можно только ресурсы из настроек кампании.
     allowed = {r.strip().lstrip("@").lower() for r in allowed_resources}

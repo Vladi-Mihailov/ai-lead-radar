@@ -38,8 +38,8 @@ INSURANCE_Q = "Сколько стоит страховка и где оформ
 
 @pytest.mark.parametrize("country,text,expected", [
     ("ge", FINE_Q, ("@tplgee", PROTOCOL_GE)),
-    ("ge", INSURANCE_Q, ("@tplgee",)),
-    ("ge", TOLL_Q, ("@tplgee",)),                     # платные дороги — не грузинский бот
+    ("ge", INSURANCE_Q, ("@tplgee", PROTOCOL_GE)),    # insurance в GE: штраф за отсутствие страховки
+    ("ge", TOLL_Q, ("@tplgee", PROTOCOL_GE)),         # insurance в GE — @ProtocolGEbot всегда уместен
     ("tr", FINE_Q, ("@tplgee", PROTOCOL_TR)),
     ("tr", TOLL_Q, ("@tplgee", PROTOCOL_TR)),
     ("tr", "Пришло начисление за toll на мосту", ("@tplgee", PROTOCOL_TR)),
@@ -130,44 +130,64 @@ def _run(env, *, ident, text, output):
     return outreach.get(oid), service.calls[0]
 
 
+BLOCK_END = chr(10) * 2
+GOOD_GE = "Штраф за отсутствие автостраховки в Грузии — 100 лари. Полис можно оформить через @tplgee, а штрафы отслеживать через @ProtocolGEbot."
+
+
+def test_non_insurance_campaign_in_ge_gets_protocol_ge_only_for_fines():
+    resources = ("@tplgee", PROTOCOL_GE, PROTOCOL_TR)
+    assert allowed_resources(resources, resource_region="ge", intent_text=TOLL_Q, campaign_key="border_queue") == ()
+    assert allowed_resources(resources, resource_region="ge", intent_text=FINE_Q,
+                             campaign_key="border_queue") == (PROTOCOL_GE,)
+
+
 def test_ge_fine_question_offers_protocol_ge_bot(env):
     row, prompt = _run(env, ident="VerhniyLars", text=FINE_Q,
-                       output=_out(primary_message="@ProtocolGEbot может прислать штраф, как только он появится в базе.",
-                                   used_context_refs=[], evidence_strength="none"))
-    assert "@ProtocolGEbot — может прислать штраф" in prompt and "@ProtocolTRbot" not in prompt
+                       output=_out(primary_message=GOOD_GE, used_context_refs=[], evidence_strength="none"))
+    assert "@ProtocolGEbot — отслеживание грузинских штрафов" in prompt and "@ProtocolTRbot" not in prompt
     assert row.status == STATUS_DRAFT
 
 
-def test_ge_insurance_question_hides_protocol_bot_from_model_and_rejects_it(env):
+def test_ge_insurance_question_offers_both_and_rejects_tr_bot(env):
     row, prompt = _run(env, ident="VerhniyLars", text=INSURANCE_Q,
-                       output=_out(primary_message="Оформить можно у @tplgee, а штрафы — в @ProtocolGEbot.",
+                       output=_out(primary_message=GOOD_GE + " Начисления — в @ProtocolTRbot.",
                                    used_context_refs=[], evidence_strength="none"))
-    assert "@tplgee" in prompt and "ProtocolGEbot" not in prompt.split("ALLOWED PROMOTED RESOURCES")[1].split("\n\n")[0]
+    block = prompt.split("ALLOWED PROMOTED RESOURCES" + chr(10))[1].split(BLOCK_END)[0]
+    assert "@tplgee" in block and "@ProtocolGEbot" in block and "ProtocolTRbot" not in block
     assert (row.status, row.error_kind) == (STATUS_FAILED, "ai_invalid_output")
 
 
+def test_ge_insurance_question_valid_expert_draft(env):
+    row, _ = _run(env, ident="VerhniyLars", text=INSURANCE_Q,
+                  output=_out(primary_message=GOOD_GE, used_context_refs=[], evidence_strength="none"))
+    assert (row.status, row.primary_text) == (STATUS_DRAFT, GOOD_GE)
+
+
 def test_tr_toll_question_offers_protocol_tr_bot(env):
+    text = ("Начисления за платные дороги в Турции приходят отдельно от полиса. Полис можно оформить через "
+            "@tplgee, а начисления отслеживать через @ProtocolTRbot.")
     row, prompt = _run(env, ident="turkey_group", text=TOLL_Q,
-                       output=_out(primary_message="@ProtocolTRbot пришлёт начисления по платным дорогам.",
-                                   used_context_refs=[], evidence_strength="none"))
-    assert "@ProtocolTRbot — может прислать штрафы и начисления" in prompt
+                       output=_out(primary_message=text, used_context_refs=[], evidence_strength="none"))
+    assert "@ProtocolTRbot — может прислать штрафы и начисления" in prompt and "@ProtocolGEbot" not in prompt
     assert row.status == STATUS_DRAFT
 
 
 def test_unknown_country_gets_no_protocol_bot(env):
     row, prompt = _run(env, ident="krayzemlige", text=FINE_Q,
-                       output=_out(primary_message="Проверьте в @ProtocolGEbot.", used_context_refs=[],
-                                   evidence_strength="none"))
-    resources_block = prompt.split("ALLOWED PROMOTED RESOURCES")[1].split("\n\n")[0]
+                       output=_out(primary_message="Штраф проверяют по базе. Отслеживать можно в @ProtocolGEbot, "
+                                                   "полис — через @tplgee.",
+                                   used_context_refs=[], evidence_strength="none"))
+    resources_block = prompt.split("ALLOWED PROMOTED RESOURCES" + chr(10))[1].split(BLOCK_END)[0]
     assert "Protocol" not in resources_block and "@tplgee" in resources_block
     assert row.status == STATUS_FAILED
 
 
-def test_tplgee_still_works_for_insurance(env):
+def test_insurance_draft_without_required_resource_is_rejected(env):
     row, _ = _run(env, ident="VerhniyLars", text=INSURANCE_Q,
-                  output=_out(primary_message="Точную стоимость сейчас не подскажу. Рассчитать можно у @tplgee.",
+                  output=_out(primary_message="Да, автостраховку проверяет грузинская сторона. Полис можно оформить через @tplgee.",
                               used_context_refs=[], evidence_strength="none"))
-    assert (row.status, row.primary_text) == (STATUS_DRAFT, "Точную стоимость сейчас не подскажу. Рассчитать можно у @tplgee.")
+    assert (row.status, row.error_kind) == (STATUS_FAILED, "ai_invalid_output")
+    assert row.error == "missing_resource:@ProtocolGEbot"
 
 
 # ---- groups.yaml country ----

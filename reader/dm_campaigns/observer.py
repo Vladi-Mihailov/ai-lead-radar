@@ -28,7 +28,7 @@ from reader.dm_campaigns.outreach_repository import (
 from reader.dm_campaigns.recent_messages import RecentMessageRepository
 from reader.dm_campaigns.repository import DmCampaignRepository
 from reader.dm_campaigns.sendability import assess_sendability
-from reader.insurance_matching import is_insurance_text, is_non_auto_insurance_text
+from reader.insurance_matching import is_insurance_text
 
 logger = logging.getLogger(__name__)
 
@@ -128,8 +128,8 @@ class DmOutreachObserver:
             return FILTER_SOURCE_CHAT
         if campaign.scenario_name == INSURANCE_SCENARIO and not is_insurance_text(message.text):
             return FILTER_INSURANCE_PREFILTER
-        if campaign.scenario_name == INSURANCE_SCENARIO and is_non_auto_insurance_text(message.text):
-            return FILTER_NON_AUTO_INSURANCE
+        # Вопрос только о медицинской страховке больше НЕ отсекается: у кампании
+        # есть утверждённый ответ (медстраховка — см. CAMPAIGN GUIDELINE).
         return None
 
     def _insert(self, message: Message, campaign: DmCampaign, status: str, filter_reason: str | None) -> None:
