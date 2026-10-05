@@ -27,6 +27,7 @@ from reader.dm_campaigns.outreach_repository import (
 )
 from reader.dm_campaigns.recent_messages import RecentMessageRepository
 from reader.dm_campaigns.repository import DmCampaignRepository
+from reader.dm_campaigns.sendability import assess_sendability
 from reader.insurance_matching import is_insurance_text
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,8 @@ INSURANCE_SCENARIO = "insurance"
 FILTER_SOURCE_CHAT = "source_chat_not_allowed"
 FILTER_INSURANCE_PREFILTER = "insurance_prefilter_rejected"
 FILTER_NO_SENDER_ID = "no_sender_id"
+# Больше не присваивается (Phase 2.6: @username не обязателен); остаётся
+# как значение filter_reason у строк, созданных раньше.
 FILTER_NO_USERNAME = "no_username"
 
 # Настройки кампаний перечитываются не чаще раза в N секунд — не SELECT на
@@ -107,12 +110,12 @@ class DmOutreachObserver:
                 self._insert(message, first_rejection[0], STATUS_FILTERED, first_rejection[1])
             return
 
+        # Минимальная пригодность: recipient_user_id + исходное сообщение
+        # (source_chat_id/source_message_id есть всегда). @username НЕ
+        # обязателен: без него отправляющий аккаунт адресует автора через
+        # исходное сообщение (см. reader/dm_campaigns/sendability.py).
         if message.sender_id is None:
             self._insert(message, chosen, STATUS_FILTERED, FILTER_NO_SENDER_ID)
-        elif not message.sender_username:
-            # Без @username другой (отправляющий) аккаунт в Phase 3 не сможет
-            # надёжно найти получателя — черновик бесполезен, OpenAI не зовём.
-            self._insert(message, chosen, STATUS_FILTERED, FILTER_NO_USERNAME)
         else:
             self._insert(message, chosen, STATUS_PENDING_CONTEXT, None)
 
@@ -134,6 +137,12 @@ class DmOutreachObserver:
             recipient_username=message.sender_username, source_text=message.text, status=status,
             now=now, draft_after_at=now + self._context_wait if status == STATUS_PENDING_CONTEXT else None,
             filter_reason=filter_reason,
+            sendability=assess_sendability(
+                username=message.sender_username, recipient_user_id=message.sender_id,
+                source_chat_id=message.chat_id, source_message_id=message.id,
+                contact_require_premium=message.sender_contact_require_premium,
+            ),
+            contact_require_premium=message.sender_contact_require_premium,
         )
         if outreach_id is None:
             return

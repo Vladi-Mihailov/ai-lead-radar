@@ -491,6 +491,7 @@ class TelegramSource(BaseSource):
             link=self._build_link(event.chat_id, event.id, resolved),
             chat_identifier=resolved.identifier if resolved else None,
             reply_to_msg_id=_reply_to_msg_id(event),
+            sender_contact_require_premium=_contact_require_premium(event),
         )
 
         if self._debug_events:
@@ -537,3 +538,13 @@ def _reply_to_msg_id(event) -> int | None:
     reply_to = getattr(getattr(event, "message", None), "reply_to", None)
     value = getattr(reply_to, "reply_to_msg_id", None)
     return value if isinstance(value, int) else None
+
+
+def _contact_require_premium(event) -> bool | None:
+    """User.contact_require_premium отправителя — только из объекта, который
+    Telethon УЖЕ получил (event.sender после get_sender в _resolve_sender),
+    без нового запроса. None — объекта User нет (не загружен/не пользователь)."""
+    sender = getattr(event, "sender", None)
+    if not isinstance(sender, User):
+        return None
+    return bool(getattr(sender, "contact_require_premium", False))

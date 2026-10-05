@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 from reader.dm_campaigns.recent_messages import format_time, parse_time
+from reader.dm_campaigns.sendability import SENDABILITY_UNRESOLVED, SENDABILITY_VALUES
 
 STATUS_PENDING_CONTEXT = "pending_context"
 STATUS_DRAFTING = "drafting"
@@ -55,6 +56,8 @@ _SCHEMA = (
         created_at              TEXT NOT NULL,
         updated_at              TEXT NOT NULL,
         generated_at            TEXT,
+        sendability             TEXT NOT NULL DEFAULT 'unresolved',
+        contact_require_premium INTEGER,
         UNIQUE (source_chat_id, source_message_id)
     )
     """,
@@ -67,7 +70,14 @@ _COLUMNS = (
     "source_message_at, source_link, source_reply_to_msg_id, recipient_user_id, recipient_username, "
     "source_text, status, draft_after_at, attempts, context_json, primary_text, follow_up_text, "
     "evidence_strength, used_context_refs_json, filter_reason, error_kind, error, created_at, "
-    "updated_at, generated_at"
+    "updated_at, generated_at, sendability, contact_require_premium"
+)
+
+# Аддитивные колонки для таблиц, созданных до Phase 2.6 (строки-старожилы
+# получают sendability='unresolved', contact_require_premium=NULL).
+_COLUMN_MIGRATIONS = (
+    ("sendability", "TEXT NOT NULL DEFAULT 'unresolved'"),
+    ("contact_require_premium", "INTEGER"),
 )
 
 # Сколько раз кандидат может быть забран обработчиком (включая повторы
@@ -107,6 +117,10 @@ class DmOutreach:
     created_at: datetime
     updated_at: datetime
     generated_at: datetime | None
+    # Phase 2.6 (см. reader/dm_campaigns/sendability.py). access_hash НЕ
+    # хранится: он привязан к читающему аккаунту и отправителю бесполезен.
+    sendability: str = SENDABILITY_UNRESOLVED
+    contact_require_premium: bool | None = None
 
 
 def _opt_time(value: str | None) -> datetime | None:
@@ -119,7 +133,7 @@ def _row(row) -> DmOutreach:
         source_message_at, source_link, source_reply_to_msg_id, recipient_user_id, recipient_username,
         source_text, status, draft_after_at, attempts, context_json, primary_text, follow_up_text,
         evidence_strength, used_context_refs_json, filter_reason, error_kind, error, created_at,
-        updated_at, generated_at,
+        updated_at, generated_at, sendability, contact_require_premium,
     ) = row
     return DmOutreach(
         id=id_, campaign_id=campaign_id, source_chat_id=source_chat_id,
@@ -134,6 +148,8 @@ def _row(row) -> DmOutreach:
         filter_reason=filter_reason, error_kind=error_kind, error=error,
         created_at=parse_time(created_at), updated_at=parse_time(updated_at),
         generated_at=_opt_time(generated_at),
+        sendability=sendability or SENDABILITY_UNRESOLVED,
+        contact_require_premium=None if contact_require_premium is None else bool(contact_require_premium),
     )
 
 
@@ -147,6 +163,10 @@ class DmOutreachRepository:
         self._conn.execute("PRAGMA foreign_keys=ON")
         for statement in _SCHEMA:
             self._conn.execute(statement)
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(dm_outreach)")}
+        for column, definition in _COLUMN_MIGRATIONS:
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE dm_outreach ADD COLUMN {column} {definition}")
         self._conn.commit()
 
     def insert_candidate(
@@ -155,13 +175,16 @@ class DmOutreachRepository:
         source_link: str | None, source_reply_to_msg_id: int | None,
         recipient_user_id: int | None, recipient_username: str | None, source_text: str,
         status: str, now: datetime, draft_after_at: datetime | None = None,
-        filter_reason: str | None = None,
+        filter_reason: str | None = None, sendability: str = SENDABILITY_UNRESOLVED,
+        contact_require_premium: bool | None = None,
     ) -> int | None:
         """INSERT OR IGNORE по глобальному UNIQUE(source_chat_id,
         source_message_id). id новой строки, либо None — для этого
         сообщения строка уже есть (в любой кампании)."""
         if status not in (STATUS_PENDING_CONTEXT, STATUS_FILTERED):
             raise ValueError(f"Недопустимый начальный статус: {status!r}")
+        if sendability not in SENDABILITY_VALUES:
+            raise ValueError(f"Недопустимое значение sendability: {sendability!r}")
         stamp = format_time(now)
         cursor = self._conn.execute(
             """
@@ -169,14 +192,15 @@ class DmOutreachRepository:
                 campaign_id, source_chat_id, source_chat_identifier, source_chat_title,
                 source_message_id, source_message_at, source_link, source_reply_to_msg_id,
                 recipient_user_id, recipient_username, source_text, status, draft_after_at,
-                filter_reason, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                filter_reason, created_at, updated_at, sendability, contact_require_premium
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 campaign_id, source_chat_id, source_chat_identifier, source_chat_title,
                 source_message_id, format_time(source_message_at), source_link, source_reply_to_msg_id,
                 recipient_user_id, recipient_username, (source_text or "")[:_MAX_SOURCE_TEXT], status,
                 format_time(draft_after_at) if draft_after_at else None, filter_reason, stamp, stamp,
+                sendability, None if contact_require_premium is None else int(bool(contact_require_premium)),
             ),
         )
         self._conn.commit()

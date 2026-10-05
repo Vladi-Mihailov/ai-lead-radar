@@ -19,6 +19,9 @@ class Message:
     chat_identifier: str | None = None
     # id сообщения, на которое это сообщение отвечает (контекст ЛС-черновиков).
     reply_to_msg_id: int | None = None
+    # User.contact_require_premium из УЖЕ полученного Telethon-объекта
+    # отправителя (без отдельного запроса); None — объекта нет.
+    sender_contact_require_premium: bool | None = None
 
 
 @dataclass(frozen=True)
