@@ -8,6 +8,7 @@ from reader.turkey_bot.texts import (
     GEORGIAN_BOT_LINK_LABEL,
     HELP_LABEL,
     MY_CARS_LABEL,
+    OSAGO_TR_LABEL,
     SEARCH_LABEL,
     STATISTICS_LABEL,
     STOP_MONITORING_LABEL,
@@ -40,7 +41,7 @@ def test_manager_menu_has_statistics_and_search_row():
     assert texts_grid[0] == [ADD_CAR_LABEL, MY_CARS_LABEL]
     assert texts_grid[1] == [CHECK_NOW_LABEL, SEARCH_LABEL]
     assert texts_grid[2] == [STATISTICS_LABEL, GEORGIAN_BOT_LINK_LABEL]
-    assert texts_grid[3] == [HELP_LABEL]
+    assert texts_grid[3] == [HELP_LABEL, OSAGO_TR_LABEL]
     flat = [label for row in texts_grid for label in row]
     assert STOP_MONITORING_LABEL not in flat
 

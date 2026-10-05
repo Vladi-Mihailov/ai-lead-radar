@@ -286,6 +286,33 @@ GEORGIAN_BOT_LINK_LABEL = "🇬🇪 Штрафы Грузии"
 GEORGIAN_BOT_LINK_TEXT = "🇬🇪 Проверка штрафов в Грузии"
 GEORGIAN_BOT_URL = "https://t.me/ProtocolGEbot"
 
+# Переход в страховой Turkey-бот @OSAGOTRbot (см. reader/public_bot/
+# texts.py::OSAGO_LABEL/OSAGO_LINK_TEXT/OSAGO_BOT_URL — тот же приём,
+# буквально воспроизведённый для Turkey: ОБЫЧНАЯ reply-кнопка в главном
+# меню, видна ВСЕМ (не trusted-gated), использует УЖЕ существующий
+# BotReply.cta_buttons (см. reader/turkey_bot/conversation.py::
+# _debt_cta_buttons про тот же механизм) — отдельная inline-разметка
+# (georgian_bot_link_keyboard-style) не заводится, она не нужна при одной
+# кнопке. Вся логика оформления (цены, документы, заказ, оплата, полис) —
+# только там; здесь лишь переход. start=turkey_bot — deep-link payload,
+# который @OSAGOTRbot сохраняет как acquisition_source (см.
+# app.telegram_bot.sessions.parse_source в auto-insurance — родовой,
+# НЕ привязан к конкретному payload, "turkey_bot" уже работает без
+# изменений на той стороне).
+#
+# НЕ ПУТАТЬ с _debt_cta_buttons()'s "🚗 ОСАГО Турции" (см. conversation.py)
+# — та кнопка ведёт на человека-оператора (payment_help_contact_username)
+# под результатом проверки задолженности, это ОТДЕЛЬНАЯ, уже существующая
+# фича, которую эта задача не трогает.
+OSAGO_TR_LABEL = "🛡 ОСАГО Турция"
+OSAGO_TR_LINK_TEXT = (
+    "🛡 ОСАГО Турция\n\n"
+    "Оформление страховки происходит в нашем страховом боте.\n\n"
+    "Нажмите кнопку ниже:"
+)
+OSAGO_TR_LINK_BUTTON_LABEL = "🚗 Оформить ОСАГО Турция"
+OSAGO_TR_BOT_URL = "https://t.me/OSAGOTRbot?start=turkey_bot"
+
 # One-off сообщение существующим пользователям после production
 # deployment (см. задачу "Перенос Unified Turkey функционала в
 # production" п.8, reader/turkey_bot/migration_notify.py::notify_all) —
@@ -340,7 +367,14 @@ EMPTY_GARAGE_TEXT = (
     "Проверьте автомобиль по номеру — после успешной проверки он появится здесь."
 )
 
-HELP_MENU_TEXT = "ℹ️ Справка\n\nВыберите раздел:"
+# Одна строка про OSAGO_TR_LABEL добавлена здесь (не в отдельный раздел
+# ниже, см. задачу) — вся логика оформления находится в @OSAGOTRbot, не
+# в этом боте, подробный раздел справки тут не нужен.
+HELP_MENU_TEXT = (
+    "ℹ️ Справка\n\n"
+    "• 🛡 ОСАГО Турция — оформить страховку для поездки по Турции.\n\n"
+    "Выберите раздел:"
+)
 
 HELP_TERMS_TEXT = (
     "📖 Термины\n\n"

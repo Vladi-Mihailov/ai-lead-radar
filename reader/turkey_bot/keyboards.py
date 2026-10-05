@@ -39,6 +39,7 @@ from reader.turkey_bot.texts import (
     HELP_TERMS_LABEL,
     HISTORY_LABEL,
     MY_CARS_LABEL,
+    OSAGO_TR_LABEL,
     SEARCH_BACK_LABEL,
     SEARCH_LABEL,
     SEARCH_MENU_LABEL,
@@ -95,17 +96,16 @@ def cancel_keyboard() -> list[list[Button]]:
 
 
 def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
-    """Макет обычного пользователя (НЕ менялся, см. задачу "Расположение
-    кнопок manager ReplyKeyboard"):
+    """Макет обычного пользователя:
       ROW 1: ADD_CAR_LABEL | MY_CARS_LABEL
       ROW 2: CHECK_NOW_LABEL | GEORGIAN_BOT_LINK_LABEL
-      ROW 3: HELP_LABEL
+      ROW 3: HELP_LABEL | OSAGO_TR_LABEL
 
     Макет manager (is_trusted=True):
       ROW 1: ADD_CAR_LABEL | MY_CARS_LABEL
       ROW 2: CHECK_NOW_LABEL | SEARCH_LABEL
       ROW 3: STATISTICS_LABEL | GEORGIAN_BOT_LINK_LABEL
-      ROW 4: HELP_LABEL
+      ROW 4: HELP_LABEL | OSAGO_TR_LABEL
 
     SEARCH_LABEL (см. задачу "manager/trusted Search") заменяет здесь
     бывшую "⛔ Остановить мониторинг" (STOP_MONITORING_LABEL, см.
@@ -116,14 +116,20 @@ def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
     доступен через handle_stop_monitoring(), просто без кнопки в меню.
 
     "🇬🇪 Штрафы Грузии" — обычная reply-кнопка (см. georgian_bot_link_keyboard
-    докстрок ниже про то, почему она не может сама быть URL-кнопкой)."""
+    докстрок ниже про то, почему она не может сама быть URL-кнопкой).
+
+    "🛡 ОСАГО Турция" (см. задачу "add Turkey OSAGO handoff to
+    ProtocolTRbot", reader/turkey_bot/texts.py::OSAGO_TR_LABEL — тот же
+    приём, что и у @ProtocolGEbot's OSAGO_LABEL, см.
+    reader/public_bot/keyboards.py::main_menu_keyboard) — последняя
+    строка, рядом с HELP_LABEL, видна ВСЕМ (не trusted-gated)."""
     rows = [[Button.text(ADD_CAR_LABEL, resize=True), Button.text(MY_CARS_LABEL, resize=True)]]
     if is_trusted:
         rows.append([Button.text(CHECK_NOW_LABEL, resize=True), Button.text(SEARCH_LABEL, resize=True)])
         rows.append([Button.text(STATISTICS_LABEL, resize=True), Button.text(GEORGIAN_BOT_LINK_LABEL, resize=True)])
     else:
         rows.append([Button.text(CHECK_NOW_LABEL, resize=True), Button.text(GEORGIAN_BOT_LINK_LABEL, resize=True)])
-    rows.append([Button.text(HELP_LABEL, resize=True)])
+    rows.append([Button.text(HELP_LABEL, resize=True), Button.text(OSAGO_TR_LABEL, resize=True)])
     return rows
 
 

@@ -282,6 +282,9 @@ class ConversationController:
         if stripped == texts.GEORGIAN_BOT_LINK_LABEL:
             return self.handle_georgian_bot_link(chat_id=chat_id)
 
+        if stripped == texts.OSAGO_TR_LABEL:
+            return self.handle_osago_tr_link(chat_id=chat_id)
+
         state = self._states.get(chat_id)
         if state is not None and state.step == _STEP_AWAITING_NEW_CAR_PLATE:
             return await self._handle_new_car_plate(
@@ -771,6 +774,23 @@ class ConversationController:
     def handle_georgian_bot_link(self, *, chat_id: int) -> BotReply:
         self._states.clear(chat_id)
         return BotReply(text=texts.GEORGIAN_BOT_LINK_TEXT, show_georgian_bot_link=True)
+
+    def handle_osago_tr_link(self, *, chat_id: int) -> BotReply:
+        """"🛡 ОСАГО Турция" -> @OSAGOTRbot (см. задачу "add Turkey OSAGO
+        handoff to ProtocolTRbot", reader/public_bot/conversation.py's own
+        OSAGO handler for the same pattern on the Georgia side). Reuses the
+        EXISTING generic cta_buttons mechanism (see _debt_cta_buttons above
+        and handlers.py's rendering of it) instead of a dedicated
+        show_*_link boolean + its own keyboard function -- one inline URL
+        button is all this needs. Only переход, никакой логики оформления
+        страховки здесь нет; НЕ путать с _debt_cta_buttons()'s "🚗 ОСАГО
+        Турции" (human operator CTA under a debt-check result) -- отдельная,
+        не затронутая этой задачей фича."""
+        self._states.clear(chat_id)
+        return BotReply(
+            text=texts.OSAGO_TR_LINK_TEXT,
+            cta_buttons=((texts.OSAGO_TR_LINK_BUTTON_LABEL, texts.OSAGO_TR_BOT_URL),),
+        )
 
     def handle_help_callback(self, section: str) -> BotReply:
         if section == "terms":
