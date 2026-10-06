@@ -18,7 +18,7 @@ from reader.core.engine import MatchEngine
 from reader.core.models import Message
 from reader.core.pipeline import Pipeline
 from reader.dm_campaigns.context import DmContextBuilder
-from reader.dm_campaigns.draft_models import DmDraftOutput, normalize_draft
+from reader.dm_campaigns.draft_models import DmDraftOutput, DmDraftOutputExpert, DmIntentOutput, normalize_draft
 from reader.dm_campaigns.draft_prompt import SYSTEM_PROMPT, build_user_text
 from reader.dm_campaigns.draft_service import DmDraftService, DmDraftServiceError
 from reader.dm_campaigns.observer import DmOutreachObserver
@@ -94,7 +94,11 @@ def test_discussion_before_after_reply_and_pseudonyms(env):
     row = _candidate(outreach, border, reply=98)
     ctx = _builder(recent).build(row, border, T0 + timedelta(minutes=4))
     refs = [i.ref for i in ctx.discussion]
-    assert refs == ["B1", "B2", "A1"]  # 98 уже в "до" — в цепочку не дублируется
+    # Цепочка ответов (95 <- 98 <- 100) всегда помечается R, даже внутри окна
+    # "до", и не дублируется в B: модель видит, кому отвечает USER.
+    assert refs == ["R1", "R2", "A1"]
+    r2 = next(i for i in ctx.discussion if i.ref == "R2")
+    assert (r2.text, r2.note) == ("Мы выезжаем вечером", "сообщение, на которое отвечает USER")
     a1 = next(i for i in ctx.discussion if i.ref == "A1")
     assert (a1.author, a1.note, a1.age_minutes, a1.chat) == ("P3", "ответ на исходное сообщение USER", 3, "Верхний Ларс")
     payload = ctx.to_json()
@@ -177,10 +181,12 @@ def test_prompt_contains_no_identifiers(env):
 
 
 def _out(**kwargs):
+    # intent — только для экспертной кампании (insurance); по умолчанию — свой
+    # вопрос автора (лид), прочие кампании это поле игнорируют.
     base = dict(should_generate=True, skip_reason=None, primary_message="Ответ по делу.", follow_up_message=None,
-                evidence_strength="several_consistent", used_context_refs=["S1"])
+                evidence_strength="several_consistent", used_context_refs=["S1"], intent="QUESTION")
     base.update(kwargs)
-    return DmDraftOutput(**base)
+    return DmDraftOutputExpert(**base)
 
 
 def _norm(output, **kwargs):
@@ -310,8 +316,13 @@ class _FakeService:
         self.delay = delay
         self.calls = []
         self.instructions = []
+        self.classifications = []  # шаг 1 insurance — отдельно от генерации
 
-    async def generate(self, user_text, *, instructions=None):
+    async def generate(self, user_text, *, instructions=None, text_format=None):
+        if text_format is DmIntentOutput:
+            self.classifications.append(user_text)
+            return DmIntentOutput(intent=getattr(self.output, "intent", "QUESTION"), has_own_problem=True,
+                                  reason="test")
         self.calls.append(user_text)
         self.instructions.append(instructions)
         if self.delay:
@@ -358,7 +369,7 @@ async def test_campaign_disabled_before_generation(env):
 async def test_source_changed_before_generation(env):
     _, campaigns, outreach, recent = env
     fuel = campaigns.set_enabled(campaigns.get_campaign_by_key("fuel").id, True)
-    row = _candidate(outreach, fuel)
+    row = _candidate(outreach, fuel, text="Есть бензин на М4?")
     campaigns.update_source_chats(fuel.id, ["Sadahlo"])
     service = _FakeService()
     await _processor(env, service, _Clock(T0 + timedelta(minutes=5))).run_once()
@@ -368,7 +379,7 @@ async def test_source_changed_before_generation(env):
 async def test_ai_not_suitable_is_filtered(env):
     _, campaigns, outreach, recent = env
     fuel = campaigns.set_enabled(campaigns.get_campaign_by_key("fuel").id, True)
-    row = _candidate(outreach, fuel)
+    row = _candidate(outreach, fuel, text="Есть бензин на М4?")
     service = _FakeService(_out(should_generate=False, primary_message=None, skip_reason="дизельный двигатель, не про топливо"))
     await _processor(env, service, _Clock(T0 + timedelta(minutes=5))).run_once()
     done = outreach.get(row.id)
@@ -378,12 +389,12 @@ async def test_ai_not_suitable_is_filtered(env):
 
 @pytest.mark.parametrize("service,kind", [
     (_FakeService(error=DmDraftServiceError("transient failure after retry")), "ai_error"),
-    (_FakeService(_out(used_context_refs=["S7"])), "ai_invalid_output"),
+    (_FakeService(_out(primary_message="Пишите @some_other_bot")), "ai_invalid_output"),
 ])
 async def test_ai_failures(env, service, kind):
     _, campaigns, outreach, recent = env
     fuel = campaigns.set_enabled(campaigns.get_campaign_by_key("fuel").id, True)
-    row = _candidate(outreach, fuel)
+    row = _candidate(outreach, fuel, text="Есть бензин на М4?")
     await _processor(env, service, _Clock(T0 + timedelta(minutes=5))).run_once()
     done = outreach.get(row.id)
     assert (done.status, done.error_kind) == (STATUS_FAILED, kind)
@@ -392,7 +403,7 @@ async def test_ai_failures(env, service, kind):
 async def test_ai_timeout(env):
     _, campaigns, outreach, recent = env
     fuel = campaigns.set_enabled(campaigns.get_campaign_by_key("fuel").id, True)
-    row = _candidate(outreach, fuel)
+    row = _candidate(outreach, fuel, text="Есть бензин на М4?")
     await _processor(env, _FakeService(delay=1.0), _Clock(T0 + timedelta(minutes=5)), generation_timeout_seconds=0.01).run_once()
     assert (outreach.get(row.id).status, outreach.get(row.id).error_kind) == (STATUS_FAILED, "ai_timeout")
 
@@ -400,7 +411,7 @@ async def test_ai_timeout(env):
 async def test_recovery_and_attempt_limit(env):
     _, campaigns, outreach, recent = env
     fuel = campaigns.set_enabled(campaigns.get_campaign_by_key("fuel").id, True)
-    row = _candidate(outreach, fuel)
+    row = _candidate(outreach, fuel, text="Есть бензин на М4?")
     clock = _Clock(T0 + timedelta(minutes=5))
     for _ in range(3):  # трижды "упал" посреди генерации
         assert outreach.claim(row.id, clock.now)
@@ -415,7 +426,7 @@ async def test_recovery_and_attempt_limit(env):
 async def test_processor_recovers_stale_drafting_then_drafts(env):
     _, campaigns, outreach, recent = env
     fuel = campaigns.set_enabled(campaigns.get_campaign_by_key("fuel").id, True)
-    row = _candidate(outreach, fuel)
+    row = _candidate(outreach, fuel, text="Есть бензин на М4?")
     outreach.claim(row.id, T0 + timedelta(minutes=3))
     await _processor(env, _FakeService(), _Clock(T0 + timedelta(minutes=20))).run_once()
     assert outreach.get(row.id).status == STATUS_DRAFT

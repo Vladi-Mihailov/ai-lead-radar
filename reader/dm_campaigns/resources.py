@@ -59,9 +59,28 @@ def has_toll_intent(text: str) -> bool:
     return bool(_TOLL_RE.search(text or ""))
 
 
+# Поездка на машине через Грузию: явно названа Грузия/её КПП, либо маршрут
+# между Россией и Арменией/Турцией (сухопутный путь идёт через Грузию).
+_GEORGIA_RE = re.compile(r"грузи|georgia|ларс|дариал|сарпи|садахло|тбилиси|батуми", re.IGNORECASE)
+_RUSSIA_RE = re.compile(r"росси|(?<!\w)рф(?!\w)|russia", re.IGNORECASE)
+_ARMENIA_TURKEY_RE = re.compile(r"армени|турци|armenia|turkey", re.IGNORECASE)
+
+
+def georgia_transit(text: str) -> bool:
+    text = text or ""
+    if _GEORGIA_RE.search(text):
+        return True
+    return bool(_RUSSIA_RE.search(text) and _ARMENIA_TURKEY_RE.search(text))
+
+
 def contextual_resource(*, resource_region: str, intent_text: str, campaign_key: str | None = None) -> str | None:
-    # insurance в GE-группе: вопрос о страховке — это и вопрос о штрафе за её
-    # отсутствие (утверждённый факт кампании), поэтому @ProtocolGEbot уместен.
+    # insurance в GE-группе (или поездка через Грузию из любой группы): вопрос
+    # о страховке — это и вопрос о штрафе за её отсутствие (утверждённый факт
+    # кампании), поэтому @ProtocolGEbot уместен.
+    if campaign_key == INSURANCE_CAMPAIGN_KEY and resource_region != "ge" and georgia_transit(intent_text) and not (
+        resource_region == "tr" and (has_fine_intent(intent_text) or has_toll_intent(intent_text))
+    ):
+        return PROTOCOL_GE
     if resource_region == "ge" and (has_fine_intent(intent_text) or campaign_key == INSURANCE_CAMPAIGN_KEY):
         return PROTOCOL_GE
     if resource_region == "tr" and (has_fine_intent(intent_text) or has_toll_intent(intent_text)):

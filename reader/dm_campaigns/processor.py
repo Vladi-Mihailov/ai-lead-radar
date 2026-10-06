@@ -19,12 +19,32 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
 from reader.dm_campaigns.context import DmContextBuilder
-from reader.dm_campaigns.draft_models import normalize_draft
-from reader.dm_campaigns.draft_prompt import EXPERT_CAMPAIGNS, build_user_text, system_prompt_for
+from reader.dm_campaigns.draft_models import (
+    LEAD_INTENTS,
+    DmDraftOutput,
+    DmIntentOutput,
+    normalize_draft,
+    resolve_intent,
+)
+from reader.dm_campaigns.draft_prompt import (
+    EXPERT_CAMPAIGNS,
+    INTENT_CLASSIFIER_PROMPT,
+    build_classification_text,
+    build_user_text,
+    reply_to_other,
+    system_prompt_for,
+)
 from reader.dm_campaigns.draft_service import DmDraftService, DmDraftServiceError
 from reader.dm_campaigns.models import source_chat_allowed
+from reader.dm_campaigns.observer import ACTIVE_DRAFT_WINDOW, FILTER_ACTIVE_DRAFT
 from reader.dm_campaigns.outreach_repository import MAX_ATTEMPTS, DmOutreach, DmOutreachRepository
 from reader.dm_campaigns.recent_messages import RecentMessageRepository
+from reader.dm_campaigns.relevance import (
+    FILTER_CAMPAIGN_NOT_RELEVANT,
+    ROUTABLE_CAMPAIGNS,
+    campaign_relevant,
+    side_topics,
+)
 from reader.dm_campaigns.repository import DmCampaignRepository
 from reader.dm_campaigns.resources import allowed_resources
 from reader.groups import REGION_UNKNOWN
@@ -34,6 +54,31 @@ logger = logging.getLogger(__name__)
 FILTER_CAMPAIGN_DISABLED = "campaign_disabled_before_generation"
 FILTER_SOURCE_CHANGED = "source_chat_not_allowed_before_generation"
 FILTER_AI_NOT_SUITABLE = "ai_not_suitable"
+
+# Исправимые причины отказа экспертного черновика -> подсказка для одной
+# повторной генерации.
+RETRY_HINTS = {
+    "topic_leak_medical": "в ответе есть медицинская страховка, а USER о ней не спрашивал — убери её.",
+    "too_long": "слишком длинно — максимум 3 коротких предложения.",
+    "legalese": "юридические обороты — перескажи простыми словами.",
+    "missing_resource": "упомяни по назначению каждый ресурс из ALLOWED PROMOTED RESOURCES.",
+    "ad_only_answer": "сначала ответ по существу, ресурсы — после.",
+    "expert_hedging_or_group_reference": "без оговорок и без ссылок на группу или её участников.",
+    "unapproved_claim": "утверждение, которого нет в утверждённых фактах, — убери его.",
+    "unnecessary_clarification": "не переспрашивай — ответь тем, что следует из фактов.",
+}
+# fuel / border_queue: та же одна исправляющая попытка — для оговорок,
+# обещаний и ссылок на несуществующие сообщения.
+DYNAMIC_RETRY_HINTS = {
+    "dynamic_hedging": "без оговорок «точно подтвердить не могу» и без отсылок к официальным каналам; нет данных — "
+                       "скажи прямо: «В свежих сообщениях нет данных о …».",
+    "future_promise": "не обещай ничего сделать потом (посмотрю, проверю, уточню, напишите маршрут) — ответь сразу "
+                      "тем, что есть.",
+    "unknown_context_refs": "used_context_refs — только метки сообщений из контекста; утверждай только то, что есть "
+                            "в этих сообщениях.",
+    "topic_leak": "в ответе только темы, о которых USER не спрашивал (страховка, бензин, посылки, штрафы, документы, "
+                  "номера, обмен валют) — ответь только на его вопрос о проезде; нет данных — так и скажи.",
+}
 
 _BATCH_LIMIT = 5
 _CLEANUP_INTERVAL_SECONDS = 3600.0
@@ -129,6 +174,16 @@ class DmDraftProcessor:
             self._log(row, "filtered", note=FILTER_SOURCE_CHANGED)
             return True
 
+        # Пока кандидат ждал контекст, тому же человеку мог появиться черновик
+        # в этой кампании (другое сообщение той же дискуссии) — второй не нужен.
+        if self._outreach.active_draft_exists(
+            campaign_id=campaign.id, recipient_user_id=row.recipient_user_id,
+            recipient_username=row.recipient_username, since=now - ACTIVE_DRAFT_WINDOW, exclude_id=row.id,
+        ):
+            self._outreach.mark_filtered(row.id, now=now, reason=FILTER_ACTIVE_DRAFT)
+            self._log(row, "filtered", note=FILTER_ACTIVE_DRAFT)
+            return True
+
         try:
             context = self._context.build(row, campaign, now)
         except Exception as exc:
@@ -146,11 +201,49 @@ class DmDraftProcessor:
         )
 
         started = time.monotonic()
+        expert = campaign.key in EXPERT_CAMPAIGNS
+        intent = None
         try:
+            # Шаг 1 (ВСЕ ЛС-кампании): общая классификация роли сообщения —
+            # без фактов и ресурсов кампании. Не лид — генерация не запускается.
+            classified = await asyncio.wait_for(
+                self._service.generate(
+                    build_classification_text(row, context), instructions=INTENT_CLASSIFIER_PROMPT,
+                    text_format=DmIntentOutput,
+                ),
+                timeout=self._timeout,
+            )
+            intent = resolve_intent(classified, reply_to_other=reply_to_other(context))
+            intent_audit = {
+                "model_intent": classified.intent, "final_intent": intent, "intent": intent,
+                "has_own_problem": classified.has_own_problem, "intent_reason": (classified.reason or "")[:300],
+            }
+            context_json = context.to_json(**intent_audit)
+            if intent not in LEAD_INTENTS:
+                reason = f"not_lead_intent:{intent.lower()}"
+                self._outreach.mark_filtered(row.id, now=self._clock(), reason=reason, context_json=context_json)
+                self._log(row, "filtered", campaign_key=campaign.key, note=reason)
+                return True
+            # Лид, но тема не этой кампании (посылка в border_queue, продукты на
+            # таможне…) — без генерации; детерминированно, без OpenAI. Тему
+            # insurance уже проверил страховой префильтр observer.
+            replies = [i.text for i in context.discussion if i.ref.startswith("R")]
+            intent_audit["campaign_relevant"] = (
+                campaign.key not in ROUTABLE_CAMPAIGNS or campaign_relevant(campaign.key, row.source_text, replies)
+            )
+            context_json = context.to_json(**intent_audit)
+            if not intent_audit["campaign_relevant"]:
+                self._outreach.mark_filtered(
+                    row.id, now=self._clock(), reason=FILTER_CAMPAIGN_NOT_RELEVANT, context_json=context_json,
+                )
+                self._log(row, "filtered", campaign_key=campaign.key, note=FILTER_CAMPAIGN_NOT_RELEVANT)
+                return True
+            # Шаг 2: генерация ответа генератором ЭТОЙ кампании.
             output = await asyncio.wait_for(
                 self._service.generate(
                     build_user_text(row, campaign, context, allowed_resources=resources),
                     instructions=system_prompt_for(campaign.key),
+                    text_format=DmDraftOutput,
                 ),
                 timeout=self._timeout,
             )
@@ -173,21 +266,51 @@ class DmDraftProcessor:
                 context_json=context_json,
             )
             return True
-        latency = time.monotonic() - started
 
-        decision = normalize_draft(
-            output,
-            follow_up_enabled=campaign.follow_up_enabled,
-            valid_refs=context.refs,
-            fresh_context_used=context.fresh_context_used,
-            n_distinct_senders=meta.n_distinct_senders if meta else 0,
-            allowed_resources=resources,
-            expert=campaign.key in EXPERT_CAMPAIGNS,
-        )
+        def decide(out):
+            return normalize_draft(
+                out,
+                follow_up_enabled=campaign.follow_up_enabled,
+                valid_refs=context.refs,
+                fresh_context_used=context.fresh_context_used,
+                n_distinct_senders=meta.n_distinct_senders if meta else 0,
+                allowed_resources=resources,
+                expert=expert,
+                intent_text=intent_text,
+                intent=intent,
+                side_topics_asked=side_topics(row.source_text) if campaign.key == "border_queue" else None,
+            )
+
+        decision = decide(output)
+        # Одна исправляющая попытка, если сервер отклонил черновик по исправимой
+        # причине (insurance: лишняя медстраховка, длина, канцелярит, нет
+        # ресурса…; fuel/border_queue: оговорки, обещания, чужие метки) —
+        # модели называется причина; проверка та же, не ослаблена.
+        hints = RETRY_HINTS if expert else DYNAMIC_RETRY_HINTS
+        hint = hints.get((decision.error or "").split(":")[0]) if decision.kind == "invalid" else None
+        if hint:
+            try:
+                output = await asyncio.wait_for(
+                    self._service.generate(
+                        build_user_text(row, campaign, context, allowed_resources=resources)
+                        + f"\n\nПРЕДЫДУЩИЙ ЧЕРНОВИК ОТКЛОНЁН ПРОВЕРКОЙ: {hint} Напиши заново, исправив это.",
+                        instructions=system_prompt_for(campaign.key),
+                        text_format=DmDraftOutput,
+                    ),
+                    timeout=self._timeout,
+                )
+                decision = decide(output)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # первая (отклонённая) попытка остаётся итогом
+                logger.warning("dm_outreach id=%s: исправляющая попытка не удалась (%s)", row.id, type(exc).__name__)
+        latency = time.monotonic() - started
         finished = self._clock()
         if decision.kind == "filtered":
-            stored = context.to_json(ai_skip_reason=(output.skip_reason or "")[:300])
-            self._outreach.mark_filtered(row.id, now=finished, reason=FILTER_AI_NOT_SUITABLE, context_json=stored)
+            stored = context.to_json(ai_skip_reason=(output.skip_reason or "")[:300], **intent_audit)
+            self._outreach.mark_filtered(
+                row.id, now=finished, reason=decision.filter_reason or FILTER_AI_NOT_SUITABLE, context_json=stored,
+            )
             status = "filtered"
         elif decision.kind == "invalid":
             self._outreach.mark_failed(
@@ -195,6 +318,8 @@ class DmDraftProcessor:
             )
             status = "failed"
         else:
+            if decision.removed_side_topics:
+                context_json = context.to_json(removed_side_topics=list(decision.removed_side_topics), **intent_audit)
             self._outreach.mark_draft(
                 row.id, now=finished, context_json=context_json, primary_text=decision.primary_message,
                 follow_up_text=decision.follow_up_message, evidence_strength=decision.evidence_strength,

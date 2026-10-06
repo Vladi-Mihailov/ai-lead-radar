@@ -18,7 +18,7 @@ import pytest
 from test_dm_outreach_drafts import _builder, _FakeService, _out
 
 from reader.dm_campaigns.context import DraftContext
-from reader.dm_campaigns.draft_models import DmDraftOutput, normalize_draft
+from reader.dm_campaigns.draft_models import DmDraftOutput, DmDraftOutputExpert, normalize_draft
 from reader.dm_campaigns.draft_prompt import (
     SYSTEM_PROMPT,
     SYSTEM_PROMPT_EXPERT,
@@ -59,11 +59,12 @@ TARGET_ANSWERS = [
 ]
 
 
-def _norm(primary: str, *, expert=True, allowed=GE_REQUIRED):
-    output = DmDraftOutput(should_generate=True, skip_reason=None, primary_message=primary, follow_up_message=None,
-                           evidence_strength="none", used_context_refs=[])
+def _norm(primary: str, *, expert=True, allowed=GE_REQUIRED, intent_text=""):
+    output = DmDraftOutputExpert(should_generate=True, skip_reason=None, primary_message=primary,
+                                 follow_up_message=None, evidence_strength="none", used_context_refs=[],
+                                 intent="QUESTION")
     return normalize_draft(output, follow_up_enabled=False, valid_refs=frozenset(), fresh_context_used=False,
-                           n_distinct_senders=0, allowed_resources=allowed, expert=expert)
+                           n_distinct_senders=0, allowed_resources=allowed, expert=expert, intent_text=intent_text)
 
 
 # ---------------- маршрутизация на реальных вопросах ----------------
@@ -95,9 +96,9 @@ def test_armenia_and_unknown_get_no_protocol_bot():
 # ---------------- серверная проверка: целевой стиль ----------------
 
 
-@pytest.mark.parametrize("answer", TARGET_ANSWERS)
-def test_target_style_answers_pass(answer):
-    decision = _norm(answer)
+@pytest.mark.parametrize("question,answer", list(zip(REAL_QUESTIONS, TARGET_ANSWERS)))
+def test_target_style_answers_pass(question, answer):
+    decision = _norm(answer, intent_text=question)
     assert (decision.kind, decision.primary_message) == ("draft", answer)
 
 
@@ -228,15 +229,18 @@ def test_border_queue_keeps_dynamic_prompt_end_to_end(env):
 def test_expert_mode_drops_non_message_refs_instead_of_rejecting():
     """Реальный ответ модели (dry-run): в used_context_refs попали названия
     секций — в экспертном режиме они отбрасываются, черновик сохраняется."""
-    output = DmDraftOutput(should_generate=True, skip_reason=None, primary_message=TARGET_ANSWERS[4],
-                           follow_up_message=None, evidence_strength="none",
-                           used_context_refs=["CAMPAIGN_GUIDELINE", "ORIGINAL_MESSAGE"])
+    output = DmDraftOutputExpert(should_generate=True, skip_reason=None, primary_message=TARGET_ANSWERS[4],
+                                 follow_up_message=None, evidence_strength="none",
+                                 used_context_refs=["CAMPAIGN_GUIDELINE", "ORIGINAL_MESSAGE"], intent="QUESTION")
     decision = normalize_draft(output, follow_up_enabled=False, valid_refs=frozenset(), fresh_context_used=False,
                                n_distinct_senders=0, allowed_resources=GE_REQUIRED, expert=True)
     assert (decision.kind, decision.used_context_refs) == ("draft", ())
-    dynamic = normalize_draft(output, follow_up_enabled=False, valid_refs=frozenset(), fresh_context_used=False,
-                              n_distinct_senders=0, allowed_resources=GE_REQUIRED)
-    assert dynamic.kind == "invalid"  # вне экспертного режима — прежняя строгость
+    # fuel/border_queue: чужие метки тоже отбрасываются, но черновик, который
+    # заявляет свежие сведения без единого реального сообщения, — отклоняется.
+    claimed = output.model_copy(update={"evidence_strength": "several_consistent"})
+    dynamic = normalize_draft(claimed, follow_up_enabled=False, valid_refs=frozenset({"B1"}), fresh_context_used=True,
+                              n_distinct_senders=2, allowed_resources=GE_REQUIRED)
+    assert (dynamic.kind, dynamic.error) == ("invalid", "unknown_context_refs:CAMPAIGN_GUIDELINE,ORIGINAL_MESSAGE")
 
 
 def test_expert_prompt_requires_resources_in_every_answer_and_short_answers():

@@ -8,6 +8,8 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from reader.dm_campaigns.relevance import strip_side_topics
+
 EvidenceStrength = Literal["none", "single_report", "several_consistent", "contradictory"]
 
 
@@ -18,6 +20,38 @@ class DmDraftOutput(BaseModel):
     follow_up_message: str | None
     evidence_strength: EvidenceStrength
     used_context_refs: list[str]
+
+
+# Роль сообщения (insurance): черновик — только для собственного вопроса,
+# просьбы о помощи или личной проблемы автора; советы/ответы/рассказы/мнения
+# других участников — не лид, даже со словами «страховка», «штраф».
+MessageIntent = Literal[
+    "QUESTION", "HELP_REQUEST", "PERSONAL_PROBLEM", "ADVICE", "ANSWER", "STORY", "OPINION", "OTHER",
+]
+LEAD_INTENTS = frozenset({"QUESTION", "HELP_REQUEST", "PERSONAL_PROBLEM"})
+INSUFFICIENT_INTENT = "insufficient_user_intent"
+
+
+class DmIntentOutput(BaseModel):
+    """Шаг 1 (insurance): отдельная классификация роли сообщения ДО генерации."""
+
+    intent: MessageIntent
+    has_own_problem: bool
+    reason: str
+
+
+def resolve_intent(output: DmIntentOutput, *, reply_to_other: bool) -> str:
+    """Серверное правило поверх модели: ответ на сообщение ДРУГОГО участника
+    без собственной проблемы автора — не лид (ANSWER), что бы модель ни сказала."""
+    if reply_to_other and not output.has_own_problem and output.intent in LEAD_INTENTS:
+        return "ANSWER"
+    return output.intent
+
+
+class DmDraftOutputExpert(DmDraftOutput):
+    """Structured output экспертной кампании (insurance): + роль сообщения."""
+
+    intent: MessageIntent
 
 
 @dataclass(frozen=True)
@@ -32,6 +66,11 @@ class DraftDecision:
     evidence_strength: str = "none"
     used_context_refs: tuple[str, ...] = ()
     error: str | None = None
+    # filtered: причина для dm_outreach.filter_reason (None — ai_not_suitable).
+    filter_reason: str | None = None
+    intent: str | None = None
+    # border_queue: соседние темы, вырезанные из ответа (аудит).
+    removed_side_topics: tuple[str, ...] = ()
 
 
 _MENTION_RE = re.compile(r"(?<![\w@])@([A-Za-z0-9_]{4,32})")
@@ -116,6 +155,54 @@ _EXPERT_LEGALESE_RE = re.compile(
 )
 MAX_EXPERT_SENTENCES = 3
 
+# Медицинская страховка в ответе — только если о ней спрашивают (факты — база
+# знаний, а не чек-лист): иначе это утечка темы.
+_MEDICAL_MENTION_RE = re.compile(
+    r"медицин|медстрах|(?<!\w)мед\.?\s*страх|несчастн\w*\s+случа|страховк\w*\s+здоровья", re.IGNORECASE,
+)
+_MEDICAL_INTENT_RE = re.compile(
+    r"(?<!\w)мед(?:\.|\s|ицин|страх)|медстрах|здоровь|health|travel|туристическ\w*\s+страх|несчастн\w*\s+случа",
+    re.IGNORECASE,
+)
+
+
+# fuel / border_queue (свежие сообщения группы — допустимый источник): без
+# дежурных оговорок и без обещаний что-то сделать потом. Нет данных — так и
+# говорится («В свежих сообщениях нет данных о снеге на Ларсе.»).
+_DYNAMIC_HEDGING_RE = re.compile(
+    r"точно\s+(?:подтвердить|сказать|ответить)\s+не\s+могу|не\s+могу\s+(?:точно\s+)?(?:подтвердить|гарантировать)"
+    r"|ориентируйтесь\s+(?:\w+\s+){0,2}(?:на|по)\s+официальн"
+    r"|(?:уточните|проверьте|сверьтесь)\s+(?:\w+\s+){0,3}(?:в|на|по|с|через)\s+официальн"
+    r"|официальн\w*\s+(?:канал|источник|информаци)",
+    re.IGNORECASE,
+)
+_FUTURE_PROMISE_RE = re.compile(
+    r"(?<!\w)(?:посмотрю|проверю|уточню|узнаю|подскажу\s+позже|сообщу|отпишусь|дам\s+знать)(?!\w)"
+    r"|напишу\s+(?:вам\s+)?(?:позже|потом|как\s+только)"
+    r"|(?:напишите|укажите|пришлите|скиньте)\s+(?:\w+\s+){0,2}маршрут",
+    re.IGNORECASE,
+)
+# Ровно дежурная оговорка в начале предложения («Точно подтвердить не могу.»,
+# «Точно подтвердить не могу — в свежих…») вырезается; остальное — правка моделью.
+_LEADING_HEDGE_RE = re.compile(
+    r"(?:^|(?<=[.!?]\s))точно\s+(?:подтвердить|сказать)\s+не\s+могу\s*(?:[.!]+\s*|[—–:,-]\s*)(\w?)",
+    re.IGNORECASE,
+)
+
+
+def strip_leading_hedge(text: str) -> str:
+    """Вырезает дежурное «Точно подтвердить не могу» в начале предложения;
+    следующее за ним слово начинает предложение — с заглавной."""
+    return _LEADING_HEDGE_RE.sub(lambda m: m.group(1).upper(), text.strip()).strip()
+
+
+def _dynamic_problem(text: str) -> str | None:
+    if _DYNAMIC_HEDGING_RE.search(text):
+        return "dynamic_hedging"
+    if _FUTURE_PROMISE_RE.search(text):
+        return "future_promise"
+    return None
+
 
 def _expert_problem(text: str) -> str | None:
     if _EXPERT_HEDGING_RE.search(text):
@@ -166,9 +253,23 @@ def normalize_draft(
     n_distinct_senders: int,
     allowed_resources: tuple[str, ...],
     expert: bool = False,
+    intent_text: str = "",
+    intent: str | None = None,
+    side_topics_asked: frozenset[str] | None = None,
 ) -> DraftDecision:
+    # intent — итог отдельного шага классификации (processor); если не
+    # передан — из ответа модели (совместимость со схемой DmDraftOutputExpert).
+    intent = intent if intent is not None else getattr(output, "intent", None)
+    if expert:
+        # Роль сообщения решает раньше всего: не лид — не черновик, что бы
+        # модель ни написала в primary_message.
+        if (output.skip_reason or "").strip() == INSUFFICIENT_INTENT:
+            return DraftDecision(kind="filtered", filter_reason=INSUFFICIENT_INTENT, intent=intent)
+        if intent not in LEAD_INTENTS:
+            return DraftDecision(kind="filtered", filter_reason=f"not_lead_intent:{str(intent).lower()}",
+                                 intent=intent)
     if not output.should_generate:
-        return DraftDecision(kind="filtered")
+        return DraftDecision(kind="filtered", intent=intent)
 
     primary = (output.primary_message or "").strip()
     if not primary:
@@ -183,6 +284,21 @@ def normalize_draft(
     # черновик отклоняется (метки живут только в used_context_refs).
     primary = _strip_ref_groups(primary, valid_refs)
     follow_up = _strip_ref_groups(follow_up, valid_refs) or None if follow_up else None
+    if not expert:
+        primary = strip_leading_hedge(primary)
+        follow_up = strip_leading_hedge(follow_up) or None if follow_up else None
+    # border_queue (side_topics_asked задан): предложения о соседних темах
+    # (страховка, бензин, посылки, штрафы, документы, номера…), о которых USER
+    # не спрашивал, вырезаются; не осталось ничего — черновик отклоняется.
+    removed: frozenset[str] = frozenset()
+    if side_topics_asked is not None:
+        cleaned, removed = strip_side_topics(primary, side_topics_asked)
+        if not cleaned:
+            return DraftDecision(kind="invalid", error=f"topic_leak:{','.join(sorted(removed))}")
+        primary = cleaned
+        if follow_up:
+            follow_up, dropped = strip_side_topics(follow_up, side_topics_asked)
+            follow_up, removed = follow_up or None, removed | dropped
     for text in (primary, follow_up):
         problem = _text_problem(text, valid_refs) if text else None
         if problem:
@@ -190,15 +306,19 @@ def normalize_draft(
     if not primary:
         return DraftDecision(kind="invalid", error="empty_primary_message")
 
+    # Неизвестные метки used_context_refs (служебные метаданные, в тексте их
+    # нет) отбрасываются — не подменяются другими. Экспертный режим отвечает по
+    # фактам кампании; в остальных черновик, который после этого не опирается
+    # ни на одно реальное сообщение, но заявляет свежие сведения, — отклоняется.
     refs = tuple(dict.fromkeys(ref.strip() for ref in output.used_context_refs if ref and ref.strip()))
-    if expert:
-        # Экспертный режим отвечает по фактам кампании: ссылки на сообщения —
-        # лишь метаданные; чужие метки ("CAMPAIGN_GUIDELINE") отбрасываются, а
-        # не губят черновик (в самом тексте метки по-прежнему запрещены выше).
-        refs = tuple(ref for ref in refs if ref in valid_refs)
     unknown = [ref for ref in refs if ref not in valid_refs]
-    if unknown:
-        return DraftDecision(kind="invalid", error=f"unknown_context_refs:{','.join(unknown[:5])}")
+    refs = tuple(ref for ref in refs if ref in valid_refs)
+
+    if not expert:
+        for text in (primary, follow_up):
+            problem = _dynamic_problem(text) if text else None
+            if problem:
+                return DraftDecision(kind="invalid", error=problem)
 
     # Экспертный режим (insurance): без оговорок/пересказа группы, не только
     # реклама, и КАЖДЫЙ разрешённый ресурс упомянут (наши ресурсы обязательны).
@@ -207,6 +327,8 @@ def normalize_draft(
             problem = _expert_problem(text) if text else None
             if problem:
                 return DraftDecision(kind="invalid", error=problem)
+        if _MEDICAL_MENTION_RE.search(primary) and not _MEDICAL_INTENT_RE.search(intent_text or ""):
+            return DraftDecision(kind="invalid", error="topic_leak_medical", intent=intent)
         handles = _handles(primary)
         missing = [r for r in allowed_resources if r.strip().lstrip("@").lower() not in handles]
         if missing:
@@ -227,8 +349,11 @@ def normalize_draft(
         strength = "none"
     elif n_distinct_senders == 1 and strength in ("several_consistent", "contradictory"):
         strength = "single_report"
+    if unknown and not expert and not refs and strength != "none":
+        return DraftDecision(kind="invalid", error=f"unknown_context_refs:{','.join(unknown[:5])}")
 
     return DraftDecision(
         kind="draft", primary_message=primary, follow_up_message=follow_up,
-        evidence_strength=strength, used_context_refs=refs,
+        evidence_strength=strength, used_context_refs=refs, intent=intent,
+        removed_side_topics=tuple(sorted(removed)),
     )

@@ -159,7 +159,7 @@ async def test_no_username_candidate_reaches_stored_draft(env):
     _, campaigns, outreach, recent, observer, _ = env
     _observe(observer, _msg(username=None, premium=False))
     (row,) = outreach.list_all()
-    service = _FakeService(_out(used_context_refs=[]))
+    service = _FakeService(_out(primary_message='Полис можно оформить онлайн. Штрафы можно отслеживать через @ProtocolGEbot.', used_context_refs=[]))
     processor = DmDraftProcessor(
         outreach, campaigns, recent, _builder(recent), service, interval_seconds=1,
         drafting_recovery_seconds=600, retention_hours=48, clock=lambda: T0 + timedelta(minutes=4),
@@ -167,7 +167,7 @@ async def test_no_username_candidate_reaches_stored_draft(env):
     )
     assert await processor.run_once() == 1
     done = outreach.get(row.id)
-    assert (done.status, done.primary_text, done.recipient_username) == (STATUS_DRAFT, "Ответ по делу.", None)
+    assert (done.status, done.primary_text, done.recipient_username) == (STATUS_DRAFT, 'Полис можно оформить онлайн. Штрафы можно отслеживать через @ProtocolGEbot.', None)
     assert done.sendability == SENDABILITY_SOURCE_MESSAGE  # переживает переход в draft
     assert len(service.calls) == 1
     assert "555" not in service.calls[0]  # recipient_user_id в OpenAI не уходит
@@ -178,7 +178,7 @@ async def test_premium_required_candidate_reaches_draft_without_assigned_sender(
     _observe(observer, _msg(username="ivan", premium=True))
     (row,) = outreach.list_all()
     processor = DmDraftProcessor(
-        outreach, campaigns, recent, _builder(recent), _FakeService(_out(used_context_refs=[])), interval_seconds=1,
+        outreach, campaigns, recent, _builder(recent), _FakeService(_out(primary_message='Полис можно оформить онлайн. Штрафы можно отслеживать через @ProtocolGEbot.', used_context_refs=[])), interval_seconds=1,
         drafting_recovery_seconds=600, retention_hours=48, clock=lambda: T0 + timedelta(minutes=4),
         monotonic=lambda: 0.0,
     )
