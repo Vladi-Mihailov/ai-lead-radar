@@ -21,6 +21,7 @@ from reader.dm_campaigns.context import DraftContext
 from reader.dm_campaigns.draft_models import DmDraftOutput, DmDraftOutputExpert, normalize_draft
 from reader.dm_campaigns.draft_prompt import (
     SYSTEM_PROMPT,
+    SYSTEM_PROMPT_BORDER,
     SYSTEM_PROMPT_EXPERT,
     build_user_text,
     system_prompt_for,
@@ -150,7 +151,7 @@ def test_dynamic_campaigns_keep_previous_rules():
 
 def test_insurance_uses_expert_prompt_others_keep_dynamic_prompt():
     assert system_prompt_for("insurance") is SYSTEM_PROMPT_EXPERT
-    assert system_prompt_for("border_queue") is SYSTEM_PROMPT and system_prompt_for("fuel") is SYSTEM_PROMPT
+    assert system_prompt_for("border_queue") is SYSTEM_PROMPT_BORDER and system_prompt_for("fuel") is SYSTEM_PROMPT
     for rule in ("утверждённые факты кампании важнее любых сообщений группы", "«точно подтвердить не могу»",
                  "«в группе пишут»", "не переспрашивай", "Ответ только рекламой", "КАЖДЫЙ из них"):
         assert rule in SYSTEM_PROMPT_EXPERT
@@ -220,10 +221,10 @@ def test_real_question_hedged_model_answer_is_not_stored_as_draft(env):
                                                         "expert_hedging_or_group_reference")
 
 
-def test_border_queue_keeps_dynamic_prompt_end_to_end(env):
+def test_border_queue_uses_border_prompt_end_to_end(env):
     row, service = _process(env, key="border_queue", text="Что сейчас на Ларсе? Большая очередь?",
-                            primary="В свежих сообщениях группы пишут, что очередь большая.")
-    assert row.status == STATUS_DRAFT and service.instructions == [SYSTEM_PROMPT]
+                            primary="Верхний Ларс открыт, критичных очередей сейчас нет.")
+    assert row.status == STATUS_DRAFT and service.instructions == [SYSTEM_PROMPT_BORDER]
 
 
 def test_expert_mode_drops_non_message_refs_instead_of_rejecting():

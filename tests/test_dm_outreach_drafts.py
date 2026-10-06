@@ -167,11 +167,12 @@ def test_insurance_does_not_use_fresh_evidence_and_empty_buffer(env):
 
 def test_prompt_contains_no_identifiers(env):
     _, campaigns, outreach, recent = env
-    border = campaigns.get_campaign_by_key("border_queue")
-    campaigns.update_resources(border.id, ["@tplgee"])
-    border = campaigns.get_campaign(border.id)
-    row = _candidate(outreach, border)
-    text = build_user_text(row, border, _builder(recent).build(row, border, T0))
+    # fuel: ресурсы перечисляются модели (border_queue их добавляет сервер, см. border.py)
+    fuel = campaigns.get_campaign_by_key("fuel")
+    campaigns.update_resources(fuel.id, ["@tplgee"])
+    fuel = campaigns.get_campaign(fuel.id)
+    row = _candidate(outreach, fuel)
+    text = build_user_text(row, fuel, _builder(recent).build(row, fuel, T0))
     assert "555" not in text and "ivan" not in text
     assert "ALLOWED PROMOTED RESOURCES\n@tplgee" in text and "EVIDENCE METADATA" in text
     assert "should_generate" in SYSTEM_PROMPT
@@ -519,7 +520,7 @@ async def test_pipeline_end_to_end_border_draft(env):
         (1, STATUS_PENDING_CONTEXT), (2, STATUS_PENDING_CONTEXT), (3, STATUS_PENDING_CONTEXT)]
     assert recent.count() == 4
 
-    service = _FakeService(_out(primary_message="Несколько участников пишут, что очередь около двух часов.",
+    service = _FakeService(_out(primary_message="Сейчас на Ларсе очередь около двух часов.",
                                 evidence_strength="several_consistent", used_context_refs=["S1", "A1"]))
     clock.now = T0 + timedelta(minutes=4)
     await _processor(env, service, clock).run_once()

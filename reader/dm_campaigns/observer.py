@@ -21,6 +21,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
 from reader.core.models import Message, ScenarioMatch
+from reader.dm_campaigns.border import place_hint
 from reader.dm_campaigns.models import DmCampaign, source_chat_allowed
 from reader.dm_campaigns.outreach_repository import (
     STATUS_FILTERED,
@@ -117,11 +118,13 @@ class DmOutreachObserver:
         # fuel/border_queue по теме («очереди на АЗС с АИ-95» — fuel); иначе
         # первая сработавшая (processor отфильтрует campaign_not_relevant).
         replies = self._reply_texts(message)
-        chosen = next((c for c in passing if campaign_relevant(c.key, message.text, replies)), None)
+        hint = place_hint(message.chat_identifier, replies)
+        chosen = next((c for c in passing if campaign_relevant(c.key, message.text, replies, place_hint=hint)), None)
         if chosen is None and passing:
             chosen = next(
                 (c for c in campaigns if c.key in ROUTABLE_CAMPAIGNS and c not in passing
-                 and self._rejection(c, message) is None and campaign_relevant(c.key, message.text, replies)),
+                 and self._rejection(c, message) is None
+                 and campaign_relevant(c.key, message.text, replies, place_hint=hint)),
                 passing[0],
             )
 

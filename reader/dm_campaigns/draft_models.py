@@ -8,6 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from reader.dm_campaigns.border import BorderPolicy, border_problem, decorate, other_checkpoint_sentences
 from reader.dm_campaigns.relevance import strip_side_topics
 
 EvidenceStrength = Literal["none", "single_report", "several_consistent", "contradictory"]
@@ -256,6 +257,7 @@ def normalize_draft(
     intent_text: str = "",
     intent: str | None = None,
     side_topics_asked: frozenset[str] | None = None,
+    border_policy: BorderPolicy | None = None,
 ) -> DraftDecision:
     # intent — итог отдельного шага классификации (processor); если не
     # передан — из ответа модели (совместимость со схемой DmDraftOutputExpert).
@@ -299,6 +301,18 @@ def normalize_draft(
         if follow_up:
             follow_up, dropped = strip_side_topics(follow_up, side_topics_asked)
             follow_up, removed = follow_up or None, removed | dropped
+    if border_policy is not None:
+        # Только запрошенный КПП (вопрос о Ларсе — без Сарпи/Вале), без
+        # раскрытия источника и без «спокойно» вопреки негативным сигналам.
+        cleaned, other = other_checkpoint_sentences(primary, border_policy.checkpoints)
+        if not cleaned:
+            return DraftDecision(kind="invalid", error=f"topic_leak:{','.join(sorted(other))}")
+        primary, removed = cleaned, removed | other
+        follow_up = other_checkpoint_sentences(follow_up, border_policy.checkpoints)[0] or None if follow_up else None
+        for text in (primary, follow_up):
+            problem = border_problem(text, border_policy) if text else None
+            if problem:
+                return DraftDecision(kind="invalid", error=problem)
     for text in (primary, follow_up):
         problem = _text_problem(text, valid_refs) if text else None
         if problem:
@@ -352,6 +366,9 @@ def normalize_draft(
     if unknown and not expert and not refs and strength != "none":
         return DraftDecision(kind="invalid", error=f"unknown_context_refs:{','.join(unknown[:5])}")
 
+    if border_policy is not None:
+        # Приветствие и наши ресурсы — детерминированно, после всех проверок.
+        primary = decorate(primary, border_policy)
     return DraftDecision(
         kind="draft", primary_message=primary, follow_up_message=follow_up,
         evidence_strength=strength, used_context_refs=refs, intent=intent,

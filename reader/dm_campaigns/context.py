@@ -23,6 +23,7 @@ from datetime import datetime, timedelta
 from reader.dm_campaigns.models import DmCampaign, same_chat_identifier
 from reader.dm_campaigns.outreach_repository import DmOutreach
 from reader.dm_campaigns.recent_messages import RecentMessage, RecentMessageRepository
+from reader.dm_campaigns.border import checkpoint_evidence_ok, requested_checkpoints
 from reader.dm_campaigns.relevance import border_evidence_relevant, side_topics
 from reader.scenarios import KeywordMatcher, Scenario
 from reader.time_display import to_tbilisi
@@ -171,7 +172,7 @@ class DmContextBuilder:
         evidence: list[ContextItem] = []
         metadata: EvidenceMetadata | None = None
         if fresh_used:
-            evidence, metadata = self._evidence(outreach, campaign, authors, now)
+            evidence, metadata = self._evidence(outreach, campaign, authors, now, [m.text for m in chain])
 
         refs = frozenset(item.ref for item in discussion) | frozenset(item.ref for item in evidence)
         return DraftContext(
@@ -194,12 +195,16 @@ class DmContextBuilder:
 
     def _evidence(
         self, outreach: DmOutreach, campaign: DmCampaign, authors: _Authors, now: datetime,
+        reply_texts: Iterable[str] = (),
     ) -> tuple[list[ContextItem], EvidenceMetadata]:
         matcher = self._topic_matcher(campaign)
         chats = self._evidence_chats(campaign)
         selected: list[RecentMessage] = []
         border = campaign.key == BORDER_QUEUE
         asked = side_topics(outreach.source_text) if border else frozenset()
+        # border_queue: только запрошенный КПП (вопрос о Ларсе — без Сарпи/Вале).
+        checkpoints = (requested_checkpoints(outreach.source_text, reply_texts, outreach.source_chat_identifier)
+                       if border else frozenset())
         if matcher is not None:
             for msg in self._recent.recent(since=now - self._fresh_window, until=now, limit=EVIDENCE_SCAN_LIMIT):
                 if msg.chat_id == outreach.source_chat_id and msg.message_id == outreach.source_message_id:
@@ -212,6 +217,8 @@ class DmContextBuilder:
                 if not matcher.match(msg.text):
                     continue
                 if border and not border_evidence_relevant(msg.text, asked):
+                    continue
+                if border and not checkpoint_evidence_ok(msg.text, msg.chat_identifier, checkpoints):
                     continue
                 selected.append(msg)
                 if len(selected) >= self._max_evidence:
