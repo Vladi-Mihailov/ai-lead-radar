@@ -231,6 +231,10 @@ class ConversationController:
     def _is_trusted(self, telegram_user_id: int) -> bool:
         return telegram_user_id in self._trusted_operator_user_ids
 
+    def reset_conversation(self, chat_id: int) -> None:
+        """Вход в диалог с оператором: незавершённый шаг сбрасывается."""
+        self._states.clear(chat_id)
+
     def is_trusted(self, telegram_user_id: int) -> bool:
         """Публичная обёртка — нужна reader/turkey_bot/handlers.py,
         чтобы решить, показывать ли STATISTICS_LABEL/STOP_MONITORING_LABEL

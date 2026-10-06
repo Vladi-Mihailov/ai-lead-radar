@@ -18,6 +18,7 @@ event.sender_id), тот же принцип, что и раньше."""
 from telethon import Button
 
 from reader.turkey_bot.models import TurkeyUserCar
+from reader.protocol_support.texts import OPERATOR_LABEL
 from reader.turkey_bot.texts import (
     ADD_CAR_LABEL,
     BACK_LABEL,
@@ -124,11 +125,16 @@ def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
     докстрок ниже про то, почему она не может сама быть URL-кнопкой)."""
     rows = [[Button.text(ADD_CAR_LABEL, resize=True), Button.text(MY_CARS_LABEL, resize=True)]]
     if is_trusted:
+        # Меню менеджера НЕ меняется: «👨‍💼 Оператор» — только у пользователей.
         rows.append([Button.text(CHECK_NOW_LABEL, resize=True), Button.text(SEARCH_LABEL, resize=True)])
         rows.append([Button.text(STATISTICS_LABEL, resize=True), Button.text(OSAGO_TR_LABEL, resize=True)])
-    else:
-        rows.append([Button.text(CHECK_NOW_LABEL, resize=True), Button.text(OSAGO_TR_LABEL, resize=True)])
-    rows.append([Button.text(HELP_LABEL, resize=True), Button.text(GEORGIAN_BOT_LINK_LABEL, resize=True)])
+        rows.append([Button.text(HELP_LABEL, resize=True), Button.text(GEORGIAN_BOT_LINK_LABEL, resize=True)])
+        return rows
+    # Пользователь: «👨‍💼 Оператор» — на месте «ℹ️ Справка» (сразу под
+    # «🔎 Проверить сейчас»), «ℹ️ Справка» — отдельной последней строкой.
+    rows.append([Button.text(CHECK_NOW_LABEL, resize=True), Button.text(OSAGO_TR_LABEL, resize=True)])
+    rows.append([Button.text(OPERATOR_LABEL, resize=True), Button.text(GEORGIAN_BOT_LINK_LABEL, resize=True)])
+    rows.append([Button.text(HELP_LABEL, resize=True)])
     return rows
 
 

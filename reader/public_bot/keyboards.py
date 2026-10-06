@@ -35,6 +35,7 @@ from datetime import date
 from telethon import Button
 
 from reader.public_bot.conversation import PERIOD_CHOICES, TRUSTED_TASK_PERIOD_CHOICES
+from reader.protocol_support.texts import OPERATOR_LABEL
 from reader.public_bot.texts import (
     ADD_CAR_LABEL,
     BACK_BUTTON_LABEL,
@@ -143,10 +144,15 @@ def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
         [Button.text(CHECK_NOW_LABEL, resize=True), Button.text(OSAGO_LABEL, resize=True)],
     ]
     if is_trusted:
+        # Меню менеджера НЕ меняется: «👨‍💼 Оператор» — только у пользователей
+        # (менеджеры работают через группу поддержки, см. reader/protocol_support).
         rows.append([Button.text(STATISTICS_LABEL, resize=True), Button.text(SEARCH_LABEL, resize=True)])
-    # "ℹ️ Справка" | "🇹🇷 Штрафы Турции" — последняя строка, видна ВСЕМ;
-    # обе распознаются как текст в ConversationController._handle_menu_label.
-    rows.append([Button.text(HELP_LABEL, resize=True), Button.text(TURKEY_BOT_LINK_LABEL, resize=True)])
+        rows.append([Button.text(HELP_LABEL, resize=True), Button.text(TURKEY_BOT_LINK_LABEL, resize=True)])
+        return rows
+    # Пользователь: «👨‍💼 Оператор» — на месте «ℹ️ Справка» (сразу под
+    # «🔎 Проверить сейчас»), «ℹ️ Справка» — отдельной последней строкой.
+    rows.append([Button.text(OPERATOR_LABEL, resize=True), Button.text(TURKEY_BOT_LINK_LABEL, resize=True)])
+    rows.append([Button.text(HELP_LABEL, resize=True)])
     return rows
 
 

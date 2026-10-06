@@ -61,7 +61,8 @@ def test_menu_has_help_and_osago_in_their_positions(is_trusted):
     full by tests/test_public_bot_keyboards.py; this test only checks
     presence/uniqueness, not full layout)."""
     rows = _rows(main_menu_keyboard(is_trusted=is_trusted))
-    assert rows[-1] == [texts.HELP_LABEL, texts.TURKEY_BOT_LINK_LABEL]
+    # Пользователь: «ℹ️ Справка» — последняя строка целиком; меню менеджера — прежнее.
+    assert rows[-1] == ([texts.HELP_LABEL, texts.TURKEY_BOT_LINK_LABEL] if is_trusted else [texts.HELP_LABEL])
     assert [texts.CHECK_NOW_LABEL, texts.OSAGO_LABEL] in rows
     # Существующие кнопки на месте (по одному разу), новые не дублируются.
     labels = [label for row in rows for label in row]
@@ -126,7 +127,7 @@ async def test_help_reply_renders_with_main_menu_keyboard():
 
     (call,) = event.calls
     assert call["text"] == texts.HELP_TEXT
-    assert [label for row in _rows(call["buttons"]) for label in row][-2:] == [texts.HELP_LABEL, texts.TURKEY_BOT_LINK_LABEL]
+    assert _rows(call["buttons"])[-1] == [texts.HELP_LABEL]
 
 
 # ---- OSAGO deep link ----
@@ -242,7 +243,8 @@ async def test_start_reply_renders_the_menu_with_both_new_buttons(is_trusted):
     await _send_reply(event, _FakeReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True), is_trusted=is_trusted)
 
     (call,) = event.calls
-    assert _rows(call["buttons"])[-1] == [texts.HELP_LABEL, texts.TURKEY_BOT_LINK_LABEL]
+    expected = [texts.HELP_LABEL, texts.TURKEY_BOT_LINK_LABEL] if is_trusted else [texts.HELP_LABEL]
+    assert _rows(call["buttons"])[-1] == expected
 
 
 def test_osago_button_label_and_url_are_exact():
