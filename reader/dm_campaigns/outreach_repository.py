@@ -512,6 +512,28 @@ class DmOutreachRepository:
         "(status IN ('sent', 'sending') OR (status = 'send_failed' AND send_error LIKE 'uncertain%'))"
     )
 
+    def active_draft_exists(
+        self, *, campaign_id: int, recipient_user_id: int | None, recipient_username: str | None, since: datetime,
+        exclude_id: int | None = None,
+    ) -> bool:
+        """Есть ли у этого получателя в этой кампании черновик (status='draft'),
+        созданный после since — защита от нескольких ЛС одному человеку в одной
+        дискуссии ДО отправки (кулдаун после отправки — отдельно)."""
+        # Человек — по числовому id, если он известен (username можно сменить
+        # или передать); по username — только когда id нет.
+        if recipient_user_id is not None:
+            who, value = "recipient_user_id = ?", recipient_user_id
+        elif recipient_username:
+            who, value = "lower(recipient_username) = ?", recipient_username.lower()
+        else:
+            return False
+        row = self._conn.execute(
+            f"SELECT 1 FROM dm_outreach WHERE campaign_id = ? AND status = ? AND created_at >= ? AND id != ? "
+            f"AND {who} LIMIT 1",
+            (campaign_id, STATUS_DRAFT, format_time(since), exclude_id if exclude_id is not None else -1, value),
+        ).fetchone()
+        return row is not None
+
     def recipient_recently_messaged(
         self, *, recipient_user_id: int | None, recipient_username: str | None, since: datetime,
         exclude_id: int | None = None,

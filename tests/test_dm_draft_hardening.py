@@ -132,7 +132,7 @@ def test_cash_is_not_treated_as_browser_cache():
 
 def test_prompt_states_the_rules():
     for rule in ("ref-метки", "used_context_refs", "очистить кэш", "сменить браузер", "ввести VIN",
-                 "Точно подтвердить не могу", "Точную стоимость сейчас не подскажу", "1–3 коротких абзаца"):
+                 "В свежих сообщениях нет данных о снеге на Ларсе", "«посмотрю», «проверю»", "1–3 коротких абзаца"):
         assert rule in SYSTEM_PROMPT
 
 
@@ -173,7 +173,7 @@ def _process_one(env, output, *, username, premium):
 ])
 async def test_every_sendability_reaches_draft_without_sender(env, username, premium, sendability):
     path = env[0]
-    outreach, _, processor = _process_one(env, _out(used_context_refs=[]), username=username, premium=premium)
+    outreach, _, processor = _process_one(env, _out(primary_message='Полис можно оформить онлайн. Штрафы можно отслеживать через @ProtocolGEbot.', used_context_refs=[]), username=username, premium=premium)
     assert await processor.run_once() == 1
     (row,) = outreach.list_all()
     assert (row.status, row.sendability) == (STATUS_DRAFT, sendability)

@@ -6,7 +6,9 @@
 - свежие сообщения по теме (только для сценариев, где важна текущая
   ситуация — граница, бензин): окно fresh_context_hours, только
   отслеживаемые группы кампании, только сообщения, совпавшие с терминами
-  сценария из config/scenarios.yaml (keywords + context_keywords).
+  сценария из config/scenarios.yaml (keywords + context_keywords); для
+  border_queue — только сообщения о проезде (очередь, время, открыт/закрыт,
+  дорога, погода) или о соседней теме, о которой спросил сам USER.
 
 Авторы обезличены: автор исходного сообщения — USER, остальные — P1, P2…
 Ни user_id, ни username в контекст не попадают. Метаданные свежих
@@ -21,6 +23,7 @@ from datetime import datetime, timedelta
 from reader.dm_campaigns.models import DmCampaign, same_chat_identifier
 from reader.dm_campaigns.outreach_repository import DmOutreach
 from reader.dm_campaigns.recent_messages import RecentMessage, RecentMessageRepository
+from reader.dm_campaigns.relevance import border_evidence_relevant, side_topics
 from reader.scenarios import KeywordMatcher, Scenario
 from reader.time_display import to_tbilisi
 
@@ -35,6 +38,7 @@ EVIDENCE_MAX_TOTAL_CHARS = 6000
 EVIDENCE_SCAN_LIMIT = 2000
 
 SOURCE_AUTHOR = "USER"
+BORDER_QUEUE = "border_queue"
 
 
 @dataclass(frozen=True)
@@ -136,9 +140,12 @@ class DmContextBuilder:
 
         before = self._recent.before(chat_id, source_id, since=source_at - BEFORE_WINDOW, limit=self._max_context)
         after = self._recent.after(chat_id, source_id, until=until, limit=self._max_context)
-        seen = {m.message_id for m in before} | {m.message_id for m in after} | {source_id}
 
+        # Цепочка ответов — ВСЕГДА как R ("сообщение, на которое отвечает
+        # USER"), даже если то же сообщение попало в окно "до": по ней модель
+        # понимает роль сообщения (свой вопрос или ответ другому участнику).
         chain: list[RecentMessage] = []
+        seen = {source_id}
         parent_id = outreach.source_reply_to_msg_id
         while parent_id is not None and len(chain) < REPLY_CHAIN_DEPTH:
             parent = self._recent.get(chat_id, parent_id)
@@ -148,6 +155,8 @@ class DmContextBuilder:
                 chain.append(parent)
                 seen.add(parent.message_id)
             parent_id = parent.reply_to_msg_id
+        before = [m for m in before if m.message_id not in seen]
+        after = [m for m in after if m.message_id not in seen]
 
         discussion: list[ContextItem] = []
         for index, msg in enumerate(reversed(chain), start=1):
@@ -189,6 +198,8 @@ class DmContextBuilder:
         matcher = self._topic_matcher(campaign)
         chats = self._evidence_chats(campaign)
         selected: list[RecentMessage] = []
+        border = campaign.key == BORDER_QUEUE
+        asked = side_topics(outreach.source_text) if border else frozenset()
         if matcher is not None:
             for msg in self._recent.recent(since=now - self._fresh_window, until=now, limit=EVIDENCE_SCAN_LIMIT):
                 if msg.chat_id == outreach.source_chat_id and msg.message_id == outreach.source_message_id:
@@ -199,6 +210,8 @@ class DmContextBuilder:
                 if chats and not (msg.chat_identifier and any(same_chat_identifier(msg.chat_identifier, c) for c in chats)):
                     continue
                 if not matcher.match(msg.text):
+                    continue
+                if border and not border_evidence_relevant(msg.text, asked):
                     continue
                 selected.append(msg)
                 if len(selected) >= self._max_evidence:

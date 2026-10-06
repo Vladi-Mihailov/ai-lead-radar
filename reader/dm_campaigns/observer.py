@@ -10,8 +10,10 @@
 Выбор кампании для сообщения детерминирован: совпадения перебираются в
 порядке KeywordMatcher (= порядок сценариев в config/scenarios.yaml),
 берётся первая ВКЛЮЧЁННАЯ кампания этого сценария, прошедшая фильтр
-источника (и страховой префильтр для сценария insurance). Одно сообщение —
-не более одной строки dm_outreach (глобальный UNIQUE в БД)."""
+источника (и страховой префильтр для сценария insurance) и относящаяся к
+теме кампании (relevance.py; если ни одна сработавшая не по теме — другая
+включённая fuel/border_queue по теме). Одно сообщение — не более одной
+строки dm_outreach (глобальный UNIQUE в БД)."""
 
 import logging
 import time
@@ -26,6 +28,7 @@ from reader.dm_campaigns.outreach_repository import (
     DmOutreachRepository,
 )
 from reader.dm_campaigns.recent_messages import RecentMessageRepository
+from reader.dm_campaigns.relevance import ROUTABLE_CAMPAIGNS, campaign_relevant
 from reader.dm_campaigns.repository import DmCampaignRepository
 from reader.dm_campaigns.sendability import assess_sendability
 from reader.insurance_matching import is_insurance_text
@@ -40,6 +43,10 @@ FILTER_INSURANCE_PREFILTER = "insurance_prefilter_rejected"
 # не целевой лид insurance; отсекается до OpenAI.
 FILTER_NON_AUTO_INSURANCE = "non_auto_insurance"
 FILTER_NO_SENDER_ID = "no_sender_id"
+# У этого человека в этой кампании уже есть свежий черновик (одна дискуссия —
+# один черновик; первый автоматически не переписывается).
+FILTER_ACTIVE_DRAFT = "active_draft_exists"
+ACTIVE_DRAFT_WINDOW = timedelta(hours=2)
 # Больше не присваивается (Phase 2.6: @username не обязателен); остаётся
 # как значение filter_reason у строк, созданных раньше.
 FILTER_NO_USERNAME = "no_username"
@@ -93,20 +100,30 @@ class DmOutreachObserver:
             self._detect(message, matches, campaigns)
 
     def _detect(self, message: Message, matches: list[ScenarioMatch], campaigns: list[DmCampaign]) -> None:
-        chosen: DmCampaign | None = None
+        passing: list[DmCampaign] = []
         first_rejection: tuple[DmCampaign, str] | None = None
         for match in matches:
             for campaign in campaigns:
-                if campaign.scenario_name != match.scenario_name:
+                if campaign.scenario_name != match.scenario_name or campaign in passing:
                     continue
                 reason = self._rejection(campaign, message)
                 if reason is None:
-                    chosen = campaign
-                    break
-                if first_rejection is None:
+                    passing.append(campaign)
+                elif first_rejection is None:
                     first_rejection = (campaign, reason)
-            if chosen is not None:
-                break
+
+        # Одно сообщение — одна кампания: первая сработавшая И по теме (см.
+        # relevance.py). Ни одна сработавшая не по теме — другая включённая
+        # fuel/border_queue по теме («очереди на АЗС с АИ-95» — fuel); иначе
+        # первая сработавшая (processor отфильтрует campaign_not_relevant).
+        replies = self._reply_texts(message)
+        chosen = next((c for c in passing if campaign_relevant(c.key, message.text, replies)), None)
+        if chosen is None and passing:
+            chosen = next(
+                (c for c in campaigns if c.key in ROUTABLE_CAMPAIGNS and c not in passing
+                 and self._rejection(c, message) is None and campaign_relevant(c.key, message.text, replies)),
+                passing[0],
+            )
 
         if chosen is None:
             if first_rejection is not None:
@@ -119,8 +136,19 @@ class DmOutreachObserver:
         # исходное сообщение (см. reader/dm_campaigns/sendability.py).
         if message.sender_id is None:
             self._insert(message, chosen, STATUS_FILTERED, FILTER_NO_SENDER_ID)
+        elif self._outreach.active_draft_exists(
+            campaign_id=chosen.id, recipient_user_id=message.sender_id, recipient_username=message.sender_username,
+            since=self._clock() - ACTIVE_DRAFT_WINDOW,
+        ):
+            self._insert(message, chosen, STATUS_FILTERED, FILTER_ACTIVE_DRAFT)
         else:
             self._insert(message, chosen, STATUS_PENDING_CONTEXT, None)
+
+    def _reply_texts(self, message: Message) -> tuple[str, ...]:
+        if message.reply_to_msg_id is None:
+            return ()
+        target = self._recent.get(message.chat_id, message.reply_to_msg_id)
+        return (target.text,) if target is not None and target.text else ()
 
     @staticmethod
     def _rejection(campaign: DmCampaign, message: Message) -> str | None:
