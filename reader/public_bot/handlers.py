@@ -69,7 +69,9 @@ from reader.public_bot.keyboards import (
     turkey_bot_link_keyboard,
 )
 from reader.public_bot.known_users_repository import BotKnownUsersRepository
-from reader.public_bot.texts import CALLBACK_NOT_AUTHORIZED_TEXT
+from reader.protocol_support.service import ProtocolSupportService
+from reader.protocol_support.telethon_gateway import handle_private_support
+from reader.public_bot.texts import CALLBACK_NOT_AUTHORIZED_TEXT, MAIN_MENU_TEXT
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +95,7 @@ def register(
     client: TelegramClient,
     controller: ConversationController,
     known_users_repository: BotKnownUsersRepository | None = None,
+    support: ProtocolSupportService | None = None,
 ) -> None:
     """Регистрирует NewMessage/CallbackQuery handlers на уже
     сконфигурированном bot-mode TelegramClient (см. reader/public_bot/
@@ -121,6 +124,15 @@ def register(
 
     @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def _on_message(event: events.NewMessage.Event) -> None:
+        # «👨‍💼 Оператор» / открытый диалог с оператором — раньше обычной
+        # логики (и раньше отсечения пустого текста: фото/документ без подписи).
+        trusted = controller.is_trusted(event.sender_id)
+        if await handle_private_support(
+            event, support, is_trusted=trusted, reset_state=lambda: controller.reset_conversation(event.chat_id),
+            main_menu=main_menu_keyboard(is_trusted=trusted), main_menu_text=MAIN_MENU_TEXT,
+        ):
+            return
+
         text = event.raw_text
         if not text or not text.strip():
             return

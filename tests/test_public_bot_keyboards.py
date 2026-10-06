@@ -12,6 +12,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from reader.protocol_support.texts import OPERATOR_LABEL
 from reader.public_bot.keyboards import (  # noqa: E402
     decode_trusted_task_continue_callback,
     decode_trusted_task_open_callback,
@@ -62,14 +63,16 @@ def test_main_menu_keyboard_ordinary_user_is_a_2x2_layout():
     """См. задачу "swap OSAGO and cross-country fines button positions":
     ROW 1: ➕ Добавить авто | 📋 Мои авто
     ROW 2: 🔎 Проверить сейчас | 🛡 ОСАГО Грузия
-    ROW 3 — "ℹ️ Справка" | "🇹🇷 Штрафы Турции", последняя строка.
+    ROW 3 — "👨‍💼 Оператор" (на прежнем месте "ℹ️ Справка") | "🇹🇷 Штрафы Турции".
+    ROW 4 — "ℹ️ Справка" отдельной последней строкой на всю ширину.
     "📸 Проверить протокол" в меню скрыта (flow не удалён)."""
     keyboard = main_menu_keyboard(is_trusted=False)
 
-    assert len(keyboard) == 3
+    assert len(keyboard) == 4
     assert [b.button.text for b in keyboard[0]] == [ADD_CAR_LABEL, MY_CARS_LABEL]
     assert [b.button.text for b in keyboard[1]] == [CHECK_NOW_LABEL, OSAGO_LABEL]
-    assert [b.button.text for b in keyboard[2]] == [HELP_LABEL, TURKEY_BOT_LINK_LABEL]
+    assert [b.button.text for b in keyboard[2]] == [OPERATOR_LABEL, TURKEY_BOT_LINK_LABEL]
+    assert [b.button.text for b in keyboard[3]] == [HELP_LABEL]
     assert PROTOCOL_CHECK_LABEL not in _labels(keyboard)
 
 
@@ -109,7 +112,10 @@ def test_main_menu_keyboard_does_not_change_ordinary_user_buttons():
         assert label in without
         assert label in with_trusted
 
-    assert len(with_trusted) == len(without) + 2  # + STATISTICS_LABEL + SEARCH_LABEL
+    # менеджер: + STATISTICS_LABEL + SEARCH_LABEL, но без «👨‍💼 Оператор»
+    # (только у пользователей) — меню менеджера не изменилось.
+    assert len(with_trusted) == len(without) + 1
+    assert OPERATOR_LABEL in without and OPERATOR_LABEL not in with_trusted
 
 
 # ==== manager-facing "📋 Мои авто" ON/OFF + "▶️ Продолжить мониторинг"

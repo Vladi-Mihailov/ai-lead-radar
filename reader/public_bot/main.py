@@ -44,7 +44,11 @@ from reader.public_bot.delivery_repository import (
 )
 from reader.public_bot.delivery_service import ClientDeliveryService
 from reader.public_bot.full_check_service import FullCheckService
+from reader.protocol_support.repository import ProtocolSupportRepository
+from reader.protocol_support.service import BotProfile, ProtocolSupportService
+from reader.protocol_support.telethon_gateway import TelethonSupportGateway, register_support_group_handlers
 from reader.public_bot.handlers import register
+from reader.public_bot.keyboards import main_menu_keyboard
 from reader.public_bot.known_users_repository import (
     BotKnownUsersRepository,
 )
@@ -235,6 +239,7 @@ async def run() -> None:
         headers={"User-Agent": _POLICE_GE_USER_AGENT},
     )
 
+    support_repository = None
     try:
         # Тот же PoliceGeSession/PoliceGeProvider/FineCheckService, что и у
         # операторского Fine Monitor (см. reader/main.py::
@@ -329,7 +334,16 @@ async def run() -> None:
             fine_admin_user_ids=frozenset(settings.fine_monitor.allowed_user_ids),
         )
 
-        register(client, controller, known_users_repository)
+        # «👨‍💼 Оператор»: живой диалог через группу менеджеров (общая
+        # реализация reader/protocol_support, bot_key='ge').
+        support_repository = ProtocolSupportRepository(settings.app.users_db_file)
+        support = ProtocolSupportService(
+            support_repository, BotProfile(key="ge", username=_BOT_USERNAME, flag="🇬🇪"),
+            TelethonSupportGateway(client, user_main_menu=lambda: main_menu_keyboard(is_trusted=False)),
+            support_chat_id=settings.public_bot.support_chat_id, is_trusted=controller.is_trusted,
+        )
+        register(client, controller, known_users_repository, support=support)
+        register_support_group_handlers(client, support)
 
         delivery_service = ClientDeliveryService(
             detected_fine_repository, subscription_repository, delivery_repository,
@@ -363,6 +377,8 @@ async def run() -> None:
         subscription_repository.close()
         conversation_state_repository.close()
         known_users_repository.close()
+        if support_repository is not None:
+            support_repository.close()
         delivery_repository.close()
 
 

@@ -305,6 +305,10 @@ class PublicBotSettings(BaseModel):
 
     trusted_operator_user_ids: list[int] = Field(default_factory=list)
     payment_help_contact_username: str = "tplgee"
+    # Внутренняя группа менеджеров для живого диалога «👨‍💼 Оператор» обоих
+    # Protocol-ботов: числовой chat_id (PROTOCOL_SUPPORT_CHAT_ID в .env или
+    # public_bot.support_chat_id в config.yaml). None — функция выключена.
+    support_chat_id: int | None = None
 
 
 class InviterAdminBotSettings(BaseModel):
@@ -599,6 +603,9 @@ def load_settings(config_path: Path) -> Settings:
                 payment_help_contact_username=public_bot_raw.get(
                     "payment_help_contact_username", "tplgee"
                 ),
+                support_chat_id=_support_chat_id(
+                    os.getenv("PROTOCOL_SUPPORT_CHAT_ID") or public_bot_raw.get("support_chat_id")
+                ),
             ),
             inviter_admin_bot=InviterAdminBotSettings(
                 trusted_admin_user_ids=list(
@@ -637,6 +644,17 @@ def _parse_forward_targets(raw: str) -> list[int | str]:
 def _parse_check_time(value: str) -> time:
     hour_str, _, minute_str = str(value).partition(":")
     return time(int(hour_str), int(minute_str))
+
+
+def _support_chat_id(value) -> int | None:
+    """Группа менеджеров — только числовой chat_id (username группы не
+    принимается: ответ не должен уйти не в тот чат)."""
+    if value in (None, ""):
+        return None
+    normalized = _normalize_chat_id(value)
+    if not isinstance(normalized, int):
+        raise ValueError("PROTOCOL_SUPPORT_CHAT_ID должен быть числовым chat_id группы (например -100...)")
+    return normalized
 
 
 def _normalize_chat_id(value: int | str) -> int | str:

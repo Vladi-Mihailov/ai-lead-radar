@@ -17,6 +17,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from reader.protocol_support.texts import OPERATOR_LABEL
 from reader.turkey_bot.keyboards import (
     BACK_TO_MY_CARS_CALLBACK_DATA,
     CANCEL_CALLBACK_DATA,
@@ -95,7 +96,9 @@ def test_regular_user_main_menu_layout():
 
     assert grid[0] == [ADD_CAR_LABEL, MY_CARS_LABEL]
     assert grid[1] == [CHECK_NOW_LABEL, OSAGO_TR_LABEL]
-    assert grid[2] == [HELP_LABEL, GEORGIAN_BOT_LINK_LABEL]
+    assert grid[2] == [OPERATOR_LABEL, GEORGIAN_BOT_LINK_LABEL]  # «Оператор» на прежнем месте «Справки»
+    assert grid[3] == [HELP_LABEL]  # «Справка» — отдельная последняя строка
+    assert len(grid) == 4
     flat = [label for row in grid for label in row]
     assert STATISTICS_LABEL not in flat
     assert STOP_MONITORING_LABEL not in flat

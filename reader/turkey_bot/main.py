@@ -65,7 +65,11 @@ from reader.turkey_bot.conversation_state_repository import (
 )
 from reader.turkey_bot.debt_refresh_service import TurkeyDebtRefreshService
 from reader.turkey_bot.gib.translation import TurkeyFineTranslationService
+from reader.protocol_support.repository import ProtocolSupportRepository
+from reader.protocol_support.service import BotProfile, ProtocolSupportService
+from reader.protocol_support.telethon_gateway import TelethonSupportGateway, register_support_group_handlers
 from reader.turkey_bot.handlers import register
+from reader.turkey_bot.keyboards import main_menu_keyboard
 from reader.turkey_bot.known_users_repository import (
     TurkeyBotKnownUsersRepository,
 )
@@ -97,6 +101,8 @@ CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 # Отдельный .session-файл — та же production-сессия, что и раньше (см.
 # deploy/ai-lead-radar-turkeybot.service) — НЕ переносится/не заменяется.
 _SESSION_PATH = PROJECT_ROOT / "data" / "sessions" / "turkeybot"
+# Имя бота в карточках обращений группы менеджеров (см. reader/protocol_support).
+_BOT_USERNAME = "ProtocolTRbot"
 
 # Планировщик тикает раз в 30с (см. reader/jobs/scheduler.py) — тот же
 # poll_interval, что и у reader/main.py и у test-бота.
@@ -210,6 +216,7 @@ async def run() -> None:
         garage_repository, run_repository, check_service, statistics_service,
     )
 
+    support_repository = None
     try:
         controller = ConversationController(
             conversation_state_repository, garage_repository, run_repository,
@@ -224,7 +231,16 @@ async def run() -> None:
         )
 
         client = TelegramClient(str(_SESSION_PATH), api_id, api_hash)
-        register(client, controller, known_users_repository)
+        # «👨‍💼 Оператор»: живой диалог через группу менеджеров (общая
+        # реализация reader/protocol_support, bot_key='tr').
+        support_repository = ProtocolSupportRepository(settings.app.users_db_file)
+        support = ProtocolSupportService(
+            support_repository, BotProfile(key="tr", username=_BOT_USERNAME, flag="🇹🇷"),
+            TelethonSupportGateway(client, user_main_menu=lambda: main_menu_keyboard(is_trusted=False)),
+            support_chat_id=settings.public_bot.support_chat_id, is_trusted=controller.is_trusted,
+        )
+        register(client, controller, known_users_repository, support=support)
+        register_support_group_handlers(client, support)
 
         notifier = _TelethonNotifier(client)
         monitoring_service = TurkeyMonitoringService(
@@ -253,6 +269,8 @@ async def run() -> None:
     finally:
         conversation_state_repository.close()
         known_users_repository.close()
+        if support_repository is not None:
+            support_repository.close()
         garage_repository.close()
         run_repository.close()
         subscription_repository.close()
