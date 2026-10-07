@@ -26,7 +26,10 @@ from reader.dm_campaigns.border import (
     greeting_for,
     negative_signals,
     place_hint,
+    question_options,
     requested_checkpoints,
+    unsupported_checkpoint,
+    unsupported_checkpoint_answer,
 )
 from reader.dm_campaigns.context import DmContextBuilder
 from reader.dm_campaigns.draft_models import (
@@ -99,6 +102,8 @@ DYNAMIC_RETRY_HINTS = {
                                   "предвидится» — только подтверждённое, иначе безопасный совет без выдуманного факта.",
     "unsupported_detail": "в ответе места, трассы или цифры, которых нет в сообщениях контекста, — убери их; "
                           "оставь только подтверждённое.",
+    "ignored_question_options": "USER перечислил конкретные варианты (сети АЗС) — ответь именно про них, а не "
+                                "общей фразой «заправки есть»; без гарантий, если это не подтверждено.",
 }
 
 # ЛС-кампании с серверным оформлением ответа (приветствие; для fuel и
@@ -243,6 +248,8 @@ class DmDraftProcessor:
                 side_topics_asked=side_topics(row.source_text),
                 context_text=" ".join(
                     [row.source_text] + [i.text for i in context.discussion] + [i.text for i in context.evidence]),
+                unsupported_checkpoint=unsupported_checkpoint(row.source_text) if border else None,
+                question_options=question_options(row.source_text) if campaign.key == "fuel" else (),
             )
             resources = tuple(dict.fromkeys(resources + cta_handles(border_policy)))
 
@@ -285,15 +292,25 @@ class DmDraftProcessor:
                 )
                 self._log(row, "filtered", campaign_key=campaign.key, note=FILTER_CAMPAIGN_NOT_RELEVANT)
                 return True
-            # Шаг 2: генерация ответа генератором ЭТОЙ кампании.
-            output = await asyncio.wait_for(
-                self._service.generate(
-                    build_user_text(row, campaign, context, allowed_resources=resources, border_policy=border_policy),
-                    instructions=system_prompt_for(campaign.key),
-                    text_format=DmDraftOutput,
-                ),
-                timeout=self._timeout,
-            )
+            # Шаг 2: генерация ответа генератором ЭТОЙ кампании. Явно названный
+            # КПП, который мы не отслеживаем («Красный камень»), — честное «не
+            # подскажу» без модели: статус не выдумывается, Ларсом не подменяется.
+            if border_policy is not None and border_policy.unsupported_checkpoint:
+                output = DmDraftOutput(
+                    should_generate=True, skip_reason=None,
+                    primary_message=unsupported_checkpoint_answer(border_policy.unsupported_checkpoint),
+                    follow_up_message=None, evidence_strength="none", used_context_refs=[],
+                )
+            else:
+                output = await asyncio.wait_for(
+                    self._service.generate(
+                        build_user_text(row, campaign, context, allowed_resources=resources,
+                                        border_policy=border_policy),
+                        instructions=system_prompt_for(campaign.key),
+                        text_format=DmDraftOutput,
+                    ),
+                    timeout=self._timeout,
+                )
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:

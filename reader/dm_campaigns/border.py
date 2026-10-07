@@ -51,14 +51,44 @@ def checkpoints_in(text: str) -> frozenset[str]:
     return frozenset(key for key, rx in CHECKPOINTS.items() if rx.search(text or ""))
 
 
+# КПП, по которому у нас нет оперативных сведений («пропускной пункт РБ-РФ
+# Красный камень»): его статус не выдумывается и Ларсом не подменяется.
+_CHECKPOINT_WORD = (r"(?:[Кк][Пп][Пп]|[Пп]ропускн\w*\s+пункт\w*|[Пп]ункт\w*\s+пропуска|[Пп]огранпереход\w*"
+                    r"|[Пп]ограничн\w*\s+переход\w*|[Пп]ереход\w*)")
+_NAMED_CHECKPOINT_RE = re.compile(
+    _CHECKPOINT_WORD + r"\s+(?:[A-ZА-ЯЁ]{2,3}\s*[-–]\s*[A-ZА-ЯЁ]{2,3}\s+)?[«\"]?"
+    r"([А-ЯЁ][а-яё]+(?:ый|ий|ой|ая|ое|ие)\s+(?:[А-ЯЁ][а-яё]+|камень|мост|брод)(?!\w)"
+    r"|[А-ЯЁ][а-яё]+(?:[-–][А-ЯЁ][а-яё]+)?)"
+)
+_KNOWN_UNSUPPORTED_RE = re.compile(r"красн\w*\s+кам\w*|яраг|казмаляр|(?<!\w)самур(?!\w)|бугаздро|гугути", _I)
+
+
+def unsupported_checkpoint(text: str) -> str | None:
+    """Явно названный в сообщении КПП, который мы не отслеживаем, -> его имя.
+    Если в сообщении назван и отслеживаемый КПП (Ларс, Сарпи…) — None."""
+    text = text or ""
+    if checkpoints_in(text):
+        return None
+    match = _NAMED_CHECKPOINT_RE.search(text)
+    if match and not checkpoints_in(match.group(1)):
+        return match.group(1).strip()
+    known = _KNOWN_UNSUPPORTED_RE.search(text)
+    return known.group(0).strip() if known else None
+
+
 def chat_checkpoint(chat_identifier: str | None) -> str | None:
     return CHAT_CHECKPOINT.get((chat_identifier or "").lstrip("@").lower())
 
 
 def requested_checkpoints(text: str, reply_texts: Iterable[str] = (), chat_identifier: str | None = None) -> frozenset[str]:
+    """Объект вопроса: явный КПП в сообщении > в цепочке ответов > КПП чата.
+    Явно названный неотслеживаемый КПП («Красный камень») — объект вопроса:
+    КПП чата (Ларс) тогда НЕ подставляется."""
     named = checkpoints_in(text)
     if named:
         return named
+    if unsupported_checkpoint(text):
+        return frozenset()
     for reply in reply_texts:
         named = checkpoints_in(reply)
         if named:
@@ -163,7 +193,8 @@ _SOURCE_DISCLOSURE_RE = re.compile(
 _CALM_RE = re.compile(
     r"критичн\w*\s+очеред\w*\s+(?:сейчас\s+)?нет|очеред\w*\s+(?:сейчас\s+)?(?:нет|не\s+наблюда)|без\s+очеред"
     r"|спокойн|свободн|проблем\w*\s+нет", _I)
-_OVERCLAIM_RE = re.compile(r"точно\s+нет|гарантированн|100\s*%", _I)
+_OVERCLAIM_RE = re.compile(
+    r"точно\s+(?:нет|есть|будет|будут|заправ\w*|пропуст\w*)|гарантированн|100\s*%|всегда\s+(?:есть|бывает)", _I)
 
 
 # ---------------- поездка в/через Грузию (подвал с ресурсами) ----------------
@@ -176,7 +207,9 @@ _ARMENIA_TURKEY_RE = re.compile(r"армени|ереван|турци|armenia|t
 _RUSSIA_INTERNAL_RE = re.compile(
     r"москв|питер|петербург|(?<!\w)спб(?!\w)|ростов|волгоград|краснодар|(?<!\w)м-?\s?(?:4|11)(?!\d)|элист"
     r"|ставропол|саратов|воронеж|самар|казан|нижн\w*\s+новгород|ярослав|пятигорск|минвод|(?<!\w)кмв(?!\w)"
-    r"|невинномыс|владикавказ|оренбург|челябинск|екатеринбург|уф[аеуы](?!\w)", _I)
+    r"|невинномыс|оренбург|челябинск|екатеринбург|уф[аеуы](?!\w)", _I)
+# Подъезд к Верхнему Ларсу (Владикавказ, Северная Осетия) — уже поездка в Грузию.
+_LARS_APPROACH_RE = re.compile(r"владикавказ|владик(?!\w)|беслан|осети|алагир|(?<!\w)чми(?!\w)", _I)
 _IN_GEORGIA_RE = re.compile(
     r"(?:выезжа\w*|еду|едем|возвраща\w*|выехал\w*|уезжа\w*)\s+(?:с|из)\s+грузи|(?:с|из)\s+грузии\s+(?:в|на)\s+"
     r"(?:рф|росси)|нахож\w*\s+в\s+грузи|(?:сейчас|уже)\s+в\s+грузи|по\s+грузии", _I)
@@ -193,6 +226,8 @@ def georgia_trip(text: str, reply_texts: Iterable[str] = (), chat_identifier: st
     if any(_GEORGIA_RE.search(t) for t in texts):
         return True
     if any((_RUSSIA_RE.search(t) or _RUSSIA_INTERNAL_RE.search(t)) and _ARMENIA_TURKEY_RE.search(t) for t in texts):
+        return True
+    if any(_LARS_APPROACH_RE.search(t) for t in texts):
         return True
     if _RUSSIA_INTERNAL_RE.search(text or ""):
         return False
@@ -231,10 +266,21 @@ class BorderPolicy:
     # Всё, что видит модель (сообщение USER, обсуждение, свежие сведения), —
     # конкретные места, трассы и цифры ответа должны отсюда подтверждаться.
     context_text: str = ""
+    # Явно названный неотслеживаемый КПП: ответ — честное «не подскажу» без
+    # подмены другим КПП (unsupported_checkpoint_answer, модель не вызывается).
+    unsupported_checkpoint: str | None = None
+    # Сети АЗС, перечисленные USER («Лукойл, Роснефть, Газпром?»): ответ
+    # обязан работать с ними, а не отделываться общей фразой.
+    question_options: tuple[str, ...] = ()
 
     def audit(self) -> dict:
-        return {"checkpoints": sorted(self.checkpoints), "negative_signals": list(self.negative_signals),
-                "greeting": self.greeting, "cta": bool(self.cta)}
+        audit = {"checkpoints": sorted(self.checkpoints), "negative_signals": list(self.negative_signals),
+                 "greeting": self.greeting, "cta": bool(self.cta)}
+        if self.unsupported_checkpoint:
+            audit["unsupported_checkpoint"] = self.unsupported_checkpoint
+        if self.question_options:
+            audit["question_options"] = list(self.question_options)
+        return audit
 
     @property
     def expert_dynamic(self) -> bool:
@@ -299,6 +345,24 @@ def unsupported_detail(text: str, context_text: str) -> str | None:
     return None
 
 
+_FUEL_BRANDS = {
+    "Лукойл": r"лукойл|лукоил|lukoil", "Роснефть": r"роснефт|rosneft", "Газпром": r"газпром|gazprom",
+    "Татнефть": r"татнефт", "Shell": r"shell|шелл", "Teboil": r"teboil|тебойл", "SOCAR": r"socar|сокар",
+    "Wissol": r"wissol|виссол", "Gulf": r"(?<!\w)gulf|галф", "Rompetrol": r"rompetrol|ромпетрол",
+    "ННК": r"(?<!\w)ннк(?!\w)", "Нефтьмагистраль": r"нефтьмагистрал", "Опти": r"(?<!\w)опти(?!\w)",
+}
+
+
+def question_options(text: str) -> tuple[str, ...]:
+    """Сети АЗС, перечисленные USER в вопросе."""
+    return tuple(name for name, rx in _FUEL_BRANDS.items() if re.search(rx, text or "", _I))
+
+
+def unsupported_checkpoint_answer(name: str) -> str:
+    return (f"По переходу «{name}» сейчас не буду вводить вас в заблуждение — точную текущую обстановку "
+            "по нему не подскажу.")
+
+
 def border_problem(text: str, policy: BorderPolicy) -> str | None:
     if _SOURCE_DISCLOSURE_RE.search(text):
         return "source_disclosure"
@@ -308,7 +372,10 @@ def border_problem(text: str, policy: BorderPolicy) -> str | None:
         return "contradicts_signals"
     if _GENERALIZATION_RE.search(text):
         return "unsupported_generalization"
-    detail = unsupported_detail(text, policy.context_text) if policy.context_text else None
+    if policy.question_options and not any(
+            re.search(_FUEL_BRANDS[name], text, _I) for name in policy.question_options):
+        return f"ignored_question_options:{','.join(policy.question_options)}"
+    detail =unsupported_detail(text, policy.context_text) if policy.context_text else None
     if detail:
         return f"unsupported_detail:{detail}"
     return None

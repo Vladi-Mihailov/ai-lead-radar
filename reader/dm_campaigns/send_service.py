@@ -10,9 +10,9 @@ plan() — проверки по БД без сети:
   заблокирован Telegram (blocked_until) и DM-состоянием (PeerFlood/
   FloodWait/неавторизованная сессия, см. sender_state.py), Premium для
   premium_required, session-файл есть, лимиты за скользящие 24 ч: общий
-  потолок аккаунта (sender_daily_cap) и лимит пары кампания-аккаунт, если
-  задан. telegram_accounts.enabled (включатель инвайтера) здесь не
-  учитывается.
+  потолок аккаунта (sender_daily_cap; None/0 — без потолка) и лимит пары
+  кампания-аккаунт, если задан. telegram_accounts.enabled (включатель
+  инвайтера) здесь не учитывается.
 
 send() — под asyncio.Lock (одна отправка за раз в процессе): повтор plan()
 -> атомарный claim draft->sending (второй клик получает "уже обработан") ->
@@ -146,7 +146,7 @@ class DmSendService:
         client_factory: Callable[[object], object],
         session_exists: Callable[[object], bool],
         recipient_cooldown: timedelta,
-        sender_daily_cap: int,
+        sender_daily_cap: int | None,
         clock: Callable[[], datetime] = _utcnow,
     ):
         self._outreach = outreach_repository
@@ -219,7 +219,7 @@ class DmSendService:
         candidates = []
         for account, entry, _ in awake:
             total = self._outreach.sends_since(sender_account_id=account.id, since=now - _DAY)
-            if total >= self._cap:
+            if self._cap and total >= self._cap:  # None/0 — общий потолок выключен
                 continue
             if entry.daily_limit is not None and self._outreach.sends_since(
                 sender_account_id=account.id, since=now - _DAY, campaign_id=campaign.id,
