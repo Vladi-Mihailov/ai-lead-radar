@@ -360,7 +360,7 @@ LEAKY = ("С 1 января 2026 года медстраховка для въе
 
 def test_fixable_rejection_gets_one_corrective_retry(env):
     row, service = _run_transit(env, [_expert_out(LEAKY), _expert_out(TRANSIT_ANSWER)])
-    assert (row.status, row.primary_text) == (STATUS_DRAFT, TRANSIT_ANSWER)
+    assert row.status == STATUS_DRAFT and row.primary_text.endswith(" " + TRANSIT_ANSWER)  # + приветствие
     assert len(service.calls) == 2 and "медицинская страховка, а USER о ней не спрашивал" in service.calls[1]
 
 

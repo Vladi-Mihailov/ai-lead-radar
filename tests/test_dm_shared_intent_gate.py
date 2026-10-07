@@ -139,7 +139,7 @@ def test_fuel_lead_generates(env, text, intent):
     service = TwoStepService(intent)
     _run(env, service)
     row = env[1].get(oid)
-    assert row.status == STATUS_DRAFT and service.generation_prompts == [SYSTEM_PROMPT]
+    assert row.status == STATUS_DRAFT and service.generation_prompts == [system_prompt_for("fuel")]
     audit = json.loads(row.context_json)
     assert (audit["model_intent"], audit["final_intent"], audit["has_own_problem"]) == (intent, intent, True)
 
@@ -167,7 +167,8 @@ def test_border_lead_generates(env, text, intent):
     oid = _candidate(env, "border_queue", text)
     service = TwoStepService(intent)
     _run(env, service)
-    assert env[1].get(oid).status == STATUS_DRAFT and service.generation_prompts == [SYSTEM_PROMPT]
+    assert env[1].get(oid).status == STATUS_DRAFT
+    assert service.generation_prompts == [system_prompt_for("border_queue")]
 
 
 # ---------------- reply-to-other для fuel и border ----------------

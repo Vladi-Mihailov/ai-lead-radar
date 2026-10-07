@@ -8,6 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from reader.dm_campaigns.border import BorderPolicy, border_problem, decorate, other_checkpoint_sentences
 from reader.dm_campaigns.relevance import strip_side_topics
 
 EvidenceStrength = Literal["none", "single_report", "several_consistent", "contradictory"]
@@ -204,6 +205,15 @@ def _dynamic_problem(text: str) -> str | None:
     return None
 
 
+def _has_substance(sentence: str) -> bool:
+    """Предложение отвечает по существу, а не только рекламирует: без @ —
+    да; с @ — если в нём есть часть без ресурса хотя бы из 3 слов («Искать
+    ларёк после таможни необязательно — оформить можно через @tplgee»)."""
+    if "@" not in sentence:
+        return True
+    return any("@" not in part and len(part.split()) >= 3 for part in re.split(r"\s[—–-]\s|[:;]", sentence))
+
+
 def _expert_problem(text: str) -> str | None:
     if _EXPERT_HEDGING_RE.search(text):
         return "expert_hedging_or_group_reference"
@@ -216,7 +226,7 @@ def _expert_problem(text: str) -> str | None:
     sentences = [s for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s.strip()]
     if len(sentences) > MAX_EXPERT_SENTENCES:
         return "too_long"
-    if sentences and all("@" in s for s in sentences):
+    if sentences and not any(_has_substance(s) for s in sentences):
         return "ad_only_answer"
     return None
 
@@ -256,6 +266,7 @@ def normalize_draft(
     intent_text: str = "",
     intent: str | None = None,
     side_topics_asked: frozenset[str] | None = None,
+    border_policy: BorderPolicy | None = None,
 ) -> DraftDecision:
     # intent — итог отдельного шага классификации (processor); если не
     # передан — из ответа модели (совместимость со схемой DmDraftOutputExpert).
@@ -299,6 +310,25 @@ def normalize_draft(
         if follow_up:
             follow_up, dropped = strip_side_topics(follow_up, side_topics_asked)
             follow_up, removed = follow_up or None, removed | dropped
+    if border_policy is not None and border_policy.kind == "border_queue":
+        # Только запрошенный КПП (вопрос о Ларсе — без Сарпи/Вале).
+        cleaned, other = other_checkpoint_sentences(primary, border_policy.checkpoints)
+        if not cleaned:
+            return DraftDecision(kind="invalid", error=f"topic_leak:{','.join(sorted(other))}")
+        primary, removed = cleaned, removed | other
+        follow_up = other_checkpoint_sentences(follow_up, border_policy.checkpoints)[0] or None if follow_up else None
+    if border_policy is not None and border_policy.expert_dynamic:
+        # border_queue / fuel: без раскрытия источника, без «точно/гарантированно»
+        # и (border_queue) без «спокойно» вопреки негативным сигналам.
+        for text in (primary, follow_up):
+            problem = border_problem(text, border_policy) if text else None
+            if problem:
+                return DraftDecision(kind="invalid", error=problem)
+        # Сначала ответ, реклама потом: ресурсы добавляет система, поэтому в
+        # ответе модели должно быть хотя бы одно предложение без них.
+        sentences = [s for s in re.split(r"(?<=[.!?])\s+", primary.strip()) if s.strip()]
+        if sentences and all("@" in s for s in sentences):
+            return DraftDecision(kind="invalid", error="ad_only_answer")
     for text in (primary, follow_up):
         problem = _text_problem(text, valid_refs) if text else None
         if problem:
@@ -352,6 +382,10 @@ def normalize_draft(
     if unknown and not expert and not refs and strength != "none":
         return DraftDecision(kind="invalid", error=f"unknown_context_refs:{','.join(unknown[:5])}")
 
+    if border_policy is not None:
+        # Приветствие (все ЛС-кампании) и подвал с ресурсами (fuel/border_queue,
+        # поездка в/через Грузию) — детерминированно, после всех проверок.
+        primary = decorate(primary, border_policy)
     return DraftDecision(
         kind="draft", primary_message=primary, follow_up_message=follow_up,
         evidence_strength=strength, used_context_refs=refs, intent=intent,

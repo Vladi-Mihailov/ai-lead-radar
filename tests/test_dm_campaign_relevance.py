@@ -238,11 +238,11 @@ def test_unknown_ref_on_a_no_data_answer_is_dropped():
 def test_future_promise_gets_one_repair_and_is_fixed(env):
     oid = _candidate(env, "fuel", "Где заправиться 95-м по М4?")
     service = Service("QUESTION", _draft("Напишите маршрут — посмотрю последние сообщения."),
-                      _draft("По этому участку свежих подтверждений наличия 95-го сейчас нет."))
+                      _draft("По М4 заправки есть, 95-й лучше брать заранее."))
     _run(env, service)
     row = env[1].get(oid)
-    assert (row.status, row.primary_text) == (STATUS_DRAFT,
-                                              "По этому участку свежих подтверждений наличия 95-го сейчас нет.")
+    # маршрут по России (М4) — приветствие есть, грузинского подвала нет
+    assert (row.status, row.primary_text) == (STATUS_DRAFT, "Здравствуйте! По М4 заправки есть, 95-й лучше брать заранее.")
     assert len(service.generation_inputs) == 2 and "ПРЕДЫДУЩИЙ ЧЕРНОВИК ОТКЛОНЁН" in service.generation_inputs[1]
 
 
@@ -258,7 +258,7 @@ def test_repair_is_attempted_at_most_once(env):
 
 def test_not_repairable_error_has_no_repair(env):
     oid = _candidate(env, "fuel", "Где заправиться 95-м по М4?")
-    service = Service("QUESTION", _draft("Пишите @some_other_bot"))
+    service = Service("QUESTION", _draft("По М4 заправки есть. Пишите @some_other_bot"))
     _run(env, service)
     assert env[1].get(oid).status == STATUS_FAILED and len(service.generation_inputs) == 1
 
@@ -298,7 +298,7 @@ def test_classifier_prompt_has_reply_with_own_question_rule():
 
 def test_b47_reply_with_own_question_stays_a_border_lead(env):
     oid = _reply_candidate(env, "border_queue", "С 1 декабря обязательно", B47)
-    service = Service("QUESTION", _draft("В свежих сообщениях нет данных о проезде на всесезонной резине."))
+    service = Service("QUESTION", _draft("Проезд через Ларс сейчас нормальный."))
     _run(env, service, at=T0 + timedelta(minutes=5))
     row = env[1].get(oid)
     audit = _audit(row)
@@ -380,10 +380,10 @@ def test_topic_guard_is_border_only():
 
 def test_topic_leak_gets_one_repair(env):
     oid = _candidate(env, "border_queue", "Как на Ларсе снег?")
-    service = Service("QUESTION", _draft(INSURANCE_TAIL), _draft("В свежих сообщениях нет данных о снеге на Ларсе."))
+    service = Service("QUESTION", _draft(INSURANCE_TAIL), _draft("По снегу на Ларсе сейчас проблем нет."))
     _run(env, service)
     row = env[1].get(oid)
-    assert (row.status, row.primary_text) == (STATUS_DRAFT, "В свежих сообщениях нет данных о снеге на Ларсе.")
+    assert row.status == STATUS_DRAFT and row.primary_text.startswith("Здравствуйте! По снегу на Ларсе сейчас проблем нет.")
     assert len(service.generation_inputs) == 2
 
 

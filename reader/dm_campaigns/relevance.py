@@ -72,16 +72,35 @@ def _without_idioms(text: str) -> str:
     return re.sub(r"в\s+первую\s+очередь|по\s+очереди", " ", text or "", flags=_I)
 
 
-def _border_topic(text: str) -> bool:
+# Разговорный вопрос о КПП в целом («Как Ларс?», «Что на Ларсе?», «как
+# проезд?», «как граница?»): открыт ли, есть ли очередь, нормально ли
+# проезжается — не только про качество асфальта.
+_COLLOQUIAL_RE = re.compile(r"(?<!\w)как(?!\w)|что\s+на(?!\w)|проезд|как\s+границ", _I)
+_HINT_STATE_RE = re.compile(
+    r"обстановк|ситуаци|откры|закры|(?<!не\s)работает|пропуска|выпуска|пускают|как\s+(?:там|дела|сейчас)"
+    r"|(?:^|[.!?]\s*)(?:а\s+)?что\s+(?:там|сейчас)",
+    _I,
+)
+_COLLOQUIAL_NO_PLACE_RE = re.compile(r"как\s+(?:там\s+)?(?:сейчас\s+)?(?:проезд|границ|перевал)|проезд\s+(?:открыт|есть)", _I)
+
+
+def _border_topic(text: str, place_hint: bool = False) -> bool:
+    """place_hint — разговор и так о КПП (чат КПП / ответ на сообщение о
+    КПП): тогда «какая обстановка?», «как проезд?» — тоже вопрос о проезде."""
     text = _without_idioms(text)
-    place = bool(_BORDER_PLACE_RE.search(text))
-    if _BORDER_QUEUE_RE.search(text) and (place or not _FUEL_RE.search(text)):
+    named = bool(_BORDER_PLACE_RE.search(text))
+    fuel = bool(_FUEL_RE.search(text))
+    if _BORDER_QUEUE_RE.search(text) and (named or not fuel):
         return True
-    if _ROAD_RE.search(text) or _TYRES_RE.search(text):
+    if _ROAD_RE.search(text) or _TYRES_RE.search(text) or _COLLOQUIAL_NO_PLACE_RE.search(text):
         return True
-    if place and (_BORDER_STATE_RE.search(text) or _WEATHER_RE.search(text)):
+    if named and (_BORDER_STATE_RE.search(text) or _WEATHER_RE.search(text)):
         return True
-    return False
+    # Чат КПП без названия места: только вопрос об обстановке/работе КПП/погоде,
+    # не маршрут по России и не бензин («проехать через Элисту» — не граница).
+    if place_hint and not fuel and (_HINT_STATE_RE.search(text) or _WEATHER_RE.search(text)):
+        return True
+    return named and bool(_COLLOQUIAL_RE.search(text))
 
 
 def fuel_relevant(text: str, reply_texts: Iterable[str] = ()) -> bool:
@@ -90,10 +109,10 @@ def fuel_relevant(text: str, reply_texts: Iterable[str] = ()) -> bool:
     return any(_FUEL_RE.search(t or "") for t in reply_texts)
 
 
-def border_relevant(text: str, reply_texts: Iterable[str] = ()) -> bool:
+def border_relevant(text: str, reply_texts: Iterable[str] = (), place_hint: bool = False) -> bool:
     if _BORDER_OFF_TOPIC_RE.search(text or ""):
         return False
-    if _border_topic(text):
+    if _border_topic(text, place_hint):
         return True
     # Короткое продолжение без своей темы («А сейчас?») — тема из того, на что отвечает.
     if _FUEL_RE.search(text or ""):
@@ -110,10 +129,16 @@ _RULES = {"fuel": fuel_relevant, "border_queue": border_relevant, "insurance": i
 ROUTABLE_CAMPAIGNS = frozenset({"fuel", "border_queue"})
 
 
-def campaign_relevant(campaign_key: str | None, text: str, reply_texts: Iterable[str] = ()) -> bool:
-    """True — запрос по теме кампании; кампании без правила — всегда True."""
+def campaign_relevant(campaign_key: str | None, text: str, reply_texts: Iterable[str] = (), *,
+                      place_hint: bool = False) -> bool:
+    """True — запрос по теме кампании; кампании без правила — всегда True.
+    place_hint (только border_queue) — см. border.place_hint."""
     rule = _RULES.get(campaign_key or "")
-    return True if rule is None else rule(text or "", tuple(reply_texts))
+    if rule is None:
+        return True
+    if rule is border_relevant:
+        return border_relevant(text or "", tuple(reply_texts), place_hint)
+    return rule(text or "", tuple(reply_texts))
 
 
 # ---------------- border_queue: тематический фильтр ответа ----------------
