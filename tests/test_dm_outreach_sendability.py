@@ -167,7 +167,8 @@ async def test_no_username_candidate_reaches_stored_draft(env):
     )
     assert await processor.run_once() == 1
     done = outreach.get(row.id)
-    assert (done.status, done.primary_text, done.recipient_username) == (STATUS_DRAFT, 'Полис можно оформить онлайн. Штрафы можно отслеживать через @ProtocolGEbot.', None)
+    assert (done.status, done.recipient_username) == (STATUS_DRAFT, None)
+    assert done.primary_text.endswith(' Полис можно оформить онлайн. Штрафы можно отслеживать через @ProtocolGEbot.')
     assert done.sendability == SENDABILITY_SOURCE_MESSAGE  # переживает переход в draft
     assert len(service.calls) == 1
     assert "555" not in service.calls[0]  # recipient_user_id в OpenAI не уходит

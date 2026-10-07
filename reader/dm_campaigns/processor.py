@@ -21,7 +21,8 @@ from datetime import datetime, timedelta, timezone
 from reader.dm_campaigns.border import (
     BorderPolicy,
     cta_handles,
-    cta_lines,
+    footer_lines,
+    georgia_trip,
     greeting_for,
     negative_signals,
     place_hint,
@@ -93,7 +94,16 @@ DYNAMIC_RETRY_HINTS = {
     "contradicts_signals": "в BORDER SIGNALS есть негативные сигналы — отрази их и не пиши «очередей нет», "
                            "«спокойно», «свободно».",
     "overclaim": "без «точно», «гарантированно» — обычная уверенная формулировка.",
+    "ad_only_answer": "сначала прямой ответ на вопрос по существу; ресурсы не упоминай — их добавит система.",
+    "unsupported_generalization": "без предположений «обычно», «чаще всего», «как правило», «проблем не "
+                                  "предвидится» — только подтверждённое, иначе безопасный совет без выдуманного факта.",
+    "unsupported_detail": "в ответе места, трассы или цифры, которых нет в сообщениях контекста, — убери их; "
+                          "оставь только подтверждённое.",
 }
+
+# ЛС-кампании с серверным оформлением ответа (приветствие; для fuel и
+# border_queue — ещё подвал с ресурсами и запрет раскрывать источник).
+REPLY_POLICY_CAMPAIGNS = frozenset({"insurance", "fuel", "border_queue"})
 
 _BATCH_LIMIT = 5
 _CLEANUP_INTERVAL_SECONDS = 3600.0
@@ -216,14 +226,23 @@ class DmDraftProcessor:
         )
         replies = [i.text for i in context.discussion if i.ref.startswith("R")]
         border_policy = None
-        if campaign.key == "border_queue":
-            # КПП вопроса, негативные сигналы по свежим отчётам, приветствие и
-            # наши ресурсы для поездки через Ларс (см. border.py).
-            checkpoints = requested_checkpoints(row.source_text, replies, row.source_chat_identifier)
+        if campaign.key in REPLY_POLICY_CAMPAIGNS:
+            # Приветствие — всем ЛС-кампаниям; border_queue — КПП вопроса и
+            # негативные сигналы по свежим отчётам; fuel/border_queue —
+            # обязательный подвал с ресурсами для поездки, связанной с Грузией.
+            border = campaign.key == "border_queue"
+            checkpoints = (requested_checkpoints(row.source_text, replies, row.source_chat_identifier)
+                           if border else frozenset())
+            georgia = georgia_trip(row.source_text, replies, row.source_chat_identifier, checkpoints)
             border_policy = BorderPolicy(
-                checkpoints=checkpoints, negative_signals=negative_signals(i.text for i in context.evidence),
+                kind=campaign.key, checkpoints=checkpoints,
+                negative_signals=negative_signals(i.text for i in context.evidence) if border else (),
                 greeting=greeting_for(row.source_text, continuation=bool(replies)),
-                cta=cta_lines(checkpoints, campaign.resources), side_topics_asked=side_topics(row.source_text),
+                cta=(footer_lines(row.source_text, replies, georgia=georgia, campaign_resources=campaign.resources)
+                     if campaign.key != "insurance" else ()),
+                side_topics_asked=side_topics(row.source_text),
+                context_text=" ".join(
+                    [row.source_text] + [i.text for i in context.discussion] + [i.text for i in context.evidence]),
             )
             resources = tuple(dict.fromkeys(resources + cta_handles(border_policy)))
 

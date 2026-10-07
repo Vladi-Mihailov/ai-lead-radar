@@ -160,7 +160,7 @@ def test_ge_insurance_question_offers_both_and_rejects_tr_bot(env):
 def test_ge_insurance_question_valid_expert_draft(env):
     row, _ = _run(env, ident="VerhniyLars", text=INSURANCE_Q,
                   output=_out(primary_message=GOOD_GE, used_context_refs=[], evidence_strength="none"))
-    assert (row.status, row.primary_text) == (STATUS_DRAFT, GOOD_GE)
+    assert (row.status, row.primary_text) == (STATUS_DRAFT, f"Здравствуйте! {GOOD_GE}")
 
 
 def test_tr_toll_question_offers_protocol_tr_bot(env):

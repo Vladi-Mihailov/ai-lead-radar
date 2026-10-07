@@ -139,7 +139,7 @@ def test_fuel_lead_generates(env, text, intent):
     service = TwoStepService(intent)
     _run(env, service)
     row = env[1].get(oid)
-    assert row.status == STATUS_DRAFT and service.generation_prompts == [SYSTEM_PROMPT]
+    assert row.status == STATUS_DRAFT and service.generation_prompts == [system_prompt_for("fuel")]
     audit = json.loads(row.context_json)
     assert (audit["model_intent"], audit["final_intent"], audit["has_own_problem"]) == (intent, intent, True)
 

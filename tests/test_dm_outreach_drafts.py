@@ -351,7 +351,9 @@ async def test_processor_waits_for_context_then_drafts(env):
     clock.now = T0 + timedelta(minutes=3)
     assert await proc.run_once() == 1
     done = outreach.get(row.id)
-    assert (done.status, done.primary_text, done.evidence_strength) == (STATUS_DRAFT, "Ответ по делу.", "none")
+    # М4 — маршрут по России: приветствие есть, грузинского подвала нет
+    assert (done.status, done.primary_text, done.evidence_strength) == (
+        STATUS_DRAFT, "Здравствуйте! Ответ по делу.", "none")
     assert json.loads(done.context_json)["fresh_context_used"] is True
     assert len(service.calls) == 1
     assert await proc.run_once() == 0 and len(service.calls) == 1  # повторно не генерируется

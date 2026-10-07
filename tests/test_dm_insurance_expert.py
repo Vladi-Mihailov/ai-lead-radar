@@ -19,10 +19,12 @@ from test_dm_outreach_drafts import _builder, _FakeService, _out
 
 from reader.dm_campaigns.context import DraftContext
 from reader.dm_campaigns.draft_models import DmDraftOutput, DmDraftOutputExpert, normalize_draft
+from reader.dm_campaigns.border import greeting_for
 from reader.dm_campaigns.draft_prompt import (
     SYSTEM_PROMPT,
     SYSTEM_PROMPT_BORDER,
     SYSTEM_PROMPT_EXPERT,
+    SYSTEM_PROMPT_FUEL,
     build_user_text,
     system_prompt_for,
 )
@@ -151,7 +153,7 @@ def test_dynamic_campaigns_keep_previous_rules():
 
 def test_insurance_uses_expert_prompt_others_keep_dynamic_prompt():
     assert system_prompt_for("insurance") is SYSTEM_PROMPT_EXPERT
-    assert system_prompt_for("border_queue") is SYSTEM_PROMPT_BORDER and system_prompt_for("fuel") is SYSTEM_PROMPT
+    assert system_prompt_for("border_queue") is SYSTEM_PROMPT_BORDER and system_prompt_for("fuel") is SYSTEM_PROMPT_FUEL
     for rule in ("утверждённые факты кампании важнее любых сообщений группы", "«точно подтвердить не могу»",
                  "«в группе пишут»", "не переспрашивай", "Ответ только рекламой", "КАЖДЫЙ из них"):
         assert rule in SYSTEM_PROMPT_EXPERT
@@ -207,7 +209,8 @@ def _process(env, *, key, text, primary, message_id=7):
 @pytest.mark.parametrize("question,answer", list(zip(REAL_QUESTIONS, TARGET_ANSWERS)))
 def test_real_questions_end_to_end_with_expert_prompt(env, question, answer):
     row, service = _process(env, key="insurance", text=question, primary=answer)
-    assert (row.status, row.primary_text) == (STATUS_DRAFT, answer)
+    # сервер ставит приветствие в ответ на приветствие USER (иначе «Здравствуйте!»)
+    assert (row.status, row.primary_text) == (STATUS_DRAFT, f"{greeting_for(question, continuation=False)} {answer}")
     assert service.instructions == [SYSTEM_PROMPT_EXPERT]
     block = service.calls[0].split("ALLOWED PROMOTED RESOURCES" + chr(10))[1].split(chr(10) * 2)[0]
     assert TPLGEE in block and PROTOCOL_GE in block and PROTOCOL_TR not in block
