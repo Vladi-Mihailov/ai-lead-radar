@@ -503,10 +503,50 @@ def test_campaign_account_limit_applies(env):
     assert env.outreach.get(second).status == STATUS_DRAFT and len(env.tg.sent) == 1
 
 
-def test_default_cap_is_conservative():
+def test_default_has_no_global_daily_cap_but_keeps_recipient_cooldown():
     from reader.settings import DmOutreachSettings
     settings = DmOutreachSettings()
-    assert (settings.sender_daily_cap, settings.recipient_cooldown_days) == (5, 7)
+    assert (settings.sender_daily_cap, settings.recipient_cooldown_days) == (None, 7)
+    assert DmOutreachSettings(sender_daily_cap=0).sender_daily_cap == 0  # 0 — тоже «без потолка»
+    assert DmOutreachSettings(sender_daily_cap=5).sender_daily_cap == 5  # включается конфигом
+
+
+@pytest.mark.parametrize("cap", [None, 0])
+def test_twenty_manual_sends_are_not_blocked_by_global_cap(env, cap):
+    """6-я, 10-я, 20-я ручная отправка за сутки — без «дневной лимит»."""
+    env.service._cap = cap
+    for i in range(20):
+        env.tg.users[f"u{i}"] = User(id=3000 + i, bot=False, username=f"u{i}")
+        row_id = draft(env, username=f"u{i}", user_id=3000 + i, message_id=900 + i)
+        click_and_confirm(env, row_id)
+        row = env.outreach.get(row_id)
+        assert (row.status, row.send_error) == (STATUS_SENT, None), (i + 1, row.send_error)
+    assert len(env.tg.sent) == 20
+
+
+def test_flood_wait_still_pauses_sender_without_global_cap(env):
+    env.service._cap = None
+    row_id = draft(env)
+    env.tg.send_effects = [errors.FloodWaitError(request=None, capture=300)]
+    click_and_confirm(env, row_id)
+    assert (env.outreach.get(row_id).status, env.tg.sent) == (STATUS_DRAFT, [])
+    assert env.states.get(env.vladi.id).flood_wait_until == T0 + timedelta(seconds=300)
+
+
+def test_peer_flood_still_blocks_sender_without_global_cap(env):
+    env.service._cap = None
+    row_id = draft(env)
+    env.tg.send_effects = [errors.PeerFloodError(request=None)]
+    click_and_confirm(env, row_id)
+    assert env.states.get(env.vladi.id).blocked_reason == svc.PEER_FLOOD and env.tg.sent == []
+
+
+def test_recipient_cooldown_still_applies_without_global_cap(env):
+    env.service._cap = None
+    click_and_confirm(env, draft(env))
+    second = draft(env, message_id=502)
+    press(env, cb.ACTION_APPROVE, second)
+    assert env.outreach.get(second).send_error == svc.RECENT_DM and len(env.tg.sent) == 1
 
 
 # ---------------- ошибки Telegram ----------------

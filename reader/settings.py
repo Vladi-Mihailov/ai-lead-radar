@@ -349,10 +349,13 @@ class DmOutreachSettings(BaseModel):
     # drafting дольше этого — процесс упал посреди генерации, вернуть в очередь.
     drafting_recovery_seconds: float = Field(default=600, gt=0)
     # Phase 3C (ручная отправка оператором): одному человеку — не чаще раза
-    # в N дней по ВСЕМ ЛС-кампаниям; и общий потолок успешных ЛС на аккаунт
-    # отправителя за скользящие 24 ч (NULL-лимит кампании — не "без лимита").
+    # в N дней по ВСЕМ ЛС-кампаниям. sender_daily_cap — общий потолок успешных
+    # ЛС на аккаунт отправителя за скользящие 24 ч; null/0 — без потолка
+    # (ручной режим: решает оператор). Защита Telegram (FloodWait, PeerFlood,
+    # блокировка отправителя, кулдаун получателя, лимит пары кампания-аккаунт)
+    # от этого не зависит.
     recipient_cooldown_days: float = Field(default=7, gt=0)
-    sender_daily_cap: int = Field(default=5, ge=1, le=50)
+    sender_daily_cap: int | None = Field(default=None, ge=0, le=1000)
 
 
 class Settings(BaseModel):
