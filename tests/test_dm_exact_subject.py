@@ -11,6 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import pytest
+from _dm_reply_helpers import footer
 from test_dm_campaign_relevance import Service, _draft
 from test_dm_shared_intent_gate import T0, _run, env  # noqa: F401  (env — fixture)
 
@@ -57,10 +58,10 @@ def test_524_unsupported_checkpoint_is_not_replaced_by_lars(env):
     service = Service("QUESTION", _draft("Верхний Ларс открыт, проезд нормальный, критичных очередей сейчас нет."))
     _run(env, service)
     row, audit = _saved(env, oid)
-    body = row.primary_text.split(TPLGEE_LINE)[0]
+    body = row.primary_text.split(footer(oid, Q524).split("\n")[0])[0]
     assert "Ларс" not in body and "открыт" not in body  # ни подмены, ни выдуманного статуса
     assert row.primary_text == ("Добрый день! По переходу «Красный камень» сейчас не буду вводить вас в заблуждение — "
-                                f"точную текущую обстановку по нему не подскажу. {FOOTER}")
+                                f"точную текущую обстановку по нему не подскажу. {footer(oid, Q524)}")
     assert service.generation_inputs == []  # модель не вызывается — статус не выдумать
     assert audit["border"]["unsupported_checkpoint"] == "Красный камень" and audit["border"]["checkpoints"] == []
 
@@ -98,7 +99,8 @@ def test_323_lars_behaviour_unchanged(env):
     oid = _insert(env, "border_queue", "Добрый вечер,скажите пожалуйста Ларс открыт,как дорога?", msg_id=702)
     _run(env, Service("QUESTION", _draft("Верхний Ларс открыт, критичных очередей сейчас нет.")))
     row, audit = _saved(env, oid)
-    assert row.primary_text == f"Добрый вечер! Верхний Ларс открыт, критичных очередей сейчас нет. {FOOTER}"
+    assert row.primary_text == (f"Добрый вечер! Верхний Ларс открыт, критичных очередей сейчас нет. "
+                                f"{footer(oid, 'Добрый вечер,скажите пожалуйста Ларс открыт,как дорога?')}")
     assert audit["border"]["checkpoints"] == ["lars"] and "unsupported_checkpoint" not in audit["border"]
 
 
@@ -135,7 +137,7 @@ def test_471_vladikavkaz_diesel_repaired_to_options_and_footer_saved(env):
     service = Service("QUESTION", _draft("Во Владикавказе заправки есть, дизель в наличии."), _draft(good))
     _run(env, service)
     row, audit = _saved(env, oid)
-    assert row.primary_text == f"Здравствуйте! {good} {FOOTER}"
+    assert row.primary_text == f"Здравствуйте! {good} {footer(oid, Q471)}"
     assert len(service.generation_inputs) == 2 and "перечислил конкретные варианты" in service.generation_inputs[1]
     assert audit["border"]["question_options"] == ["Лукойл", "Роснефть", "Газпром"] and audit["border"]["cta"] is True
 
@@ -161,7 +163,7 @@ def test_491_saved_primary_text_has_footer_exactly_once(env, sendability, userna
     _run(env, Service("QUESTION", _draft(answer)))
     row, _ = _saved(env, oid)
     assert row.sendability == sendability
-    assert row.primary_text == f"Здравствуйте! {answer} {FOOTER}"
+    assert row.primary_text == f"Здравствуйте! {answer} {footer(oid, Q491)}"
     assert row.primary_text.count("@tplgee") == 1 and row.primary_text.count("@ProtocolGEbot") == 1
 
 

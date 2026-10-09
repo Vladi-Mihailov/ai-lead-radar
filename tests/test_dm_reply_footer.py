@@ -10,6 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import pytest
+from _dm_reply_helpers import footer
 from test_dm_border_expert import _insert
 from test_dm_campaign_relevance import Service, _draft
 from test_dm_shared_intent_gate import _candidate, _run, env  # noqa: F401  (env — fixture)
@@ -22,6 +23,9 @@ from reader.dm_campaigns.border import (
     footer_lines,
     georgia_trip,
 )
+from datetime import date
+
+from reader.dm_campaigns.reply_style import resource_footer
 from reader.dm_campaigns.draft_models import DmDraftOutputExpert, normalize_draft
 from reader.dm_campaigns.draft_prompt import SYSTEM_PROMPT_EXPERT, SYSTEM_PROMPT_FUEL, system_prompt_for
 from reader.dm_campaigns.outreach_repository import STATUS_DRAFT
@@ -63,7 +67,7 @@ def test_394_motorhome_queue_gets_answer_then_footer(env):
     oid = _insert(env, Q394, msg_id=601)
     _run(env, Service("QUESTION", _draft(answer)))
     text = _text(env, oid)
-    assert text == f"Привет! {answer} {FOOTER}"
+    assert text == f"Привет! {answer} {footer(oid, Q394)}"
     assert _answer_before_cta(text, answer)
 
 
@@ -71,7 +75,7 @@ def test_393_entry_to_russia_gets_greeting_and_footer(env):
     answer = "Верхний Ларс открыт, критичной очереди на въезд в Россию сейчас нет."
     oid = _insert(env, Q393, msg_id=602)
     _run(env, Service("QUESTION", _draft(answer)))
-    assert _text(env, oid) == f"Доброе утро! {answer} {FOOTER}"
+    assert _text(env, oid) == f"Доброе утро! {answer} {footer(oid, Q393)}"
 
 
 def test_387_leaving_georgia_gets_insurance_reminder_with_approved_fine(env):
@@ -79,7 +83,7 @@ def test_387_leaving_georgia_gets_insurance_reminder_with_approved_fine(env):
     oid = _insert(env, Q387, msg_id=603)
     _run(env, Service("QUESTION", _draft(answer)))
     text = _text(env, oid)
-    assert text == f"Доброе утро! {answer} {REMINDER_FOOTER}"
+    assert text == f"Доброе утро! {answer} {footer(oid, Q387)}"
     assert "штраф 100 лари" in text and "@tplgee" in text and "@ProtocolGEbot" in text
     for unapproved in ("гарантир", "обязательно выпишут", "на выезде", "на границе выпиш"):
         assert unapproved not in text
@@ -89,7 +93,7 @@ def test_387_model_sentence_about_fine_mechanics_is_removed(env):
     oid = _insert(env, Q387, msg_id=604)
     _run(env, Service("QUESTION", _draft("Ларс открыт, дорога проезжая. На выезде штраф выпишут обязательно.")))
     text = _text(env, oid)
-    assert "выпишут" not in text and text.endswith(REMINDER_FOOTER)
+    assert "выпишут" not in text and text.endswith(footer(oid, Q387))
 
 
 # ---------------- fuel ----------------
@@ -101,7 +105,7 @@ def test_350_fuel_on_the_way_gets_footer(env):
     oid = _fuel(env, Q350, 605)
     _run(env, Service("QUESTION", _draft(answer)))
     text = _text(env, oid)
-    assert text == f"Здравствуйте! {answer} {FOOTER}"
+    assert text == f"Здравствуйте! {answer} {footer(oid, Q350)}"
     assert _answer_before_cta(text, answer)
 
 
@@ -110,7 +114,7 @@ def test_338_fuel_from_piter_to_georgia_gets_footer(env):
               "держать нормальный запас хода.")
     oid = _fuel(env, Q338, 606)
     _run(env, Service("QUESTION", _draft(answer)))
-    assert _text(env, oid) == f"Приветствую! {answer} {FOOTER}"
+    assert _text(env, oid) == f"Приветствую! {answer} {footer(oid, Q338)}"
 
 
 def test_fuel_uses_expert_prompt_and_rejects_source_disclosure(env):
@@ -123,11 +127,14 @@ def test_fuel_uses_expert_prompt_and_rejects_source_disclosure(env):
     assert len(service.generation_inputs) == 2 and "не раскрывай источник" in service.generation_inputs[1]
 
 
-def test_fuel_inside_russia_gets_no_georgia_footer(env):
-    oid = _fuel(env, "Кто ехал недавно из Ростова на авто - 95 вообще реально поймать по пути на заправках?", 608)
+def test_fuel_inside_russia_still_gets_both_resources(env):
+    """Новое бизнес-правило: оба ресурса — в КАЖДОМ черновике, и вне маршрута в Грузию."""
+    source = "Кто ехал недавно из Ростова на авто - 95 вообще реально поймать по пути на заправках?"
+    oid = _fuel(env, source, 608)
     _run(env, Service("QUESTION", _draft("По трассе из Ростова 95-й на сетевых АЗС есть, заправляйтесь заранее.")))
     text = _text(env, oid)
-    assert "@tplgee" not in text and "@ProtocolGEbot" not in text and text.startswith("Здравствуйте! ")
+    assert text.startswith("Здравствуйте! ") and text.endswith(footer(oid, source))
+    assert text.count("@tplgee") == 1 and text.count("@ProtocolGEbot") == 1
 
 
 # ---------------- insurance ----------------
@@ -175,8 +182,8 @@ def test_insurance_prompt_requires_direct_answer_first():
 ])
 def test_georgia_trip_detection(text, chat, expected):
     assert georgia_trip(text, (), chat) is expected
-    lines = footer_lines(text, (), georgia=georgia_trip(text, (), chat), campaign_resources=RESOURCES)
-    assert bool(lines) is expected
+    # подвал больше не зависит от маршрута: оба ресурса всегда
+    assert len(resource_footer(text, (), campaign_resources=RESOURCES, seed=1, today=date(2026, 10, 9))) == 2
 
 
 def test_footer_only_with_campaign_resources():
@@ -292,5 +299,5 @@ def test_394_unsupported_operational_fact_gets_repaired(env):
     service = Service("QUESTION", _draft("По очереди для автодомов решение чаще всего принимают на месте."),
                       _draft(good))
     _run(env, service)
-    assert _text(env, oid) == f"Привет! {good} {FOOTER}"
+    assert _text(env, oid) == f"Привет! {good} {footer(oid, Q394)}"
     assert len(service.generation_inputs) == 2 and "без предположений" in service.generation_inputs[1]

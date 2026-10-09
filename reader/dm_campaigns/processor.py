@@ -16,13 +16,11 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from reader.dm_campaigns.border import (
     BorderPolicy,
     cta_handles,
-    footer_lines,
-    georgia_trip,
     greeting_for,
     negative_signals,
     place_hint,
@@ -50,13 +48,21 @@ from reader.dm_campaigns.draft_prompt import (
 from reader.dm_campaigns.draft_service import DmDraftService, DmDraftServiceError
 from reader.dm_campaigns.models import source_chat_allowed
 from reader.dm_campaigns.observer import ACTIVE_DRAFT_WINDOW, FILTER_ACTIVE_DRAFT
-from reader.dm_campaigns.outreach_repository import MAX_ATTEMPTS, DmOutreach, DmOutreachRepository
+from reader.dm_campaigns.outreach_repository import (
+    MAX_ATTEMPTS,
+    DmOutreach,
+    DmOutreachRepository,
+)
 from reader.dm_campaigns.recent_messages import RecentMessageRepository
 from reader.dm_campaigns.relevance import (
     FILTER_CAMPAIGN_NOT_RELEVANT,
     ROUTABLE_CAMPAIGNS,
     campaign_relevant,
     side_topics,
+)
+from reader.dm_campaigns.reply_style import (
+    TPLGEE_PERSONAL_PURCHASE_DATE,
+    resource_footer,
 )
 from reader.dm_campaigns.repository import DmCampaignRepository
 from reader.dm_campaigns.resources import allowed_resources
@@ -79,6 +85,13 @@ RETRY_HINTS = {
     "expert_hedging_or_group_reference": "без оговорок и без ссылок на группу или её участников.",
     "unapproved_claim": "утверждение, которого нет в утверждённых фактах, — убери его.",
     "unnecessary_clarification": "не переспрашивай — ответь тем, что следует из фактов.",
+    "insurance_legalese": "без юридического языка («для машины на иностранных номерах», «весь срок нахождения», "
+                          "«предусмотрен штраф») — по-простому: «Да, автостраховка нужна. Если её нет — штраф 100 лари.»",
+    "unanswered_user_question": "ты не ответил на часть вопроса USER — ответь на КАЖДУЮ часть; по части без "
+                                "утверждённых фактов — «По … проверенной информации у меня нет».",
+    "tplgee_as_medical": "@tplgee — только автостраховка, не медстраховка; не упоминай его рядом с медстраховкой.",
+    "advertising_tone": "без рекламного тона («наш сервис», «у нас можно», «предлагаем», «переходите») — "
+                        "советуй как обычный участник чата.",
 }
 # fuel / border_queue: та же одна исправляющая попытка — для оговорок,
 # обещаний и ссылок на несуществующие сообщения.
@@ -104,6 +117,12 @@ DYNAMIC_RETRY_HINTS = {
                           "оставь только подтверждённое.",
     "ignored_question_options": "USER перечислил конкретные варианты (сети АЗС) — ответь именно про них, а не "
                                 "общей фразой «заправки есть»; без гарантий, если это не подтверждено.",
+    "unanswered_user_question": "ты не ответил на часть вопроса USER — ответь на КАЖДУЮ часть. Если по части "
+                                "нет подтверждённого ответа, скажи именно про неё «Про … сейчас не подскажу» — "
+                                "без слов «данные», «сведения», «информация».",
+    "tplgee_as_medical": "@tplgee — только автостраховка, не медстраховка; не упоминай его рядом с медстраховкой.",
+    "advertising_tone": "без рекламного тона («наш сервис», «у нас можно», «предлагаем», «переходите») — "
+                        "советуй как обычный участник чата.",
 }
 
 # ЛС-кампании с серверным оформлением ответа (приветствие; для fuel и
@@ -132,9 +151,11 @@ class DmDraftProcessor:
         retention_hours: float,
         generation_timeout_seconds: float = 90.0,
         group_resource_regions: dict[str, str] | None = None,
+        tplgee_purchase_date: date = TPLGEE_PERSONAL_PURCHASE_DATE,
         clock: Callable[[], datetime] = _utcnow,
         monotonic: Callable[[], float] = time.monotonic,
     ):
+        self._tplgee_purchase_date = tplgee_purchase_date
         self._outreach = outreach_repository
         self._campaigns = campaign_repository
         self._recent = recent_repository
@@ -231,6 +252,7 @@ class DmDraftProcessor:
         )
         replies = [i.text for i in context.discussion if i.ref.startswith("R")]
         border_policy = None
+        validation_resources = resources
         if campaign.key in REPLY_POLICY_CAMPAIGNS:
             # Приветствие — всем ЛС-кампаниям; border_queue — КПП вопроса и
             # негативные сигналы по свежим отчётам; fuel/border_queue —
@@ -238,20 +260,23 @@ class DmDraftProcessor:
             border = campaign.key == "border_queue"
             checkpoints = (requested_checkpoints(row.source_text, replies, row.source_chat_identifier)
                            if border else frozenset())
-            georgia = georgia_trip(row.source_text, replies, row.source_chat_identifier, checkpoints)
             border_policy = BorderPolicy(
                 kind=campaign.key, checkpoints=checkpoints,
                 negative_signals=negative_signals(i.text for i in context.evidence) if border else (),
                 greeting=greeting_for(row.source_text, continuation=bool(replies)),
-                cta=(footer_lines(row.source_text, replies, georgia=georgia, campaign_resources=campaign.resources)
-                     if campaign.key != "insurance" else ()),
+                # Оба ресурса — в КАЖДОМ готовом черновике всех трёх кампаний;
+                # формулировка варьируется по id строки (стабильно для черновика).
+                cta=resource_footer(row.source_text, replies, campaign_resources=campaign.resources, seed=row.id,
+                                    today=now.date(), purchased=self._tplgee_purchase_date),
+                question_text=row.source_text,
                 side_topics_asked=side_topics(row.source_text),
                 context_text=" ".join(
                     [row.source_text] + [i.text for i in context.discussion] + [i.text for i in context.evidence]),
                 unsupported_checkpoint=unsupported_checkpoint(row.source_text) if border else None,
                 question_options=question_options(row.source_text) if campaign.key == "fuel" else (),
             )
-            resources = tuple(dict.fromkeys(resources + cta_handles(border_policy)))
+            # Модели — прежний список по региону; проверке — ещё и ресурсы подвала.
+            validation_resources = tuple(dict.fromkeys(resources + cta_handles(border_policy)))
 
         started = time.monotonic()
         expert = campaign.key in EXPERT_CAMPAIGNS
@@ -338,7 +363,7 @@ class DmDraftProcessor:
                 valid_refs=context.refs,
                 fresh_context_used=context.fresh_context_used,
                 n_distinct_senders=meta.n_distinct_senders if meta else 0,
-                allowed_resources=resources,
+                allowed_resources=validation_resources,
                 expert=expert,
                 intent_text=intent_text,
                 intent=intent,

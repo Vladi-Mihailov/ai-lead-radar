@@ -164,13 +164,14 @@ _STARTS_WITH_GREETING_RE = re.compile(
     r"^\s*(?:добр\w*\s+(?:утр|д|вечер|ноч)\w*|(?:утр|день|вечер|ноч)\w*\s+добр\w*|здравствуй\w*|привет\w*)", _I)
 
 
-def greeting_for(source_text: str, *, continuation: bool) -> str | None:
-    """Приветствие ответа: зеркально приветствию USER; без приветствия —
-    «Здравствуйте!», кроме продолжения разговора (ответ в ветке)."""
+def greeting_for(source_text: str, *, continuation: bool = False) -> str:
+    """Приветствие ответа — всегда (каждый ЛС начинается с приветствия):
+    зеркально приветствию USER, иначе «Здравствуйте!». continuation больше
+    не отменяет приветствие (параметр оставлен для совместимости)."""
     for rx, greeting in _GREETINGS:
         if rx.search(source_text or ""):
             return greeting
-    return None if continuation else "Здравствуйте!"
+    return "Здравствуйте!"
 
 
 # ---------------- проверки и оформление ответа ----------------
@@ -272,6 +273,9 @@ class BorderPolicy:
     # Сети АЗС, перечисленные USER («Лукойл, Роснефть, Газпром?»): ответ
     # обязан работать с ними, а не отделываться общей фразой.
     question_options: tuple[str, ...] = ()
+    # Исходное сообщение USER — для проверки, что ответ покрывает все части
+    # вопроса и что юридический язык уместен (reply_style.py).
+    question_text: str = ""
 
     def audit(self) -> dict:
         audit = {"checkpoints": sorted(self.checkpoints), "negative_signals": list(self.negative_signals),

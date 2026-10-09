@@ -172,22 +172,27 @@ def test_tr_toll_question_offers_protocol_tr_bot(env):
     assert row.status == STATUS_DRAFT
 
 
-def test_unknown_country_gets_no_protocol_bot(env):
+def test_unknown_country_prompt_has_no_protocol_bot_but_draft_gets_both_resources(env):
+    """Модели Protocol-бот не предлагается (регион неизвестен), но готовый черновик
+    по бизнес-правилу содержит оба ресурса — @ProtocolGEbot разрешён как ресурс подвала."""
     row, prompt = _run(env, ident="krayzemlige", text=FINE_Q,
                        output=_out(primary_message="Штраф проверяют по базе. Отслеживать можно в @ProtocolGEbot, "
                                                    "полис — через @tplgee.",
                                    used_context_refs=[], evidence_strength="none"))
     resources_block = prompt.split("ALLOWED PROMOTED RESOURCES" + chr(10))[1].split(BLOCK_END)[0]
     assert "Protocol" not in resources_block and "@tplgee" in resources_block
-    assert row.status == STATUS_FAILED
+    assert row.status == STATUS_DRAFT
+    assert row.primary_text.count("@tplgee") == 1 and row.primary_text.count("@ProtocolGEbot") == 1
 
 
-def test_insurance_draft_without_required_resource_is_rejected(env):
+def test_insurance_draft_without_protocol_bot_gets_it_added_by_server(env):
+    """Не отклоняем, а гарантируем: недостающий @ProtocolGEbot добавляет сервер."""
     row, _ = _run(env, ident="VerhniyLars", text=INSURANCE_Q,
-                  output=_out(primary_message="Да, автостраховку проверяет грузинская сторона. Полис можно оформить через @tplgee.",
+                  output=_out(primary_message="Цену полиса не назову, а оформить ОСАГО можно тут: @tplgee.",
                               used_context_refs=[], evidence_strength="none"))
-    assert (row.status, row.error_kind) == (STATUS_FAILED, "ai_invalid_output")
-    assert row.error == "missing_resource:@ProtocolGEbot"
+    assert row.status == STATUS_DRAFT, row.error
+    assert row.primary_text.count("@tplgee") == 1 and row.primary_text.count("@ProtocolGEbot") == 1
+    assert row.primary_text.index("@tplgee") < row.primary_text.index("@ProtocolGEbot")
 
 
 # ---- groups.yaml country ----

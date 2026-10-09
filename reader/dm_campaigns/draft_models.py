@@ -8,8 +8,20 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from reader.dm_campaigns.border import BorderPolicy, border_problem, decorate, other_checkpoint_sentences
+from reader.dm_campaigns.border import (
+    BorderPolicy,
+    border_problem,
+    cta_handles,
+    decorate,
+    other_checkpoint_sentences,
+)
 from reader.dm_campaigns.relevance import strip_side_topics
+from reader.dm_campaigns.reply_style import (
+    advertising_tone,
+    insurance_legalese,
+    tplgee_as_medical,
+    unanswered_topics,
+)
 
 EvidenceStrength = Literal["none", "single_report", "several_consistent", "contradictory"]
 
@@ -154,7 +166,7 @@ _EXPERT_LEGALESE_RE = re.compile(
     r"|по\s+грузинскому\s+законодательству",
     re.IGNORECASE,
 )
-MAX_EXPERT_SENTENCES = 3
+MAX_EXPERT_SENTENCES = 4
 
 # Медицинская страховка в ответе — только если о ней спрашивают (факты — база
 # знаний, а не чек-лист): иначе это утечка темы.
@@ -317,6 +329,18 @@ def normalize_draft(
             return DraftDecision(kind="invalid", error=f"topic_leak:{','.join(sorted(other))}")
         primary, removed = cleaned, removed | other
         follow_up = other_checkpoint_sentences(follow_up, border_policy.checkpoints)[0] or None if follow_up else None
+    if border_policy is not None:
+        # Все ЛС-кампании: ответ на КАЖДУЮ распознанную часть вопроса, @tplgee
+        # не как медстраховка, insurance — без юридического языка.
+        missed = unanswered_topics(border_policy.question_text, primary) if border_policy.question_text else ()
+        if missed:
+            return DraftDecision(kind="invalid", error=f"unanswered_user_question:{','.join(missed)}")
+        if tplgee_as_medical(primary):
+            return DraftDecision(kind="invalid", error="tplgee_as_medical")
+        if advertising_tone(primary):
+            return DraftDecision(kind="invalid", error="advertising_tone")
+        if border_policy.kind == "insurance" and insurance_legalese(primary, border_policy.question_text):
+            return DraftDecision(kind="invalid", error="insurance_legalese")
     if border_policy is not None and border_policy.expert_dynamic:
         # border_queue / fuel: без раскрытия источника, без «точно/гарантированно»
         # и (border_queue) без «спокойно» вопреки негативным сигналам.
@@ -360,7 +384,11 @@ def normalize_draft(
         if _MEDICAL_MENTION_RE.search(primary) and not _MEDICAL_INTENT_RE.search(intent_text or ""):
             return DraftDecision(kind="invalid", error="topic_leak_medical", intent=intent)
         handles = _handles(primary)
-        missing = [r for r in allowed_resources if r.strip().lstrip("@").lower() not in handles]
+        # Ресурсы подвала (@tplgee, @ProtocolGEbot) добавляет сервер — модель
+        # обязана упомянуть только остальные разрешённые (например, @ProtocolTRbot).
+        footer = {h.lstrip("@").lower() for h in cta_handles(border_policy)} if border_policy else set()
+        missing = [r for r in allowed_resources
+                   if r.strip().lstrip("@").lower() not in handles and r.strip().lstrip("@").lower() not in footer]
         if missing:
             return DraftDecision(kind="invalid", error=f"missing_resource:{','.join(missing[:5])}")
 
