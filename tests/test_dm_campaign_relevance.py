@@ -242,7 +242,10 @@ def test_future_promise_gets_one_repair_and_is_fixed(env):
     _run(env, service)
     row = env[1].get(oid)
     # маршрут по России (М4) — приветствие есть, грузинского подвала нет
-    assert (row.status, row.primary_text) == (STATUS_DRAFT, "Здравствуйте! По М4 заправки есть, 95-й лучше брать заранее.")
+    from _dm_reply_helpers import footer
+
+    assert (row.status, row.primary_text) == (
+        STATUS_DRAFT, f"Здравствуйте! По М4 заправки есть, 95-й лучше брать заранее. {footer(oid, 'Где заправиться 95-м по М4?')}")
     assert len(service.generation_inputs) == 2 and "ПРЕДЫДУЩИЙ ЧЕРНОВИК ОТКЛОНЁН" in service.generation_inputs[1]
 
 

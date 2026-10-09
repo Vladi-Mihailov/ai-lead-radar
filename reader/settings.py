@@ -1,6 +1,6 @@
 import os
 import re
-from datetime import time
+from datetime import date, time
 from pathlib import Path
 
 import yaml
@@ -356,6 +356,9 @@ class DmOutreachSettings(BaseModel):
     # от этого не зависит.
     recipient_cooldown_days: float = Field(default=7, gt=0)
     sender_daily_cap: int | None = Field(default=None, ge=0, le=1000)
+    # Дата последнего личного оформления через @tplgee (факт от оператора): из
+    # неё считается «я вчера / позавчера / несколько дней назад оформлял».
+    tplgee_purchase_date: date = date(2026, 10, 5)
 
 
 class Settings(BaseModel):

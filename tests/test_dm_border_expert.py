@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import pytest
+from _dm_reply_helpers import footer
 from test_dm_campaign_relevance import Service, _draft
 from test_dm_shared_intent_gate import T0, _run, env  # noqa: F401  (env — fixture)
 
@@ -71,7 +72,7 @@ def test_a_323_lars_open_and_road_is_an_expert_border_draft(env):
     assert (audit["final_intent"], audit["campaign_relevant"]) == ("QUESTION", True)
     assert audit["border"] == {"checkpoints": ["lars"], "negative_signals": [], "greeting": "Добрый вечер!", "cta": True}
     text = row.primary_text
-    assert text == f"Добрый вечер! {CALM} {TPLGEE_LINE}\n{PROTOCOL_GE_LINE}"
+    assert text == f"Добрый вечер! {CALM} {footer(oid, Q323)}"
     assert "@tplgee" in text and "@ProtocolGEbot" in text
     assert not any(bad in text.lower() for bad in DISCLOSURE)
     assert "Сарпи" not in text and "Вале" not in text
@@ -115,8 +116,8 @@ def test_c_road_question_in_reply_about_lars_is_relevant(env):
     _run(env, Service("QUESTION", _draft("Проезд через Ларс сейчас нормальный.")))
     audit = _audit(env, oid)
     assert audit["campaign_relevant"] is True and audit["border"]["checkpoints"] == ["lars"]
-    # продолжение разговора без приветствия USER — без навязанного «Здравствуйте!»
-    assert env[1].get(oid).primary_text.startswith("Проезд через Ларс сейчас нормальный.")
+    # каждый ЛС начинается с приветствия — и продолжение ветки тоже
+    assert env[1].get(oid).primary_text.startswith("Здравствуйте! Проезд через Ларс сейчас нормальный.")
 
 
 def test_route_and_fuel_talk_in_lars_chat_stays_not_border():
@@ -230,14 +231,17 @@ def test_other_checkpoint_sentence_is_removed():
     assert "Сарпи" not in decision.primary_message and decision.removed_side_topics == ("Сарпи",)
 
 
-def test_sarpi_to_turkey_gets_no_georgian_cross_sell(env):
+def test_sarpi_to_turkey_also_gets_both_resources(env):
+    """Бизнес-правило (2026-10-09): оба ресурса — в КАЖДОМ готовом черновике
+    insurance / fuel / border_queue, в т.ч. «Сарпи в сторону Турции»."""
     _buffer(env, 450, "Сарпи прошли за час", chat="sarpi_ge", chat_id=-1002, sender=907)
-    oid = _insert(env, "Сарпи открыт в сторону Турции?", chat="sarpi_ge", msg_id=451)
+    source = "Сарпи открыт в сторону Турции?"
+    oid = _insert(env, source, chat="sarpi_ge", msg_id=451)
     _run(env, Service("QUESTION", _draft("Сарпи работает, критичных очередей сейчас нет.")))
     row = env[1].get(oid)
-    assert row.status == STATUS_DRAFT
-    assert "@tplgee" not in row.primary_text and "@ProtocolGEbot" not in row.primary_text
-    assert _audit(env, oid)["border"]["cta"] is False
+    assert row.status == STATUS_DRAFT, row.error
+    assert row.primary_text == f"Здравствуйте! Сарпи работает, критичных очередей сейчас нет. {footer(oid, source)}"
+    assert _audit(env, oid)["border"]["cta"] is True
 
 
 def test_model_resource_mentions_are_not_duplicated():
@@ -257,7 +261,7 @@ def test_model_resource_mentions_are_not_duplicated():
     ("Здравствуйте, как Ларс?", False, "Здравствуйте!"),
     ("Привет, как там Ларс?", False, "Привет!"),
     ("Как там Ларс?", False, "Здравствуйте!"),
-    ("А сейчас как?", True, None),
+    ("А сейчас как?", True, "Здравствуйте!"),
 ])
 def test_greeting_mirrors_user(source, continuation, greeting):
     assert greeting_for(source, continuation=continuation) == greeting

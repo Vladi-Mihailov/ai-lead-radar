@@ -454,6 +454,7 @@ def build_dm_outreach_components(
         drafting_recovery_seconds=dm.drafting_recovery_seconds,
         retention_hours=dm.recent_message_retention_hours,
         group_resource_regions={str(g.identifier): g.resource_region for g in groups},
+        tplgee_purchase_date=dm.tplgee_purchase_date,
     )
     return observer, processor, [campaign_repository, outreach_repository, recent_repository]
 
