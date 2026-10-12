@@ -22,6 +22,18 @@ _I = re.IGNORECASE
 # Дата последнего личного оформления через @tplgee (факт от оператора).
 TPLGEE_PERSONAL_PURCHASE_DATE = date(2026, 10, 5)
 
+# Цена дизеля в Грузии — утверждённый факт оператора на конкретную дату (см.
+# задачу "обновляем knowledge/style DM"). Как и TPLGEE_PERSONAL_PURCHASE_DATE,
+# хранится с updated_at рядом со значением, а не живёт анонимно в тексте
+# промпта — обновлять ОБА поля вместе, когда цена меняется.
+DIESEL_PRICE_GEL_PER_LITER = 4.6
+DIESEL_PRICE_UPDATED_AT = date(2026, 10, 12)
+
+
+def diesel_price_ru() -> str:
+    """«4,6» — русская запись через запятую, как в примерах ответа оператора."""
+    return str(DIESEL_PRICE_GEL_PER_LITER).replace(".", ",")
+
 
 def personal_when(today: date, purchased: date = TPLGEE_PERSONAL_PURCHASE_DATE) -> str:
     """«вчера» / «позавчера» / «несколько дней назад» / «недавно» / "" (давно)."""

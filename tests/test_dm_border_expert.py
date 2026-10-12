@@ -175,6 +175,24 @@ def test_d_prompt_states_business_logic_and_bans_disclosure():
         assert rule in SYSTEM_PROMPT_BORDER
 
 
+# ---------------- Regression case 1 (см. задачу "обновляем knowledge/style
+# DM"): прямой ответ по очереди без вводной фразы о статусе перехода ----------------
+
+
+def test_d_queue_specific_answer_passes_without_open_status_preamble():
+    """«Большая очередь на прохождение таможни?» — ответ сразу про очередь, "
+    без обязательной фразы «Верхний Ларс открыт» и без аббревиатуры «КПП»."""
+    decision = _norm("Сейчас со стороны России очередь примерно два часа.", LARS_CALM)
+    assert decision.kind == "draft"
+    assert "КПП" not in decision.primary_message
+
+
+def test_d_prompt_requires_natural_wording_and_conditional_open_status():
+    for rule in ("не используй аббревиатуру «КПП»", "ТОЛЬКО если USER явно спросил, открыт ли переход",
+                 "«российская сторона», «грузинская сторона»", "без вводной фразы о том, что переход открыт"):
+        assert rule in SYSTEM_PROMPT_BORDER
+
+
 # ---------------- E: есть реальный сигнал ----------------
 
 

@@ -145,15 +145,49 @@ _EXPERT_CLARIFY_RE = re.compile(
 )
 
 
-# Утверждения, которые бизнес отозвал как неподтверждённые ("на практике
-# не проверяют", момент/место оформления штрафа): модель могла взять их из
-# сообщений группы — такой черновик отклоняется.
-_EXPERT_RETRACTED_RE = re.compile(
-    r"(?:на\s+практике|пока|никогда|обычно|сейчас)\s+(?:\w+\s+){0,2}не\s+(?:проверя|спрашива|смотр)"
-    r"|при\s+выезде\s+(?:\w+\s+){0,3}(?:оформля|выписыва|наклад)\w*\s+штраф"
+# Утверждения, которые бизнес отозвал как неподтверждённые (момент/место
+# оформления штрафа): модель могла взять их из сообщений группы — такой
+# черновик отклоняется.
+# ИСКЛЮЧЕНИЕ (см. задачу "обновляем knowledge/style DM" + правку после review
+# "Medical-insurance exception APPROVED... исправить EXIT guard",
+# SYSTEM_PROMPT_EXPERT правило 3c): "штраф за отсутствие АВТОстраховки
+# оформляют при выезде" — теперь утверждённый факт оператора (кто и когда
+# оформляет именно ЭТОТ штраф), а не непроверенное утверждение из группы.
+# Любой ДРУГОЙ штраф/нарушение (не связанный со страховкой) по-прежнему
+# считается отозванным утверждением о моменте/месте оформления — защита не
+# менялась.
+_EXPERT_RETRACTED_FINE_TIMING_RE = re.compile(
+    r"при\s+выезде\s+(?:\w+\s+){0,3}(?:оформля|выписыва|наклад)\w*\s+штраф"
     r"|штраф\w*\s+(?:\w+\s+){0,3}(?:оформля|выписыва)\w*\s+при\s+выезде",
     re.IGNORECASE,
 )
+_INSURANCE_TOPIC_RE = re.compile(r"страховк", re.IGNORECASE)
+# "На практике не проверяют/не спрашивают" — раньше тоже было отозванным
+# утверждением (модель могла взять его из сообщений группы). ИСКЛЮЧЕНИЕ (см.
+# задачу "обновляем knowledge/style DM", SYSTEM_PROMPT_EXPERT правило 3a):
+# для МЕДИЦИНСКОЙ страховки это теперь сам утверждённый факт оператора, а не
+# непроверенное утверждение — больше не отклоняется. Для автостраховки и
+# любых других тем эта защита не менялась: такая фраза без упоминания
+# медстраховки по-прежнему считается отозванным утверждением.
+_EXPERT_RETRACTED_PRACTICE_RE = re.compile(
+    r"(?:на\s+практике|пока|никогда|обычно|сейчас)\s+(?:\w+\s+){0,2}не\s+(?:проверя|спрашива|смотр)",
+    re.IGNORECASE,
+)
+_MEDICAL_INSURANCE_TOPIC_RE = re.compile(r"мед\w*\.?\s*страх|медстрах|медицинск\w*\s+страх", re.IGNORECASE)
+
+
+def _retracted_claim(text: str) -> bool:
+    if _EXPERT_RETRACTED_FINE_TIMING_RE.search(text):
+        # "страховк" matches both "автостраховка" and "медстраховка" — the
+        # exit-fine exemption is AUTO-insurance-only (см. правило 3c), so a
+        # medical-flavored claim must still be rejected despite containing
+        # "страховк" as a substring of "медстраховка".
+        is_approved_auto_insurance_exit_fact = (
+            _INSURANCE_TOPIC_RE.search(text) and not _MEDICAL_INSURANCE_TOPIC_RE.search(text)
+        )
+        if not is_approved_auto_insurance_exit_fact:
+            return True
+    return bool(_EXPERT_RETRACTED_PRACTICE_RE.search(text)) and not _MEDICAL_INSURANCE_TOPIC_RE.search(text)
 
 
 # Стиль живого менеджера: тяжёлые юридические обороты из фактов и раздутые
@@ -229,7 +263,7 @@ def _has_substance(sentence: str) -> bool:
 def _expert_problem(text: str) -> str | None:
     if _EXPERT_HEDGING_RE.search(text):
         return "expert_hedging_or_group_reference"
-    if _EXPERT_RETRACTED_RE.search(text):
+    if _retracted_claim(text):
         return "unapproved_claim"
     if _EXPERT_CLARIFY_RE.search(text):
         return "unnecessary_clarification"
