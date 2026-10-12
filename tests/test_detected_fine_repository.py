@@ -337,10 +337,12 @@ def test_mark_notification_sent_updates_notification_sent_at(tmp_path):
 
 
 def test_create_with_notification_sent_at_pre_set_is_invisible_to_pending(tmp_path):
-    """"fine check-all" silent scan (см. задачу "add silent Georgia full
-    database check command") — create(notification_sent_at=<now>) должен
-    сделать строку невидимой для list_pending_notifications() СРАЗУ, без
-    отдельного вызова mark_notification_sent()."""
+    """Низкоуровневая repository-возможность (см. задачу "Fix Georgia fine
+    notifications" — текущий код сознательно НЕ вызывает create() с
+    notification_sent_at != None ни в одном месте, см.
+    reader/fines/check_service.py) — create(notification_sent_at=<now>)
+    должен сделать строку невидимой для list_pending_notifications() СРАЗУ,
+    без отдельного вызова mark_notification_sent()."""
     db_path = tmp_path / "users.db"
     task_id = _make_task(tmp_path, db_path)
 
