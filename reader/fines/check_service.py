@@ -2,9 +2,15 @@
 про Telegram/Scheduler/CommandDispatcher/конкретный сайт-источник — только
 FineProvider (интерфейс) и оба Repository. Сам никогда не отправляет
 уведомления (это ответственность FineNotificationCoordinator, используется
-FineJob и FineCommand) — notification_policy (см. NotificationPolicy ниже)
-влияет ТОЛЬКО на то, чем НОВАЯ detected_fines-строка рождается
-(notification_sent_at NULL vs уже проставлен), не на сам факт отправки.
+FineJob и FineCommand) — каждая новая detected_fines-строка рождается с
+notification_sent_at=NULL, независимо от того, какой вызывающий код привёл
+к её созданию (мониторинг, manual "Проверить сейчас", Add Car, manager
+mass refresh или "fine check-all") — все штрафы попадают в единый
+FineNotificationCoordinator.flush_pending() одинаково (см. задачу "Fix
+Georgia fine notifications": ранее здесь существовал notification_policy
+с веткой "silent", которой "fine check-all" подавлял именно эту
+доставку — этот механизм удалён как единственный известный gap в
+notification pipeline).
 
 Перевод грузинского place/violation_description на русский (см.
 reader/fines/translation.py) — тоже единственная точка: и background
@@ -21,7 +27,7 @@ import sqlite3
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from typing import Literal, Protocol
+from typing import Protocol
 
 from reader.fines.detected_fine_repository import DetectedFineRepository
 from reader.fines.models import (
@@ -51,20 +57,6 @@ logger = logging.getLogger(__name__)
 # защитный технический таймаут одного provider-запроса, а не бизнес-
 # параметр расписания.
 _ZERO_CONFIRMATION_DELAY_SECONDS = 5.0
-
-# "fine check-all" (см. задачу "add silent Georgia full database check
-# command") — "normal" (default) сохраняет ВСЕ существующие вызывающие коды
-# бит в бит (новая detected_fines-строка рождается с notification_sent_at
-# NULL — обычная semantics "ждёт уведомления"). "silent" — ТОЛЬКО для
-# технического maintenance-скана: новая строка рождается С УЖЕ
-# проставленным notification_sent_at (см. _finalize() ниже) — поэтому
-# list_pending_notifications() (см. reader/fines/detected_fine_repository.py)
-# никогда её не увидит, без единого изменения в FineNotificationCoordinator/
-# NotificationFlushJob. Уже известные штрафы (mark_seen(), не create())
-# полностью не затрагиваются этим параметром в любом случае — mark_seen()
-# никогда не трогает notification_sent_at (см. reader/fines/
-# detected_fine_repository.py).
-NotificationPolicy = Literal["normal", "silent"]
 
 
 def _elapsed_ms(started_at: float) -> int:
@@ -187,22 +179,13 @@ class FineCheckService:
             result.violation_description_ru if needs_description else existing_violation_description_ru,
         )
 
-    async def check_task(
-        self, task: FineMonitoringTask, *, notification_policy: NotificationPolicy = "normal",
-    ) -> CheckResult:
+    async def check_task(self, task: FineMonitoringTask) -> CheckResult:
         """Единственный authoritative check path (см. задачу "manager
         Statistics / refresh для обоих ботов" п.11 и задачу "guard Georgia
         debt against false zero results") — вызывается мониторингом,
-        manual "Проверить сейчас", Add Car и manager mass refresh
-        одинаково, поэтому false-zero guard ниже защищает ВСЕ эти пути
-        разом, без отдельной реализации в каждом из них.
-
-        notification_policy — "normal" (default, см. NotificationPolicy
-        выше) для ВСЕХ существующих вызывающих кодов без изменений;
-        "silent" — ТОЛЬКО для "fine check-all" (см. задачу "add silent
-        Georgia full database check command"), прокидывается в _finalize()
-        без какого-либо влияния на false-zero guard ниже (это два
-        полностью независимых измерения одного и того же вызова).
+        manual "Проверить сейчас", Add Car, manager mass refresh и "fine
+        check-all" одинаково, поэтому false-zero guard ниже защищает ВСЕ
+        эти пути разом, без отдельной реализации в каждом из них.
 
         False-zero guard: police.ge подтверждённо может вернуть технически
         валидный success:true с пустым/усечённым results под нагрузкой (см.
@@ -244,14 +227,10 @@ class FineCheckService:
         # Snapshot принятого результата — ДО медленной обработки штрафов
         # (перевод/detected_fines), см. _persist_snapshot.
         self._persist_snapshot(task, records)
-        return await self._finalize(task, records, started_at, notification_policy=notification_policy)
+        return await self._finalize(task, records, started_at)
 
     async def check_plate_for_tasks(
-        self,
-        car_number: str,
-        tasks: list[FineMonitoringTask],
-        *,
-        notification_policy: NotificationPolicy = "normal",
+        self, car_number: str, tasks: list[FineMonitoringTask],
     ) -> dict[int, CheckResult]:
         """См. задачу "Georgia debt deduplication by physical car_number" —
         когда НЕСКОЛЬКО fine_monitoring_tasks делят один и тот же
@@ -311,7 +290,7 @@ class FineCheckService:
             self._persist_snapshot(task, records)
 
         return {
-            task.id: await self._finalize(task, records, started_at, notification_policy=notification_policy)
+            task.id: await self._finalize(task, records, started_at)
             for task in tasks
         }
 
@@ -416,12 +395,7 @@ class FineCheckService:
         )
 
     async def _finalize(
-        self,
-        task: FineMonitoringTask,
-        records: list[ParsedFineRecord],
-        started_at: float,
-        *,
-        notification_policy: NotificationPolicy = "normal",
+        self, task: FineMonitoringTask, records: list[ParsedFineRecord], started_at: float,
     ) -> CheckResult:
         """records — ФИНАЛЬНЫЙ, уже решённый набор (см. check_task()) — эта
         часть ВСЕГДА выполняется РОВНО ОДИН раз за вызов check_task(),
@@ -432,13 +406,10 @@ class FineCheckService:
         применяется к уже подтверждённому results, а не к первому попавшемуся
         ответу provider'а.
 
-        notification_policy="silent" (см. NotificationPolicy) влияет
-        ТОЛЬКО на ветку create() ниже (генуинно НОВЫЙ fingerprint) — уже
-        известные штрафы (mark_seen()) не создают notification в любом
-        случае, этот параметр для них буквально ничего не значит."""
-        silent_notification_sent_at = (
-            datetime.now(timezone.utc) if notification_policy == "silent" else None
-        )
+        Каждый генуинно НОВЫЙ fingerprint (ветка create() ниже) рождается с
+        notification_sent_at=NULL — единое поведение для всех вызывающих
+        кодов (см. модульный докстрок). Уже известные штрафы (mark_seen())
+        никогда не создают notification независимо от этого."""
         new_fines: list[NewFineEvent] = []
         # ВСЕ штрафы этой проверки (новые и уже известные) — для manual
         # "Проверить сейчас" (см. CheckResult.current_fines). Фоновый
@@ -502,7 +473,6 @@ class FineCheckService:
                     violation_description=record.violation_description,
                     place_ru=place_ru,
                     violation_description_ru=violation_description_ru,
-                    notification_sent_at=silent_notification_sent_at,
                 )
             except sqlite3.IntegrityError:
                 # Конкурентная вставка между get_by_fingerprint() и create() —

@@ -317,15 +317,16 @@ class DetectedFineRepository:
         violation_description_ru: str | None = None,
         notification_sent_at: datetime | None = None,
     ) -> DetectedFine:
-        """notification_sent_at — по умолчанию None (NULL), ПОЛНОСТЬЮ
-        сохраняет прежнее поведение всех существующих вызывающих кодов
-        (см. list_pending_notifications() — "новый штраф ждёт уведомления").
-        Передаётся НЕ-None ИСКЛЮЧИТЕЛЬНО "тихим" maintenance-сканом (см.
-        задачу "add silent Georgia full database check command" —
-        FineCheckService.check_task(..., notification_policy="silent")) —
-        строка тогда с рождения невидима для list_pending_notifications()
-        (WHERE notification_sent_at IS NULL), без единого изменения в
-        FineNotificationCoordinator/NotificationFlushJob."""
+        """notification_sent_at — по умолчанию None (NULL): "новый штраф
+        ждёт уведомления" (см. list_pending_notifications()). Все
+        вызывающие коды в проекте (FineCheckService._finalize(), см. задачу
+        "Fix Georgia fine notifications") используют именно это значение по
+        умолчанию — передача НЕ-None значения создаёт строку, с рождения
+        невидимую для list_pending_notifications() (WHERE
+        notification_sent_at IS NULL), без единого изменения в
+        FineNotificationCoordinator/NotificationFlushJob; это низкоуровневая
+        возможность repository, которой текущий код сознательно не
+        пользуется ни в одном вызывающем месте."""
         try:
             cursor = self._conn.execute(
                 _INSERT,

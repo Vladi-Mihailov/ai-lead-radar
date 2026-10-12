@@ -1,7 +1,11 @@
-"""Тесты "fine check-all" (@ProtocolGEbot, задача "add silent Georgia full
-database check command") — скрытая fine-admin-only maintenance-команда.
-Repository — настоящие (SQLite/tmp_path), FineProvider — scripted-фейк,
-sleep — записывающий фейк (НЕ реальные секунды)."""
+"""Тесты "fine check-all" (@ProtocolGEbot, изначально задача "add silent
+Georgia full database check command") — скрытая fine-admin-only
+maintenance-команда. С задачи "Fix Georgia fine notifications" скан больше
+НЕ "тихий": новые штрафы, найденные им, проходят через обычный
+notification pipeline (NotificationFlushJob/FineNotificationCoordinator),
+как и из любого другого источника — см. тесты ниже с префиксом "Regression
+test" в докстроке. Repository — настоящие (SQLite/tmp_path), FineProvider —
+scripted-фейк, sleep — записывающий фейк (НЕ реальные секунды)."""
 
 import sys
 from datetime import date
@@ -415,9 +419,14 @@ async def test_full_check_service_raises_when_already_in_progress_directly(tmp_p
         await fx.full_check_service.run(chat_id=_CHAT_ID)
 
 
-# ---- 19/20. technical scan sends ZERO client notifications, not pending ----
+# ---- 19/20. "Fix Georgia fine notifications": a brand-new fine found by
+# the scan is now an ORDINARY pending notification, exactly like any other
+# check path — this closes the gap where the scan used to create detected_fines
+# rows with notification_sent_at already set, invisible to
+# FineNotificationCoordinator.flush_pending() forever. ----
 
-async def test_scan_discovered_fine_is_not_pending_for_later_flush(tmp_path):
+async def test_scan_discovered_new_fine_becomes_pending_for_later_flush(tmp_path):
+    """Regression test A (см. задачу "Fix Georgia fine notifications")."""
     fx = _Fixture(tmp_path)
     fx.make_task("AA001AA")
     fx.provider.script("AA001AA", [[_fine(car_number="AA001AA", fingerprint="fp-new", amount=75)]])
@@ -425,17 +434,21 @@ async def test_scan_discovered_fine_is_not_pending_for_later_flush(tmp_path):
     await fx.send(texts.FULL_CHECK_CONFIRM_COMMAND)
 
     pending = fx.detected_fine_repository.list_pending_notifications()
-    assert pending == []
+    assert len(pending) == 1
+    assert pending[0].fingerprint == "fp-new"
+
     fine = fx.detected_fine_repository.get_by_fingerprint(
         fx.task_repository.list_all_task_ids()[0], "fp-new",
     )
     assert fine is not None
-    assert fine.notification_sent_at is not None
+    assert fine.notification_sent_at is None
 
 
-# ---- 21. running NotificationFlushJob-equivalent after scan sends nothing ----
-
-async def test_flush_pending_after_scan_sends_nothing_for_scan_created_fine(tmp_path):
+async def test_flush_pending_after_scan_delivers_scan_created_fine_once(tmp_path):
+    """Regression test B — NotificationFlushJob/FineNotificationCoordinator
+    now picks up a scan-discovered fine exactly like any other source, sends
+    it to the operator exactly once, and sets notification_sent_at
+    afterward (no re-send on a later flush)."""
     fx = _Fixture(tmp_path)
     fx.make_task("AA001AA")
     fx.provider.script("AA001AA", [[_fine(car_number="AA001AA", fingerprint="fp-new", amount=75)]])
@@ -448,11 +461,105 @@ async def test_flush_pending_after_scan_sends_nothing_for_scan_created_fine(tmp_
     )
     result = await coordinator.flush_pending()
 
+    assert len(notification_service.notify_calls) == 1
+    assert len(notification_service.notify_calls[0]) == 1
+    assert notification_service.notify_calls[0][0].external_fine_id == "fp-new"
+    assert result.delivered_event_ids
+
+    fine = fx.detected_fine_repository.get_by_fingerprint(
+        fx.task_repository.list_all_task_ids()[0], "fp-new",
+    )
+    assert fine.notification_sent_at is not None
+
+    # A later flush finds nothing new to send — no duplicate.
+    second_result = await coordinator.flush_pending()
+    assert len(notification_service.notify_calls) == 1  # still just the one call
+    assert second_result.delivered_event_ids == []
+
+
+async def test_scan_rediscovering_already_known_fine_sends_no_duplicate_notification(tmp_path):
+    """Regression test C — a fine already known (and already delivered)
+    before this scan is reached via mark_seen(), never re-queued, and never
+    re-sent, regardless of how many times "fine check-all" re-discovers it."""
+    fx = _Fixture(tmp_path)
+    task = fx.make_task("AA001AA")
+    fx.provider.script("AA001AA", [[_fine(car_number="AA001AA", fingerprint="fp-known", amount=50)]])
+    await fx.check_service.check_task(task)  # ordinary path creates+queues it
+
+    notification_service = _FakeNotificationService()
+    coordinator = FineNotificationCoordinator(
+        fx.detected_fine_repository, fx.task_repository, notification_service,
+    )
+    await coordinator.flush_pending()  # operator already notified once
+    delivered = fx.detected_fine_repository.get_by_fingerprint(task.id, "fp-known")
+    assert delivered.notification_sent_at is not None
+    notification_service.notify_calls.clear()
+
+    # "fine check-all" re-discovers the SAME fine later.
+    fx.provider.script("AA001AA", [[_fine(car_number="AA001AA", fingerprint="fp-known", amount=50)]])
+    await fx.send(texts.FULL_CHECK_CONFIRM_COMMAND)
+
+    all_rows = fx.detected_fine_repository.list_by_car_number("AA001AA")
+    assert len(all_rows) == 1  # никакого дубликата — тот же (task_id, fingerprint)
+    assert all_rows[0].notification_sent_at == delivered.notification_sent_at  # mark_seen не трогает поле
+
+    assert fx.detected_fine_repository.list_pending_notifications() == []
+    flush_result = await coordinator.flush_pending()
     assert notification_service.notify_calls == []
-    assert result.delivered_event_ids == []
+    assert flush_result.delivered_event_ids == []
 
 
-# ---- 22. later genuinely new fine found by ordinary monitoring DOES notify ----
+async def test_scan_two_new_fines_for_same_car_both_delivered_without_duplicates(tmp_path):
+    """Regression test D — multiple genuinely new fines found for the same
+    car in one scan all become pending and are all delivered by a single
+    flush, with no duplicate sends."""
+    fx = _Fixture(tmp_path)
+    fx.make_task("AA001AA")
+    fx.provider.script("AA001AA", [[
+        _fine(car_number="AA001AA", fingerprint="fp-1", amount=50),
+        _fine(car_number="AA001AA", fingerprint="fp-2", amount=30),
+    ]])
+
+    await fx.send(texts.FULL_CHECK_CONFIRM_COMMAND)
+
+    pending = fx.detected_fine_repository.list_pending_notifications()
+    assert {fine.fingerprint for fine in pending} == {"fp-1", "fp-2"}
+
+    notification_service = _FakeNotificationService()
+    coordinator = FineNotificationCoordinator(
+        fx.detected_fine_repository, fx.task_repository, notification_service,
+    )
+    result = await coordinator.flush_pending()
+
+    assert len(notification_service.notify_calls) == 1  # one batched call
+    assert {e.external_fine_id for e in notification_service.notify_calls[0]} == {"fp-1", "fp-2"}
+    assert set(result.delivered_event_ids) == {fine.id for fine in pending}
+
+    second_result = await coordinator.flush_pending()
+    assert len(notification_service.notify_calls) == 1  # no duplicate second send
+    assert second_result.delivered_event_ids == []
+
+
+async def test_suppressed_plate_fine_never_becomes_pending_even_if_row_predates_denylist(tmp_path):
+    """Regression test I — suppression behavior is unchanged: a suppressed
+    car_number is never even checked by "fine check-all" (see
+    test_full_check_skips_suppressed_plate_without_calling_provider), and
+    FineNotificationCoordinator.flush_pending() independently excludes any
+    suppressed car_number from the pending list regardless of which code
+    path created the row — this fix does not bypass either guard."""
+    fx = _Fixture(tmp_path)
+    fx.make_task("O687KE761")  # denylisted, see reader/fines/suppression.py
+    fx.provider.script("O687KE761", [[_fine(car_number="O687KE761", fingerprint="fp-canary", amount=999)]])
+
+    await fx.send(texts.FULL_CHECK_CONFIRM_COMMAND)
+
+    assert fx.provider.requested_plates == []  # never even checked
+    assert fx.detected_fine_repository.list_by_car_number("O687KE761") == []
+    assert fx.detected_fine_repository.list_pending_notifications() == []
+
+
+# ---- later genuinely new fine found by ordinary monitoring also notifies,
+# alongside the (now also pending) scan-discovered fine ----
 
 async def test_later_genuine_fine_from_ordinary_monitoring_still_notifies(tmp_path):
     fx = _Fixture(tmp_path)
@@ -460,8 +567,17 @@ async def test_later_genuine_fine_from_ordinary_monitoring_still_notifies(tmp_pa
     fx.provider.script("AA001AA", [[_fine(car_number="AA001AA", fingerprint="fp-scan", amount=75)]])
     await fx.send(texts.FULL_CHECK_CONFIRM_COMMAND)
 
-    # Regular monitoring (default notification_policy="normal") later finds
-    # a genuinely NEW fine (different fingerprint) for the same task.
+    # The scan-discovered fine is now ALSO pending (see test A above) — flush
+    # it first so this test can isolate the later, ordinary-monitoring fine.
+    notification_service = _FakeNotificationService()
+    coordinator = FineNotificationCoordinator(
+        fx.detected_fine_repository, fx.task_repository, notification_service,
+    )
+    await coordinator.flush_pending()
+    notification_service.notify_calls.clear()
+
+    # Regular monitoring later finds a genuinely NEW fine (different
+    # fingerprint) for the same task.
     fx.provider.script("AA001AA", [[
         _fine(car_number="AA001AA", fingerprint="fp-scan", amount=75),
         _fine(car_number="AA001AA", fingerprint="fp-genuine-new", amount=30),
@@ -473,10 +589,6 @@ async def test_later_genuine_fine_from_ordinary_monitoring_still_notifies(tmp_pa
     assert len(pending) == 1
     assert pending[0].fingerprint == "fp-genuine-new"
 
-    notification_service = _FakeNotificationService()
-    coordinator = FineNotificationCoordinator(
-        fx.detected_fine_repository, fx.task_repository, notification_service,
-    )
     flush_result = await coordinator.flush_pending()
     assert len(notification_service.notify_calls) == 1
     assert len(notification_service.notify_calls[0]) == 1
@@ -484,7 +596,7 @@ async def test_later_genuine_fine_from_ordinary_monitoring_still_notifies(tmp_pa
     assert flush_result.delivered_event_ids
 
 
-# ---- 23. latest-state correctly updates from scan ----
+# ---- latest-state correctly updates from scan ----
 
 async def test_latest_state_updates_from_scan(tmp_path):
     fx = _Fixture(tmp_path)
@@ -496,22 +608,6 @@ async def test_latest_state_updates_from_scan(tmp_path):
     updated = fx.task_repository.get(task.id)
     assert updated.last_successful_total_amount == 120
     assert updated.last_successful_checked_at is not None
-
-
-# ---- 24. detected_fines dedup remains correct ----
-
-async def test_detected_fines_dedup_unaffected_by_silent_scan(tmp_path):
-    fx = _Fixture(tmp_path)
-    task = fx.make_task("AA001AA")
-    fx.provider.script("AA001AA", [[_fine(car_number="AA001AA", fingerprint="fp-a", amount=50)]])
-    await fx.check_service.check_task(task)  # normal (pre-existing) detection
-
-    fx.provider.script("AA001AA", [[_fine(car_number="AA001AA", fingerprint="fp-a", amount=50)]])
-    await fx.send(texts.FULL_CHECK_CONFIRM_COMMAND)
-
-    all_rows = fx.detected_fine_repository.list_by_car_number("AA001AA")
-    assert len(all_rows) == 1  # никакого дубликата — тот же (task_id, fingerprint)
-    assert all_rows[0].notification_sent_at is None  # уже известный, mark_seen не трогает поле
 
 
 # ---- progress reporting sanity ----

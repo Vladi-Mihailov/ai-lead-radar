@@ -7,16 +7,17 @@ check здесь нет, ни дублирования false-zero guard (та з
 ИСКЛЮЧИТЕЛЬНО внутри check_task(), см. reader/fines/check_service.py, и
 работает одинаково независимо от того, кто его вызывает).
 
-notification_policy="silent" (см. reader/fines/check_service.py::
-NotificationPolicy) — штрафы, впервые обнаруженные ИМЕННО этим сканом,
-рождаются с уже проставленным notification_sent_at и поэтому никогда не
-попадут в FineNotificationCoordinator.flush_pending() — ни сейчас, ни
-позже. Обычный мониторинг (FineJob/ClientFineJob/manual "Проверить
-сейчас") продолжает работать штатно (notification_policy="normal" по
-умолчанию) — генуинно новый штраф, найденный ПОСЛЕ этого скана, создаёт
-свою собственную detected_fines-строку (дедуп — (monitoring_task_id,
-fingerprint)) с обычным notification_sent_at=NULL и будет доставлен как
-всегда.
+Штрафы, впервые обнаруженные этим сканом, проходят через check_task() с
+ЕГО ОБЫЧНЫМ notification-поведением (см. задачу "Fix Georgia fine
+notifications" — ранее здесь использовался notification_policy="silent",
+из-за чего такие штрафы никогда не попадали в
+FineNotificationCoordinator.flush_pending(); это был единственный
+известный gap в едином notification pipeline и он устранён: теперь
+detected_fines-строка рождается с notification_sent_at=NULL, как и у
+любого другого вызывающего кода, и будет доставлена оператору
+NotificationFlushJob'ом на одном из следующих тиков, как обычно). Уже
+известные штрафы (mark_seen(), не create()) по-прежнему не создают
+никакого notification — это не менялось.
 
 Прогресс — ОДНО сообщение, периодически редактируемое (см.
 ProgressSenderLike) — НЕ отдельное сообщение на каждую машину и НИКОГДА не
@@ -146,11 +147,12 @@ class FullCheckService:
                     # счётчик итогового summary.
                     continue
 
-                # notification_policy="silent" — ЕДИНСТВЕННОЕ отличие от
-                # обычного вызова (см. задачу п.4/п.5 и reader/fines/
-                # check_service.py::NotificationPolicy) — false-zero guard
-                # внутри check_task() работает совершенно одинаково.
-                result = await self._check_service.check_task(task, notification_policy="silent")
+                # Обычный check_task() вызов — без какого-либо специального
+                # notification-поведения (см. модульный докстрок про задачу
+                # "Fix Georgia fine notifications"): новый штраф получает
+                # notification_sent_at=NULL и будет доставлен оператору
+                # NotificationFlushJob'ом, как и из любого другого источника.
+                result = await self._check_service.check_task(task)
                 if result.status == "error":
                     failed += 1
                     failed_car_numbers.append(task.car_number)
