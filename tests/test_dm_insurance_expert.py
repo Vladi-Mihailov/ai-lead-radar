@@ -232,6 +232,66 @@ def test_border_queue_uses_border_prompt_end_to_end(env):
     assert row.status == STATUS_DRAFT and service.instructions == [SYSTEM_PROMPT_BORDER]
 
 
+# ---------------- Regression cases 2/5/6/7 (см. задачу "обновляем
+# knowledge/style DM") — новые утверждённые факты проходят end-to-end ----------------
+
+
+def test_medical_insurance_check_practice_fact_passes_end_to_end(env):
+    row, _ = _process(
+        env, key="insurance", text="Проверяют ли медстраховку на границе?",
+        primary="Да, медстраховка обязательна с 1 января 2026 года, но на практике сейчас её обычно "
+                "не спрашивают.",
+    )
+    assert row.status == STATUS_DRAFT
+
+
+def test_vale_online_auto_insurance_fact_passes_end_to_end(env):
+    row, _ = _process(
+        env, key="insurance", text="На Вале же можно страховку онлайн показать?",
+        primary="Да, на Вале страховку можно показать онлайн. Оформить её можно через @tplgee, "
+                "а штрафы по Грузии проверять через @ProtocolGEbot.",
+    )
+    assert row.status == STATUS_DRAFT
+
+
+def test_insurance_checked_on_exit_fact_passes_end_to_end(env):
+    row, _ = _process(
+        env, key="insurance", text="А при выезде из Грузии страховку на машину спрашивают обычно?",
+        primary="Да, при выезде страховку на машину проверяют. Если её нет — штраф 100 лари, его "
+                "оформляют прямо на границе. Если страховка ещё не сделана — оформить можно через "
+                "@tplgee, штрафы по Грузии проверять через @ProtocolGEbot.",
+    )
+    assert row.status == STATUS_DRAFT
+
+
+def test_tbank_medical_insurance_fact_passes_end_to_end(env):
+    row, _ = _process(
+        env, key="insurance", text="Можно ли через Т-Банк сделать медстраховку?",
+        primary="Да, медстраховку можно оформить через Т-Банк или Сбер.",
+    )
+    assert row.status == STATUS_DRAFT
+
+
+def test_tbank_auto_insurance_redirects_to_tplgee_not_bank_app(env):
+    row, _ = _process(
+        env, key="insurance", text="Можно ли через приложение Т-Банк или Сбер сделать страховку на авто в Грузию?",
+        primary="Автостраховку для Грузии проще оформить онлайн через @tplgee. Если её нет — штраф 100 "
+                "лари. Штрафы по Грузии можно проверять через @ProtocolGEbot.",
+    )
+    assert row.status == STATUS_DRAFT
+
+
+def test_new_insurance_facts_are_in_prompt():
+    for rule in (
+        "медицинская страховка обязательна с 1 января 2026 года",
+        "автостраховку можно показать онлайн на любом",
+        "при выезде из Грузии наличие автостраховки проверяют",
+        "через приложения российских банков, включая Т-Банк и Сбер",
+        "АВТОстраховку через банковские приложения НЕ утверждай",
+    ):
+        assert rule in SYSTEM_PROMPT_EXPERT
+
+
 def test_expert_mode_drops_non_message_refs_instead_of_rejecting():
     """Реальный ответ модели (dry-run): в used_context_refs попали названия
     секций — в экспертном режиме они отбрасываются, черновик сохраняется."""
@@ -259,8 +319,6 @@ def test_expert_prompt_requires_resources_in_every_answer_and_short_answers():
 
 
 @pytest.mark.parametrize("bad", [
-    "Медстраховка обязательна, но на практике её не проверяют. Полис — через @tplgee, штрафы — @ProtocolGEbot.",
-    "Медстраховку пока не проверяют. Полис — через @tplgee, штрафы — @ProtocolGEbot.",
     "Страховку никогда не спрашивают. Полис — через @tplgee, штрафы — @ProtocolGEbot.",
     "При выезде из Грузии оформляют штраф 100 лари. Полис — через @tplgee, штрафы — @ProtocolGEbot.",
     "Штраф 100 лари оформляют при выезде. Полис — через @tplgee, штрафы — @ProtocolGEbot.",
@@ -269,9 +327,55 @@ def test_retracted_claims_are_rejected(bad):
     assert _norm(bad).error == "unapproved_claim"
 
 
+@pytest.mark.parametrize("now_approved", [
+    "Медстраховка обязательна, но на практике её не проверяют. Полис — через @tplgee, штрафы — @ProtocolGEbot.",
+    "Медстраховку пока не проверяют. Полис — через @tplgee, штрафы — @ProtocolGEbot.",
+])
+def test_medical_insurance_practice_claim_is_no_longer_retracted(now_approved):
+    """Regression (см. задачу "обновляем knowledge/style DM", правило 3a):
+    "на практике не проверяют" для МЕДСТРАХОВКИ конкретно — теперь
+    утверждённый факт оператора, не отозванное утверждение из группы. Для
+    автостраховки/прочих тем (см. test_retracted_claims_are_rejected выше)
+    защита не изменилась."""
+    assert _norm(now_approved, intent_text="Проверяют ли медстраховку?").kind == "draft"
+
+
 def test_approved_russian_side_wording_passes():
     """Разрешённая формулировка про российскую сторону — не «отозванное утверждение»."""
     assert _norm(TARGET_ANSWERS[2]).kind == "draft"
+
+
+# ---------------- Exit-fine guard: узкое исключение ТОЛЬКО для approved
+# AUTO-insurance exit fact (см. правку после review "Medical-insurance
+# exception APPROVED... исправить EXIT guard") ----------------
+
+
+def test_auto_insurance_exit_fact_phrasing_is_allowed():
+    """Буквальный пример из задачи — не триггерит сам fine-timing regex, но
+    закрепляем как regression, что эта формулировка пропускается."""
+    text = ("При выезде страховку проверяют, если нет — штраф 100 лари. Полис — через @tplgee, "
+            "штрафы — @ProtocolGEbot.")
+    assert _norm(text).kind == "draft"
+
+
+def test_auto_insurance_exit_fact_passes_even_when_matching_fine_timing_pattern():
+    """Та же approved-факт мысль, но сформулирована так, что ДЕЙСТВИТЕЛЬНО
+    попадает под _EXPERT_RETRACTED_FINE_TIMING_RE ("при выезде ... оформляют
+    штраф") — исключение должно сработать именно здесь, не только в
+    формулировках, случайно не задевающих regex."""
+    text = ("При выезде из Грузии за отсутствие автостраховки оформляют штраф 100 лари. "
+            "Полис — через @tplgee, штрафы — @ProtocolGEbot.")
+    assert _norm(text).kind == "draft"
+
+
+def test_other_fine_timing_claims_remain_rejected():
+    for bad in (
+        "Штраф за любое нарушение оформляют при выезде. Полис — через @tplgee, штрафы — @ProtocolGEbot.",
+        "Штраф за превышение скорости оформляют при выезде. Полис — через @tplgee, штрафы — @ProtocolGEbot.",
+        ("При выезде из Грузии оформляют штраф за просроченную визу. Полис — через @tplgee, "
+         "штрафы — @ProtocolGEbot."),
+    ):
+        assert _norm(bad).error == "unapproved_claim"
 
 
 @pytest.mark.parametrize("bad", [

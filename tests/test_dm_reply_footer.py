@@ -250,6 +250,47 @@ def test_fuel_prompt_mentions_canister_only_if_asked():
     assert "ТОЛЬКО если USER сам о них спросил" in SYSTEM_PROMPT_FUEL
 
 
+# ---------------- Regression cases 3/4/8 (см. задачу "обновляем
+# knowledge/style DM") — fuel/HGS facts пройдут деterминированную проверку ----------------
+
+
+def test_fuel_canister_fact_distinguishes_official_rule_from_practice():
+    text = ("Официально — не больше 10 литров. На практике нередко провозят и больше, 20–30, иногда "
+            "50 литров, но это уже на усмотрение границы — гарантировать пропуск большего объёма нельзя.")
+    decision = _norm(text, _policy())
+    assert decision.kind == "draft"
+
+
+def test_diesel_price_direct_answer_passes():
+    decision = _norm("Дизель сейчас примерно 4,6 лари за литр.", _policy())
+    assert decision.kind == "draft"
+
+
+def test_hgs_question_mentioning_protocol_tr_passes():
+    """Regression (см. правку после review "HGS: не утверждать то, чего мы
+    не подтвердили") — approved fact только про проверку/оплату долга через
+    @ProtocolTRbot; покупка HGS на АЗС НЕ подтверждается (нет отдельного
+    approved fact)."""
+    text = ("Это уже вопрос к банку. Если уже проехали по платной дороге, задолженность можно "
+            "проверить и оплатить через @ProtocolTRbot.")
+    decision = normalize_draft(
+        _draft(text), follow_up_enabled=False, valid_refs=frozenset(), fresh_context_used=False,
+        n_distinct_senders=0, allowed_resources=RESOURCES, border_policy=_policy(cta=()),
+    )
+    assert decision.kind == "draft"
+    assert "оплатить можно и так" not in text
+
+
+def test_new_fuel_facts_are_in_prompt():
+    for rule in (
+        "официально разрешено ввезти не больше 10 литров",
+        "дизель в Грузии сейчас примерно",
+        "обязательно упомяни именно его сам",
+        "не делай его главным ресурсом турецкого вопроса",
+    ):
+        assert rule in SYSTEM_PROMPT_FUEL
+
+
 # ---------------- неподтверждённые факты ----------------
 
 CTX = "Ларс открыт, прошли за 40 минут. На М4 после Новочеркасска 95-го нет. Еду с Питера в Грузию"
