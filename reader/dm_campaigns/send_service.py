@@ -20,7 +20,15 @@ connect -> is_user_authorized -> резолв получателя ВЫБРАН�
 (username: resolve + сверка числового id; source_message: исходное
 сообщение читается самим отправителем, peer = InputPeerUserFromMessage,
 чужой access_hash не используется и не хранится) -> ОДИН send_message ->
-sent. Исходы ошибок:
+sent.
+
+Доступ к source-чату проверяется самим резолвом (без send_message и без
+проверки членства: публичный чат, который читается, подходит). Если
+отправитель не смог прочитать исходное сообщение (sender_not_in_source_chat),
+строка в том же статусе sending переписывается на следующего кандидата из
+plan() (reassign_sender) и попытка продолжается; если не смог никто —
+строка возвращается в draft с no_eligible_sender_for_source. Фолбэк только
+для этой причины. Исходы ошибок:
   - FloodWait / PeerFlood / сбой до send_message — отправки точно не было:
     строка возвращается в draft (FloodWait — пауза отправителя до времени,
     PeerFlood — отправитель блокируется до ручной проверки);
@@ -70,6 +78,8 @@ DAILY_LIMIT = "daily_limit_reached"
 SENDER_FLOOD_WAIT = "sender_flood_wait"
 SENDER_UNAUTHORIZED = "sender_session_unauthorized"
 NOT_IN_SOURCE_CHAT = "sender_not_in_source_chat"
+NO_SENDER_FOR_SOURCE = "no_eligible_sender_for_source"
+STATE_CHANGED = "send_state_changed"
 IDENTITY_MISMATCH = "recipient_identity_mismatch"
 USERNAME_NOT_FOUND = "username_not_found"
 PRIVACY = "user_privacy_restricted"
@@ -95,7 +105,7 @@ _RECIPIENT_ERRORS = (
 _RECIPIENT_ERROR_TYPES = tuple(cls for cls, _ in _RECIPIENT_ERRORS)
 _SOURCE_CHAT_ERRORS = (
     ValueError, errors.ChannelPrivateError, errors.ChannelInvalidError, errors.ChatIdInvalidError,
-    errors.MsgIdInvalidError, errors.ChatAdminRequiredError,
+    errors.MsgIdInvalidError, errors.ChatAdminRequiredError, errors.UserNotParticipantError,
 )
 _TRANSPORT_ERRORS = (ConnectionError, OSError, asyncio.TimeoutError, asyncio.IncompleteReadError)
 
@@ -114,6 +124,8 @@ KIND_ALREADY = "already_processed"
 class Plan:
     reason: str | None
     sender: object | None = None  # reader.inviter.models.TelegramAccount
+    # Все подходящие по БД отправители в порядке выбора; sender — первый.
+    candidates: tuple = ()
 
     @property
     def ok(self) -> bool:
@@ -228,7 +240,8 @@ class DmSendService:
             candidates.append((total, account.id, account))
         if not candidates:
             return Plan(DAILY_LIMIT)
-        return Plan(None, sender=min(candidates, key=lambda c: (c[0], c[1]))[2])
+        ranked = tuple(c[2] for c in sorted(candidates, key=lambda c: (c[0], c[1])))
+        return Plan(None, sender=ranked[0], candidates=ranked)
 
     # ---------------- действия оператора ----------------
 
@@ -263,11 +276,26 @@ class DmSendService:
             ):
                 return SendOutcome(KIND_ALREADY, reason=NOT_DRAFT)
             item = self._outreach.get(outreach_id)
-            outcome = await self._deliver(item, sender)
+            outcome = await self._deliver_with_fallback(item, plan.candidates or (sender,))
             logger.info("dm_outreach id=%s: отправка -> %s (%s)", outreach_id, outcome.kind, outcome.reason)
             return outcome
 
     # ---------------- Telegram ----------------
+
+    async def _deliver_with_fallback(self, item: DmOutreach, candidates) -> SendOutcome:
+        """Строка уже в sending на candidates[0]. Следующий кандидат — только
+        если предыдущий не смог прочитать исходное сообщение."""
+        for index, sender in enumerate(candidates):
+            if index and not self._outreach.reassign_sender(item.id, sender_account_id=sender.id, now=self._clock()):
+                logger.warning("dm_outreach id=%s: статус изменился во время отправки — остановлено", item.id)
+                return SendOutcome(KIND_ALREADY, reason=STATE_CHANGED)
+            outcome = await self._deliver(item, sender)
+            if outcome.reason != NOT_IN_SOURCE_CHAT or outcome.kind != KIND_DRAFT:
+                return outcome
+            logger.info("dm_outreach id=%s: у отправителя %s нет доступа к исходному сообщению — следующий",
+                        item.id, _sender_label(sender))
+        self._outreach.release_to_draft(item.id, now=self._clock(), error=NO_SENDER_FOR_SOURCE)
+        return SendOutcome(KIND_DRAFT, reason=NO_SENDER_FOR_SOURCE)
 
     async def _deliver(self, item: DmOutreach, sender) -> SendOutcome:
         label = _sender_label(sender)
@@ -281,6 +309,9 @@ class DmSendService:
                 return SendOutcome(KIND_DRAFT, reason=SENDER_UNAUTHORIZED, sender_label=label)
             stage = "resolve"
             peer, problem = await self._resolve(client, item)
+            if problem == NOT_IN_SOURCE_CHAT:
+                # Строку не трогаем: решает _deliver_with_fallback.
+                return SendOutcome(KIND_DRAFT, reason=NOT_IN_SOURCE_CHAT, sender_label=label)
             if problem:
                 self._outreach.mark_send_blocked(item.id, now=self._clock(), reason=problem)
                 return SendOutcome(KIND_BLOCKED, reason=problem, sender_label=label)

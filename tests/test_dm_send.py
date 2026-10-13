@@ -76,6 +76,13 @@ class FakeTelegram:
         self.send_effects = []  # исключения для очередных send_message
         self.connect_exc = None
         self.send_delay = 0.0
+        # Доступ к source по отправителю (account_id): ошибка резолва чата,
+        # ошибка чтения сообщения, сообщение не видно (None).
+        self.entity_errors = {}
+        self.read_errors = {}
+        self.hidden_messages = set()
+        self.source_reads = []  # account_id, читавшие исходное сообщение
+        self.before_send = None  # хук: вызывается перед каждым send_message
 
 
 class FakeClient:
@@ -99,15 +106,24 @@ class FakeClient:
         return self.tg.users[username]
 
     async def get_input_entity(self, chat_ref):
+        if self.account.id in self.tg.entity_errors:
+            raise self.tg.entity_errors[self.account.id]
         if chat_ref not in self.tg.chats:
             raise ValueError("Could not find the input entity")
         return self.tg.chats[chat_ref]
 
     async def get_messages(self, chat, ids):
+        self.tg.source_reads.append(self.account.id)
+        if self.account.id in self.tg.read_errors:
+            raise self.tg.read_errors[self.account.id]
+        if self.account.id in self.tg.hidden_messages:
+            return None
         ref = next(k for k, v in self.tg.chats.items() if v == chat)
         return self.tg.messages.get((ref, ids))
 
     async def send_message(self, peer, text):
+        if self.tg.before_send:
+            self.tg.before_send(self.account)
         if self.tg.send_delay:
             await asyncio.sleep(self.tg.send_delay)
         if self.tg.send_effects:
@@ -240,12 +256,12 @@ def test_source_message_resolves_via_selected_sender(env):
     assert env.outreach.get(row_id).status == STATUS_SENT
 
 
-def test_source_message_sender_without_access_is_blocked(env):
+def test_source_message_sender_without_access_keeps_draft(env):
     env.tg.chats.clear()
     row_id = draft(env, sendability=SENDABILITY_SOURCE_MESSAGE, username=None)
     _, reply = click_and_confirm(env, row_id)
     row = env.outreach.get(row_id)
-    assert (row.status, row.send_error) == (STATUS_BLOCKED, svc.NOT_IN_SOURCE_CHAT) and env.tg.sent == []
+    assert (row.status, row.send_error) == (STATUS_DRAFT, svc.NO_SENDER_FOR_SOURCE) and env.tg.sent == []
     assert texts.NOT_SENT_TEXT in reply.text and "нет доступа к исходной группе" in reply.text
 
 
@@ -639,3 +655,162 @@ def test_sender_client_factory_is_safe_by_construction(tmp_path):
     client = build_sender_client_factory(1, "hash", tmp_path)(SimpleNamespace(session_path="data/sessions/vladi"))
     assert client.flood_sleep_threshold == 0 and client._request_retries == 1
     assert isinstance(client.session, StringSession) and session.read_bytes() == before
+
+
+# ---------------- source-aware выбор отправителя ----------------
+
+
+def add_sender(env, name, *, premium=False):
+    slug = name.lstrip("@")
+    account = env.accounts.create(name=name, phone="", session_name=slug, session_path=f"data/sessions/{slug}",
+                                  enabled=False, can_send_dm=True, is_premium=premium)
+    env.campaigns.set_campaign_account_enabled(env.insurance.id, account.id, True)
+    return account
+
+
+def source_draft(env, **kwargs):
+    return draft(env, sendability=SENDABILITY_SOURCE_MESSAGE, username=None, **kwargs)
+
+
+def test_first_sender_without_source_access_second_sends(env):
+    second = add_sender(env, "@second")
+    env.tg.read_errors[env.vladi.id] = errors.ChannelPrivateError(request=None)
+    row_id = source_draft(env)
+    seen = []
+    env.tg.before_send = lambda account: seen.append(env.outreach.get(row_id).sender_account_id)
+    preview, reply = click_and_confirm(env, row_id)
+    assert "Отправитель: @Vladi_mihailov" in preview.text          # preview — первый кандидат, без сети
+    assert [a for a, _, _ in env.tg.sent] == [second.id]            # пропущенный отправитель: 0 send_message
+    assert seen == [second.id]                                      # sender_account_id сменён ДО send_message
+    assert env.tg.source_reads == [env.vladi.id, second.id]
+    row = env.outreach.get(row_id)
+    assert (row.status, row.sender_account_id, row.send_error) == (STATUS_SENT, second.id, None)
+    assert "Отправитель: @second" in reply.text
+
+
+@pytest.mark.parametrize("stage", ["entity", "read"])
+def test_channel_private_or_forbidden_moves_to_next_sender(env, stage):
+    """ChannelForbidden: username резолвится, но GetChannels/GetHistory дают ChannelPrivateError."""
+    second = add_sender(env, "@second")
+    target = env.tg.entity_errors if stage == "entity" else env.tg.read_errors
+    target[env.vladi.id] = errors.ChannelPrivateError(request=None)
+    row_id = source_draft(env)
+    click_and_confirm(env, row_id)
+    assert [a for a, _, _ in env.tg.sent] == [second.id] and env.outreach.get(row_id).status == STATUS_SENT
+
+
+@pytest.mark.parametrize("problem", ["none", "msg_id_invalid", "not_participant"])
+def test_unreadable_source_message_moves_to_next_sender(env, problem):
+    second = add_sender(env, "@second")
+    if problem == "none":
+        env.tg.hidden_messages.add(env.vladi.id)
+    elif problem == "msg_id_invalid":
+        env.tg.read_errors[env.vladi.id] = errors.MsgIdInvalidError(request=None)
+    else:
+        env.tg.read_errors[env.vladi.id] = errors.UserNotParticipantError(request=None)
+    row_id = source_draft(env)
+    click_and_confirm(env, row_id)
+    assert [a for a, _, _ in env.tg.sent] == [second.id] and env.outreach.get(row_id).status == STATUS_SENT
+
+
+def test_public_readable_source_without_membership_is_allowed(env):
+    """Членство не проверяется: если сообщение читается, путь работает
+    (любой лишний вызов вроде get_permissions упал бы в FakeClient)."""
+    add_sender(env, "@second")
+    row_id = source_draft(env)
+    click_and_confirm(env, row_id)
+    assert [a for a, _, _ in env.tg.sent] == [env.vladi.id] and env.tg.source_reads == [env.vladi.id]
+    assert env.outreach.get(row_id).status == STATUS_SENT
+
+
+def test_all_senders_without_source_access_keep_retryable_draft(env):
+    second = add_sender(env, "@second")
+    env.tg.read_errors[env.vladi.id] = errors.ChannelPrivateError(request=None)
+    env.tg.hidden_messages.add(second.id)
+    row_id = source_draft(env)
+    _, reply = click_and_confirm(env, row_id)
+    row = env.outreach.get(row_id)
+    assert (row.status, row.send_error, row.sender_account_id) == (STATUS_DRAFT, svc.NO_SENDER_FOR_SOURCE, None)
+    assert env.tg.sent == [] and env.tg.source_reads == [env.vladi.id, second.id]
+    assert "ни у одного отправителя" in reply.text
+    assert env.states.get(env.vladi.id).blocked_reason is None and env.states.get(second.id).blocked_reason is None
+
+    env.tg.hidden_messages.clear()  # доступ появился — повторная отправка
+    click_and_confirm(env, row_id)
+    row = env.outreach.get(row_id)
+    assert (row.status, row.sender_account_id) == (STATUS_SENT, second.id)
+    assert [a for a, _, _ in env.tg.sent] == [second.id]
+
+
+def test_username_path_does_not_require_source_access(env):
+    env.tg.read_errors[env.vladi.id] = errors.ChannelPrivateError(request=None)
+    env.tg.entity_errors[env.vladi.id] = errors.ChannelPrivateError(request=None)
+    row_id = draft(env)
+    click_and_confirm(env, row_id)
+    assert [a for a, _, _ in env.tg.sent] == [env.vladi.id] and env.tg.source_reads == []
+
+
+def test_identity_mismatch_does_not_fall_back(env):
+    add_sender(env, "@second")
+    env.tg.messages[("VerhniyLars", 501)] = SimpleNamespace(sender_id=111)
+    row_id = source_draft(env)
+    click_and_confirm(env, row_id)
+    row = env.outreach.get(row_id)
+    assert (row.status, row.send_error) == (STATUS_BLOCKED, svc.IDENTITY_MISMATCH)
+    assert env.tg.source_reads == [env.vladi.id] and env.tg.sent == []
+
+
+def test_reassign_sender_only_while_sending(env):
+    second = add_sender(env, "@second")
+    row_id = source_draft(env)
+    assert not env.outreach.reassign_sender(row_id, sender_account_id=second.id, now=T0)  # draft
+    assert env.outreach.get(row_id).sender_account_id is None
+    assert env.outreach.claim_for_send(row_id, operator_id=ADMIN, sender_account_id=env.vladi.id, now=T0)
+    assert env.outreach.reassign_sender(row_id, sender_account_id=second.id, now=T0)
+    row = env.outreach.get(row_id)
+    assert (row.status, row.sender_account_id) == ("sending", second.id)
+
+
+def test_reassign_conflict_aborts_without_send(env, monkeypatch):
+    second = add_sender(env, "@second")
+    env.tg.read_errors[env.vladi.id] = errors.ChannelPrivateError(request=None)
+    row_id = source_draft(env)
+    monkeypatch.setattr(env.outreach, "reassign_sender", lambda *a, **k: False)
+    outcome = asyncio.run(env.service.send(row_id, operator_id=ADMIN))
+    assert (outcome.kind, outcome.reason) == (svc.KIND_ALREADY, svc.STATE_CHANGED)
+    assert env.tg.sent == [] and env.tg.source_reads == [env.vladi.id]
+    assert second.id not in env.tg.source_reads
+
+
+def test_peer_flood_sender_is_not_a_fallback(env):
+    second = add_sender(env, "@second")
+    env.states.block(second.id, reason=svc.PEER_FLOOD, now=T0)
+    env.tg.read_errors[env.vladi.id] = errors.ChannelPrivateError(request=None)
+    row_id = source_draft(env)
+    click_and_confirm(env, row_id)
+    assert env.outreach.get(row_id).send_error == svc.NO_SENDER_FOR_SOURCE
+    assert env.tg.source_reads == [env.vladi.id] and env.tg.sent == []
+
+
+def test_premium_required_fallback_uses_only_premium_senders(env):
+    premium = add_sender(env, "@premium_one", premium=True)
+    env.tg.read_errors[premium.id] = errors.ChannelPrivateError(request=None)
+    row_id = draft(env, sendability=SENDABILITY_PREMIUM_REQUIRED, username=None)
+    click_and_confirm(env, row_id)
+    assert env.outreach.get(row_id).send_error == svc.NO_SENDER_FOR_SOURCE
+    assert env.tg.source_reads == [premium.id] and env.tg.sent == []   # не-Premium vladi не пробуется
+
+
+def test_daily_cap_sender_is_not_a_fallback(env):
+    second = add_sender(env, "@second")
+    env.campaigns.set_campaign_account_enabled(env.insurance.id, env.vladi.id, False)
+    click_and_confirm(env, draft(env))                                  # 1 отправка от second
+    env.campaigns.set_campaign_account_enabled(env.insurance.id, env.vladi.id, True)
+    env.service._cap = 1
+    env.tg.read_errors[env.vladi.id] = errors.ChannelPrivateError(request=None)
+    env.tg.source_reads.clear()
+    env.tg.messages[("VerhniyLars", 777)] = SimpleNamespace(sender_id=RECIPIENT_ID + 1)
+    row_id = source_draft(env, message_id=777, user_id=RECIPIENT_ID + 1)
+    click_and_confirm(env, row_id)
+    assert env.outreach.get(row_id).send_error == svc.NO_SENDER_FOR_SOURCE
+    assert env.tg.source_reads == [env.vladi.id] and [a for a, _, _ in env.tg.sent] == [second.id]
