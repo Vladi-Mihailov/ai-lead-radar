@@ -814,3 +814,84 @@ def test_daily_cap_sender_is_not_a_fallback(env):
     click_and_confirm(env, row_id)
     assert env.outreach.get(row_id).send_error == svc.NO_SENDER_FOR_SOURCE
     assert env.tg.source_reads == [env.vladi.id] and [a for a, _, _ in env.tg.sent] == [second.id]
+
+
+# ---------------- явный потолок конкретного отправителя ----------------
+
+
+def _record_sends(env, account_id, n, *, start=40000):
+    """n учтённых отправок аккаунта за последние 24 ч (без Telegram)."""
+    for i in range(n):
+        row_id = draft(env, username=f"cap{start + i}", user_id=start + i, message_id=start + i)
+        assert env.outreach.claim_for_send(row_id, operator_id=ADMIN, sender_account_id=account_id, now=T0)
+        assert env.outreach.mark_sent(row_id, now=T0, telegram_message_id=None)
+
+
+def _cap_env(env):
+    alena = env.accounts.create(name="@alenaogir", phone="", session_name="alena", session_path="data/sessions/alena",
+                                enabled=False, can_send_dm=True, is_premium=True)
+    other = env.accounts.create(name="@other_premium", phone="", session_name="op", session_path="data/sessions/op",
+                                enabled=False, can_send_dm=True, is_premium=True)
+    for account in (alena, other):
+        env.campaigns.set_campaign_account_enabled(env.insurance.id, account.id, True)
+    env.service._cap = 5
+    env.service._cap_overrides = {alena.id: 20}
+    return alena, other
+
+
+def test_cap_override_allows_alena_up_to_twenty(env):
+    alena, other = _cap_env(env)
+    _record_sends(env, env.vladi.id, 5)
+    _record_sends(env, other.id, 5, start=41000)
+    _record_sends(env, alena.id, 19, start=42000)
+    row_id = draft(env, username="fresh_lead", user_id=777, message_id=43000)
+    plan = env.service.plan(row_id)
+    assert plan.ok and plan.sender.id == alena.id                       # 19/20 — можно
+    assert [a.id for a in plan.candidates] == [alena.id]               # vladi 5/5 и Premium без override 5/5 — нет
+
+
+def test_cap_override_excludes_alena_at_twenty(env):
+    alena, other = _cap_env(env)
+    _record_sends(env, env.vladi.id, 5)
+    _record_sends(env, other.id, 5, start=41000)
+    _record_sends(env, alena.id, 20, start=42000)
+    row_id = draft(env, username="fresh_lead", user_id=777, message_id=43000)
+    assert env.service.plan(row_id).reason == svc.DAILY_LIMIT           # 20/20, 5/5, 5/5
+
+
+def test_cap_override_is_not_applied_to_other_premium_senders(env):
+    alena, other = _cap_env(env)
+    env.campaigns.set_campaign_account_enabled(env.insurance.id, alena.id, False)
+    env.campaigns.set_campaign_account_enabled(env.insurance.id, env.vladi.id, False)
+    _record_sends(env, other.id, 5, start=41000)
+    row_id = draft(env, username="fresh_lead", user_id=777, message_id=43000)
+    assert env.service.plan(row_id).reason == svc.DAILY_LIMIT
+
+
+def test_cap_override_keeps_peer_flood_and_premium_filters(env):
+    alena, _ = _cap_env(env)
+    env.states.block(alena.id, reason=svc.PEER_FLOOD, now=T0)
+    row_id = draft(env, username="fresh_lead", user_id=777, message_id=43000)
+    plan = env.service.plan(row_id)
+    assert plan.ok and alena.id not in [a.id for a in plan.candidates]
+
+
+def test_cap_override_settings_default_and_validation():
+    from reader.settings import DmOutreachSettings
+    assert DmOutreachSettings().sender_daily_cap_overrides == {}
+    assert DmOutreachSettings(sender_daily_cap=5, sender_daily_cap_overrides={14: 20}).sender_daily_cap_overrides == {
+        14: 20}
+    with pytest.raises(ValueError):
+        DmOutreachSettings(sender_daily_cap_overrides={14: -1})
+
+
+def test_expected_sender_uses_same_cap_override(env):
+    from reader.dm_campaigns.sender_selection import SenderSelector
+    alena, other = _cap_env(env)
+    _record_sends(env, env.vladi.id, 5)
+    _record_sends(env, other.id, 5, start=41000)
+    _record_sends(env, alena.id, 19, start=42000)
+    item = env.outreach.get(draft(env, username="fresh_lead", user_id=777, message_id=43000))
+    selector = SenderSelector(env.outreach, env.campaigns, env.accounts, env.states, session_exists=lambda a: True)
+    assert selector.expected_sender(item, T0, cap=5, cap_overrides={alena.id: 20}).id == alena.id
+    assert selector.expected_sender(item, T0, cap=5) is None  # без override — у всех 5/5

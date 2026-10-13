@@ -5,10 +5,11 @@
 Фильтры: allowlist кампании, can_send_dm/Premium (dm_sender_eligible),
 is_old, blocked_until, DM-блок отправителя (PeerFlood и т.п.), наличие
 session-файла, FloodWait, общий потолок за 24 ч (cap; None/0 — без
-потолка), лимит пары кампания-аккаунт. Порядок: меньше отправок за 24 ч,
+потолка; cap_overrides — явный потолок конкретного аккаунта по id), лимит
+пары кампания-аккаунт. Порядок: меньше отправок за 24 ч,
 затем меньший id."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 
 from reader.dm_campaigns.outreach_repository import DmOutreach, DmOutreachRepository
@@ -40,7 +41,8 @@ class SenderSelector:
         self._states = sender_states
         self._session_exists = session_exists
 
-    def rank(self, item: DmOutreach, campaign, now: datetime, *, cap: int | None) -> tuple[str | None, tuple]:
+    def rank(self, item: DmOutreach, campaign, now: datetime, *, cap: int | None,
+             cap_overrides: Mapping[int, int] | None = None) -> tuple[str | None, tuple]:
         """(причина, ()) если подходящих нет, иначе (None, отправители по порядку)."""
         usable = []
         for entry in self._campaigns.list_campaign_accounts(campaign.id):
@@ -63,7 +65,8 @@ class SenderSelector:
         candidates = []
         for account, entry, _ in awake:
             total = self._outreach.sends_since(sender_account_id=account.id, since=now - _DAY)
-            if cap and total >= cap:  # None/0 — общий потолок выключен
+            limit = (cap_overrides or {}).get(account.id, cap)
+            if limit and total >= limit:  # None/0 — потолок выключен
                 continue
             if entry.daily_limit is not None and self._outreach.sends_since(
                 sender_account_id=account.id, since=now - _DAY, campaign_id=campaign.id,
@@ -74,11 +77,12 @@ class SenderSelector:
             return DAILY_LIMIT, ()
         return None, tuple(c[2] for c in sorted(candidates, key=lambda c: (c[0], c[1])))
 
-    def expected_sender(self, item: DmOutreach, now: datetime, *, cap: int | None):
+    def expected_sender(self, item: DmOutreach, now: datetime, *, cap: int | None,
+                        cap_overrides: Mapping[int, int] | None = None):
         """Первый отправитель по тому же порядку, что и preview; None — нет.
         Фактический отправитель выбирается при отправке и может отличаться."""
         campaign = self._campaigns.get_campaign(item.campaign_id)
         if campaign is None:
             return None
-        reason, ranked = self.rank(item, campaign, now, cap=cap)
+        reason, ranked = self.rank(item, campaign, now, cap=cap, cap_overrides=cap_overrides)
         return None if reason else ranked[0]

@@ -2,7 +2,7 @@ import os
 import re
 from datetime import date, time
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 import yaml
 from dotenv import load_dotenv
@@ -361,6 +361,10 @@ class DmOutreachSettings(BaseModel):
     # от этого не зависит.
     recipient_cooldown_days: float = Field(default=7, gt=0)
     sender_daily_cap: int | None = Field(default=None, ge=0, le=1000)
+    # Явный потолок конкретного аккаунта (telegram_accounts.id -> ЛС за
+    # скользящие 24 ч) вместо sender_daily_cap; 0 — без потолка. Только для
+    # перечисленных id — по Premium автоматически не применяется.
+    sender_daily_cap_overrides: dict[int, Annotated[int, Field(ge=0, le=1000)]] = Field(default_factory=dict)
     # Дата последнего личного оформления через @tplgee (факт от оператора): из
     # неё считается «я вчера / позавчера / несколько дней назад оформлял».
     tplgee_purchase_date: date = date(2026, 10, 5)

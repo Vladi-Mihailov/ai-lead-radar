@@ -159,6 +159,7 @@ class DmSendService:
         session_exists: Callable[[object], bool],
         recipient_cooldown: timedelta,
         sender_daily_cap: int | None,
+        sender_daily_cap_overrides: dict[int, int] | None = None,
         clock: Callable[[], datetime] = _utcnow,
         feedback_repository=None,  # reader.dm_campaigns.feedback.DmFeedbackRepository
     ):
@@ -170,6 +171,7 @@ class DmSendService:
         self._session_exists = session_exists
         self._cooldown = recipient_cooldown
         self._cap = sender_daily_cap
+        self._cap_overrides = dict(sender_daily_cap_overrides or {})
         self._selector = SenderSelector(
             outreach_repository, campaign_repository, account_repository, sender_states,
             session_exists=session_exists,
@@ -216,7 +218,7 @@ class DmSendService:
         return False
 
     def _select_sender(self, item: DmOutreach, campaign, now: datetime) -> Plan:
-        reason, ranked = self._selector.rank(item, campaign, now, cap=self._cap)
+        reason, ranked = self._selector.rank(item, campaign, now, cap=self._cap, cap_overrides=self._cap_overrides)
         if reason:
             return Plan(reason)
         return Plan(None, sender=ranked[0], candidates=ranked)
