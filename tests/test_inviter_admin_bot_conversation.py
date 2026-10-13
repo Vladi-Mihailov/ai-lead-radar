@@ -340,7 +340,7 @@ async def test_add_account_code_step_needs_password_then_authorizes(fx):
 
 async def test_add_account_invalid_code_lets_admin_retry_same_step(fx):
     fx.auth.code_outcomes = [
-        AuthOutcome(result=AuthResult.INVALID_CODE, error_summary="Код неверный или устарел. Введите код ещё раз."),
+        AuthOutcome(result=AuthResult.INVALID_CODE, error_summary="Код неверный. Введите ещё раз."),
     ]
 
     await fx.controller.handle_text(texts.ADD_ACCOUNT_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
@@ -350,6 +350,24 @@ async def test_add_account_invalid_code_lets_admin_retry_same_step(fx):
     assert reply.text == texts.INVALID_CODE_RETRY_TEXT
     state = fx.states.get(_CHAT_ID)
     assert state is not None and state.step == "awaiting_code"  # остаёмся на этом же шаге
+
+
+async def test_add_account_expired_code_ends_dialog(fx):
+    fx.auth.code_outcomes = [
+        AuthOutcome(result=AuthResult.CODE_EXPIRED, error_summary="Код устарел. Запустите авторизацию заново."),
+    ]
+
+    await fx.controller.handle_text(texts.ADD_ACCOUNT_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+    await fx.controller.handle_text("+995571024864", chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+    reply = await fx.controller.handle_text("1-2-3-4-5", chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
+
+    assert reply.text == texts.CODE_EXPIRED_TEXT
+    assert fx.states.get(_CHAT_ID) is None
+
+
+def test_code_prompt_asks_for_separators_without_real_code():
+    assert "1-2-3-4-5" in texts.CODE_SENT_TEXT
+    assert "разделител" in texts.CODE_SENT_TEXT
 
 
 async def test_cancel_during_auth_flow_stops_conversation_and_cancels_coordinator(fx):
@@ -680,3 +698,7 @@ def test_toggle_on_current_account_still_works_as_before(fx):
     assert fx.accounts.get(current.id).enabled is False
     options_by_id = {aid: enabled for aid, _name, enabled, _used, _limit in reply.accounts_page_options}
     assert options_by_id[current.id] is False
+
+
+def test_code_expired_text_fits_add_and_reauthorize():
+    assert texts.CODE_EXPIRED_TEXT == "❌ Код устарел. Запустите авторизацию заново."

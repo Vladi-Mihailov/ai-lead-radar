@@ -16,14 +16,16 @@ from types import SimpleNamespace
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import pytest
 from telethon.errors import (
     PasswordHashInvalidError,
+    PhoneCodeExpiredError,
     PhoneCodeInvalidError,
     SessionPasswordNeededError,
 )
 
 from reader.inviter.repository import TelegramAccountRepository
-from reader.inviter_admin_bot.auth import AccountAuthCoordinator
+from reader.inviter_admin_bot.auth import AccountAuthCoordinator, normalize_login_code
 from reader.inviter_admin_bot.models import AuthResult
 
 _SECRET_CODE = "13579"
@@ -161,6 +163,95 @@ async def test_submit_code_invalid_lets_admin_retry(tmp_path):
 
         assert outcome.result == AuthResult.INVALID_CODE
         assert coordinator.has_pending(1) is True  # не сброшено — можно ввести код ещё раз
+    finally:
+        repo.close()
+
+
+# ---- Код вводится с разделителями: Telegram гасит код, отправленный как есть ----
+
+
+@pytest.mark.parametrize("raw", ["12345", "1-2-3-4-5", "1 2 3 4 5", " 1-2 3-4 5 "])
+def test_normalize_login_code_keeps_only_digits(raw):
+    assert normalize_login_code(raw) == "12345"
+
+
+@pytest.mark.parametrize("raw", ["1-2-3-4-5", "1 2 3 4 5", " 1-2 3-4 5 "])
+async def test_submit_code_passes_digits_only_to_sign_in(tmp_path, raw):
+    client = _FakeAuthClient()
+    coordinator, repo = _make_coordinator(tmp_path, client)
+    try:
+        await coordinator.start_new(chat_id=1, phone="+995500000001")
+        await coordinator.submit_code(chat_id=1, code=raw)
+
+        assert client.sign_in_calls[0]["code"] == "12345"
+        assert client.sign_in_calls[0]["phone_code_hash"] == "hash-abc"
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("raw", ["", "абв", "1-2-3", "1234567890"])
+async def test_submit_code_with_bad_length_does_not_call_sign_in(tmp_path, raw):
+    client = _FakeAuthClient()
+    coordinator, repo = _make_coordinator(tmp_path, client)
+    try:
+        await coordinator.start_new(chat_id=1, phone="+995500000001")
+        outcome = await coordinator.submit_code(chat_id=1, code=raw)
+
+        assert outcome.result == AuthResult.INVALID_CODE
+        assert client.sign_in_calls == []
+        assert coordinator.has_pending(1) is True
+    finally:
+        repo.close()
+
+
+async def test_submit_code_invalid_is_logged_as_invalid(tmp_path, caplog):
+    client = _FakeAuthClient(sign_in_errors=[PhoneCodeInvalidError(request=None)])
+    coordinator, repo = _make_coordinator(tmp_path, client)
+    try:
+        await coordinator.start_new(chat_id=1, phone="+995500000001")
+        with caplog.at_level(logging.DEBUG):
+            outcome = await coordinator.submit_code(chat_id=1, code="1-3-5-7-9")
+
+        assert outcome.result == AuthResult.INVALID_CODE
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Login code invalid" in m for m in messages)
+        assert not any("expired" in m for m in messages)
+        assert coordinator.has_pending(1) is True
+    finally:
+        repo.close()
+
+
+async def test_submit_code_expired_is_logged_as_expired_and_ends_dialog(tmp_path, caplog):
+    client = _FakeAuthClient(sign_in_errors=[PhoneCodeExpiredError(request=None)])
+    coordinator, repo = _make_coordinator(tmp_path, client)
+    try:
+        await coordinator.start_new(chat_id=1, phone="+995500000001")
+        with caplog.at_level(logging.DEBUG):
+            outcome = await coordinator.submit_code(chat_id=1, code="1-3-5-7-9")
+
+        assert outcome.result == AuthResult.CODE_EXPIRED
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Login code expired" in m for m in messages)
+        assert not any("invalid" in m for m in messages)
+        assert coordinator.has_pending(1) is False
+        assert client.disconnected is True
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("error", [PhoneCodeInvalidError(request=None), PhoneCodeExpiredError(request=None), None])
+async def test_login_code_phone_and_hash_never_logged(tmp_path, caplog, error):
+    client = _FakeAuthClient(sign_in_errors=[error])
+    coordinator, repo = _make_coordinator(tmp_path, client)
+    try:
+        with caplog.at_level(logging.DEBUG):
+            await coordinator.start_new(chat_id=1, phone="+995500000001")
+            outcome = await coordinator.submit_code(chat_id=1, code="1-3-5-7-9")
+            await coordinator.submit_code(chat_id=1, code="1-2")
+
+        for text in [r.getMessage() for r in caplog.records] + [outcome.error_summary or ""]:
+            for secret in ("13579", "1-3-5-7-9", "995500000001", "hash-abc"):
+                assert secret not in text
     finally:
         repo.close()
 
