@@ -134,6 +134,7 @@ async def run() -> None:
         session_exists=build_session_exists(PROJECT_ROOT),
         recipient_cooldown=timedelta(days=settings.dm_outreach.recipient_cooldown_days),
         sender_daily_cap=settings.dm_outreach.sender_daily_cap,
+        sender_daily_cap_overrides=settings.dm_outreach.sender_daily_cap_overrides,
         feedback_repository=dm_feedback,
     )
 

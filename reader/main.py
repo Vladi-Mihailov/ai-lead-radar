@@ -464,7 +464,8 @@ def build_dm_outreach_components(
     )
 
     def sender_persona(item) -> SenderPersona | None:
-        account = sender_selection.expected_sender(item, datetime.now(timezone.utc), cap=dm.sender_daily_cap)
+        account = sender_selection.expected_sender(item, datetime.now(timezone.utc), cap=dm.sender_daily_cap,
+                                                   cap_overrides=dm.sender_daily_cap_overrides)
         if account is None:
             return None
         persona = dm.sender_personas.get(account.id)
