@@ -45,6 +45,21 @@ from reader.inviter_admin_bot.models import AuthOutcome, AuthResult
 
 logger = logging.getLogger(__name__)
 
+# Код входа Telegram — обычно 5 цифр (бывает 6); границы защищают от
+# случайного ввода, а не проверяют конкретный тип кода.
+LOGIN_CODE_MIN_DIGITS = 4
+LOGIN_CODE_MAX_DIGITS = 8
+
+_INVALID_CODE_TEXT = "Код неверный. Введите ещё раз."
+_EXPIRED_CODE_TEXT = "Код устарел. Запустите авторизацию заново."
+
+
+def normalize_login_code(text: str) -> str:
+    """Оставляет только цифры: админ вводит код с разделителями
+    ("1-2-3-4-5", "1 2 3 4 5"), потому что Telegram сразу гасит код входа,
+    отправленный как есть сообщением в любой Telegram-чат."""
+    return "".join(ch for ch in text if ch.isdigit())
+
 
 class TelethonAuthClientLike(Protocol):
     """Часть TelegramClient, нужная именно для login-флоу — подмножество
@@ -163,14 +178,26 @@ class AccountAuthCoordinator:
                 result=AuthResult.FAILED, error_summary="Диалог авторизации устарел — начните заново.",
             )
 
+        code = normalize_login_code(code)
+        if not LOGIN_CODE_MIN_DIGITS <= len(code) <= LOGIN_CODE_MAX_DIGITS:
+            # sign_in не вызывается — Telegram не тратит попытку на заведомо
+            # неверный ввод; pending остаётся, можно ввести код ещё раз.
+            logger.warning("Login code has unexpected format (chat_id=%s)", chat_id)
+            return AuthOutcome(result=AuthResult.INVALID_CODE, error_summary=_INVALID_CODE_TEXT)
+
         try:
             await pending.client.sign_in(pending.phone, code, phone_code_hash=pending.phone_code_hash)
         except SessionPasswordNeededError:
             return AuthOutcome(result=AuthResult.NEEDS_PASSWORD)
-        except (PhoneCodeInvalidError, PhoneCodeExpiredError):
-            return AuthOutcome(
-                result=AuthResult.INVALID_CODE, error_summary="Код неверный или устарел. Введите код ещё раз.",
-            )
+        except PhoneCodeInvalidError:
+            logger.warning("Login code invalid (chat_id=%s)", chat_id)
+            return AuthOutcome(result=AuthResult.INVALID_CODE, error_summary=_INVALID_CODE_TEXT)
+        except PhoneCodeExpiredError:
+            # Повторный ввод этого же кода бесполезен — нужен новый
+            # send_code_request, то есть новый запуск авторизации.
+            await self.cancel(chat_id)
+            logger.warning("Login code expired (chat_id=%s)", chat_id)
+            return AuthOutcome(result=AuthResult.CODE_EXPIRED, error_summary=_EXPIRED_CODE_TEXT)
         except Exception as exc:
             await self.cancel(chat_id)
             logger.warning("Ошибка авторизации по коду (chat_id=%s): %s", chat_id, type(exc).__name__)

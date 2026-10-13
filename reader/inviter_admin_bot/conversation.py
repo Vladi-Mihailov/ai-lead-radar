@@ -229,6 +229,8 @@ class AdminBotController:
             return BotReply(text=texts.INVALID_PASSWORD_RETRY_TEXT, show_cancel_button=True)
 
         self._states.clear(chat_id)
+        if outcome.result == AuthResult.CODE_EXPIRED:
+            return BotReply(text=texts.CODE_EXPIRED_TEXT, show_main_menu=True)
         if outcome.result == AuthResult.AUTHORIZED and outcome.account is not None:
             display_name = outcome.account.name
             return BotReply(text=texts.format_auth_success(display_name), show_main_menu=True)

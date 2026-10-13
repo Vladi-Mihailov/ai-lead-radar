@@ -154,6 +154,7 @@ class AuthResult(StrEnum):
     NEEDS_PASSWORD = "needs_password"
     AUTHORIZED = "authorized"
     INVALID_CODE = "invalid_code"
+    CODE_EXPIRED = "code_expired"
     INVALID_PASSWORD = "invalid_password"
     FAILED = "failed"
 
