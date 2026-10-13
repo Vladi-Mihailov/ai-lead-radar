@@ -2,10 +2,12 @@
 только ограниченный обезличенный контекст (см. context.py): ни user_id,
 ни username, ни внутренних id аккаунтов."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from reader.dm_campaigns.border import CHECKPOINT_TITLES, BorderPolicy, checkpoints_in
 from reader.dm_campaigns.context import DraftContext
+from reader.dm_campaigns.feedback import FeedbackExample, format_examples_block
 from reader.dm_campaigns.models import DmCampaign
 from reader.dm_campaigns.outreach_repository import DmOutreach
 from reader.dm_campaigns.relevance import border_evidence_relevant, side_topics
@@ -546,6 +548,7 @@ def build_user_text(
     outreach: DmOutreach, campaign: DmCampaign, context: DraftContext,
     *, allowed_resources: tuple[str, ...] | None = None, border_policy: BorderPolicy | None = None,
     sender: SenderPersona | None = None, sender_known: bool = False,
+    feedback_examples: Sequence[FeedbackExample] = (),
 ) -> str:
     """allowed_resources — уже отобранные по стране группы и смыслу
     вопроса (см. reader/dm_campaigns/resources.py); None — ресурсы кампании."""
@@ -601,6 +604,10 @@ def build_user_text(
     sections.append(f"FOLLOW-UP\n{follow_up}")
     if sender is not None or sender_known:
         sections.append(sender_block(sender))
+    # Примеры стиля — последним блоком: факты и правила выше важнее.
+    examples = format_examples_block(feedback_examples)
+    if examples:
+        sections.append(examples)
     return "\n\n".join(sections)
 
 

@@ -47,6 +47,7 @@ from reader.dm_campaigns.draft_prompt import (
     system_prompt_for,
 )
 from reader.dm_campaigns.draft_service import DmDraftService, DmDraftServiceError
+from reader.dm_campaigns.feedback import FeedbackRetriever
 from reader.dm_campaigns.models import source_chat_allowed
 from reader.dm_campaigns.observer import ACTIVE_DRAFT_WINDOW, FILTER_ACTIVE_DRAFT
 from reader.dm_campaigns.outreach_repository import (
@@ -154,6 +155,7 @@ class DmDraftProcessor:
         group_resource_regions: dict[str, str] | None = None,
         tplgee_purchase_date: date = TPLGEE_PERSONAL_PURCHASE_DATE,
         sender_persona: Callable[[DmOutreach], SenderPersona | None] | None = None,
+        feedback_retriever: FeedbackRetriever | None = None,
         clock: Callable[[], datetime] = _utcnow,
         monotonic: Callable[[], float] = time.monotonic,
     ):
@@ -161,6 +163,8 @@ class DmDraftProcessor:
         # None — ожидаемый отправитель не определяется (prompt прежний,
         # подвал — без рода).
         self._sender_persona = sender_persona
+        # None — feedback learning выключен: prompt прежний.
+        self._feedback = feedback_retriever
         self._outreach = outreach_repository
         self._campaigns = campaign_repository
         self._recent = recent_repository
@@ -330,6 +334,10 @@ class DmDraftProcessor:
             # Шаг 2: генерация ответа генератором ЭТОЙ кампании. Явно названный
             # КПП, который мы не отслеживаем («Красный камень»), — честное «не
             # подскажу» без модели: статус не выдумывается, Ларсом не подменяется.
+            examples = await self._feedback_examples(row, campaign.key)
+            if self._feedback is not None:
+                intent_audit["feedback_example_ids"] = [e.id for e in examples]
+                context_json = context.to_json(**intent_audit)
             if border_policy is not None and border_policy.unsupported_checkpoint:
                 output = DmDraftOutput(
                     should_generate=True, skip_reason=None,
@@ -341,7 +349,8 @@ class DmDraftProcessor:
                     self._service.generate(
                         build_user_text(row, campaign, context, allowed_resources=resources,
                                         border_policy=border_policy, sender=sender,
-                                        sender_known=self._sender_persona is not None),
+                                        sender_known=self._sender_persona is not None,
+                                        feedback_examples=examples),
                         instructions=system_prompt_for(campaign.key),
                         text_format=DmDraftOutput,
                     ),
@@ -394,7 +403,8 @@ class DmDraftProcessor:
                 output = await asyncio.wait_for(
                     self._service.generate(
                         build_user_text(row, campaign, context, allowed_resources=resources, border_policy=border_policy,
-                                        sender=sender, sender_known=self._sender_persona is not None)
+                                        sender=sender, sender_known=self._sender_persona is not None,
+                                        feedback_examples=examples)
                         + f"\n\nПРЕДЫДУЩИЙ ЧЕРНОВИК ОТКЛОНЁН ПРОВЕРКОЙ: {hint} Напиши заново, исправив это.",
                         instructions=system_prompt_for(campaign.key),
                         text_format=DmDraftOutput,
@@ -443,6 +453,22 @@ class DmDraftProcessor:
         except Exception as exc:  # noqa: BLE001 — без отправителя: нейтральная форма
             logger.warning("dm_outreach id=%s: ожидаемый отправитель не определён (%s)", row.id, type(exc).__name__)
             return None
+
+    async def _feedback_examples(self, row: DmOutreach, campaign_key: str) -> list:
+        """Отправленные примеры той же кампании; сбой — генерация без них."""
+        if self._feedback is None:
+            return []
+        try:
+            examples = await asyncio.wait_for(self._feedback.select(campaign_key, row.source_text),
+                                              timeout=self._timeout)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("dm_outreach id=%s: feedback examples недоступны (%s)", row.id, type(exc).__name__)
+            examples = []
+        logger.info("dm_outreach id=%s campaign=%s feedback_examples_used=%d feedback_example_ids=%s",
+                    row.id, campaign_key, len(examples), [e.id for e in examples])
+        return examples
 
     @staticmethod
     def _log(row: DmOutreach, status: str, *, campaign_key: str | None = None, context_count: int | None = None,

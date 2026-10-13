@@ -354,6 +354,9 @@ class DmOutreachRepository:
             follow_up_text=follow_up_text, evidence_strength=evidence_strength,
             used_context_refs_json=json.dumps(list(used_context_refs), ensure_ascii=False),
             generated_at=format_time(now), filter_reason=None, error_kind=None, error=None,
+            # Новый AI-текст: исходник прошлой правки к нему не относится
+            # (original_primary_text заполнит первая правка этого текста).
+            original_primary_text=None, edited_by=None, edited_at=None,
         )
 
     def mark_filtered(

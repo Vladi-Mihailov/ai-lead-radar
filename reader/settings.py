@@ -371,6 +371,13 @@ class DmOutreachSettings(BaseModel):
         1: SenderPersonaSettings(gender="male"),     # @vladimihailov
         15: SenderPersonaSettings(gender="male"),    # @Vladi_mihailov
     })
+    # Feedback learning: отправленные (в т.ч. правленые оператором) ответы той
+    # же кампании — примеры стиля в prompt. Выключено по умолчанию; данные в
+    # dm_draft_feedback копятся всегда (запись — при успешной отправке).
+    feedback_learning_enabled: bool = False
+    feedback_learning_max_examples: int = Field(default=3, ge=1, le=5)
+    feedback_learning_candidate_limit: int = Field(default=200, ge=1, le=2000)
+    feedback_learning_embedding_model: str = "text-embedding-3-small"
 
 
 class Settings(BaseModel):
