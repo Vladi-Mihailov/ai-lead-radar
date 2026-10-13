@@ -2,6 +2,8 @@
 только ограниченный обезличенный контекст (см. context.py): ни user_id,
 ни username, ни внутренних id аккаунтов."""
 
+from dataclasses import dataclass
+
 from reader.dm_campaigns.border import CHECKPOINT_TITLES, BorderPolicy, checkpoints_in
 from reader.dm_campaigns.context import DraftContext
 from reader.dm_campaigns.models import DmCampaign
@@ -543,6 +545,7 @@ def build_classification_text(outreach: DmOutreach, context: DraftContext) -> st
 def build_user_text(
     outreach: DmOutreach, campaign: DmCampaign, context: DraftContext,
     *, allowed_resources: tuple[str, ...] | None = None, border_policy: BorderPolicy | None = None,
+    sender: SenderPersona | None = None, sender_known: bool = False,
 ) -> str:
     """allowed_resources — уже отобранные по стране группы и смыслу
     вопроса (см. reader/dm_campaigns/resources.py); None — ресурсы кампании."""
@@ -596,4 +599,37 @@ def build_user_text(
         if campaign.follow_up_enabled else "выключен (follow_up_message = null)"
     )
     sections.append(f"FOLLOW-UP\n{follow_up}")
+    if sender is not None or sender_known:
+        sections.append(sender_block(sender))
     return "\n\n".join(sections)
+
+
+@dataclass(frozen=True)
+class SenderPersona:
+    """Ожидаемый отправитель черновика (первый по текущему порядку выбора);
+    при отправке он может смениться (доступ к источнику, лимиты, блокировки)."""
+    username: str
+    gender: str | None  # "male" / "female" / None — неизвестно
+
+
+_NEUTRAL_RULE = (
+    "Prefer gender-neutral phrasing where natural, because delivery may fall back to another sender "
+    "(«могу подсказать», «рекомендую», «обычно проверяю», «можно оформить» instead of «пользовался», "
+    "«ездил», «покупал»)."
+)
+
+
+def sender_block(sender: SenderPersona | None) -> str:
+    if sender is None or sender.gender not in ("male", "female"):
+        return (
+            "SENDER\nThe sender's gender is unknown. Do not use gendered first-person past-tense forms in "
+            "Russian (оформлял/оформляла, проверял/проверяла, ездил/ездила, покупал/покупала): rephrase "
+            f"gender-neutrally. {_NEUTRAL_RULE}"
+        )
+    forms = ("я оформляла, я проверяла, я ездила" if sender.gender == "female"
+             else "я оформлял, я проверял, я ездил")
+    return (
+        f"SENDER\nThe reply will be sent from {sender.username}.\nSender gender: {sender.gender}.\n"
+        "When speaking in the first person in Russian, use grammatical forms matching the sender "
+        f"({forms}). {_NEUTRAL_RULE}"
+    )

@@ -96,7 +96,9 @@ def test_personal_when_is_relative_to_purchase_date(today, when):
 
 def test_old_purchase_has_no_stale_relative_word():
     line = tplgee_line("Как очередь?", (), seed=0, today=date(2027, 1, 1))
-    assert "я оформлял тут: @tplgee" in line and "позавчера" not in line and "вчера" not in line
+    assert "мне оформили тут: @tplgee" in line and "позавчера" not in line and "вчера" not in line
+    male = tplgee_line("Как очередь?", (), seed=0, today=date(2027, 1, 1), sender_gender="male")
+    assert "я оформлял тут: @tplgee" in male
 
 
 def test_purchase_date_is_configurable():

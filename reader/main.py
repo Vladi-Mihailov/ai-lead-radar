@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import sys
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -29,12 +30,16 @@ from reader.commands.insurance_ocr import InsuranceOcrCommand  # noqa: E402
 from reader.core.engine import MatchEngine  # noqa: E402
 from reader.core.pipeline import Pipeline  # noqa: E402
 from reader.dm_campaigns.context import DmContextBuilder  # noqa: E402
+from reader.dm_campaigns.draft_prompt import SenderPersona  # noqa: E402
 from reader.dm_campaigns.draft_service import DmDraftService  # noqa: E402
 from reader.dm_campaigns.observer import DmOutreachObserver  # noqa: E402
 from reader.dm_campaigns.outreach_repository import DmOutreachRepository  # noqa: E402
 from reader.dm_campaigns.processor import DmDraftProcessor  # noqa: E402
 from reader.dm_campaigns.recent_messages import RecentMessageRepository  # noqa: E402
 from reader.dm_campaigns.repository import DmCampaignRepository  # noqa: E402
+from reader.dm_campaigns.sender_client import build_session_exists  # noqa: E402
+from reader.dm_campaigns.sender_selection import SenderSelector  # noqa: E402
+from reader.dm_campaigns.sender_state import DmSenderStateRepository  # noqa: E402
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
 from reader.fines.notification_coordinator import FineNotificationCoordinator  # noqa: E402
@@ -43,6 +48,7 @@ from reader.fines.police_ge_session import PoliceGeSession  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
 from reader.fines.translation import FineTranslationService  # noqa: E402
 from reader.groups import Group, GroupLoadError, load_groups  # noqa: E402
+from reader.inviter.repository import TelegramAccountRepository  # noqa: E402
 from reader.jobs.archive_fine_job import ArchiveFineJob  # noqa: E402
 from reader.jobs.fine_job import FineJob  # noqa: E402
 from reader.jobs.notification_flush_job import NotificationFlushJob  # noqa: E402
@@ -447,6 +453,22 @@ def build_dm_outreach_components(
         fresh_context_hours=dm.fresh_context_hours,
         max_evidence_messages=dm.max_evidence_messages,
     )
+    # Ожидаемый отправитель (тот же порядок выбора, что и preview; только БД,
+    # без сети) — для формы речи от первого лица в черновике.
+    account_repository = TelegramAccountRepository(db_path)
+    sender_states = DmSenderStateRepository(db_path)
+    sender_selection = SenderSelector(
+        outreach_repository, campaign_repository, account_repository, sender_states,
+        session_exists=build_session_exists(PROJECT_ROOT),
+    )
+
+    def sender_persona(item) -> SenderPersona | None:
+        account = sender_selection.expected_sender(item, datetime.now(timezone.utc), cap=dm.sender_daily_cap)
+        if account is None:
+            return None
+        persona = dm.sender_personas.get(account.id)
+        return SenderPersona(username=account.name, gender=persona.gender if persona else None)
+
     processor = DmDraftProcessor(
         outreach_repository, campaign_repository, recent_repository, context_builder,
         DmDraftService(api_key=settings.ocr.openai_api_key, model=dm.model),
@@ -455,8 +477,11 @@ def build_dm_outreach_components(
         retention_hours=dm.recent_message_retention_hours,
         group_resource_regions={str(g.identifier): g.resource_region for g in groups},
         tplgee_purchase_date=dm.tplgee_purchase_date,
+        sender_persona=sender_persona,
     )
-    return observer, processor, [campaign_repository, outreach_repository, recent_repository]
+    return observer, processor, [campaign_repository, outreach_repository, recent_repository,
+                                 account_repository, sender_states]
+
 
 
 def resolve_telegram_sink_recipients(

@@ -2,6 +2,7 @@ import os
 import re
 from datetime import date, time
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from dotenv import load_dotenv
@@ -330,6 +331,10 @@ class InviterAdminBotSettings(BaseModel):
     trusted_admin_user_ids: list[int] = Field(default_factory=list)
 
 
+class SenderPersonaSettings(BaseModel):
+    gender: Literal["male", "female"]
+
+
 class DmOutreachSettings(BaseModel):
     """ЛС-кампании, Phase 2 (reader/dm_campaigns/): генерация ЧЕРНОВИКОВ в
     процессе Reader, ничего не отправляется. Секция dm_outreach в
@@ -359,6 +364,13 @@ class DmOutreachSettings(BaseModel):
     # Дата последнего личного оформления через @tplgee (факт от оператора): из
     # неё считается «я вчера / позавчера / несколько дней назад оформлял».
     tplgee_purchase_date: date = date(2026, 10, 5)
+    # Пол отправителя по telegram_accounts.id — для формы речи от первого
+    # лица в черновике («оформлял» / «оформляла»). Нет в списке — без рода.
+    sender_personas: dict[int, SenderPersonaSettings] = Field(default_factory=lambda: {
+        14: SenderPersonaSettings(gender="female"),  # @alenaogir
+        1: SenderPersonaSettings(gender="male"),     # @vladimihailov
+        15: SenderPersonaSettings(gender="male"),    # @Vladi_mihailov
+    })
 
 
 class Settings(BaseModel):

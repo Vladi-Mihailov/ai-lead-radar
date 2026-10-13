@@ -40,6 +40,7 @@ from reader.dm_campaigns.draft_models import (
 from reader.dm_campaigns.draft_prompt import (
     EXPERT_CAMPAIGNS,
     INTENT_CLASSIFIER_PROMPT,
+    SenderPersona,
     build_classification_text,
     build_user_text,
     reply_to_other,
@@ -152,10 +153,14 @@ class DmDraftProcessor:
         generation_timeout_seconds: float = 90.0,
         group_resource_regions: dict[str, str] | None = None,
         tplgee_purchase_date: date = TPLGEE_PERSONAL_PURCHASE_DATE,
+        sender_persona: Callable[[DmOutreach], SenderPersona | None] | None = None,
         clock: Callable[[], datetime] = _utcnow,
         monotonic: Callable[[], float] = time.monotonic,
     ):
         self._tplgee_purchase_date = tplgee_purchase_date
+        # None — ожидаемый отправитель не определяется (prompt прежний,
+        # подвал — без рода).
+        self._sender_persona = sender_persona
         self._outreach = outreach_repository
         self._campaigns = campaign_repository
         self._recent = recent_repository
@@ -251,6 +256,7 @@ class DmDraftProcessor:
             campaign.resources, resource_region=region, intent_text=intent_text, campaign_key=campaign.key,
         )
         replies = [i.text for i in context.discussion if i.ref.startswith("R")]
+        sender = self._expected_sender(row)
         border_policy = None
         validation_resources = resources
         if campaign.key in REPLY_POLICY_CAMPAIGNS:
@@ -267,7 +273,8 @@ class DmDraftProcessor:
                 # Оба ресурса — в КАЖДОМ готовом черновике всех трёх кампаний;
                 # формулировка варьируется по id строки (стабильно для черновика).
                 cta=resource_footer(row.source_text, replies, campaign_resources=campaign.resources, seed=row.id,
-                                    today=now.date(), purchased=self._tplgee_purchase_date),
+                                    today=now.date(), purchased=self._tplgee_purchase_date,
+                                    sender_gender=sender.gender if sender else None),
                 question_text=row.source_text,
                 side_topics_asked=side_topics(row.source_text),
                 context_text=" ".join(
@@ -305,6 +312,9 @@ class DmDraftProcessor:
             # Лид, но тема не этой кампании (посылка в border_queue, продукты на
             # таможне…) — без генерации; детерминированно, без OpenAI. Тему
             # insurance уже проверил страховой префильтр observer.
+            if self._sender_persona is not None:
+                intent_audit["expected_sender"] = sender.username if sender else None
+                intent_audit["sender_gender"] = sender.gender if sender else None
             intent_audit["campaign_relevant"] = campaign.key not in ROUTABLE_CAMPAIGNS or campaign_relevant(
                 campaign.key, row.source_text, replies, place_hint=place_hint(row.source_chat_identifier, replies),
             )
@@ -330,7 +340,8 @@ class DmDraftProcessor:
                 output = await asyncio.wait_for(
                     self._service.generate(
                         build_user_text(row, campaign, context, allowed_resources=resources,
-                                        border_policy=border_policy),
+                                        border_policy=border_policy, sender=sender,
+                                        sender_known=self._sender_persona is not None),
                         instructions=system_prompt_for(campaign.key),
                         text_format=DmDraftOutput,
                     ),
@@ -382,7 +393,8 @@ class DmDraftProcessor:
             try:
                 output = await asyncio.wait_for(
                     self._service.generate(
-                        build_user_text(row, campaign, context, allowed_resources=resources, border_policy=border_policy)
+                        build_user_text(row, campaign, context, allowed_resources=resources, border_policy=border_policy,
+                                        sender=sender, sender_known=self._sender_persona is not None)
                         + f"\n\nПРЕДЫДУЩИЙ ЧЕРНОВИК ОТКЛОНЁН ПРОВЕРКОЙ: {hint} Напиши заново, исправив это.",
                         instructions=system_prompt_for(campaign.key),
                         text_format=DmDraftOutput,
@@ -422,6 +434,15 @@ class DmDraftProcessor:
             note=decision.error if decision.kind == "invalid" else None,
         )
         return True
+
+    def _expected_sender(self, row: DmOutreach) -> SenderPersona | None:
+        if self._sender_persona is None:
+            return None
+        try:
+            return self._sender_persona(row)
+        except Exception as exc:  # noqa: BLE001 — без отправителя: нейтральная форма
+            logger.warning("dm_outreach id=%s: ожидаемый отправитель не определён (%s)", row.id, type(exc).__name__)
+            return None
 
     @staticmethod
     def _log(row: DmOutreach, status: str, *, campaign_key: str | None = None, context_count: int | None = None,
