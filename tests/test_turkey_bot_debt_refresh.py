@@ -256,8 +256,12 @@ async def test_confirm_runs_refresh_and_returns_simplified_summary():
     reply = await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
 
     assert "🔄 Проверка завершена" in reply.text
-    assert "Проверено: 1" in reply.text
-    assert "⚠️ Не удалось проверить: 0" in reply.text
+    assert "✅ Проверено: 1" in reply.text
+    # См. задачу "Turkey debt-refresh counter/UI fix" — при нулевых
+    # partial/error ⚠️/❌ строки не показываются вовсе (раньше "⚠️ Не
+    # удалось проверить: 0" показывалось всегда).
+    assert "⚠️" not in reply.text
+    assert "❌" not in reply.text
     assert "Задолженность погашена" not in reply.text
     assert "Задолженность осталась" not in reply.text
     assert "Было" not in reply.text
@@ -265,6 +269,34 @@ async def test_confirm_runs_refresh_and_returns_simplified_summary():
     assert "🚨 Задолженность по последней проверке" in reply.text
     assert "Автомобилей: 0" in reply.text
     assert "AA001AA" not in reply.text
+
+
+async def test_confirm_summary_counts_unique_plates_not_owner_rows():
+    """Регрессионный тест по задаче "Turkey debt-refresh counter/UI fix" —
+    9 уникальных физических plates, по 2 owners на каждый (18 owner-строк
+    суммарно), все provider checks успешны. Summary должен показать
+    "Проверено: 9", а НЕ "Проверено: 18" (старый баг — see "Со штрафами:
+    10"/"Проверено: 20" в production)."""
+    fx = _Fixture(poison_check_service=False)
+    fx.check_service = _make_check_service(gib_amount=Decimal(500))
+    fx.debt_refresh._check_service = fx.check_service
+
+    plates = [f"AA{i:03d}AA" for i in range(9)]
+    owner_id = 1
+    for plate in plates:
+        for _ in range(2):  # 2 owners на plate -> 18 owner-строк, 9 plates
+            fx.add_car(telegram_user_id=owner_id, car_number=plate)
+            await fx.seed(telegram_user_id=owner_id, plate=plate, amount=Decimal(500))
+            owner_id += 1
+
+    reply = await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
+
+    assert "✅ Проверено: 9" in reply.text
+    assert "Проверено: 18" not in reply.text
+    assert "⚠️" not in reply.text
+    assert "❌" not in reply.text
+    full_text = "\n".join((reply.text, *reply.extra_texts))
+    assert "Автомобилей: 9" in full_text  # долг остался (GİB по-прежнему has_debt=500 на каждый plate)
 
 
 async def test_confirm_row_format_is_car_colon_owner_colon_amount():

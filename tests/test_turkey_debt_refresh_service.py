@@ -325,6 +325,101 @@ async def test_partial_result_is_stored_and_marked_incomplete_in_summary(fx):
     assert rows[0].total_amount == Decimal(900)
 
 
+# ---- Unique-plate outcome counters (задача "Turkey debt-refresh
+# counter/UI fix") ----
+
+
+async def test_outcome_counts_plate_once_even_with_multiple_owners(fx):
+    fx.add_car(telegram_user_id=1, car_number="AA001AA")
+    fx.add_car(telegram_user_id=2, car_number="AA001AA")
+    await fx.seed(telegram_user_id=1, plate="AA001AA", amount=Decimal(500))
+    await fx.seed(telegram_user_id=2, plate="AA001AA", amount=Decimal(500))
+    fx.debt_refresh._check_service = _make_check_service(gib=Decimal(500))
+
+    outcome = await fx.debt_refresh.refresh()
+
+    assert outcome.total_plates == 1
+    assert outcome.successful_plates == 1
+    assert outcome.partial_plates == 0
+    assert outcome.error_plates == 0
+    assert outcome.checked == 2  # owner-row семантика (persistence) не меняется
+
+
+async def test_outcome_partial_counts_one_unique_plate(fx):
+    fx.add_car(telegram_user_id=1, car_number="AA001AA")
+    await fx.seed(telegram_user_id=1, plate="AA001AA", amount=Decimal(500))
+    fx.debt_refresh._check_service = _make_check_service(gib_error=True, kgm=Decimal(900))
+
+    outcome = await fx.debt_refresh.refresh()
+
+    assert outcome.total_plates == 1
+    assert outcome.partial_plates == 1
+    assert outcome.partial_car_numbers == ("AA001AA",)
+    assert outcome.successful_plates == 0
+    assert outcome.error_plates == 0
+
+
+async def test_outcome_error_counts_one_unique_plate(fx):
+    fx.add_car(telegram_user_id=1, car_number="AA001AA")
+    await fx.seed(telegram_user_id=1, plate="AA001AA", amount=Decimal(2740))
+    fx.debt_refresh._check_service = _make_check_service(gib_error=True, avrasya_error=True, kgm_error=True)
+
+    outcome = await fx.debt_refresh.refresh()
+
+    assert outcome.total_plates == 1
+    assert outcome.error_plates == 1
+    assert outcome.error_car_numbers == ("AA001AA",)
+    assert outcome.successful_plates == 0
+    assert outcome.partial_plates == 0
+
+
+async def test_outcome_partial_plate_with_three_owners_still_counts_once(fx):
+    for uid in (1, 2, 3):
+        fx.add_car(telegram_user_id=uid, car_number="AA001AA")
+        await fx.seed(telegram_user_id=uid, plate="AA001AA", amount=Decimal(500))
+    fx.debt_refresh._check_service = _make_check_service(gib_error=True, kgm=Decimal(900))
+
+    outcome = await fx.debt_refresh.refresh()
+
+    assert outcome.total_plates == 1
+    assert outcome.partial_plates == 1
+    assert outcome.error_plates == 0
+    assert outcome.checked == 3  # owner-row семантика (persistence) не меняется
+
+
+async def test_outcome_mixed_plates_classified_independently(fx):
+    """Один plate успешен, один PARTIAL, один ERROR — каждый посчитан
+    РОВНО один раз в своей категории, independently от числа owners."""
+    fx.add_car(telegram_user_id=1, car_number="AA001AA")
+    fx.add_car(telegram_user_id=2, car_number="BB002BB")
+    fx.add_car(telegram_user_id=3, car_number="CC003CC")
+    await fx.seed(telegram_user_id=1, plate="AA001AA", amount=Decimal(100))
+    await fx.seed(telegram_user_id=2, plate="BB002BB", amount=Decimal(200))
+    await fx.seed(telegram_user_id=3, plate="CC003CC", amount=Decimal(300))
+
+    _PER_PLATE_BEHAVIOR = {
+        "AA001AA": {"gib": Decimal(50)},  # success
+        "BB002BB": {"gib_error": True, "kgm": Decimal(900)},  # partial
+        "CC003CC": {"gib_error": True, "avrasya_error": True, "kgm_error": True},  # error
+    }
+
+    class _SwitchingCheckService:
+        async def check(self, plate, **kwargs):
+            service = _make_check_service(**_PER_PLATE_BEHAVIOR[plate])
+            return await service.check(plate, **kwargs)
+
+    fx.debt_refresh._check_service = _SwitchingCheckService()
+
+    outcome = await fx.debt_refresh.refresh()
+
+    assert outcome.total_plates == 3
+    assert outcome.successful_plates == 1
+    assert outcome.partial_plates == 1
+    assert outcome.error_plates == 1
+    assert outcome.partial_car_numbers == ("BB002BB",)
+    assert outcome.error_car_numbers == ("CC003CC",)
+
+
 # ---- Avrasya/KGM double-counting (задача TESTS п.11-12) ----
 
 
