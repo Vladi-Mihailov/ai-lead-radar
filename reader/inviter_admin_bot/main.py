@@ -16,6 +16,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient
 
+from reader.dm_campaigns.feedback import DmFeedbackRepository
 from reader.dm_campaigns.outreach_repository import DmOutreachRepository
 from reader.dm_campaigns.repository import DmCampaignRepository
 from reader.dm_campaigns.send_service import DmSendService
@@ -124,12 +125,16 @@ async def run() -> None:
     # оператора (DmSendService), фонового отправителя нет.
     dm_outreach_repository = DmOutreachRepository(settings.app.users_db_file)
     dm_sender_states = DmSenderStateRepository(settings.app.users_db_file)
+    # Feedback learning: пример пишется только после успешной отправки
+    # (копится всегда; в prompt — только при dm_outreach.feedback_learning_enabled).
+    dm_feedback = DmFeedbackRepository(settings.app.users_db_file)
     dm_send_service = DmSendService(
         dm_outreach_repository, dm_campaign_repository, account_repository, dm_sender_states,
         client_factory=build_sender_client_factory(settings.telegram.api_id, settings.telegram.api_hash, PROJECT_ROOT),
         session_exists=build_session_exists(PROJECT_ROOT),
         recipient_cooldown=timedelta(days=settings.dm_outreach.recipient_cooldown_days),
         sender_daily_cap=settings.dm_outreach.sender_daily_cap,
+        feedback_repository=dm_feedback,
     )
 
     def dm_sender_label(account_id: int) -> str | None:
@@ -177,6 +182,7 @@ async def run() -> None:
             notifier_task.cancel()
         dm_outreach_repository.close()
         dm_sender_states.close()
+        dm_feedback.close()
         account_repository.close()
         campaign_repository.close()
         invite_repository.close()

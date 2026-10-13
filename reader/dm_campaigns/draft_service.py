@@ -66,3 +66,12 @@ class DmDraftService:
             except OpenAIError as exc:
                 logger.warning("dm_outreach: OpenAI provider error (%s)", type(exc).__name__)
                 raise DmDraftServiceError("provider error") from exc
+
+    async def embed(self, texts: list[str], model: str) -> list[list[float]]:
+        """Embeddings для feedback learning (тексты не логируются)."""
+        try:
+            response = await self._client.embeddings.create(model=model, input=[t[:2000] for t in texts])
+        except OpenAIError as exc:
+            logger.warning("dm_outreach: OpenAI embeddings error (%s)", type(exc).__name__)
+            raise DmDraftServiceError("embeddings error") from exc
+        return [list(item.embedding) for item in sorted(response.data, key=lambda d: d.index)]

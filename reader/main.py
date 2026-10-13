@@ -32,6 +32,7 @@ from reader.core.pipeline import Pipeline  # noqa: E402
 from reader.dm_campaigns.context import DmContextBuilder  # noqa: E402
 from reader.dm_campaigns.draft_prompt import SenderPersona  # noqa: E402
 from reader.dm_campaigns.draft_service import DmDraftService  # noqa: E402
+from reader.dm_campaigns.feedback import DmFeedbackRepository, FeedbackRetriever  # noqa: E402
 from reader.dm_campaigns.observer import DmOutreachObserver  # noqa: E402
 from reader.dm_campaigns.outreach_repository import DmOutreachRepository  # noqa: E402
 from reader.dm_campaigns.processor import DmDraftProcessor  # noqa: E402
@@ -469,19 +470,28 @@ def build_dm_outreach_components(
         persona = dm.sender_personas.get(account.id)
         return SenderPersona(username=account.name, gender=persona.gender if persona else None)
 
+    draft_service = DmDraftService(api_key=settings.ocr.openai_api_key, model=dm.model)
+    closables = [campaign_repository, outreach_repository, recent_repository, account_repository, sender_states]
+    feedback_retriever = None
+    if dm.feedback_learning_enabled:
+        feedback_repository = DmFeedbackRepository(db_path)
+        closables.append(feedback_repository)
+        feedback_retriever = FeedbackRetriever(
+            feedback_repository, draft_service.embed, max_examples=dm.feedback_learning_max_examples,
+            candidate_limit=dm.feedback_learning_candidate_limit, model=dm.feedback_learning_embedding_model,
+        )
+    logger.info("dm_outreach feedback learning: %s", "enabled" if feedback_retriever else "disabled")
     processor = DmDraftProcessor(
-        outreach_repository, campaign_repository, recent_repository, context_builder,
-        DmDraftService(api_key=settings.ocr.openai_api_key, model=dm.model),
+        outreach_repository, campaign_repository, recent_repository, context_builder, draft_service,
         interval_seconds=dm.draft_processor_interval_seconds,
         drafting_recovery_seconds=dm.drafting_recovery_seconds,
         retention_hours=dm.recent_message_retention_hours,
         group_resource_regions={str(g.identifier): g.resource_region for g in groups},
         tplgee_purchase_date=dm.tplgee_purchase_date,
         sender_persona=sender_persona,
+        feedback_retriever=feedback_retriever,
     )
-    return observer, processor, [campaign_repository, outreach_repository, recent_repository,
-                                 account_repository, sender_states]
-
+    return observer, processor, closables
 
 
 def resolve_telegram_sink_recipients(

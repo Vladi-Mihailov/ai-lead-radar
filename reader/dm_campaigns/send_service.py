@@ -160,6 +160,7 @@ class DmSendService:
         recipient_cooldown: timedelta,
         sender_daily_cap: int | None,
         clock: Callable[[], datetime] = _utcnow,
+        feedback_repository=None,  # reader.dm_campaigns.feedback.DmFeedbackRepository
     ):
         self._outreach = outreach_repository
         self._campaigns = campaign_repository
@@ -175,6 +176,7 @@ class DmSendService:
         )
         self._clock = clock
         self._lock = asyncio.Lock()
+        self._feedback = feedback_repository
 
     # ---------------- проверки без сети ----------------
 
@@ -293,7 +295,8 @@ class DmSendService:
                 return SendOutcome(KIND_BLOCKED, reason=problem, sender_label=label)
             stage = "send"
             message = await client.send_message(peer, item.primary_text)
-            self._outreach.mark_sent(item.id, now=self._clock(), telegram_message_id=getattr(message, "id", None))
+            if self._outreach.mark_sent(item.id, now=self._clock(), telegram_message_id=getattr(message, "id", None)):
+                self._record_feedback(item.id)
             return SendOutcome(KIND_SENT, sender_label=label)
         except errors.FloodWaitError as exc:
             now = self._clock()
@@ -332,6 +335,20 @@ class DmSendService:
                 await client.disconnect()
             except Exception:  # noqa: BLE001
                 logger.warning("dm send: не удалось корректно отключить клиент отправителя")
+
+    def _record_feedback(self, outreach_id: int) -> None:
+        """Пример для feedback learning — только после mark_sent. Любой сбой
+        здесь не влияет на исход отправки (сообщение уже ушло)."""
+        if self._feedback is None:
+            return
+        try:
+            item = self._outreach.get(outreach_id)
+            campaign = self._campaigns.get_campaign(item.campaign_id) if item is not None else None
+            if item is None or campaign is None or item.sent_at is None:
+                return
+            self._feedback.record_sent(item, campaign_key=campaign.key, sent_at=item.sent_at, now=self._clock())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("dm_outreach id=%s: не удалось сохранить feedback (%s)", outreach_id, type(exc).__name__)
 
     async def _resolve(self, client, item: DmOutreach):
         """(peer, None) либо (None, причина blocked). FloodWait/PeerFlood и
