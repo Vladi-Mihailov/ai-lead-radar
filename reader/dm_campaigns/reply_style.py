@@ -51,8 +51,20 @@ def personal_when(today: date, purchased: date = TPLGEE_PERSONAL_PURCHASE_DATE) 
     return ""
 
 
-def _i_did(when: str) -> str:
-    return f"я {when} оформлял" if when else "я оформлял"
+GENDER_FEMALE = "female"
+GENDER_MALE = "male"
+
+
+def _i_did(when: str, gender: str | None = None) -> str:
+    """Форма — по полу ожидаемого отправителя; пол неизвестен — без рода
+    («мне вчера оформили»), чтобы не ошибиться при смене отправителя."""
+    if gender == GENDER_FEMALE:
+        verb = "оформляла"
+    elif gender == GENDER_MALE:
+        verb = "оформлял"
+    else:
+        return f"мне {when} оформили" if when else "мне оформили"
+    return f"я {when} {verb}" if when else f"я {verb}"
 
 
 _ARMENIA_RE = re.compile(r"армени|ереван|armenia", _I)
@@ -62,9 +74,9 @@ _IN_GEORGIA_RE = re.compile(
 
 
 def tplgee_line(source_text: str, reply_texts: Iterable[str], *, seed: int, today: date,
-                purchased: date = TPLGEE_PERSONAL_PURCHASE_DATE) -> str:
+                purchased: date = TPLGEE_PERSONAL_PURCHASE_DATE, sender_gender: str | None = None) -> str:
     texts = [source_text or "", *reply_texts]
-    did = _i_did(personal_when(today, purchased))
+    did = _i_did(personal_when(today, purchased), sender_gender)
     if is_non_auto_insurance_text(source_text or ""):
         # вопрос только о медстраховке: @tplgee — явно про АВТОстраховку
         return f"Если едете на машине, автостраховку {did} тут: {TPLGEE}."
@@ -93,14 +105,16 @@ def protocol_line(*, seed: int) -> str:
 
 
 def resource_footer(source_text: str, reply_texts: Iterable[str], *, campaign_resources: Iterable[str], seed: int,
-                    today: date, purchased: date = TPLGEE_PERSONAL_PURCHASE_DATE) -> tuple[str, ...]:
+                    today: date, purchased: date = TPLGEE_PERSONAL_PURCHASE_DATE,
+                    sender_gender: str | None = None) -> tuple[str, ...]:
     """Обязательный подвал insurance / fuel / border_queue: оба ресурса (из
     настроек кампании), 1–2 коротких предложения."""
     replies = tuple(reply_texts)
     handles = {r.strip().lstrip("@").lower() for r in campaign_resources}
     lines = []
     if TPLGEE.lstrip("@").lower() in handles:
-        lines.append(tplgee_line(source_text, replies, seed=seed, today=today, purchased=purchased))
+        lines.append(tplgee_line(source_text, replies, seed=seed, today=today, purchased=purchased,
+                                 sender_gender=sender_gender))
     if PROTOCOL_GE.lstrip("@").lower() in handles:
         lines.append(protocol_line(seed=seed))
     return tuple(lines)

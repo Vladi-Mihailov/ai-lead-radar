@@ -59,7 +59,13 @@ from reader.dm_campaigns.sendability import (
     SENDABILITY_PREMIUM_REQUIRED,
     SENDABILITY_SOURCE_MESSAGE,
     SENDABILITY_USERNAME,
-    dm_sender_eligible,
+)
+from reader.dm_campaigns.sender_selection import (  # noqa: F401 — коды причин реэкспортируются
+    DAILY_LIMIT,
+    NO_ELIGIBLE_SENDER,
+    NO_PREMIUM_SENDER,
+    SENDER_FLOOD_WAIT,
+    SenderSelector,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,11 +77,7 @@ NOT_DRAFT = "not_draft"
 CAMPAIGN_NOT_MANUAL = "campaign_not_manual"
 NO_RECIPIENT = "no_recipient"
 NO_TEXT = "no_text"
-NO_ELIGIBLE_SENDER = "no_eligible_sender"
-NO_PREMIUM_SENDER = "no_eligible_premium_sender"
 RECENT_DM = "blocked_recent_dm"
-DAILY_LIMIT = "daily_limit_reached"
-SENDER_FLOOD_WAIT = "sender_flood_wait"
 SENDER_UNAUTHORIZED = "sender_session_unauthorized"
 NOT_IN_SOURCE_CHAT = "sender_not_in_source_chat"
 NO_SENDER_FOR_SOURCE = "no_eligible_sender_for_source"
@@ -108,8 +110,6 @@ _SOURCE_CHAT_ERRORS = (
     errors.MsgIdInvalidError, errors.ChatAdminRequiredError, errors.UserNotParticipantError,
 )
 _TRANSPORT_ERRORS = (ConnectionError, OSError, asyncio.TimeoutError, asyncio.IncompleteReadError)
-
-_DAY = timedelta(hours=24)
 
 # Итог действия оператора.
 KIND_READY = "ready"            # проверки пройдены, ждём подтверждения
@@ -169,6 +169,10 @@ class DmSendService:
         self._session_exists = session_exists
         self._cooldown = recipient_cooldown
         self._cap = sender_daily_cap
+        self._selector = SenderSelector(
+            outreach_repository, campaign_repository, account_repository, sender_states,
+            session_exists=session_exists,
+        )
         self._clock = clock
         self._lock = asyncio.Lock()
 
@@ -210,37 +214,9 @@ class DmSendService:
         return False
 
     def _select_sender(self, item: DmOutreach, campaign, now: datetime) -> Plan:
-        usable = []
-        for entry in self._campaigns.list_campaign_accounts(campaign.id):
-            account = self._accounts.get(entry.account_id)
-            if account is None or account.is_old or not dm_sender_eligible(account, item.sendability):
-                continue
-            if account.blocked_until is not None and account.blocked_until > now:
-                continue
-            state = self._states.get(account.id)
-            if state.blocked_reason or not self._session_exists(account):
-                continue
-            usable.append((account, entry, state))
-        if not usable:
-            return Plan(NO_PREMIUM_SENDER if item.sendability == SENDABILITY_PREMIUM_REQUIRED else NO_ELIGIBLE_SENDER)
-
-        awake = [u for u in usable if not (u[2].flood_wait_until and u[2].flood_wait_until > now)]
-        if not awake:
-            return Plan(SENDER_FLOOD_WAIT)
-
-        candidates = []
-        for account, entry, _ in awake:
-            total = self._outreach.sends_since(sender_account_id=account.id, since=now - _DAY)
-            if self._cap and total >= self._cap:  # None/0 — общий потолок выключен
-                continue
-            if entry.daily_limit is not None and self._outreach.sends_since(
-                sender_account_id=account.id, since=now - _DAY, campaign_id=campaign.id,
-            ) >= entry.daily_limit:
-                continue
-            candidates.append((total, account.id, account))
-        if not candidates:
-            return Plan(DAILY_LIMIT)
-        ranked = tuple(c[2] for c in sorted(candidates, key=lambda c: (c[0], c[1])))
+        reason, ranked = self._selector.rank(item, campaign, now, cap=self._cap)
+        if reason:
+            return Plan(reason)
         return Plan(None, sender=ranked[0], candidates=ranked)
 
     # ---------------- действия оператора ----------------
