@@ -156,6 +156,41 @@ _USER_CAMPAIGN_INVITES_COLUMN_MIGRATIONS = {
     "next_attempt_at": "ALTER TABLE user_campaign_invites ADD COLUMN next_attempt_at TIMESTAMP",
 }
 
+# Факт реальной invite RPC (InviteToChannelRequest/AddChatUserRequest) для
+# пары (кампания, пользователь, ПРИГЛАШАЮЩИЙ аккаунт): одна строка на пару,
+# вставляется атомарно ДО отправки (claim, INSERT OR IGNORE) — один аккаунт
+# никогда не приглашает одного и того же кандидата в одну кампанию дважды,
+# в т.ч. после рестарта и при параллельных тиках. Другой аккаунт того же
+# кандидата по-прежнему может пробовать. Отказы ДО RPC (блокировка аккаунта,
+# лимиты, резолв identity) claim не создают; FloodWait на самой RPC (Telegram
+# запрос не выполнил) claim снимает.
+_INVITE_ATTEMPTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS invite_attempts (
+    campaign_id  INTEGER NOT NULL,
+    user_id      INTEGER NOT NULL,
+    account_id   INTEGER NOT NULL,
+    claimed_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (campaign_id, user_id, account_id)
+)
+"""
+
+# Одноразовое заполнение при создании таблицы: каждая уже записанная попытка,
+# дошедшая до invite RPC. Не попытка: отказ ДО неё (failure_kind
+# 'unresolved' — резолв identity) и ограничения аккаунта ('account'), КРОМЕ
+# PeerFlood — Telegram ответил на саму invite RPC (str(PeerFloodError)
+# начинается с "Too many requests"). FloodWait ("A wait of N seconds…") и
+# ChatWriteForbidden ("You can't write in this chat…" — нет доступа к target)
+# попыткой не считаются.
+_INVITE_ATTEMPTS_BACKFILL = """
+INSERT OR IGNORE INTO invite_attempts (campaign_id, user_id, account_id, claimed_at)
+SELECT campaign_id, user_id, account_id, MIN(created_at)
+FROM user_campaign_invites
+WHERE account_id IS NOT NULL
+  AND NOT (status = 'failed' AND failure_kind = 'unresolved')
+  AND NOT (status = 'failed' AND failure_kind = 'account' AND COALESCE(error, '') NOT LIKE 'Too many requests%')
+GROUP BY campaign_id, user_id, account_id
+"""
+
 _USER_CAMPAIGN_INVITES_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_user_campaign_invites_user_id "
     "ON user_campaign_invites (user_id)",
@@ -363,6 +398,18 @@ _CANDIDATES_BASE_WHERE = _LEADS_WHERE + """
               AND ra.campaign_id = :campaign_id
               AND ra.account_id = :account_id
               AND ra.failure_kind = 'unresolved'
+        )
+    )
+    -- Этот аккаунт уже делал invite RPC этому кандидату в этой кампании
+    -- (любой исход: pending, CHAT_MEMBER_ADD_FAILED, приватность…) —
+    -- повторно ему не выбирается (см. invite_attempts).
+    AND (
+        :account_id IS NULL
+        OR NOT EXISTS (
+            SELECT 1 FROM invite_attempts ia
+            WHERE ia.campaign_id = :campaign_id
+              AND ia.user_id = u.user_id
+              AND ia.account_id = :account_id
         )
     )
 """
@@ -920,7 +967,37 @@ class UserCampaignInviteRepository:
         self._migrate_missing_columns()
         for statement in _USER_CAMPAIGN_INVITES_INDEXES:
             self._conn.execute(statement)
+        attempts_exist = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'invite_attempts'"
+        ).fetchone()
+        self._conn.execute(_INVITE_ATTEMPTS_SCHEMA)
+        if attempts_exist is None:
+            self._conn.execute(_INVITE_ATTEMPTS_BACKFILL)
         self._conn.commit()
+
+    def claim_attempt(self, campaign_id: int, user_id: int, account_id: int) -> bool:
+        """Атомарно занимает пару для ОДНОЙ invite RPC; False — эта пара
+        уже была (или прямо сейчас занята другим тиком/процессом)."""
+        cursor = self._conn.execute(
+            "INSERT OR IGNORE INTO invite_attempts (campaign_id, user_id, account_id) VALUES (?, ?, ?)",
+            (campaign_id, user_id, account_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
+
+    def release_attempt(self, campaign_id: int, user_id: int, account_id: int) -> None:
+        """Только когда RPC Telegram НЕ выполнил (FloodWait)."""
+        self._conn.execute(
+            "DELETE FROM invite_attempts WHERE campaign_id = ? AND user_id = ? AND account_id = ?",
+            (campaign_id, user_id, account_id),
+        )
+        self._conn.commit()
+
+    def attempted(self, campaign_id: int, user_id: int, account_id: int) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM invite_attempts WHERE campaign_id = ? AND user_id = ? AND account_id = ?",
+            (campaign_id, user_id, account_id),
+        ).fetchone() is not None
 
     def _migrate_missing_columns(self) -> None:
         """CREATE TABLE IF NOT EXISTS не добавляет колонки в уже

@@ -126,6 +126,11 @@ _PENDING_CHECK_LONG_WAIT_SECONDS = 300
 TEST_MODE_MAX_SUCCESSFUL_INVITES = 30
 
 
+# Запас кандидатов сверх limit в одной выборке волны: пара, занятая между
+# выборкой и отправкой (параллельный тик), не должна оставить волну пустой.
+_CLAIM_RESERVE = 3
+
+
 def _choose_invite_pause_seconds() -> float:
     """~_LONG_PAUSE_PROBABILITY (по умолчанию 20%) случаев — длинная пауза
     (_LONG_PAUSE_MIN_SECONDS.._LONG_PAUSE_MAX_SECONDS), иначе — короткая
@@ -1547,15 +1552,21 @@ class InviterService:
         вызывающий код (_execute_account) тогда не выполняет ни проверку
         pending, ни волну добора."""
         raw_candidates = self._invite_repository.select_candidates(
-            campaign.id, limit=limit + len(attempted_user_ids), account_id=account.id,
+            campaign.id, limit=limit + len(attempted_user_ids) + _CLAIM_RESERVE, account_id=account.id,
         )
-        candidates = [c for c in raw_candidates if c.user_id not in attempted_user_ids][:limit]
-        logger.info(_format_candidates_block(campaign, account, candidates, found))
+        candidates = [c for c in raw_candidates if c.user_id not in attempted_user_ids]
+        logger.info(_format_candidates_block(campaign, account, candidates[:limit], found))
+        processed = 0
         for candidate in candidates:
+            if processed >= limit:
+                break
             attempted_user_ids.add(candidate.user_id)
             should_stop = await self._invite_candidate(
                 client, campaign, account, target_entity, candidate, stats,
             )
+            if should_stop is None:
+                continue  # пара уже занята (см. claim_attempt) — следующий кандидат
+            processed += 1
             if should_stop:
                 return True
         return False
@@ -1674,7 +1685,7 @@ class InviterService:
         target_entity,
         candidate: InviteCandidate,
         stats: InviteStats,
-    ) -> bool:
+    ) -> bool | None:
         """Ровно один запрос Telethon на кандидата (InviteToChannelRequest
         или AddChatUserRequest, см. _build_invite_request) — результат
         сохраняется в user_campaign_invites немедленно, независимо от
@@ -1716,6 +1727,17 @@ class InviterService:
             return await self._handle_invite_error(
                 exc, campaign, account, candidate, stats, user_label,
             )
+
+        # Резолв пройден — дальше реальная invite RPC: пара (кампания,
+        # кандидат, аккаунт) занимается в БД ДО отправки. Уже занята (была
+        # попытка раньше / параллельный тик) — RPC не делаем, кандидат не
+        # считается обработанным (None, см. _run_invite_wave).
+        if not self._invite_repository.claim_attempt(campaign.id, candidate.user_id, account.id):
+            logger.info(
+                f"[EXECUTE]\nAccount: {account.name}\nUser: {user_label}\n"
+                f"Этот аккаунт уже приглашал кандидата в эту кампанию — пропуск без запроса."
+            )
+            return None
 
         try:
             request = _build_invite_request(target_entity, input_peer)
@@ -1829,6 +1851,10 @@ class InviterService:
         см. classification.operator_message), иначе False."""
         classification = _classify_invite_error(exc)
         raw_text = str(exc)
+        if isinstance(exc, FloodWaitError):
+            # Telegram запрос не выполнил — это не попытка приглашения:
+            # пара снова доступна этому аккаунту после блокировки.
+            self._invite_repository.release_attempt(campaign.id, candidate.user_id, account.id)
         db_status, stat_field, next_attempt_at = self._apply_retry_policy(
             classification, campaign, account, candidate,
         )
