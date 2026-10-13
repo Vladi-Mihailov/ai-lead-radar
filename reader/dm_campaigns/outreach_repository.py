@@ -478,6 +478,11 @@ class DmOutreachRepository:
         self._conn.commit()
         return cursor.rowcount == 1
 
+    def reassign_sender(self, outreach_id: int, *, sender_account_id: int, now: datetime) -> bool:
+        """Другой отправитель для той же попытки — только пока строка в
+        sending. False — статус уже изменился, отправку продолжать нельзя."""
+        return self._from_sending(outreach_id, now, sender_account_id=sender_account_id)
+
     def _from_sending(self, outreach_id: int, now: datetime, **fields) -> bool:
         assignments = ", ".join(f"{column} = :{column}" for column in fields)
         cursor = self._conn.execute(
