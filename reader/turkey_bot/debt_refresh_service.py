@@ -82,11 +82,30 @@ class TurkeyRefreshOutcome:
     проверить", а актуальный список — из заново перечитанного persisted
     state (см. ConversationController._build_debt_section). failed
     объединяет ERROR И PARTIAL (см. модуль docstring/задачу "PARTIAL": ни
-    то, ни другое не является гарантированно полной проверкой)."""
+    то, ни другое не является гарантированно полной проверкой).
+
+    checked/failed/failed_car_numbers — OWNER-ROW семантика (один и тот же
+    plate у N owners даёт вклад N в checked), нужна persistence-слою/
+    существующим тестам и НЕ предназначена для прямого показа в summary UI
+    (см. задачу "Turkey debt-refresh counter/UI fix" — отображение по
+    owner-row вместо unique plate было самим багом).
+
+    total_plates/successful_plates/partial_plates/error_plates/
+    partial_car_numbers/error_car_numbers — UNIQUE PLATE семантика
+    (каждый физический plate ровно один раз, независимо от числа owners),
+    посчитана из того же by_plate group, что уже строит refresh() для
+    provider-дедупликации — ИМЕННО это summary UI (format_debt_refresh_
+    summary) обязан использовать для "Проверено"/"⚠️"/"❌"."""
 
     checked: int
     failed: int
     failed_car_numbers: tuple[str, ...] = ()
+    total_plates: int = 0
+    successful_plates: int = 0
+    partial_plates: int = 0
+    error_plates: int = 0
+    partial_car_numbers: tuple[str, ...] = ()
+    error_car_numbers: tuple[str, ...] = ()
 
 
 class TurkeyRefreshAlreadyInProgressError(Exception):
@@ -159,6 +178,11 @@ class TurkeyDebtRefreshService:
 
             failed = 0
             failed_car_numbers: list[str] = []
+            successful_plates = 0
+            partial_plates = 0
+            error_plates = 0
+            partial_car_numbers: list[str] = []
+            error_car_numbers: list[str] = []
 
             for index, (plate, rows) in enumerate(by_plate.items()):
                 if index > 0:
@@ -174,6 +198,19 @@ class TurkeyDebtRefreshService:
                     failed += len(rows)
                     failed_car_numbers.append(plate)
 
+                # Unique-plate классификация (см. TurkeyRefreshOutcome
+                # docstring) — ОДИН инкремент на plate, НЕ на owner-row,
+                # ERROR и PARTIAL остаются различимы (см. задачу "Keep
+                # these distinct in UI" — PARTIAL != полный провал).
+                if result.overall_status == OverallStatus.ERROR:
+                    error_plates += 1
+                    error_car_numbers.append(plate)
+                elif result.overall_status == OverallStatus.PARTIAL:
+                    partial_plates += 1
+                    partial_car_numbers.append(plate)
+                else:
+                    successful_plates += 1
+
                 for row in rows:
                     self._runs.save(
                         result, telegram_user_id=row.owner_telegram_user_id,
@@ -187,6 +224,9 @@ class TurkeyDebtRefreshService:
 
             return TurkeyRefreshOutcome(
                 checked=len(candidates), failed=failed, failed_car_numbers=tuple(failed_car_numbers),
+                total_plates=len(by_plate), successful_plates=successful_plates,
+                partial_plates=partial_plates, error_plates=error_plates,
+                partial_car_numbers=tuple(partial_car_numbers), error_car_numbers=tuple(error_car_numbers),
             )
         finally:
             self._in_progress = False

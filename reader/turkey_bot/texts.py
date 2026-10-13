@@ -866,16 +866,38 @@ def format_debt_refresh_summary(outcome: TurkeyRefreshOutcome) -> str:
     ConversationController._build_debt_section), склеиваемый вызывающим
     кодом ПОСЛЕ этого текста, а не здесь (тот же принцип, что и у Georgia,
     см. reader/public_bot/texts.py::format_debt_refresh_summary — единый
-    формат результата для обеих стран)."""
-    lines = [
-        "🔄 Проверка завершена",
-        "",
-        f"Проверено: {outcome.checked}",
-        f"⚠️ Не удалось проверить: {outcome.failed}",
-    ]
-    if outcome.failed_car_numbers:
+    формат результата для обеих стран).
+
+    См. задачу "Turkey debt-refresh counter/UI fix" — считает по UNIQUE
+    physical plate (outcome.successful_plates/partial_plates/error_plates),
+    а НЕ по owner-row (outcome.checked/failed, которые остаются owner-row
+    семантикой для persistence-слоя/других тестов, см. TurkeyRefreshOutcome
+    docstring). При нулевых partial/error ⚠️/❌ строки не показываются
+    вовсе (ранее "⚠️ Не удалось проверить: 0" показывалось всегда — см.
+    задачу). PARTIAL и ERROR остаются различимы: PARTIAL — "⚠️ Проверено
+    частично" (часть провайдеров успешна), ERROR — "❌ Не удалось
+    проверить" (полный провал), один не подменяет другой."""
+    lines = ["🔄 Проверка завершена", ""]
+
+    if outcome.partial_plates == 0 and outcome.error_plates == 0:
+        lines.append(f"✅ Проверено: {outcome.successful_plates}")
+        return "\n".join(lines)
+
+    lines.append(f"✅ Проверено полностью: {outcome.successful_plates}")
+    if outcome.partial_plates:
+        lines.append(f"⚠️ Проверено частично: {outcome.partial_plates}")
+    if outcome.error_plates:
+        lines.append(f"❌ Не удалось проверить: {outcome.error_plates}")
+
+    detail_lines = []
+    if outcome.partial_car_numbers:
+        detail_lines.append("Частично: " + ", ".join(outcome.partial_car_numbers))
+    if outcome.error_car_numbers:
+        detail_lines.append("Не удалось проверить: " + ", ".join(outcome.error_car_numbers))
+    if detail_lines:
         lines.append("")
-        lines.append("Не удалось проверить: " + ", ".join(outcome.failed_car_numbers))
+        lines.extend(detail_lines)
+
     return "\n".join(lines)
 
 
