@@ -199,18 +199,18 @@ def test_group_identifier_prefers_username_over_id():
 # ---- целиком и добавление banks_ge) --------------------------------------
 
 
-def test_project_groups_yaml_has_27_total_configured_groups():
+def test_project_groups_yaml_has_28_total_configured_groups():
     """16 существующих + 10 турецких (все disabled) + banks_ge — ни одна
     запись не удалена, только у части выставлен enabled: false."""
     entries = _load_raw_group_entries()
 
-    assert len(entries) == 27
+    assert len(entries) == 28
 
 
-def test_project_groups_yaml_has_17_enabled_groups():
+def test_project_groups_yaml_has_18_enabled_groups():
     groups = load_groups(_CONFIG_GROUPS_PATH)
 
-    assert len(groups) == 17
+    assert len(groups) == 18
 
 
 def test_project_groups_yaml_disables_exactly_all_ten_turkey_groups():

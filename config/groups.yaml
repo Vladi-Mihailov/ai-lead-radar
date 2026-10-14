@@ -49,6 +49,11 @@ groups:
     title: "Грузия"
     enabled: true
 
+  # title не указан намеренно — резолвится при первом подключении.
+  - username: "gruzia_tb"
+    resource_region: "ge"
+    enabled: true
+
 
 
 
