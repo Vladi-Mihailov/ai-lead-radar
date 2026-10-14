@@ -107,6 +107,19 @@ _MAX_TOLERABLE_FLOOD_WAIT_SECONDS = 300
 # параметр вроде daily_limit/invitations_per_account_per_hour.
 _PEER_FLOOD_COOLDOWN_SECONDS = 24 * 60 * 60
 
+# CHAT_MEMBER_ADD_FAILED на invite RPC — сигнал ограничения АККАУНТА (а не
+# кандидата): аккаунт временно не используется. Пауза растёт с числом таких
+# ответов за 24 ч после последнего успешного приглашения (успех обнуляет).
+_ADD_FAILED_COOLDOWNS = (timedelta(hours=1), timedelta(hours=6), timedelta(hours=24))
+_ADD_FAILED_WINDOW = timedelta(hours=24)
+_ADD_FAILED_REASON = "chat_member_add_failed"
+
+
+def _is_chat_member_add_failed(exc: Exception) -> bool:
+    return isinstance(exc, RPCError) and "CHAT_MEMBER_ADD_FAILED" in (
+        f"{getattr(exc, 'message', '') or ''} {exc}"
+    )
+
 # После основной волны приглашений (см. _execute_account) ждём этот
 # интервал ПЕРЕД проверкой pending (см. _verify_pending_invites) — Telegram
 # может обрабатывать вступление не мгновенно, особенно для больших пачек.
@@ -1900,6 +1913,9 @@ class InviterService:
         if stat_field is not None:
             setattr(stats, stat_field, getattr(stats, stat_field) + 1)
 
+        if _is_chat_member_add_failed(exc):
+            account = self._apply_add_failed_cooldown(account)
+
         if classification.action == InviteErrorAction.RETRY_LATER:
             await asyncio.sleep(classification.wait_seconds)
             return False
@@ -2152,6 +2168,25 @@ class InviterService:
                 f"Не удалось обновить access_hash пользователя {entity.id} в users.db",
                 exc_info=True,
             )
+
+    def _apply_add_failed_cooldown(self, account: TelegramAccount) -> TelegramAccount:
+        """1-й CHAT_MEMBER_ADD_FAILED за 24 ч -> 1 ч, 2-й -> 6 ч, далее -> 24 ч
+        (текущий ответ уже записан в user_campaign_invites). Тот же
+        blocked_until, что и у FloodWait/PeerFlood: worker пропускает аккаунт,
+        следующий тик берёт другой."""
+        try:
+            streak = self._invite_repository.count_recent_add_failed(
+                account.id, datetime.now(timezone.utc) - _ADD_FAILED_WINDOW,
+            )
+        except Exception:
+            logger.warning(f"Не удалось посчитать CHAT_MEMBER_ADD_FAILED для {account.name}", exc_info=True)
+            streak = 1
+        cooldown = _ADD_FAILED_COOLDOWNS[min(max(streak, 1), len(_ADD_FAILED_COOLDOWNS)) - 1]
+        logger.warning(
+            f"[EXECUTE]\nAccount: {account.name}\nCHAT_MEMBER_ADD_FAILED #{streak} за 24 ч — "
+            f"аккаунт на паузе {_format_duration(cooldown.total_seconds())}."
+        )
+        return self._persist_flood_wait_block(account, cooldown.total_seconds(), _ADD_FAILED_REASON)
 
     def _persist_flood_wait_block(
         self, account: TelegramAccount, wait_seconds: float, blocked_reason: str,

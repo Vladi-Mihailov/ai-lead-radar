@@ -1207,6 +1207,27 @@ class UserCampaignInviteRepository:
         ).fetchone()
         return row[0]
 
+    def count_recent_add_failed(self, account_id: int, since: datetime) -> int:
+        """CHAT_MEMBER_ADD_FAILED этого аккаунта (по всем кампаниям) начиная с
+        since — но только ПОСЛЕ его последнего успешного приглашения (успех
+        обнуляет серию). Без отдельного счётчика: по истории попыток."""
+        row = self._conn.execute(
+            """
+            SELECT COUNT(*) FROM user_campaign_invites f
+            WHERE f.account_id = :account_id
+              AND f.status = 'failed'
+              AND f.error LIKE '%CHAT_MEMBER_ADD_FAILED%'
+              AND datetime(f.created_at) >= datetime(:since)
+              AND datetime(f.created_at) > COALESCE((
+                  SELECT MAX(datetime(s.invited_at)) FROM user_campaign_invites s
+                  WHERE s.account_id = :account_id AND s.status IN ('pending', 'joined')
+                    AND s.invited_at IS NOT NULL
+              ), '0000-00-00 00:00:00')
+            """,
+            {"account_id": account_id, "since": since.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")},
+        ).fetchone()
+        return row[0]
+
     def count_failures(self, user_id: int, campaign_id: int, failure_kind: str) -> int:
         """Сколько неудачных попыток этого рода уже было у пользователя в
         кампании — основа экспоненциального backoff (см.
