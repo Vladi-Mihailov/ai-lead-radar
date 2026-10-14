@@ -174,6 +174,11 @@ def test_already_attempted_candidate_is_skipped_and_next_one_is_invited(tmp_path
     asyncio.run(_run_service(db_path, client_factory=_make_client_factory(
         call_errors={"acc1": [_chat_member_add_failed()]}), execute=True))
     _expire_backoff(db_path)
+    # Пауза аккаунта после CHAT_MEMBER_ADD_FAILED (см. test_inviter_add_failed_cooldown.py)
+    # истекла — проверяется именно выбор следующего кандидата.
+    accounts = TelegramAccountRepository(db_path)
+    accounts.update(acc1.id, blocked_until=datetime.now(timezone.utc) - timedelta(seconds=1))
+    accounts.close()
     created = []
     asyncio.run(_run_service(db_path, client_factory=_make_client_factory(created=created), execute=True))
     sent = [r for c in created for r in c.call_requests]
