@@ -18,6 +18,7 @@ from telethon.errors import FloodWaitError  # noqa: E402
 
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
+from reader.plate_display import format_plate_for_telegram  # noqa: E402
 from reader.public_bot.delivery_repository import ClientFineDeliveryRepository  # noqa: E402
 from reader.public_bot.delivery_service import (  # noqa: E402
     MAX_DELIVERY_ATTEMPTS,
@@ -187,7 +188,7 @@ async def test_delivers_to_owner_for_normal_subscription(tmp_path):
         assert result.delivered == 1
         assert result.failed == 0
         assert fx.sender.sent == [(777, fx.sender.sent[0][1])]
-        assert "AA001AA" in fx.sender.sent[0][1]
+        assert format_plate_for_telegram("AA001AA") in fx.sender.sent[0][1]
         assert fx.delivery_repository.is_delivered(fine_id, sub.id, "owner") is True
     finally:
         fx.close()
@@ -680,7 +681,7 @@ async def test_owner_message_shows_all_extended_fields_when_present(tmp_path):
 
         _, text, _ = fx.sender.sent_full[0]
         assert "🚨 Обнаружен новый штраф" in text
-        assert "🚗 Автомобиль: AA001AA" in text
+        assert f"🚗 Автомобиль: {format_plate_for_telegram('AA001AA')}" in text
         assert "📄 Штраф №: AB1" in text
         assert "📅 Дата нарушения: 05.08.2026" in text
         assert "💰 Сумма: 100 GEL" in text

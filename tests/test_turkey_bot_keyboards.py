@@ -189,6 +189,34 @@ def test_check_now_picker_keyboard_uses_plain_plate_label():
     assert decode_car_action_callback(keyboard[0][0].data) == ("check", 5)
 
 
+def test_plate_bolding_never_reaches_button_labels_or_callback_data():
+    """См. задачу "plate readability improvement" — DISPLAY ONLY: буквы
+    жирным только в ТЕКСТЕ сообщений (format_plate_for_telegram), кнопки/
+    callback_data остаются raw canonical car_number, Telegram keyboard API
+    не поддерживает rich text в button labels. Используем plate с
+    несколькими letter-run'ами (M606OM35 -> **M**606**OM**35 в тексте),
+    чтобы бы точно заметить, если бы bolding случайно просочился сюда.
+    .type.data вместо .data — тот же KeyboardInlineButton API, что и
+    .data, но не подвержен отдельной (несвязанной) проблеме совместимости
+    Telethon-версии, которая ломает .data в остальных тестах этого файла."""
+    plate = "M606OM35"
+    cars = [_car(7, plate)]
+
+    my_cars_keyboard = my_cars_list_keyboard(cars, {7: True})
+    assert my_cars_keyboard[0][0].text == f"🟢 {plate} — ON"
+    assert "*" not in my_cars_keyboard[0][0].text
+    assert decode_car_open_callback(my_cars_keyboard[0][0].type.data) == 7
+
+    picker_keyboard = check_now_picker_keyboard(cars)
+    assert picker_keyboard[0][0].text == f"🚗 {plate}"
+    assert "*" not in picker_keyboard[0][0].text
+    assert decode_car_action_callback(picker_keyboard[0][0].type.data) == ("check", 7)
+
+    plate_callback = encode_car_open_by_plate_callback(plate)
+    assert decode_car_open_by_plate_callback(plate_callback) == plate
+    assert b"*" not in plate_callback
+
+
 def test_off_card_shows_enable_button_history_delete_back():
     keyboard = car_card_keyboard(_car(3), monitoring_active=False)
     labels = [row[0].text for row in keyboard]

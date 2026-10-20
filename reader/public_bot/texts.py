@@ -9,6 +9,7 @@ import re
 from datetime import date, datetime
 
 from reader.fines.models import FineMonitoringTask, NewFineEvent
+from reader.plate_display import format_plate_for_telegram
 from reader.public_bot.debt_refresh_service import DebtSummary, RefreshOutcome
 from reader.public_bot.delivery_texts import format_check_now_fines_message
 from reader.public_bot.full_check_service import FullCheckOutcome
@@ -155,14 +156,17 @@ def format_check_now_result(outcome) -> str:
     показывается — outcome.fines это ВСЕ штрафы из ответа police.ge на
     этой проверке, новые и уже известные (см. CheckResult.current_fines)."""
     if not outcome.check_ok:
-        return f"⚠️ Проверить штрафы для {outcome.car_number} сейчас не удалось. Попробуйте позже."
+        return (
+            f"⚠️ Проверить штрафы для {format_plate_for_telegram(outcome.car_number)} "
+            "сейчас не удалось. Попробуйте позже."
+        )
     if not outcome.fines:
-        return f"🔎 {outcome.car_number}: штрафов не найдено"
+        return f"🔎 {format_plate_for_telegram(outcome.car_number)}: штрафов не найдено"
     return format_check_now_fines_message(car_number=outcome.car_number, fines=outcome.fines)
 
 
 def format_stop_success(car_number: str) -> str:
-    return f"✅ Мониторинг для {car_number} остановлен."
+    return f"✅ Мониторинг для {format_plate_for_telegram(car_number)} остановлен."
 
 _DATE_FORMAT = "%d.%m.%Y"
 
@@ -193,13 +197,14 @@ def format_add_car_summary(
     независимо от того, есть ли у клиента username — клиент и так знает
     свой Telegram-логин, это не новая для него информация."""
     period = f"{_fmt_date(start_date)} — {_fmt_date(end_date)}"
+    formatted_car_number = format_plate_for_telegram(car_number)
 
     if not check_ok:
         return "\n".join([
             "⚠️ Автомобиль добавлен на мониторинг,",
             "но проверить штрафы сейчас не удалось",
             "",
-            f"🚗 {car_number}",
+            f"🚗 {formatted_car_number}",
             f"📅 Мониторинг: {period}",
         ])
 
@@ -211,7 +216,7 @@ def format_add_car_summary(
     return "\n".join([
         "✅ Автомобиль добавлен на мониторинг",
         "",
-        f"🚗 {car_number}",
+        f"🚗 {formatted_car_number}",
         f"📅 Мониторинг: {period}",
         check_line,
     ])
@@ -232,13 +237,14 @@ def format_delegated_add_car_summary(
     ТОЛЬКО trusted-оператору (владельцу это же событие ничего не
     показывает, пока он не claimed, см. design report)."""
     period = f"{_fmt_date(start_date)} — {_fmt_date(end_date)}"
+    formatted_car_number = format_plate_for_telegram(car_number)
 
     if not check_ok:
         lines = [
             "⚠️ Автомобиль добавлен на мониторинг,",
             "но проверить штрафы сейчас не удалось",
             "",
-            f"🚗 {car_number}",
+            f"🚗 {formatted_car_number}",
             f"👤 Владелец: @{owner_username}",
             f"📅 Мониторинг: {period}",
         ]
@@ -251,7 +257,7 @@ def format_delegated_add_car_summary(
         lines = [
             "✅ Автомобиль добавлен на мониторинг",
             "",
-            f"🚗 {car_number}",
+            f"🚗 {formatted_car_number}",
             f"👤 Владелец: @{owner_username}",
             f"📅 Мониторинг: {period}",
             check_line,
@@ -284,13 +290,14 @@ def format_delegated_add_car_without_client_summary(
     без строки "👤 Владелец: ..." — клиента нет и, возможно, не будет
     никогда (см. design report: username клиента не обязателен)."""
     period = f"{_fmt_date(start_date)} — {_fmt_date(end_date)}"
+    formatted_car_number = format_plate_for_telegram(car_number)
 
     if not check_ok:
         return "\n".join([
             "⚠️ Автомобиль добавлен на мониторинг,",
             "но проверить штрафы сейчас не удалось",
             "",
-            f"🚗 {car_number}",
+            f"🚗 {formatted_car_number}",
             f"📅 Мониторинг: {period}",
         ])
 
@@ -302,7 +309,7 @@ def format_delegated_add_car_without_client_summary(
     return "\n".join([
         "✅ Автомобиль добавлен на мониторинг",
         "",
-        f"🚗 {car_number}",
+        f"🚗 {formatted_car_number}",
         f"📅 Мониторинг: {period}",
         check_line,
     ])
@@ -369,7 +376,7 @@ def format_car_details(subscription: FineMonitoringSubscription, today: date) ->
         else f"📅 До {_fmt_date(subscription.end_date)}"
     )
     return "\n".join([
-        f"🚗 {subscription.car_number}",
+        f"🚗 {format_plate_for_telegram(subscription.car_number)}",
         f"Мониторинг: {emoji} {state}",
         date_line,
     ])
@@ -394,16 +401,16 @@ CAR_ACTION_FAILED_TEXT = (
 
 
 def format_turn_off_success(car_number: str) -> str:
-    return f"⏸ Мониторинг {car_number} выключен.\nАвтомобиль сохранён в «Мои авто»."
+    return f"⏸ Мониторинг {format_plate_for_telegram(car_number)} выключен.\nАвтомобиль сохранён в «Мои авто»."
 
 
 def format_turn_on_success(car_number: str) -> str:
-    return f"▶️ Мониторинг {car_number} включён."
+    return f"▶️ Мониторинг {format_plate_for_telegram(car_number)} включён."
 
 
 def format_delete_confirm_prompt(car_number: str) -> str:
     return (
-        f"⚠️ Удалить {car_number} из списка?\n"
+        f"⚠️ Удалить {format_plate_for_telegram(car_number)} из списка?\n"
         "После удаления автомобиль исчезнет из «Мои авто»."
     )
 
@@ -416,7 +423,7 @@ def format_trusted_task_detail(task: FineMonitoringTask) -> str:
     callback). ON/OFF + период + последняя проверка — та же информация,
     что раньше была видна прямо в списке, теперь ТОЛЬКО здесь."""
     emoji, state = task_monitoring_state(task)
-    lines = [f"🚗 {task.car_number}" + (f" ({task.label})" if task.label else "")]
+    lines = [f"🚗 {format_plate_for_telegram(task.car_number)}" + (f" ({task.label})" if task.label else "")]
     lines.append(f"Мониторинг: {emoji} {state}")
     lines.append(f"📅 {_fmt_date(task.start_date)} — {_fmt_date(task.end_date)}")
     if task.last_checked_at is not None:
@@ -452,7 +459,7 @@ def format_trusted_check_now_not_found(car_number: str) -> str:
     design report) — номер не найден среди активных fine_monitoring_tasks.
     Явное требование: ничего не добавляется автоматически, только эта
     ошибка."""
-    return f"❌ Автомобиль {car_number} не найден в активном мониторинге."
+    return f"❌ Автомобиль {format_plate_for_telegram(car_number)} не найден в активном мониторинге."
 
 
 def task_monitoring_state(task: FineMonitoringTask) -> tuple[str, str]:
@@ -472,18 +479,21 @@ def task_monitoring_state(task: FineMonitoringTask) -> tuple[str, str]:
 def format_trusted_task_off_detail(task: FineMonitoringTask) -> str:
     """Экран "▶️ Продолжить мониторинг" (см. design report) — показывается
     после нажатия ⚪ OFF в списке, ИЛИ сразу после ON -> OFF toggle."""
-    return f"🚗 {task.car_number}\nМониторинг: ⚪ OFF"
+    return f"🚗 {format_plate_for_telegram(task.car_number)}\nМониторинг: ⚪ OFF"
 
 
 def format_trusted_task_turn_off_success(car_number: str) -> str:
-    return f"⏸ Мониторинг {car_number} выключен."
+    return f"⏸ Мониторинг {format_plate_for_telegram(car_number)} выключен."
 
 
 def format_trusted_task_resume_success(car_number: str, days: int, end_date: date) -> str:
     """Подтверждение после выбора 15/30/90 дней (см. design report,
     ТОЧНЫЙ формат из задачи: "✅ Мониторинг {car} включён на {N} дней\\nДо:
     {дата}")."""
-    return f"✅ Мониторинг {car_number} включён на {days} дней\nДо: {_fmt_date(end_date)}"
+    return (
+        f"✅ Мониторинг {format_plate_for_telegram(car_number)} включён на {days} дней\n"
+        f"До: {_fmt_date(end_date)}"
+    )
 
 
 def format_trusted_stop_confirm_prompt(car_number: str, subscriber_count: int) -> str:
@@ -491,13 +501,14 @@ def format_trusted_stop_confirm_prompt(car_number: str, subscriber_count: int) -
     если у задачи есть ещё actionable (active/pending_claim) client-
     подписки (см. design report): формулировка корректно отражает
     единственное/множественное число получателей."""
+    formatted_car_number = format_plate_for_telegram(car_number)
     if subscriber_count == 0:
-        return _TRUSTED_STOP_CONFIRM_PROMPT_NO_CLIENTS.format(car_number=car_number)
+        return _TRUSTED_STOP_CONFIRM_PROMPT_NO_CLIENTS.format(car_number=formatted_car_number)
     template = (
         _TRUSTED_STOP_CONFIRM_PROMPT_ONE_CLIENT if subscriber_count == 1
         else _TRUSTED_STOP_CONFIRM_PROMPT_MANY_CLIENTS
     )
-    return template.format(car_number=car_number)
+    return template.format(car_number=formatted_car_number)
 
 
 def trusted_stop_confirm_button_label(subscriber_count: int) -> str:
@@ -582,7 +593,10 @@ def format_debt_refresh_summary(outcome: RefreshOutcome) -> str:
     ]
     if outcome.failed_car_numbers:
         lines.append("")
-        lines.append("Не удалось проверить: " + ", ".join(outcome.failed_car_numbers))
+        lines.append(
+            "Не удалось проверить: "
+            + ", ".join(format_plate_for_telegram(p) for p in outcome.failed_car_numbers)
+        )
     return "\n".join(lines)
 
 
@@ -600,7 +614,7 @@ def format_debt_row(*, car_number: str, owner_displays: list[str], total_amount:
     конце (не дублируется на каждого owner)."""
     owners_text = " | ".join(owner_displays)
     amount_text = _format_search_amount(total_amount)
-    return f"🚗 {car_number}: {owners_text}: {amount_text}"
+    return f"🚗 {format_plate_for_telegram(car_number)}: {owners_text}: {amount_text}"
 
 
 def format_debt_list_section(row_lines: list[str], *, page: int, total_pages: int) -> str:

@@ -87,6 +87,7 @@ from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 from reader.fines.validation import FineValidationError, normalize_car_number
+from reader.plate_display import format_plate_for_telegram
 from reader.public_bot import texts
 from reader.public_bot.conversation_state_repository import (
     BotConversationStateRepository,
@@ -607,7 +608,8 @@ class ConversationController:
                     # значение, но отдельный hardcode здесь, т.к. этот текст
                     # формируется в conversation.py, а не в
                     # subscription_service.py::_build_claim_link).
-                    car_number=outcome.subscription.car_number, bot_username="ProtocolGEbot",
+                    car_number=format_plate_for_telegram(outcome.subscription.car_number),
+                    bot_username="ProtocolGEbot",
                 ),
                 show_main_menu=True,
             )
@@ -1932,7 +1934,7 @@ class ConversationController:
 
         lines = [
             f"👤 {owner_display}",
-            f"🚗 {hit.car_number}",
+            f"🚗 {format_plate_for_telegram(hit.car_number)}",
             texts.format_search_money_line(check_ok=check_ok, fines=fines),
             texts.format_search_monitoring_line(monitoring_active=monitoring_active),
             texts.format_search_checked_at_line(checked_at),
