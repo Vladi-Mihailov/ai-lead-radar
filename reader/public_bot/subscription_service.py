@@ -997,6 +997,33 @@ class SubscriptionService:
         # что и в reader/commands/fine.py::_handle_check/_handle_stop.
         return await self.check_now_task(tasks[0].id)
 
+    def find_representative_task_for_inactive_car(self, car_number: str) -> FineMonitoringTask | None:
+        """Trusted-operator "🔎 Проверить сейчас" по номеру (см. задачу
+        "expired Georgia Check Now UX") — вызывается ПОСЛЕ того, как
+        check_now_task_by_car_number() вернул None (нет active задачи):
+        ищет ЛЮБУЮ историческую (completed/stopped) задачу этого
+        car_number через list_tasks_for_car() (тот же источник, что и у
+        Search), чтобы показать "мониторинг завершён/выключен"-карточку
+        вместо голого "не найден". None — для этого car_number вообще нет
+        ни одной задачи (вызывающий код должен показать старый NOT_FOUND).
+
+        Несколько исторических задач на один car_number (редкий, но
+        возможный случай дублирующихся строк на один physical car, см.
+        design report про check_plate_for_tasks) — выбирается ОДНА
+        representative-задача, ТОТ ЖЕ tie-break, что и у
+        FineCheckService._pick_freshest_task/FineMonitoringTaskRepository.
+        list_debt_car_groups() (max last_successful_checked_at, при
+        равенстве — больший task.id), а не новая формула — см. design
+        report про переиспользование уже существующего project-wide
+        соглашения."""
+        tasks = self.list_tasks_for_car(car_number)
+        if not tasks:
+            return None
+        return max(
+            tasks,
+            key=lambda t: (t.last_successful_checked_at or datetime.min.replace(tzinfo=timezone.utc), t.id),
+        )
+
     async def check_now_task_for_search(self, task_id: int) -> CheckNowOutcome | None:
         """Как check_now_task(), но БЕЗ требования status=='active' (см.
         get_task_for_trusted_admin вместо get_active_task_for_trusted_admin)

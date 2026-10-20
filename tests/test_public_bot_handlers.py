@@ -39,6 +39,7 @@ class _FakeReply:
         self.trusted_task_off_page = None
         self.trusted_task_period_id = None
         self.trusted_task_period_page = None
+        self.trusted_check_now_inactive_id = None
         self.my_cars_page_options = None
         self.car_delete_confirm_subscription_id = None
         self.car_detail_subscription_id = None

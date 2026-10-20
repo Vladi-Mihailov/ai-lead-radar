@@ -36,8 +36,10 @@ from reader.public_bot.conversation import (  # noqa: E402
 )
 from reader.public_bot.conversation_state_repository import BotConversationStateRepository  # noqa: E402
 from reader.public_bot.keyboards import (  # noqa: E402
+    decode_trusted_check_now_once_callback,
     decode_trusted_task_open_callback,
     encode_trusted_task_open_callback,
+    trusted_check_now_inactive_keyboard,
     trusted_tasks_page_keyboard,
 )
 from reader.public_bot.known_users_repository import BotKnownUsersRepository  # noqa: E402
@@ -1952,10 +1954,46 @@ async def test_trusted_check_now_rejects_unknown_plate_without_creating_anything
     assert trusted_fx.task_repository.get_active_by_car_number("E911EE95") == []
 
 
-async def test_trusted_check_now_rejects_inactive_task_plate(trusted_fx):
-    """Машина существовала, но задача уже completed/stopped — та же
-    ошибка "не найден", а не случайная проверка неактивной задачи."""
-    _make_operator_task(trusted_fx, "E911EE95", status="completed")
+async def test_trusted_check_now_shows_inactive_card_for_expired_task_plate(trusted_fx):
+    """Задача "expired Georgia Check Now UX" — машина существовала, но
+    задача уже completed/stopped: ВМЕСТО голого "не найден" (прежнее
+    поведение, см. git history этого теста) теперь показывается
+    информативная карточка "мониторинг завершён" с действиями. Точный
+    production-репро: task_id=623, car_number=O111KO26, status=completed,
+    end_date=2026-08-08 (см. диагностику "O111KO26 / О111КО26")."""
+    today = _today()
+    task_id = _make_operator_task(trusted_fx, "O111KO26", status="completed")
+    trusted_fx.task_repository.return_to_active_monitoring(
+        task_id, start_date=today - timedelta(days=100), end_date=today - timedelta(days=30),
+    )
+    trusted_fx.task_repository.set_status(task_id, "completed")
+
+    await trusted_fx.controller.handle_text(
+        texts.CHECK_NOW_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+    reply = await trusted_fx.controller.handle_text(
+        "O111KO26", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    expired_on = today - timedelta(days=30)
+    assert reply.text == (
+        f"🚗 {format_plate_for_telegram('O111KO26')}\n\n"
+        f"Срок мониторинга закончился {expired_on.strftime('%d.%m.%Y')}."
+    )
+    assert reply.trusted_check_now_inactive_id == task_id
+    assert reply.show_main_menu is False  # своя клавиатура, не main menu
+
+
+async def test_trusted_check_now_shows_inactive_card_for_manually_stopped_not_yet_expired(trusted_fx):
+    """Вторая ветка п.8 — stopped ДО истечения end_date: "выключен
+    вручную", а не "срок закончился" (разные формулировки для одного и
+    того же "нет активной задачи")."""
+    today = _today()
+    task_id = _make_operator_task(trusted_fx, "E911EE95")
+    trusted_fx.task_repository.return_to_active_monitoring(
+        task_id, start_date=today - timedelta(days=10), end_date=today + timedelta(days=20),
+    )
+    trusted_fx.task_repository.set_status(task_id, "stopped")
 
     await trusted_fx.controller.handle_text(
         texts.CHECK_NOW_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
@@ -1964,7 +2002,85 @@ async def test_trusted_check_now_rejects_inactive_task_plate(trusted_fx):
         "E911EE95", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert reply.text == f"❌ Автомобиль {format_plate_for_telegram('E911EE95')} не найден в активном мониторинге."
+    still_valid_until = today + timedelta(days=20)
+    assert reply.text == (
+        f"🚗 {format_plate_for_telegram('E911EE95')}\n\n"
+        "Автоматический мониторинг выключен.\n"
+        f"Срок действует до {still_valid_until.strftime('%d.%m.%Y')}."
+    )
+    assert reply.trusted_check_now_inactive_id == task_id
+
+
+async def test_trusted_check_now_inactive_card_found_via_cyrillic_input(trusted_fx):
+    """Та же задача "O111KO26 / О111КО26" — ввод кириллицей ДОЛЖЕН найти
+    ТУ ЖЕ историческую задачу (normalize_car_number уже делает это,
+    регрессия на этот путь никак не менялась)."""
+    today = _today()
+    task_id = _make_operator_task(trusted_fx, "O111KO26", status="completed")
+    trusted_fx.task_repository.return_to_active_monitoring(
+        task_id, start_date=today - timedelta(days=100), end_date=today - timedelta(days=30),
+    )
+    trusted_fx.task_repository.set_status(task_id, "completed")
+
+    await trusted_fx.controller.handle_text(
+        texts.CHECK_NOW_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+    reply = await trusted_fx.controller.handle_text(
+        "О111КО26", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,  # Cyrillic О/К
+    )
+
+    assert reply.trusted_check_now_inactive_id == task_id
+
+
+async def test_trusted_check_now_inactive_card_found_via_spaces_and_hyphens(trusted_fx):
+    today = _today()
+    task_id = _make_operator_task(trusted_fx, "O111KO26", status="completed")
+    trusted_fx.task_repository.return_to_active_monitoring(
+        task_id, start_date=today - timedelta(days=100), end_date=today - timedelta(days=30),
+    )
+    trusted_fx.task_repository.set_status(task_id, "completed")
+
+    await trusted_fx.controller.handle_text(
+        texts.CHECK_NOW_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+    reply = await trusted_fx.controller.handle_text(
+        "O 111-KO-26", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert reply.trusted_check_now_inactive_id == task_id
+
+
+async def test_trusted_check_now_inactive_card_plate_bold_but_callback_raw(trusted_fx):
+    """П.7 задачи — отображение через format_plate_for_telegram()
+    (жирные буквы), а callback_data кнопок строится ИСКЛЮЧИТЕЛЬНО из
+    task_id (никакого car_number/markdown в payload, см.
+    keyboards.py::trusted_check_now_inactive_keyboard)."""
+    today = _today()
+    task_id = _make_operator_task(trusted_fx, "O111KO26", status="completed")
+    trusted_fx.task_repository.return_to_active_monitoring(
+        task_id, start_date=today - timedelta(days=100), end_date=today - timedelta(days=30),
+    )
+    trusted_fx.task_repository.set_status(task_id, "completed")
+
+    await trusted_fx.controller.handle_text(
+        texts.CHECK_NOW_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+    reply = await trusted_fx.controller.handle_text(
+        "O111KO26", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+
+    assert format_plate_for_telegram("O111KO26") in reply.text
+    assert "O111KO26" not in reply.text  # только жирная форма, не "голый" номер
+
+    buttons = trusted_check_now_inactive_keyboard(reply.trusted_check_now_inactive_id)
+    for row in buttons:
+        for button in row:
+            data = button.data if hasattr(button, "data") else button.type.data
+            assert b"O111KO26" not in data
+            assert b"**" not in data
+    once_button_data = buttons[0][0].data if hasattr(buttons[0][0], "data") else buttons[0][0].type.data
+    once_id = decode_trusted_check_now_once_callback(once_button_data)
+    assert once_id == task_id
 
 
 async def test_trusted_check_now_uses_existing_dedup(tmp_path):
@@ -2057,6 +2173,192 @@ async def test_ordinary_user_cannot_reach_trusted_check_now_step_by_forging_stat
 
     assert reply.text == texts.CALLBACK_NOT_AUTHORIZED_TEXT
     assert reply.show_main_menu is True
+
+
+# ==== "🔎 Проверить разово" на карточке "мониторинг завершён/выключен"
+# (см. задачу "expired Georgia Check Now UX") ====
+
+
+async def test_trusted_check_now_once_works_for_completed_task(tmp_path):
+    """П.3 задачи — реальная police.ge-проверка (через ТОТ ЖЕ
+    FineCheckService, что и у Search) даже для completed задачи."""
+    fixture = _Fixture(
+        tmp_path, records_by_car={"O111KO26": [_record(car_number="O111KO26", fingerprint="fp-once")]},
+        trusted_operator_user_ids={_TRUSTED_ID},
+    )
+    try:
+        today = _today()
+        task_id = _make_operator_task(fixture, "O111KO26", status="completed")
+        fixture.task_repository.return_to_active_monitoring(
+            task_id, start_date=today - timedelta(days=100), end_date=today - timedelta(days=30),
+        )
+        fixture.task_repository.set_status(task_id, "completed")
+
+        reply = await fixture.controller.handle_trusted_check_now_once(task_id, telegram_user_id=_TRUSTED_ID)
+
+        assert "🚨 Обнаружен штраф" in reply.text
+        assert "Мониторинг завершён" in reply.text
+        assert reply.trusted_task_off_id == task_id
+        assert reply.trusted_task_off_page == 0
+    finally:
+        fixture.close()
+
+
+async def test_trusted_check_now_once_works_for_stopped_task(trusted_fx):
+    task_id = _make_operator_task(trusted_fx, "E911EE95", status="stopped")
+
+    reply = await trusted_fx.controller.handle_trusted_check_now_once(task_id, telegram_user_id=_TRUSTED_ID)
+
+    assert "штрафов не найдено" in reply.text
+
+
+async def test_trusted_check_now_once_does_not_change_status_or_dates(trusted_fx):
+    """КРИТИЧНО (см. задачу п.3) — разовая проверка не включает
+    мониторинг, не продлевает срок, не создаёт новую задачу/подписку."""
+    task_id = _make_operator_task(trusted_fx, "E911EE95", status="completed")
+    before = trusted_fx.task_repository.get(task_id)
+
+    await trusted_fx.controller.handle_trusted_check_now_once(task_id, telegram_user_id=_TRUSTED_ID)
+
+    after = trusted_fx.task_repository.get(task_id)
+    assert after.status == "completed"
+    assert after.start_date == before.start_date
+    assert after.end_date == before.end_date
+    assert len(trusted_fx.task_repository.list_by_car_number("E911EE95")) == 1
+    assert trusted_fx.subscription_repository.list_by_car_number("E911EE95") == []
+
+
+async def test_trusted_check_now_once_persists_new_fine_through_normal_pipeline(tmp_path):
+    """П.3 задачи — новый штраф от этой разовой проверки должен попасть в
+    ту же detected_fines/notification-цепочку, что и ЛЮБАЯ другая
+    проверка (см. FineCheckService.check_task — единственный authoritative
+    слой персистентности, здесь НЕ реализуется отдельная запись)."""
+    fixture = _Fixture(
+        tmp_path, records_by_car={"E911EE95": [_record(car_number="E911EE95", fingerprint="fp-once-new")]},
+        trusted_operator_user_ids={_TRUSTED_ID},
+    )
+    try:
+        task_id = _make_operator_task(fixture, "E911EE95", status="stopped")
+
+        await fixture.controller.handle_trusted_check_now_once(task_id, telegram_user_id=_TRUSTED_ID)
+
+        rows = fixture.detected_fine_repository.list_by_car_number("E911EE95")
+        assert any(row.fingerprint == "fp-once-new" for row in rows)
+    finally:
+        fixture.close()
+
+
+async def test_trusted_check_now_once_missing_task_returns_failure(trusted_fx):
+    reply = await trusted_fx.controller.handle_trusted_check_now_once(999999, telegram_user_id=_TRUSTED_ID)
+    assert reply is None
+
+
+async def test_ordinary_user_cannot_use_trusted_check_now_once(tmp_path):
+    """П.6 задачи — все новые callbacks (включая "🔎 Проверить разово")
+    должны заново проверять is_trusted() по РЕАЛЬНОМУ telegram_user_id,
+    независимо от того, что task_id в callback_data валиден и публичен."""
+    fixture = _Fixture(
+        tmp_path, records_by_car={"E911EE95": [_record(car_number="E911EE95", fingerprint="fp-forged")]},
+    )
+    try:
+        task_id = _make_operator_task(fixture, "E911EE95", status="completed")
+
+        reply = await fixture.controller.handle_trusted_check_now_once(task_id, telegram_user_id=1)
+
+        assert reply is None
+        assert fixture.task_repository.get(task_id).status == "completed"
+        assert fixture.detected_fine_repository.list_by_car_number("E911EE95") == []
+    finally:
+        fixture.close()
+
+
+def _set_last_successful_checked_at(task_repository, task_id: int, iso_timestamp: str) -> None:
+    """Тот же приём, что и в tests/test_debt_refresh_service.py — прямая
+    запись в БД, т.к. record_successful_check() пишет CURRENT_TIMESTAMP и
+    не позволяет детерминированно выставить "какая задача свежее"."""
+    task_repository._conn.execute(
+        "UPDATE fine_monitoring_tasks SET last_successful_checked_at = ? WHERE id = ?",
+        (iso_timestamp, task_id),
+    )
+    task_repository._conn.commit()
+
+
+async def test_trusted_check_now_once_multiple_historical_tasks_checks_only_representative(tmp_path):
+    """П.2/п.3 задачи — несколько исторических задач на один car_number:
+    детерминированный representative (freshest last_successful_checked_at,
+    tie-break — больший id), ОДИН внешний запрос (см. design report про
+    representative-only вместо check_plate_for_tasks — обоснование в
+    финальном отчёте)."""
+    fixture = _Fixture(
+        tmp_path, records_by_car={"OO015OO": [_record(car_number="OO015OO", fingerprint="fp-group")]},
+        trusted_operator_user_ids={_TRUSTED_ID},
+    )
+    try:
+        older_id = _make_operator_task(fixture, "OO015OO", status="completed")
+        newer_id = fixture.task_repository.create(
+            car_number="OO015OO", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 7, 1),
+            telegram_chat_id=-100999, created_by_user_id=111,
+        ).id
+        fixture.task_repository.set_status(newer_id, "completed")
+        _set_last_successful_checked_at(fixture.task_repository, older_id, "2026-09-26T10:00:00+00:00")
+        _set_last_successful_checked_at(fixture.task_repository, newer_id, "2026-09-26T11:00:00+00:00")
+
+        representative = fixture.service.find_representative_task_for_inactive_car("OO015OO")
+        assert representative.id == newer_id
+
+        before_older = fixture.task_repository.get(older_id)
+        reply = await fixture.controller.handle_trusted_check_now_once(newer_id, telegram_user_id=_TRUSTED_ID)
+        assert "🚨 Обнаружен штраф" in reply.text
+
+        # Представитель — единственная проверенная задача группы; сестринская
+        # (older_id) задача НЕ тронута этим одиночным check (см. design
+        # report про representative-only).
+        after_older = fixture.task_repository.get(older_id)
+        assert after_older.last_checked_at == before_older.last_checked_at
+        assert fixture.task_repository.get(newer_id).last_checked_at is not None
+    finally:
+        fixture.close()
+
+
+async def test_trusted_check_now_once_resume_flow_reuses_existing_period_picker(trusted_fx):
+    """П.4/п.11/п.12/п.13 задачи — "▶️ Возобновить мониторинг" на карточке
+    "мониторинг завершён" открывает ТОТ ЖЕ 15/30/90 picker и использует ТУ
+    ЖЕ resume_task_for_trusted_admin бизнес-логику, что и "📋 Мои авто" —
+    никакой параллельной реализации. Один клик "Проверить разово" ДО
+    возобновления не должен ничего включать (см. предыдущий тест) и не
+    мешает последующему явному возобновлению."""
+    today = _today()
+    task_id = _make_operator_task(trusted_fx, "E911EE95", status="completed")
+    trusted_fx.task_repository.return_to_active_monitoring(
+        task_id, start_date=today - timedelta(days=100), end_date=today - timedelta(days=30),
+    )
+    trusted_fx.task_repository.set_status(task_id, "completed")
+
+    await trusted_fx.controller.handle_text(
+        texts.CHECK_NOW_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+    card_reply = await trusted_fx.controller.handle_text(
+        "E911EE95", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
+    )
+    assert card_reply.trusted_check_now_inactive_id == task_id
+
+    continue_reply = trusted_fx.controller.handle_trusted_task_continue(
+        task_id, 0, telegram_user_id=_TRUSTED_ID,
+    )
+    assert continue_reply.text == texts.TRUSTED_TASK_PERIOD_PROMPT
+    assert continue_reply.trusted_task_period_id == task_id
+
+    period_reply = trusted_fx.controller.handle_trusted_task_period_choice(
+        task_id, 30, 0, telegram_user_id=_TRUSTED_ID,
+    )
+
+    resumed = trusted_fx.task_repository.get(task_id)
+    assert resumed.status == "active"
+    assert resumed.start_date == today
+    assert resumed.end_date == today + timedelta(days=30)
+    assert f"✅ Мониторинг {format_plate_for_telegram('E911EE95')} включён на 30 дней" in period_reply.text
+    # Никакой новой задачи/дубликата не создано.
+    assert len(trusted_fx.task_repository.list_by_car_number("E911EE95")) == 1
 
 
 async def test_trusted_stop_task_without_subscribers_shows_plain_confirm(trusted_fx):

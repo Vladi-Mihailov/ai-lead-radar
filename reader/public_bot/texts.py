@@ -462,6 +462,38 @@ def format_trusted_check_now_not_found(car_number: str) -> str:
     return f"❌ Автомобиль {format_plate_for_telegram(car_number)} не найден в активном мониторинге."
 
 
+def format_trusted_check_now_inactive_card(task: FineMonitoringTask, *, today: date) -> str:
+    """Trusted-operator "🔎 Проверить сейчас" по номеру (см. задачу
+    "expired Georgia Check Now UX") — заменяет голый
+    format_trusted_check_now_not_found(), когда АКТИВНОЙ задачи нет, но
+    есть историческая (completed/stopped), см.
+    SubscriptionService.find_representative_task_for_inactive_car().
+    Различает ДВЕ ситуации по end_date, а не по status (см. design report
+    п.8 — "stopped + end_date>=today" и "stopped/completed + end_date<
+    today" — completed ПО ЖИЗНЕННОМУ ЦИКЛУ всегда означает end_date уже в
+    прошлом, см. reader/jobs/fine_job.py, поэтому одного сравнения дат
+    достаточно для обоих статусов):
+    - end_date < today — срок уже истёк естественным образом;
+    - end_date >= today — мониторинг выключен вручную ДО истечения срока."""
+    plate = format_plate_for_telegram(task.car_number)
+    if task.end_date < today:
+        status_line = f"Срок мониторинга закончился {_fmt_date(task.end_date)}."
+    else:
+        status_line = f"Автоматический мониторинг выключен.\nСрок действует до {_fmt_date(task.end_date)}."
+    return f"🚗 {plate}\n\n{status_line}"
+
+
+def format_monitoring_still_inactive_line(task: FineMonitoringTask, *, today: date) -> str:
+    """Хвост экрана после "🔎 Проверить разово" (см. задачу "expired
+    Georgia Check Now UX") — ТА ЖЕ end_date-семантика, что и у
+    format_trusted_check_now_inactive_card(), подтверждает, что разовая
+    проверка НЕ включила мониторинг заново (см.
+    ConversationController.handle_trusted_check_now_once)."""
+    if task.end_date < today:
+        return f"Мониторинг завершён {_fmt_date(task.end_date)}."
+    return f"Мониторинг по-прежнему выключен.\nСрок действует до {_fmt_date(task.end_date)}."
+
+
 def task_monitoring_state(task: FineMonitoringTask) -> tuple[str, str]:
     """(emoji, state) для manager-facing "📋 Мои авто" ON/OFF (см. design
     report про per-car monitoring toggle) — task-level, В ОТЛИЧИЕ от

@@ -1388,6 +1388,80 @@ def test_get_task_for_trusted_admin_returns_stopped_task(fx):
     assert found.status == "stopped"
 
 
+def _set_last_successful_checked_at(task_repository, task_id: int, iso_timestamp: str) -> None:
+    """Тот же приём, что и в tests/test_debt_refresh_service.py — прямая
+    запись в БД, т.к. record_successful_check() пишет CURRENT_TIMESTAMP и
+    не позволяет детерминированно выставить "какая задача свежее"."""
+    task_repository._conn.execute(
+        "UPDATE fine_monitoring_tasks SET last_successful_checked_at = ? WHERE id = ?",
+        (iso_timestamp, task_id),
+    )
+    task_repository._conn.commit()
+
+
+def test_find_representative_task_for_inactive_car_returns_none_when_no_task_exists(fx):
+    assert fx.service.find_representative_task_for_inactive_car("Z999ZZ99") is None
+
+
+def test_find_representative_task_for_inactive_car_returns_single_historical_task(fx):
+    """Точный production-репро (см. задачу "expired Georgia Check Now
+    UX") — task_id=623, car_number=O111KO26, status=completed."""
+    task = fx.task_repository.create(
+        car_number="O111KO26", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 8, 8),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    fx.task_repository.set_status(task.id, "completed")
+
+    found = fx.service.find_representative_task_for_inactive_car("O111KO26")
+
+    assert found is not None
+    assert found.id == task.id
+
+
+def test_find_representative_task_for_inactive_car_picks_freshest_last_successful_check(fx):
+    """Та же freshest-семантика, что и у FineCheckService._pick_freshest_
+    task/DebtRefreshService.list_debt_car_groups (см. задачу п.2:
+    "предпочесть самую свежую" задачу) — max last_successful_checked_at
+    побеждает, независимо от порядка создания задач."""
+    task_older = fx.task_repository.create(
+        car_number="OO015OO", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 6, 1),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    task_newer = fx.task_repository.create(
+        car_number="OO015OO", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 7, 1),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    fx.task_repository.set_status(task_older.id, "completed")
+    fx.task_repository.set_status(task_newer.id, "completed")
+    _set_last_successful_checked_at(fx.task_repository, task_older.id, "2026-09-26T10:00:00+00:00")
+    _set_last_successful_checked_at(fx.task_repository, task_newer.id, "2026-09-26T11:00:00+00:00")
+
+    found = fx.service.find_representative_task_for_inactive_car("OO015OO")
+
+    assert found.id == task_newer.id
+
+
+def test_find_representative_task_for_inactive_car_tie_breaks_on_larger_id(fx):
+    """Обе задачи ни разу не проверялись успешно (last_successful_checked_at
+    IS NULL у обеих, см. _pick_freshest_task — datetime.min проигрывает
+    любому реальному значению, но при РАВЕНСТВЕ ключей tie-break должен
+    стабильно предпочесть больший id)."""
+    task_a = fx.task_repository.create(
+        car_number="PP016PP", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 6, 1),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    task_b = fx.task_repository.create(
+        car_number="PP016PP", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 7, 1),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
+    )
+    fx.task_repository.set_status(task_a.id, "completed")
+    fx.task_repository.set_status(task_b.id, "completed")
+
+    found = fx.service.find_representative_task_for_inactive_car("PP016PP")
+
+    assert found.id == task_b.id  # task_b.id > task_a.id (создана второй)
+
+
 def test_resume_task_for_trusted_admin_sets_new_period_and_activates(fx):
     task = fx.task_repository.create(
         car_number="E911EE95", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
