@@ -362,7 +362,11 @@ _LEADS_WHERE = f"""
 # кампании когда-нибудь будут вести в один target (для единственной
 # кампании с данным target_chat ничего не меняется). 'invalid' другой
 # кампании не переносится — он остаётся решением только своей кампании.
-_CANDIDATES_BASE_WHERE = _LEADS_WHERE + """
+# Сколько РАЗНЫХ аккаунтов может получить CHAT_MEMBER_ADD_FAILED на одном
+# кандидате в кампании, прежде чем он перестаёт выбираться (см. service.py).
+ADD_FAILED_MAX_ACCOUNTS = 2
+
+_CANDIDATES_BASE_WHERE = _LEADS_WHERE + f"""
     AND NOT EXISTS (
         SELECT 1 FROM user_campaign_invites uci
         LEFT JOIN invite_campaigns oc ON oc.id = uci.campaign_id
@@ -400,6 +404,17 @@ _CANDIDATES_BASE_WHERE = _LEADS_WHERE + """
               AND ra.failure_kind = 'unresolved'
         )
     )
+    -- CHAT_MEMBER_ADD_FAILED (результат по кандидату) уже получили
+    -- ADD_FAILED_MAX_ACCOUNTS разных аккаунтов в этой кампании — больше никому
+    -- не выбирается. Считается по тексту ошибки, поэтому покрывает и старые
+    -- строки (до появления failure_kind='add_failed').
+    AND (
+        SELECT COUNT(DISTINCT af.account_id) FROM user_campaign_invites af
+        WHERE af.user_id = u.user_id
+          AND af.campaign_id = :campaign_id
+          AND af.account_id IS NOT NULL
+          AND af.error LIKE '%CHAT_MEMBER_ADD_FAILED%'
+    ) < {ADD_FAILED_MAX_ACCOUNTS}
     -- Этот аккаунт уже делал invite RPC этому кандидату в этой кампании
     -- (любой исход: pending, CHAT_MEMBER_ADD_FAILED, приватность…) —
     -- повторно ему не выбирается (см. invite_attempts).
@@ -1207,26 +1222,16 @@ class UserCampaignInviteRepository:
         ).fetchone()
         return row[0]
 
-    def count_recent_add_failed(self, account_id: int, since: datetime) -> int:
-        """CHAT_MEMBER_ADD_FAILED этого аккаунта (по всем кампаниям) начиная с
-        since — но только ПОСЛЕ его последнего успешного приглашения (успех
-        обнуляет серию). Без отдельного счётчика: по истории попыток."""
-        row = self._conn.execute(
-            """
-            SELECT COUNT(*) FROM user_campaign_invites f
-            WHERE f.account_id = :account_id
-              AND f.status = 'failed'
-              AND f.error LIKE '%CHAT_MEMBER_ADD_FAILED%'
-              AND datetime(f.created_at) >= datetime(:since)
-              AND datetime(f.created_at) > COALESCE((
-                  SELECT MAX(datetime(s.invited_at)) FROM user_campaign_invites s
-                  WHERE s.account_id = :account_id AND s.status IN ('pending', 'joined')
-                    AND s.invited_at IS NOT NULL
-              ), '0000-00-00 00:00:00')
-            """,
-            {"account_id": account_id, "since": since.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")},
-        ).fetchone()
-        return row[0]
+    def add_failed_account_ids(self, user_id: int, campaign_id: int) -> set[int]:
+        """Аккаунты, получившие CHAT_MEMBER_ADD_FAILED на этом кандидате в
+        этой кампании (по тексту ошибки — включая старые строки)."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT account_id FROM user_campaign_invites "
+            "WHERE user_id = ? AND campaign_id = ? AND account_id IS NOT NULL "
+            "AND error LIKE '%CHAT_MEMBER_ADD_FAILED%'",
+            (user_id, campaign_id),
+        ).fetchall()
+        return {row[0] for row in rows}
 
     def count_failures(self, user_id: int, campaign_id: int, failure_kind: str) -> int:
         """Сколько неудачных попыток этого рода уже было у пользователя в
