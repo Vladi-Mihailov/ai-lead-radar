@@ -14,6 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import pytest
 
+from reader.plate_display import format_plate_for_telegram
 from reader.turkey_bot import texts
 from reader.turkey_bot.avrasya.models import AvrasyaSubmitOutcome
 from reader.turkey_bot.conversation import ConversationController
@@ -170,7 +171,7 @@ async def test_statistics_open_makes_zero_provider_calls(fx):
 
     reply = await fx.controller.handle_text(texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
 
-    assert "AA001AA" in "".join((reply.text, *reply.extra_texts))
+    assert format_plate_for_telegram("AA001AA") in "".join((reply.text, *reply.extra_texts))
     assert reply.debt_refresh_available is True
 
 
@@ -309,7 +310,7 @@ async def test_confirm_row_format_is_car_colon_owner_colon_amount():
     reply = await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
 
     full_text = "\n".join((reply.text, *reply.extra_texts))
-    assert "🚗 BB002BB: —: 1 800 ₺" in full_text
+    assert f"🚗 {format_plate_for_telegram('BB002BB')}: —: 1 800 ₺" in full_text
 
 
 async def test_confirm_display_aggregates_duplicate_plate_one_row_one_amount():
@@ -329,8 +330,8 @@ async def test_confirm_display_aggregates_duplicate_plate_one_row_one_amount():
     full_text = "\n".join((reply.text, *reply.extra_texts))
     assert "Автомобилей: 1" in full_text
     assert "Общая сумма: 1 800 ₺" in full_text
-    debt_row_line = next(line for line in full_text.splitlines() if line.startswith("🚗 BB002BB"))
-    assert debt_row_line == "🚗 BB002BB: — | —: 1 800 ₺"  # оба owner без known-профиля -> "—" x2, amount один раз
+    debt_row_line = next(line for line in full_text.splitlines() if line.startswith(f"🚗 {format_plate_for_telegram('BB002BB')}"))
+    assert debt_row_line == f"🚗 {format_plate_for_telegram('BB002BB')}: — | —: 1 800 ₺"  # оба owner без known-профиля -> "—" x2, amount один раз
     assert debt_row_line.count("1 800 ₺") == 1
 
 
@@ -426,7 +427,7 @@ async def test_statistics_after_refresh_reflects_updated_data():
     await fx.seed(telegram_user_id=1, plate="AA001AA", amount=Decimal(2740))
 
     before = await fx.controller.handle_text(texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
-    assert "AA001AA" in "".join((before.text, *before.extra_texts))
+    assert format_plate_for_telegram("AA001AA") in "".join((before.text, *before.extra_texts))
 
     await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
 

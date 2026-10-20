@@ -25,6 +25,7 @@ from reader.fines.detected_fine_repository import DetectedFineRepository
 from reader.fines.models import ParsedFineRecord
 from reader.fines.provider import FineProvider, FineProviderError
 from reader.fines.task_repository import FineMonitoringTaskRepository
+from reader.plate_display import format_plate_for_telegram
 from reader.public_bot import texts
 from reader.public_bot.conversation import ConversationController
 from reader.public_bot.conversation_state_repository import (
@@ -207,7 +208,7 @@ async def test_search_by_username_with_at(trusted_fx):
     reply = await _search(trusted_fx, "@alenaogir")
 
     assert reply.search_result_shown is True
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
     assert "@alenaogir" in reply.text
 
 
@@ -222,7 +223,7 @@ async def test_search_by_username_without_at(trusted_fx):
     reply = await _search(trusted_fx, "mihailov_vm")
 
     assert reply.search_result_shown is True
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
 
 
 async def test_search_by_username_is_case_insensitive(trusted_fx):
@@ -232,7 +233,7 @@ async def test_search_by_username_is_case_insensitive(trusted_fx):
     reply = await _search(trusted_fx, "@ALENAOGIR")
 
     assert reply.search_result_shown is True
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
     # Отображается АКТУАЛЬНЫЙ known username (корректный регистр), не
     # введённый пользователем запрос as-is.
     assert "@AlenaOgir" in reply.text
@@ -248,7 +249,7 @@ async def test_search_by_first_name(trusted_fx):
     reply = await _search(trusted_fx, "Иван")
 
     assert reply.search_result_shown is True
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
     assert "👤 Иван" in reply.text
 
 
@@ -258,7 +259,7 @@ async def test_search_by_first_name_is_case_insensitive(trusted_fx):
 
     reply = await _search(trusted_fx, "иВАН")
 
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
 
 
 async def test_search_by_last_name(trusted_fx):
@@ -267,7 +268,7 @@ async def test_search_by_last_name(trusted_fx):
 
     reply = await _search(trusted_fx, "Иванов")
 
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
     assert "👤 Иван Иванов" in reply.text
 
 
@@ -277,7 +278,7 @@ async def test_search_by_full_name(trusted_fx):
 
     reply = await _search(trusted_fx, "Иван Иванов")
 
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
 
 
 async def test_search_by_full_name_is_case_insensitive(trusted_fx):
@@ -286,7 +287,7 @@ async def test_search_by_full_name_is_case_insensitive(trusted_fx):
 
     reply = await _search(trusted_fx, "иван иванов")
 
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
 
 
 async def test_search_by_name_finds_two_different_users_with_same_name(trusted_fx):
@@ -299,8 +300,8 @@ async def test_search_by_name_finds_two_different_users_with_same_name(trusted_f
 
     reply = await _search(trusted_fx, "Иван")
 
-    assert "AA001AA" in reply.text
-    assert "BB002BB" in reply.text
+    assert format_plate_for_telegram("AA001AA") in reply.text
+    assert format_plate_for_telegram("BB002BB") in reply.text
     assert "🔎 Результаты поиска" in reply.text
 
 
@@ -351,7 +352,7 @@ async def test_search_by_bare_username_without_at_still_works(trusted_fx):
 
     reply = await _search(trusted_fx, "mihailov_vm")
 
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
     assert "@mihailov_vm" in reply.text
 
 
@@ -367,7 +368,7 @@ async def test_search_by_car_number_normalizes_input(trusted_fx):
     reply = await _search(trusted_fx, "m295 yb196")
 
     assert reply.search_result_shown is True
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
     assert reply.text != texts.format_search_not_found("M295YB196")
 
 
@@ -381,8 +382,8 @@ async def test_search_by_username_shows_all_cars(trusted_fx):
 
     reply = await _search(trusted_fx, "@alenaogir")
 
-    assert "AA001AA" in reply.text
-    assert "BB002BB" in reply.text
+    assert format_plate_for_telegram("AA001AA") in reply.text
+    assert format_plate_for_telegram("BB002BB") in reply.text
     assert "🔎 Результаты поиска" in reply.text
 
 
@@ -558,14 +559,14 @@ async def test_search_pagination_across_many_cars(trusted_fx):
     )
     assert page0.search_total_pages == 2
     assert page0.search_page == 0
-    assert "P014AA01" in page0.text
+    assert format_plate_for_telegram("P014AA01") in page0.text
     assert "P004AA01" not in page0.text
 
     page1 = await trusted_fx.controller.handle_search_page(
         "username", "alenaogir", 1, telegram_user_id=_TRUSTED_ID,
     )
     assert page1.search_page == 1
-    assert "P000AA01" in page1.text
+    assert format_plate_for_telegram("P000AA01") in page1.text
     assert "P014AA01" not in page1.text
 
     clamped_high = await trusted_fx.controller.handle_search_page(
@@ -589,7 +590,7 @@ async def test_name_search_pagination_does_not_lose_matched_users(trusted_fx):
     assert page0.search_query_type == "person"
     assert page0.search_total_pages == 1  # 8 машин, PAGE_SIZE=10 -> одна страница
     for i in range(8):
-        assert f"I{i:03d}AA01" in page0.text
+        assert format_plate_for_telegram(f"I{i:03d}AA01") in page0.text
 
 
 # ---- 19. forged callbacks denied ----

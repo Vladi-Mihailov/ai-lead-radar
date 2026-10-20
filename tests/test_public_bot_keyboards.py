@@ -196,6 +196,27 @@ def test_trusted_tasks_page_keyboard_left_button_is_bare_car_number():
     assert "@" not in left_label
 
 
+def test_plate_bolding_never_reaches_button_labels_or_callback_data():
+    """См. задачу "plate readability improvement" — DISPLAY ONLY: буквы
+    жирным только в ТЕКСТЕ сообщений (format_plate_for_telegram), левая
+    кнопка manager-списка остаётся raw canonical car_number, callback_data
+    по-прежнему строится ИСКЛЮЧИТЕЛЬНО из task_id. Используем plate с
+    несколькими letter-run'ами (M606OM35 -> **M**606**OM**35 в тексте),
+    чтобы точно заметить, если бы bolding случайно просочился сюда.
+    .type.data вместо .data — тот же KeyboardInlineButton API, не
+    подвержен отдельной (несвязанной) проблеме совместимости Telethon-
+    версии, которая ломает .data в соседних тестах этого файла."""
+    plate = "M606OM35"
+    keyboard = trusted_tasks_page_keyboard(
+        [(42, plate, "@alenaogir", True, date(2026, 12, 20))], page=0, total_pages=1,
+    )
+
+    left_button = keyboard[0][0]
+    assert left_button.text == plate
+    assert "*" not in left_button.text
+    assert decode_trusted_task_open_callback(left_button.type.data) == (42, 0)
+
+
 def test_trusted_tasks_page_keyboard_middle_button_shows_owner_username():
     """Средняя кнопка — "@username" владельца, если он известен (см.
     задачу: НИКОГДА "@None"/"None"/пустая кнопка)."""

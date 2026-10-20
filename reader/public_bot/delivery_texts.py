@@ -10,6 +10,7 @@ format_fine_block() — тот же расширенный информацио�
 
 from reader.fines.models import DetectedFine, NewFineEvent
 from reader.notifications.telegram_notification_service import format_fine_block
+from reader.plate_display import format_plate_for_telegram
 
 # Коммерческие CTA-кнопки — ТОЛЬКО в owner-уведомлении (не в
 # trusted_operator и не в существующем операторском чате, см. design
@@ -25,7 +26,7 @@ def format_owner_fine_message(*, car_number: str, fine: DetectedFine) -> str:
     lines = [
         "🚨 Обнаружен новый штраф",
         "",
-        f"🚗 Автомобиль: {car_number}",
+        f"🚗 Автомобиль: {format_plate_for_telegram(car_number)}",
         format_fine_block(event),
     ]
     return "\n".join(lines)
@@ -38,7 +39,7 @@ def format_trusted_operator_fine_message(
     lines = [
         "🚨 Новый штраф по автомобилю, поставленному вами на мониторинг",
         "",
-        f"🚗 {car_number}",
+        f"🚗 {format_plate_for_telegram(car_number)}",
     ]
     if owner_display:
         lines.append(f"👤 Владелец: @{owner_display}")
@@ -59,12 +60,13 @@ def format_check_now_fines_message(*, car_number: str, fines: list[NewFineEvent]
     manual check неотличимы по виду одного штрафа). Пустой fines сюда не
     передаётся — вызывающий код (texts.format_check_now_result) обрабатывает
     "штрафов не найдено" отдельно, до вызова этой функции."""
+    formatted_car_number = format_plate_for_telegram(car_number)
     blocks = []
     for fine in fines:
         lines = [
             "🚨 Обнаружен штраф",
             "",
-            f"🚗 Автомобиль: {car_number}",
+            f"🚗 Автомобиль: {formatted_car_number}",
             format_fine_block(fine),
         ]
         blocks.append("\n".join(lines))

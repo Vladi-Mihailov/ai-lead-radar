@@ -20,6 +20,7 @@ import re
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
+from reader.plate_display import format_plate_for_telegram
 from reader.turkey_bot.avrasya.models import AvrasyaDebtItem
 from reader.turkey_bot.debt_refresh_service import TurkeyRefreshOutcome
 from reader.turkey_bot.gib.models import GibFineRecord
@@ -807,7 +808,7 @@ def format_debt_row(*, car_number: str, owner_displays: list[str], total_amount:
     каждого owner)."""
     amount_text = _format_try_amount(total_amount)
     owners_text = " | ".join(owner_displays)
-    return f"🚗 {car_number}: {owners_text}: {amount_text}"
+    return f"🚗 {format_plate_for_telegram(car_number)}: {owners_text}: {amount_text}"
 
 
 def format_debt_list_messages(rows: list[str]) -> list[str]:
@@ -891,9 +892,13 @@ def format_debt_refresh_summary(outcome: TurkeyRefreshOutcome) -> str:
 
     detail_lines = []
     if outcome.partial_car_numbers:
-        detail_lines.append("Частично: " + ", ".join(outcome.partial_car_numbers))
+        detail_lines.append(
+            "Частично: " + ", ".join(format_plate_for_telegram(p) for p in outcome.partial_car_numbers)
+        )
     if outcome.error_car_numbers:
-        detail_lines.append("Не удалось проверить: " + ", ".join(outcome.error_car_numbers))
+        detail_lines.append(
+            "Не удалось проверить: " + ", ".join(format_plate_for_telegram(p) for p in outcome.error_car_numbers)
+        )
     if detail_lines:
         lines.append("")
         lines.extend(detail_lines)
@@ -971,7 +976,7 @@ def format_unified_check_result(result: UnifiedCheckResult) -> str:
     _format_unified_provider_detail_block), только для provider'ов, у
     которых реально есть items — раздел целиком опускается, если
     детализировать нечего (все NO_DEBT/ERROR)."""
-    lines = [f"🚗 {result.plate}", "", _format_unified_total_line(result)]
+    lines = [f"🚗 {format_plate_for_telegram(result.plate)}", "", _format_unified_total_line(result)]
     lines.extend(_format_unified_provider_line(p) for p in result.providers)
 
     detail_blocks = []
@@ -1038,7 +1043,7 @@ def format_manager_car_detail(
     owner_line = f"👤 @{owner_username}" if owner_username else "👤 Владелец неизвестен"
     emoji, state = ("🟢", "ON") if monitoring_active else ("⚪", "OFF")
     return "\n".join([
-        f"🚗 {car.car_number}",
+        f"🚗 {format_plate_for_telegram(car.car_number)}",
         owner_line,
         f"Мониторинг: {emoji} {state}",
     ])
@@ -1049,7 +1054,7 @@ def format_car_card_text(car: TurkeyUserCar, *, monitoring_active: bool) -> str:
     БЕЗ даты/периода — Turkey monitoring бессрочен до ручного отключения."""
     emoji = "🟢" if monitoring_active else "⚪"
     state = "ON" if monitoring_active else "OFF"
-    return f"🚗 {car.car_number}\nМониторинг: {emoji} {state}"
+    return f"🚗 {format_plate_for_telegram(car.car_number)}\nМониторинг: {emoji} {state}"
 
 
 def format_delete_confirm_prompt(plate: str) -> str:
@@ -1058,7 +1063,7 @@ def format_delete_confirm_prompt(plate: str) -> str:
     п.7: "Если Georgian bot использует confirmation перед удалением —
     повторить этот pattern")."""
     return (
-        f"⚠️ Удалить {plate} из списка?\n"
+        f"⚠️ Удалить {format_plate_for_telegram(plate)} из списка?\n"
         "Мониторинг будет отключён, автомобиль исчезнет из «🚗 Мои автомобили»."
     )
 
@@ -1081,9 +1086,10 @@ def _format_history_line(run: UnifiedCheckResult) -> str:
 def format_history_messages(plate: str, runs: list[UnifiedCheckResult]) -> list[str]:
     """PARTIAL/ERROR отображаются честно (см. design report п.7: "не как
     0 ₺"), никогда не подменяются на "нет задолженности"."""
+    formatted_plate = format_plate_for_telegram(plate)
     if not runs:
-        return [HISTORY_EMPTY_TEMPLATE.format(plate=plate)]
-    header = f"📜 История {plate}"
+        return [HISTORY_EMPTY_TEMPLATE.format(plate=formatted_plate)]
+    header = f"📜 История {formatted_plate}"
     lines = [_format_history_line(run) for run in runs]
     return _split_into_telegram_messages([header, "\n".join(lines)])
 
@@ -1183,7 +1189,7 @@ def format_search_block(
     "Ещё не проверялось", а НЕ 0 ₺/подделанный статус."""
     lines = [f"👤 {owner_display}"]
     if unified_result is None:
-        lines.append(f"🚗 {car_number}")
+        lines.append(f"🚗 {format_plate_for_telegram(car_number)}")
         lines.append("Ещё не проверялось")
     else:
         lines.append(format_unified_check_result(unified_result))

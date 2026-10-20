@@ -14,6 +14,7 @@ from decimal import Decimal
 
 import pytest
 
+from reader.plate_display import format_plate_for_telegram
 from reader.turkey_bot import texts
 from reader.turkey_bot.conversation import ConversationController
 from reader.turkey_bot.conversation_state_repository import (
@@ -159,7 +160,7 @@ async def test_search_by_username_with_at(fx):
     reply = await _search(fx, "@Mihailov_vm")
 
     assert reply.search_result_shown is True
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
     assert "@Mihailov_vm" in reply.text
 
 
@@ -170,7 +171,7 @@ async def test_search_by_username_without_at(fx):
     reply = await _search(fx, "Mihailov_vm")
 
     assert reply.search_result_shown is True
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
 
 
 async def test_search_by_username_is_case_insensitive(fx):
@@ -194,7 +195,7 @@ async def test_search_by_first_name(fx):
     reply = await _search(fx, "Иван")
 
     assert reply.search_result_shown is True
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
     assert "👤 Иван" in reply.text
 
 
@@ -204,7 +205,7 @@ async def test_search_by_first_name_is_case_insensitive(fx):
 
     reply = await _search(fx, "иВАН")
 
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
 
 
 async def test_search_by_last_name(fx):
@@ -213,7 +214,7 @@ async def test_search_by_last_name(fx):
 
     reply = await _search(fx, "Иванов")
 
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
     assert "👤 Иван Иванов" in reply.text
 
 
@@ -223,7 +224,7 @@ async def test_search_by_full_name(fx):
 
     reply = await _search(fx, "Иван Иванов")
 
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
 
 
 async def test_search_by_full_name_is_case_insensitive(fx):
@@ -232,7 +233,7 @@ async def test_search_by_full_name_is_case_insensitive(fx):
 
     reply = await _search(fx, "иван иванов")
 
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
 
 
 async def test_search_by_name_finds_two_different_users_with_same_name(fx):
@@ -245,8 +246,8 @@ async def test_search_by_name_finds_two_different_users_with_same_name(fx):
 
     reply = await _search(fx, "Иван")
 
-    assert "AA001AA" in reply.text
-    assert "BB002BB" in reply.text
+    assert format_plate_for_telegram("AA001AA") in reply.text
+    assert format_plate_for_telegram("BB002BB") in reply.text
     assert "🔎 Результаты поиска" in reply.text
 
 
@@ -297,7 +298,7 @@ async def test_search_by_bare_username_without_at_still_works(fx):
 
     reply = await _search(fx, "mihailov_vm")
 
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
     assert "@mihailov_vm" in reply.text
 
 
@@ -313,7 +314,7 @@ async def test_name_search_pagination_does_not_lose_matched_users(fx):
     assert page0.search_query_type == "person"
     assert page0.search_total_pages == 1  # 8 машин, PAGE_SIZE=10 -> одна страница
     for i in range(8):
-        assert f"I{i:03d}AA01" in page0.text
+        assert format_plate_for_telegram(f"I{i:03d}AA01") in page0.text
 
 
 async def test_ordinary_user_cannot_use_name_search(fx):
@@ -336,7 +337,7 @@ async def test_search_by_plate_normalizes_input(fx):
     reply = await _search(fx, "m295 yb196")
 
     assert reply.search_result_shown is True
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
     assert reply.text != texts.format_search_not_found("M295YB196")
 
 
@@ -350,8 +351,8 @@ async def test_search_by_username_shows_all_cars(fx):
 
     reply = await _search(fx, "@alenaogir")
 
-    assert "AA001AA" in reply.text
-    assert "BB002BB" in reply.text
+    assert format_plate_for_telegram("AA001AA") in reply.text
+    assert format_plate_for_telegram("BB002BB") in reply.text
     assert "🔎 Результаты поиска" in reply.text
 
 
@@ -372,7 +373,7 @@ async def test_search_by_username_does_not_duplicate_plate_line(fx):
 
     reply = await _search(fx, "@alenaogir")
 
-    assert reply.text.count("M295YB196") == 1
+    assert reply.text.count(format_plate_for_telegram("M295YB196")) == 1
 
 
 # ---- 11. plate -> correct owner ----
@@ -556,12 +557,12 @@ async def test_search_pagination_across_many_cars(fx):
     page0 = await fx.controller.handle_text("@alenaogir", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
     assert page0.search_total_pages == 2
     assert page0.search_page == 0
-    assert "P014AA01" in page0.text  # ORDER BY id DESC -> новые первыми
+    assert format_plate_for_telegram("P014AA01") in page0.text  # ORDER BY id DESC -> новые первыми
     assert "P004AA01" not in page0.text
 
     page1 = fx.controller.handle_search_page("username", "alenaogir", 1, telegram_user_id=_TRUSTED_ID)
     assert page1.search_page == 1
-    assert "P000AA01" in page1.text
+    assert format_plate_for_telegram("P000AA01") in page1.text
     assert "P014AA01" not in page1.text
 
     clamped_high = fx.controller.handle_search_page("username", "alenaogir", 999, telegram_user_id=_TRUSTED_ID)

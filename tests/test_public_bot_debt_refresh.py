@@ -20,6 +20,7 @@ from reader.fines.detected_fine_repository import DetectedFineRepository
 from reader.fines.models import ParsedFineRecord
 from reader.fines.provider import FineProvider
 from reader.fines.task_repository import FineMonitoringTaskRepository
+from reader.plate_display import format_plate_for_telegram
 from reader.public_bot import texts
 from reader.public_bot.conversation import ConversationController
 from reader.public_bot.conversation_state_repository import (
@@ -255,7 +256,7 @@ async def test_statistics_still_shows_unrelated_plate_debt_alongside_suppressed_
     )
 
     assert "O687KE761" not in reply.text
-    assert "🚗 P004XC163: —: 40 ₾" in reply.text
+    assert f"🚗 {format_plate_for_telegram('P004XC163')}: —: 40 ₾" in reply.text
 
 
 # ---- единый формат строки CAR: OWNER: AMOUNT (задача п.1/п.13) ----
@@ -271,7 +272,7 @@ async def test_row_format_is_car_colon_owner_colon_amount(fx):
         texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert "🚗 AA111AA: @ao777oa777: 800 ₾" in reply.text
+    assert f"🚗 {format_plate_for_telegram('AA111AA')}: @ao777oa777: 800 ₾" in reply.text
 
 
 async def test_row_has_no_checked_at_date_or_today_yesterday_wording(fx):
@@ -282,12 +283,12 @@ async def test_row_has_no_checked_at_date_or_today_yesterday_wording(fx):
         texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    row_line = next(line for line in reply.text.splitlines() if line.startswith("🚗 BB222BB"))
+    row_line = next(line for line in reply.text.splitlines() if line.startswith(f"🚗 {format_plate_for_telegram('BB222BB')}"))
     assert "сегодня" not in row_line
     assert "вчера" not in row_line
     assert " — " not in row_line
     assert "· " not in row_line
-    assert row_line == "🚗 BB222BB: —: 50 ₾"
+    assert row_line == f"🚗 {format_plate_for_telegram('BB222BB')}: —: 50 ₾"
 
 
 async def test_row_never_shows_repeated_dash_dash_dash(fx):
@@ -299,7 +300,7 @@ async def test_row_never_shows_repeated_dash_dash_dash(fx):
         texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert "🚗 CC333CC: —: 50 ₾" in reply.text
+    assert f"🚗 {format_plate_for_telegram('CC333CC')}: —: 50 ₾" in reply.text
     assert "— — —" not in reply.text
     assert "None" not in reply.text
 
@@ -317,7 +318,7 @@ async def test_owner_display_name_and_username(fx):
         texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert "🚗 DD444DD: Дамир Татаров (@DamirTat): 120 ₾" in reply.text
+    assert f"🚗 {format_plate_for_telegram('DD444DD')}: Дамир Татаров (@DamirTat): 120 ₾" in reply.text
 
 
 async def test_owner_display_username_only(fx):
@@ -330,7 +331,7 @@ async def test_owner_display_username_only(fx):
         texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert "🚗 EE555EE: @DamirTat: 50 ₾" in reply.text
+    assert f"🚗 {format_plate_for_telegram('EE555EE')}: @DamirTat: 50 ₾" in reply.text
 
 
 async def test_owner_display_name_only(fx):
@@ -343,7 +344,7 @@ async def test_owner_display_name_only(fx):
         texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert "🚗 FF666FF: Иван Иванов: 50 ₾" in reply.text
+    assert f"🚗 {format_plate_for_telegram('FF666FF')}: Иван Иванов: 50 ₾" in reply.text
 
 
 async def test_owner_display_dot_name_falls_back_to_username_only(fx):
@@ -358,7 +359,7 @@ async def test_owner_display_dot_name_falls_back_to_username_only(fx):
         texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert "🚗 GG777GG: @Roma12312: 350 ₾" in reply.text
+    assert f"🚗 {format_plate_for_telegram('GG777GG')}: @Roma12312: 350 ₾" in reply.text
     assert ". (@Roma12312)" not in reply.text
 
 
@@ -372,7 +373,7 @@ async def test_owner_display_dash_username_and_underscore_sanitized(fx):
         texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert "🚗 HH888HH: @someone: 10 ₾" in reply.text
+    assert f"🚗 {format_plate_for_telegram('HH888HH')}: @someone: 10 ₾" in reply.text
 
 
 # ---- pagination продолжает работать (задача п.7/п.13) ----
@@ -396,7 +397,7 @@ async def test_debt_list_pagination_does_not_exceed_telegram_limit(fx):
         assert len(page_reply.text) <= 4096
         for i in range(35):
             plate = f"P{i:04d}AA"
-            if plate in page_reply.text:
+            if format_plate_for_telegram(plate) in page_reply.text:
                 seen_cars.add(plate)
     assert len(seen_cars) == 35
 
@@ -483,7 +484,7 @@ async def test_confirm_shows_updated_list_800_to_500(fx):
     assert "🚨 Штрафы по последней проверке" in reply.text
     assert "Автомобилей: 1" in reply.text
     assert "Общая сумма: 500 ₾" in reply.text
-    assert "🚗 FF666FF: —: 500 ₾" in reply.text
+    assert f"🚗 {format_plate_for_telegram('FF666FF')}: —: 500 ₾" in reply.text
     assert "800" not in reply.text
 
 
@@ -517,8 +518,8 @@ async def test_error_preserves_previous_reliable_state_in_confirm_result(fx):
     reply = await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
 
     assert "⚠️ Не удалось проверить: 1" in reply.text
-    assert "HH888HH" in reply.text  # упомянута в failed-списке
-    assert "🚗 HH888HH: —: 2740 ₾" in reply.text  # осталась в списке со СТАРОЙ суммой
+    assert format_plate_for_telegram("HH888HH") in reply.text  # упомянута в failed-списке
+    assert f"🚗 {format_plate_for_telegram('HH888HH')}: —: 2740 ₾" in reply.text  # осталась в списке со СТАРОЙ суммой
 
 
 async def test_confirm_with_no_known_debt_checks_nothing(fx):
@@ -583,7 +584,7 @@ async def test_one_plate_one_task_shows_one_row(fx):
     )
 
     assert "Автомобилей: 1" in reply.text
-    assert "🚗 TT001TT: @alice: 200 ₾" in reply.text
+    assert f"🚗 {format_plate_for_telegram('TT001TT')}: @alice: 200 ₾" in reply.text
 
 
 async def test_one_plate_two_tasks_same_owner_shows_one_row_owner_once(fx):
@@ -603,8 +604,8 @@ async def test_one_plate_two_tasks_same_owner_shows_one_row_owner_once(fx):
     )
 
     assert "Автомобилей: 1" in reply.text
-    row_line = next(line for line in reply.text.splitlines() if line.startswith("🚗 TT002TT"))
-    assert row_line == "🚗 TT002TT: @bob: 200 ₾"  # НЕ "@bob | @bob"
+    row_line = next(line for line in reply.text.splitlines() if line.startswith(f"🚗 {format_plate_for_telegram('TT002TT')}"))
+    assert row_line == f"🚗 {format_plate_for_telegram('TT002TT')}: @bob: 200 ₾"  # НЕ "@bob | @bob"
 
 
 async def test_one_plate_multiple_owners_joined_with_pipe_amount_once(fx):
@@ -621,8 +622,8 @@ async def test_one_plate_multiple_owners_joined_with_pipe_amount_once(fx):
         texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    row_line = next(line for line in reply.text.splitlines() if line.startswith("🚗 TT003TT"))
-    assert row_line == "🚗 TT003TT: @alice | @carol: 300 ₾"
+    row_line = next(line for line in reply.text.splitlines() if line.startswith(f"🚗 {format_plate_for_telegram('TT003TT')}"))
+    assert row_line == f"🚗 {format_plate_for_telegram('TT003TT')}: @alice | @carol: 300 ₾"
     assert row_line.count("300 ₾") == 1
 
 

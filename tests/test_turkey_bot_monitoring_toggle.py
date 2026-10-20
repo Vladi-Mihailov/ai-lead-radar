@@ -3,6 +3,7 @@
 
 import pytest
 
+from reader.plate_display import format_plate_for_telegram
 from reader.turkey_bot.conversation import ConversationController
 from reader.turkey_bot.conversation_state_repository import (
     TurkeyConversationStateRepository,
@@ -56,7 +57,7 @@ async def test_enable_monitoring_creates_active_subscription():
     # Карточка перерисовывается ОДНИМ сообщением (см. задачу "Адаптация
     # car-centric UX Georgian bot" п.5) — РОВНО тот текст, что задан в
     # задаче: "🚗 {plate}\nМониторинг: 🟢 ON".
-    assert reply.text == "🚗 A123AA123\nМониторинг: 🟢 ON"
+    assert reply.text == f"🚗 {format_plate_for_telegram('A123AA123')}\nМониторинг: 🟢 ON"
     assert reply.car_card_monitoring_active is True
     sub = subscriptions.get(telegram_user_id=_USER_ID, plate="A123AA123")
     assert sub is not None
@@ -71,7 +72,7 @@ async def test_disable_monitoring_deactivates_subscription():
 
     reply = await controller.handle_car_action("monitor_off", car_id, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
-    assert reply.text == "🚗 A123AA123\nМониторинг: ⚪ OFF"
+    assert reply.text == f"🚗 {format_plate_for_telegram('A123AA123')}\nМониторинг: ⚪ OFF"
     assert reply.car_card_monitoring_active is False
     sub = subscriptions.get(telegram_user_id=_USER_ID, plate="A123AA123")
     assert sub.active is False
@@ -181,11 +182,11 @@ async def test_on_off_state_survives_restart_reads_from_db_not_memory(tmp_path):
 
     on_reply = controller_2.handle_car_open(car_id, telegram_user_id=_USER_ID)
     assert on_reply.car_card_monitoring_active is True
-    assert on_reply.text == "🚗 A123AA123\nМониторинг: 🟢 ON"
+    assert on_reply.text == f"🚗 {format_plate_for_telegram('A123AA123')}\nМониторинг: 🟢 ON"
 
     await controller_2.handle_car_action("monitor_off", car_id, chat_id=_CHAT_ID, telegram_user_id=_USER_ID)
 
     controller_3, _garage_3, _subscriptions_3 = _build_controller(tmp_path)
     off_reply = controller_3.handle_car_open(car_id, telegram_user_id=_USER_ID)
     assert off_reply.car_card_monitoring_active is False
-    assert off_reply.text == "🚗 A123AA123\nМониторинг: ⚪ OFF"
+    assert off_reply.text == f"🚗 {format_plate_for_telegram('A123AA123')}\nМониторинг: ⚪ OFF"

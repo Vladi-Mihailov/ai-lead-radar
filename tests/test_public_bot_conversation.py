@@ -24,6 +24,7 @@ from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa
 from reader.fines.models import ParsedFineRecord  # noqa: E402
 from reader.fines.provider import FineProvider  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
+from reader.plate_display import format_plate_for_telegram  # noqa: E402
 from reader.public_bot import texts  # noqa: E402
 from reader.public_bot.conversation import (  # noqa: E402
     STEP_AWAITING_CAR_NUMBER,
@@ -280,7 +281,7 @@ async def test_add_car_summary_without_username_has_no_none_or_prompt_text(fx):
     assert "None" not in reply.text
     assert "Telegram-логин" not in reply.text
     assert "👤" not in reply.text
-    assert "🚗 M295YB196" in reply.text
+    assert f"🚗 {format_plate_for_telegram('M295YB196')}" in reply.text
     assert "📅 Мониторинг:" in reply.text
 
 
@@ -300,7 +301,7 @@ async def test_period_choice_creates_subscription_with_expected_dates(fx, days):
     expected_end = today + timedelta(days=days)
     assert reply is not None
     assert "✅ Автомобиль добавлен на мониторинг" in reply.text
-    assert "🚗 M295YB196" in reply.text
+    assert f"🚗 {format_plate_for_telegram('M295YB196')}" in reply.text
     # Строка "👤 @username" убрана из self-service summary целиком (см.
     # задачу "Georgia должен работать с Telegram identity так же, как
     # Turkey") — даже когда username реально есть, он не показывается.
@@ -904,7 +905,7 @@ async def test_check_now_lists_own_car_and_returns_result(fx):
 
     result_reply = await fx.controller.handle_check_now_choice(subscription_id, telegram_user_id=1)
     assert result_reply is not None
-    assert "M295YB196" in result_reply.text
+    assert format_plate_for_telegram("M295YB196") in result_reply.text
     assert "штрафов не найдено" in result_reply.text
     assert "новых штрафов нет" not in result_reply.text
     assert result_reply.cta_buttons is None  # штрафов нет — CTA нечего показывать
@@ -1009,7 +1010,7 @@ async def test_check_now_shows_existing_fine_found_by_earlier_check(tmp_path):
         assert "новых штрафов нет" not in reply.text
         assert "штрафов не найдено" not in reply.text
         assert "🚨 Обнаружен штраф" in reply.text
-        assert "🚗 Автомобиль: M295YB196" in reply.text
+        assert f"🚗 Автомобиль: {format_plate_for_telegram('M295YB196')}" in reply.text
         assert "📄 Штраф №: AB123456" in reply.text
         # Реальный владелец (не trusted-creator) — CTA-кнопки присутствуют.
         assert reply.cta_buttons is not None
@@ -1037,7 +1038,7 @@ async def test_my_car_turn_off_flow_open_toggle_and_back(fx):
     detail_reply = fx.controller.handle_my_car_open(subscription_id, 0, telegram_user_id=1)
     assert detail_reply is not None
     assert detail_reply.car_detail_monitoring_state == "ON"
-    assert "M295YB196" in detail_reply.text
+    assert format_plate_for_telegram("M295YB196") in detail_reply.text
 
     off_reply = fx.controller.handle_my_car_turn_off(subscription_id, 0, telegram_user_id=1)
     assert off_reply is not None
@@ -1110,7 +1111,7 @@ async def test_my_car_delete_requires_confirmation_and_cancel_preserves_car(fx):
 
     prompt_reply = fx.controller.handle_my_car_delete_prompt(subscription.id, 0, telegram_user_id=1)
     assert prompt_reply is not None
-    assert "M295YB196" in prompt_reply.text
+    assert format_plate_for_telegram("M295YB196") in prompt_reply.text
     assert prompt_reply.car_delete_confirm_subscription_id == subscription.id
     # Ничего ещё не удалено (см. design report: "Сразу ничего не удалять").
     assert fx.subscription_repository.get(subscription.id).status == "active"
@@ -1636,7 +1637,7 @@ def test_trusted_task_open_shows_car_detail_card(trusted_fx):
 
     assert reply.trusted_task_detail_id == task_id
     assert reply.trusted_task_detail_page == 0
-    assert "🚗 H331HA763" in reply.text
+    assert f"🚗 {format_plate_for_telegram('H331HA763')}" in reply.text
     assert "Мониторинг: 🟢 ON" in reply.text
     assert "📅 01.08.2026 — 31.12.2026" in reply.text
     assert "🔎 Ещё не проверялась" in reply.text
@@ -1685,7 +1686,7 @@ def test_trusted_task_toggle_on_turns_off_and_shows_continue_screen(trusted_fx):
     assert trusted_fx.task_repository.get(task_id).status == "stopped"
     assert reply.trusted_task_off_id == task_id
     assert reply.trusted_task_off_page == 0
-    assert "M295YB196" in reply.text
+    assert format_plate_for_telegram("M295YB196") in reply.text
     assert "⚪ OFF" in reply.text
 
 
@@ -1890,7 +1891,7 @@ async def test_trusted_check_now_works_for_task_without_subscription(trusted_fx)
         "E911EE95", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert "E911EE95" in check_reply.text
+    assert format_plate_for_telegram("E911EE95") in check_reply.text
     assert "штрафов не найдено" in check_reply.text
     assert trusted_fx.subscription_repository.list_by_user(_TRUSTED_ID) == []
     # Диалог завершён — state очищен.
@@ -1909,7 +1910,7 @@ async def test_trusted_check_now_normalizes_car_number_input(trusted_fx):
         "e911ee95", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert "E911EE95" in check_reply.text
+    assert format_plate_for_telegram("E911EE95") in check_reply.text
 
 
 async def test_trusted_check_now_can_find_car_beyond_old_first_50_limit(trusted_fx):
@@ -1927,7 +1928,7 @@ async def test_trusted_check_now_can_find_car_beyond_old_first_50_limit(trusted_
         "E911EE95", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert "E911EE95" in check_reply.text
+    assert format_plate_for_telegram("E911EE95") in check_reply.text
     # "не найден в активном мониторинге" (task-level 404) — НЕ "штрафов не
     # найдено" (0 fines, штатный manual-check результат для задачи,
     # которая реально существует и была найдена) — эти два разных смысла
@@ -1947,7 +1948,7 @@ async def test_trusted_check_now_rejects_unknown_plate_without_creating_anything
         "E911EE95", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert reply.text == "❌ Автомобиль E911EE95 не найден в активном мониторинге."
+    assert reply.text == f"❌ Автомобиль {format_plate_for_telegram('E911EE95')} не найден в активном мониторинге."
     assert trusted_fx.task_repository.get_active_by_car_number("E911EE95") == []
 
 
@@ -1963,7 +1964,7 @@ async def test_trusted_check_now_rejects_inactive_task_plate(trusted_fx):
         "E911EE95", chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, username=None,
     )
 
-    assert reply.text == "❌ Автомобиль E911EE95 не найден в активном мониторинге."
+    assert reply.text == f"❌ Автомобиль {format_plate_for_telegram('E911EE95')} не найден в активном мониторинге."
 
 
 async def test_trusted_check_now_uses_existing_dedup(tmp_path):
@@ -2066,7 +2067,7 @@ async def test_trusted_stop_task_without_subscribers_shows_plain_confirm(trusted
     pick_reply = trusted_fx.controller.handle_trusted_stop_pick(task_id, telegram_user_id=_TRUSTED_ID)
 
     assert pick_reply is not None
-    assert pick_reply.text == "Остановить мониторинг для E911EE95?"
+    assert pick_reply.text == f"Остановить мониторинг для {format_plate_for_telegram('E911EE95')}?"
     assert pick_reply.trusted_stop_confirm_task_id == task_id
     assert pick_reply.trusted_stop_confirm_button_label == "⛔ Остановить"
 
