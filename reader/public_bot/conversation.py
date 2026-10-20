@@ -263,6 +263,16 @@ class BotReply:
     task_id/page, см. handle_trusted_task_toggle — переиспользуется как
     no-op показ, задача уже OFF).
 
+    trusted_check_now_inactive_id — карточка "мониторинг завершён/
+    выключен" (см. задачу "expired Georgia Check Now UX") — показывается
+    ВМЕСТО texts.format_trusted_check_now_not_found(), когда trusted
+    "🔎 Проверить сейчас" по номеру не нашёл АКТИВНОЙ задачи, но нашёл
+    историческую (см. _handle_trusted_check_now_car_number_input/
+    SubscriptionService.find_representative_task_for_inactive_car). Та же
+    клавиатура, что и у "▶️ Продолжить мониторинг"/"⬅️ Назад" OFF-детали,
+    плюс "🔎 Проверить разово" (см. keyboards.py::
+    trusted_check_now_inactive_keyboard, handle_trusted_check_now_once).
+
     my_cars_page_options/my_cars_page/my_cars_total_pages — car-centric
     "📋 Мои авто" для ОБЫЧНОГО (не-trusted) пользователя (см. design
     report про переработку UX): (subscription_id, label) для списка
@@ -313,6 +323,7 @@ class BotReply:
     trusted_task_off_page: int | None = None
     trusted_task_period_id: int | None = None
     trusted_task_period_page: int | None = None
+    trusted_check_now_inactive_id: int | None = None
     my_cars_page_options: list[tuple[int, str]] | None = None
     my_cars_page: int | None = None
     my_cars_total_pages: int | None = None
@@ -1215,11 +1226,19 @@ class ConversationController:
         self._clear_state(chat_id)
 
         outcome = await self._subscriptions.check_now_task_by_car_number(car_number)
-        if outcome is None:
+        if outcome is not None:
+            return BotReply(text=texts.format_check_now_result(outcome), show_main_menu=True)
+
+        representative = self._subscriptions.find_representative_task_for_inactive_car(car_number)
+        if representative is None:
             return BotReply(
                 text=texts.format_trusted_check_now_not_found(car_number), show_main_menu=True,
             )
-        return BotReply(text=texts.format_check_now_result(outcome), show_main_menu=True)
+
+        return BotReply(
+            text=texts.format_trusted_check_now_inactive_card(representative, today=self._today()),
+            trusted_check_now_inactive_id=representative.id,
+        )
 
     # ---- "👤 Добавить Telegram клиента?" (inline-кнопки, trusted-flow) ----
 
@@ -1721,6 +1740,48 @@ class ConversationController:
             trusted_tasks_total_pages=list_reply.trusted_tasks_total_pages,
             trusted_tasks_page_options=list_reply.trusted_tasks_page_options,
         )
+
+    async def handle_trusted_check_now_once(
+        self, task_id: int, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """"🔎 Проверить разово" на карточке "мониторинг завершён/выключен"
+        (см. задачу "expired Georgia Check Now UX" и keyboards.py::
+        trusted_check_now_inactive_keyboard) — РЕАЛЬНАЯ police.ge-проверка
+        даже для completed/stopped/expired задачи, через ТОТ ЖЕ
+        SubscriptionService.check_now_task_for_search(), что уже
+        использует manager/trusted Search (см. design report: "не
+        реализовывать отдельный provider/checker") — никакой отдельной
+        бизнес-логики проверки здесь.
+
+        КРИТИЧНО (см. задачу): check_now_task_for_search() → в итоге
+        FineCheckService.check_task() трогает ТОЛЬКО last_checked_at/
+        last_successful_*/detected_fines — status/start_date/end_date
+        этой задачи НЕ меняются, новый task/subscription НЕ создаются,
+        мониторинг НЕ включается (см. тест test_trusted_check_now_once_
+        does_not_change_task_dates_or_status). Хвост
+        "Мониторинг по-прежнему выключен/завершён" использует task,
+        загруженную ДО проверки — end_date/status заведомо не меняются
+        этой проверкой, повторный запрос не нужен.
+
+        None — не trusted, ИЛИ задача не существует (см. handle_trusted_
+        task_toggle выше — тот же принцип, callback task_id публичен и не
+        является доказательством авторизации)."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+
+        task = self._subscriptions.get_task_for_trusted_admin(task_id)
+        if task is None:
+            return None
+
+        outcome = await self._subscriptions.check_now_task_for_search(task_id)
+        if outcome is None:
+            return BotReply(text=texts.CAR_ACTION_FAILED_TEXT, show_main_menu=True)
+
+        text = (
+            texts.format_check_now_result(outcome)
+            + "\n\n" + texts.format_monitoring_still_inactive_line(task, today=self._today())
+        )
+        return BotReply(text=text, trusted_task_off_id=task_id, trusted_task_off_page=0)
 
     # ---- trusted-operator task-level admin (см. design report: пересмотр
     # архитектуры) — 🔎/⛔ работают НАПРЯМУЮ с fine_monitoring_tasks, без

@@ -90,6 +90,11 @@ _TRUSTED_TASK_OPEN_PREFIX = b"ttaskopen:"
 _TRUSTED_TASK_TOGGLE_PREFIX = b"ttasktoggle:"
 _TRUSTED_TASK_CONTINUE_PREFIX = b"ttaskcontinue:"
 _TRUSTED_TASK_PERIOD_PREFIX = b"ttaskperiod:"
+# "🔎 Проверить разово" на карточке "мониторинг завершён/выключен" (см.
+# задачу "expired Georgia Check Now UX") — ОТДЕЛЬНЫЙ префикс от
+# _CHECK_NOW_PREFIX (тот — subscription-id self-service, этот — task-id
+# trusted-admin, разные data model, см. decode_check_now_callback выше).
+_TRUSTED_CHECK_NOW_ONCE_PREFIX = b"tchecknowonce:"
 
 # car-centric "📋 Мои авто" (см. design report про переработку UX) — для
 # обычного (не-trusted) пользователя, subscription-based, ОТДЕЛЬНЫЕ
@@ -418,6 +423,14 @@ def decode_trusted_task_continue_callback(data: bytes | None) -> tuple[int, int]
     return _decode_id_page(data, _TRUSTED_TASK_CONTINUE_PREFIX)
 
 
+def encode_trusted_check_now_once_callback(task_id: int) -> bytes:
+    return _TRUSTED_CHECK_NOW_ONCE_PREFIX + str(task_id).encode("ascii")
+
+
+def decode_trusted_check_now_once_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _TRUSTED_CHECK_NOW_ONCE_PREFIX)
+
+
 def encode_trusted_task_period_callback(task_id: int, days: int, page: int) -> bytes:
     return _TRUSTED_TASK_PERIOD_PREFIX + f"{task_id}:{days}:{page}".encode("ascii")
 
@@ -525,6 +538,24 @@ def trusted_task_off_keyboard(task_id: int, *, page: int) -> list[list[Button]]:
     return [
         [Button.inline("▶️ Продолжить мониторинг", encode_trusted_task_continue_callback(task_id, page))],
         [Button.inline(BACK_BUTTON_LABEL, encode_trusted_tasks_page_callback(page))],
+    ]
+
+
+def trusted_check_now_inactive_keyboard(task_id: int) -> list[list[Button]]:
+    """Карточка "мониторинг завершён/выключен" (см. задачу "expired
+    Georgia Check Now UX") — показывается вместо голого NOT_FOUND после
+    trusted "🔎 Проверить сейчас" по номеру, когда активной задачи нет, но
+    есть историческая (см. ConversationController.
+    _handle_trusted_check_now_car_number_input/SubscriptionService.
+    find_representative_task_for_inactive_car). "▶️ Продолжить
+    мониторинг"/"⬅️ Назад" — ТЕ ЖЕ callbacks, что и на экране OFF-детали
+    (см. trusted_task_off_keyboard выше), page=0 намеренно: эта карточка
+    открывается ПО НОМЕРУ, а не со страницы списка "📋 Мои авто", поэтому
+    "вернуться на ту же page" неприменимо — ведёт на её первую страницу."""
+    return [
+        [Button.inline("🔎 Проверить разово", encode_trusted_check_now_once_callback(task_id))],
+        [Button.inline("▶️ Продолжить мониторинг", encode_trusted_task_continue_callback(task_id, 0))],
+        [Button.inline(BACK_BUTTON_LABEL, encode_trusted_tasks_page_callback(0))],
     ]
 
 

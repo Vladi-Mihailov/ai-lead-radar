@@ -44,6 +44,7 @@ from reader.public_bot.keyboards import (
     decode_search_back_callback,
     decode_search_new_callback,
     decode_search_page_callback,
+    decode_trusted_check_now_once_callback,
     decode_trusted_stop_confirm_callback,
     decode_trusted_stop_pick_callback,
     decode_trusted_task_continue_callback,
@@ -60,6 +61,7 @@ from reader.public_bot.keyboards import (
     protocol_check_method_keyboard,
     search_entry_keyboard,
     search_result_keyboard,
+    trusted_check_now_inactive_keyboard,
     trusted_stop_confirm_keyboard,
     trusted_stop_options_keyboard,
     trusted_task_detail_keyboard,
@@ -269,6 +271,14 @@ def register(
         if trusted_task_continue is not None:
             task_id, page = trusted_task_continue
             reply = controller.handle_trusted_task_continue(task_id, page, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        trusted_check_now_once_id = decode_trusted_check_now_once_callback(data)
+        if trusted_check_now_once_id is not None:
+            reply = await controller.handle_trusted_check_now_once(
+                trusted_check_now_once_id, telegram_user_id=event.sender_id,
+            )
             await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
@@ -485,6 +495,8 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False, is_trusted: bo
         buttons = trusted_task_period_choice_keyboard(
             reply.trusted_task_period_id, page=reply.trusted_task_period_page,
         )
+    elif reply.trusted_check_now_inactive_id is not None:
+        buttons = trusted_check_now_inactive_keyboard(reply.trusted_check_now_inactive_id)
     elif reply.my_cars_page_options is not None:
         # car-centric "📋 Мои авто" (см. design report про переработку
         # UX) — пустой список ([]) — валидный (см. design: "показать 0 из

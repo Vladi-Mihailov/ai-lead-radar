@@ -14,16 +14,19 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from reader.protocol_support.texts import OPERATOR_LABEL
 from reader.public_bot.keyboards import (  # noqa: E402
+    decode_trusted_check_now_once_callback,
     decode_trusted_task_continue_callback,
     decode_trusted_task_open_callback,
     decode_trusted_task_period_callback,
     decode_trusted_task_toggle_callback,
     decode_trusted_tasks_page_callback,
+    encode_trusted_check_now_once_callback,
     encode_trusted_task_continue_callback,
     encode_trusted_task_open_callback,
     encode_trusted_task_period_callback,
     encode_trusted_task_toggle_callback,
     main_menu_keyboard,
+    trusted_check_now_inactive_keyboard,
     trusted_task_detail_keyboard,
     trusted_task_off_keyboard,
     trusted_task_period_choice_keyboard,
@@ -316,6 +319,42 @@ def test_trusted_task_off_keyboard_has_continue_and_back():
 
     labels = [b.text for row in keyboard for b in row]
     assert labels == ["▶️ Продолжить мониторинг", "⬅️ Назад"]
+
+
+def test_trusted_check_now_once_callback_round_trips():
+    data = encode_trusted_check_now_once_callback(42)
+    assert decode_trusted_check_now_once_callback(data) == 42
+
+
+def test_trusted_check_now_once_callback_rejects_other_prefixes():
+    """Разные namespace'ы не должны случайно декодироваться друг другом
+    (см. design report про _CHECK_NOW_PREFIX — subscription-id self-
+    service, другая data model)."""
+    assert decode_trusted_check_now_once_callback(encode_trusted_task_continue_callback(42, 0)) is None
+    assert decode_trusted_task_continue_callback(encode_trusted_check_now_once_callback(42)) is None
+
+
+def test_trusted_check_now_inactive_keyboard_has_once_continue_and_back():
+    """См. задачу "expired Georgia Check Now UX" — РОВНО три кнопки,
+    "🔎 Проверить разово" первая (см. design report про мокап)."""
+    keyboard = trusted_check_now_inactive_keyboard(42)
+
+    labels = [b.text for row in keyboard for b in row]
+    assert labels == ["🔎 Проверить разово", "▶️ Продолжить мониторинг", "⬅️ Назад"]
+
+
+def test_trusted_check_now_inactive_keyboard_buttons_use_task_id_not_car_number():
+    """Callback_data строится ИСКЛЮЧИТЕЛЬНО из task_id — никакого
+    car_number/markdown в payload (см. задачу п.7)."""
+    keyboard = trusted_check_now_inactive_keyboard(42)
+
+    once_data = keyboard[0][0].type.data
+    continue_data = keyboard[1][0].type.data
+    assert decode_trusted_check_now_once_callback(once_data) == 42
+    assert decode_trusted_task_continue_callback(continue_data) == (42, 0)
+    for row in keyboard:
+        for button in row:
+            assert b"*" not in button.type.data
 
 
 def test_trusted_task_period_choice_keyboard_has_15_30_90_and_back():
