@@ -4259,8 +4259,9 @@ def test_humanize_error_falls_back_to_str_for_unmapped_exception():
             InviteErrorAction.SKIP_USER, "invalid", "invalid",
         ),
         (
+            # Пользователь в предельном числе групп — кандидат сразу исключается.
             UserChannelsTooMuchError(request=GetHistoryRequest),
-            InviteErrorAction.SKIP_USER, "failed", "errors",
+            InviteErrorAction.SKIP_USER, "invalid", "invalid",
         ),
         (
             # Исключён (забанен) в target — повтор не поможет.
@@ -5936,7 +5937,10 @@ def test_execute_test_mode_errors_and_already_participant_do_not_count_toward_li
         # эти 2 успешные отправки остаются 'pending', а не 'joined'.
         assert sum(1 for i in invites if i.status == "joined") == 1
         assert sum(1 for i in invites if i.status == "pending") == 2
-        assert sum(1 for i in invites if i.status == "failed") == 2
+        # UserChannelsTooMuchError теперь сразу 'invalid' (кандидат исключён
+        # из кампании), а не 'failed' с backoff.
+        assert sum(1 for i in invites if i.status == "failed") == 1
+        assert sum(1 for i in invites if i.status == "invalid") == 1
     finally:
         invite_repository.close()
 
@@ -6013,10 +6017,11 @@ def test_execute_test_mode_stop_still_sends_correct_final_stats_notifications(tm
     assert "📤 Отправлено приглашений: 3" in account_notifications[0]
     assert "✅ Подтверждено участников: 1" in account_notifications[0]
     assert "⏳ Ожидают подтверждения: 3" in account_notifications[0]
-    assert "🚫 Недоступны (invalid): 0" in account_notifications[0]
-    assert "❌ Ошибок: 1" in account_notifications[0]
-    # 5, а не 6: кандидат с UserChannelsTooMuchError теперь в backoff
-    # (failure_kind=user_state) и не возвращается в очередь сразу же.
+    # Кандидат с UserChannelsTooMuchError теперь сразу 'invalid' (исключён из
+    # кампании), поэтому он в «Недоступны», а не в «Ошибок», и в очередь не
+    # возвращается (5, а не 6).
+    assert "🚫 Недоступны (invalid): 1" in account_notifications[0]
+    assert "❌ Ошибок: 0" in account_notifications[0]
     assert "Осталось кандидатов: 5" in account_notifications[0]
 
     campaign_notifications = [m for m in reports if "Итоги кампании" in m]
@@ -6024,7 +6029,7 @@ def test_execute_test_mode_stop_still_sends_correct_final_stats_notifications(tm
     assert "📤 Отправлено приглашений: 3" in campaign_notifications[0]
     assert "✅ Подтверждено участников: 1" in campaign_notifications[0]
     assert "⏳ Ожидают подтверждения: 3" in campaign_notifications[0]
-    assert "❌ Ошибок: 1" in campaign_notifications[0]
+    assert "❌ Ошибок: 0" in campaign_notifications[0]
     # 10 подходящих кандидатов всего - 4 со статусом 'pending'/'joined' в БД
     # (3 pending + 1 joined) = 6 осталось.
     assert "Осталось кандидатов: 5" in campaign_notifications[0]

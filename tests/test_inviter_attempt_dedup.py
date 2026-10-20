@@ -81,9 +81,11 @@ def test_same_account_never_retries_same_candidate(tmp_path, error):
     asyncio.run(_run_service(db_path, client_factory=_make_client_factory(created=created), execute=True))
     assert [r for c in created for r in c.call_requests] == []
 
-    # Другой аккаунт, который его не пробовал, — может; кроме приватности:
-    # она и раньше делала кандидата invalid для всей кампании (не меняется).
-    assert _candidates(db_path, campaign.id, account_id=acc2.id) == ([] if error == "privacy" else [1])
+    # Другой аккаунт, который его не пробовал, — может; кроме явных отказов по
+    # самому кандидату (приватность, предельное число групп) — они делают его
+    # invalid для всей кампании.
+    assert _candidates(db_path, campaign.id, account_id=acc2.id) == (
+        [] if error in ("privacy", "channels_too_much") else [1])
 
 
 def test_different_account_can_invite_after_chat_member_add_failed(tmp_path):
@@ -174,8 +176,7 @@ def test_already_attempted_candidate_is_skipped_and_next_one_is_invited(tmp_path
     asyncio.run(_run_service(db_path, client_factory=_make_client_factory(
         call_errors={"acc1": [_chat_member_add_failed()]}), execute=True))
     _expire_backoff(db_path)
-    # Пауза аккаунта после CHAT_MEMBER_ADD_FAILED (см. test_inviter_add_failed_cooldown.py)
-    # истекла — проверяется именно выбор следующего кандидата.
+    # blocked_until в прошлом — проверяется именно выбор следующего кандидата.
     accounts = TelegramAccountRepository(db_path)
     accounts.update(acc1.id, blocked_until=datetime.now(timezone.utc) - timedelta(seconds=1))
     accounts.close()

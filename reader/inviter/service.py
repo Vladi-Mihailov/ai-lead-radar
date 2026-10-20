@@ -59,6 +59,7 @@ from reader.inviter.identity import (
 )
 from reader.inviter.models import InviteCampaign, InviteCandidate, TelegramAccount
 from reader.inviter.repository import (
+    ADD_FAILED_MAX_ACCOUNTS,
     InviteCampaignRepository,
     TelegramAccountRepository,
     UserCampaignInviteRepository,
@@ -107,12 +108,15 @@ _MAX_TOLERABLE_FLOOD_WAIT_SECONDS = 300
 # параметр вроде daily_limit/invitations_per_account_per_hour.
 _PEER_FLOOD_COOLDOWN_SECONDS = 24 * 60 * 60
 
-# CHAT_MEMBER_ADD_FAILED на invite RPC — сигнал ограничения АККАУНТА (а не
-# кандидата): аккаунт временно не используется. Пауза растёт с числом таких
-# ответов за 24 ч после последнего успешного приглашения (успех обнуляет).
-_ADD_FAILED_COOLDOWNS = (timedelta(hours=1), timedelta(hours=6), timedelta(hours=24))
-_ADD_FAILED_WINDOW = timedelta(hours=24)
-_ADD_FAILED_REASON = "chat_member_add_failed"
+# CHAT_MEMBER_ADD_FAILED на invite RPC — результат по КАНДИДАТУ (этого человека
+# нельзя добавить), а не ограничение аккаунта: production 12–20.10 — 98 таких
+# ответов пришлись всего на 17 кандидатов, каждого перепробовали 3–7 разных
+# аккаунтов, ни один не добавился, а те же аккаунты в это же время успешно
+# приглашали других. Аккаунт не блокируется; кандидата пробуют не больше
+# ADD_FAILED_MAX_ACCOUNTS разных аккаунтов (см. repository.py), затем он
+# исключается из кампании ('invalid'). Второй аккаунт — не раньше чем через
+# _ADD_FAILED_RETRY_DELAY.
+_ADD_FAILED_RETRY_DELAY = timedelta(hours=1)
 
 
 def _is_chat_member_add_failed(exc: Exception) -> bool:
@@ -350,12 +354,15 @@ _PERMANENT_CANDIDATE_ERROR_TYPES = (
     # _SKIP_USER_ERROR_TYPES (status='failed', выбирался заново на каждом
     # тике бесконечно): пользователь запретил приглашения в группы
     # (настройка приватности самого пользователя), исключён из target
-    # (бан в target_chat), удалён/деактивирован.
+    # (бан в target_chat), удалён (INPUT_USER_DEACTIVATED, 400 — именно
+    # приглашаемый пользователь). UserDeactivatedError/UserDeactivatedBanError
+    # сюда НЕ относятся: это 401 про НАШ аккаунт, см. _STOP_ACCOUNT_ERROR_TYPES.
     UserPrivacyRestrictedError,
     UserKickedError,
-    UserDeactivatedError,
-    UserDeactivatedBanError,
     InputUserDeactivatedError,
+    # Пользователь состоит в предельном числе групп — раньше user_state с
+    # backoff 3–30 дней и повтором; теперь кандидат сразу исключается.
+    UserChannelsTooMuchError,
 )
 
 # "Такого объекта нет" при резолве — РЕАЛЬНЫЕ исключения, которые отдаёт
@@ -405,6 +412,8 @@ def _next_attempt_delay(failure_kind: str | None, previous_failures: int) -> tim
         return min(_TRANSIENT_RETRY_BASE * (2 ** min(previous_failures, 16)), _TRANSIENT_RETRY_CAP)
     if failure_kind == "user_state":
         return min(_USER_STATE_RETRY_BASE * (2 ** min(previous_failures, 16)), _USER_STATE_RETRY_CAP)
+    if failure_kind == "add_failed":
+        return _ADD_FAILED_RETRY_DELAY
     return None
 
 
@@ -633,6 +642,11 @@ class InviteErrorAction(Enum):
     # Временное общее ограничение API (небольшой FloodWait) — подождать
     # exc.seconds и продолжить тем же аккаунтом.
     RETRY_LATER = "retry_later"
+    # Проблема только в этом кандидате (CHAT_MEMBER_ADD_FAILED), но аккаунт
+    # завершает ТЕКУЩИЙ вызов: не больше одной реальной invite RPC за тик
+    # воркера (как и раньше). Аккаунт не блокируется, оператор не
+    # уведомляется — на следующем своём тике аккаунт берёт другого кандидата.
+    SKIP_USER_END_CALL = "skip_user_end_call"
     # Совсем не Telegram RPC-ошибка (не RPCError вовсе) — по определению
     # ничего о ней не известно, поэтому обрабатывается так же осторожно,
     # как STOP_ACCOUNT, но отдельно — для логирования с трассировкой.
@@ -696,7 +710,6 @@ class InviteErrorClassification:
 # per-user состояния (приватность, бан в target, удалённый аккаунт, не
 # взаимный контакт) — в _PERMANENT_CANDIDATE_ERROR_TYPES (status='invalid').
 _USER_STATE_ERROR_TYPES = (
-    UserChannelsTooMuchError,
     UserBlockedError,
 )
 
@@ -733,6 +746,11 @@ _STOP_ACCOUNT_ERROR_TYPES = (
     ChatWriteForbiddenError,
     ChannelPrivateError,
     UsersTooMuchError,
+    # 401 USER_DEACTIVATED / USER_DEACTIVATED_BAN (Telethon 1.44): удалён или
+    # забанен САМ приглашающий аккаунт, а не кандидат — кандидат не должен
+    # становиться 'invalid' (раньше ошибочно стояли среди ошибок кандидата).
+    UserDeactivatedError,
+    UserDeactivatedBanError,
 )
 
 
@@ -824,6 +842,13 @@ def _classify_invite_error(exc: Exception) -> InviteErrorClassification:
         return InviteErrorClassification(
             InviteErrorAction.STOP_ACCOUNT, db_status="failed", stat_field="errors",
             operator_message=_humanize_error(exc), failure_kind="account",
+        )
+    if _is_chat_member_add_failed(exc):
+        # Отдельного класса в Telethon нет (обычный RPCError) — проверка ДО
+        # общей ветки RPCError, которая остановила бы аккаунт.
+        return InviteErrorClassification(
+            InviteErrorAction.SKIP_USER_END_CALL, db_status="failed", stat_field="errors",
+            failure_kind="add_failed",
         )
     if isinstance(exc, RPCError):
         # Нераспознанная RPC-ошибка: аккаунт останавливается (как раньше), а
@@ -1338,7 +1363,7 @@ class InviterService:
            вообще можно приглашать в эту группу/канал) — если аккаунт не
            может приглашать, кандидаты не выбираются вовсе.
         5. Основная волна (см. _run_invite_wave) — до remaining кандидатов.
-        6. Если волна не была прервана (STOP_ACCOUNT/FATAL/лимит тестового
+        6. Если волна не была прервана (STOP_ACCOUNT/FATAL/SKIP_USER_END_CALL/лимит тестового
            режима) И account.verify_membership — подождать (см.
            _wait_before_verifying_pending, по числу реально отправленных)
            и проверить всех pending этого аккаунта в этой кампании (см.
@@ -1560,7 +1585,7 @@ class InviterService:
 
         Возвращает True, если аккаунт должен немедленно прекратить
         обработку ОСТАЛЬНЫХ кандидатов ЭТОЙ волны (см.
-        _classify_invite_error — STOP_ACCOUNT/FATAL, либо достигнут лимит
+        _classify_invite_error — STOP_ACCOUNT/FATAL/SKIP_USER_END_CALL, либо достигнут лимит
         успешных отправок тестового режима, см. _invite_candidate) —
         вызывающий код (_execute_account) тогда не выполняет ни проверку
         pending, ни волну добора."""
@@ -1707,7 +1732,7 @@ class InviterService:
 
         Возвращает True, если этот аккаунт должен немедленно прекратить
         обработку ОСТАЛЬНЫХ кандидатов (см. _classify_invite_error —
-        InviteErrorAction.STOP_ACCOUNT/FATAL, либо достигнут лимит
+        InviteErrorAction.STOP_ACCOUNT/FATAL/SKIP_USER_END_CALL, либо достигнут лимит
         успешных приглашений тестового режима) — обрыв connect() отдельно
         этого аккаунта уже обрабатывается выше по стеку, здесь же он не
         встречается. Во всех остальных случаях — False, и после случайной
@@ -1856,7 +1881,7 @@ class InviterService:
         классификатор: запись в user_campaign_invites/InviteStats (raw
         str(exc) — техническая причина, для диагностики), опциональное
         is_bot=1 в users.db (см. _mark_user_as_bot), и одно из четырёх
-        действий (STOP_ACCOUNT/SKIP_USER/RETRY_LATER/FATAL).
+        действий (STOP_ACCOUNT/SKIP_USER/SKIP_USER_END_CALL/RETRY_LATER/FATAL).
 
         Возвращает True, если аккаунт должен прекратить обработку
         ОСТАЛЬНЫХ кандидатов (STOP_ACCOUNT и FATAL — оператору отправляется
@@ -1872,10 +1897,16 @@ class InviterService:
             classification, campaign, account, candidate,
         )
         if db_status == "invalid" and classification.db_status != "invalid":
-            raw_text = (
-                f"{raw_text} | identity не резолвится НИ ОДНИМ активным аккаунтом "
-                f"(failure_kind=unresolved у всех) — терминально для этой кампании"
-            )
+            if classification.failure_kind == "add_failed":
+                raw_text = (
+                    f"{raw_text} | CHAT_MEMBER_ADD_FAILED от {ADD_FAILED_MAX_ACCOUNTS} разных аккаунтов — "
+                    f"кандидат не добавляется, терминально для этой кампании"
+                )
+            else:
+                raw_text = (
+                    f"{raw_text} | identity не резолвится НИ ОДНИМ активным аккаунтом "
+                    f"(failure_kind=unresolved у всех) — терминально для этой кампании"
+                )
 
         if classification.mark_as_bot:
             self._mark_user_as_bot(candidate.user_id)
@@ -1913,8 +1944,10 @@ class InviterService:
         if stat_field is not None:
             setattr(stats, stat_field, getattr(stats, stat_field) + 1)
 
-        if _is_chat_member_add_failed(exc):
-            account = self._apply_add_failed_cooldown(account)
+        if classification.action == InviteErrorAction.SKIP_USER_END_CALL:
+            # Кандидат обработан; аккаунт заканчивает этот вызов без паузы и
+            # без уведомления оператору (см. InviteErrorAction.SKIP_USER_END_CALL).
+            return True
 
         if classification.action == InviteErrorAction.RETRY_LATER:
             await asyncio.sleep(classification.wait_seconds)
@@ -1961,6 +1994,12 @@ class InviterService:
 
         kind = classification.failure_kind
         now = datetime.now(timezone.utc)
+        if kind == "add_failed":
+            tried = self._invite_repository.add_failed_account_ids(candidate.user_id, campaign.id)
+            tried.add(account.id)
+            if len(tried) >= ADD_FAILED_MAX_ACCOUNTS:
+                return "invalid", "invalid", None
+            return "failed", classification.stat_field, now + _ADD_FAILED_RETRY_DELAY
         if kind == "unresolved":
             tried = self._invite_repository.unresolved_account_ids(candidate.user_id, campaign.id)
             tried.add(account.id)
@@ -2168,25 +2207,6 @@ class InviterService:
                 f"Не удалось обновить access_hash пользователя {entity.id} в users.db",
                 exc_info=True,
             )
-
-    def _apply_add_failed_cooldown(self, account: TelegramAccount) -> TelegramAccount:
-        """1-й CHAT_MEMBER_ADD_FAILED за 24 ч -> 1 ч, 2-й -> 6 ч, далее -> 24 ч
-        (текущий ответ уже записан в user_campaign_invites). Тот же
-        blocked_until, что и у FloodWait/PeerFlood: worker пропускает аккаунт,
-        следующий тик берёт другой."""
-        try:
-            streak = self._invite_repository.count_recent_add_failed(
-                account.id, datetime.now(timezone.utc) - _ADD_FAILED_WINDOW,
-            )
-        except Exception:
-            logger.warning(f"Не удалось посчитать CHAT_MEMBER_ADD_FAILED для {account.name}", exc_info=True)
-            streak = 1
-        cooldown = _ADD_FAILED_COOLDOWNS[min(max(streak, 1), len(_ADD_FAILED_COOLDOWNS)) - 1]
-        logger.warning(
-            f"[EXECUTE]\nAccount: {account.name}\nCHAT_MEMBER_ADD_FAILED #{streak} за 24 ч — "
-            f"аккаунт на паузе {_format_duration(cooldown.total_seconds())}."
-        )
-        return self._persist_flood_wait_block(account, cooldown.total_seconds(), _ADD_FAILED_REASON)
 
     def _persist_flood_wait_block(
         self, account: TelegramAccount, wait_seconds: float, blocked_reason: str,
