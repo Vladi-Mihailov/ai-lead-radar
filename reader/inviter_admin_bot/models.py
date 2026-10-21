@@ -26,13 +26,19 @@ class AccountListEntry:
     сама показывает "USED / LIMIT"). ТА ЖЕ формула, что и
     AccountUsage.sent_today/InviterService._remaining_daily_budget (см.
     service.py::_account_usage — joined_today + pending_today), никакого
-    отдельного счётчика здесь не вводится."""
+    отдельного счётчика здесь не вводится.
+
+    attempts_today — реальные invite RPC за те же сутки, независимо от исхода
+    (CHAT_MEMBER_ADD_FAILED, приватность, PeerFlood... тоже), по уже
+    записанной истории — см. UserCampaignInviteRepository.
+    count_today_invite_attempts. Кнопка строки: "успешные / попытки / лимит"."""
 
     id: int
     display_name: str
     enabled: bool
     sent_today: int
     daily_limit: int
+    attempts_today: int = 0
 
 
 @dataclass(frozen=True)

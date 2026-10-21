@@ -290,24 +290,25 @@ def main_menu_keyboard() -> list[list[Button]]:
     ]
 
 
-def accounts_page_keyboard(entries: list[tuple[int, str, bool, int, int]]) -> list[list[Button]]:
+def accounts_page_keyboard(entries: list[tuple[int, str, bool, int, int, int]]) -> list[list[Button]]:
     """entries — (account_id, display_name, enabled, sent_today,
-    daily_limit) (см. задачу "объедини экраны 👤 Аккаунты и ⚙️ Лимиты" —
-    бывший отдельный экран "⚙️ Лимиты" удалён, его данные/кнопка
+    attempts_today, daily_limit) (см. задачу "объедини экраны 👤 Аккаунты и
+    ⚙️ Лимиты" — бывший отдельный экран "⚙️ Лимиты" удалён, его данные/кнопка
     перенесены сюда третьей кнопкой строки). Три кнопки на строку: имя
     открывает карточку (encode_account_open_callback, без изменений),
     🟢/⚪ переключает enabled напрямую из списка (см. design "Нажатие
     должно включать/выключать account.enabled", логика НЕ менялась),
-    "USED / LIMIT" (та же формула, что и у inviter — joined_today +
-    pending_today) открывает выбор лимита, который возвращает на этот же
-    список (см. limits_value_choice_keyboard/ACCOUNTS_BACK)."""
+    "УСПЕШНЫЕ / ПОПЫТКИ / ЛИМИТ" за сутки (успешные — та же формула, что и у
+    inviter: joined_today + pending_today; попытки — реальные invite RPC,
+    см. AccountListEntry.attempts_today) открывает выбор лимита, который
+    возвращает на этот же список (см. limits_value_choice_keyboard/ACCOUNTS_BACK)."""
     return [
         [
             Button.inline(display_name, encode_account_open_callback(account_id)),
             Button.inline("🟢" if enabled else "⚪", encode_account_toggle_callback(account_id)),
-            Button.inline(f"{sent_today} / {daily_limit}", encode_limits_open_callback(account_id)),
+            Button.inline(f"{sent_today} / {attempts_today} / {daily_limit}", encode_limits_open_callback(account_id)),
         ]
-        for account_id, display_name, enabled, sent_today, daily_limit in entries
+        for account_id, display_name, enabled, sent_today, attempts_today, daily_limit in entries
     ]
 
 

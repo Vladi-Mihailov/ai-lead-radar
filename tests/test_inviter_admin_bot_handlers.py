@@ -78,18 +78,19 @@ async def test_access_denied_reply_has_no_buttons_at_all():
 
 async def test_accounts_page_reply_attaches_account_rows():
     """Задача "объедини экраны 👤 Аккаунты и ⚙️ Лимиты" — каждая строка
-    теперь три кнопки: имя, 🟢/⚪, USED / LIMIT (бывший отдельный экран
-    "⚙️ Лимиты" удалён, его данные — третья кнопка этой же строки)."""
+    теперь три кнопки: имя, 🟢/⚪, УСПЕШНЫЕ / ПОПЫТКИ / ЛИМИТ (бывший
+    отдельный экран "⚙️ Лимиты" удалён, его данные — третья кнопка этой же
+    строки; попытки — реальные invite RPC за сутки)."""
     reply = _FakeReply(
         text=texts.ACCOUNTS_HEADER,
-        accounts_page_options=[(1, "@vvz982", True, 3, 15), (2, "@ib85gnat", False, 0, 20)],
+        accounts_page_options=[(1, "@vvz982", True, 2, 7, 15), (2, "@ib85gnat", False, 0, 0, 20)],
     )
     event = _FakeEvent()
 
     await _send_reply(event, reply)
 
     labels = _labels(event.calls[0]["buttons"])
-    assert labels == ["@vvz982", "🟢", "3 / 15", "@ib85gnat", "⚪", "0 / 20"]
+    assert labels == ["@vvz982", "🟢", "2 / 7 / 15", "@ib85gnat", "⚪", "0 / 0 / 20"]
 
 
 async def test_account_card_reply_shows_turn_off_when_enabled():

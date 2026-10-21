@@ -49,7 +49,7 @@ class BotReply:
     text: str
     show_main_menu: bool = False
     show_cancel_button: bool = False
-    accounts_page_options: list[tuple[int, str, bool, int, int]] | None = None
+    accounts_page_options: list[tuple[int, str, bool, int, int, int]] | None = None
     account_card_id: int | None = None
     account_card_enabled: bool | None = None
     # Phase 3A: текущие права аккаунта для кнопок карточки (📩 ЛС / 👥 Инвайты).
@@ -273,9 +273,9 @@ class AdminBotController:
             account_card_dm=account.can_send_dm, account_card_invite=account.can_invite_to_groups,
         )
 
-    def _accounts_page_options(self) -> list[tuple[int, str, bool, int, int]]:
+    def _accounts_page_options(self) -> list[tuple[int, str, bool, int, int, int]]:
         return [
-            (e.id, e.display_name, e.enabled, e.sent_today, e.daily_limit)
+            (e.id, e.display_name, e.enabled, e.sent_today, e.attempts_today, e.daily_limit)
             for e in self._service.list_accounts()
         ]
 

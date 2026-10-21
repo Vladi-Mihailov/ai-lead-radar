@@ -551,6 +551,30 @@ WHERE account_id = :account_id
   AND invited_at >= :since
 """
 
+# Реальные invite RPC аккаунта за текущие UTC-сутки (только для показа в
+# "👤 Аккаунты" админ-бота, инвайтер этим не пользуется). Каждый исход попытки
+# InviterService пишет НОВОЙ строкой (_record_invite_result -> create()),
+# created_at — момент записи результата; проверка pending
+# (_verify_pending_invites) обновляет ту же строку, поэтому не считается
+# повторно. RPC была, если Telegram принял приглашение (статусы ниже, joined —
+# в т.ч. UserAlreadyParticipant) или ответил ошибкой на САМ запрос
+# приглашения: Telethon пишет его в текст ошибки ("... (caused by
+# InvokeWithoutUpdatesRequest(InviteToChannelRequest))") — CHAT_MEMBER_ADD_FAILED,
+# приватность, PeerFlood, FloodWait на самой RPC. Не RPC: отказ резолва
+# (ошибка ResolveUsername/GetUsers), отмена для бота; пропуски по лимиту/
+# блокировке/без кандидатов и dry-run строк не пишут вовсе.
+_COUNT_TODAY_INVITE_ATTEMPTS = """
+SELECT COUNT(*)
+FROM user_campaign_invites
+WHERE account_id = :account_id
+  AND created_at >= :today_start
+  AND (
+      status IN ('pending', 'joined', 'not_joined', 'invited')
+      OR error LIKE '%InviteToChannelRequest%'
+      OR error LIKE '%AddChatUserRequest%'
+  )
+"""
+
 # Все приглашения ЭТОГО аккаунта в рамках ЭТОЙ кампании, которые ждут
 # подтверждения вступления (см. InviterService._verify_pending_invites) —
 # независимо от того, когда именно они были отправлены (в том числе из
@@ -1204,6 +1228,23 @@ class UserCampaignInviteRepository:
         row = self._conn.execute(
             _COUNT_TODAY_PENDING,
             {"account_id": account_id, "today_start": today_start.isoformat()},
+        ).fetchone()
+        return row[0]
+
+    def count_today_invite_attempts(self, account_id: int) -> int:
+        """Сколько РЕАЛЬНЫХ invite RPC (InviteToChannelRequest/
+        AddChatUserRequest) этот account_id выполнил с начала текущих суток
+        (UTC, как и count_today_joined/count_today_pending), независимо от
+        исхода — см. _COUNT_TODAY_INVITE_ATTEMPTS. Только чтение уже
+        записанной истории, для показа в админ-боте."""
+        today_start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        )
+        row = self._conn.execute(
+            _COUNT_TODAY_INVITE_ATTEMPTS,
+            # created_at — CURRENT_TIMESTAMP ("YYYY-MM-DD HH:MM:SS"), сравнение
+            # строк того же формата.
+            {"account_id": account_id, "today_start": today_start.strftime("%Y-%m-%d %H:%M:%S")},
         ).fetchone()
         return row[0]
 

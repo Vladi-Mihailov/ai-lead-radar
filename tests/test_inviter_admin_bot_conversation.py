@@ -172,7 +172,7 @@ async def test_trusted_user_sees_accounts_list(fx):
     reply = await fx.controller.handle_text(texts.ACCOUNTS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
 
     assert reply.text == texts.ACCOUNTS_HEADER
-    names = {name for _id, name, _enabled, _used, _limit in reply.accounts_page_options}
+    names = {name for _id, name, _enabled, _used, _attempts, _limit in reply.accounts_page_options}
     assert names == {"@vvz982", "@ib85gnat"}
 
 
@@ -191,8 +191,8 @@ async def test_accounts_list_shows_used_over_limit_per_row(fx):
 
     reply = await fx.controller.handle_text(texts.ACCOUNTS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
 
-    by_name = {name: (used, limit) for _id, name, _enabled, used, limit in reply.accounts_page_options}
-    assert by_name == {"@vladimihailov": (0, 15), "@ao777oa777": (0, 15)}
+    by_name = {name: (used, attempts, limit) for _id, name, _enabled, used, attempts, limit in reply.accounts_page_options}
+    assert by_name == {"@vladimihailov": (0, 0, 15), "@ao777oa777": (0, 0, 15)}
 
 
 # ---- 3. account card ----
@@ -223,7 +223,7 @@ def test_toggle_account_from_card_flow(fx):
     reply = fx.controller.handle_account_toggle(account.id, telegram_user_id=_TRUSTED_ID)
 
     assert fx.accounts.get(account.id).enabled is False
-    options_by_id = {aid: enabled for aid, _name, enabled, _used, _limit in reply.accounts_page_options}
+    options_by_id = {aid: enabled for aid, _name, enabled, _used, _attempts, _limit in reply.accounts_page_options}
     assert options_by_id[account.id] is False
 
 
@@ -457,7 +457,7 @@ def test_limits_value_selection_updates_and_returns_to_accounts_list(fx):
     reply = fx.controller.handle_limits_value(account.id, 20, telegram_user_id=_TRUSTED_ID)
 
     assert fx.accounts.get(account.id).daily_limit == 20
-    limits_by_id = {aid: limit for aid, _name, _enabled, _used, limit in reply.accounts_page_options}
+    limits_by_id = {aid: limit for aid, _name, _enabled, _used, _attempts, limit in reply.accounts_page_options}
     assert limits_by_id[account.id] == 20
     # После изменения возвращаемся именно к списку "👤 Аккаунты", не к карточке.
     assert reply.account_card_id is None
@@ -474,7 +474,7 @@ async def test_limits_manual_flow_returns_to_accounts_list(fx):
     final_reply = await fx.controller.handle_text("42", chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
 
     assert fx.accounts.get(account.id).daily_limit == 42
-    limits_by_id = {aid: limit for aid, _name, _enabled, _used, limit in final_reply.accounts_page_options}
+    limits_by_id = {aid: limit for aid, _name, _enabled, _used, _attempts, limit in final_reply.accounts_page_options}
     assert limits_by_id[account.id] == 42
     assert final_reply.account_card_id is None
 
@@ -621,7 +621,7 @@ async def test_account_enabled_icon_independent_of_global_pause(fx):
     fx.service.set_global_enabled(False)
     accounts_reply = await fx.controller.handle_text(texts.ACCOUNTS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
 
-    enabled_by_name = {name: enabled for _id, name, enabled, _used, _limit in accounts_reply.accounts_page_options}
+    enabled_by_name = {name: enabled for _id, name, enabled, _used, _attempts, _limit in accounts_reply.accounts_page_options}
     assert enabled_by_name["@vvz982"] is True  # глобальная пауза не трогает account.enabled
 
     status_reply = await fx.controller.handle_text(texts.STATUS_LABEL, chat_id=_CHAT_ID, telegram_user_id=_TRUSTED_ID)
@@ -696,7 +696,7 @@ def test_toggle_on_current_account_still_works_as_before(fx):
     reply = fx.controller.handle_account_toggle(current.id, telegram_user_id=_TRUSTED_ID)
 
     assert fx.accounts.get(current.id).enabled is False
-    options_by_id = {aid: enabled for aid, _name, enabled, _used, _limit in reply.accounts_page_options}
+    options_by_id = {aid: enabled for aid, _name, enabled, _used, _attempts, _limit in reply.accounts_page_options}
     assert options_by_id[current.id] is False
 
 
