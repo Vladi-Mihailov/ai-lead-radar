@@ -12,6 +12,7 @@ Identity — ВСЕГДА event.sender_id (numeric), никогда не usernam
 import logging
 
 from telethon import Button, TelegramClient, events
+from telethon.errors.rpcerrorlist import QueryIdInvalidError
 
 from reader.public_bot.conversation import ConversationController
 from reader.public_bot.keyboards import (
@@ -177,30 +178,42 @@ def register(
 
         days = decode_period_callback(data)
         if days is not None:
-            reply = await controller.handle_period_choice(
-                days,
-                chat_id=event.chat_id,
-                telegram_user_id=event.sender_id,
-                first_name=first_name,
-                last_name=last_name,
+            # add_car()/add_delegated_car*() внутри делают немедленную
+            # onboarding-проверку (live police.ge) — см.
+            # _ack_then_await_slow_check про QueryIdInvalidError.
+            await _ack_then_await_slow_check(
+                event,
+                controller.handle_period_choice(
+                    days,
+                    chat_id=event.chat_id,
+                    telegram_user_id=event.sender_id,
+                    first_name=first_name,
+                    last_name=last_name,
+                ),
+                is_trusted=is_trusted,
             )
-            await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
         check_now_id = decode_check_now_callback(data)
         if check_now_id is not None:
-            reply = await controller.handle_check_now_choice(
-                check_now_id, telegram_user_id=event.sender_id,
+            # Production incident O127PX62 (2026-10-21) — см.
+            # _ack_then_await_slow_check.
+            await _ack_then_await_slow_check(
+                event,
+                controller.handle_check_now_choice(check_now_id, telegram_user_id=event.sender_id),
+                is_trusted=is_trusted,
             )
-            await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
         my_car_check_now_once = decode_my_car_check_now_once_callback(data)
         if my_car_check_now_once is not None:
-            reply = await controller.handle_my_car_check_now_once(
-                my_car_check_now_once, telegram_user_id=event.sender_id,
+            await _ack_then_await_slow_check(
+                event,
+                controller.handle_my_car_check_now_once(
+                    my_car_check_now_once, telegram_user_id=event.sender_id,
+                ),
+                is_trusted=is_trusted,
             )
-            await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
         my_car_resume = decode_my_car_resume_callback(data)
@@ -295,10 +308,13 @@ def register(
 
         trusted_check_now_once_id = decode_trusted_check_now_once_callback(data)
         if trusted_check_now_once_id is not None:
-            reply = await controller.handle_trusted_check_now_once(
-                trusted_check_now_once_id, telegram_user_id=event.sender_id,
+            await _ack_then_await_slow_check(
+                event,
+                controller.handle_trusted_check_now_once(
+                    trusted_check_now_once_id, telegram_user_id=event.sender_id,
+                ),
+                is_trusted=is_trusted,
             )
-            await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
         trusted_task_period = decode_trusted_task_period_callback(data)
@@ -339,12 +355,15 @@ def register(
             return
 
         if decode_debt_refresh_confirm_callback(data):
-            # Как и handle_check_now_choice выше — event.answer() (снятие
-            # спиннера кнопки) сознательно ПОСЛЕ await живой проверки, не
-            # до (см. _answer_and_send), тот же уже установленный в этом
-            # файле принцип для единственного другого live-check callback'а.
-            reply = await controller.handle_debt_refresh_confirm(telegram_user_id=event.sender_id)
-            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            # Батч-проверка нескольких машин подряд — ещё медленнее
+            # одиночного check_now (см. _ack_then_await_slow_check про
+            # QueryIdInvalidError; прежнее "ack сознательно после" здесь
+            # решение пересмотрено по production-инциденту O127PX62).
+            await _ack_then_await_slow_check(
+                event,
+                controller.handle_debt_refresh_confirm(telegram_user_id=event.sender_id),
+                is_trusted=is_trusted,
+            )
             return
 
         if decode_debt_refresh_cancel_callback(data):
@@ -474,6 +493,41 @@ async def _answer_and_send(event, reply, *, is_trusted: bool = False) -> None:
         return
     await event.answer()
     await _send_reply(event, reply, prefer_edit=True, is_trusted=is_trusted)
+
+
+async def _ack_then_await_slow_check(event, coro, *, is_trusted: bool = False) -> None:
+    """Для callback'ов, чей handler делает реальный live-check (police.ge,
+    Add Car onboarding-проверка, debt refresh) — может занимать секунды (см.
+    production incident O127PX62, 2026-10-21: request_timeout=30s + false-
+    zero confirmation retry легко превышают срок жизни callback-query
+    token — event.answer() ПОСЛЕ проверки бросал QueryIdInvalidError,
+    непойманную, рушившую handler ДО _send_reply — итоговый ответ
+    терялся, хотя сама проверка успешно завершалась, пусть даже с
+    graceful ошибкой). ТОТ ЖЕ проверенный приём, что уже чинил идентичный
+    баг на Turkey (см. reader/turkey_bot/handlers.py, commit f062cb7 "fix:
+    preserve Turkey replies after long checks") — ack СРАЗУ, до начала
+    проверки, ловим ИМЕННО ожидаемый QueryIdInvalidError (остальные
+    Telegram-ошибки не маскируем).
+
+    None от coro — тот же смысл, что и в _answer_and_send (подписка/
+    задача не найдена/не принадлежит/состояние устарело), но alert-попап
+    после answer() уже недоступен (Telegram не позволяет answer() дважды
+    на один callback) — обычным сообщением, не alert, тот же приём, что и
+    у Turkey (UNKNOWN_BUTTON_TEXT через event.respond()).
+
+    prefer_edit=False (не True, как у _answer_and_send) — та же причина,
+    что и у Turkey: после возможной многосекундной паузы оригинальное
+    сообщение может быть уже неактуальным/устаревшим для пользователя,
+    новое сообщение — более надёжная гарантия доставки."""
+    try:
+        await event.answer()
+    except QueryIdInvalidError:
+        pass
+    reply = await coro
+    if reply is None:
+        await event.respond(CALLBACK_NOT_AUTHORIZED_TEXT)
+        return
+    await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=False)
 
 
 async def _send_reply(event, reply, *, prefer_edit: bool = False, is_trusted: bool = False) -> None:
