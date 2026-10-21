@@ -154,8 +154,17 @@ def format_check_now_result(outcome) -> str:
     состояния машины (см. задачу про UX manual check), а не delta с
     прошлой проверки: "новых штрафов нет" здесь принципиально не
     показывается — outcome.fines это ВСЕ штрафы из ответа police.ge на
-    этой проверке, новые и уже известные (см. CheckResult.current_fines)."""
+    этой проверке, новые и уже известные (см. CheckResult.current_fines).
+
+    provider_unavailable (см. задачу "back off when police.ge is
+    unavailable", production incident 2026-10-21) — ОТДЕЛЬНОЕ, более
+    понятное сообщение вместо общего "попробуйте позже", когда circuit
+    breaker уже признал police.ge недоступным (не единичный сбой, а
+    известное временное состояние источника) — быстрый ответ БЕЗ
+    ожидания повторного request_timeout."""
     if not outcome.check_ok:
+        if outcome.provider_unavailable:
+            return "⚠️ Сервис police.ge временно недоступен.\nПопробуйте проверить штрафы позже."
         return (
             f"⚠️ Проверить штрафы для {format_plate_for_telegram(outcome.car_number)} "
             "сейчас не удалось. Попробуйте позже."
@@ -182,6 +191,7 @@ def format_add_car_summary(
     end_date: date,
     check_ok: bool,
     new_fines_count: int,
+    provider_unavailable: bool = False,
 ) -> str:
     """Итог Add Car flow, показываемый клиенту — не путать с операторским
     reader/commands/fine.py::_format_add_summary (другой текст/аудитория,
@@ -195,11 +205,28 @@ def format_add_car_summary(
     вообще опускать строку по условию было бы непоследовательно; вместо
     этого строка убрана целиком для ВСЕХ self-service подтверждений,
     независимо от того, есть ли у клиента username — клиент и так знает
-    свой Telegram-логин, это не новая для него информация."""
+    свой Telegram-логин, это не новая для него информация.
+
+    provider_unavailable (см. задачу "back off when police.ge is
+    unavailable") — подписка/задача УЖЕ создана независимо от исхода
+    проверки (см. SubscriptionService.add_car — check_task() вызывается
+    ПОСЛЕ создания, никогда не блокирует его), здесь только разные
+    формулировки ПОЧЕМУ проверка не удалась: источник временно недоступен
+    (circuit breaker) — отдельное, более понятное сообщение; любая другая
+    причина — прежний текст без изменений."""
     period = f"{_fmt_date(start_date)} — {_fmt_date(end_date)}"
     formatted_car_number = format_plate_for_telegram(car_number)
 
     if not check_ok:
+        if provider_unavailable:
+            return "\n".join([
+                "✅ Автомобиль добавлен.",
+                "⚠️ Первичная проверка штрафов временно недоступна",
+                "(сервис police.ge не отвечает) и будет выполнена позже.",
+                "",
+                f"🚗 {formatted_car_number}",
+                f"📅 Мониторинг: {period}",
+            ])
         return "\n".join([
             "⚠️ Автомобиль добавлен на мониторинг,",
             "но проверить штрафы сейчас не удалось",

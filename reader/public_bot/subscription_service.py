@@ -42,6 +42,11 @@ class AddCarOutcome:
     subscription: FineMonitoringSubscription
     check_ok: bool
     new_fines_count: int
+    # См. CheckNowOutcome.provider_unavailable/задачу "back off when
+    # police.ge is unavailable" — та же семантика, для текста Add Car
+    # (см. texts.format_add_car_summary). Default False сохраняет
+    # поведение существующих вызовов AddCarOutcome(...) без правки.
+    provider_unavailable: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,6 +99,13 @@ class CheckNowOutcome:
     check_ok: bool
     fines: list[NewFineEvent]
     is_owner: bool
+    # True ТОЛЬКО когда check_ok=False потому, что police.ge circuit
+    # breaker открыт (см. CheckResult.provider_unavailable, задача "back
+    # off when police.ge is unavailable") — позволяет texts.
+    # format_check_now_result() показать отдельное, понятное сообщение
+    # вместо общего "попробуйте позже". Default False сохраняет поведение
+    # существующих вызовов CheckNowOutcome(...) без правки.
+    provider_unavailable: bool = False
 
 
 @dataclass(frozen=True)
@@ -265,6 +277,7 @@ class SubscriptionService:
             subscription=subscription,
             check_ok=check_result.shows_as_ok,
             new_fines_count=len(check_result.new_fines) if check_result.shows_as_ok else 0,
+            provider_unavailable=check_result.provider_unavailable,
         )
 
     # ---- trusted-operator delegated flow ----
@@ -838,6 +851,7 @@ class SubscriptionService:
             check_ok=check_result.shows_as_ok,
             fines=check_result.current_fines if check_result.shows_as_ok else [],
             is_owner=subscription.telegram_user_id == telegram_user_id,
+            provider_unavailable=check_result.provider_unavailable,
         )
 
     # ---- trusted-operator task-level admin (см. design report: пересмотр
@@ -1001,6 +1015,7 @@ class SubscriptionService:
             check_ok=check_result.shows_as_ok,
             fines=check_result.current_fines if check_result.shows_as_ok else [],
             is_owner=False,  # task-level admin — всегда trusted-оператор, не владелец
+            provider_unavailable=check_result.provider_unavailable,
         )
 
     async def check_now_task_by_car_number(self, car_number: str) -> CheckNowOutcome | None:
@@ -1064,6 +1079,7 @@ class SubscriptionService:
             check_ok=check_result.shows_as_ok,
             fines=check_result.current_fines if check_result.shows_as_ok else [],
             is_owner=False,
+            provider_unavailable=check_result.provider_unavailable,
         )
 
     def list_tasks_for_car(self, car_number: str) -> list[FineMonitoringTask]:

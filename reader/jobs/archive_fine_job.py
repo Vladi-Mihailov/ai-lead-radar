@@ -106,8 +106,24 @@ class ArchiveFineJob(Job):
         checked = 0
         new_fines_total = 0
         errors = 0
+        # Circuit breaker (см. задачу "back off when police.ge is
+        # unavailable") — проверяется перед КАЖДЫМ check_task(), не один
+        # раз в начале (breaker может восстановиться в середине backlog'а);
+        # одно WARNING на первый пропуск, остальные — только в итоговой
+        # сводке (см. задачу п.4: "Do not generate hundreds of identical
+        # errors").
+        skipped_due_to_unavailable = 0
 
         for index, task in enumerate(due_tasks, start=1):
+            if not self._check_service.provider_available():
+                skipped_due_to_unavailable += 1
+                if skipped_due_to_unavailable == 1:
+                    logger.warning(
+                        "police_ge circuit breaker open — skipping archive checks (due=%d)",
+                        len(due_tasks),
+                    )
+                continue
+
             try:
                 result = await self._check_service.check_task(task)
             except Exception as exc:
@@ -183,8 +199,8 @@ class ArchiveFineJob(Job):
             self.status.last_success_at = run_at
 
         logger.info(
-            "ArchiveFineJob finished: checked=%d, new_fines=%d, errors=%d",
-            checked, new_fines_total, errors,
+            "ArchiveFineJob finished: checked=%d, new_fines=%d, errors=%d, skipped_unavailable=%d",
+            checked, new_fines_total, errors, skipped_due_to_unavailable,
         )
 
     def _compute_next_check_at(self, task: FineMonitoringTask, run_at: datetime) -> datetime:

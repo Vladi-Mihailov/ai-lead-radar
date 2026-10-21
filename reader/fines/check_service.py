@@ -36,7 +36,7 @@ from reader.fines.models import (
     NewFineEvent,
     ParsedFineRecord,
 )
-from reader.fines.provider import FineProvider, FineProviderError
+from reader.fines.provider import FineProvider, FineProviderError, PoliceGeUnavailableError
 from reader.fines.suppression import is_fine_output_suppressed
 from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.fines.translation import (
@@ -124,6 +124,20 @@ class FineCheckService:
         # секунд (см. тесты test_false_zero_confirmation.py).
         self._zero_confirmation_delay_seconds = zero_confirmation_delay_seconds
         self._sleep = sleep
+
+    def provider_available(self) -> bool:
+        """См. задачу "back off when police.ge is unavailable" — тонкий
+        pass-through к FineProvider.is_available() (True по умолчанию для
+        провайдеров без circuit breaker). Используется ИСКЛЮЧИТЕЛЬНО
+        scheduled-джобами (FineJob/ArchiveFineJob) ЗАРАНЕЕ, чтобы
+        пропустить батч целиком одним логом, а не вызывать check_task()
+        для каждой задачи по отдельности, когда источник уже точно
+        недоступен (см. задачу п.4: "do not generate hundreds of
+        identical errors") — check_task() сам по себе остаётся
+        единственным authoritative путём проверки, этот метод НЕ
+        заменяет его собственную circuit-breaker проверку внутри
+        PoliceGeSession.search_by_plate()."""
+        return self._provider.is_available()
 
     async def _resolve_translation(
         self,
@@ -392,6 +406,11 @@ class FineCheckService:
             error_message=error_message,
             total_fines_found=0,
             duration_ms=_elapsed_ms(started_at),
+            # См. задачу "back off when police.ge is unavailable" —
+            # PoliceGeUnavailableError (circuit breaker открыт) отличается
+            # от обычного одноразового FineProviderError только ЭТИМ
+            # флагом, чтобы UI-слой мог показать отдельное сообщение.
+            provider_unavailable=isinstance(exc, PoliceGeUnavailableError),
         )
 
     async def _finalize(

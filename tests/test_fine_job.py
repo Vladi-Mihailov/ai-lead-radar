@@ -39,9 +39,19 @@ _MID_PERIOD = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
 
 
 class _FakeProvider(FineProvider):
-    def __init__(self, records_by_car: dict[str, list[ParsedFineRecord]] | None = None):
+    def __init__(self, records_by_car: dict[str, list[ParsedFineRecord]] | None = None, *, available: bool = True):
         self._records_by_car = records_by_car or {}
         self.requested_plates: list[str] = []
+        # available=False — см. задачу "back off when police.ge is
+        # unavailable": эмулирует circuit breaker, открытый ДРУГИМ
+        # экземпляром PoliceGeSession в этом же процессе (см.
+        # FineProvider.is_available() докстрок) — не настоящий breaker,
+        # просто фиксированный флаг, достаточный для проверки, что FineJob
+        # его действительно спрашивает ПЕРЕД check_task().
+        self._available = available
+
+    def is_available(self) -> bool:
+        return self._available
 
     async def search_by_plate(self, plate: str) -> list[ParsedFineRecord]:
         self.requested_plates.append(plate)
@@ -994,6 +1004,130 @@ async def test_pre_complete_hook_not_called_when_none(tmp_path):
 
         assert task_repo.get(task.id).status == "completed"
         assert provider.requested_plates == []
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+# ==== Circuit breaker — "back off when police.ge is unavailable" (см.
+# задачу, production incident 2026-10-21) ====
+
+
+async def test_fine_job_skips_tasks_when_provider_unavailable(tmp_path):
+    """Главный regression-критерий (п.9.4): "FineJob skips safely" — ни
+    одного check_task()/provider-запроса на due-задачу, когда circuit
+    breaker (эмулирован provider.is_available()=False) открыт."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    try:
+        for i in range(5):
+            task_repo.create(
+                car_number=f"CAR{i:04d}", label=None,
+                start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+                telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+            )
+
+        provider = _FakeProvider(available=False)
+        job = _make_job(task_repo, fine_repo, provider, _FakeNotificationService())
+
+        await job.run(_MID_PERIOD)
+
+        assert provider.requested_plates == []
+        for task in task_repo.list_active():
+            assert task.last_check_status is None  # ни одной записи — задача вообще не тронута
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_fine_job_preserves_last_successful_total_amount_when_unavailable(tmp_path):
+    """П.9.5: "last_successful_total_amount preserved" — задача, у
+    которой УЖЕ была известная положительная задолженность, не должна
+    потерять/обнулить её только потому, что circuit breaker открыт на
+    этом прогоне (и уж тем более не должна создать false-zero, см. задачу
+    п.4)."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    try:
+        task = task_repo.create(
+            car_number="AA001AA", label=None,
+            start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+        task_repo.record_successful_check(task.id, total_amount=250.0)
+        before = task_repo.get(task.id)
+        assert before.last_successful_total_amount == 250.0
+
+        provider = _FakeProvider(available=False)
+        job = _make_job(task_repo, fine_repo, provider, _FakeNotificationService())
+
+        await job.run(_MID_PERIOD)
+
+        after = task_repo.get(task.id)
+        assert after.last_successful_total_amount == 250.0
+        assert after.last_successful_checked_at == before.last_successful_checked_at
+        assert after.last_check_status == before.last_check_status  # не перезаписан 'error'
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_fine_job_logs_single_warning_for_multiple_skipped_tasks(tmp_path, caplog):
+    """П.4/п.8 задачи: "Do not generate hundreds of identical errors" —
+    ровно одно WARNING на весь run(), независимо от числа пропущенных
+    задач, плюс одна итоговая сводка (см. задачу п.8: конкретные строки
+    "police_ge circuit opened"/.../"police_ge circuit recovered" —
+    FineJob использует СВОЮ отдельную формулировку "circuit breaker open",
+    т.к. само состояние breaker'а логируется им самим, см.
+    test_police_ge_circuit_breaker.py)."""
+    import logging
+
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    try:
+        for i in range(10):
+            task_repo.create(
+                car_number=f"CAR{i:04d}", label=None,
+                start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+                telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+            )
+
+        provider = _FakeProvider(available=False)
+        job = _make_job(task_repo, fine_repo, provider, _FakeNotificationService())
+
+        with caplog.at_level(logging.WARNING, logger="reader.jobs.fine_job"):
+            await job.run(_MID_PERIOD)
+
+        warning_lines = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_lines) == 1
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_fine_job_resumes_normal_checks_once_provider_available_again(tmp_path):
+    """П.7 задачи: "Resume gradually using existing normal scheduler
+    cadence" — ни bulk catch-up, ни отдельной логики здесь не требуется:
+    СЛЕДУЮЩИЙ обычный run() просто видит provider.is_available()=True
+    снова и проверяет задачи штатно, как будто ничего не произошло."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    try:
+        task_repo.create(
+            car_number="AA001AA", label=None,
+            start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+
+        provider = _FakeProvider(available=False)
+        job = _make_job(task_repo, fine_repo, provider, _FakeNotificationService())
+        await job.run(_MID_PERIOD)
+        assert provider.requested_plates == []
+
+        provider._available = True  # circuit breaker recovered elsewhere in the process
+        await job.run(_MID_PERIOD + timedelta(hours=6))
+
+        assert provider.requested_plates == ["AA001AA"]
     finally:
         task_repo.close()
         fine_repo.close()

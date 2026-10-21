@@ -16,7 +16,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
 from reader.fines.models import ParsedFineRecord  # noqa: E402
-from reader.fines.provider import FineProvider, FineProviderError  # noqa: E402
+from reader.fines.provider import FineProvider, FineProviderError, PoliceGeUnavailableError  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
 from reader.fines.translation import FineTranslationError, TranslatedFineText  # noqa: E402
 
@@ -25,10 +25,20 @@ _USER_ID = 111
 
 
 class _FakeProvider(FineProvider):
-    def __init__(self, records: list[ParsedFineRecord] | None = None, error: Exception | None = None):
+    def __init__(
+        self,
+        records: list[ParsedFineRecord] | None = None,
+        error: Exception | None = None,
+        *,
+        available: bool = True,
+    ):
         self._records = records or []
         self._error = error
+        self._available = available
         self.requested_plates: list[str] = []
+
+    def is_available(self) -> bool:
+        return self._available
 
     async def search_by_plate(self, plate: str) -> list[ParsedFineRecord]:
         self.requested_plates.append(plate)
@@ -552,6 +562,62 @@ async def test_fine_provider_error_sets_error_status_and_keeps_existing_data(tmp
         updated_task = task_repo.get(task.id)
         assert updated_task.last_check_status == "error"
         assert updated_task.last_error == "сайт недоступен"
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_police_ge_unavailable_error_marks_result_provider_unavailable(tmp_path):
+    """Circuit breaker открыт (см. задачу "back off when police.ge is
+    unavailable") — только PoliceGeUnavailableError должен выставлять
+    CheckResult.provider_unavailable=True, чтобы UI-слой мог показать
+    отдельное сообщение вместо общей ошибки."""
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        provider = _FakeProvider(error=PoliceGeUnavailableError("circuit open"))
+
+        result = await FineCheckService(provider, task_repo, fine_repo).check_task(task)
+
+        assert result.status == "error"
+        assert result.provider_unavailable is True
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_ordinary_provider_error_does_not_mark_provider_unavailable(tmp_path):
+    """Обычная FineProviderError (parser/business-ошибка, НЕ transport-сбой)
+    — не должна выглядеть как "источник недоступен" для UI-слоя (см. задачу
+    п.2: "Only network/connectivity failures should affect circuit state")."""
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        provider = _FakeProvider(error=FineProviderError("csrf token not found"))
+
+        result = await FineCheckService(provider, task_repo, fine_repo).check_task(task)
+
+        assert result.status == "error"
+        assert result.provider_unavailable is False
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_provider_available_delegates_to_provider_is_available(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        service_open = FineCheckService(_FakeProvider(available=False), task_repo, fine_repo)
+        service_closed = FineCheckService(_FakeProvider(available=True), task_repo, fine_repo)
+
+        assert service_open.provider_available() is False
+        assert service_closed.provider_available() is True
     finally:
         task_repo.close()
         fine_repo.close()

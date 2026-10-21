@@ -312,6 +312,14 @@ class CheckResult:
     error_message: str | None
     total_fines_found: int
     duration_ms: int
+    # True ТОЛЬКО когда error_message пришёл от PoliceGeUnavailableError
+    # (circuit breaker отказал ДО единого обращения к police.ge, см.
+    # задачу "back off when police.ge is unavailable") — НЕ для обычных
+    # одноразовых transport/parser-сбоев. Позволяет UI-слою (см.
+    # CheckNowOutcome/format_check_now_result) показать отдельное, более
+    # понятное сообщение вместо общего "попробуйте позже". Default False
+    # сохраняет поведение существующих вызовов CheckResult(...) без правки.
+    provider_unavailable: bool = False
 
 
     @property

@@ -1393,6 +1393,7 @@ class ConversationController:
                 end_date=outcome.subscription.end_date,
                 check_ok=outcome.check_ok,
                 new_fines_count=outcome.new_fines_count,
+                provider_unavailable=outcome.provider_unavailable,
             )
         )
 

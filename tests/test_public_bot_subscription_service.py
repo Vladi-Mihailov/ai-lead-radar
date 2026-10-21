@@ -20,7 +20,11 @@ from telethon.tl.types import User as TelethonUser  # noqa: E402
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
 from reader.fines.models import ParsedFineRecord  # noqa: E402
-from reader.fines.provider import FineProvider, FineProviderError  # noqa: E402
+from reader.fines.provider import (  # noqa: E402
+    FineProvider,
+    FineProviderError,
+    PoliceGeUnavailableError,
+)
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
 from reader.public_bot.owner_resolution import OwnerResolutionError  # noqa: E402
 from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
@@ -371,6 +375,30 @@ async def test_add_car_immediate_check_failure_keeps_task_and_subscription(tmp_p
         assert outcome.new_fines_count == 0
 
         # Подписка/задача остаются созданными, несмотря на ошибку проверки.
+        [task] = fixture.task_repository.list_active()
+        assert task.id == outcome.task.id
+        assert fixture.subscription_repository.get(outcome.subscription.id) is not None
+    finally:
+        fixture.close()
+
+
+async def test_add_car_when_circuit_open_keeps_subscription_and_marks_provider_unavailable(tmp_path):
+    """П.6 задачи "back off when police.ge is unavailable": circuit breaker
+    открыт во время Add Car — подписка/задача ВСЁ РАВНО создаются, только
+    outcome.provider_unavailable=True, чтобы UI показал отдельное
+    "будет выполнена позже" вместо общей ошибки (см. texts.
+    format_add_car_summary)."""
+    fixture = _Fixture(tmp_path, provider_error=PoliceGeUnavailableError("circuit open"))
+    try:
+        outcome = await fixture.service.add_car(
+            telegram_user_id=42, telegram_chat_id=42, username="client",
+            first_name=None, last_name=None, car_number="M295YB196",
+            period_days=30, today=date(2026, 9, 3),
+        )
+
+        assert outcome.check_ok is False
+        assert outcome.provider_unavailable is True
+
         [task] = fixture.task_repository.list_active()
         assert task.id == outcome.task.id
         assert fixture.subscription_repository.get(outcome.subscription.id) is not None
@@ -1076,6 +1104,31 @@ async def test_check_now_suppressed_plate_never_calls_provider_and_shows_no_fine
         assert fixture.provider.requested_plates == []
     finally:
         fixture.close()
+
+
+async def test_check_now_when_circuit_open_returns_immediately_with_provider_unavailable(fx):
+    """П.5 задачи "back off when police.ge is unavailable": 🔎 Проверить
+    сейчас при открытом circuit breaker — ОДИН provider-запрос (тот же
+    check_task(), никакого отдельного retry-цикла "на всякий случай" внутри
+    одного запроса пользователя, см. задачу п.3), PoliceGeUnavailableError
+    долетает до CheckNowOutcome.provider_unavailable=True для UI-слоя (см.
+    texts.format_check_now_result)."""
+    outcome = await fx.service.add_car(
+        telegram_user_id=42, telegram_chat_id=42, username="client",
+        first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+    )
+    requests_before = len(fx.provider.requested_plates)
+
+    fx.provider._error = PoliceGeUnavailableError("circuit open")
+    result = await fx.service.check_now(outcome.subscription.id, telegram_user_id=42)
+
+    assert result is not None
+    assert result.check_ok is False
+    assert result.provider_unavailable is True
+    # Ровно один дополнительный запрос — не несколько попыток внутри этого
+    # одного вызова check_now().
+    assert len(fx.provider.requested_plates) == requests_before + 1
+    assert fx.provider.requested_plates[requests_before:] == ["AA001AA"]
 
 
 async def test_check_now_returns_none_for_unauthorized_user(fx):
