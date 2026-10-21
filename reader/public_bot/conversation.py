@@ -290,6 +290,15 @@ class BotReply:
     Удалить {car} из списка?" (см. handle_my_car_delete_prompt) — ОТДЕЛЬНОЕ
     промежуточное подтверждение перед soft delete, ничего ещё не удаляет.
 
+    my_car_inactive_id — ИСТЁК-карточка обычного пользователя (см. задачу
+    "align Georgia user check-now flow", production-пример O127PX62) —
+    показывается ВМЕСТО немедленного check (handle_check_now_choice),
+    когда выбранная подписка просрочена (см. texts.car_monitoring_state).
+    ON/OFF по-прежнему делают обычный немедленный check — эта карточка
+    СТРОГО для ИСТЁК. "🔎 Проверить разово"/"▶️ Продолжить мониторинг"/
+    "⬅️ Назад" — см. keyboards.py::my_car_inactive_keyboard,
+    handle_my_car_check_now_once, handle_my_car_resume_prompt.
+
     cta_buttons — коммерческие CTA-кнопки под manual "🔎 Проверить сейчас"
     (см. design report про UX manual check) — ТОЛЬКО когда реальный
     владелец увидел хотя бы один штраф своей машины (см.
@@ -330,6 +339,7 @@ class BotReply:
     car_detail_subscription_id: int | None = None
     car_detail_monitoring_state: str | None = None
     car_detail_page: int | None = None
+    my_car_inactive_id: int | None = None
     car_delete_confirm_subscription_id: int | None = None
     car_delete_confirm_page: int | None = None
     cta_buttons: list[list[tuple[str, str]]] | None = None
@@ -1003,15 +1013,17 @@ class ConversationController:
         SubscriptionService.list_actionable_subscriptions) — включает
         OFF/'stopped' машины (см. задачу "fix: allow manual checks for
         stopped Georgia cars": OFF означает только "мониторинг выключен",
-        не "нельзя проверить вручную"), исключает только archived и
-        просроченные по end_date. subscription_id в кнопках, не
-        car_number, чтобы не полагаться на уникальность номера при
-        последующей server-side проверке владения. Единственный
+        не "нельзя проверить вручную") И просроченные/ИСТЁК (см. задачу
+        "align Georgia user check-now flow" — O127PX62: больше не
+        пропадает из списка молча), исключает только archived.
+        subscription_id в кнопках, не car_number, чтобы не полагаться на
+        уникальность номера при последующей server-side проверке владения.
+        handle_check_now_choice() сам решает, что показать конкретной
+        выбранной строке (живой check для ON/OFF, informative-карточку для
+        ИСТЁК) — этот picker одинаково ведёт на ЛЮБУЮ из них. Единственный
         оставшийся потребитель этого picker'а (⛔ для обычного пользователя
         заменена car-centric ON/OFF, см. design report п.8)."""
-        subscriptions = self._subscriptions.list_actionable_subscriptions(
-            telegram_user_id, today=self._today(),
-        )
+        subscriptions = self._subscriptions.list_actionable_subscriptions(telegram_user_id)
         if not subscriptions:
             return BotReply(text=texts.NO_ACTIONABLE_CARS_TEXT)
 
@@ -1443,20 +1455,100 @@ class ConversationController:
         self, subscription_id: int, *, telegram_user_id: int,
     ) -> BotReply | None:
         """None — подписка не найдена/не принадлежит/не создана этим
-        telegram_user_id (см. SubscriptionService.get_actionable_subscription,
-        вызывается внутри check_now()) — Telethon-адаптер (handlers.py)
-        в этом случае отвечает алертом и ничего не проверяет. subscription_id
-        пришёл из callback_data (см. reader/public_bot/keyboards.py) —
-        публичный, не секрет; авторизация — ИСКЛЮЧИТЕЛЬНО через запрос к
-        БД по РЕАЛЬНОМУ event.sender_id, а не через факт валидности id."""
+        telegram_user_id (см. SubscriptionService.get_actionable_subscription) —
+        Telethon-адаптер (handlers.py) в этом случае отвечает алертом и
+        ничего не проверяет. subscription_id пришёл из callback_data (см.
+        reader/public_bot/keyboards.py) — публичный, не секрет; авторизация —
+        ИСКЛЮЧИТЕЛЬНО через запрос к БД по РЕАЛЬНОМУ event.sender_id, а не
+        через факт валидности id.
+
+        ИСТЁК (см. задачу "align Georgia user check-now flow",
+        production-пример O127PX62: раньше такая подписка просто не
+        попадала в picker вовсе, см. SubscriptionService.
+        list_actionable_subscriptions) — ВМЕСТО немедленного check
+        показывает informative-карточку (см. texts.
+        format_my_car_inactive_card/keyboards.py::my_car_inactive_keyboard).
+        ON/OFF — ПРЕЖНЕЕ поведение, НЕ тронуто (см. design report "Check
+        Now должен работать даже если OFF" — немедленный live check,
+        просто как раньше)."""
+        subscription = self._subscriptions.get_actionable_subscription(
+            subscription_id, telegram_user_id=telegram_user_id,
+        )
+        if subscription is None:
+            return None
+
+        today = self._today()
+        _, monitoring_state = texts.car_monitoring_state(subscription, today)
+        if monitoring_state == "ИСТЁК":
+            return BotReply(
+                text=texts.format_my_car_inactive_card(subscription, today=today),
+                my_car_inactive_id=subscription.id,
+            )
+
         outcome = await self._subscriptions.check_now(subscription_id, telegram_user_id=telegram_user_id)
         if outcome is None:
             return None
+        return self._format_check_now_outcome_reply(outcome)
+
+    def _format_check_now_outcome_reply(self, outcome) -> BotReply:
         # CTA — ТОЛЬКО реальному владельцу и только когда есть хотя бы один
         # штраф (см. design report: "CTA — только owner", не trusted-
         # оператору, управляющему чужой delegated-подпиской).
         cta = self._owner_cta_buttons() if outcome.is_owner and outcome.fines else None
         return BotReply(text=texts.format_check_now_result(outcome), cta_buttons=cta)
+
+    async def handle_my_car_check_now_once(
+        self, subscription_id: int, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """"🔎 Проверить разово" на ИСТЁК-карточке (см. keyboards.py::
+        my_car_inactive_keyboard, задача "align Georgia user check-now
+        flow") — РЕАЛЬНЫЙ live check через ТОТ ЖЕ SubscriptionService.
+        check_now(), что и обычный ON/OFF путь выше — никакой отдельной
+        реализации проверки. check_now() -> FineCheckService.check_task()
+        не меняет status/start_date/end_date задачи или подписки (см.
+        check_service.py — трогает только last_checked_at/
+        last_successful_*/detected_fines) — эта кнопка НИЧЕГО не
+        реактивирует, только проверяет.
+
+        None — не владелец/создатель подписки, ИЛИ подписка не существует
+        (см. get_actionable_subscription внутри check_now() — тот же
+        принцип: subscription_id публичен, авторизация ИСКЛЮЧИТЕЛЬНО через
+        запрос к БД по РЕАЛЬНОМУ telegram_user_id)."""
+        outcome = await self._subscriptions.check_now(subscription_id, telegram_user_id=telegram_user_id)
+        if outcome is None:
+            return None
+        return self._format_check_now_outcome_reply(outcome)
+
+    def handle_my_car_resume_prompt(
+        self, subscription_id: int, *, chat_id: int, telegram_user_id: int, username: str | None,
+    ) -> BotReply | None:
+        """"▶️ Продолжить мониторинг" на ИСТЁК-карточке (см. keyboards.py::
+        my_car_inactive_keyboard, задача "align Georgia user check-now
+        flow") — переиспользует ТОТ ЖЕ period-picker (PERIOD_CHOICES) и ту
+        же завершающую бизнес-логику (handle_period_choice ->
+        _complete_self_add_car -> SubscriptionService.add_car), что и
+        "➕ Добавить авто" для нового номера (см. _handle_car_number_input) —
+        car_number уже известен из существующей подписки, поэтому шаг
+        ввода номера пропускается, сразу STEP_AWAITING_PERIOD с тем же
+        payload-форматом ({"car_number", "username"} — is_self_service-
+        ветка handle_period_choice отличает self-service по наличию ключа
+        "username" в payload, см. его докстрок). add_car() сам обнаружит
+        СУЩЕСТВУЮЩУЮ задачу на этот car_number и продлит её — новой задачи
+        не создаст (см. test_add_car_reuses_and_extends_existing_client_
+        bot_task), никакой параллельной бизнес-логики здесь нет.
+
+        None — не владелец/создатель подписки, ИЛИ подписка не существует."""
+        subscription = self._subscriptions.get_actionable_subscription(
+            subscription_id, telegram_user_id=telegram_user_id,
+        )
+        if subscription is None:
+            return None
+
+        self._states.set(
+            chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_PERIOD,
+            payload={"car_number": subscription.car_number, "username": username},
+        )
+        return BotReply(text=texts.PERIOD_PROMPT, show_period_buttons=True)
 
     def handle_stop_cancel(self) -> BotReply:
         """"Отмена" на ⛔-подтверждении — ОБЩАЯ и для trusted task-level

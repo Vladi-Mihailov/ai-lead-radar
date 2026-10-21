@@ -173,3 +173,86 @@ async def test_missing_csrf_token_on_page_raises_error():
 
     with pytest.raises(FineProviderError):
         await session.search_by_plate("AA001AA")
+
+
+# ---- Production bug (O127PX62, 2026-10-21): transport-level httpx
+# exceptions (ConnectTimeout и т.п.) должны оборачиваться в
+# FineProviderError, а не падать unhandled мимо check_task()'s except
+# FineProviderError — см. FineProvider.search_by_plate докстрок: "Бросает
+# FineProviderError при сбое запроса к источнику" (сеть ИЛИ формат) ----
+
+
+def _make_session_raising(exc: Exception, *, on_method: str = "GET") -> PoliceGeSession:
+    """on_method — на каком именно запросе (первом GET за csrf_token или
+    последующем POST поиска) эмулируется сбой сети."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == on_method:
+            raise exc
+        return httpx.Response(200, text=_page_html("token-1"))
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(base_url="https://police.ge/protocol/", transport=transport)
+    return PoliceGeSession(client, page_url=_PAGE_URL, request_timeout=5)
+
+
+async def test_connect_timeout_on_csrf_page_load_raises_fine_provider_error():
+    """ТОЧНЫЙ production repro — httpx.ConnectTimeout на GET csrf-страницы
+    (см. production traceback: police_ge_session.py:47 search_by_plate ->
+    _refresh_csrf_token -> self._client.get(...))."""
+    session = _make_session_raising(httpx.ConnectTimeout("connect timed out"), on_method="GET")
+
+    with pytest.raises(FineProviderError) as excinfo:
+        await session.search_by_plate("O127PX62")
+
+    # Exception chaining сохранён (см. задачу "существующая logging/error
+    # handling должна сохранить exception context") — не "проглочено".
+    assert isinstance(excinfo.value.__cause__, httpx.ConnectTimeout)
+
+
+async def test_connect_timeout_on_search_post_raises_fine_provider_error():
+    """ТОЧНЫЙ production repro — httpx.ConnectTimeout на POST поиска (см.
+    production traceback: police_ge_session.py:72 _try_search ->
+    self._client.post(...))."""
+    session = _make_session_raising(httpx.ConnectTimeout("connect timed out"), on_method="POST")
+
+    with pytest.raises(FineProviderError) as excinfo:
+        await session.search_by_plate("O127PX62")
+
+    assert isinstance(excinfo.value.__cause__, httpx.ConnectTimeout)
+
+
+async def test_read_timeout_raises_fine_provider_error():
+    """Не только ConnectTimeout — ЛЮБОЙ httpx.HTTPError (см.
+    reader/turkey_bot/gib/session.py — тот же проверенный паттерн, что уже
+    используется для Turkey-провайдеров)."""
+    session = _make_session_raising(httpx.ReadTimeout("read timed out"), on_method="POST")
+
+    with pytest.raises(FineProviderError):
+        await session.search_by_plate("O127PX62")
+
+
+async def test_connect_error_raises_fine_provider_error():
+    session = _make_session_raising(
+        httpx.ConnectError("connection refused"), on_method="GET",
+    )
+
+    with pytest.raises(FineProviderError):
+        await session.search_by_plate("O127PX62")
+
+
+async def test_http_status_error_from_raise_for_status_raises_fine_provider_error():
+    """5xx-ответ (raise_for_status() бросает httpx.HTTPStatusError,
+    подкласс httpx.HTTPError) — та же обёртка, что и у транспортных сбоев."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text=_page_html("token-1"))
+        return httpx.Response(503, text="Service Unavailable")
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(base_url="https://police.ge/protocol/", transport=transport)
+    session = PoliceGeSession(client, page_url=_PAGE_URL, request_timeout=5)
+
+    with pytest.raises(FineProviderError):
+        await session.search_by_plate("O127PX62")

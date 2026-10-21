@@ -382,6 +382,21 @@ def format_car_details(subscription: FineMonitoringSubscription, today: date) ->
     ])
 
 
+def format_my_car_inactive_card(subscription: FineMonitoringSubscription, *, today: date) -> str:
+    """"🔎 Проверить сейчас" для ИСТЁК-подписки обычного пользователя (см.
+    задачу "align Georgia user check-now flow", production-пример
+    O127PX62) — вместо немедленного check (как у ON/OFF, см. design report
+    "Check Now должен работать даже если OFF" — это решение НЕ трогается)
+    показывает карточку с объяснением + [🔎 Проверить разово]
+    [▶️ Продолжить мониторинг][⬅️ Назад]. 'stopped' сюда никогда не
+    попадает (см. car_monitoring_state — 'stopped' безусловно OFF,
+    независимо от даты), поэтому здесь ТОЛЬКО одна формулировка — "срок
+    закончился", без варианта "выключен вручную, но ещё действует" (та
+    ветка — уже существующий OFF-экран, не этот)."""
+    plate = format_plate_for_telegram(subscription.car_number)
+    return f"🚗 {plate}\n\nСрок мониторинга закончился {_fmt_date(subscription.end_date)}."
+
+
 TURN_OFF_BUTTON_LABEL = "⏸ Выключить мониторинг"
 TURN_ON_BUTTON_LABEL = "▶️ Включить мониторинг"
 DELETE_CAR_BUTTON_LABEL = "🗑 Удалить автомобиль"

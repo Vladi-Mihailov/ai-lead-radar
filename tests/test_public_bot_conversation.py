@@ -36,9 +36,11 @@ from reader.public_bot.conversation import (  # noqa: E402
 )
 from reader.public_bot.conversation_state_repository import BotConversationStateRepository  # noqa: E402
 from reader.public_bot.keyboards import (  # noqa: E402
+    decode_my_car_check_now_once_callback,
     decode_trusted_check_now_once_callback,
     decode_trusted_task_open_callback,
     encode_trusted_task_open_callback,
+    my_car_inactive_keyboard,
     trusted_check_now_inactive_keyboard,
     trusted_tasks_page_keyboard,
 )
@@ -990,6 +992,206 @@ async def test_check_now_rejects_subscription_belonging_to_another_user(fx):
     result_reply = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=999)
 
     assert result_reply is None
+
+
+# ==== "🔎 Проверить сейчас" для обычного пользователя — ИСТЁК (см. задачу
+# "align Georgia user check-now flow", production-пример O127PX62) ====
+
+
+def _make_expired_subscription(fx, car_number="O127PX62", *, telegram_user_id=1):
+    """status='active', но end_date уже в прошлом — ИСТЁК (см.
+    texts.car_monitoring_state). 'stopped' сюда намеренно НЕ подходит —
+    stopped безусловно OFF независимо от даты, это другая, уже
+    существующая и НЕ тронутая этой задачей ветка (см. design report:
+    "Check Now должен работать даже если OFF" — немедленный check для
+    stopped остаётся прежним, см. тест ниже)."""
+    today = _today()
+    task = fx.task_repository.create(
+        car_number=car_number, label=None,
+        start_date=today - timedelta(days=60), end_date=today - timedelta(days=30),
+        telegram_chat_id=telegram_user_id, created_by_user_id=telegram_user_id,
+        monitoring_scope="client_bot",
+    )
+    return fx.subscription_repository.create(
+        monitoring_task_id=task.id, car_number=car_number, telegram_user_id=telegram_user_id,
+        telegram_chat_id=telegram_user_id, telegram_username="alice",
+        start_date=today - timedelta(days=60), end_date=today - timedelta(days=30),
+    )
+
+
+async def test_check_now_choice_shows_inactive_card_for_expired_subscription(fx):
+    """Главный regression этой задачи — O127PX62: раньше такая подписка
+    не попадала в picker вовсе; теперь попадает, и выбор её ПОКАЗЫВАЕТ
+    informative-карточку ВМЕСТО немедленного check (никакого provider
+    request здесь не было — fx._provider пустой, `_FakeProvider()`)."""
+    subscription = _make_expired_subscription(fx)
+
+    reply = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=1)
+
+    assert reply is not None
+    assert reply.my_car_inactive_id == subscription.id
+    assert reply.text == (
+        f"🚗 {format_plate_for_telegram('O127PX62')}\n\n"
+        f"Срок мониторинга закончился {(_today() - timedelta(days=30)).strftime('%d.%m.%Y')}."
+    )
+    assert "штрафов не найдено" not in reply.text
+
+
+async def test_check_now_choice_still_does_immediate_check_for_stopped_not_expired(fx):
+    """Явно зафиксированное решение (см. AskUserQuestion в рамках этой
+    задачи) — 'stopped' + ещё НЕ истёкший срок ПРОДОЛЖАЕТ делать
+    немедленный check одним тапом, БЕЗ промежуточной карточки (см. design
+    report "Check Now должен работать даже если OFF") — ИСТЁК-карточка
+    строго для просроченных, это НЕ регрессия на уже отгруженное UX."""
+    await fx.service.add_car(
+        telegram_user_id=1, telegram_chat_id=1, username="alice",
+        first_name=None, last_name=None, car_number="M295YB196", period_days=30, today=_today(),
+    )
+    [subscription] = fx.subscription_repository.list_by_user(1)
+    fx.service.turn_off_car(subscription.id, telegram_user_id=1)
+
+    reply = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=1)
+
+    assert reply is not None
+    assert reply.my_car_inactive_id is None
+    assert "штрафов не найдено" in reply.text
+
+
+async def test_my_car_check_now_once_performs_real_live_check(tmp_path):
+    """"🔎 Проверить разово" на ИСТЁК-карточке — РЕАЛЬНЫЙ live check (см.
+    задачу п.9 — для O127PX62 ожидается provider result с 1 штрафом), а
+    НЕ просто показ cached DB amount."""
+    fixture = _Fixture(
+        tmp_path, records_by_car={"O127PX62": [_record(car_number="O127PX62", fingerprint="fp-o127px62")]},
+    )
+    try:
+        subscription = _make_expired_subscription(fixture)
+
+        reply = await fixture.controller.handle_my_car_check_now_once(
+            subscription.id, telegram_user_id=1,
+        )
+
+        assert reply is not None
+        assert "🚨 Обнаружен штраф" in reply.text
+        assert format_plate_for_telegram("O127PX62") in reply.text
+    finally:
+        fixture.close()
+
+
+async def test_my_car_check_now_once_does_not_change_status_or_dates(fx):
+    """КРИТИЧНО (см. задачу п.5) — разовая проверка НЕ включает мониторинг,
+    НЕ продлевает срок, НЕ создаёт дубликат задачи/подписки."""
+    subscription = _make_expired_subscription(fx)
+    before = fx.subscription_repository.get(subscription.id)
+    before_task = fx.task_repository.get(subscription.monitoring_task_id)
+
+    await fx.controller.handle_my_car_check_now_once(subscription.id, telegram_user_id=1)
+
+    after = fx.subscription_repository.get(subscription.id)
+    after_task = fx.task_repository.get(subscription.monitoring_task_id)
+    assert after.status == before.status == "active"  # ИСТЁК — всё ещё формально 'active', см. car_monitoring_state
+    assert after.start_date == before.start_date
+    assert after.end_date == before.end_date
+    assert after_task.status == before_task.status
+    assert after_task.start_date == before_task.start_date
+    assert after_task.end_date == before_task.end_date
+    assert len(fx.subscription_repository.list_by_user(1)) == 1  # никакого дубликата
+
+
+async def test_my_car_check_now_once_rejects_other_users_subscription(fx):
+    """Явное требование п.6/п.8 — forged callback чужим telegram_user_id
+    не проверяет и ничего не меняет."""
+    subscription = _make_expired_subscription(fx)
+
+    reply = await fx.controller.handle_my_car_check_now_once(subscription.id, telegram_user_id=999)
+
+    assert reply is None
+    unchanged = fx.subscription_repository.get(subscription.id)
+    assert unchanged.status == "active"
+
+
+async def test_my_car_check_now_once_persists_new_fine_through_normal_pipeline(tmp_path):
+    """П.9/п.13 задачи — новый штраф от разовой проверки попадает в ту же
+    detected_fines-цепочку, что и ЛЮБАЯ другая проверка."""
+    fixture = _Fixture(
+        tmp_path, records_by_car={"O127PX62": [_record(car_number="O127PX62", fingerprint="fp-new")]},
+    )
+    try:
+        subscription = _make_expired_subscription(fixture)
+
+        await fixture.controller.handle_my_car_check_now_once(subscription.id, telegram_user_id=1)
+
+        rows = fixture.detected_fine_repository.list_by_car_number("O127PX62")
+        assert any(row.fingerprint == "fp-new" for row in rows)
+    finally:
+        fixture.close()
+
+
+async def test_my_car_resume_prompt_opens_existing_period_picker(fx):
+    """"▶️ Продолжить мониторинг" на ИСТЁК-карточке — переиспользует ТОТ
+    ЖЕ period-picker, что и "➕ Добавить авто" (см. задачу п.7: "existing
+    user period-picker/business logic"), car_number уже известен — шаг
+    ввода номера пропущен."""
+    subscription = _make_expired_subscription(fx)
+
+    reply = fx.controller.handle_my_car_resume_prompt(
+        subscription.id, chat_id=1, telegram_user_id=1, username="alice",
+    )
+
+    assert reply is not None
+    assert reply.text == texts.PERIOD_PROMPT
+    assert reply.show_period_buttons is True
+    state = fx.conversation_state_repository.get(1)
+    assert state.step == STEP_AWAITING_PERIOD
+    assert state.payload == {"car_number": "O127PX62", "username": "alice"}
+
+
+async def test_my_car_resume_flow_reuses_existing_task_without_duplicate(fx):
+    """П.7 задачи — после выбора периода: status становится active, даты
+    обновляются через СУЩЕСТВУЮЩУЮ add_car()-логику (reuse+extend), и
+    НИКАКОЙ новой задачи/подписки не создаётся."""
+    subscription = _make_expired_subscription(fx)
+    task_id = subscription.monitoring_task_id
+    today = _today()
+
+    fx.controller.handle_my_car_resume_prompt(
+        subscription.id, chat_id=1, telegram_user_id=1, username="alice",
+    )
+    period_reply = await fx.controller.handle_period_choice(
+        30, chat_id=1, telegram_user_id=1, first_name="Alice", last_name=None,
+    )
+
+    assert period_reply is not None
+    resumed_task = fx.task_repository.get(task_id)
+    assert resumed_task.status == "active"
+    assert resumed_task.end_date == today + timedelta(days=30)
+    assert len(fx.subscription_repository.list_by_user(1)) == 1  # не задвоилось
+    [resumed_subscription] = fx.subscription_repository.list_by_user(1)
+    assert resumed_subscription.monitoring_task_id == task_id  # та же задача, не новая
+
+
+async def test_my_car_resume_prompt_rejects_other_users_subscription(fx):
+    subscription = _make_expired_subscription(fx)
+
+    reply = fx.controller.handle_my_car_resume_prompt(
+        subscription.id, chat_id=999, telegram_user_id=999, username="stranger",
+    )
+
+    assert reply is None
+    assert fx.conversation_state_repository.get(999) is None
+
+
+def test_my_car_inactive_keyboard_buttons_use_subscription_id_not_car_number():
+    """П.8/п.12 задачи — plate bold в тексте (см. test выше), но
+    callback_data кнопок строится ИСКЛЮЧИТЕЛЬНО из subscription_id."""
+    buttons = my_car_inactive_keyboard(42)
+    for row in buttons:
+        for button in row:
+            data = button.data if hasattr(button, "data") else button.type.data
+            assert b"O127PX62" not in data
+            assert b"**" not in data
+    once_data = buttons[0][0].data if hasattr(buttons[0][0], "data") else buttons[0][0].type.data
+    assert decode_my_car_check_now_once_callback(once_data) == 42
 
 
 async def test_check_now_shows_existing_fine_found_by_earlier_check(tmp_path):
@@ -2490,7 +2692,7 @@ async def test_forced_stop_does_not_leave_client_with_misleading_active_state(tr
     assert (
         trusted_fx.service.get_actionable_subscription(subscription.id, telegram_user_id=777) is not None
     )  # get_actionable_subscription не фильтрует по статусу — это ожидаемо
-    actionable = trusted_fx.service.list_actionable_subscriptions(777, today=_today())
+    actionable = trusted_fx.service.list_actionable_subscriptions(777)
     assert [s.id for s in actionable] == [subscription.id]
     assert actionable[0].status == "stopped"
 

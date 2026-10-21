@@ -221,6 +221,39 @@ async def test_add_car_does_not_shorten_existing_task_period(fx):
     assert second.subscription.end_date == date(2026, 10, 3)
 
 
+async def test_add_car_extends_own_expired_subscription_without_duplicate_error(fx):
+    """Production bug, обнаружен в рамках задачи "align Georgia user
+    check-now flow" (O127PX62) — re-add той же машины ТЕМ ЖЕ
+    пользователем, у которого уже есть ИСТЁК-строка (status='active' в БД,
+    end_date в прошлом, см. texts.car_monitoring_state) на этот же
+    (task, user), раньше падал DuplicateActiveSubscriptionError:
+    get_active_for_user_and_car() фильтрует по end_date и не находил
+    существующую строку, create() пытался вставить вторую 'active' на тот
+    же (monitoring_task_id, telegram_user_id) и упирался в partial unique
+    index. Теперь находит её (см. get_active_subscription_for_user_and_
+    task) и продлевает — ни новой задачи, ни новой подписки."""
+    first = await fx.service.add_car(
+        telegram_user_id=1, telegram_chat_id=1, username="alice",
+        first_name=None, last_name=None, car_number="M295YB196",
+        period_days=30, today=date(2026, 1, 1),
+    )
+    # today=2026-09-03 во втором вызове уже далеко за end_date=2026-01-31
+    # первой подписки — status остаётся 'active' в БД (никакая фоновая job
+    # его не меняет, см. car_monitoring_state докстрок), тот же сценарий,
+    # что и production O127PX62.
+    second = await fx.service.add_car(
+        telegram_user_id=1, telegram_chat_id=1, username="alice",
+        first_name=None, last_name=None, car_number="M295YB196",
+        period_days=30, today=date(2026, 9, 3),
+    )
+
+    assert second.task.id == first.task.id
+    assert second.subscription.id == first.subscription.id  # та же строка, не дубликат
+    assert second.subscription.status == "active"
+    assert second.subscription.end_date == date(2026, 10, 3)
+    assert len(fx.subscription_repository.list_by_user(1)) == 1
+
+
 # ---- существующая операторская задача ----
 
 
@@ -436,7 +469,7 @@ def test_turn_off_car_keeps_it_actionable_for_manual_check(fx):
     _task, sub = _make_client_car(fx)
     fx.service.turn_off_car(sub.id, telegram_user_id=1)
 
-    actionable = fx.service.list_actionable_subscriptions(1, today=date(2026, 9, 3))
+    actionable = fx.service.list_actionable_subscriptions(1)
     assert [s.id for s in actionable] == [sub.id]
     assert actionable[0].status == "stopped"
 
@@ -905,17 +938,19 @@ async def test_list_actionable_subscriptions_combines_own_and_managed_without_du
         owner_username="real_owner", car_number="BB002BB", period_days=30, today=date(2026, 9, 3),
     )
 
-    actionable = fx.service.list_actionable_subscriptions(42, today=date(2026, 9, 3))
+    actionable = fx.service.list_actionable_subscriptions(42)
 
     assert {s.id for s in actionable} == {own.subscription.id, delegated.subscription.id}
 
 
-def test_list_actionable_subscriptions_excludes_expired_regardless_of_status(fx):
-    """Просроченный по end_date остаётся исключённым, ДАЖЕ если он ещё раз
-    "остановлен" поверх уже истёкшего периода (см. задачу "fix: allow
-    manual checks for stopped Georgia cars" п.1: end_date >= today
-    остаётся обязательным условием — 'stopped' само по себе больше НЕ
-    исключает, но expiry по дате исключает всегда)."""
+def test_list_actionable_subscriptions_includes_expired_active_subscription(fx):
+    """См. задачу "align Georgia user check-now flow" (production-пример
+    O127PX62) — раньше просроченный по end_date (ИСТЁК) subscription
+    исключался из этого списка безусловно, и обычный пользователь не мог
+    дотянуться до него через "🔎 Проверить сейчас" вовсе. Теперь ВКЛЮЧЁН
+    (handle_check_now_choice сам решает — informative-карточка вместо
+    немедленного check, см. texts.car_monitoring_state == "ИСТЁК"), пока
+    status остаётся в _CHECK_NOW_STATUSES."""
     task = fx.task_repository.create(
         car_number="AA001AA", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
         telegram_chat_id=1, created_by_user_id=1, monitoring_scope="client_bot",
@@ -930,12 +965,11 @@ def test_list_actionable_subscriptions_excludes_expired_regardless_of_status(fx)
         telegram_chat_id=2, telegram_username="bob",
         start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
     )
-    fx.subscription_repository.stop_by_owner_or_creator(expired.id, telegram_user_id=1)  # не влияет — уже expired по дате
 
-    actionable_for_expired_owner = fx.service.list_actionable_subscriptions(1, today=date(2026, 9, 3))
-    actionable_for_active_owner = fx.service.list_actionable_subscriptions(2, today=date(2026, 9, 3))
+    actionable_for_expired_owner = fx.service.list_actionable_subscriptions(1)
+    actionable_for_active_owner = fx.service.list_actionable_subscriptions(2)
 
-    assert actionable_for_expired_owner == []
+    assert [s.id for s in actionable_for_expired_owner] == [expired.id]
     assert [s.id for s in actionable_for_active_owner] == [active.id]
 
 
@@ -946,18 +980,39 @@ def test_list_actionable_subscriptions_excludes_archived(fx):
     fx.subscription_repository.archive(sub.id)
 
     assert fx.subscription_repository.get(sub.id).status == "archived"
-    assert fx.service.list_actionable_subscriptions(1, today=date(2026, 9, 3)) == []
+    assert fx.service.list_actionable_subscriptions(1) == []
 
 
 def test_list_actionable_subscriptions_includes_stopped_with_future_end_date(fx):
-    """Основной regression этой задачи: 'stopped' + end_date в будущем ->
-    selectable (в отличие от test_list_actionable_subscriptions_excludes_
-    expired_regardless_of_status выше, где 'stopped' накладывается на УЖЕ
-    истёкший период)."""
+    """'stopped' + end_date в будущем -> selectable (см. задачу "fix:
+    allow manual checks for stopped Georgia cars")."""
     _task, sub = _make_client_car(fx, period_days=30, today=date(2026, 9, 3))
     fx.subscription_repository.stop_by_owner_or_creator(sub.id, telegram_user_id=1)
 
-    actionable = fx.service.list_actionable_subscriptions(1, today=date(2026, 9, 3))
+    actionable = fx.service.list_actionable_subscriptions(1)
+
+    assert [s.id for s in actionable] == [sub.id]
+    assert actionable[0].status == "stopped"
+
+
+def test_list_actionable_subscriptions_includes_stopped_with_past_end_date(fx):
+    """'stopped' остаётся OFF независимо от даты (см.
+    texts.car_monitoring_state — 'stopped' безусловно OFF, никогда не
+    ИСТЁК) — тоже должен остаться selectable, как и раньше (regression на
+    test_turn_off_car_keeps_it_actionable_for_manual_check, здесь с явно
+    просроченной датой)."""
+    task = fx.task_repository.create(
+        car_number="AA001AA", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        telegram_chat_id=1, created_by_user_id=1, monitoring_scope="client_bot",
+    )
+    sub = fx.subscription_repository.create(
+        monitoring_task_id=task.id, car_number="AA001AA", telegram_user_id=1,
+        telegram_chat_id=1, telegram_username="alice",
+        start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+    )
+    fx.subscription_repository.stop_by_owner_or_creator(sub.id, telegram_user_id=1)
+
+    actionable = fx.service.list_actionable_subscriptions(1)
 
     assert [s.id for s in actionable] == [sub.id]
     assert actionable[0].status == "stopped"
@@ -1101,7 +1156,7 @@ async def test_check_now_picker_shows_duplicate_subscriptions_for_same_car_as_se
     )
     fx.subscription_repository.stop_by_owner_or_creator(duplicate.id, telegram_user_id=42)
 
-    actionable = fx.service.list_actionable_subscriptions(42, today=date(2026, 9, 3))
+    actionable = fx.service.list_actionable_subscriptions(42)
 
     assert {s.id for s in actionable} == {outcome.subscription.id, duplicate.id}
     assert len(actionable) == 2  # обе строки — по одной кнопке на каждую, не одна общая
