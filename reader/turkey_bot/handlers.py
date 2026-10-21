@@ -375,6 +375,54 @@ def _first_message_buttons(reply: BotReply, *, is_trusted: bool, has_extra: bool
     return None
 
 
+# Production bug (см. журнал/diagnostic report "expired Georgia Check Now
+# UX"/K935EC07 — 2026-10-21): event.respond(reply.text, ...) падал с
+# telethon.errors.rpcerrorlist.MessageTooLongError для машин с большим
+# количеством штрафов (K935EC07: 40 combined debt items по gib+kgm+avrasya,
+# ₺6265) — unified check успевал завершиться, но СГЕНЕРИРОВАННЫЙ текст
+# ответа превышал предел Telegram, exception падал unhandled в Telethon
+# _dispatch_update, пользователь не получал вообще никакого ответа. ТОТ ЖЕ
+# proven pattern, что уже чинил идентичный баг на Georgia (см.
+# reader/public_bot/handlers.py::_TELEGRAM_SAFE_TEXT_LIMIT/
+# _split_telegram_text, commit 6869009 "fix: split long Telegram replies")
+# — те же имя/значение/алгоритм, никакой новой реализации.
+_TELEGRAM_SAFE_TEXT_LIMIT = 3900
+
+
+def _split_telegram_text(text: str, *, limit: int = _TELEGRAM_SAFE_TEXT_LIMIT) -> list[str]:
+    """Режет text на куски <= limit символов, НИКОГДА не теряя и не
+    дублируя ни одного символа ("".join(_split_telegram_text(text)) ==
+    text всегда, см. тесты) — байт-в-байт тот же алгоритм, что и
+    reader/public_bot/handlers.py::_split_telegram_text (см. design report
+    "не придумывай другой chunking algorithm без необходимости").
+    Предпочитает границы строк (splitlines(keepends=True) сохраняет
+    исходные символы конца строки ровно как они были, что и даёт лёгкое
+    "join без потерь"). Если ОДНА строка сама по себе длиннее limit —
+    режется жёстко, по limit символов, без попытки угадать "красивую"
+    границу внутри неё."""
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        if len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            for start in range(0, len(line), limit):
+                chunks.append(line[start:start + limit])
+            continue
+        if current and len(current) + len(line) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current += line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 async def _send_reply(event, reply: BotReply, *, is_trusted: bool = False, prefer_edit: bool = False) -> None:
     """extra_texts — дополнительные сообщения ПОСЛЕ основного; cta_buttons/
     show_main_menu (если установлены) прикрепляются к ПОСЛЕДНЕМУ из них, а
@@ -386,27 +434,54 @@ async def _send_reply(event, reply: BotReply, *, is_trusted: bool = False, prefe
     — тот же Georgian pattern "не создавать новое сообщение без
     необходимости"), с safe fallback на event.respond, если редактирование
     невозможно (например, сообщение слишком старое для Telegram edit-
-    window)."""
+    window).
+
+    Длинный reply.text/extra_text (см. production bug K935EC07 —
+    MessageTooLongError) безопасно режется _split_telegram_text() на
+    несколько Telegram-сообщений — короткий текст (подавляющее
+    большинство случаев) даёт РОВНО один chunk, и поведение бит в бит
+    совпадает с прежним (один edit/respond на блок). Кнопки, вычисленные
+    для блока (first_buttons для основного текста, extra_buttons для
+    extra_text), вешаются ТОЛЬКО на ПОСЛЕДНИЙ chunk ЭТОГО блока — ни один
+    chunk не дублирует чужую клавиатуру, независимо от того, разрезан он
+    или нет."""
     has_extra = bool(reply.extra_texts)
 
     first_buttons = _first_message_buttons(reply, is_trusted=is_trusted, has_extra=has_extra)
+    main_chunks = _split_telegram_text(reply.text)
+    main_last_index = len(main_chunks) - 1
+
+    send_from = 0
     if prefer_edit:
         try:
-            await event.edit(reply.text, buttons=first_buttons)
+            await event.edit(main_chunks[0], buttons=first_buttons if main_last_index == 0 else None)
+            send_from = 1
         except Exception:
+            # Как и у event.respond ниже — редактирование могло стать
+            # недоступным (сообщение слишком старое для Telegram edit-
+            # window), но результат всё равно должен дойти: send_from
+            # остаётся 0, весь main_chunks (включая chunks[0]) уходит через
+            # respond ниже, ничего не потеряно и не задвоено (edit выше
+            # либо не отправил ничего вовсе, либо сам упал с исключением
+            # до применения).
             logger.warning("Не удалось отредактировать сообщение Turkey test bot, отправляю новое", exc_info=True)
-            await event.respond(reply.text, buttons=first_buttons)
-    else:
-        await event.respond(reply.text, buttons=first_buttons)
 
-    for index, extra_text in enumerate(reply.extra_texts):
-        is_last = index == len(reply.extra_texts) - 1
-        if is_last and reply.cta_buttons:
+    for index in range(send_from, len(main_chunks)):
+        await event.respond(main_chunks[index], buttons=first_buttons if index == main_last_index else None)
+
+    for extra_index, extra_text in enumerate(reply.extra_texts):
+        is_last_extra = extra_index == len(reply.extra_texts) - 1
+        if is_last_extra and reply.cta_buttons:
             extra_buttons = [[Button.url(label, url) for label, url in reply.cta_buttons]]
-        elif is_last and reply.debt_refresh_available:
+        elif is_last_extra and reply.debt_refresh_available:
             extra_buttons = debt_refresh_button_keyboard()
-        elif is_last and reply.show_main_menu:
+        elif is_last_extra and reply.show_main_menu:
             extra_buttons = main_menu_keyboard(is_trusted=is_trusted)
         else:
             extra_buttons = None
-        await event.respond(extra_text, buttons=extra_buttons)
+
+        extra_chunks = _split_telegram_text(extra_text)
+        extra_last_index = len(extra_chunks) - 1
+        for chunk_index, chunk in enumerate(extra_chunks):
+            is_last_chunk_of_last_extra = is_last_extra and chunk_index == extra_last_index
+            await event.respond(chunk, buttons=extra_buttons if is_last_chunk_of_last_extra else None)
