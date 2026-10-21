@@ -164,12 +164,14 @@ class InviterAdminService:
         "⚙️ Лимиты" (см. задачу) каждая запись несёт также sent_today/
         daily_limit, ТА ЖЕ _account_usage() (joined_today + pending_today),
         что и account_card()/InviterService._remaining_daily_budget —
-        никакого нового счётчика."""
+        никакого нового счётчика. attempts_today — реальные invite RPC за
+        сутки по уже записанной истории (см. count_today_invite_attempts)."""
         return [
             AccountListEntry(
                 id=a.id, display_name=_display_name(a), enabled=a.enabled,
                 sent_today=_account_usage(self._invites, a).sent_today,
                 daily_limit=a.daily_limit,
+                attempts_today=self._invites.count_today_invite_attempts(a.id),
             )
             for a in self._current_accounts()
         ]
