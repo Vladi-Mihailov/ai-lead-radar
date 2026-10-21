@@ -147,6 +147,13 @@ _SELECT_ACTIVE_FOR_USER_AND_CAR = f"""
       AND end_date >= :today
 """
 
+_SELECT_ACTIVE_FOR_USER_AND_TASK = f"""
+    SELECT {_SELECT_FIELDS} FROM fine_monitoring_subscriptions
+    WHERE telegram_user_id = :telegram_user_id
+      AND monitoring_task_id = :monitoring_task_id
+      AND status = 'active'
+"""
+
 _SELECT_BY_USER = f"""
     SELECT {_SELECT_FIELDS} FROM fine_monitoring_subscriptions
     WHERE telegram_user_id = ?
@@ -693,6 +700,25 @@ class FineSubscriptionRepository:
                 "car_number": car_number,
                 "today": today.isoformat(),
             },
+        ).fetchone()
+        return _row_to_subscription(row) if row else None
+
+    def get_active_subscription_for_user_and_task(
+        self, telegram_user_id: int, monitoring_task_id: int,
+    ) -> FineMonitoringSubscription | None:
+        """Как get_active_for_user_and_car() выше, но БЕЗ фильтра по
+        end_date (см. задачу "align Georgia user check-now flow",
+        production-пример O127PX62) — находит ИСТЁК-строку (status
+        остаётся 'active' в БД, просто end_date уже в прошлом, см.
+        texts.car_monitoring_state), у которой УЖЕ есть эта (task, user)
+        пара под partial unique index (WHERE status='active'). Нужна,
+        чтобы SubscriptionService._create_or_update_subscription() нашёл
+        её и продлил (update_period), а не попытался create() вторую
+        'active'-строку на тот же (task, user) и упал с
+        DuplicateActiveSubscriptionError (см. _INSERT)."""
+        row = self._conn.execute(
+            _SELECT_ACTIVE_FOR_USER_AND_TASK,
+            {"telegram_user_id": telegram_user_id, "monitoring_task_id": monitoring_task_id},
         ).fetchone()
         return _row_to_subscription(row) if row else None
 

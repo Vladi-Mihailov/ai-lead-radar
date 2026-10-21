@@ -108,6 +108,13 @@ _MY_CAR_TURN_OFF_PREFIX = b"mycaroff:"
 _MY_CAR_DELETE_PREFIX = b"mycardel:"
 _MY_CAR_DELETE_YES_PREFIX = b"mycardelyes:"
 _MY_CAR_DELETE_NO_PREFIX = b"mycardelno:"
+# ИСТЁК-карточка обычного пользователя (см. задачу "align Georgia user
+# check-now flow", O127PX62) — ОТДЕЛЬНЫЕ от _CHECK_NOW_PREFIX (тот всегда
+# делает немедленный check для ON/OFF, см. design report "Check Now
+# должен работать даже если OFF"); эти два — ТОЛЬКО с informative-карточки
+# ИСТЁК, разные data model/назначение.
+_MY_CAR_CHECK_NOW_ONCE_PREFIX = b"mycarchecknowonce:"
+_MY_CAR_RESUME_PREFIX = b"mycarresume:"
 
 
 def main_menu_keyboard(*, is_trusted: bool = False) -> list[list[Button]]:
@@ -316,6 +323,39 @@ def encode_my_car_delete_cancel_callback(subscription_id: int, page: int) -> byt
 
 def decode_my_car_delete_cancel_callback(data: bytes | None) -> tuple[int, int] | None:
     return _decode_id_page(data, _MY_CAR_DELETE_NO_PREFIX)
+
+
+def encode_my_car_check_now_once_callback(subscription_id: int) -> bytes:
+    return _MY_CAR_CHECK_NOW_ONCE_PREFIX + str(subscription_id).encode("ascii")
+
+
+def decode_my_car_check_now_once_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _MY_CAR_CHECK_NOW_ONCE_PREFIX)
+
+
+def encode_my_car_resume_callback(subscription_id: int) -> bytes:
+    return _MY_CAR_RESUME_PREFIX + str(subscription_id).encode("ascii")
+
+
+def decode_my_car_resume_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _MY_CAR_RESUME_PREFIX)
+
+
+def my_car_inactive_keyboard(subscription_id: int) -> list[list[Button]]:
+    """ИСТЁК-карточка обычного пользователя (см. задачу "align Georgia
+    user check-now flow", production-пример O127PX62) — показывается
+    вместо немедленного check, когда выбранная через "🔎 Проверить
+    сейчас" подписка оказалась просроченной (см.
+    ConversationController.handle_check_now_choice/texts.
+    format_my_car_inactive_card). "⬅️ Назад" ведёт на первую страницу
+    "📋 Мои авто" (та же page=0 семантика, что и у trusted-аналога, см.
+    trusted_check_now_inactive_keyboard — эта карточка открыта НЕ со
+    страницы списка, поэтому "вернуться на ту же page" неприменимо)."""
+    return [
+        [Button.inline("🔎 Проверить разово", encode_my_car_check_now_once_callback(subscription_id))],
+        [Button.inline("▶️ Продолжить мониторинг", encode_my_car_resume_callback(subscription_id))],
+        [Button.inline(BACK_BUTTON_LABEL, encode_my_cars_page_callback(0))],
+    ]
 
 
 def my_cars_page_keyboard(

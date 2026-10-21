@@ -28,10 +28,12 @@ from reader.public_bot.keyboards import (
     decode_debt_refresh_cancel_callback,
     decode_debt_refresh_confirm_callback,
     decode_debt_refresh_pick_callback,
+    decode_my_car_check_now_once_callback,
     decode_my_car_delete_callback,
     decode_my_car_delete_cancel_callback,
     decode_my_car_delete_confirm_callback,
     decode_my_car_open_callback,
+    decode_my_car_resume_callback,
     decode_my_car_turn_off_callback,
     decode_my_car_turn_on_callback,
     decode_my_cars_page_callback,
@@ -53,6 +55,7 @@ from reader.public_bot.keyboards import (
     decode_trusted_task_toggle_callback,
     decode_trusted_tasks_page_callback,
     main_menu_keyboard,
+    my_car_inactive_keyboard,
     my_cars_page_keyboard,
     period_choice_keyboard,
     protocol_check_back_to_method_keyboard,
@@ -188,6 +191,22 @@ def register(
         if check_now_id is not None:
             reply = await controller.handle_check_now_choice(
                 check_now_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        my_car_check_now_once = decode_my_car_check_now_once_callback(data)
+        if my_car_check_now_once is not None:
+            reply = await controller.handle_my_car_check_now_once(
+                my_car_check_now_once, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        my_car_resume = decode_my_car_resume_callback(data)
+        if my_car_resume is not None:
+            reply = controller.handle_my_car_resume_prompt(
+                my_car_resume, chat_id=event.chat_id, telegram_user_id=event.sender_id, username=username,
             )
             await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
@@ -516,6 +535,8 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False, is_trusted: bo
             monitoring_state=reply.car_detail_monitoring_state,
             page=reply.car_detail_page,
         )
+    elif reply.my_car_inactive_id is not None:
+        buttons = my_car_inactive_keyboard(reply.my_car_inactive_id)
     elif reply.cta_buttons:
         # Manual "🔎 Проверить сейчас" — коммерческие CTA (см.
         # ConversationController._owner_cta_buttons); conversation.py

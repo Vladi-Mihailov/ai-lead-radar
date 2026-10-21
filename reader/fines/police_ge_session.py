@@ -59,8 +59,21 @@ class PoliceGeSession:
         )
 
     async def _refresh_csrf_token(self) -> None:
-        response = await self._client.get(self._page_url, timeout=self._timeout)
-        response.raise_for_status()
+        # Production bug (O127PX62, 2026-10-21): необёрнутый httpx.ConnectTimeout
+        # (police.ge временно недоступен) проходил мимо check_task()'s
+        # except FineProviderError и падал unhandled до самого Telethon-
+        # диспетчера — пользователь не получал вообще никакого ответа. ТОТ
+        # ЖЕ приём, что и у Turkey-провайдеров (см. reader/turkey_bot/gib/
+        # session.py и соседние — except httpx.HTTPError, оборачивают в
+        # provider-specific error) — здесь единый FineProviderError, как и
+        # требует докстрок FineProvider.search_by_plate ("Бросает
+        # FineProviderError при сбое запроса к источнику" — сеть ИЛИ
+        # формат, см. police_ge_provider.py докстрок).
+        try:
+            response = await self._client.get(self._page_url, timeout=self._timeout)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise FineProviderError(f"Не удалось загрузить страницу police.ge: {exc}") from exc
 
         match = _CSRF_RE.search(response.text)
         if match is None:
@@ -69,20 +82,23 @@ class PoliceGeSession:
         self._csrf_token = match.group(1)
 
     async def _try_search(self, plate: str) -> dict | None:
-        response = await self._client.post(
-            _SEARCH_URL_PATH,
-            data={
-                "firstResult": 0,
-                "protocolAuto": plate,
-                "csrf_token": self._csrf_token,
-            },
-            headers={
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": self._page_url,
-            },
-            timeout=self._timeout,
-        )
-        response.raise_for_status()
+        try:
+            response = await self._client.post(
+                _SEARCH_URL_PATH,
+                data={
+                    "firstResult": 0,
+                    "protocolAuto": plate,
+                    "csrf_token": self._csrf_token,
+                },
+                headers={
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": self._page_url,
+                },
+                timeout=self._timeout,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise FineProviderError(f"Не удалось выполнить запрос к police.ge: {exc}") from exc
 
         try:
             data = response.json()

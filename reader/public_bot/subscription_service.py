@@ -557,6 +557,18 @@ class SubscriptionService:
         existing = self._subscription_repository.get_active_for_user_and_car(
             telegram_user_id, car_number, today=start_date,
         )
+        if existing is None:
+            # ИСТЁК (см. задачу "align Georgia user check-now flow",
+            # production-пример O127PX62) — get_active_for_user_and_car()
+            # выше НЕ находит её (фильтрует по end_date), но в БД это
+            # ВСЁ ЕЩЁ 'active'-строка под тем же partial unique index
+            # (monitoring_task_id, telegram_user_id) — просто продлеваем
+            # её же (update_period), а не создаём вторую (create() упал бы
+            # DuplicateActiveSubscriptionError, см.
+            # get_active_subscription_for_user_and_task докстрок).
+            existing = self._subscription_repository.get_active_subscription_for_user_and_task(
+                telegram_user_id, task_id,
+            )
         if existing is not None:
             # Повторное "Добавить авто" на ту же машину для того же
             # владельца — обновляем период существующей подписки, дубль не
@@ -586,9 +598,13 @@ class SubscriptionService:
             # приём, что и FineCheckService/IntegrityError на detected_fines,
             # см. reader/fines/check_service.py) — кто-то другой (повторное
             # нажатие/два параллельных апдейта) уже создал активную подписку
-            # для этой же пары — обновляем её, а не падаем.
+            # для этой же пары — обновляем её, а не падаем. Тот же
+            # date-unaware lookup, что и выше (ИСТЁК-строка тоже должна
+            # находиться здесь, не только "по-настоящему" активная).
             refreshed = self._subscription_repository.get_active_for_user_and_car(
                 telegram_user_id, car_number, today=start_date,
+            ) or self._subscription_repository.get_active_subscription_for_user_and_task(
+                telegram_user_id, task_id,
             )
             if refreshed is None:
                 raise
@@ -741,17 +757,24 @@ class SubscriptionService:
     # Stage 4, раздел "UI completion") ----
 
     def list_actionable_subscriptions(
-        self, telegram_user_id: int, *, today: date,
+        self, telegram_user_id: int,
     ) -> list[FineMonitoringSubscription]:
         """Подписки, которые этот пользователь может вручную проверить
         через "🔎 Проверить сейчас" — свои (owner) плюс delegated, которые
         он создал (creator), в статусе active/pending_claim/stopped (см.
         _CHECK_NOW_STATUSES — OFF НЕ исключает ручную проверку, только
-        фоновый мониторинг) и ещё не истёкшие (end_date >= today) —
-        archived и просроченные по дате по-прежнему исключены. Дедуп по
-        id — та же строка МОЖЕТ оказаться и "своей", и "созданной им"
-        одновременно (trusted-оператор поставил машину на мониторинг для
-        самого себя).
+        фоновый мониторинг). Дедуп по id — та же строка МОЖЕТ оказаться и
+        "своей", и "созданной им" одновременно (trusted-оператор поставил
+        машину на мониторинг для самого себя).
+
+        Просроченные (end_date < today, см. texts.car_monitoring_state
+        "ИСТЁК") БОЛЬШЕ НЕ исключаются (см. задачу "align Georgia user
+        check-now flow" — production-пример O127PX62: раньше истёкшая
+        машина молча пропадала из этого списка, у обычного пользователя не
+        было ни одного способа дотянуться до неё через "🔎 Проверить
+        сейчас" вовсе). handle_check_now_choice() сам решает, что
+        показать — обычный живой check (ON/OFF) или informative-карточку
+        (ИСТЁК) — только archived по-прежнему исключён (_CHECK_NOW_STATUSES).
 
         НЕ дедуплицирует по car_number/monitoring_task_id — если у
         пользователя ЕСТЬ две отдельные subscription-строки на один и тот
@@ -766,10 +789,7 @@ class SubscriptionService:
         seen_ids = {s.id for s in own}
         combined = own + [s for s in managed if s.id not in seen_ids]
 
-        return [
-            s for s in combined
-            if s.status in _CHECK_NOW_STATUSES and s.end_date >= today
-        ]
+        return [s for s in combined if s.status in _CHECK_NOW_STATUSES]
 
     def get_actionable_subscription(
         self, subscription_id: int, *, telegram_user_id: int,

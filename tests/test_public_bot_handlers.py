@@ -43,6 +43,7 @@ class _FakeReply:
         self.my_cars_page_options = None
         self.car_delete_confirm_subscription_id = None
         self.car_detail_subscription_id = None
+        self.my_car_inactive_id = None
         self.cta_buttons = None
         self.show_turkey_bot_link = show_turkey_bot_link
         self.debt_refresh_available = False
