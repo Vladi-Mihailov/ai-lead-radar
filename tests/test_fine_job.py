@@ -25,6 +25,7 @@ from reader.fines.models import NewFineEvent, ParsedFineRecord  # noqa: E402
 from reader.fines.notification_coordinator import FineNotificationCoordinator  # noqa: E402
 from reader.fines.provider import FineProvider  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
+from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository  # noqa: E402
 from reader.jobs.fine_job import FineJob  # noqa: E402
 from reader.notifications.base import NotificationResult, NotificationService  # noqa: E402
 
@@ -1126,6 +1127,110 @@ async def test_fine_job_resumes_normal_checks_once_provider_available_again(tmp_
 
         provider._available = True  # circuit breaker recovered elsewhere in the process
         await job.run(_MID_PERIOD + timedelta(hours=6))
+
+        assert provider.requested_plates == ["AA001AA"]
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+# ==== bootstrap-completed plates — "Georgia fines incremental public-feed
+# monitoring": scheduled FineJob must NOT perform normal per-car
+# police.ge search anymore for them ====
+
+
+def _make_job_with_bootstrap(
+    task_repo, fine_repo, provider, notification_service, *, plate_bootstrap_repository,
+) -> FineJob:
+    check_service = FineCheckService(provider, task_repo, fine_repo)
+    coordinator = FineNotificationCoordinator(fine_repo, task_repo, notification_service)
+    return FineJob(
+        task_repository=task_repo,
+        check_service=check_service,
+        notification_coordinator=coordinator,
+        run_times=_RUN_TIMES,
+        tz=_TBILISI,
+        plate_bootstrap_repository=plate_bootstrap_repository,
+    )
+
+
+async def test_bootstrap_completed_plate_is_not_checked_by_fine_job(tmp_path):
+    """Тест 15 задачи: "completed plate: later scheduled runs do NOT call
+    per-plate provider"."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    bootstrap_repo = GeorgiaPlateBootstrapRepository(tmp_path / "users.db")
+    try:
+        task_repo.create(
+            car_number="AA001AA", label=None,
+            start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+        bootstrap_repo.ensure_pending("AA001AA")
+        bootstrap_repo.mark_completed("AA001AA", completed_at=_MID_PERIOD)
+
+        provider = _FakeProvider()
+        job = _make_job_with_bootstrap(
+            task_repo, fine_repo, provider, _FakeNotificationService(),
+            plate_bootstrap_repository=bootstrap_repo,
+        )
+
+        await job.run(_MID_PERIOD)
+
+        assert provider.requested_plates == []
+    finally:
+        task_repo.close()
+        fine_repo.close()
+        bootstrap_repo.close()
+
+
+async def test_bootstrap_pending_plate_is_still_checked_by_fine_job(tmp_path):
+    """Контрольный случай к предыдущему тесту: 'pending' (ещё не
+    bootstrapped) машина продолжает проверяться как раньше — это НЕ режим
+    "выключить всё", а именно "completed -> feed only"."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    bootstrap_repo = GeorgiaPlateBootstrapRepository(tmp_path / "users.db")
+    try:
+        task_repo.create(
+            car_number="AA001AA", label=None,
+            start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+        bootstrap_repo.ensure_pending("AA001AA")
+
+        provider = _FakeProvider()
+        job = _make_job_with_bootstrap(
+            task_repo, fine_repo, provider, _FakeNotificationService(),
+            plate_bootstrap_repository=bootstrap_repo,
+        )
+
+        await job.run(_MID_PERIOD)
+
+        assert provider.requested_plates == ["AA001AA"]
+    finally:
+        task_repo.close()
+        fine_repo.close()
+        bootstrap_repo.close()
+
+
+async def test_fine_job_without_bootstrap_repository_checks_everything_as_before(tmp_path):
+    """plate_bootstrap_repository=None (default) — поведение бит в бит как
+    до задачи "Georgia fines incremental public-feed monitoring", даже
+    если georgia_plate_bootstrap_state откуда-то содержал бы completed."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    try:
+        task_repo.create(
+            car_number="AA001AA", label=None,
+            start_date=date(2026, 8, 1), end_date=date(2026, 8, 31),
+            telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+        )
+
+        provider = _FakeProvider()
+        job = _make_job(task_repo, fine_repo, provider, _FakeNotificationService())
+
+        await job.run(_MID_PERIOD)
 
         assert provider.requested_plates == ["AA001AA"]
     finally:

@@ -1163,3 +1163,122 @@ async def test_translation_api_failure_does_not_break_fine_detection(tmp_path):
     finally:
         task_repo.close()
         fine_repo.close()
+
+
+# ==== persist_feed_match — GeorgiaPublicFineFeedJob (см. задачу "Georgia
+# fines incremental public-feed monitoring") ====
+
+
+async def test_persist_feed_match_creates_new_detected_fine(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        service = FineCheckService(_FakeProvider(), task_repo, fine_repo)
+        record = _record(fingerprint="fp-feed-1", external_fine_id="AB999999")
+
+        result = await service.persist_feed_match(task, record)
+
+        assert result.status == "ok"
+        assert len(result.new_fines) == 1
+        stored = fine_repo.get_by_fingerprint(task.id, "fp-feed-1")
+        assert stored is not None
+        assert stored.external_fine_id == "AB999999"
+        # ПРОВАЙДЕР вообще не вызывался — запись пришла уже готовой из feed'а.
+        assert service._provider.requested_plates == []  # noqa: SLF001
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_persist_feed_match_does_not_touch_last_successful_snapshot(tmp_path):
+    """Критично (см. задачу): ОДНА feed-строка — это публикация ОДНОГО
+    штрафа, НЕ полный снимок задолженности машины (в отличие от
+    searchByAuto) — last_successful_checked_at/last_successful_total_amount
+    не должны обновляться persist_feed_match()."""
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        before = task_repo.get(task.id)
+        assert before.last_successful_checked_at is None
+        assert before.last_successful_total_amount is None
+
+        service = FineCheckService(_FakeProvider(), task_repo, fine_repo)
+        await service.persist_feed_match(task, _record(fingerprint="fp-feed-1"))
+
+        after = task_repo.get(task.id)
+        assert after.last_successful_checked_at is None
+        assert after.last_successful_total_amount is None
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_persist_feed_match_marks_already_known_fingerprint_seen_not_duplicated(tmp_path):
+    """Тест 20/25 задачи: "overlap window intentionally re-reads rows but
+    fingerprints prevent duplicates" — та же запись, увиденная ДВАЖДЫ (два
+    отдельных вызова persist_feed_match, как при overlap-окне), не
+    создаёт вторую строку и не считается новым штрафом во второй раз."""
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        service = FineCheckService(_FakeProvider(), task_repo, fine_repo)
+        record = _record(fingerprint="fp-feed-1", external_fine_id="AB999999")
+
+        first = await service.persist_feed_match(task, record)
+        second = await service.persist_feed_match(task, record)
+
+        assert len(first.new_fines) == 1
+        assert len(second.new_fines) == 0  # уже известен — не "новый" повторно
+        assert len(fine_repo.list_by_car_number(task.car_number)) == 1
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_persist_feed_match_two_different_protocol_numbers_both_persisted(tmp_path):
+    """Тест 19 задачи: "two rows same plate/date but different source IDs:
+    both fines processed" — главный regression-критерий аудита про
+    plate+date не являющийся уникальным ключом."""
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        service = FineCheckService(_FakeProvider(), task_repo, fine_repo)
+        record_a = _record(fingerprint="fp-a", external_fine_id="AB111111")
+        record_b = _record(fingerprint="fp-b", external_fine_id="AB222222")
+
+        result_a = await service.persist_feed_match(task, record_a)
+        result_b = await service.persist_feed_match(task, record_b)
+
+        assert len(result_a.new_fines) == 1
+        assert len(result_b.new_fines) == 1
+        assert len(fine_repo.list_by_car_number(task.car_number)) == 2
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_persist_feed_match_respects_denylist_suppression(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo, car_number="O687KE761")  # см. reader/fines/suppression.py
+        service = FineCheckService(_FakeProvider(), task_repo, fine_repo)
+
+        result = await service.persist_feed_match(
+            task, _record(fingerprint="fp-feed-1", car_number="O687KE761"),
+        )
+
+        assert result.status == "suppressed"
+        assert fine_repo.list_by_car_number("O687KE761") == []
+    finally:
+        task_repo.close()
+        fine_repo.close()

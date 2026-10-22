@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -44,15 +44,19 @@ from reader.dm_campaigns.sender_state import DmSenderStateRepository  # noqa: E4
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
 from reader.fines.notification_coordinator import FineNotificationCoordinator  # noqa: E402
+from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository  # noqa: E402
 from reader.fines.police_ge_circuit_breaker import PoliceGeCircuitBreaker  # noqa: E402
 from reader.fines.police_ge_provider import PoliceGeProvider  # noqa: E402
 from reader.fines.police_ge_session import PoliceGeSession  # noqa: E402
+from reader.fines.public_feed_seen_repository import GeorgiaPublicFeedSeenRepository  # noqa: E402
+from reader.fines.public_feed_state_repository import GeorgiaPublicFeedStateRepository  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
 from reader.fines.translation import FineTranslationService  # noqa: E402
 from reader.groups import Group, GroupLoadError, load_groups  # noqa: E402
 from reader.inviter.repository import TelegramAccountRepository  # noqa: E402
 from reader.jobs.archive_fine_job import ArchiveFineJob  # noqa: E402
 from reader.jobs.fine_job import FineJob  # noqa: E402
+from reader.jobs.georgia_public_feed_job import GeorgiaPublicFineFeedJob  # noqa: E402
 from reader.jobs.notification_flush_job import NotificationFlushJob  # noqa: E402
 from reader.jobs.scheduler import Scheduler  # noqa: E402
 from reader.lead_ai.service import LeadAiService  # noqa: E402
@@ -113,6 +117,9 @@ def build_fine_monitor_components(
     allowed_user_ids: list[int],
     user_repository: UserRepository | None = None,
     client_subscription_repository: FineSubscriptionRepository | None = None,
+    plate_bootstrap_repository: GeorgiaPlateBootstrapRepository | None = None,
+    feed_state_repository: GeorgiaPublicFeedStateRepository | None = None,
+    feed_seen_repository: GeorgiaPublicFeedSeenRepository | None = None,
 ) -> tuple[FineJob, Scheduler, TelegramNotificationService, CommandDispatcher, FineCommand]:
     """Чистая сборка зависимостей мониторинга штрафов — без единого await,
     без обращения к сети/Telegram (конструкторы ничего не подключают, только
@@ -132,7 +139,16 @@ def build_fine_monitor_components(
     scope FineJob (см. extend_client_bot_task_if_still_needed), None —
     хук просто не подключается (client_bot-задачи заканчиваются как
     раньше, без пересчёта под ещё действующие подписки) — как и с
-    user_repository=None, отсутствие не должно ронять запуск."""
+    user_repository=None, отсутствие не должно ронять запуск.
+
+    plate_bootstrap_repository/feed_state_repository/feed_seen_repository
+    (см. задачу "Georgia fines incremental public-feed monitoring") —
+    None (по умолчанию, И всегда, когда settings.fine_monitor.
+    public_feed_enabled=False) означает "public-feed архитектура выключена
+    в этой сборке": fine_job/client_fine_job/archive_fine_job проверяют
+    ВСЕ активные задачи как раньше, GeorgiaPublicFineFeedJob не создаётся
+    и не регистрируется в Scheduler'е вовсе — поведение полностью
+    совпадает с тем, что было до этой задачи."""
     fine_monitor = settings.fine_monitor
     tz = ZoneInfo(fine_monitor.timezone)
 
@@ -192,6 +208,7 @@ def build_fine_monitor_components(
         archive_check_hour=fine_monitor.archive_check_hour,
         archive_interval_days=fine_monitor.archive_interval_days,
         scope="operator",
+        plate_bootstrap_repository=plate_bootstrap_repository,
     )
 
     # Второй, независимый job — та же логика (тот же класс FineJob), но
@@ -224,6 +241,7 @@ def build_fine_monitor_components(
         scope="client_bot",
         name="fine_monitoring_client_bot",
         pre_complete_hook=client_pre_complete_hook,
+        plate_bootstrap_repository=plate_bootstrap_repository,
     )
 
     # Третий, независимый job — архивные проверки (см. докстрок
@@ -241,6 +259,7 @@ def build_fine_monitor_components(
         interval_days=fine_monitor.archive_interval_days,
         daily_limit=fine_monitor.archive_daily_limit,
         tz=tz,
+        plate_bootstrap_repository=plate_bootstrap_repository,
     )
 
     # Четвёртый job — НЕ проверяет штрафы, только максимально часто (на
@@ -257,10 +276,39 @@ def build_fine_monitor_components(
     # не имеет доступа к notification_coordinator).
     notification_flush_job = NotificationFlushJob(notification_coordinator)
 
-    scheduler = Scheduler(
-        [fine_job, client_fine_job, archive_fine_job, notification_flush_job],
-        poll_interval_seconds=_SCHEDULER_POLL_INTERVAL_SECONDS,
-    )
+    jobs: list = [fine_job, client_fine_job, archive_fine_job, notification_flush_job]
+
+    # Пятый job — ТОЛЬКО когда public-feed архитектура включена (см. задачу
+    # "Georgia fines incremental public-feed monitoring" + докстрок этой
+    # функции про plate_bootstrap_repository/feed_state_repository/
+    # feed_seen_repository=None). ТОТ ЖЕ police_ge_session/circuit
+    # breaker/check_service, что и у fine_job/client_fine_job/
+    # archive_fine_job выше — ни второго HTTP-клиента, ни второго
+    # notification flow не создаётся.
+    if (
+        fine_monitor.public_feed_enabled
+        and plate_bootstrap_repository is not None
+        and feed_state_repository is not None
+        and feed_seen_repository is not None
+    ):
+        georgia_public_feed_job = GeorgiaPublicFineFeedJob(
+            police_ge_session,
+            task_repository,
+            check_service,
+            feed_state_repository,
+            feed_seen_repository,
+            poll_interval=timedelta(minutes=fine_monitor.public_feed_poll_interval_minutes),
+            max_pages_per_cycle=fine_monitor.public_feed_max_pages_per_cycle,
+            first_run_max_pages=fine_monitor.public_feed_first_run_max_pages,
+            retention_days=fine_monitor.public_feed_seen_retention_days,
+        )
+        jobs.append(georgia_public_feed_job)
+        logger.info(
+            "Georgia public fine feed monitoring enabled (poll_interval=%d min)",
+            fine_monitor.public_feed_poll_interval_minutes,
+        )
+
+    scheduler = Scheduler(jobs, poll_interval_seconds=_SCHEDULER_POLL_INTERVAL_SECONDS)
 
     command_dispatcher = CommandDispatcher(
         source.client, notification_chat_ids[0], allowed_user_ids
@@ -322,6 +370,27 @@ async def _run_fine_monitor(
         base_url="https://police.ge/protocol/",
         headers={"User-Agent": _POLICE_GE_USER_AGENT},
     )
+    # "Georgia fines incremental public-feed monitoring" — ВСЕ ТРИ
+    # репозитория открываются ТОЛЬКО когда архитектура явно включена (см.
+    # докстрок build_fine_monitor_components) — та же БД
+    # (settings.app.users_db_file), что и у остальных репозиториев этого
+    # процесса, отдельные соединения, закрываются вместе с процессом (как
+    # и все остальные репозитории здесь).
+    plate_bootstrap_repository = (
+        GeorgiaPlateBootstrapRepository(settings.app.users_db_file)
+        if settings.fine_monitor.public_feed_enabled
+        else None
+    )
+    feed_state_repository = (
+        GeorgiaPublicFeedStateRepository(settings.app.users_db_file)
+        if settings.fine_monitor.public_feed_enabled
+        else None
+    )
+    feed_seen_repository = (
+        GeorgiaPublicFeedSeenRepository(settings.app.users_db_file)
+        if settings.fine_monitor.public_feed_enabled
+        else None
+    )
     try:
         _fine_job, scheduler, notification_service, command_dispatcher, fine_command = (
             build_fine_monitor_components(
@@ -329,6 +398,9 @@ async def _run_fine_monitor(
                 http_client, notification_chat_ids, allowed_user_ids,
                 user_repository=user_repository,
                 client_subscription_repository=client_subscription_repository,
+                plate_bootstrap_repository=plate_bootstrap_repository,
+                feed_state_repository=feed_state_repository,
+                feed_seen_repository=feed_seen_repository,
             )
         )
 

@@ -320,6 +320,18 @@ class CheckResult:
     # понятное сообщение вместо общего "попробуйте позже". Default False
     # сохраняет поведение существующих вызовов CheckResult(...) без правки.
     provider_unavailable: bool = False
+    # True ТОЛЬКО когда результат получен через FineCheckService.
+    # _read_last_known_state() (см. задачу "Georgia fines incremental
+    # public-feed monitoring", emergency-mode чтение из detected_fines
+    # вместо живого police.ge-запроса) — НЕ "генуинный" live-результат.
+    # Единственный потребитель — bootstrap-логика (см.
+    # SubscriptionService.add_car): "Do NOT falsely mark completed" —
+    # bootstrap_status переходит в 'completed' ТОЛЬКО когда
+    # from_cache=False, иначе emergency-mode чтение ложно считалось бы
+    # полноценной historical проверкой машины, которую police.ge на самом
+    # деле ни разу не возвращал. Default False сохраняет поведение
+    # существующих вызовов CheckResult(...) без правки.
+    from_cache: bool = False
 
 
     @property

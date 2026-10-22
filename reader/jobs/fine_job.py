@@ -20,6 +20,7 @@ from reader.fines.archive_scheduling import local_time_to_utc
 from reader.fines.check_service import FineCheckService
 from reader.fines.models import FineMonitoringScope, FineMonitoringTask
 from reader.fines.notification_coordinator import FineNotificationCoordinator
+from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository
 from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.jobs.base import Job
 
@@ -62,6 +63,7 @@ class FineJob(Job):
         pre_complete_hook: (
             Callable[[FineMonitoringTask, date], Awaitable[FineMonitoringTask]] | None
         ) = None,
+        plate_bootstrap_repository: GeorgiaPlateBootstrapRepository | None = None,
     ):
         self._task_repository = task_repository
         self._check_service = check_service
@@ -96,6 +98,15 @@ class FineJob(Job):
         # reader/public_bot/subscription_service.py::
         # extend_client_bot_task_if_still_needed).
         self._pre_complete_hook = pre_complete_hook
+        # None (по умолчанию) — public-feed архитектура не включена в этой
+        # сборке (см. задачу "Georgia fines incremental public-feed
+        # monitoring"): ни одна задача не пропускается по bootstrap-
+        # признаку, поведение полностью совпадает с существующим.
+        # bootstrap_status='completed' для car_number задачи — та машина
+        # отслеживается ИСКЛЮЧИТЕЛЬНО через GeorgiaPublicFineFeedJob,
+        # обычный per-car searchByAuto для неё больше не нужен (см.
+        # докстрок run() ниже, "ключевая архитектурная перемена").
+        self._plate_bootstrap_repository = plate_bootstrap_repository
         self._last_run_slot: tuple[date, dt_time] | None = None
         self.status = FineJobStatus()
 
@@ -157,6 +168,14 @@ class FineJob(Job):
         # а НЕ отдельная запись/лог на каждую пропущенную задачу (см.
         # задачу п.4: "Do not generate hundreds of identical errors").
         skipped_due_to_unavailable = 0
+        # "Georgia fines incremental public-feed monitoring" — ключевая
+        # архитектурная перемена: машина с bootstrap_status='completed'
+        # отслеживается ИСКЛЮЧИТЕЛЬНО через GeorgiaPublicFineFeedJob,
+        # FineJob больше не делает по ней обычный per-car поиск вовсе (см.
+        # _plate_bootstrap_repository докстрок в __init__). Отдельный
+        # счётчик от skipped_due_to_unavailable — РАЗНАЯ причина пропуска
+        # (архитектурная, не временная недоступность источника).
+        skipped_due_to_feed_coverage = 0
 
         for task in tasks:
             try:
@@ -174,6 +193,9 @@ class FineJob(Job):
                         # проходе, без ожидания следующего запуска.
                         task = await self._pre_complete_hook(task, today)
                         if today <= task.end_date:
+                            if self._is_bootstrap_completed(task.car_number):
+                                skipped_due_to_feed_coverage += 1
+                                continue
                             if not self._check_service.provider_available():
                                 skipped_due_to_unavailable += 1
                                 self._log_circuit_open_once(skipped_due_to_unavailable)
@@ -198,6 +220,9 @@ class FineJob(Job):
                     continue
 
                 # start_date <= today <= end_date — границы включительно.
+                if self._is_bootstrap_completed(task.car_number):
+                    skipped_due_to_feed_coverage += 1
+                    continue
                 if not self._check_service.provider_available():
                     skipped_due_to_unavailable += 1
                     self._log_circuit_open_once(skipped_due_to_unavailable)
@@ -221,6 +246,12 @@ class FineJob(Job):
                 "while police_ge circuit was open",
                 skipped_due_to_unavailable, self._scope,
             )
+        if skipped_due_to_feed_coverage:
+            logger.info(
+                "FineJob: skipped %d task(s) this run (scope=%s) — bootstrap-completed, "
+                "monitored exclusively via GeorgiaPublicFineFeedJob",
+                skipped_due_to_feed_coverage, self._scope,
+            )
 
         try:
             # Уведомляем отдельно от самой проверки: сюда попадают и штрафы,
@@ -234,6 +265,11 @@ class FineJob(Job):
             return
 
         self.status.last_success_at = run_at
+
+    def _is_bootstrap_completed(self, car_number: str) -> bool:
+        if self._plate_bootstrap_repository is None:
+            return False
+        return self._plate_bootstrap_repository.is_completed(car_number)
 
     def _log_circuit_open_once(self, skipped_count: int) -> None:
         """Ровно одно WARNING на весь run() — на первом пропуске (см.

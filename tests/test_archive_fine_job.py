@@ -22,6 +22,7 @@ from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
 from reader.fines.models import ParsedFineRecord  # noqa: E402
 from reader.fines.notification_coordinator import FineNotificationCoordinator  # noqa: E402
+from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository  # noqa: E402
 from reader.fines.provider import FineProvider, FineProviderError  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
 from reader.jobs.archive_fine_job import ArchiveFineJob  # noqa: E402
@@ -115,6 +116,7 @@ def _make_fine_repo(tmp_path) -> DetectedFineRepository:
 def _make_archive_job(
     task_repo, fine_repo, provider, notification_service,
     *, enabled=True, hour=_HOUR, interval_days=_INTERVAL_DAYS, daily_limit=_DAILY_LIMIT,
+    plate_bootstrap_repository=None,
 ) -> ArchiveFineJob:
     check_service = FineCheckService(provider, task_repo, fine_repo)
     coordinator = FineNotificationCoordinator(fine_repo, task_repo, notification_service)
@@ -127,6 +129,7 @@ def _make_archive_job(
         interval_days=interval_days,
         daily_limit=daily_limit,
         tz=_TBILISI,
+        plate_bootstrap_repository=plate_bootstrap_repository,
     )
 
 
@@ -816,3 +819,31 @@ async def test_archive_job_resumes_once_provider_available_again(tmp_path):
     finally:
         task_repo.close()
         fine_repo.close()
+
+
+async def test_bootstrap_completed_plate_is_not_checked_by_archive_job(tmp_path):
+    """Та же перемена, что и в FineJob (см. test_fine_job.py) — машина уже
+    перешедшая в архивный режим, но bootstrap-completed, отслеживается
+    исключительно через GeorgiaPublicFineFeedJob."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    bootstrap_repo = GeorgiaPlateBootstrapRepository(tmp_path / "users.db")
+    try:
+        now = datetime(2026, 9, 1, 0, 0, tzinfo=timezone.utc)
+        _create_archived_task(task_repo, "AA001AA", now)
+        bootstrap_repo.ensure_pending("AA001AA")
+        bootstrap_repo.mark_completed("AA001AA", completed_at=now)
+
+        provider = _FakeProvider()
+        job = _make_archive_job(
+            task_repo, fine_repo, provider, _FakeNotificationService(),
+            plate_bootstrap_repository=bootstrap_repo,
+        )
+
+        await job.run(now)
+
+        assert provider.requested_plates == []
+    finally:
+        task_repo.close()
+        fine_repo.close()
+        bootstrap_repo.close()

@@ -20,6 +20,7 @@ from telethon.tl.types import User as TelethonUser  # noqa: E402
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
 from reader.fines.models import ParsedFineRecord  # noqa: E402
+from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository  # noqa: E402
 from reader.fines.provider import (  # noqa: E402
     FineProvider,
     FineProviderError,
@@ -111,7 +112,10 @@ def _record(
 
 
 class _Fixture:
-    def __init__(self, tmp_path, records_by_car=None, provider_error=None, owner_resolver_client=None):
+    def __init__(
+        self, tmp_path, records_by_car=None, provider_error=None, owner_resolver_client=None,
+        enable_bootstrap=False,
+    ):
         db_path = tmp_path / "users.db"
         self.task_repository = FineMonitoringTaskRepository(db_path)
         self.detected_fine_repository = DetectedFineRepository(db_path)
@@ -121,10 +125,18 @@ class _Fixture:
         self.check_service = FineCheckService(
             self.provider, self.task_repository, self.detected_fine_repository,
         )
+        # enable_bootstrap — см. задачу "Georgia fines incremental
+        # public-feed monitoring": None сохраняет поведение ВСЕХ
+        # существующих тестов этого файла бит в бит (add_car() не трогает
+        # bootstrap state вовсе, см. SubscriptionService docstring).
+        self.plate_bootstrap_repository = (
+            GeorgiaPlateBootstrapRepository(db_path) if enable_bootstrap else None
+        )
         self.service = SubscriptionService(
             self.task_repository, self.subscription_repository,
             self.user_repository, self.check_service,
             owner_resolver_client=owner_resolver_client,
+            plate_bootstrap_repository=self.plate_bootstrap_repository,
         )
 
     def close(self):
@@ -132,6 +144,8 @@ class _Fixture:
         self.detected_fine_repository.close()
         self.subscription_repository.close()
         self.user_repository.close()
+        if self.plate_bootstrap_repository is not None:
+            self.plate_bootstrap_repository.close()
 
 
 @pytest.fixture
@@ -416,6 +430,76 @@ async def test_add_car_when_circuit_open_keeps_subscription_and_marks_provider_u
         [task] = fixture.task_repository.list_active()
         assert task.id == outcome.task.id
         assert fixture.subscription_repository.get(outcome.subscription.id) is not None
+    finally:
+        fixture.close()
+
+
+# ==== Bootstrap state — "Georgia fines incremental public-feed
+# monitoring" ====
+
+
+async def test_add_car_for_first_ever_plate_does_one_live_check_and_completes_bootstrap(tmp_path):
+    """Тесты 13/14 задачи: "first-ever plate: one full-history lookup" +
+    "successful bootstrap: bootstrap marked completed"."""
+    fixture = _Fixture(tmp_path, enable_bootstrap=True)
+    try:
+        assert fixture.plate_bootstrap_repository.get("M295YB196") is None
+
+        await fixture.service.add_car(
+            telegram_user_id=42, telegram_chat_id=42, username="client",
+            first_name=None, last_name=None, car_number="M295YB196",
+            period_days=30, today=date(2026, 9, 3),
+        )
+
+        assert fixture.provider.requested_plates == ["M295YB196"]  # ОДИН живой запрос
+        state = fixture.plate_bootstrap_repository.get("M295YB196")
+        assert state is not None
+        assert state.is_completed is True
+    finally:
+        fixture.close()
+
+
+async def test_add_car_second_subscription_for_same_plate_does_not_reset_bootstrap(tmp_path):
+    """Вторая подписка (другой пользователь, тот же физический номер) на
+    уже bootstrapped машину не должна откатить её на pending (см.
+    GeorgiaPlateBootstrapRepository.ensure_pending докстрок)."""
+    fixture = _Fixture(tmp_path, enable_bootstrap=True)
+    try:
+        await fixture.service.add_car(
+            telegram_user_id=42, telegram_chat_id=42, username="client_one",
+            first_name=None, last_name=None, car_number="M295YB196",
+            period_days=30, today=date(2026, 9, 3),
+        )
+        assert fixture.plate_bootstrap_repository.is_completed("M295YB196") is True
+
+        await fixture.service.add_car(
+            telegram_user_id=43, telegram_chat_id=43, username="client_two",
+            first_name=None, last_name=None, car_number="M295YB196",
+            period_days=30, today=date(2026, 9, 3),
+        )
+
+        assert fixture.plate_bootstrap_repository.is_completed("M295YB196") is True
+    finally:
+        fixture.close()
+
+
+async def test_add_car_when_circuit_open_keeps_bootstrap_pending(tmp_path):
+    """Тест 16 задачи: "pending bootstrap: remains pending when police.ge
+    unavailable" — "Do NOT falsely mark completed" (см.
+    check_service.py::CheckResult.from_cache)."""
+    fixture = _Fixture(
+        tmp_path, provider_error=PoliceGeUnavailableError("circuit open"), enable_bootstrap=True,
+    )
+    try:
+        await fixture.service.add_car(
+            telegram_user_id=42, telegram_chat_id=42, username="client",
+            first_name=None, last_name=None, car_number="M295YB196",
+            period_days=30, today=date(2026, 9, 3),
+        )
+
+        state = fixture.plate_bootstrap_repository.get("M295YB196")
+        assert state is not None
+        assert state.is_completed is False
     finally:
         fixture.close()
 

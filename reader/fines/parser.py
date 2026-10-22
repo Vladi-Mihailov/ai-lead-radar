@@ -1,6 +1,8 @@
-"""Преобразование JSON-ответа police.ge (endpoint searchByAuto) в
-ParsedFineRecord. Никакой сети/httpx здесь нет — вход уже готовый dict,
-выход — доменные объекты. Полностью детерминировано, тестируется без сети.
+"""Преобразование JSON-ответа police.ge (endpoint searchByAuto, а также
+публичного feed "Receipts of fines published" — endpoint protocols, см.
+parse_published_protocols_response ниже) в ParsedFineRecord. Никакой
+сети/httpx здесь нет — вход уже готовый dict, выход — доменные объекты.
+Полностью детерминировано, тестируется без сети.
 """
 
 import hashlib
@@ -113,3 +115,52 @@ def parse_search_response(raw: Any, *, car_number: str) -> list[ParsedFineRecord
         )
 
     return [_parse_entry(entry, fallback_car_number=car_number) for entry in results]
+
+
+def extract_published_protocols_results(raw: Any) -> list[dict]:
+    """Публичный feed (см. задачу "Georgia fines incremental public-feed
+    monitoring", PoliceGeSession.fetch_published_protocols) — ТОТ ЖЕ
+    конверт {success, data: {results}}, что и searchByAuto (см.
+    parse_search_response докстрок) — валидирует его и возвращает СЫРЫЕ
+    записи (ещё НЕ ParsedFineRecord).
+
+    Сознательно НЕ парсит каждую запись сразу (в отличие от
+    parse_search_response) — GeorgiaPublicFineFeedJob сначала сверяет
+    СЫРОЙ protocolAuto с отслеживаемым множеством номеров и только для
+    РЕАЛЬНО совпавших строк вызывает parse_published_protocol_entry()
+    ниже (см. задачу "DATA MINIMIZATION": несовпавшие строки не должны
+    порождать ничего, кроме мгновенно отброшенного локального значения).
+    publishDate (здесь есть, у ParsedFineRecord — нет) читается
+    вызывающим кодом прямо из сырых записей для курсора/overlap-окна (см.
+    reader/fines/public_feed_state_repository.py)."""
+    if not isinstance(raw, dict) or raw.get("success") is not True:
+        raise FineParseError("Ожидался ответ police.ge с success:true")
+
+    data = raw.get("data")
+    if not isinstance(data, dict):
+        raise FineParseError("Некорректный формат ответа police.ge: data не объект")
+
+    results = data.get("results")
+    if not isinstance(results, list):
+        raise FineParseError("Некорректный формат ответа police.ge: data.results не список")
+
+    if any(not isinstance(entry, dict) for entry in results):
+        raise FineParseError(
+            "Некорректный формат ответа police.ge: data.results содержит не-объектные элементы"
+        )
+
+    return results
+
+
+def parse_published_protocol_entry(entry: dict) -> ParsedFineRecord:
+    """ОДНА уже провалидированная (см. extract_published_protocols_results)
+    запись feed'а -> ParsedFineRecord. Вызывается ТОЛЬКО для строк,
+    реально совпавших с отслеживаемым номером (см. GeorgiaPublicFineFeedJob)
+    — проверено вживую (audit report): все поля, нужные _parse_entry()
+    (protocolAuto/protocolNo/violationDate/protocolAmount/protocolDate/
+    lastDate/activeDate/protocolPlace/protocolLawDescription), уже
+    присутствуют напрямую в каждой записи feed'а — ни одного отдельного
+    detail-запроса к police.ge не требуется. fallback_car_number =
+    protocolAuto самой записи (а не "чей-то один номер", как у
+    searchByAuto) — список покрывает множество разных машин сразу."""
+    return _parse_entry(entry, fallback_car_number=entry.get("protocolAuto") or "")

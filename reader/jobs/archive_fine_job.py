@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 from reader.fines.check_service import FineCheckService
 from reader.fines.models import FineMonitoringTask
 from reader.fines.notification_coordinator import FineNotificationCoordinator
+from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository
 from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.jobs.base import Job
 
@@ -57,6 +58,7 @@ class ArchiveFineJob(Job):
         interval_days: int,
         daily_limit: int,
         tz: ZoneInfo,
+        plate_bootstrap_repository: GeorgiaPlateBootstrapRepository | None = None,
     ):
         self._task_repository = task_repository
         self._check_service = check_service
@@ -66,6 +68,9 @@ class ArchiveFineJob(Job):
         self._interval_days = interval_days
         self._daily_limit = daily_limit
         self._tz = tz
+        # None (по умолчанию) — см. reader/jobs/fine_job.py про тот же
+        # параметр: public-feed архитектура не включена в этой сборке.
+        self._plate_bootstrap_repository = plate_bootstrap_repository
         self._last_run_date: date | None = None
         self.status = ArchiveFineJobStatus()
 
@@ -113,8 +118,20 @@ class ArchiveFineJob(Job):
         # сводке (см. задачу п.4: "Do not generate hundreds of identical
         # errors").
         skipped_due_to_unavailable = 0
+        # "Georgia fines incremental public-feed monitoring" — та же
+        # перемена, что и в FineJob.run(): bootstrap-completed машина
+        # отслеживается исключительно через GeorgiaPublicFineFeedJob, даже
+        # если конкретная задача уже перешла в архивный режим.
+        skipped_due_to_feed_coverage = 0
 
         for index, task in enumerate(due_tasks, start=1):
+            if (
+                self._plate_bootstrap_repository is not None
+                and self._plate_bootstrap_repository.is_completed(task.car_number)
+            ):
+                skipped_due_to_feed_coverage += 1
+                continue
+
             if not self._check_service.provider_available():
                 skipped_due_to_unavailable += 1
                 if skipped_due_to_unavailable == 1:
@@ -199,8 +216,9 @@ class ArchiveFineJob(Job):
             self.status.last_success_at = run_at
 
         logger.info(
-            "ArchiveFineJob finished: checked=%d, new_fines=%d, errors=%d, skipped_unavailable=%d",
-            checked, new_fines_total, errors, skipped_due_to_unavailable,
+            "ArchiveFineJob finished: checked=%d, new_fines=%d, errors=%d, skipped_unavailable=%d, "
+            "skipped_feed_coverage=%d",
+            checked, new_fines_total, errors, skipped_due_to_unavailable, skipped_due_to_feed_coverage,
         )
 
     def _compute_next_check_at(self, task: FineMonitoringTask, run_at: datetime) -> datetime:
