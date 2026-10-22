@@ -17,6 +17,8 @@ import pytest  # noqa: E402
 from reader.fines.parser import (  # noqa: E402
     FineParseError,
     compute_fingerprint,
+    extract_published_protocols_results,
+    parse_published_protocol_entry,
     parse_search_response,
 )
 
@@ -240,3 +242,97 @@ def test_fingerprint_differs_for_different_amount():
     )
 
     assert fp1 != fp2
+
+
+# ==== Публичный feed "Receipts of fines published" (см. задачу "Georgia
+# fines incremental public-feed monitoring", audit report) ====
+
+
+def _feed_entry(
+    *, protocol_no="AB123456", plate="AA001AA", publish_date="2026-10-22",
+    violation_date="2026-10-22", amount=50,
+) -> dict:
+    """Форма записи РЕАЛЬНО подтверждена live-запросом (см. audit report) —
+    те же ключи, что и у searchByAuto, плюс publishDate/protocolLaw,
+    которых searchByAuto не отдаёт."""
+    return {
+        "protocolAuto": plate,
+        "protocolNo": protocol_no,
+        "protocolDate": "2026-10-22",
+        "activeDate": None,
+        "violationDate": violation_date,
+        "protocolPlace": "ქუჩა",
+        "protocolLaw": "125-1",
+        "protocolLawDescription": "სისწრაფის გადაჭარბება",
+        "protocolAmount": amount,
+        "publishDate": publish_date,
+        "lastDate": "2026-12-21",
+        "remainingDays": 60,
+    }
+
+
+def test_extract_published_protocols_results_returns_raw_dicts():
+    raw = {"success": True, "data": {"count": 2, "results": [_feed_entry(), _feed_entry(plate="BB002BB")]}}
+
+    results = extract_published_protocols_results(raw)
+
+    assert len(results) == 2
+    assert results[0]["protocolAuto"] == "AA001AA"
+    assert results[1]["protocolAuto"] == "BB002BB"
+    # Сырые dict — publishDate присутствует (ParsedFineRecord его не несёт).
+    assert results[0]["publishDate"] == "2026-10-22"
+
+
+def test_extract_published_protocols_results_rejects_non_success():
+    with pytest.raises(FineParseError):
+        extract_published_protocols_results({"success": False})
+
+
+def test_extract_published_protocols_results_rejects_non_list_results():
+    with pytest.raises(FineParseError):
+        extract_published_protocols_results({"success": True, "data": {"results": "garbage"}})
+
+
+def test_extract_published_protocols_results_rejects_non_object_entries():
+    with pytest.raises(FineParseError):
+        extract_published_protocols_results({"success": True, "data": {"results": ["garbage"]}})
+
+
+def test_parse_published_protocol_entry_produces_parsed_fine_record():
+    entry = _feed_entry(protocol_no="AB123456", plate="AA001AA", amount=50)
+
+    record = parse_published_protocol_entry(entry)
+
+    assert record.car_number == "AA001AA"
+    assert record.external_fine_id == "AB123456"
+    assert record.amount == 50
+    assert record.violation_date == date(2026, 10, 22)
+
+
+def test_parse_published_protocol_entry_fingerprint_matches_search_by_auto_fingerprint():
+    """Критично для dedup (см. задачу "DEDUPE STRATEGY") — один и тот же
+    штраф, увиденный ЛИБО через searchByAuto, ЛИБО через feed, должен
+    получить ОДИНАКОВЫЙ fingerprint, иначе один и тот же штраф задвоился
+    бы в detected_fines в зависимости от того, какой путь его нашёл первым."""
+    feed_entry = _feed_entry(protocol_no="AB123456", plate="AA001AA", amount=50)
+    search_entry = dict(feed_entry)  # searchByAuto отдаёт те же ключи для общих полей
+
+    feed_record = parse_published_protocol_entry(feed_entry)
+    [search_record] = parse_search_response(
+        {"success": True, "data": {"results": [search_entry]}}, car_number="AA001AA"
+    )
+
+    assert feed_record.fingerprint == search_record.fingerprint
+
+
+def test_different_protocol_no_same_plate_same_date_get_different_fingerprints():
+    """Главный regression-критерий аудита: "plate + penalty_date is NOT a
+    valid unique key" — две РАЗНЫЕ записи одной машины в один день
+    (разные protocolNo) должны давать РАЗНЫЕ fingerprint."""
+    entry_a = _feed_entry(protocol_no="AB111111", plate="AA001AA", violation_date="2026-10-22")
+    entry_b = _feed_entry(protocol_no="AB222222", plate="AA001AA", violation_date="2026-10-22")
+
+    record_a = parse_published_protocol_entry(entry_a)
+    record_b = parse_published_protocol_entry(entry_b)
+
+    assert record_a.fingerprint != record_b.fingerprint

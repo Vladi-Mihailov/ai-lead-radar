@@ -210,6 +210,7 @@ class FineCheckService:
             error_message=None,
             total_fines_found=len(current_fines),
             duration_ms=0,
+            from_cache=True,
         )
 
     async def _resolve_translation(
@@ -485,6 +486,36 @@ class FineCheckService:
             # флагом, чтобы UI-слой мог показать отдельное сообщение.
             provider_unavailable=isinstance(exc, PoliceGeUnavailableError),
         )
+
+    async def persist_feed_match(
+        self, task: FineMonitoringTask, record: ParsedFineRecord,
+    ) -> CheckResult:
+        """Для GeorgiaPublicFineFeedJob (см. задачу "Georgia fines
+        incremental public-feed monitoring") — persist ОДНОЙ записи, уже
+        полученной из публичного feed'а, напрямую через _finalize() (ТОТ
+        ЖЕ dedup/translation/notification-подготовка, что и check_task(),
+        см. его докстрок) — "Do NOT create a separate parallel fine
+        model" (см. задачу).
+
+        Сознательно НЕ вызывает _persist_snapshot() (last_successful_
+        checked_at/last_successful_total_amount, см. check_task()) — ОДНА
+        feed-строка это публикация ОДНОГО конкретного штрафа, а НЕ полный
+        снимок текущей задолженности машины (в отличие от searchByAuto,
+        который возвращает СРАЗУ все текущие штрафы) — перезаписывать
+        "итоговую сумму" по одной найденной строке было бы неверно
+        (ложный частичный снимок). False-zero guard не применим здесь:
+        это не полноценная проверка машины, а точечное обнаружение
+        одного конкретного, уже опубликованного штрафа.
+
+        Denylist (см. reader/fines/suppression.py) — ТА ЖЕ первая
+        проверка, что и в check_task(): если car_number попал в denylist
+        ПОСЛЕ того, как задача уже существовала (редкий, но возможный
+        порядок событий), feed НЕ должен обойти suppression стороной."""
+        if is_fine_output_suppressed(task.car_number):
+            return self._suppressed_result()
+
+        started_at = time.monotonic()
+        return await self._finalize(task, [record], started_at)
 
     async def _finalize(
         self, task: FineMonitoringTask, records: list[ParsedFineRecord], started_at: float,

@@ -19,6 +19,12 @@ from reader.fines.provider import FineProviderError, PoliceGeUnavailableError
 _CSRF_RE = re.compile(r'name="csrf_token"\s+value="([^"]*)"')
 
 _SEARCH_URL_PATH = "index.php?url=protocols/searchByAuto"
+# Публичный feed "Receipts of fines published" (см. задачу "Georgia fines
+# incremental public-feed monitoring") — ТОТ ЖЕ скрипт/сессия/csrf, что и
+# searchByAuto выше, другой query-route. Проверено вживую (см. audit
+# report): без protocolAuto в теле — весь список, не по конкретному
+# номеру; ответ — тот же конверт {success, data: {count, results}}.
+_PUBLISHED_PROTOCOLS_URL_PATH = "index.php?url=protocols"
 
 
 class PoliceGeSession:
@@ -83,6 +89,41 @@ class PoliceGeSession:
             f"даже после обновления сессии (csrf_token)"
         )
 
+    async def fetch_published_protocols(self, *, first_result: int) -> dict:
+        """Одна страница публичного feed'а (см. _PUBLISHED_PROTOCOLS_URL_PATH
+        докстрок) — используется GeorgiaPublicFineFeedJob вместо серии
+        search_by_plate() на каждый отслеживаемый номер (см. задачу: "Do
+        NOT continuously search every plate individually"). ТА ЖЕ сессия/
+        csrf_token/circuit breaker, что и search_by_plate() — переключение
+        между feed-страницами и обычным поиском внутри одного прохода
+        scheduler'а безопасно (общий csrf_token просто переиспользуется).
+
+        Каждый results[i] уже содержит ВСЕ поля, нужные _parse_entry() (см.
+        reader/fines/parser.py) — ни одного отдельного detail-запроса не
+        требуется (см. audit report: "blue detail arrow" на сайте — чисто
+        client-side DOM toggle, не HTTP-запрос)."""
+        if self._circuit_breaker is not None and not self._circuit_breaker.allow_request():
+            raise PoliceGeUnavailableError(
+                "police.ge временно недоступен (circuit breaker открыт после повторных сбоев соединения)"
+            )
+
+        if self._csrf_token is None:
+            await self._refresh_csrf_token()
+
+        result = await self._try_request(_PUBLISHED_PROTOCOLS_URL_PATH, {"firstResult": first_result})
+        if result is not None:
+            return result
+
+        await self._refresh_csrf_token()
+        result = await self._try_request(_PUBLISHED_PROTOCOLS_URL_PATH, {"firstResult": first_result})
+        if result is not None:
+            return result
+
+        raise FineProviderError(
+            f"police.ge вернул некорректный ответ для публичного feed "
+            f"(firstResult={first_result}) даже после обновления сессии (csrf_token)"
+        )
+
     async def _refresh_csrf_token(self) -> None:
         # Production bug (O127PX62, 2026-10-21): необёрнутый httpx.ConnectTimeout
         # (police.ge временно недоступен) проходил мимо check_task()'s
@@ -116,14 +157,20 @@ class PoliceGeSession:
         self._csrf_token = match.group(1)
 
     async def _try_search(self, plate: str) -> dict | None:
+        return await self._try_request(
+            _SEARCH_URL_PATH, {"firstResult": 0, "protocolAuto": plate},
+        )
+
+    async def _try_request(self, url_path: str, extra_data: dict) -> dict | None:
+        """Общая механика POST+csrf+circuit breaker для ЛЮБОГО route на
+        этом же PHP-скрипте (searchByAuto ИЛИ публичный feed, см.
+        fetch_published_protocols) — единственное различие между ними —
+        url_path/extra_data, вся обработка транспортных ошибок/протухшей
+        сессии идентична."""
         try:
             response = await self._client.post(
-                _SEARCH_URL_PATH,
-                data={
-                    "firstResult": 0,
-                    "protocolAuto": plate,
-                    "csrf_token": self._csrf_token,
-                },
+                url_path,
+                data={**extra_data, "csrf_token": self._csrf_token},
                 headers={
                     "X-Requested-With": "XMLHttpRequest",
                     "Referer": self._page_url,

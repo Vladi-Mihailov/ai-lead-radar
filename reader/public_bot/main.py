@@ -29,6 +29,7 @@ from telethon import TelegramClient
 
 from reader.fines.check_service import FineCheckService
 from reader.fines.detected_fine_repository import DetectedFineRepository
+from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository
 from reader.fines.police_ge_circuit_breaker import PoliceGeCircuitBreaker
 from reader.fines.police_ge_provider import PoliceGeProvider
 from reader.fines.police_ge_session import PoliceGeSession
@@ -288,9 +289,20 @@ async def run() -> None:
         # register(client, ...) ниже, тоже до start()).
         client = TelegramClient(str(_SESSION_PATH), api_id, api_hash)
 
+        # "Georgia fines incremental public-feed monitoring" — та же БД
+        # (settings.app.users_db_file), что и у остальных репозиториев этого
+        # процесса; None при public_feed_enabled=False (см. docstring
+        # SubscriptionService.add_car) — add_car() тогда вообще не трогает
+        # bootstrap state, поведение не меняется.
+        plate_bootstrap_repository = (
+            GeorgiaPlateBootstrapRepository(settings.app.users_db_file)
+            if settings.fine_monitor.public_feed_enabled
+            else None
+        )
         subscription_service = SubscriptionService(
             task_repository, subscription_repository, user_repository, check_service,
             owner_resolver_client=client, bot_username=_BOT_USERNAME,
+            plate_bootstrap_repository=plate_bootstrap_repository,
         )
         # "📊 Статистика" (trusted-operator-only) — поверх уже открытых
         # known_users_repository/subscription_repository/

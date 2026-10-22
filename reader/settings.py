@@ -144,6 +144,52 @@ class FineMonitorSettings(BaseModel):
     # видят оригинальный грузинский текст вместо перевода).
     translation_model: str = "gpt-5-mini"
 
+    # GeorgiaPublicFineFeedJob (см. задачу "Georgia fines incremental
+    # public-feed monitoring") — ОТДЕЛЬНЫЙ от per-car check_times/
+    # client_check_times режим: ОДИН периодический обход публичного feed'а
+    # ("Receipts of fines published", см. audit report) вместо N отдельных
+    # search_by_plate() на bootstrap-completed машинах (см.
+    # reader/fines/plate_bootstrap_repository.py). public_feed_enabled по
+    # умолчанию False — существующий production config.yaml не обязан
+    # ничего менять, пока архитектура явно не включена; при False
+    # GeorgiaPublicFineFeedJob не регистрируется в Scheduler'е вовсе, а
+    # FineJob/ArchiveFineJob продолжают проверять ВСЕ активные задачи как
+    # раньше (bootstrap_status игнорируется, см. reader/jobs/fine_job.py —
+    # plate_bootstrap_repository=None).
+    public_feed_enabled: bool = False
+    public_feed_poll_interval_minutes: int = 5
+    # Safety cap страниц (по 30 строк) на ОДИН ОБЫЧНЫЙ (FAST-режим, см.
+    # reader/jobs/georgia_public_feed_job.py докстрок) ЛИБО
+    # восстановительный (после сбоя предыдущего цикла) проход — см. audit
+    # report про реально измеренную скорость публикации (~670 штрафов/
+    # сутки ≈ 2-3 строки за 5-минутный цикл в среднем): FAST-режим
+    # останавливается НАМНОГО раньше этого предела почти всегда (как
+    # только страница содержит хотя бы одну уже известную запись, см.
+    # "IMPORTANT CORRECTION BEFORE COMMIT / PR" про исправление
+    # первоначальной версии, пересматривавшей целый день на каждом
+    # цикле) — это именно safety net на случай всплеска/восстановления,
+    # а не ожидаемый типичный объём за цикл.
+    public_feed_max_pages_per_cycle: int = 30
+    # Safety cap ТОЛЬКО для истинного первого запуска (cutover catch-up,
+    # когда georgia_public_feed_state.last_successful_poll_at ещё ни разу
+    # не был установлен) — заметно больше обычного: нужно перекрыть разрыв
+    # между последней успешной per-car проверкой и моментом включения
+    # feed'а (см. audit report: 520/523 активных машин проверялись в
+    # последние 48 часов — 100 страниц (3000 строк) с запасом покрывает
+    # это окно при наблюдаемой скорости публикации). ОДНОразовая операция
+    # (см. задачу: "That is a ONE-TIME operation. It must not become the
+    # normal polling strategy") — после первого успешного завершения
+    # (пустая страница в пределах этого лимита) больше никогда не
+    # используется, все последующие циклы работают в FAST-режиме.
+    public_feed_first_run_max_pages: int = 100
+    # Retention для georgia_public_feed_seen (см.
+    # reader/fines/public_feed_seen_repository.py) — "видели ли мы уже
+    # этот protocolNo" нужно знать только для недавних записей (текущая
+    # FAST-граница всегда среди самых свежих publishDate); при
+    # наблюдаемой скорости публикации (~670/сутки) даже 7 дней хранения —
+    # это ~4700 строк, тривиально для SQLite.
+    public_feed_seen_retention_days: int = 7
+
 
 class InviterWorkerSettings(BaseModel):
     """Постоянный фоновый режим инвайтера (см. reader/inviter/worker.py,
@@ -590,6 +636,19 @@ def load_settings(config_path: Path) -> Settings:
                 archive_interval_days=int(fine_monitor_raw.get("archive_interval_days", 30)),
                 archive_daily_limit=int(fine_monitor_raw.get("archive_daily_limit", 200)),
                 translation_model=fine_monitor_raw.get("translation_model", "gpt-5-mini"),
+                public_feed_enabled=bool(fine_monitor_raw.get("public_feed_enabled", False)),
+                public_feed_poll_interval_minutes=int(
+                    fine_monitor_raw.get("public_feed_poll_interval_minutes", 5)
+                ),
+                public_feed_max_pages_per_cycle=int(
+                    fine_monitor_raw.get("public_feed_max_pages_per_cycle", 30)
+                ),
+                public_feed_first_run_max_pages=int(
+                    fine_monitor_raw.get("public_feed_first_run_max_pages", 100)
+                ),
+                public_feed_seen_retention_days=int(
+                    fine_monitor_raw.get("public_feed_seen_retention_days", 7)
+                ),
             ),
             inviter=InviterSettings(
                 worker=InviterWorkerSettings(

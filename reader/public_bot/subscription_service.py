@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from reader.fines.check_service import FineCheckService
 from reader.fines.models import FineMonitoringTask, NewFineEvent
+from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository
 from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.public_bot.car_owner_sync import sync_user_and_car
 from reader.public_bot.models import FineMonitoringSubscription
@@ -214,6 +215,13 @@ class SubscriptionService:
         # _BOT_USERNAME, чтобы не оставлять устаревшую identity ни в одном
         # hardcode.
         bot_username: str = "ProtocolGEbot",
+        # None — как и everywhere в проекте (см. задачу "Georgia fines
+        # incremental public-feed monitoring") — означает "public-feed
+        # архитектура в этой сборке ещё не включена": add_car() просто не
+        # трогает bootstrap state вовсе, существующие вызовы
+        # SubscriptionService(...) без этого параметра (тесты и т.п.)
+        # продолжают работать бит в бит как раньше.
+        plate_bootstrap_repository: GeorgiaPlateBootstrapRepository | None = None,
     ):
         self._task_repository = task_repository
         self._subscription_repository = subscription_repository
@@ -224,6 +232,7 @@ class SubscriptionService:
         # тогда работает только по локальной БД (см. owner_resolution.py).
         self._owner_resolver_client = owner_resolver_client
         self._bot_username = bot_username
+        self._plate_bootstrap_repository = plate_bootstrap_repository
 
     # ---- self-service (обычный пользователь) ----
 
@@ -249,6 +258,17 @@ class SubscriptionService:
         # докстрок — существующий пользователь, добавляющий второй
         # автомобиль, не должен ложно всплыть как "новый").
         is_first_car_for_user = not self._subscription_repository.list_by_user(telegram_user_id)
+
+        # Bootstrap state (см. задачу "Georgia fines incremental
+        # public-feed monitoring") — ПЕРЕД созданием задачи/подписки:
+        # идемпотентно гарантирует 'pending'-строку для car_number, если
+        # её ещё нет вовсе (см. ensure_pending() докстрок — НИКОГДА не
+        # трогает уже существующую 'completed' строку, вторая подписка на
+        # уже bootstrapped машину не считается "новой"). None —
+        # public-feed архитектура не включена в этой сборке, ничего не
+        # делает.
+        if self._plate_bootstrap_repository is not None:
+            self._plate_bootstrap_repository.ensure_pending(car_number)
 
         task = self._create_or_extend_task(
             car_number=car_number,
@@ -299,6 +319,20 @@ class SubscriptionService:
         # is_first_car_for_user выше уведомляет менеджера проверить
         # вручную).
         check_result = await self._check_service.check_task_or_read_cached(task)
+
+        # Bootstrap завершён ТОЛЬКО на генуинно живом успешном результате
+        # (см. CheckResult.from_cache докстрок) — emergency-mode чтение из
+        # нашей БД (from_cache=True) НЕ считается full-history lookup'ом,
+        # см. задачу: "Do NOT falsely mark completed... Once connectivity
+        # returns, perform the ONE pending bootstrap check."
+        if (
+            self._plate_bootstrap_repository is not None
+            and check_result.status == "ok"
+            and not check_result.from_cache
+        ):
+            self._plate_bootstrap_repository.mark_completed(
+                car_number, completed_at=datetime.now(timezone.utc),
+            )
 
         return AddCarOutcome(
             task=task,

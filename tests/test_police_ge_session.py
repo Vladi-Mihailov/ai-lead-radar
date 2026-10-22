@@ -376,3 +376,101 @@ async def test_successful_search_resets_circuit_breaker():
     assert result["success"] is True
     assert breaker.consecutive_failures == 0
     assert breaker.is_open is False
+
+
+# ==== fetch_published_protocols — публичный feed (см. задачу "Georgia
+# fines incremental public-feed monitoring") ====
+
+
+async def test_fetch_published_protocols_returns_parsed_json():
+    log = _CallLog()
+    session = _make_session(
+        pages=[_page_html("token-1")],
+        posts=[_json_response({"success": True, "data": {"count": 311185, "results": [{"protocolAuto": "AA001AA"}]}})],
+        log=log,
+    )
+
+    result = await session.fetch_published_protocols(first_result=0)
+
+    assert result["success"] is True
+    assert result["data"]["count"] == 311185
+    assert result["data"]["results"] == [{"protocolAuto": "AA001AA"}]
+
+
+async def test_fetch_published_protocols_reuses_csrf_token_from_search_by_plate():
+    """ТА ЖЕ сессия/csrf_token — переключение между обычным поиском и
+    feed-страницами внутри одного прохода scheduler'а безопасно (см.
+    PoliceGeSession докстрок про "общий csrf_token просто переиспользуется")."""
+    log = _CallLog()
+    session = _make_session(
+        pages=[_page_html("token-1")],
+        posts=[
+            _json_response({"success": True, "data": {"count": 1, "results": []}}),
+            _json_response({"success": True, "data": {"count": 1, "results": []}}),
+        ],
+        log=log,
+    )
+
+    await session.search_by_plate("AA001AA")
+    await session.fetch_published_protocols(first_result=0)
+
+    # Один GET за csrf (не два) — второй вызов переиспользовал токен.
+    get_calls = [c for c in log.calls if c["method"] == "GET"]
+    assert len(get_calls) == 1
+    post_tokens = [c["csrf_token"] for c in log.calls if c["method"] == "POST"]
+    assert post_tokens[0] == post_tokens[1]
+
+
+async def test_fetch_published_protocols_sends_first_result_param():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text=_page_html("token-1"))
+        body = parse_qs(request.content.decode())
+        captured["firstResult"] = body["firstResult"][0]
+        return httpx.Response(200, json={"success": True, "data": {"count": 0, "results": []}})
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(base_url="https://police.ge/protocol/", transport=transport)
+    session = PoliceGeSession(client, page_url=_PAGE_URL, request_timeout=5)
+
+    await session.fetch_published_protocols(first_result=90)
+
+    assert captured["firstResult"] == "90"
+
+
+async def test_fetch_published_protocols_raises_police_ge_unavailable_when_circuit_open():
+    breaker = PoliceGeCircuitBreaker(failure_threshold=3)
+    for _ in range(3):
+        breaker.record_transport_failure()
+    assert breaker.is_open is True
+
+    log = _CallLog()
+    session = _make_session(pages=["unused"], posts=[], log=log, circuit_breaker=breaker)
+
+    with pytest.raises(PoliceGeUnavailableError):
+        await session.fetch_published_protocols(first_result=0)
+
+    assert log.calls == []  # ни единого HTTP-запроса
+
+
+async def test_fetch_published_protocols_connect_timeout_raises_fine_provider_error():
+    session = _make_session_raising(httpx.ConnectTimeout("connect timed out"), on_method="POST")
+
+    with pytest.raises(FineProviderError) as excinfo:
+        await session.fetch_published_protocols(first_result=0)
+
+    assert isinstance(excinfo.value.__cause__, httpx.ConnectTimeout)
+
+
+async def test_fetch_published_protocols_transport_failure_records_against_circuit_breaker():
+    breaker = PoliceGeCircuitBreaker(failure_threshold=3)
+    session = _make_session_raising(
+        httpx.ConnectTimeout("connect timed out"), on_method="POST", circuit_breaker=breaker,
+    )
+
+    with pytest.raises(FineProviderError):
+        await session.fetch_published_protocols(first_result=0)
+
+    assert breaker.consecutive_failures == 1
