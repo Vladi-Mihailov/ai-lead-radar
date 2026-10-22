@@ -147,6 +147,17 @@ class FineJob(Job):
             else self._task_repository.list_active()
         )
 
+        # Circuit breaker (см. задачу "back off when police.ge is
+        # unavailable", production incident 2026-10-21: батч из сотен
+        # задач подряд ждал полный request_timeout=30s на КАЖДОЙ, прежде
+        # чем провалиться) — проверяется заново перед КАЖДЫМ вызовом
+        # check_task() (а не один раз в начале run()), т.к. breaker может
+        # перейти в half-open/восстановиться прямо в середине батча —
+        # одно WARNING при первом пропуске + одна итоговая сводка в конце,
+        # а НЕ отдельная запись/лог на каждую пропущенную задачу (см.
+        # задачу п.4: "Do not generate hundreds of identical errors").
+        skipped_due_to_unavailable = 0
+
         for task in tasks:
             try:
                 if today < task.start_date:
@@ -163,6 +174,10 @@ class FineJob(Job):
                         # проходе, без ожидания следующего запуска.
                         task = await self._pre_complete_hook(task, today)
                         if today <= task.end_date:
+                            if not self._check_service.provider_available():
+                                skipped_due_to_unavailable += 1
+                                self._log_circuit_open_once(skipped_due_to_unavailable)
+                                continue
                             await self._check_service.check_task(task)
                             continue
 
@@ -183,6 +198,10 @@ class FineJob(Job):
                     continue
 
                 # start_date <= today <= end_date — границы включительно.
+                if not self._check_service.provider_available():
+                    skipped_due_to_unavailable += 1
+                    self._log_circuit_open_once(skipped_due_to_unavailable)
+                    continue
                 await self._check_service.check_task(task)
             except Exception as exc:
                 # Ошибка на одной задаче (проверка или завершение) не должна
@@ -196,6 +215,13 @@ class FineJob(Job):
                 )
                 continue
 
+        if skipped_due_to_unavailable:
+            logger.info(
+                "police_ge circuit recovered or run finished — skipped %d task(s) this run (scope=%s) "
+                "while police_ge circuit was open",
+                skipped_due_to_unavailable, self._scope,
+            )
+
         try:
             # Уведомляем отдельно от самой проверки: сюда попадают и штрафы,
             # только что созданные выше (notification_sent_at ещё NULL), и
@@ -208,6 +234,17 @@ class FineJob(Job):
             return
 
         self.status.last_success_at = run_at
+
+    def _log_circuit_open_once(self, skipped_count: int) -> None:
+        """Ровно одно WARNING на весь run() — на первом пропуске (см.
+        задачу п.4: "Do not generate hundreds of identical errors") —
+        остальные пропуски в ЭТОМ ЖЕ run() учитываются только в итоговой
+        сводке (см. конец run())."""
+        if skipped_count == 1:
+            logger.warning(
+                "police_ge circuit breaker open — skipping provider requests for scope=%s this run",
+                self._scope,
+            )
 
     def _first_archive_check_at(self, run_at: datetime) -> datetime:
         """~archive_interval_days от сегодня (по self._tz), время —

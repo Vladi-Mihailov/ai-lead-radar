@@ -29,6 +29,7 @@ from telethon import TelegramClient
 
 from reader.fines.check_service import FineCheckService
 from reader.fines.detected_fine_repository import DetectedFineRepository
+from reader.fines.police_ge_circuit_breaker import PoliceGeCircuitBreaker
 from reader.fines.police_ge_provider import PoliceGeProvider
 from reader.fines.police_ge_session import PoliceGeSession
 from reader.fines.task_repository import FineMonitoringTaskRepository
@@ -249,10 +250,19 @@ async def run() -> None:
         # Используется и для immediate-check в Add Car flow, и для
         # 🔎 Проверить сейчас — ни то, ни другое не обходит
         # FineCheckService/дедуп (см. design report Stage 4).
+        # Circuit breaker (см. задачу "back off when police.ge is
+        # unavailable", production incident 2026-10-21) — ОТДЕЛЬНЫЙ
+        # инстанс от reader/main.py (разные процессы, см. комментарий
+        # выше про "второй экземпляр нужен только потому, что это
+        # отдельный процесс") — обоснование, почему per-process достаточно
+        # (а не требуется DB-persisted/cross-process состояние), см.
+        # финальный отчёт задачи.
+        police_ge_circuit_breaker = PoliceGeCircuitBreaker()
         police_ge_session = PoliceGeSession(
             http_client,
             page_url=settings.fine_monitor.source_url,
             request_timeout=settings.fine_monitor.request_timeout,
+            circuit_breaker=police_ge_circuit_breaker,
         )
         fine_provider = PoliceGeProvider(police_ge_session)
         # Тот же общий OPENAI_API_KEY/приём, что и в reader/main.py::
@@ -342,7 +352,10 @@ async def run() -> None:
             TelethonSupportGateway(client, user_main_menu=lambda: main_menu_keyboard(is_trusted=False)),
             support_chat_id=settings.public_bot.support_chat_id, is_trusted=controller.is_trusted,
         )
-        register(client, controller, known_users_repository, support=support)
+        register(
+            client, controller, known_users_repository, support=support,
+            manager_chat_id=settings.public_bot.support_chat_id,
+        )
         register_support_group_handlers(client, support)
 
         delivery_service = ClientDeliveryService(

@@ -209,6 +209,7 @@ def test_canary_amount_never_appears_in_check_now_result_text():
         car_number = _SUPPRESSED_PLATE
         check_ok = False
         fines: tuple = ()
+        provider_unavailable = False
 
     text = texts.format_check_now_result(_FakeOutcome())
 

@@ -44,6 +44,7 @@ from reader.dm_campaigns.sender_state import DmSenderStateRepository  # noqa: E4
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
 from reader.fines.notification_coordinator import FineNotificationCoordinator  # noqa: E402
+from reader.fines.police_ge_circuit_breaker import PoliceGeCircuitBreaker  # noqa: E402
 from reader.fines.police_ge_provider import PoliceGeProvider  # noqa: E402
 from reader.fines.police_ge_session import PoliceGeSession  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
@@ -142,10 +143,18 @@ def build_fine_monitor_components(
         detected_fine_repository, task_repository, notification_service, user_repository
     )
 
+    # Circuit breaker (см. задачу "back off when police.ge is
+    # unavailable", production incident 2026-10-21) — один инстанс на
+    # ВЕСЬ процесс (fine_job/client_fine_job/archive_fine_job делят ОДИН
+    # и тот же check_service/police_ge_session выше, см. design report
+    # про "ни второго обращения к police.ge, ни второго notification
+    # flow"), поэтому один breaker здесь уже покрывает ВСЕ три job'а.
+    police_ge_circuit_breaker = PoliceGeCircuitBreaker()
     police_ge_session = PoliceGeSession(
         http_client,
         page_url=fine_monitor.source_url,
         request_timeout=fine_monitor.request_timeout,
+        circuit_breaker=police_ge_circuit_breaker,
     )
     fine_provider = PoliceGeProvider(police_ge_session)
     # Тот же общий OPENAI_API_KEY, что и у OCR/lead_ai (settings.ocr.

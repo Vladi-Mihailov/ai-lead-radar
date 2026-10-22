@@ -22,7 +22,7 @@ from telethon.tl.types import User as TelethonUser  # noqa: E402
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
 from reader.fines.models import ParsedFineRecord  # noqa: E402
-from reader.fines.provider import FineProvider  # noqa: E402
+from reader.fines.provider import FineProvider, PoliceGeUnavailableError  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
 from reader.plate_display import format_plate_for_telegram  # noqa: E402
 from reader.public_bot import texts  # noqa: E402
@@ -57,10 +57,13 @@ _TRUSTED_CHAT_ID = 5712994689
 
 
 class _FakeProvider(FineProvider):
-    def __init__(self, records_by_car=None):
+    def __init__(self, records_by_car=None, error: Exception | None = None):
         self._records_by_car = records_by_car or {}
+        self._error = error
 
     async def search_by_plate(self, plate: str):
+        if self._error is not None:
+            raise self._error
         return self._records_by_car.get(plate, [])
 
 
@@ -108,6 +111,7 @@ class _Fixture:
     def __init__(
         self, tmp_path, records_by_car=None,
         trusted_operator_user_ids=frozenset(), owner_resolver_client=None,
+        provider_error=None,
     ):
         self.db_path = tmp_path / "users.db"
         self.task_repository = FineMonitoringTaskRepository(self.db_path)
@@ -117,7 +121,8 @@ class _Fixture:
         self.conversation_state_repository = BotConversationStateRepository(self.db_path)
         self.known_users_repository = BotKnownUsersRepository(self.db_path)
         self.check_service = FineCheckService(
-            _FakeProvider(records_by_car), self.task_repository, self.detected_fine_repository,
+            _FakeProvider(records_by_car, error=provider_error),
+            self.task_repository, self.detected_fine_repository,
         )
         self.service = SubscriptionService(
             self.task_repository, self.subscription_repository,
@@ -268,6 +273,45 @@ async def test_add_car_without_username_completes_subscription_successfully(fx):
     assert subscription.telegram_user_id == 2
     assert subscription.telegram_username is None
     assert fx.conversation_state_repository.get(2) is None  # диалог завершён
+
+
+async def test_add_car_when_circuit_open_shows_normal_message_and_alerts_manager(tmp_path):
+    """IMPORTANT PRODUCT DECISION — CHANGE PREVIOUS REQUIREMENT (см. задачу
+    "back off when police.ge is unavailable" + "no disclaimer in emergency
+    mode"): circuit breaker открыт во время Add Car — подписка всё равно
+    создаётся успешно, клиент видит ОБЫЧНЫЙ текст успеха (никаких
+    "police.ge"/"недоступен"/disclaimer, см. check_service.py::
+    check_task_or_read_cached) — единственная компенсация: BotReply.
+    manager_alert_text (см. задачу "NEW USER EMERGENCY WORKFLOW"),
+    которое handlers.py (не этот тест) отправит менеджеру отдельно."""
+    fixture = _Fixture(tmp_path, provider_error=PoliceGeUnavailableError("circuit open"))
+    try:
+        await fixture.controller.handle_text(
+            texts.ADD_CAR_LABEL, chat_id=2, telegram_user_id=2, username=None,
+        )
+        await fixture.controller.handle_text(
+            "M295YB196", chat_id=2, telegram_user_id=2, username=None,
+        )
+
+        reply = await fixture.controller.handle_period_choice(
+            30, chat_id=2, telegram_user_id=2, first_name=None, last_name=None,
+        )
+
+        assert reply is not None
+        assert "✅ Автомобиль добавлен на мониторинг" in reply.text
+        assert "штрафов нет" in reply.text
+        for banned in ("police.ge", "недоступн", "Первичная проверка", "cached", "emergency"):
+            assert banned not in reply.text
+
+        assert reply.manager_alert_text is not None
+        assert "Пользователь добавил автомобиль" in reply.manager_alert_text
+        assert "295" in reply.manager_alert_text  # car_number digits (format_plate_for_telegram bolds letters only)
+
+        # Подписка реально создана, несмотря на недоступность источника.
+        [subscription] = fixture.subscription_repository.list_by_user(2)
+        assert subscription.car_number == "M295YB196"
+    finally:
+        fixture.close()
 
 
 async def test_add_car_summary_without_username_has_no_none_or_prompt_text(fx):

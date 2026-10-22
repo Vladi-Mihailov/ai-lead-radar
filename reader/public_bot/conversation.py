@@ -88,7 +88,7 @@ from zoneinfo import ZoneInfo
 
 from reader.fines.validation import FineValidationError, normalize_car_number
 from reader.plate_display import format_plate_for_telegram
-from reader.public_bot import texts
+from reader.public_bot import manager_alerts, texts
 from reader.public_bot.conversation_state_repository import (
     BotConversationStateRepository,
 )
@@ -399,6 +399,16 @@ class BotReply:
     # _handle_trusted_check_now_car_number_input.
     protocol_check_method_prompt: bool = False
     protocol_check_back_target: str | None = None
+
+    # Emergency-mode "NEW USER EMERGENCY WORKFLOW" (см. задачу "manager
+    # process во время circuit breaker outage") — побочное сообщение В
+    # ДРУГОЙ чат (группа менеджеров), не пользователю, которому адресован
+    # остальной BotReply. handlers.py — единственное место, которое решает,
+    # КУДА его отправить (settings.public_bot.support_chat_id, см.
+    # register()) — conversation.py только формирует текст, никогда не
+    # знает о TelegramClient/chat_id. None — ничего дополнительно
+    # отправлять не нужно (подавляющее большинство ответов).
+    manager_alert_text: str | None = None
 
 
 class ConversationController:
@@ -1386,6 +1396,21 @@ class ConversationController:
         )
         self._clear_state(chat_id)
 
+        # "NEW USER EMERGENCY WORKFLOW" (см. задачу) — короткое дополнение
+        # менеджеру РОВНО когда это первый автомобиль, когда-либо
+        # добавленный этим telegram_user_id (см. AddCarOutcome.
+        # is_first_car_for_user докстрок) — handlers.py решает, КУДА его
+        # отправить (см. BotReply.manager_alert_text докстрок), здесь
+        # только формируется текст.
+        manager_alert_text = (
+            manager_alerts.format_car_added_alert(
+                telegram_user_id=telegram_user_id, username=username,
+                first_name=first_name, last_name=last_name, car_number=car_number,
+            )
+            if outcome.is_first_car_for_user
+            else None
+        )
+
         return BotReply(
             text=texts.format_add_car_summary(
                 car_number=car_number,
@@ -1393,7 +1418,9 @@ class ConversationController:
                 end_date=outcome.subscription.end_date,
                 check_ok=outcome.check_ok,
                 new_fines_count=outcome.new_fines_count,
-            )
+                provider_unavailable=outcome.provider_unavailable,
+            ),
+            manager_alert_text=manager_alert_text,
         )
 
     async def _complete_delegated_add_car(

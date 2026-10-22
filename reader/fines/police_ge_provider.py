@@ -14,6 +14,12 @@ class PoliceGeProvider(FineProvider):
     def __init__(self, session: PoliceGeSession):
         self._session = session
 
+    def is_available(self) -> bool:
+        """См. FineProvider.is_available() — делегирует PoliceGeSession's
+        circuit breaker (см. задачу "back off when police.ge is
+        unavailable")."""
+        return self._session.is_available()
+
     async def search_by_plate(self, plate: str) -> list[ParsedFineRecord]:
         raw = await self._session.search_by_plate(plate)
 

@@ -15,8 +15,12 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import httpx  # noqa: E402
 import pytest  # noqa: E402
 
+from reader.fines.police_ge_circuit_breaker import PoliceGeCircuitBreaker  # noqa: E402
 from reader.fines.police_ge_session import PoliceGeSession  # noqa: E402
-from reader.fines.provider import FineProviderError  # noqa: E402
+from reader.fines.provider import (  # noqa: E402
+    FineProviderError,
+    PoliceGeUnavailableError,
+)
 
 _PAGE_URL = "https://police.ge/protocol/index.php?lang=en"
 
@@ -35,7 +39,10 @@ class _CallLog:
         self.calls: list[dict] = []
 
 
-def _make_session(pages: list[str], posts: list[httpx.Response], log: _CallLog) -> PoliceGeSession:
+def _make_session(
+    pages: list[str], posts: list[httpx.Response], log: _CallLog,
+    *, circuit_breaker: PoliceGeCircuitBreaker | None = None,
+) -> PoliceGeSession:
     page_iter = iter(pages)
     post_iter = iter(posts)
 
@@ -50,7 +57,9 @@ def _make_session(pages: list[str], posts: list[httpx.Response], log: _CallLog) 
 
     transport = httpx.MockTransport(handler)
     client = httpx.AsyncClient(base_url="https://police.ge/protocol/", transport=transport)
-    return PoliceGeSession(client, page_url=_PAGE_URL, request_timeout=5)
+    return PoliceGeSession(
+        client, page_url=_PAGE_URL, request_timeout=5, circuit_breaker=circuit_breaker,
+    )
 
 
 def _json_response(payload: dict) -> httpx.Response:
@@ -182,7 +191,9 @@ async def test_missing_csrf_token_on_page_raises_error():
 # FineProviderError при сбое запроса к источнику" (сеть ИЛИ формат) ----
 
 
-def _make_session_raising(exc: Exception, *, on_method: str = "GET") -> PoliceGeSession:
+def _make_session_raising(
+    exc: Exception, *, on_method: str = "GET", circuit_breaker: PoliceGeCircuitBreaker | None = None,
+) -> PoliceGeSession:
     """on_method — на каком именно запросе (первом GET за csrf_token или
     последующем POST поиска) эмулируется сбой сети."""
 
@@ -193,7 +204,9 @@ def _make_session_raising(exc: Exception, *, on_method: str = "GET") -> PoliceGe
 
     transport = httpx.MockTransport(handler)
     client = httpx.AsyncClient(base_url="https://police.ge/protocol/", transport=transport)
-    return PoliceGeSession(client, page_url=_PAGE_URL, request_timeout=5)
+    return PoliceGeSession(
+        client, page_url=_PAGE_URL, request_timeout=5, circuit_breaker=circuit_breaker,
+    )
 
 
 async def test_connect_timeout_on_csrf_page_load_raises_fine_provider_error():
@@ -256,3 +269,110 @@ async def test_http_status_error_from_raise_for_status_raises_fine_provider_erro
 
     with pytest.raises(FineProviderError):
         await session.search_by_plate("O127PX62")
+
+
+# ---- Circuit breaker integration (см. задачу "back off when police.ge
+# is unavailable", production incident 2026-10-21) ----
+
+
+async def test_transport_failure_records_against_circuit_breaker():
+    breaker = PoliceGeCircuitBreaker(failure_threshold=3)
+    session = _make_session_raising(
+        httpx.ConnectTimeout("connect timed out"), on_method="GET", circuit_breaker=breaker,
+    )
+
+    with pytest.raises(FineProviderError):
+        await session.search_by_plate("O127PX62")
+
+    assert breaker.consecutive_failures == 1
+    assert breaker.is_open is False
+
+
+async def test_three_transport_failures_open_the_circuit_via_session():
+    breaker = PoliceGeCircuitBreaker(failure_threshold=3)
+    for _ in range(3):
+        session = _make_session_raising(
+            httpx.ConnectTimeout("connect timed out"), on_method="GET", circuit_breaker=breaker,
+        )
+        with pytest.raises(FineProviderError):
+            await session.search_by_plate("O127PX62")
+
+    assert breaker.is_open is True
+
+
+async def test_open_circuit_rejects_immediately_without_any_http_call():
+    """Главный regression-критерий (п.9.2): "while OPEN -> provider not
+    called" — ни одного GET/POST не уходит, PoliceGeUnavailableError
+    бросается СРАЗУ."""
+    breaker = PoliceGeCircuitBreaker(failure_threshold=3)
+    for _ in range(3):
+        breaker.record_transport_failure()
+    assert breaker.is_open is True
+
+    log = _CallLog()
+    session = _make_session(pages=["unused"], posts=[], log=log, circuit_breaker=breaker)
+
+    with pytest.raises(PoliceGeUnavailableError):
+        await session.search_by_plate("O127PX62")
+
+    assert log.calls == []  # ни единого HTTP-запроса
+
+
+async def test_parser_business_error_does_not_record_transport_failure():
+    """П.9.8: "parser error does NOT open circuit" — csrf_token-не-найден
+    это parser/business-ошибка (страница реально загрузилась), НЕ
+    transport-сбой (см. задачу п.2: "Do NOT classify parser/business
+    errors as connectivity failures")."""
+    breaker = PoliceGeCircuitBreaker(failure_threshold=3)
+    session = _make_session(pages=[_page_html(None)], posts=[], log=_CallLog(), circuit_breaker=breaker)
+
+    with pytest.raises(FineProviderError):
+        await session.search_by_plate("O127PX62")
+
+    assert breaker.consecutive_failures == 0
+    assert breaker.is_open is False
+
+
+async def test_repeated_success_false_does_not_open_circuit():
+    """success:false retry (та же parser/business категория) — тоже НЕ
+    transport-сбой, даже после двух подряд (см.
+    test_repeated_failure_after_retry_raises_error выше)."""
+    breaker = PoliceGeCircuitBreaker(failure_threshold=3)
+    session = _make_session(
+        pages=[_page_html("token-1"), _page_html("token-2")],
+        posts=[
+            _json_response({"success": False, "message": None, "data": []}),
+            _json_response({"success": False, "message": None, "data": []}),
+        ],
+        log=_CallLog(),
+        circuit_breaker=breaker,
+    )
+
+    with pytest.raises(FineProviderError):
+        await session.search_by_plate("AA001AA")
+
+    assert breaker.consecutive_failures == 0
+    assert breaker.is_open is False
+
+
+async def test_successful_search_resets_circuit_breaker():
+    """П.9.9/п.2: "A successful request resets circuit to CLOSED" — даже
+    после пары transport-сбоев (не дошедших до порога), успешный поиск
+    сбрасывает счётчик."""
+    breaker = PoliceGeCircuitBreaker(failure_threshold=3)
+    breaker.record_transport_failure()
+    breaker.record_transport_failure()
+    assert breaker.consecutive_failures == 2
+
+    session = _make_session(
+        pages=[_page_html("token-1")],
+        posts=[_json_response({"success": True, "data": {"count": 0, "results": []}})],
+        log=_CallLog(),
+        circuit_breaker=breaker,
+    )
+
+    result = await session.search_by_plate("AA001AA")
+
+    assert result["success"] is True
+    assert breaker.consecutive_failures == 0
+    assert breaker.is_open is False

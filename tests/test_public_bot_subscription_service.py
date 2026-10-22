@@ -20,7 +20,11 @@ from telethon.tl.types import User as TelethonUser  # noqa: E402
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
 from reader.fines.models import ParsedFineRecord  # noqa: E402
-from reader.fines.provider import FineProvider, FineProviderError  # noqa: E402
+from reader.fines.provider import (  # noqa: E402
+    FineProvider,
+    FineProviderError,
+    PoliceGeUnavailableError,
+)
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
 from reader.public_bot.owner_resolution import OwnerResolutionError  # noqa: E402
 from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
@@ -38,10 +42,17 @@ _TRUSTED_CHAT_ID = 5712994689
 
 
 class _FakeProvider(FineProvider):
-    def __init__(self, records_by_car=None, error: Exception | None = None):
+    def __init__(self, records_by_car=None, error: Exception | None = None, *, available: bool = True):
         self._records_by_car = records_by_car or {}
         self._error = error
         self.requested_plates: list[str] = []
+        # available=False — эмулирует circuit breaker, открытый другим
+        # экземпляром PoliceGeSession в этом же процессе (см. задачу "back
+        # off when police.ge is unavailable").
+        self._available = available
+
+    def is_available(self) -> bool:
+        return self._available
 
     async def search_by_plate(self, plate: str) -> list[ParsedFineRecord]:
         self.requested_plates.append(plate)
@@ -371,6 +382,37 @@ async def test_add_car_immediate_check_failure_keeps_task_and_subscription(tmp_p
         assert outcome.new_fines_count == 0
 
         # Подписка/задача остаются созданными, несмотря на ошибку проверки.
+        [task] = fixture.task_repository.list_active()
+        assert task.id == outcome.task.id
+        assert fixture.subscription_repository.get(outcome.subscription.id) is not None
+    finally:
+        fixture.close()
+
+
+async def test_add_car_when_circuit_open_keeps_subscription_and_marks_provider_unavailable(tmp_path):
+    """IMPORTANT PRODUCT DECISION — CHANGE PREVIOUS REQUIREMENT (см. задачу
+    "back off when police.ge is unavailable" + "no disclaimer in emergency
+    mode"): circuit breaker открыт во время Add Car — подписка/задача ВСЁ
+    РАВНО создаются, а первичная проверка теперь читает БД
+    (check_task_or_read_cached, см. check_service.py) вместо показа
+    disclaimer'а — для только что созданной задачи БД пуста, поэтому
+    outcome выглядит ОБЫЧНЫМ успешным "штрафов не найдено"
+    (check_ok=True, provider_unavailable=False), НЕ как ошибка.
+    is_first_car_for_user=True — единственная компенсация (см. задачу
+    "NEW USER EMERGENCY WORKFLOW")."""
+    fixture = _Fixture(tmp_path, provider_error=PoliceGeUnavailableError("circuit open"))
+    try:
+        outcome = await fixture.service.add_car(
+            telegram_user_id=42, telegram_chat_id=42, username="client",
+            first_name=None, last_name=None, car_number="M295YB196",
+            period_days=30, today=date(2026, 9, 3),
+        )
+
+        assert outcome.check_ok is True
+        assert outcome.provider_unavailable is False
+        assert outcome.new_fines_count == 0
+        assert outcome.is_first_car_for_user is True
+
         [task] = fixture.task_repository.list_active()
         assert task.id == outcome.task.id
         assert fixture.subscription_repository.get(outcome.subscription.id) is not None
@@ -1074,6 +1116,38 @@ async def test_check_now_suppressed_plate_never_calls_provider_and_shows_no_fine
         assert result.check_ok is True
         assert result.fines == []
         assert fixture.provider.requested_plates == []
+    finally:
+        fixture.close()
+
+
+async def test_check_now_when_circuit_open_shows_last_known_fine_without_disclaimer(tmp_path):
+    """IMPORTANT PRODUCT DECISION — CHANGE PREVIOUS REQUIREMENT (см. задачу
+    "EMERGENCY MODE USER BEHAVIOR"): 🔎 Проверить сейчас при открытом
+    circuit breaker — НИ ОДНОГО provider-запроса (check_task_or_read_cached
+    проверяет provider_available() ДО check_task(), см. check_service.py),
+    результат читается из detected_fines последней успешной проверки и
+    показывается КАК ОБЫЧНЫЙ успешный результат — check_ok=True,
+    provider_unavailable=False, тот самый штраф в fines (НЕ "попробуйте
+    позже"/disclaimer)."""
+    fixture = _Fixture(tmp_path, records_by_car={"AA001AA": [_record(car_number="AA001AA", fingerprint="fp-1")]})
+    try:
+        outcome = await fixture.service.add_car(
+            telegram_user_id=42, telegram_chat_id=42, username="client",
+            first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+        )
+        assert outcome.check_ok is True and outcome.new_fines_count == 1
+        requests_before = len(fixture.provider.requested_plates)
+
+        fixture.provider._available = False  # circuit breaker opened elsewhere in the process
+        result = await fixture.service.check_now(outcome.subscription.id, telegram_user_id=42)
+
+        assert result is not None
+        assert result.check_ok is True
+        assert result.provider_unavailable is False
+        assert len(result.fines) == 1
+        assert result.fines[0].external_fine_id == "AB123456"
+        # Ни одного дополнительного provider-запроса — чтение полностью из БД.
+        assert len(fixture.provider.requested_plates) == requests_before
     finally:
         fixture.close()
 
