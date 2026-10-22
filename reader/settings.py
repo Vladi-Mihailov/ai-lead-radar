@@ -157,7 +157,20 @@ class FineMonitorSettings(BaseModel):
     # раньше (bootstrap_status игнорируется, см. reader/jobs/fine_job.py —
     # plate_bootstrap_repository=None).
     public_feed_enabled: bool = False
-    public_feed_poll_interval_minutes: int = 5
+    # Расписание ТРЁХ фиксированных моментов суток (см. задачу "schedule
+    # Georgia public feed three times daily") — заменяет прежний
+    # public_feed_poll_interval_minutes ("каждые N минут от момента
+    # запуска"): этот подход не давал точного wall-clock расписания и к
+    # тому же запускал первый цикл немедленно при старте процесса,
+    # независимо от времени суток (см. GeorgiaPublicFineFeedJob.
+    # should_run() докстрок). ТОТ ЖЕ формат/парсинг, что и check_times/
+    # client_check_times выше (список "HH:MM"), и ТА ЖЕ timezone —
+    # public_feed_times читается в этом же self.timezone (Asia/Tbilisi по
+    # умолчанию), отдельная настройка timezone для public feed не заводится
+    # (один canonical Georgia timezone на весь fine_monitor).
+    public_feed_times: list[time] = Field(
+        default_factory=lambda: [time(9, 0), time(15, 0), time(21, 0)]
+    )
     # Safety cap страниц (по 30 строк) на ОДИН ОБЫЧНЫЙ (FAST-режим, см.
     # reader/jobs/georgia_public_feed_job.py докстрок) ЛИБО
     # восстановительный (после сбоя предыдущего цикла) проход — см. audit
@@ -637,9 +650,12 @@ def load_settings(config_path: Path) -> Settings:
                 archive_daily_limit=int(fine_monitor_raw.get("archive_daily_limit", 200)),
                 translation_model=fine_monitor_raw.get("translation_model", "gpt-5-mini"),
                 public_feed_enabled=bool(fine_monitor_raw.get("public_feed_enabled", False)),
-                public_feed_poll_interval_minutes=int(
-                    fine_monitor_raw.get("public_feed_poll_interval_minutes", 5)
-                ),
+                public_feed_times=[
+                    _parse_check_time(value)
+                    for value in fine_monitor_raw.get(
+                        "public_feed_times", ["09:00", "15:00", "21:00"]
+                    )
+                ],
                 public_feed_max_pages_per_cycle=int(
                     fine_monitor_raw.get("public_feed_max_pages_per_cycle", 30)
                 ),

@@ -19,7 +19,9 @@ GeorgiaPublicFeedStateRepository/GeorgiaPublicFeedSeenRepository —
 
 import sys
 from datetime import date, datetime, timedelta, timezone
+from datetime import time as dt_time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -45,6 +47,8 @@ _CHAT_ID = -100999
 _USER_ID = 111
 _RUN_AT = datetime(2026, 10, 22, 10, 0, tzinfo=timezone.utc)
 _TODAY = date(2026, 10, 22)
+_TBILISI = ZoneInfo("Asia/Tbilisi")
+_DEFAULT_RUN_TIMES = [dt_time(9, 0), dt_time(15, 0), dt_time(21, 0)]
 
 
 class _FakeCircuitProvider(FineProvider):
@@ -124,11 +128,19 @@ def _make_seen_repo(tmp_path) -> GeorgiaPublicFeedSeenRepository:
 def _make_job(
     session, task_repo, fine_repo, feed_state_repo, seen_repo, *, provider_available=True,
     max_pages_per_cycle=30, first_run_max_pages=100, retention_days=7,
+    run_times=None, tz=_TBILISI,
 ) -> tuple[GeorgiaPublicFineFeedJob, _FakeCircuitProvider]:
+    """run_times/tz — только для схемы "schedule Georgia public feed three
+    times daily" (см. GeorgiaPublicFineFeedJob.should_run()); тесты
+    пагинации/frontier/overlap/dedup ниже вызывают run() напрямую и никогда
+    не проходят через should_run(), поэтому значение по умолчанию здесь
+    (09:00/15:00/21:00 Asia/Tbilisi) для них не имеет значения — только
+    тесты в разделе "schedule" ниже реально на него опираются."""
     provider = _FakeCircuitProvider(available=provider_available)
     check_service = FineCheckService(provider, task_repo, fine_repo)
     job = GeorgiaPublicFineFeedJob(
         session, task_repo, check_service, feed_state_repo, seen_repo,
+        run_times=run_times if run_times is not None else _DEFAULT_RUN_TIMES, tz=tz,
         max_pages_per_cycle=max_pages_per_cycle, first_run_max_pages=first_run_max_pages,
         retention_days=retention_days,
     )
@@ -747,23 +759,132 @@ async def test_multiple_tasks_for_same_plate_each_get_persisted(tmp_path):
         seen_repo.close()
 
 
-async def test_should_run_respects_poll_interval(tmp_path):
+# ==== schedule: 09:00/15:00/21:00 Asia/Tbilisi (см. задачу "schedule
+# Georgia public feed three times daily") ====
+#
+# Asia/Tbilisi не наблюдает DST (UTC+4 круглый год) — 09:00/15:00/21:00
+# local соответствуют 05:00/11:00/17:00 UTC, используется ниже вместо
+# datetime(..., tzinfo=_TBILISI) только чтобы явно проверить, что
+# should_run() делает конвертацию сам (now приходит в UTC, как и из
+# Scheduler.run_forever(), см. reader/jobs/scheduler.py), а не полагается
+# на то, что now уже в нужной таймзоне.
+
+
+def _utc(hour: int, minute: int = 0, *, day: int = 22) -> datetime:
+    """UTC-момент, соответствующий заданному local-времени Asia/Tbilisi
+    (UTC+4, без DST) в день _TODAY (или +N дней, см. day)."""
+    local = datetime(2026, 10, day, hour, minute, tzinfo=_TBILISI)
+    return local.astimezone(timezone.utc)
+
+
+@pytest.mark.parametrize("hour", [9, 15, 21])
+async def test_should_run_true_at_each_scheduled_slot(tmp_path, hour):
     task_repo = _make_task_repo(tmp_path)
     fine_repo = _make_fine_repo(tmp_path)
     feed_state_repo = _make_feed_state_repo(tmp_path)
     seen_repo = _make_seen_repo(tmp_path)
     try:
-        provider = _FakeCircuitProvider()
-        check_service = FineCheckService(provider, task_repo, fine_repo)
-        job = GeorgiaPublicFineFeedJob(
-            _FakeFeedSession(), task_repo, check_service, feed_state_repo, seen_repo,
-            poll_interval=timedelta(minutes=5),
-        )
+        job, _provider = _make_job(_FakeFeedSession(), task_repo, fine_repo, feed_state_repo, seen_repo)
+        assert await job.should_run(_utc(hour)) is True
+    finally:
+        task_repo.close()
+        fine_repo.close()
+        feed_state_repo.close()
+        seen_repo.close()
 
-        assert await job.should_run(_RUN_AT) is True
-        await job.run(_RUN_AT)
-        assert await job.should_run(_RUN_AT + timedelta(minutes=2)) is False
-        assert await job.should_run(_RUN_AT + timedelta(minutes=5)) is True
+
+@pytest.mark.parametrize("hour", [0, 3, 6, 12, 18])
+async def test_should_run_false_outside_scheduled_slots(tmp_path, hour):
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    feed_state_repo = _make_feed_state_repo(tmp_path)
+    seen_repo = _make_seen_repo(tmp_path)
+    try:
+        job, _provider = _make_job(_FakeFeedSession(), task_repo, fine_repo, feed_state_repo, seen_repo)
+        assert await job.should_run(_utc(hour)) is False
+    finally:
+        task_repo.close()
+        fine_repo.close()
+        feed_state_repo.close()
+        seen_repo.close()
+
+
+async def test_should_run_after_21_00_next_slot_is_09_00_next_day(tmp_path):
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    feed_state_repo = _make_feed_state_repo(tmp_path)
+    seen_repo = _make_seen_repo(tmp_path)
+    try:
+        job, _provider = _make_job(_FakeFeedSession(), task_repo, fine_repo, feed_state_repo, seen_repo)
+
+        assert await job.should_run(_utc(21)) is True
+        await job.run(_utc(21))
+
+        # Никаких запусков после 21:00 того же дня — ни на следующей
+        # минуте опроса Scheduler'а (та же минута 21:00 — защита от
+        # двойного срабатывания), ни на 00:00/03:00/06:00/12:00/18:00.
+        assert await job.should_run(_utc(21)) is False
+        for hour in (0, 3, 6, 12, 18):
+            assert await job.should_run(_utc(hour, day=23)) is False
+
+        # Следующий запуск — ровно 09:00 следующего дня.
+        assert await job.should_run(_utc(9, day=23)) is True
+    finally:
+        task_repo.close()
+        fine_repo.close()
+        feed_state_repo.close()
+        seen_repo.close()
+
+
+async def test_should_run_false_mid_day_after_restart_does_not_fire_unsolicited_run(tmp_path):
+    """Рестарт сервиса в 13:00 (между 09:00 и 15:00) не должен сам по себе
+    запускать public feed — см. задачу "STARTUP": "Обычный restart сервиса
+    НЕ должен сам по себе запускать public feed вне 09:00/15:00/21:00".
+    Новый процесс создаёт НОВЫЙ GeorgiaPublicFineFeedJob с
+    `_last_run_slot=None` (см. should_run() докстрок) — это ровно
+    воспроизводится здесь свежим job'ом, которому ни разу ещё не задавали
+    should_run()."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    feed_state_repo = _make_feed_state_repo(tmp_path)
+    seen_repo = _make_seen_repo(tmp_path)
+    try:
+        fresh_job_after_restart, _provider = _make_job(
+            _FakeFeedSession(), task_repo, fine_repo, feed_state_repo, seen_repo,
+        )
+        assert await fresh_job_after_restart.should_run(_utc(13)) is False
+    finally:
+        task_repo.close()
+        fine_repo.close()
+        feed_state_repo.close()
+        seen_repo.close()
+
+
+async def test_missed_slot_does_not_trigger_per_car_fallback_next_scheduled_run_catches_up(tmp_path):
+    """Пропущенный слот (процесс был выключен в 21:00) НЕ порождает
+    отдельный per-car catch-up — см. задачу "DOWNTIME": "не запускать
+    отдельный per-car catch-up storm". should_run() просто никогда не
+    вернул True для пропущенной минуты (эмулируется тем, что мы его для
+    неё и не вызываем); при СЛЕДУЮЩЕМ обычном запуске (09:00 следующего
+    дня) backlog по-прежнему безопасно дочитывается существующей DEEP/
+    frontier-логикой run() — ни одного обращения к search_by_plate()."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    feed_state_repo = _make_feed_state_repo(tmp_path)
+    seen_repo = _make_seen_repo(tmp_path)
+    try:
+        _create_active_task(task_repo, "AA001AA")
+        session = _FakeFeedSession({0: _page([_entry(plate="AA001AA")]), 30: _empty_page()})
+        job, provider = _make_job(session, task_repo, fine_repo, feed_state_repo, seen_repo)
+
+        # 21:00 слот "пропущен" — should_run() для него никогда не
+        # вызывается (процесс был выключен). Следующий опрос Scheduler'а,
+        # который job реально видит, — 09:00 следующего дня.
+        assert await job.should_run(_utc(9, day=23)) is True
+        await job.run(_utc(9, day=23))
+
+        assert provider.search_by_plate_calls == []
+        assert session.requested_offsets == [0, 30]
     finally:
         task_repo.close()
         fine_repo.close()

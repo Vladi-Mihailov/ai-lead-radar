@@ -10,6 +10,7 @@ Telethon ничего не подключает в конструкторе, с�
 """
 
 import sys
+from datetime import time as dt_time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -36,10 +37,18 @@ from reader.commands.insurance_ocr import InsuranceOcrCommand  # noqa: E402
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
 from reader.fines.notification_coordinator import FineNotificationCoordinator  # noqa: E402
+from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository  # noqa: E402
 from reader.fines.police_ge_provider import PoliceGeProvider  # noqa: E402
+from reader.fines.public_feed_seen_repository import (  # noqa: E402
+    GeorgiaPublicFeedSeenRepository,
+)
+from reader.fines.public_feed_state_repository import (  # noqa: E402
+    GeorgiaPublicFeedStateRepository,
+)
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
 from reader.jobs.archive_fine_job import ArchiveFineJob  # noqa: E402
 from reader.jobs.fine_job import FineJob  # noqa: E402
+from reader.jobs.georgia_public_feed_job import GeorgiaPublicFineFeedJob  # noqa: E402
 from reader.jobs.notification_flush_job import NotificationFlushJob  # noqa: E402
 from reader.jobs.scheduler import Scheduler  # noqa: E402
 from reader.main import (  # noqa: E402
@@ -174,6 +183,50 @@ def test_load_settings_parses_explicit_archive_settings(tmp_path, monkeypatch):
     assert settings.fine_monitor.archive_check_hour == 5
     assert settings.fine_monitor.archive_interval_days == 14
     assert settings.fine_monitor.archive_daily_limit == 50
+
+
+def test_load_settings_defaults_public_feed_schedule(tmp_path, monkeypatch):
+    """См. задачу "schedule Georgia public feed three times daily" —
+    _CONFIG_YAML не задаёт ни public_feed_enabled, ни public_feed_times,
+    должны применяться defaults: архитектура выключена, но даже её
+    расписание по умолчанию уже 09:00/15:00/21:00 (та же таймзона, что и
+    fine_monitor.timezone — отдельной настройки для public feed нет)."""
+    _set_required_env(monkeypatch)
+    config_path = _write_config(tmp_path, _CONFIG_YAML)
+
+    settings = load_settings(config_path)
+
+    assert settings.fine_monitor.public_feed_enabled is False
+    assert [t.strftime("%H:%M") for t in settings.fine_monitor.public_feed_times] == [
+        "09:00",
+        "15:00",
+        "21:00",
+    ]
+
+
+def test_load_settings_parses_explicit_public_feed_schedule(tmp_path, monkeypatch):
+    _set_required_env(monkeypatch)
+    config_with_public_feed = _CONFIG_YAML + (
+        "  public_feed_enabled: true\n"
+        "  public_feed_times:\n"
+        "    - \"09:00\"\n"
+        "    - \"15:00\"\n"
+        "    - \"21:00\"\n"
+    )
+    config_path = _write_config(tmp_path, config_with_public_feed)
+
+    settings = load_settings(config_path)
+
+    assert settings.fine_monitor.public_feed_enabled is True
+    assert [t.strftime("%H:%M") for t in settings.fine_monitor.public_feed_times] == [
+        "09:00",
+        "15:00",
+        "21:00",
+    ]
+    # Явно НЕ эти моменты — упавший бы тест на неявном "каждые N минут"
+    # поведении, если бы кто-то вернул poll_interval обратно.
+    assert dt_time(0, 0) not in settings.fine_monitor.public_feed_times
+    assert dt_time(12, 0) not in settings.fine_monitor.public_feed_times
 
 
 def test_resolve_notification_chat_ids_prefers_explicit_config(tmp_path, monkeypatch):
@@ -359,6 +412,111 @@ async def test_build_fine_monitor_components_wires_dependencies_correctly(tmp_pa
         task_repository.close()
         detected_fine_repository.close()
         client_subscription_repository.close()
+        await http_client.aclose()
+
+
+async def test_build_fine_monitor_components_does_not_schedule_georgia_public_feed_job_when_disabled(
+    tmp_path, monkeypatch,
+):
+    """См. задачу "schedule Georgia public feed three times daily" —
+    public_feed_enabled=False (default, см. _CONFIG_YAML) означает
+    GeorgiaPublicFineFeedJob не регистрируется в Scheduler'е вовсе, даже
+    когда bootstrap/feed_state/feed_seen репозитории переданы (см.
+    build_fine_monitor_components докстрок про None-гейт)."""
+    _set_required_env(monkeypatch)
+    config_path = _write_config(tmp_path, _CONFIG_YAML)
+    settings = load_settings(config_path)
+    assert settings.fine_monitor.public_feed_enabled is False
+
+    user_repository = UserRepository(tmp_path / "users.db")
+    source = TelegramSource(settings.telegram, groups=[], user_repository=user_repository)
+    task_repository = FineMonitoringTaskRepository(tmp_path / "users.db")
+    detected_fine_repository = DetectedFineRepository(tmp_path / "users.db")
+    plate_bootstrap_repository = GeorgiaPlateBootstrapRepository(tmp_path / "users.db")
+    feed_state_repository = GeorgiaPublicFeedStateRepository(tmp_path / "users.db")
+    feed_seen_repository = GeorgiaPublicFeedSeenRepository(tmp_path / "users.db")
+    http_client = httpx.AsyncClient()
+
+    try:
+        notification_chat_ids = resolve_notification_chat_ids(settings)
+        _fine_job, scheduler, _notification_service, _command_dispatcher, _fine_command = (
+            build_fine_monitor_components(
+                settings, source, task_repository, detected_fine_repository,
+                http_client, notification_chat_ids, settings.fine_monitor.allowed_user_ids,
+                user_repository=user_repository,
+                plate_bootstrap_repository=plate_bootstrap_repository,
+                feed_state_repository=feed_state_repository,
+                feed_seen_repository=feed_seen_repository,
+            )
+        )
+
+        assert len(scheduler._jobs) == 4
+        assert not any(isinstance(job, GeorgiaPublicFineFeedJob) for job in scheduler._jobs)
+    finally:
+        user_repository.close()
+        task_repository.close()
+        detected_fine_repository.close()
+        plate_bootstrap_repository.close()
+        feed_state_repository.close()
+        feed_seen_repository.close()
+        await http_client.aclose()
+
+
+async def test_build_fine_monitor_components_schedules_georgia_public_feed_job_with_configured_times_when_enabled(
+    tmp_path, monkeypatch,
+):
+    """public_feed_enabled=True + bootstrap/feed_state/feed_seen репозитории
+    -> ПЯТЫЙ job в Scheduler'е, с run_times/tz взятыми из config.yaml (а не
+    захардкоженными) — см. задачу "schedule Georgia public feed three times
+    daily": "09:00 / 15:00 / 21:00 Asia/Tbilisi" + "это EXACT wall-clock
+    schedule, а не 'каждые 6 часов от момента запуска'"."""
+    _set_required_env(monkeypatch)
+    config_with_public_feed = _CONFIG_YAML + (
+        "  public_feed_enabled: true\n"
+        "  public_feed_times:\n"
+        "    - \"09:00\"\n"
+        "    - \"15:00\"\n"
+        "    - \"21:00\"\n"
+    )
+    config_path = _write_config(tmp_path, config_with_public_feed)
+    settings = load_settings(config_path)
+
+    user_repository = UserRepository(tmp_path / "users.db")
+    source = TelegramSource(settings.telegram, groups=[], user_repository=user_repository)
+    task_repository = FineMonitoringTaskRepository(tmp_path / "users.db")
+    detected_fine_repository = DetectedFineRepository(tmp_path / "users.db")
+    plate_bootstrap_repository = GeorgiaPlateBootstrapRepository(tmp_path / "users.db")
+    feed_state_repository = GeorgiaPublicFeedStateRepository(tmp_path / "users.db")
+    feed_seen_repository = GeorgiaPublicFeedSeenRepository(tmp_path / "users.db")
+    http_client = httpx.AsyncClient()
+
+    try:
+        notification_chat_ids = resolve_notification_chat_ids(settings)
+        _fine_job, scheduler, _notification_service, _command_dispatcher, _fine_command = (
+            build_fine_monitor_components(
+                settings, source, task_repository, detected_fine_repository,
+                http_client, notification_chat_ids, settings.fine_monitor.allowed_user_ids,
+                user_repository=user_repository,
+                plate_bootstrap_repository=plate_bootstrap_repository,
+                feed_state_repository=feed_state_repository,
+                feed_seen_repository=feed_seen_repository,
+            )
+        )
+
+        assert len(scheduler._jobs) == 5
+        georgia_job = scheduler._jobs[4]
+        assert isinstance(georgia_job, GeorgiaPublicFineFeedJob)
+        assert [t.strftime("%H:%M") for t in georgia_job._run_times] == [
+            "09:00", "15:00", "21:00",
+        ]
+        assert str(georgia_job._tz) == "Asia/Tbilisi"
+    finally:
+        user_repository.close()
+        task_repository.close()
+        detected_fine_repository.close()
+        plate_bootstrap_repository.close()
+        feed_state_repository.close()
+        feed_seen_repository.close()
         await http_client.aclose()
 
 

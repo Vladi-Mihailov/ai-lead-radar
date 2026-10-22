@@ -3,7 +3,13 @@ public-feed monitoring" (production architecture change после PR #30
 "back off when police.ge is unavailable"), ИСПРАВЛЕНО по корректирующей
 задаче "IMPORTANT CORRECTION BEFORE COMMIT / PR" (request-volume
 contradiction: исходная версия пересканировала весь overlap-день заново
-КАЖДЫЙ 5-минутный цикл — ~6600 запросов/день вместо ожидаемых ~288/день).
+КАЖДЫЙ 5-минутный цикл — ~6600 запросов/день вместо ожидаемых ~288/день),
+И ЕЩЁ РАЗ ИСПРАВЛЕНО по задаче "schedule Georgia public feed three times
+daily" (см. should_run() докстрок) — расписание сменилось с "каждые N
+минут от момента запуска" на ТРИ фиксированных момента суток
+(09:00/15:00/21:00 Asia/Tbilisi по умолчанию, см. settings.fine_monitor.
+public_feed_times/timezone), тем же способом, что и FineJob.run_times/tz
+(см. reader/jobs/fine_job.py::should_run).
 
 Заменяет per-car scheduled police.ge-опрос (FineJob/ArchiveFineJob на
 bootstrap-completed машинах, см. reader/fines/plate_bootstrap_repository.py)
@@ -31,10 +37,19 @@ overlap'ов. Поэтому стоимость цикла — O(число НО
     (сама страница + overlap).
   - 30 новых, граница на странице 2 -> overlap на странице 3 -> 3 запроса.
   - 75 новых, граница на странице 3 -> overlap на странице 4 -> 4 запроса.
-При наблюдаемой скорости (~670/день ≈ 2-3 записи/5-минутный цикл в среднем)
-это даёт ТИПИЧНЫЙ цикл = 2 запроса, ИТОГО ≈576 запросов/день — всё ещё
-существенно меньше прежних ~1345 scheduled per-plate запросов/день и не
-зависит от числа отслеживаемых номеров.
+
+РАСПИСАНИЕ (см. задачу "schedule Georgia public feed three times daily"):
+ТРИ ФИКСИРОВАННЫХ момента суток в сутки (по умолчанию 09:00/15:00/21:00
+Asia/Tbilisi, см. settings.fine_monitor.public_feed_times/timezone), а НЕ
+"каждые N минут от момента запуска" — см. should_run() докстрок. Типичный
+(ничего не накопилось сверх одной страницы) цикл — frontier-страница + 1
+overlap-страница = ТИПИЧНЫЙ baseline ≈ 3 цикла × 2 запроса ≈ 6 запросов/
+день — НЕ гарантия: если между циклами накопилось больше 30 новых записей,
+pagination сама сделает больше запросов (см. примеры выше), а
+первый-в-жизни DEEP catch-up (или любое восстановление после сбоя) может
+потребовать заметно больше страниц — это одноразовое/recovery поведение,
+не входящее в типичный ежедневный baseline (см. "ОДНОРАЗОВЫЙ CUTOVER
+CATCH-UP" и safety cap ниже — их семантика этой задачей не меняется).
 
 РЕЖИМЫ (см. _choose_mode):
 - "DEEP" (первый запуск ЛИБО восстановление после сбоя предыдущего
@@ -68,6 +83,8 @@ protocolNo и на пустоту страницы."""
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from datetime import time as dt_time
+from zoneinfo import ZoneInfo
 
 from reader.fines.check_service import FineCheckService
 from reader.fines.models import FineMonitoringTask
@@ -112,7 +129,8 @@ class GeorgiaPublicFineFeedJob(Job):
         feed_state_repository: GeorgiaPublicFeedStateRepository,
         seen_repository: GeorgiaPublicFeedSeenRepository,
         *,
-        poll_interval: timedelta = timedelta(minutes=5),
+        run_times: list[dt_time],
+        tz: ZoneInfo,
         max_pages_per_cycle: int = 30,
         first_run_max_pages: int = 100,
         retention_days: int = 7,
@@ -122,24 +140,61 @@ class GeorgiaPublicFineFeedJob(Job):
         self._check_service = check_service
         self._feed_state = feed_state_repository
         self._seen = seen_repository
-        self._poll_interval = poll_interval
+        self._run_times = run_times
+        self._tz = tz
         self._max_pages_per_cycle = max_pages_per_cycle
         self._first_run_max_pages = first_run_max_pages
         self._retention_days = retention_days
-        # Только в памяти (см. reader/jobs/fine_job.py::_last_run_slot —
-        # тот же принцип): "можно ли уже запускать следующий цикл", НЕ
-        # источник истины про режим — это georgia_public_feed_state.
-        self._last_run_at: datetime | None = None
+        # Только в памяти, тот же приём, что и reader/jobs/fine_job.py::
+        # FineJob._last_run_slot — какой именно (день, время-слот) из
+        # run_times уже отработан, НЕ источник истины про DEEP/FAST режим
+        # (это georgia_public_feed_state, см. run() ниже).
+        self._last_run_slot: tuple[date, dt_time] | None = None
         self.status = GeorgiaPublicFineFeedJobStatus()
 
     async def should_run(self, now: datetime) -> bool:
-        if self._last_run_at is None:
-            return True
-        return now - self._last_run_at >= self._poll_interval
+        """Срабатывает ТОЛЬКО при точном совпадении часа и минуты с одним
+        из run_times (в self._tz) — см. задачу "schedule Georgia public
+        feed three times daily" + reader/jobs/fine_job.py::FineJob.
+        should_run (тот же код, тот же осознанный компромисс):
+
+        - `_last_run_slot` — только в памяти этого объекта. После рестарта
+          процесса создаётся новый GeorgiaPublicFineFeedJob с
+          `_last_run_slot=None`, поэтому обычный restart НЕ запускает feed
+          вне 09:00/15:00/21:00 (если рестарт пришёлся ровно на минуту
+          одного из run_times — job запустится, как и запустился бы без
+          рестарта; это не "лишний" запуск).
+        - Пропущенный слот (процесс не опрашивал should_run() в нужную
+          минуту — был выключен/завис) просто пропускается навсегда,
+          никакого отдельного per-car catch-up здесь не создаётся — при
+          СЛЕДУЮЩЕМ обычном запуске backlog безопасно дочитывают уже
+          существующие seen/frontier/pagination/DEEP recovery/fingerprint
+          dedupe (см. run() ниже) — их семантика этой задачей не менялась.
+        """
+        local_now = now.astimezone(self._tz)
+
+        matched_time = next(
+            (
+                t
+                for t in self._run_times
+                if (t.hour, t.minute) == (local_now.hour, local_now.minute)
+            ),
+            None,
+        )
+        if matched_time is None:
+            return False
+
+        slot = (local_now.date(), matched_time)
+        if slot == self._last_run_slot:
+            # Уже отработали именно этот слот сегодня — не запускать снова
+            # при следующем опросе Scheduler'а в течение той же минуты.
+            return False
+
+        self._last_run_slot = slot
+        return True
 
     async def run(self, now: datetime | None = None) -> None:
         run_at = now or datetime.now(timezone.utc)
-        self._last_run_at = run_at
         self.status.last_run_at = run_at
 
         if not self._check_service.provider_available():
