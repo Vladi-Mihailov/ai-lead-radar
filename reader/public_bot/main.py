@@ -352,7 +352,10 @@ async def run() -> None:
             TelethonSupportGateway(client, user_main_menu=lambda: main_menu_keyboard(is_trusted=False)),
             support_chat_id=settings.public_bot.support_chat_id, is_trusted=controller.is_trusted,
         )
-        register(client, controller, known_users_repository, support=support)
+        register(
+            client, controller, known_users_repository, support=support,
+            manager_chat_id=settings.public_bot.support_chat_id,
+        )
         register_support_group_handlers(client, support)
 
         delivery_service = ClientDeliveryService(

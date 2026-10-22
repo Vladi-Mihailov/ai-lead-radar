@@ -101,6 +101,24 @@ _SELECT_PENDING_NOTIFICATIONS = f"""
     SELECT {_SELECT_FIELDS} FROM detected_fines WHERE notification_sent_at IS NULL
 """
 
+# Emergency Check Now (см. задачу "back off when police.ge is unavailable" /
+# "EMERGENCY MODE USER BEHAVIOR") — "текущие/неоплаченные" штрафы задачи БЕЗ
+# обращения к police.ge: last_seen_at обновляется (см. _MARK_SEEN/create())
+# РОВНО для тех записей, которые police.ge вернул на ПОСЛЕДНЕЙ успешной
+# проверке (см. FineCheckService._finalize — mark_seen()/create() вызываются
+# только для записей из records, а _persist_snapshot пишет
+# last_successful_checked_at ДО этого цикла, см. check_task()) — строка с
+# last_seen_at СТАРШЕ last_successful_checked_at последней успешной проверки
+# не была в её ответе, то есть больше не числится police.ge как актуальная
+# (оплачена/снята). ">=" (не "=") — last_successful_checked_at пишется ДО
+# цикла mark_seen()/create(), поэтому их CURRENT_TIMESTAMP может на секунду
+# отличаться (перевод между штрафами — см. _resolve_translation).
+_SELECT_CURRENT_FOR_TASK = f"""
+    SELECT {_SELECT_FIELDS} FROM detected_fines
+    WHERE monitoring_task_id = ? AND last_seen_at >= ?
+    ORDER BY id ASC
+"""
+
 _SELECT_STATS_BY_CAR = """
     SELECT car_number, COUNT(*) AS fine_count
     FROM detected_fines
@@ -248,6 +266,21 @@ class DetectedFineRepository:
             (monitoring_task_id,),
         ).fetchone()
         return row is not None
+
+    def list_current_for_task(self, monitoring_task_id: int, *, since: datetime) -> list[DetectedFine]:
+        """Для FineCheckService.read_last_known_state() — см. _SELECT_CURRENT_
+        FOR_TASK докстрок выше про "last_seen_at >= since" как критерий
+        "текущий/неоплаченный". since — task.last_successful_checked_at
+        (naive UTC datetime, тот же формат, что и SQLite CURRENT_TIMESTAMP,
+        см. BotKnownUsersRepository.count_first_seen_since про тот же
+        strftime-приём). Пустой список — ЛИБО у задачи нет ни одного
+        штрафа вообще, ЛИБО все известные штрафы старше последней успешной
+        проверки (значит police.ge на ней их уже не вернул — не текущие)."""
+        rows = self._conn.execute(
+            _SELECT_CURRENT_FOR_TASK,
+            (monitoring_task_id, since.strftime("%Y-%m-%d %H:%M:%S")),
+        ).fetchall()
+        return [_row_to_fine(row) for row in rows]
 
     def list_by_car_number(self, car_number: str) -> list[DetectedFine]:
         """Все обнаруженные штрафы конкретного номера — используется client

@@ -623,6 +623,157 @@ async def test_provider_available_delegates_to_provider_is_available(tmp_path):
         fine_repo.close()
 
 
+# ==== check_task_or_read_cached — "EMERGENCY MODE USER BEHAVIOR" (см.
+# задачу "back off when police.ge is unavailable" / "IMPORTANT PRODUCT
+# DECISION — CHANGE PREVIOUS REQUIREMENT": "НЕ показываем пользователю
+# никаких предупреждений о недоступности police.ge") ====
+
+_BANNED_EMERGENCY_WORDING = (
+    "police.ge", "недоступн", "cached", "кеш", "emergency", "По нашей базе",
+    "неактуальны", "Последняя успешная",
+)
+
+
+async def test_emergency_check_with_zero_known_fines_looks_like_normal_no_fines(tmp_path):
+    """Тест 1 задачи: "emergency + DB has 0 fines -> exact normal
+    'штрафов не найдено' -> provider NOT called"."""
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        provider = _FakeProvider(available=False)
+        service = FineCheckService(provider, task_repo, fine_repo)
+
+        result = await service.check_task_or_read_cached(task)
+
+        assert result.status == "ok"
+        assert result.current_fines == []
+        assert result.provider_unavailable is False
+        assert provider.requested_plates == []
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_emergency_check_with_one_known_fine_shows_it_normally(tmp_path):
+    """Тест 2 задачи: "emergency + DB has 1 current unpaid fine -> fine
+    shown normally"."""
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        ok_provider = _FakeProvider(records=[_record(fingerprint="fp-1")])
+        await FineCheckService(ok_provider, task_repo, fine_repo).check_task(task)
+
+        emergency_provider = _FakeProvider(available=False)
+        service = FineCheckService(emergency_provider, task_repo, fine_repo)
+        result = await service.check_task_or_read_cached(task)
+
+        assert result.status == "ok"
+        assert len(result.current_fines) == 1
+        assert result.current_fines[0].external_fine_id == "AB123456"
+        assert result.provider_unavailable is False
+        assert emergency_provider.requested_plates == []
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_emergency_check_with_multiple_known_fines_shows_all_once(tmp_path):
+    """Тест 3 задачи: "emergency + multiple current unpaid fines -> all
+    shown once" (не дублированы, не потеряны)."""
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        ok_provider = _FakeProvider(records=[
+            _record(fingerprint="fp-1", external_fine_id="AB111111"),
+            _record(fingerprint="fp-2", external_fine_id="AB222222"),
+            _record(fingerprint="fp-3", external_fine_id="AB333333"),
+        ])
+        await FineCheckService(ok_provider, task_repo, fine_repo).check_task(task)
+
+        service = FineCheckService(_FakeProvider(available=False), task_repo, fine_repo)
+        result = await service.check_task_or_read_cached(task)
+
+        assert result.status == "ok"
+        assert sorted(f.external_fine_id for f in result.current_fines) == [
+            "AB111111", "AB222222", "AB333333",
+        ]
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_emergency_check_text_never_contains_disclaimer_wording(tmp_path):
+    """Тест 4 задачи: "no emergency/disclaimer wording visible to
+    customer" — проверяется на РЕАЛЬНОМ тексте, который увидит клиент
+    (texts.format_check_now_result), а не только на флагах CheckResult."""
+    from reader.public_bot.subscription_service import CheckNowOutcome
+    from reader.public_bot.texts import format_check_now_result
+
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        ok_provider = _FakeProvider(records=[_record(fingerprint="fp-1")])
+        await FineCheckService(ok_provider, task_repo, fine_repo).check_task(task)
+
+        service = FineCheckService(_FakeProvider(available=False), task_repo, fine_repo)
+        result = await service.check_task_or_read_cached(task)
+
+        outcome = CheckNowOutcome(
+            car_number=task.car_number, check_ok=result.shows_as_ok,
+            fines=result.current_fines, is_owner=True,
+            provider_unavailable=result.provider_unavailable,
+        )
+        text = format_check_now_result(outcome)
+
+        for banned in _BANNED_EMERGENCY_WORDING:
+            assert banned not in text, f"banned wording {banned!r} leaked into customer text: {text!r}"
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
+async def test_emergency_check_now_does_not_mutate_any_check_state(tmp_path):
+    """"CRITICAL STATE RULE" задачи: "Emergency Check Now остаётся
+    READ-ONLY" — ни last_successful_checked_at/last_successful_total_amount
+    (task), ни last_seen_at/количество строк detected_fines не меняются от
+    вызова check_task_or_read_cached() в emergency-ветке."""
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    try:
+        task = _make_task(task_repo)
+        ok_provider = _FakeProvider(records=[_record(fingerprint="fp-1")])
+        await FineCheckService(ok_provider, task_repo, fine_repo).check_task(task)
+
+        before_task = task_repo.get(task.id)
+        before_fine = fine_repo.get_by_fingerprint(task.id, "fp-1")
+        before_count = len(fine_repo.list_by_car_number(task.car_number))
+
+        service = FineCheckService(_FakeProvider(available=False), task_repo, fine_repo)
+        await service.check_task_or_read_cached(task)
+
+        after_task = task_repo.get(task.id)
+        after_fine = fine_repo.get_by_fingerprint(task.id, "fp-1")
+        after_count = len(fine_repo.list_by_car_number(task.car_number))
+
+        assert after_task.last_successful_checked_at == before_task.last_successful_checked_at
+        assert after_task.last_successful_total_amount == before_task.last_successful_total_amount
+        assert after_task.last_check_status == before_task.last_check_status
+        assert after_fine == before_fine  # включая last_seen_at — не "подтронут" повторно
+        assert after_count == before_count
+    finally:
+        task_repo.close()
+        fine_repo.close()
+
+
 async def test_check_result_updates_task_last_checked_fields(tmp_path):
     db_path = tmp_path / "users.db"
     task_repo = FineMonitoringTaskRepository(db_path)

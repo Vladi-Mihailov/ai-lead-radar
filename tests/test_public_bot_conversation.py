@@ -275,12 +275,15 @@ async def test_add_car_without_username_completes_subscription_successfully(fx):
     assert fx.conversation_state_repository.get(2) is None  # диалог завершён
 
 
-async def test_add_car_when_circuit_open_shows_dedicated_deferred_check_message(tmp_path):
-    """П.6 задачи "back off when police.ge is unavailable": circuit breaker
-    открыт во время Add Car — подписка всё равно создаётся успешно, но
-    клиенту показывается ОТДЕЛЬНОЕ сообщение ("будет выполнена позже"), а
-    не общее "проверить штрафы сейчас не удалось" (см.
-    texts.format_add_car_summary)."""
+async def test_add_car_when_circuit_open_shows_normal_message_and_alerts_manager(tmp_path):
+    """IMPORTANT PRODUCT DECISION — CHANGE PREVIOUS REQUIREMENT (см. задачу
+    "back off when police.ge is unavailable" + "no disclaimer in emergency
+    mode"): circuit breaker открыт во время Add Car — подписка всё равно
+    создаётся успешно, клиент видит ОБЫЧНЫЙ текст успеха (никаких
+    "police.ge"/"недоступен"/disclaimer, см. check_service.py::
+    check_task_or_read_cached) — единственная компенсация: BotReply.
+    manager_alert_text (см. задачу "NEW USER EMERGENCY WORKFLOW"),
+    которое handlers.py (не этот тест) отправит менеджеру отдельно."""
     fixture = _Fixture(tmp_path, provider_error=PoliceGeUnavailableError("circuit open"))
     try:
         await fixture.controller.handle_text(
@@ -295,9 +298,14 @@ async def test_add_car_when_circuit_open_shows_dedicated_deferred_check_message(
         )
 
         assert reply is not None
-        assert "✅ Автомобиль добавлен." in reply.text
-        assert "Первичная проверка штрафов временно недоступна" in reply.text
-        assert "проверить штрафы сейчас не удалось" not in reply.text
+        assert "✅ Автомобиль добавлен на мониторинг" in reply.text
+        assert "штрафов нет" in reply.text
+        for banned in ("police.ge", "недоступн", "Первичная проверка", "cached", "emergency"):
+            assert banned not in reply.text
+
+        assert reply.manager_alert_text is not None
+        assert "Пользователь добавил автомобиль" in reply.manager_alert_text
+        assert "295" in reply.manager_alert_text  # car_number digits (format_plate_for_telegram bolds letters only)
 
         # Подписка реально создана, несмотря на недоступность источника.
         [subscription] = fixture.subscription_repository.list_by_user(2)

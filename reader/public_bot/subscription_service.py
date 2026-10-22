@@ -47,6 +47,16 @@ class AddCarOutcome:
     # (см. texts.format_add_car_summary). Default False сохраняет
     # поведение существующих вызовов AddCarOutcome(...) без правки.
     provider_unavailable: bool = False
+    # True — у ЭТОГО telegram_user_id до текущего вызова add_car() не было
+    # НИ ОДНОЙ fine_monitoring_subscriptions строки, любого статуса (см.
+    # задачу "NEW USER EMERGENCY WORKFLOW": "когда этот пользователь
+    # впервые добавит автомобиль — отправить manager'у короткое
+    # дополнение"). Вычисляется ДО создания новой подписки (см. add_car) —
+    # существующий пользователь, добавляющий ВТОРОЙ автомобиль, получает
+    # False (см. задачу п.10: "do NOT misclassify as new user"). Default
+    # False сохраняет поведение существующих вызовов AddCarOutcome(...)
+    # без правки.
+    is_first_car_for_user: bool = False
 
 
 @dataclass(frozen=True)
@@ -232,6 +242,14 @@ class SubscriptionService:
         start_date = today
         end_date = today + timedelta(days=period_days)
 
+        # "NEW USER EMERGENCY WORKFLOW" (см. задачу) — ДО создания новой
+        # подписки: ЛЮБАЯ строка этого пользователя, любого статуса (та же
+        # семантика, что и у list_by_user() для "Мои авто") означает "уже
+        # не первый автомобиль" (см. AddCarOutcome.is_first_car_for_user
+        # докстрок — существующий пользователь, добавляющий второй
+        # автомобиль, не должен ложно всплыть как "новый").
+        is_first_car_for_user = not self._subscription_repository.list_by_user(telegram_user_id)
+
         task = self._create_or_extend_task(
             car_number=car_number,
             telegram_user_id=telegram_user_id,
@@ -270,7 +288,17 @@ class SubscriptionService:
         # вызывается — новый штраф уйдёт оператору на ближайшем плановом
         # запуске FineJob/ArchiveFineJob, дедуп при этом не страдает: сам
         # факт обнаружения уже сохранён в detected_fines.
-        check_result = await self._check_service.check_task(task)
+        #
+        # check_task_or_read_cached (не check_task()) — см. задачу "back
+        # off when police.ge is unavailable" + "CHANGE PREVIOUS
+        # REQUIREMENT": circuit breaker открыт -> подписка/задача всё
+        # равно создаются (выше), но первичная проверка читает последнее
+        # достоверное состояние из нашей БД вместо disclaimer'а (для
+        # только что созданной задачи это почти всегда пустой список —
+        # "штрафов не найдено" без предупреждения, компенсация —
+        # is_first_car_for_user выше уведомляет менеджера проверить
+        # вручную).
+        check_result = await self._check_service.check_task_or_read_cached(task)
 
         return AddCarOutcome(
             task=task,
@@ -278,6 +306,7 @@ class SubscriptionService:
             check_ok=check_result.shows_as_ok,
             new_fines_count=len(check_result.new_fines) if check_result.shows_as_ok else 0,
             provider_unavailable=check_result.provider_unavailable,
+            is_first_car_for_user=is_first_car_for_user,
         )
 
     # ---- trusted-operator delegated flow ----
@@ -844,7 +873,13 @@ class SubscriptionService:
         if task is None:
             return None
 
-        check_result = await self._check_service.check_task(task)
+        # check_task_or_read_cached (не check_task()) — см. задачу "back
+        # off when police.ge is unavailable" + "EMERGENCY MODE USER
+        # BEHAVIOR": circuit breaker открыт -> читаем последнее
+        # достоверное состояние из нашей БД, БЕЗ единого обращения к
+        # police.ge и БЕЗ предупреждения пользователю (см. check_service.py
+        # докстрок).
+        check_result = await self._check_service.check_task_or_read_cached(task)
 
         return CheckNowOutcome(
             car_number=subscription.car_number,
@@ -1008,7 +1043,8 @@ class SubscriptionService:
         if task is None:
             return None
 
-        check_result = await self._check_service.check_task(task)
+        # check_task_or_read_cached — см. check_now() выше, тот же приём.
+        check_result = await self._check_service.check_task_or_read_cached(task)
 
         return CheckNowOutcome(
             car_number=task.car_number,

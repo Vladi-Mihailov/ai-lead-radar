@@ -139,6 +139,79 @@ class FineCheckService:
         PoliceGeSession.search_by_plate()."""
         return self._provider.is_available()
 
+    async def check_task_or_read_cached(self, task: FineMonitoringTask) -> CheckResult:
+        """Emergency Check Now / Add Car immediate check (см. задачу "back
+        off when police.ge is unavailable" + "IMPORTANT PRODUCT DECISION —
+        CHANGE PREVIOUS REQUIREMENT": "НЕ показываем пользователю никаких
+        предупреждений о недоступности police.ge") — ЕДИНСТВЕННАЯ точка,
+        где manual Check Now (SubscriptionService.check_now/check_now_task)
+        и self-service Add Car (add_car) решают, звать ли реальный
+        check_task() или читать последнее достоверное состояние из нашей
+        БД. Circuit breaker открыт ДО вызова (provider_available()=False)
+        ИЛИ открылся прямо во время ЭТОГО конкретного запроса (редкий
+        TOCTOU race — check_task() сам вернул
+        CheckResult.provider_unavailable=True) — в обоих случаях результат
+        ОДИНАКОВЫЙ: read_last_known_state(), а не "попробуйте позже"/
+        disclaimer (CheckResult.provider_unavailable остаётся полем
+        CheckResult/используется FineJob/ArchiveFineJob'ом — ЭТОТ метод
+        просто гарантирует, что ни один вызывающий его UI-путь никогда не
+        увидит provider_unavailable=True наружу).
+
+        Полностью READ-ONLY в ветке read_last_known_state (см. её докстрок)
+        — ничего не пишет сверх того, что уже написал бы обычный
+        check_task() в успешном случае."""
+        if not self.provider_available():
+            return self._read_last_known_state(task)
+
+        result = await self.check_task(task)
+        if result.provider_unavailable:
+            return self._read_last_known_state(task)
+        return result
+
+    def _read_last_known_state(self, task: FineMonitoringTask) -> CheckResult:
+        """"Текущее состояние по нашей БД" — см. задачу "CAN IDENTIFY
+        CURRENT/UNPAID FINES": detected_fines-строки задачи, чей
+        last_seen_at не старше last_successful_checked_at ПОСЛЕДНЕЙ
+        успешной проверки (см. DetectedFineRepository.list_current_for_
+        task докстрок) — ровно то, что police.ge вернул В ПОСЛЕДНИЙ раз,
+        когда он ещё отвечал. Задача свежая (перечитана из репозитория, а
+        не доверяет переданному объекту — тот же приём, что и
+        _zero_needs_confirmation).
+
+        last_successful_checked_at is None (задача ни разу не прошла
+        успешную проверку, например только что создана Add Car прямо
+        во время outage) — current_fines=[] (см. задачу: "не выдавать
+        historical detected_fines-историю за текущее состояние" —
+        единственный честный fallback без единого достоверного снимка).
+        Сознательно НЕ "error"/provider_unavailable=True — see задача:
+        "НЕ показываем пользователю никаких предупреждений", 0 известных
+        текущих штрафов показывается как обычное "штрафов не найдено".
+
+        НИКАКИХ записей в БД: ни mark_seen, ни record_successful_check, ни
+        create(), ни mark_notified — new_fines ВСЕГДА пуст (см. задачу
+        "Emergency Check Now остаётся READ-ONLY") — current_fines ТОЛЬКО
+        для отображения, уведомление оператору/клиенту НЕ запускается (оно
+        уже было запущено, когда эти штрафы были обнаружены по-настоящему,
+        см. FineNotificationCoordinator)."""
+        fresh_task = self._task_repository.get(task.id) or task
+        if fresh_task.last_successful_checked_at is None:
+            rows = []
+        else:
+            rows = self._detected_fine_repository.list_current_for_task(
+                fresh_task.id, since=fresh_task.last_successful_checked_at,
+            )
+        current_fines = [
+            NewFineEvent.from_detected_fine(row, label=fresh_task.label) for row in rows
+        ]
+        return CheckResult(
+            status="ok",
+            new_fines=[],
+            current_fines=current_fines,
+            error_message=None,
+            total_fines_found=len(current_fines),
+            duration_ms=0,
+        )
+
     async def _resolve_translation(
         self,
         record: ParsedFineRecord,

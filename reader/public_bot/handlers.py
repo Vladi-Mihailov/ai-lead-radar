@@ -74,6 +74,7 @@ from reader.public_bot.keyboards import (
     trusted_tasks_page_keyboard,
     turkey_bot_link_keyboard,
 )
+from reader.public_bot import manager_alerts
 from reader.public_bot.known_users_repository import BotKnownUsersRepository
 from reader.protocol_support.service import ProtocolSupportService
 from reader.protocol_support.telethon_gateway import handle_private_support
@@ -102,6 +103,7 @@ def register(
     controller: ConversationController,
     known_users_repository: BotKnownUsersRepository | None = None,
     support: ProtocolSupportService | None = None,
+    manager_chat_id: int | None = None,
 ) -> None:
     """Регистрирует NewMessage/CallbackQuery handlers на уже
     сконфигурированном bot-mode TelegramClient (см. reader/public_bot/
@@ -113,7 +115,14 @@ def register(
     known_users_repository — если передан, ЛЮБОЕ входящее событие (текст
     или callback), независимо от содержимого, обновляет bot_known_users
     (см. design report: единственный способ узнать, что боту можно
-    что-либо доставить этому numeric id, — он уже хоть раз ему написал)."""
+    что-либо доставить этому numeric id, — он уже хоть раз ему написал).
+
+    manager_chat_id — "NEW USER EMERGENCY WORKFLOW" (см. задачу "back off
+    when police.ge is unavailable"): куда слать проактивные алерты о новых
+    пользователях/первом добавленном автомобиле (см. reader/public_bot/
+    manager_alerts.py) — settings.public_bot.support_chat_id (та же
+    "внутренняя группа менеджеров", см. reader/public_bot/main.py). None —
+    фича выключена (напр. support_chat_id не настроен)."""
 
     def _record_known_user(
         telegram_user_id: int,
@@ -121,12 +130,46 @@ def register(
         username: str | None,
         first_name: str | None = None,
         last_name: str | None = None,
+    ) -> bool:
+        """True — telegram_user_id НЕ был известен ДО этого вызова (см.
+        задачу "NEW USER EMERGENCY WORKFLOW") — проверяется ДО upsert, по
+        персистентной bot_known_users, поэтому restart процесса/повторный
+        /start того же пользователя всегда дают False (exactly-once по
+        самой природе таблицы, без отдельного флага)."""
+        if known_users_repository is None:
+            return False
+        is_new = not known_users_repository.is_known(telegram_user_id)
+        known_users_repository.record_seen(
+            telegram_user_id=telegram_user_id, telegram_chat_id=telegram_chat_id,
+            telegram_username=username, first_name=first_name, last_name=last_name,
+        )
+        return is_new
+
+    async def _notify_manager_new_user(
+        event, username: str | None, first_name: str | None, last_name: str | None,
     ) -> None:
-        if known_users_repository is not None:
-            known_users_repository.record_seen(
-                telegram_user_id=telegram_user_id, telegram_chat_id=telegram_chat_id,
-                telegram_username=username, first_name=first_name, last_name=last_name,
-            )
+        if manager_chat_id is None:
+            return
+        text = manager_alerts.format_new_user_alert(
+            telegram_user_id=event.sender_id, username=username,
+            first_name=first_name, last_name=last_name,
+        )
+        try:
+            await event.client.send_message(manager_chat_id, text, parse_mode="md")
+        except Exception:
+            # Fail-open (тот же принцип, что и у translation/notification
+            # везде в проекте) — сбой алерта менеджеру не должен ломать
+            # обычное взаимодействие пользователя с ботом.
+            logger.exception("manager alert (новый пользователь): не удалось отправить")
+
+    async def _notify_manager_alert_if_any(event, reply) -> None:
+        text = getattr(reply, "manager_alert_text", None)
+        if manager_chat_id is None or not text:
+            return
+        try:
+            await event.client.send_message(manager_chat_id, text, parse_mode="md")
+        except Exception:
+            logger.exception("manager alert: не удалось отправить")
 
     @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def _on_message(event: events.NewMessage.Event) -> None:
@@ -144,7 +187,9 @@ def register(
             return
 
         username, first_name, last_name = await _sender_names(event)
-        _record_known_user(event.sender_id, event.chat_id, username, first_name, last_name)
+        is_new_user = _record_known_user(event.sender_id, event.chat_id, username, first_name, last_name)
+        if is_new_user:
+            await _notify_manager_new_user(event, username, first_name, last_name)
         is_trusted = controller.is_trusted(event.sender_id)
 
         reply = await controller.handle_text(
@@ -162,7 +207,9 @@ def register(
     async def _on_callback(event: events.CallbackQuery.Event) -> None:
         data = event.data
         username, first_name, last_name = await _sender_names(event)
-        _record_known_user(event.sender_id, event.chat_id, username, first_name, last_name)
+        is_new_user = _record_known_user(event.sender_id, event.chat_id, username, first_name, last_name)
+        if is_new_user:
+            await _notify_manager_new_user(event, username, first_name, last_name)
         is_trusted = controller.is_trusted(event.sender_id)
 
         wants_client = decode_add_client_decision_callback(data)
@@ -191,6 +238,7 @@ def register(
                     last_name=last_name,
                 ),
                 is_trusted=is_trusted,
+                on_reply=_notify_manager_alert_if_any,
             )
             return
 
@@ -495,7 +543,7 @@ async def _answer_and_send(event, reply, *, is_trusted: bool = False) -> None:
     await _send_reply(event, reply, prefer_edit=True, is_trusted=is_trusted)
 
 
-async def _ack_then_await_slow_check(event, coro, *, is_trusted: bool = False) -> None:
+async def _ack_then_await_slow_check(event, coro, *, is_trusted: bool = False, on_reply=None) -> None:
     """Для callback'ов, чей handler делает реальный live-check (police.ge,
     Add Car onboarding-проверка, debt refresh) — может занимать секунды (см.
     production incident O127PX62, 2026-10-21: request_timeout=30s + false-
@@ -518,7 +566,13 @@ async def _ack_then_await_slow_check(event, coro, *, is_trusted: bool = False) -
     prefer_edit=False (не True, как у _answer_and_send) — та же причина,
     что и у Turkey: после возможной многосекундной паузы оригинальное
     сообщение может быть уже неактуальным/устаревшим для пользователя,
-    новое сообщение — более надёжная гарантия доставки."""
+    новое сообщение — более надёжная гарантия доставки.
+
+    on_reply — опциональный побочный side-effect хук (см. задачу "NEW USER
+    EMERGENCY WORKFLOW": BotReply.manager_alert_text для только что
+    добавленного первого автомобиля) — вызывается ПОСЛЕ отправки ответа
+    пользователю (не должен задерживать/блокировать его), None для всех
+    остальных call site'ов этой функции."""
     try:
         await event.answer()
     except QueryIdInvalidError:
@@ -528,6 +582,8 @@ async def _ack_then_await_slow_check(event, coro, *, is_trusted: bool = False) -
         await event.respond(CALLBACK_NOT_AUTHORIZED_TEXT)
         return
     await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=False)
+    if on_reply is not None:
+        await on_reply(event, reply)
 
 
 async def _send_reply(event, reply, *, prefer_edit: bool = False, is_trusted: bool = False) -> None:
