@@ -157,19 +157,26 @@ class FineMonitorSettings(BaseModel):
     # раньше (bootstrap_status игнорируется, см. reader/jobs/fine_job.py —
     # plate_bootstrap_repository=None).
     public_feed_enabled: bool = False
-    # Расписание ТРЁХ фиксированных моментов суток (см. задачу "schedule
-    # Georgia public feed three times daily") — заменяет прежний
+    # Расписание ЧЕТЫРЁХ фиксированных моментов суток (см. задачу "schedule
+    # Georgia public feed three times daily" + корректирующую задачу
+    # "IMPORTANT SCHEDULE UPDATE": добавлен 23:55 как намеренный
+    # end-of-day sweep — подбирает публикации между обычным циклом 21:00 и
+    # концом календарного дня, чтобы минимизировать риск оставить
+    # сегодняшние публикации необработанными на ночь) — заменяет прежний
     # public_feed_poll_interval_minutes ("каждые N минут от момента
     # запуска"): этот подход не давал точного wall-clock расписания и к
     # тому же запускал первый цикл немедленно при старте процесса,
     # независимо от времени суток (см. GeorgiaPublicFineFeedJob.
-    # should_run() докстрок). ТОТ ЖЕ формат/парсинг, что и check_times/
-    # client_check_times выше (список "HH:MM"), и ТА ЖЕ timezone —
-    # public_feed_times читается в этом же self.timezone (Asia/Tbilisi по
-    # умолчанию), отдельная настройка timezone для public feed не заводится
-    # (один canonical Georgia timezone на весь fine_monitor).
+    # should_run() докстрок). 23:55, а НЕ 00:00 — намеренно: 23:55 ещё
+    # относится к ТОМУ ЖЕ грузинскому календарному дню (local_now.date()
+    # не перескакивает), 00:00 относился бы уже к следующему. ТОТ ЖЕ
+    # формат/парсинг, что и check_times/client_check_times выше (список
+    # "HH:MM"), и ТА ЖЕ timezone — public_feed_times читается в этом же
+    # self.timezone (Asia/Tbilisi по умолчанию), отдельная настройка
+    # timezone для public feed не заводится (один canonical Georgia
+    # timezone на весь fine_monitor).
     public_feed_times: list[time] = Field(
-        default_factory=lambda: [time(9, 0), time(15, 0), time(21, 0)]
+        default_factory=lambda: [time(9, 0), time(15, 0), time(21, 0), time(23, 55)]
     )
     # Safety cap страниц (по 30 строк) на ОДИН ОБЫЧНЫЙ (FAST-режим, см.
     # reader/jobs/georgia_public_feed_job.py докстрок) ЛИБО
@@ -653,7 +660,7 @@ def load_settings(config_path: Path) -> Settings:
                 public_feed_times=[
                     _parse_check_time(value)
                     for value in fine_monitor_raw.get(
-                        "public_feed_times", ["09:00", "15:00", "21:00"]
+                        "public_feed_times", ["09:00", "15:00", "21:00", "23:55"]
                     )
                 ],
                 public_feed_max_pages_per_cycle=int(

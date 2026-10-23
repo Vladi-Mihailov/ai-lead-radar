@@ -48,7 +48,7 @@ _USER_ID = 111
 _RUN_AT = datetime(2026, 10, 22, 10, 0, tzinfo=timezone.utc)
 _TODAY = date(2026, 10, 22)
 _TBILISI = ZoneInfo("Asia/Tbilisi")
-_DEFAULT_RUN_TIMES = [dt_time(9, 0), dt_time(15, 0), dt_time(21, 0)]
+_DEFAULT_RUN_TIMES = [dt_time(9, 0), dt_time(15, 0), dt_time(21, 0), dt_time(23, 55)]
 
 
 class _FakeCircuitProvider(FineProvider):
@@ -134,8 +134,8 @@ def _make_job(
     times daily" (см. GeorgiaPublicFineFeedJob.should_run()); тесты
     пагинации/frontier/overlap/dedup ниже вызывают run() напрямую и никогда
     не проходят через should_run(), поэтому значение по умолчанию здесь
-    (09:00/15:00/21:00 Asia/Tbilisi) для них не имеет значения — только
-    тесты в разделе "schedule" ниже реально на него опираются."""
+    (09:00/15:00/21:00/23:55 Asia/Tbilisi) для них не имеет значения —
+    только тесты в разделе "schedule" ниже реально на него опираются."""
     provider = _FakeCircuitProvider(available=provider_available)
     check_service = FineCheckService(provider, task_repo, fine_repo)
     job = GeorgiaPublicFineFeedJob(
@@ -759,12 +759,15 @@ async def test_multiple_tasks_for_same_plate_each_get_persisted(tmp_path):
         seen_repo.close()
 
 
-# ==== schedule: 09:00/15:00/21:00 Asia/Tbilisi (см. задачу "schedule
-# Georgia public feed three times daily") ====
+# ==== schedule: 09:00/15:00/21:00/23:55 Asia/Tbilisi (см. задачу "schedule
+# Georgia public feed three times daily" + корректирующую задачу
+# "IMPORTANT SCHEDULE UPDATE": добавлен 23:55 как намеренный end-of-day
+# sweep, НЕ 00:00 — 23:55 остаётся частью ТОГО ЖЕ грузинского календарного
+# дня) ====
 #
-# Asia/Tbilisi не наблюдает DST (UTC+4 круглый год) — 09:00/15:00/21:00
-# local соответствуют 05:00/11:00/17:00 UTC, используется ниже вместо
-# datetime(..., tzinfo=_TBILISI) только чтобы явно проверить, что
+# Asia/Tbilisi не наблюдает DST (UTC+4 круглый год) — 09:00/15:00/21:00/
+# 23:55 local соответствуют 05:00/11:00/17:00/19:55 UTC, используется ниже
+# вместо datetime(..., tzinfo=_TBILISI) только чтобы явно проверить, что
 # should_run() делает конвертацию сам (now приходит в UTC, как и из
 # Scheduler.run_forever(), см. reader/jobs/scheduler.py), а не полагается
 # на то, что now уже в нужной таймзоне.
@@ -777,15 +780,15 @@ def _utc(hour: int, minute: int = 0, *, day: int = 22) -> datetime:
     return local.astimezone(timezone.utc)
 
 
-@pytest.mark.parametrize("hour", [9, 15, 21])
-async def test_should_run_true_at_each_scheduled_slot(tmp_path, hour):
+@pytest.mark.parametrize("hour,minute", [(9, 0), (15, 0), (21, 0), (23, 55)])
+async def test_should_run_true_at_each_scheduled_slot(tmp_path, hour, minute):
     task_repo = _make_task_repo(tmp_path)
     fine_repo = _make_fine_repo(tmp_path)
     feed_state_repo = _make_feed_state_repo(tmp_path)
     seen_repo = _make_seen_repo(tmp_path)
     try:
         job, _provider = _make_job(_FakeFeedSession(), task_repo, fine_repo, feed_state_repo, seen_repo)
-        assert await job.should_run(_utc(hour)) is True
+        assert await job.should_run(_utc(hour, minute)) is True
     finally:
         task_repo.close()
         fine_repo.close()
@@ -809,7 +812,11 @@ async def test_should_run_false_outside_scheduled_slots(tmp_path, hour):
         seen_repo.close()
 
 
-async def test_should_run_after_21_00_next_slot_is_09_00_next_day(tmp_path):
+async def test_should_run_after_23_55_next_slot_is_09_00_next_day(tmp_path):
+    """23:55 — последний слот дня (намеренный end-of-day sweep, см.
+    задачу "IMPORTANT SCHEDULE UPDATE"), НЕ 00:00 — должен остаться частью
+    ТОГО ЖЕ грузинского календарного дня, а следующий запуск — ровно 09:00
+    следующего дня, а не 00:00 того же вызова _utc(..., day=23)."""
     task_repo = _make_task_repo(tmp_path)
     fine_repo = _make_fine_repo(tmp_path)
     feed_state_repo = _make_feed_state_repo(tmp_path)
@@ -817,13 +824,19 @@ async def test_should_run_after_21_00_next_slot_is_09_00_next_day(tmp_path):
     try:
         job, _provider = _make_job(_FakeFeedSession(), task_repo, fine_repo, feed_state_repo, seen_repo)
 
+        # Обычный дневной цикл 21:00 срабатывает штатно...
         assert await job.should_run(_utc(21)) is True
         await job.run(_utc(21))
 
-        # Никаких запусков после 21:00 того же дня — ни на следующей
-        # минуте опроса Scheduler'а (та же минута 21:00 — защита от
-        # двойного срабатывания), ни на 00:00/03:00/06:00/12:00/18:00.
-        assert await job.should_run(_utc(21)) is False
+        # ...и 23:55 того же дня — тоже штатный, отдельный от 21:00 слот.
+        assert await job.should_run(_utc(23, 55)) is True
+        await job.run(_utc(23, 55))
+
+        # Никаких запусков после 23:55 того же дня — ни на следующей
+        # минуте опроса Scheduler'а (та же минута 23:55 — защита от
+        # двойного срабатывания), ни на 00:00/03:00/06:00/12:00/18:00
+        # следующего дня.
+        assert await job.should_run(_utc(23, 55)) is False
         for hour in (0, 3, 6, 12, 18):
             assert await job.should_run(_utc(hour, day=23)) is False
 
@@ -839,7 +852,7 @@ async def test_should_run_after_21_00_next_slot_is_09_00_next_day(tmp_path):
 async def test_should_run_false_mid_day_after_restart_does_not_fire_unsolicited_run(tmp_path):
     """Рестарт сервиса в 13:00 (между 09:00 и 15:00) не должен сам по себе
     запускать public feed — см. задачу "STARTUP": "Обычный restart сервиса
-    НЕ должен сам по себе запускать public feed вне 09:00/15:00/21:00".
+    НЕ должен сам по себе запускать public feed вне 09:00/15:00/21:00/23:55".
     Новый процесс создаёт НОВЫЙ GeorgiaPublicFineFeedJob с
     `_last_run_slot=None` (см. should_run() докстрок) — это ровно
     воспроизводится здесь свежим job'ом, которому ни разу ещё не задавали

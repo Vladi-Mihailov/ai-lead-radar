@@ -186,11 +186,13 @@ def test_load_settings_parses_explicit_archive_settings(tmp_path, monkeypatch):
 
 
 def test_load_settings_defaults_public_feed_schedule(tmp_path, monkeypatch):
-    """См. задачу "schedule Georgia public feed three times daily" —
-    _CONFIG_YAML не задаёт ни public_feed_enabled, ни public_feed_times,
-    должны применяться defaults: архитектура выключена, но даже её
-    расписание по умолчанию уже 09:00/15:00/21:00 (та же таймзона, что и
-    fine_monitor.timezone — отдельной настройки для public feed нет)."""
+    """См. задачу "schedule Georgia public feed three times daily" +
+    корректирующую задачу "IMPORTANT SCHEDULE UPDATE" (добавлен 23:55 как
+    намеренный end-of-day sweep, НЕ 00:00) — _CONFIG_YAML не задаёт ни
+    public_feed_enabled, ни public_feed_times, должны применяться defaults:
+    архитектура выключена, но даже её расписание по умолчанию уже
+    09:00/15:00/21:00/23:55 (та же таймзона, что и fine_monitor.timezone —
+    отдельной настройки для public feed нет)."""
     _set_required_env(monkeypatch)
     config_path = _write_config(tmp_path, _CONFIG_YAML)
 
@@ -201,6 +203,7 @@ def test_load_settings_defaults_public_feed_schedule(tmp_path, monkeypatch):
         "09:00",
         "15:00",
         "21:00",
+        "23:55",
     ]
 
 
@@ -212,6 +215,7 @@ def test_load_settings_parses_explicit_public_feed_schedule(tmp_path, monkeypatc
         "    - \"09:00\"\n"
         "    - \"15:00\"\n"
         "    - \"21:00\"\n"
+        "    - \"23:55\"\n"
     )
     config_path = _write_config(tmp_path, config_with_public_feed)
 
@@ -222,9 +226,13 @@ def test_load_settings_parses_explicit_public_feed_schedule(tmp_path, monkeypatc
         "09:00",
         "15:00",
         "21:00",
+        "23:55",
     ]
     # Явно НЕ эти моменты — упавший бы тест на неявном "каждые N минут"
-    # поведении, если бы кто-то вернул poll_interval обратно.
+    # поведении, если бы кто-то вернул poll_interval обратно, и явно НЕ
+    # 00:00 — 23:55 (а не полночь) намеренно остаётся частью ТОГО ЖЕ
+    # грузинского календарного дня (см. задачу "IMPORTANT SCHEDULE
+    # UPDATE").
     assert dt_time(0, 0) not in settings.fine_monitor.public_feed_times
     assert dt_time(12, 0) not in settings.fine_monitor.public_feed_times
 
@@ -469,7 +477,8 @@ async def test_build_fine_monitor_components_schedules_georgia_public_feed_job_w
     -> ПЯТЫЙ job в Scheduler'е, с run_times/tz взятыми из config.yaml (а не
     захардкоженными) — см. задачу "schedule Georgia public feed three times
     daily": "09:00 / 15:00 / 21:00 Asia/Tbilisi" + "это EXACT wall-clock
-    schedule, а не 'каждые 6 часов от момента запуска'"."""
+    schedule, а не 'каждые 6 часов от момента запуска'", плюс
+    корректирующую задачу "IMPORTANT SCHEDULE UPDATE" (добавлен 23:55)."""
     _set_required_env(monkeypatch)
     config_with_public_feed = _CONFIG_YAML + (
         "  public_feed_enabled: true\n"
@@ -477,6 +486,7 @@ async def test_build_fine_monitor_components_schedules_georgia_public_feed_job_w
         "    - \"09:00\"\n"
         "    - \"15:00\"\n"
         "    - \"21:00\"\n"
+        "    - \"23:55\"\n"
     )
     config_path = _write_config(tmp_path, config_with_public_feed)
     settings = load_settings(config_path)
@@ -507,7 +517,7 @@ async def test_build_fine_monitor_components_schedules_georgia_public_feed_job_w
         georgia_job = scheduler._jobs[4]
         assert isinstance(georgia_job, GeorgiaPublicFineFeedJob)
         assert [t.strftime("%H:%M") for t in georgia_job._run_times] == [
-            "09:00", "15:00", "21:00",
+            "09:00", "15:00", "21:00", "23:55",
         ]
         assert str(georgia_job._tz) == "Asia/Tbilisi"
     finally:
