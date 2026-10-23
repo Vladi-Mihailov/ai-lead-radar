@@ -42,8 +42,25 @@ CREATE TABLE IF NOT EXISTS georgia_plate_bootstrap_state (
 )
 """
 
+# "ВРЕМЕННЫЙ manager workflow" (см. задачу) — единственная недостающая
+# audit-колонка: КТО (Telegram user id менеджера) подтвердил bootstrap
+# ('нет штрафов' или 'все штрафы внесены'), а не только когда
+# (bootstrap_completed_at уже существовал и для этого годится без правок).
+# ALTER TABLE ... ADD COLUMN, guarded по тому же идиому, что и
+# FineMonitoringTaskRepository._migrate_missing_columns — существующие БД
+# обновляются на лету, без отдельного migration-скрипта. NULL для уже
+# существующих строк и для автоматического (не-manual) completion-пути
+# (reader/public_bot/subscription_service.py::add_car) — ТАМ действие
+# выполнил не человек, а генуинно успешный live searchByAuto.
+_COLUMN_MIGRATIONS = {
+    "bootstrap_completed_by_user_id": (
+        "ALTER TABLE georgia_plate_bootstrap_state ADD COLUMN bootstrap_completed_by_user_id INTEGER"
+    ),
+}
+
 _SELECT = (
-    "SELECT car_number, bootstrap_status, bootstrap_completed_at, created_at "
+    "SELECT car_number, bootstrap_status, bootstrap_completed_at, created_at, "
+    "bootstrap_completed_by_user_id "
     "FROM georgia_plate_bootstrap_state WHERE car_number = ?"
 )
 
@@ -57,7 +74,9 @@ _ENSURE_PENDING = (
 
 _MARK_COMPLETED = (
     "UPDATE georgia_plate_bootstrap_state SET bootstrap_status = 'completed', "
-    "bootstrap_completed_at = :completed_at WHERE car_number = :car_number"
+    "bootstrap_completed_at = :completed_at, "
+    "bootstrap_completed_by_user_id = :completed_by_user_id "
+    "WHERE car_number = :car_number"
 )
 
 _LIST_PENDING = (
@@ -71,6 +90,11 @@ class PlateBootstrapState:
     bootstrap_status: str
     bootstrap_completed_at: datetime | None
     created_at: datetime
+    # Audit trail (см. задачу "ВРЕМЕННЫЙ manager workflow") — Telegram user
+    # id менеджера, подтвердившего bootstrap вручную. None и для ещё не
+    # завершённых строк, и для строк, завершённых автоматическим живым
+    # searchByAuto (а не менеджером) — см. mark_completed() докстрок.
+    bootstrap_completed_by_user_id: int | None = None
 
     @property
     def is_completed(self) -> bool:
@@ -78,12 +102,13 @@ class PlateBootstrapState:
 
 
 def _row_to_state(row) -> PlateBootstrapState:
-    car_number, status, completed_at, created_at = row
+    car_number, status, completed_at, created_at, completed_by_user_id = row
     return PlateBootstrapState(
         car_number=car_number,
         bootstrap_status=status,
         bootstrap_completed_at=datetime.fromisoformat(completed_at) if completed_at else None,
         created_at=datetime.fromisoformat(created_at),
+        bootstrap_completed_by_user_id=completed_by_user_id,
     )
 
 
@@ -92,7 +117,16 @@ class GeorgiaPlateBootstrapRepository:
         self._conn = sqlite3.connect(db_path)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute(_SCHEMA)
+        self._migrate_missing_columns()
         self._conn.commit()
+
+    def _migrate_missing_columns(self) -> None:
+        existing_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(georgia_plate_bootstrap_state)")
+        }
+        for column, statement in _COLUMN_MIGRATIONS.items():
+            if column not in existing_columns:
+                self._conn.execute(statement)
 
     def get(self, car_number: str) -> PlateBootstrapState | None:
         row = self._conn.execute(_SELECT, (car_number,)).fetchone()
@@ -107,15 +141,26 @@ class GeorgiaPlateBootstrapRepository:
         self._conn.commit()
         return self.get(car_number)
 
-    def mark_completed(self, car_number: str, *, completed_at: datetime) -> None:
+    def mark_completed(
+        self, car_number: str, *, completed_at: datetime, completed_by_user_id: int | None = None,
+    ) -> None:
         """Вызывается ИСКЛЮЧИТЕЛЬНО после ГЕНУИННО успешного живого
         searchByAuto (см. CheckResult.from_cache — НЕ после emergency-mode
-        чтения из БД, см. задачу: "Do NOT falsely mark completed"). Нет
+        чтения из БД, см. задачу: "Do NOT falsely mark completed") ИЛИ после
+        явного подтверждения менеджера в "ВРЕМЕННЫЙ manager workflow" (см.
+        reader/public_bot/manual_bootstrap_service.py) — completed_by_user_id
+        различает эти два пути (None = автоматический live-check, задан =
+        Telegram user id менеджера, подтвердившего проверку вручную). Нет
         строки для car_number — не создаёт её (ensure_pending должен был
         быть вызван раньше, см. add_car()) — UPDATE на несуществующую
         строку просто ничего не делает, без ошибки."""
         self._conn.execute(
-            _MARK_COMPLETED, {"car_number": car_number, "completed_at": completed_at.isoformat()},
+            _MARK_COMPLETED,
+            {
+                "car_number": car_number,
+                "completed_at": completed_at.isoformat(),
+                "completed_by_user_id": completed_by_user_id,
+            },
         )
         self._conn.commit()
 
