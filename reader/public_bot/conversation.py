@@ -102,6 +102,10 @@ from reader.public_bot.full_check_service import (
     FullCheckService,
 )
 from reader.public_bot.known_users_repository import BotKnownUsersRepository
+from reader.public_bot.manual_bootstrap_service import (
+    ManualBootstrapService,
+    parse_manual_amount,
+)
 from reader.public_bot.owner_resolution import OwnerResolutionError
 from reader.public_bot.protocol_check_ephemeral_store import ProtocolCheckEphemeralStore
 from reader.public_bot.protocol_check_models import ProtocolCheckStatus
@@ -137,6 +141,42 @@ STEP_PROTOCOL_CHECK_VEHICLE_CAR_NUMBER = "awaiting_protocol_check_vehicle_car_nu
 STEP_PROTOCOL_CHECK_VEHICLE_DOCUMENT = "awaiting_protocol_check_vehicle_document"
 STEP_PROTOCOL_CHECK_PROTOCOL_NUMBER = "awaiting_protocol_check_protocol_number"
 STEP_PROTOCOL_CHECK_PERSONAL_NUMBER = "awaiting_protocol_check_personal_number"
+
+_manual_bootstrap_keyboards_module = None
+
+
+def _mb_kb():
+    """Lazy import reader.public_bot.keyboards (см. задачу "ВРЕМЕННЫЙ
+    manager workflow для Georgia fines bot") — keyboards.py само импортирует
+    PERIOD_CHOICES/TRUSTED_TASK_PERIOD_CHOICES ИЗ ЭТОГО модуля (см. его
+    докстрок над _encode_plate), поэтому top-level "from
+    reader.public_bot.keyboards import encode_manual_bootstrap_*" здесь
+    создал бы circular import уже ПРИ ЗАГРУЗКЕ модуля — импортируем лениво,
+    при первом реальном вызове (оба модуля к этому моменту уже полностью
+    загружены), кэшируем результат, чтобы не повторять import на каждый
+    callback."""
+    global _manual_bootstrap_keyboards_module
+    if _manual_bootstrap_keyboards_module is None:
+        from reader.public_bot import keyboards
+
+        _manual_bootstrap_keyboards_module = keyboards
+    return _manual_bootstrap_keyboards_module
+
+# "ВРЕМЕННЫЙ manager workflow для Georgia fines bot" (см. задачу) —
+# "➕ Добавить штраф" multi-step ввод, fine-admin-only (см. _is_fine_admin).
+# payload накапливает {"car_number": ..., "protocol_no": ..., "amount": ...,
+# "violation_date": "YYYY-MM-DD", "place": ..., "article": ...} по мере
+# прохождения шагов (см. _handle_manual_fine_*_input). Персистентно в
+# bot_conversation_state, как и все остальные STEP_* в этом файле — то, что
+# оно переживает рестарт процесса, НЕ проблема (см. ManualBootstrapService
+# модульный докстрок): ни один шаг здесь не пишет в detected_fines до
+# STEP_MANUAL_FINE_REVIEW → "✅ Сохранить штраф".
+STEP_MANUAL_FINE_PROTOCOL = "awaiting_manual_fine_protocol"
+STEP_MANUAL_FINE_AMOUNT = "awaiting_manual_fine_amount"
+STEP_MANUAL_FINE_DATE = "awaiting_manual_fine_date"
+STEP_MANUAL_FINE_PLACE = "awaiting_manual_fine_place"
+STEP_MANUAL_FINE_ARTICLE = "awaiting_manual_fine_article"
+STEP_MANUAL_FINE_REVIEW = "awaiting_manual_fine_review"
 
 PERIOD_CHOICES = (30, 90, 180, 365)
 
@@ -410,6 +450,34 @@ class BotReply:
     # отправлять не нужно (подавляющее большинство ответов).
     manager_alert_text: str | None = None
 
+    # "ВРЕМЕННЫЙ manager workflow для Georgia fines bot" (см. задачу) —
+    # inline_buttons — та же форма/назначение, что и cta_buttons выше
+    # ((label, callback_data) вместо (label, url) — handlers.py собирает
+    # Button.inline(...), а не Button.url(...)), только для ОДНОРАЗОВЫХ
+    # экранов этой фичи (слишком много разных экранов, чтобы заводить
+    # отдельное именованное поле/keyboard-builder на каждый, см.
+    # reader/public_bot/keyboards.py докстрок над _encode_plate).
+    #
+    # customer_notify_messages — побочная рассылка КЛИЕНТАМ (не менеджеру,
+    # см. manager_alert_text выше) ровно одного прямого сообщения ("🔎 ...:
+    # штрафов не найдено", см. texts.format_no_fines_found) каждому из
+    # telegram_chat_id владельцев задач этого физического номера (fan-out,
+    # см. производственный случай O528HY702 — разные задачи одного номера
+    # МОГУТ принадлежать разным клиентам). Это НЕ detected_fines-уведомление
+    # (штрафа нет — flush_pending()/NotificationFlushJob здесь ни при чём,
+    # см. reader/public_bot/manual_bootstrap_service.py модульный докстрок)
+    # — единственный путь доставки для этого конкретного случая, поэтому
+    # отправляется отсюда напрямую, а не откладывается на другой процесс.
+    inline_buttons: list[list[tuple[str, bytes]]] | None = None
+    customer_notify_messages: list[tuple[int, str]] | None = None
+    # Кнопки ПОД manager_alert_text (другой чат, см. его докстрок выше) —
+    # [✅ Штрафов нет][➕ Добавить штраф] ТОЛЬКО когда этот физический номер
+    # действительно bootstrap-pending (см. format_car_added_alert
+    # bootstrap_pending=). Та же форма, что и inline_buttons — отдельное
+    # поле, потому что это кнопки СОВСЕМ ДРУГОГО сообщения (в чат
+    # менеджеров), а не текущего reply.text.
+    manager_alert_buttons: list[list[tuple[str, bytes]]] | None = None
+
 
 class ConversationController:
     def __init__(
@@ -427,6 +495,7 @@ class ConversationController:
         protocol_check_ephemeral_store: ProtocolCheckEphemeralStore | None = None,
         full_check_service: FullCheckService | None = None,
         fine_admin_user_ids: frozenset[int] = frozenset(),
+        manual_bootstrap_service: ManualBootstrapService | None = None,
     ):
         self._states = conversation_state_repository
         self._subscriptions = subscription_service
@@ -461,6 +530,15 @@ class ConversationController:
         # что и у debt_refresh_service/protocol_check_provider выше.
         self._full_check = full_check_service
         self._fine_admin_user_ids = frozenset(fine_admin_user_ids)
+        # "ВРЕМЕННЫЙ manager workflow для Georgia fines bot" (см. задачу) —
+        # None означает "public-feed архитектура не включена в этой сборке"
+        # (тот же приём, что и у plate_bootstrap_repository=None в
+        # SubscriptionService.add_car — см. reader/public_bot/main.py), ни
+        # одна manual-bootstrap кнопка/команда тогда не работает (см.
+        # handle_manual_bootstrap_*: fine_admin проверяется ПОСЛЕ проверки
+        # на None, оба условия — "фичи нет" ведёт себя как "недостаточно
+        # прав", снаружи неотличимо, см. _handle_full_check_command).
+        self._manual_bootstrap = manual_bootstrap_service
         # ТОЛЬКО для manager/trusted-operator "📋 Мои авто" — показать
         # auto-captured username владельца рядом с номером (см. задачу
         # "показывать владельца в manager car list"), см.
@@ -588,6 +666,340 @@ class ConversationController:
         except FullCheckAlreadyInProgressError:
             return BotReply(text=texts.FULL_CHECK_ALREADY_IN_PROGRESS_TEXT)
         return BotReply(text=texts.format_full_check_summary(outcome))
+
+    # ---- "ВРЕМЕННЫЙ manager workflow для Georgia fines bot" ----
+    # См. reader/public_bot/manual_bootstrap_service.py модульный докстрок.
+    # Все handle_manual_bootstrap_* ниже: (1) fine_admin-only — None ровно
+    # как у subscription_id в my-car-* (см. keyboards.py докстрок) means
+    # "нет доступа/не найдено", handlers.py._answer_and_send уже знает, что
+    # с этим делать (CALLBACK_NOT_AUTHORIZED_TEXT); (2) ВСЕГДА перечитывают
+    # bootstrap state заново из БД перед действием — "CONCURRENT MANAGERS"
+    # (см. задачу п.13): completed-plate короткое замыкание на
+    # MANUAL_BOOTSTRAP_ALREADY_COMPLETED_TEXT, та же идемпотентность для
+    # "completed plate второй раз" (п.16).
+
+    def _handle_pending_queue_command(
+        self, stripped_text: str, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """"⏳ Ожидают проверки" (см. задачу п.14) — СКРЫТАЯ команда, тот же
+        приём, что и у _handle_full_check_command (не пункт меню, не в
+        keyboards.py) — fine_admin вводит её текстом."""
+        if stripped_text != texts.MANUAL_BOOTSTRAP_PENDING_QUEUE_LABEL:
+            return None
+        if self._manual_bootstrap is None or not self._is_fine_admin(telegram_user_id):
+            return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
+
+        plates = self._manual_bootstrap.list_pending()
+        buttons = [
+            [(texts.MANUAL_BOOTSTRAP_OPEN_LABEL, _mb_kb().encode_manual_bootstrap_pending_open_callback(plate))]
+            for plate in plates
+        ]
+        return BotReply(
+            text=texts.format_manual_bootstrap_pending_queue(plates),
+            inline_buttons=buttons or None,
+        )
+
+    def handle_manual_bootstrap_pending_open(
+        self, car_number: str, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        if self._manual_bootstrap is None or not self._is_fine_admin(telegram_user_id):
+            return None
+        status = self._manual_bootstrap.get_status(car_number)
+        if status is None or status.is_completed:
+            return BotReply(text=texts.MANUAL_BOOTSTRAP_ALREADY_COMPLETED_TEXT)
+        return BotReply(
+            text=f"🚗 {format_plate_for_telegram(car_number)}",
+            inline_buttons=self._manual_bootstrap_action_buttons(car_number),
+        )
+
+    def handle_manual_bootstrap_nofine(
+        self, car_number: str, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """"✅ Штрафов нет" (см. задачу п.4.1) — первый шаг, только
+        confirmation-экран, ничего ещё не меняет."""
+        if self._manual_bootstrap is None or not self._is_fine_admin(telegram_user_id):
+            return None
+        status = self._manual_bootstrap.get_status(car_number)
+        if status is None or status.is_completed:
+            return BotReply(text=texts.MANUAL_BOOTSTRAP_ALREADY_COMPLETED_TEXT)
+        return BotReply(
+            text=texts.format_manual_bootstrap_nofine_confirm_prompt(car_number),
+            inline_buttons=[[
+                (
+                    texts.MANUAL_BOOTSTRAP_CONFIRM_LABEL,
+                    _mb_kb().encode_manual_bootstrap_nofine_confirm_callback(car_number),
+                ),
+                (
+                    texts.MANUAL_BOOTSTRAP_CANCEL_ARROW_LABEL,
+                    _mb_kb().encode_manual_bootstrap_nofine_cancel_callback(car_number),
+                ),
+            ]],
+        )
+
+    def handle_manual_bootstrap_nofine_cancel(
+        self, car_number: str, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        if self._manual_bootstrap is None or not self._is_fine_admin(telegram_user_id):
+            return None
+        return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
+
+    def handle_manual_bootstrap_nofine_confirm(
+        self, car_number: str, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """"✅ Подтвердить" (см. задачу п.4.2-4.4) — НЕ создаёт никакой
+        fake/synthetic detected_fines строки (см.
+        ManualBootstrapService.confirm_no_fines докстрок) — только
+        bootstrap-completion + audit (кто/когда) + рассылка клиентам
+        canonical "штрафов не найдено" (см. BotReply.customer_notify_messages
+        докстрок — ЕДИНСТВЕННЫЙ путь доставки для этого случая, т.к. нет
+        detected_fines строки, которую подхватил бы NotificationFlushJob)."""
+        if self._manual_bootstrap is None or not self._is_fine_admin(telegram_user_id):
+            return None
+        confirmed = self._manual_bootstrap.confirm_no_fines(
+            car_number, completed_by_user_id=telegram_user_id,
+        )
+        if not confirmed:
+            return BotReply(text=texts.MANUAL_BOOTSTRAP_ALREADY_COMPLETED_TEXT)
+
+        tasks = self._manual_bootstrap.tasks_for_plate(car_number)
+        chat_ids = {task.telegram_chat_id for task in tasks}
+        customer_text = texts.format_no_fines_found(car_number)
+        return BotReply(
+            text=texts.format_manual_bootstrap_nofine_done_manager_text(car_number),
+            customer_notify_messages=[(chat_id, customer_text) for chat_id in chat_ids],
+        )
+
+    def handle_manual_bootstrap_addfine_start(
+        self, car_number: str, *, chat_id: int, telegram_user_id: int,
+    ) -> BotReply | None:
+        """"➕ Добавить штраф" (см. задачу п.5) — ТАКЖЕ используется для
+        "➕ Добавить ещё штраф" (п.10) и "✏️ Исправить" (п.7) — тот же старт
+        с нуля того же многошагового ввода для того же car_number."""
+        if self._manual_bootstrap is None or not self._is_fine_admin(telegram_user_id):
+            return None
+        status = self._manual_bootstrap.get_status(car_number)
+        if status is None or status.is_completed:
+            return BotReply(text=texts.MANUAL_BOOTSTRAP_ALREADY_COMPLETED_TEXT)
+        if not self._manual_bootstrap.tasks_for_plate(car_number):
+            return BotReply(text=texts.MANUAL_BOOTSTRAP_NO_PLATES_TASKS_TEXT)
+
+        self._states.set(
+            chat_id, telegram_user_id=telegram_user_id, step=STEP_MANUAL_FINE_PROTOCOL,
+            payload={"car_number": car_number},
+        )
+        return BotReply(text=texts.MANUAL_BOOTSTRAP_PROTOCOL_PROMPT_TEXT)
+
+    def handle_manual_bootstrap_addfine_cancel(
+        self, car_number: str, *, chat_id: int, telegram_user_id: int,
+    ) -> BotReply | None:
+        """"❌ Отмена" на review-экране (см. задачу п.12: "cancel/close
+        conversation -> plate остаётся pending, no partial fine") — просто
+        очищает state, ничего в detected_fines/bootstrap_state не менялось
+        до этого момента вовсе."""
+        if self._manual_bootstrap is None or not self._is_fine_admin(telegram_user_id):
+            return None
+        self._clear_state(chat_id)
+        return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
+
+    def _handle_manual_fine_protocol_input(
+        self, stripped_text: str, *, chat_id: int, telegram_user_id: int, payload: dict,
+    ) -> BotReply:
+        if not stripped_text:
+            return BotReply(text=texts.MANUAL_BOOTSTRAP_PROTOCOL_PROMPT_TEXT)
+        payload = {**payload, "protocol_no": stripped_text}
+        self._states.set(
+            chat_id, telegram_user_id=telegram_user_id, step=STEP_MANUAL_FINE_AMOUNT, payload=payload,
+        )
+        return BotReply(text=texts.MANUAL_BOOTSTRAP_AMOUNT_PROMPT_TEXT)
+
+    def _handle_manual_fine_amount_input(
+        self, stripped_text: str, *, chat_id: int, telegram_user_id: int, payload: dict,
+    ) -> BotReply:
+        amount = parse_manual_amount(stripped_text)
+        if amount is None:
+            return BotReply(text=texts.MANUAL_BOOTSTRAP_INVALID_AMOUNT_TEXT)
+        payload = {**payload, "amount": amount}
+        self._states.set(
+            chat_id, telegram_user_id=telegram_user_id, step=STEP_MANUAL_FINE_DATE, payload=payload,
+        )
+        return BotReply(text=texts.MANUAL_BOOTSTRAP_DATE_PROMPT_TEXT)
+
+    def _handle_manual_fine_date_input(
+        self, stripped_text: str, *, chat_id: int, telegram_user_id: int, payload: dict,
+    ) -> BotReply:
+        try:
+            violation_date = datetime.strptime(stripped_text, "%d.%m.%Y").date()  # noqa: DTZ007
+        except ValueError:
+            return BotReply(text=texts.MANUAL_BOOTSTRAP_INVALID_DATE_TEXT)
+        payload = {**payload, "violation_date": violation_date.isoformat()}
+        self._states.set(
+            chat_id, telegram_user_id=telegram_user_id, step=STEP_MANUAL_FINE_PLACE, payload=payload,
+        )
+        return BotReply(text=texts.MANUAL_BOOTSTRAP_PLACE_PROMPT_TEXT)
+
+    def _handle_manual_fine_place_input(
+        self, stripped_text: str, *, chat_id: int, telegram_user_id: int, payload: dict,
+    ) -> BotReply:
+        place = None if stripped_text == texts.MANUAL_BOOTSTRAP_SKIP_COMMAND else stripped_text
+        payload = {**payload, "place": place}
+        self._states.set(
+            chat_id, telegram_user_id=telegram_user_id, step=STEP_MANUAL_FINE_ARTICLE, payload=payload,
+        )
+        return BotReply(text=texts.MANUAL_BOOTSTRAP_ARTICLE_PROMPT_TEXT)
+
+    def _handle_manual_fine_article_input(
+        self, stripped_text: str, *, chat_id: int, telegram_user_id: int, payload: dict,
+    ) -> BotReply:
+        article = None if stripped_text == texts.MANUAL_BOOTSTRAP_SKIP_COMMAND else stripped_text
+        payload = {**payload, "article": article}
+        self._states.set(
+            chat_id, telegram_user_id=telegram_user_id, step=STEP_MANUAL_FINE_REVIEW, payload=payload,
+        )
+        car_number = payload["car_number"]
+        return BotReply(
+            text=texts.format_manual_bootstrap_review(
+                car_number=car_number, protocol_no=payload["protocol_no"],
+                violation_date=date.fromisoformat(payload["violation_date"]),
+                amount=payload["amount"], place=payload.get("place"), article=article,
+            ),
+            inline_buttons=[
+                [(
+                    texts.MANUAL_BOOTSTRAP_SAVE_FINE_LABEL,
+                    _mb_kb().encode_manual_bootstrap_addfine_save_callback(car_number),
+                )],
+                [
+                    (
+                        texts.MANUAL_BOOTSTRAP_EDIT_LABEL,
+                        _mb_kb().encode_manual_bootstrap_addfine_edit_callback(car_number),
+                    ),
+                    (
+                        texts.MANUAL_BOOTSTRAP_CANCEL_X_LABEL,
+                        _mb_kb().encode_manual_bootstrap_addfine_cancel_callback(car_number),
+                    ),
+                ],
+            ],
+        )
+
+    async def handle_manual_bootstrap_addfine_save(
+        self, car_number: str, *, chat_id: int, telegram_user_id: int,
+    ) -> BotReply | None:
+        """"✅ Сохранить штраф" (см. задачу п.8) — ЕДИНСТВЕННОЕ место этого
+        flow, которое действительно пишет в detected_fines (см.
+        ManualBootstrapService.save_manual_fine докстрок: canonical
+        persist_feed_match(), тот же fingerprint/dedup/notification
+        pipeline, что и public feed)."""
+        if self._manual_bootstrap is None or not self._is_fine_admin(telegram_user_id):
+            return None
+        state = self._states.get(chat_id)
+        if (
+            state is None
+            or state.telegram_user_id != telegram_user_id
+            or state.step != STEP_MANUAL_FINE_REVIEW
+            or state.payload is None
+            or state.payload.get("car_number") != car_number
+        ):
+            # Устаревший/чужой callback (например, рестарт стёр payload из
+            # ДРУГОГО, незавершённого flow, см. задачу "RESTART... safe
+            # state/no corruption") — мягкий отказ, НЕ падение.
+            return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
+
+        payload = state.payload
+        result = await self._manual_bootstrap.save_manual_fine(
+            car_number,
+            protocol_no=payload["protocol_no"],
+            amount=payload["amount"],
+            violation_date=date.fromisoformat(payload["violation_date"]),
+            place=payload.get("place"),
+            article=payload.get("article"),
+        )
+        self._clear_state(chat_id)
+
+        if not result.saved:
+            return BotReply(text=texts.MANUAL_BOOTSTRAP_NO_PLATES_TASKS_TEXT)
+
+        header = (
+            texts.format_manual_bootstrap_duplicate_text(car_number, protocol_no=payload["protocol_no"])
+            if result.duplicate
+            else texts.MANUAL_BOOTSTRAP_FINE_SAVED_TEXT
+        )
+        return BotReply(
+            text=header,
+            inline_buttons=[[
+                (
+                    texts.MANUAL_BOOTSTRAP_ADD_ANOTHER_LABEL,
+                    _mb_kb().encode_manual_bootstrap_add_another_callback(car_number),
+                ),
+                (
+                    texts.MANUAL_BOOTSTRAP_FINISH_LABEL,
+                    _mb_kb().encode_manual_bootstrap_finish_prompt_callback(car_number),
+                ),
+            ]],
+        )
+
+    def handle_manual_bootstrap_finish_prompt(
+        self, car_number: str, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        if self._manual_bootstrap is None or not self._is_fine_admin(telegram_user_id):
+            return None
+        return BotReply(
+            text=texts.format_manual_bootstrap_finish_confirm_prompt(car_number),
+            inline_buttons=[[
+                (
+                    texts.MANUAL_BOOTSTRAP_FINISH_YES_LABEL,
+                    _mb_kb().encode_manual_bootstrap_finish_confirm_callback(car_number),
+                ),
+                (
+                    texts.MANUAL_BOOTSTRAP_BACK_LABEL,
+                    _mb_kb().encode_manual_bootstrap_finish_back_callback(car_number),
+                ),
+            ]],
+        )
+
+    def handle_manual_bootstrap_finish_back(
+        self, car_number: str, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """"⬅️ Назад" с finish-confirm экрана — возвращает к "➕ Добавить ещё
+        штраф"/"✅ Завершить проверку" (см. задачу п.10), а НЕ начинает
+        новый ввод штрафа заново."""
+        if self._manual_bootstrap is None or not self._is_fine_admin(telegram_user_id):
+            return None
+        return BotReply(
+            text=texts.MANUAL_BOOTSTRAP_FINE_SAVED_TEXT,
+            inline_buttons=[[
+                (
+                    texts.MANUAL_BOOTSTRAP_ADD_ANOTHER_LABEL,
+                    _mb_kb().encode_manual_bootstrap_add_another_callback(car_number),
+                ),
+                (
+                    texts.MANUAL_BOOTSTRAP_FINISH_LABEL,
+                    _mb_kb().encode_manual_bootstrap_finish_prompt_callback(car_number),
+                ),
+            ]],
+        )
+
+    def handle_manual_bootstrap_finish_confirm(
+        self, car_number: str, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """"✅ Да, завершить" (см. задачу п.11) — bootstrap-completion +
+        audit, НЕ создаёт дополнительные fines, НЕ выполняет police.ge
+        lookup (см. ManualBootstrapService.finish_after_fines докстрок —
+        та же idempotent completion-семантика, что и confirm_no_fines).
+        Пользователю НЕ нужно отдельное "штрафов нет" (см. задачу: "Новые
+        fines уже должны уйти пользователю через normal notification
+        pipeline") — уже сохранённые штрафы уйдут через NotificationFlushJob
+        основного процесса, ничего дополнительно отправлять здесь не нужно."""
+        if self._manual_bootstrap is None or not self._is_fine_admin(telegram_user_id):
+            return None
+        confirmed = self._manual_bootstrap.finish_after_fines(
+            car_number, completed_by_user_id=telegram_user_id,
+        )
+        if not confirmed:
+            return BotReply(text=texts.MANUAL_BOOTSTRAP_ALREADY_COMPLETED_TEXT)
+
+        fines_added = self._manual_bootstrap.count_fines_for_plate(car_number)
+        return BotReply(
+            text=texts.format_manual_bootstrap_finish_done_text(car_number, fines_added=fines_added),
+        )
 
     # ---- /start, главное меню, claim deep-link ----
 
@@ -1107,6 +1519,12 @@ class ConversationController:
         if full_check_reply is not None:
             return full_check_reply
 
+        pending_queue_reply = self._handle_pending_queue_command(
+            stripped, telegram_user_id=telegram_user_id,
+        )
+        if pending_queue_reply is not None:
+            return pending_queue_reply
+
         state = self._states.get(chat_id)
         if state is None or state.telegram_user_id != telegram_user_id:
             # Нет активного диалога у ЭТОГО пользователя в этом chat_id —
@@ -1139,6 +1557,67 @@ class ConversationController:
         if state.step == STEP_AWAITING_SEARCH_QUERY:
             return await self._handle_search_query_input(
                 stripped, chat_id=chat_id, telegram_user_id=telegram_user_id,
+            )
+
+        # "ВРЕМЕННЫЙ manager workflow для Georgia fines bot" — fine_admin
+        # уже проверен при входе в flow (handle_manual_bootstrap_addfine_
+        # start), здесь просто доводим шаги до конца (см. задачу п.5-7).
+        if state.step == STEP_MANUAL_FINE_PROTOCOL:
+            return self._handle_manual_fine_protocol_input(
+                stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, payload=state.payload or {},
+            )
+
+        if state.step == STEP_MANUAL_FINE_AMOUNT:
+            return self._handle_manual_fine_amount_input(
+                stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, payload=state.payload or {},
+            )
+
+        if state.step == STEP_MANUAL_FINE_DATE:
+            return self._handle_manual_fine_date_input(
+                stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, payload=state.payload or {},
+            )
+
+        if state.step == STEP_MANUAL_FINE_PLACE:
+            return self._handle_manual_fine_place_input(
+                stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, payload=state.payload or {},
+            )
+
+        if state.step == STEP_MANUAL_FINE_ARTICLE:
+            return self._handle_manual_fine_article_input(
+                stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, payload=state.payload or {},
+            )
+
+        if state.step == STEP_MANUAL_FINE_REVIEW:
+            # Текст на экране review игнорируется (см. STEP_AWAITING_
+            # CLIENT_DECISION выше — выбор только inline-кнопкой) — просто
+            # повторно показываем review, ничего не пишем.
+            payload = state.payload or {}
+            car_number = payload.get("car_number")
+            if not car_number or "violation_date" not in payload:
+                self._clear_state(chat_id)
+                return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
+            return BotReply(
+                text=texts.format_manual_bootstrap_review(
+                    car_number=car_number, protocol_no=payload["protocol_no"],
+                    violation_date=date.fromisoformat(payload["violation_date"]),
+                    amount=payload["amount"], place=payload.get("place"), article=payload.get("article"),
+                ),
+                inline_buttons=[
+                    [(
+                        texts.MANUAL_BOOTSTRAP_SAVE_FINE_LABEL,
+                        _mb_kb().encode_manual_bootstrap_addfine_save_callback(car_number),
+                    )],
+                    [
+                        (
+                            texts.MANUAL_BOOTSTRAP_EDIT_LABEL,
+                            _mb_kb().encode_manual_bootstrap_addfine_edit_callback(car_number),
+                        ),
+                        (
+                            texts.MANUAL_BOOTSTRAP_CANCEL_X_LABEL,
+                            _mb_kb().encode_manual_bootstrap_addfine_cancel_callback(car_number),
+                        ),
+                    ],
+                ],
             )
 
         if state.step == STEP_PROTOCOL_CHECK_METHOD:
@@ -1402,12 +1881,34 @@ class ConversationController:
         # is_first_car_for_user докстрок) — handlers.py решает, КУДА его
         # отправить (см. BotReply.manager_alert_text докстрок), здесь
         # только формируется текст.
+        #
+        # "ВРЕМЕННЫЙ manager workflow для Georgia fines bot" (см. задачу п.2:
+        # "WHERE TO PUT BUTTONS") — bootstrap_pending читается ЗАНОВО уже
+        # ПОСЛЕ add_car() выше: если живой searchByAuto внутри add_car()
+        # только что успешно завершился, plate уже 'completed' (см.
+        # SubscriptionService.add_car), и manual-bootstrap кнопки НЕ нужны —
+        # только когда police.ge действительно был недоступен (plate
+        # остался 'pending') добавляем кнопки. Не создавать эти кнопки на
+        # отдельной initial "👤 Новый пользователь" (см. format_new_user_alert
+        # — она вызывается РАНЬШЕ, в handlers.py, ДО того как номер вообще
+        # известен) — только здесь, где car_number уже есть.
+        manual_bootstrap_pending = (
+            self._manual_bootstrap is not None
+            and (status := self._manual_bootstrap.get_status(car_number)) is not None
+            and not status.is_completed
+        )
         manager_alert_text = (
             manager_alerts.format_car_added_alert(
                 telegram_user_id=telegram_user_id, username=username,
                 first_name=first_name, last_name=last_name, car_number=car_number,
+                bootstrap_pending=manual_bootstrap_pending,
             )
             if outcome.is_first_car_for_user
+            else None
+        )
+        manager_alert_buttons = (
+            self._manual_bootstrap_action_buttons(car_number)
+            if outcome.is_first_car_for_user and manual_bootstrap_pending
             else None
         )
 
@@ -1421,7 +1922,19 @@ class ConversationController:
                 provider_unavailable=outcome.provider_unavailable,
             ),
             manager_alert_text=manager_alert_text,
+            manager_alert_buttons=manager_alert_buttons,
         )
+
+    @staticmethod
+    def _manual_bootstrap_action_buttons(car_number: str) -> list[list[tuple[str, bytes]]]:
+        """[✅ Штрафов нет][➕ Добавить штраф] (см. задачу п.2) — общий
+        builder для car-added manager alert И "Открыть" из "⏳ Ожидают
+        проверки" (см. handle_manual_bootstrap_pending_open) — один и тот
+        же экран, один и тот же набор кнопок."""
+        return [[
+            (texts.MANUAL_BOOTSTRAP_NO_FINES_LABEL, _mb_kb().encode_manual_bootstrap_nofine_callback(car_number)),
+            (texts.MANUAL_BOOTSTRAP_ADD_FINE_LABEL, _mb_kb().encode_manual_bootstrap_addfine_start_callback(car_number)),
+        ]]
 
     async def _complete_delegated_add_car(
         self, *, car_number, owner_username, days, today, chat_id, telegram_user_id,

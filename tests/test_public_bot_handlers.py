@@ -14,7 +14,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from reader.public_bot import texts  # noqa: E402
+from reader.public_bot import texts
 from reader.public_bot.handlers import (
     _TELEGRAM_SAFE_TEXT_LIMIT,
     _send_reply,
@@ -44,6 +44,7 @@ class _FakeReply:
         self.car_delete_confirm_subscription_id = None
         self.car_detail_subscription_id = None
         self.my_car_inactive_id = None
+        self.inline_buttons = None
         self.cta_buttons = None
         self.show_turkey_bot_link = show_turkey_bot_link
         self.debt_refresh_available = False

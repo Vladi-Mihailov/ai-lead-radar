@@ -36,6 +36,12 @@ from reader.fines.police_ge_session import PoliceGeSession
 from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.fines.translation import FineTranslationService
 from reader.logging_setup import setup_logging
+from reader.protocol_support.repository import ProtocolSupportRepository
+from reader.protocol_support.service import BotProfile, ProtocolSupportService
+from reader.protocol_support.telethon_gateway import (
+    TelethonSupportGateway,
+    register_support_group_handlers,
+)
 from reader.public_bot.conversation import ConversationController
 from reader.public_bot.conversation_state_repository import (
     BotConversationStateRepository,
@@ -46,14 +52,12 @@ from reader.public_bot.delivery_repository import (
 )
 from reader.public_bot.delivery_service import ClientDeliveryService
 from reader.public_bot.full_check_service import FullCheckService
-from reader.protocol_support.repository import ProtocolSupportRepository
-from reader.protocol_support.service import BotProfile, ProtocolSupportService
-from reader.protocol_support.telethon_gateway import TelethonSupportGateway, register_support_group_handlers
 from reader.public_bot.handlers import register
 from reader.public_bot.keyboards import main_menu_keyboard
 from reader.public_bot.known_users_repository import (
     BotKnownUsersRepository,
 )
+from reader.public_bot.manual_bootstrap_service import ManualBootstrapService
 from reader.public_bot.protocol_check_ephemeral_store import (
     ProtocolCheckEphemeralStore,
 )
@@ -341,6 +345,24 @@ async def run() -> None:
             task_repository, check_service, _TelethonProgressSender(client),
         )
 
+        # "ВРЕМЕННЫЙ manager workflow для Georgia fines bot" (см. задачу) —
+        # None, когда public-feed архитектура не включена в этой сборке
+        # (ТОТ ЖЕ guard, что и у plate_bootstrap_repository выше) — тогда
+        # georgia_plate_bootstrap_state вообще не используется нигде в этом
+        # процессе, manual-bootstrap кнопки/команда просто не работают (см.
+        # ConversationController._manual_bootstrap докстрок). ТОТ ЖЕ
+        # task_repository/detected_fine_repository/check_service, что и у
+        # всего остального выше — ни второго соединения с БД, ни второго
+        # fingerprint/dedup/notification пути не заводится (см.
+        # reader/public_bot/manual_bootstrap_service.py модульный докстрок).
+        manual_bootstrap_service = (
+            ManualBootstrapService(
+                plate_bootstrap_repository, task_repository, detected_fine_repository, check_service,
+            )
+            if plate_bootstrap_repository is not None
+            else None
+        )
+
         controller = ConversationController(
             conversation_state_repository,
             subscription_service,
@@ -354,6 +376,7 @@ async def run() -> None:
             protocol_check_ephemeral_store=protocol_check_ephemeral_store,
             full_check_service=full_check_service,
             fine_admin_user_ids=frozenset(settings.fine_monitor.allowed_user_ids),
+            manual_bootstrap_service=manual_bootstrap_service,
         )
 
         # «👨‍💼 Оператор»: живой диалог через группу менеджеров (общая

@@ -50,18 +50,29 @@ def format_new_user_alert(
 
 def format_car_added_alert(
     *, telegram_user_id: int, username: str | None, first_name: str | None, last_name: str | None,
-    car_number: str,
+    car_number: str, bootstrap_pending: bool = False,
 ) -> str:
     """Этот же telegram_user_id впервые за всё время добавил автомобиль
     (см. SubscriptionService.add_car::is_first_car_for_user — ПЕРВАЯ
     когда-либо созданная fine_monitoring_subscriptions строка для него, а
     не "первая за сегодня"/"первая активная") — короткое дополнение к уже
     отправленному format_new_user_alert, НЕ дублирует имя/username/id
-    целиком новым длинным сообщением."""
-    return "\n".join([
+    целиком новым длинным сообщением.
+
+    bootstrap_pending (см. задачу "ВРЕМЕННЫЙ manager workflow для Georgia
+    fines bot") — True, ТОЛЬКО когда этот физический номер действительно
+    ожидает ручной первичной проверки (georgia_plate_bootstrap_state.
+    bootstrap_status == 'pending', см. reader/public_bot/
+    manual_bootstrap_service.py) — call site решает это, не эта функция
+    (чистое форматирование). False (по умолчанию) сохраняет прежний текст
+    БИТ В БИТ — существующие вызовы/тесты без этого параметра не меняются."""
+    lines = [
         "🚗 Пользователь добавил автомобиль",
         "",
         f"{_display_name(first_name=first_name, last_name=last_name)} ({_username_line(username)})",
         f"Telegram ID: {telegram_user_id}",
         f"Авто: {format_plate_for_telegram(car_number)}",
-    ])
+    ]
+    if bootstrap_pending:
+        lines += ["", "Статус первичной проверки:", "⏳ Ожидает проверки"]
+    return "\n".join(lines)

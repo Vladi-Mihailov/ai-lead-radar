@@ -34,8 +34,8 @@ from datetime import date
 
 from telethon import Button
 
-from reader.public_bot.conversation import PERIOD_CHOICES, TRUSTED_TASK_PERIOD_CHOICES
 from reader.protocol_support.texts import OPERATOR_LABEL
+from reader.public_bot.conversation import PERIOD_CHOICES, TRUSTED_TASK_PERIOD_CHOICES
 from reader.public_bot.texts import (
     ADD_CAR_LABEL,
     BACK_BUTTON_LABEL,
@@ -872,3 +872,146 @@ def protocol_check_back_to_vehicle_step1_keyboard() -> list[list[Button]]:
 def protocol_check_back_to_protocol_step1_keyboard() -> list[list[Button]]:
     """Экран ввода ID/TAX-номера нарушителя (см. задачу п.6)."""
     return [[Button.inline(PROTOCOL_CHECK_BACK_LABEL, _PROTOCOL_CHECK_BACK_TO_PROTOCOL_STEP1)]]
+
+
+# "ВРЕМЕННЫЙ manager workflow для Georgia fines bot" (см. задачу) —
+# car_number (УЖЕ нормализованный, см. reader/fines/validation.py::
+# normalize_car_number — только [A-Z0-9], ascii-safe) вместо числового id в
+# payload: тот же security-инвариант, что и везде в этом модуле (см.
+# докстрок наверху файла) — car_number сам по себе публичен и НЕ является
+# доказательством прав, ConversationController._is_fine_admin()
+# перепроверяется на КАЖДОМ из этих callback'ов заново, а не только при
+# показе кнопки. Кнопки для этих callback'ов строятся не здесь, а в
+# conversation.py/handlers.py через общий BotReply.inline_buttons (тот же
+# приём, что и у cta_buttons, см. conversation.py) — слишком много
+# одноразовых экранов для отдельной функции-keyboard на каждый.
+_MANUAL_BOOTSTRAP_NOFINE_PREFIX = b"mbnofine:"
+_MANUAL_BOOTSTRAP_NOFINE_CONFIRM_PREFIX = b"mbnofineok:"
+_MANUAL_BOOTSTRAP_NOFINE_CANCEL_PREFIX = b"mbnofinecancel:"
+_MANUAL_BOOTSTRAP_ADDFINE_START_PREFIX = b"mbaddfine:"
+_MANUAL_BOOTSTRAP_ADDFINE_SAVE_PREFIX = b"mbfinesave:"
+_MANUAL_BOOTSTRAP_ADDFINE_EDIT_PREFIX = b"mbfineedit:"
+_MANUAL_BOOTSTRAP_ADDFINE_CANCEL_PREFIX = b"mbfinecancel:"
+_MANUAL_BOOTSTRAP_ADD_ANOTHER_PREFIX = b"mbaddanother:"
+_MANUAL_BOOTSTRAP_FINISH_PROMPT_PREFIX = b"mbfinish:"
+_MANUAL_BOOTSTRAP_FINISH_CONFIRM_PREFIX = b"mbfinishok:"
+_MANUAL_BOOTSTRAP_FINISH_BACK_PREFIX = b"mbfinishback:"
+_MANUAL_BOOTSTRAP_PENDING_OPEN_PREFIX = b"mbopen:"
+
+
+def _encode_plate(prefix: bytes, car_number: str) -> bytes:
+    return prefix + car_number.encode("ascii")
+
+
+def _decode_plate(data: bytes | None, prefix: bytes) -> str | None:
+    """None для чего угодно, кроме непустого ascii-хвоста после prefix —
+    намеренно НЕ вызывает normalize_car_number() здесь (это keyboards.py,
+    чистый кодек, см. модульный докстрок) — повторная проверка формата/
+    существования car_number — забота вызывающего кода (тот же принцип,
+    что и у subscription_id в my-car-* callback'ах: сам факт валидно
+    декодированного значения ничего не доказывает)."""
+    if not data or not data.startswith(prefix):
+        return None
+    raw = data[len(prefix):]
+    if not raw:
+        return None
+    try:
+        return raw.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+
+
+def encode_manual_bootstrap_nofine_callback(car_number: str) -> bytes:
+    return _encode_plate(_MANUAL_BOOTSTRAP_NOFINE_PREFIX, car_number)
+
+
+def decode_manual_bootstrap_nofine_callback(data: bytes | None) -> str | None:
+    return _decode_plate(data, _MANUAL_BOOTSTRAP_NOFINE_PREFIX)
+
+
+def encode_manual_bootstrap_nofine_confirm_callback(car_number: str) -> bytes:
+    return _encode_plate(_MANUAL_BOOTSTRAP_NOFINE_CONFIRM_PREFIX, car_number)
+
+
+def decode_manual_bootstrap_nofine_confirm_callback(data: bytes | None) -> str | None:
+    return _decode_plate(data, _MANUAL_BOOTSTRAP_NOFINE_CONFIRM_PREFIX)
+
+
+def encode_manual_bootstrap_nofine_cancel_callback(car_number: str) -> bytes:
+    return _encode_plate(_MANUAL_BOOTSTRAP_NOFINE_CANCEL_PREFIX, car_number)
+
+
+def decode_manual_bootstrap_nofine_cancel_callback(data: bytes | None) -> str | None:
+    return _decode_plate(data, _MANUAL_BOOTSTRAP_NOFINE_CANCEL_PREFIX)
+
+
+def encode_manual_bootstrap_addfine_start_callback(car_number: str) -> bytes:
+    return _encode_plate(_MANUAL_BOOTSTRAP_ADDFINE_START_PREFIX, car_number)
+
+
+def decode_manual_bootstrap_addfine_start_callback(data: bytes | None) -> str | None:
+    return _decode_plate(data, _MANUAL_BOOTSTRAP_ADDFINE_START_PREFIX)
+
+
+def encode_manual_bootstrap_addfine_save_callback(car_number: str) -> bytes:
+    return _encode_plate(_MANUAL_BOOTSTRAP_ADDFINE_SAVE_PREFIX, car_number)
+
+
+def decode_manual_bootstrap_addfine_save_callback(data: bytes | None) -> str | None:
+    return _decode_plate(data, _MANUAL_BOOTSTRAP_ADDFINE_SAVE_PREFIX)
+
+
+def encode_manual_bootstrap_addfine_edit_callback(car_number: str) -> bytes:
+    return _encode_plate(_MANUAL_BOOTSTRAP_ADDFINE_EDIT_PREFIX, car_number)
+
+
+def decode_manual_bootstrap_addfine_edit_callback(data: bytes | None) -> str | None:
+    return _decode_plate(data, _MANUAL_BOOTSTRAP_ADDFINE_EDIT_PREFIX)
+
+
+def encode_manual_bootstrap_addfine_cancel_callback(car_number: str) -> bytes:
+    return _encode_plate(_MANUAL_BOOTSTRAP_ADDFINE_CANCEL_PREFIX, car_number)
+
+
+def decode_manual_bootstrap_addfine_cancel_callback(data: bytes | None) -> str | None:
+    return _decode_plate(data, _MANUAL_BOOTSTRAP_ADDFINE_CANCEL_PREFIX)
+
+
+def encode_manual_bootstrap_add_another_callback(car_number: str) -> bytes:
+    return _encode_plate(_MANUAL_BOOTSTRAP_ADD_ANOTHER_PREFIX, car_number)
+
+
+def decode_manual_bootstrap_add_another_callback(data: bytes | None) -> str | None:
+    return _decode_plate(data, _MANUAL_BOOTSTRAP_ADD_ANOTHER_PREFIX)
+
+
+def encode_manual_bootstrap_finish_prompt_callback(car_number: str) -> bytes:
+    return _encode_plate(_MANUAL_BOOTSTRAP_FINISH_PROMPT_PREFIX, car_number)
+
+
+def decode_manual_bootstrap_finish_prompt_callback(data: bytes | None) -> str | None:
+    return _decode_plate(data, _MANUAL_BOOTSTRAP_FINISH_PROMPT_PREFIX)
+
+
+def encode_manual_bootstrap_finish_confirm_callback(car_number: str) -> bytes:
+    return _encode_plate(_MANUAL_BOOTSTRAP_FINISH_CONFIRM_PREFIX, car_number)
+
+
+def decode_manual_bootstrap_finish_confirm_callback(data: bytes | None) -> str | None:
+    return _decode_plate(data, _MANUAL_BOOTSTRAP_FINISH_CONFIRM_PREFIX)
+
+
+def encode_manual_bootstrap_finish_back_callback(car_number: str) -> bytes:
+    return _encode_plate(_MANUAL_BOOTSTRAP_FINISH_BACK_PREFIX, car_number)
+
+
+def decode_manual_bootstrap_finish_back_callback(data: bytes | None) -> str | None:
+    return _decode_plate(data, _MANUAL_BOOTSTRAP_FINISH_BACK_PREFIX)
+
+
+def encode_manual_bootstrap_pending_open_callback(car_number: str) -> bytes:
+    return _encode_plate(_MANUAL_BOOTSTRAP_PENDING_OPEN_PREFIX, car_number)
+
+
+def decode_manual_bootstrap_pending_open_callback(data: bytes | None) -> str | None:
+    return _decode_plate(data, _MANUAL_BOOTSTRAP_PENDING_OPEN_PREFIX)
