@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -297,15 +297,17 @@ def build_fine_monitor_components(
             check_service,
             feed_state_repository,
             feed_seen_repository,
-            poll_interval=timedelta(minutes=fine_monitor.public_feed_poll_interval_minutes),
+            run_times=fine_monitor.public_feed_times,
+            tz=tz,
             max_pages_per_cycle=fine_monitor.public_feed_max_pages_per_cycle,
             first_run_max_pages=fine_monitor.public_feed_first_run_max_pages,
             retention_days=fine_monitor.public_feed_seen_retention_days,
         )
         jobs.append(georgia_public_feed_job)
         logger.info(
-            "Georgia public fine feed monitoring enabled (poll_interval=%d min)",
-            fine_monitor.public_feed_poll_interval_minutes,
+            "Georgia public fine feed monitoring enabled (times=%s, timezone=%s)",
+            [t.strftime("%H:%M") for t in fine_monitor.public_feed_times],
+            fine_monitor.timezone,
         )
 
     scheduler = Scheduler(jobs, poll_interval_seconds=_SCHEDULER_POLL_INTERVAL_SECONDS)
