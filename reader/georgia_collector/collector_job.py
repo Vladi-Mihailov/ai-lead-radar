@@ -292,7 +292,11 @@ class GeorgiaCollectorJob:
         """Один one-time historical searchByAuto на КАЖДУЮ pending-плиту,
         ТОТ ЖЕ API, что и старый per-car FineJob bootstrap до появления
         public-feed архитектуры (см. reader/fines/police_ge_session.py::
-        search_by_plate + reader/fines/parser.py::parse_search_response)."""
+        search_by_plate + reader/fines/parser.py::parse_search_response).
+        Always submits with mode="bootstrap" (the default on production's
+        side too, see collector_ingest_service.py) — this scheduled path is
+        untouched by audit mode, see run_audit() below for the separate,
+        manually-invoked mass-recheck entrypoint."""
         if not self._session.is_available():
             return
         try:
@@ -304,25 +308,73 @@ class GeorgiaCollectorJob:
         for plate in pending_plates:
             if not self._session.is_available():
                 break
-            try:
-                raw = await self._session.search_by_plate(plate)
-                records = parse_search_response(raw, car_number=plate)
-            except FineProviderError:
-                logger.warning("GeorgiaCollectorJob: bootstrap lookup для %s не удался (police.ge)", plate)
-                continue
-            except FineParseError:
-                logger.exception("GeorgiaCollectorJob: bootstrap-ответ для %s не распарсился", plate)
-                continue
+            await self._lookup_and_submit(plate, mode="bootstrap")
 
-            payload = {"car_number": plate, "fines": [record_to_payload(r) for r in records]}
-            try:
-                await self._production.submit_bootstrap_result(payload)
-            except ProductionApiError:
+    async def run_audit(self, plates: list[str]) -> None:
+        """Background mass recheck (2026-10-25, "Extend REDNET ingestion for
+        a background mass audit") — a MANUALLY invoked, one-shot pass over an
+        explicit plate list (unlike _run_bootstrap() above, this is never
+        called from run()/the scheduler loop, and deliberately does NOT
+        filter by get_pending_bootstrap_plates(): an audit plate may already
+        be completed, still pending, or (the production incident this fixes)
+        have no bootstrap row at all — ALL three must be checkable, and none
+        of the three may be changed by this call, see
+        collector_ingest_service.py's own module docstring).
+
+        Every submission carries mode="audit" — production's ingest path
+        then persists fines through the exact same canonical path as always,
+        but never calls confirm_no_fines() and never sends the "штрафов не
+        найдено" customer message (see reader/public_bot/
+        collector_ingest_service.py::ingest_bootstrap_result). A failed
+        submission (production unavailable) queues into the SAME outbox as
+        the normal bootstrap path — entry.payload already carries
+        mode="audit", so a later retry via _flush_outbox() preserves it
+        automatically, no outbox changes needed.
+
+        See reader/georgia_collector/mass_audit.py for the standalone CLI
+        entrypoint that calls this once and exits — NOT part of the
+        always-on __main__.py forever-loop, run manually by an operator."""
+        for plate in plates:
+            if not self._session.is_available():
                 logger.warning(
-                    "GeorgiaCollectorJob: production недоступна, bootstrap-result для %s уходит в outbox",
-                    plate,
+                    "GeorgiaCollectorJob: circuit breaker open — остановка audit-прогона на %s", plate,
                 )
-                self._outbox.enqueue(KIND_BOOTSTRAP_RESULT, payload)
+                break
+            await self._lookup_and_submit(plate, mode="audit")
+
+    async def _lookup_and_submit(self, plate: str, *, mode: str) -> None:
+        """Shared by _run_bootstrap() (mode="bootstrap") and run_audit()
+        (mode="audit") — identical lookup/submit/outbox-fallback logic,
+        differing ONLY in the mode value carried in the submitted payload.
+
+        The "bootstrap" payload deliberately omits the "mode" key entirely
+        rather than sending `"mode": "bootstrap"` explicitly — production's
+        own default (see collector_ingest_service.py) already treats a
+        missing mode as "bootstrap", so this keeps _run_bootstrap()'s wire
+        payload byte-for-byte identical to before audit mode existed (see
+        tests/test_georgia_collector_job.py's own exact-payload assertions)
+        — "normal bootstrap submissions must remain completely unchanged"."""
+        try:
+            raw = await self._session.search_by_plate(plate)
+            records = parse_search_response(raw, car_number=plate)
+        except FineProviderError:
+            logger.warning("GeorgiaCollectorJob: lookup для %s не удался (police.ge), mode=%s", plate, mode)
+            return
+        except FineParseError:
+            logger.exception("GeorgiaCollectorJob: ответ для %s не распарсился, mode=%s", plate, mode)
+            return
+
+        payload = {"car_number": plate, "fines": [record_to_payload(r) for r in records]}
+        if mode != "bootstrap":
+            payload["mode"] = mode
+        try:
+            await self._production.submit_bootstrap_result(payload)
+        except ProductionApiError:
+            logger.warning(
+                "GeorgiaCollectorJob: production недоступна, bootstrap-result для %s (mode=%s) уходит в outbox",
+                plate, mode,
+            )
+            self._outbox.enqueue(KIND_BOOTSTRAP_RESULT, payload)
 
     async def _flush_outbox(self) -> None:
         for entry in self._outbox.list_all():

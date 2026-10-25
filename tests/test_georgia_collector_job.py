@@ -26,6 +26,7 @@ from reader.fines.public_feed_state_repository import (
 )
 from reader.georgia_collector.collector_job import GeorgiaCollectorJob
 from reader.georgia_collector.outbox_repository import (
+    KIND_BOOTSTRAP_RESULT,
     KIND_FEED_MATCH,
     CollectorOutboxRepository,
 )
@@ -315,6 +316,68 @@ async def test_bootstrap_lookup_submits_result_including_zero_fines(tmp_path):
     assert session.search_calls == ["AA001AA"]
     assert len(production.submitted_bootstrap_results) == 1
     assert production.submitted_bootstrap_results[0] == {"car_number": "AA001AA", "fines": []}
+
+
+# ==== run_audit() — background mass recheck (2026-10-25) ====
+
+
+async def test_run_audit_submits_with_explicit_mode_audit(tmp_path):
+    """Unlike _run_bootstrap(), run_audit() never consults
+    get_pending_bootstrap_plates() at all — it takes an explicit plate list
+    (any mix of already-completed, still-pending, or entirely-untracked
+    plates is production's own concern, not this job's), and every
+    submission explicitly carries mode="audit"."""
+    session = _FakeSession(search_results={
+        "AA001AA": {"success": True, "data": {"count": 0, "results": []}},
+        "BB002BB": {"success": True, "data": {"count": 0, "results": []}},
+    })
+    production = _FakeProductionClient()
+    job, *_ = _make_job(tmp_path, session, production)
+
+    await job.run_audit(["AA001AA", "BB002BB"])
+
+    assert session.search_calls == ["AA001AA", "BB002BB"]
+    assert len(production.submitted_bootstrap_results) == 2
+    assert production.submitted_bootstrap_results[0] == {"car_number": "AA001AA", "fines": [], "mode": "audit"}
+    assert production.submitted_bootstrap_results[1] == {"car_number": "BB002BB", "fines": [], "mode": "audit"}
+
+
+async def test_run_audit_stops_when_circuit_breaker_opens_mid_run(tmp_path):
+    session = _FakeSession(available=False)
+    production = _FakeProductionClient()
+    job, *_ = _make_job(tmp_path, session, production)
+
+    await job.run_audit(["AA001AA", "BB002BB"])
+
+    assert session.search_calls == []
+    assert production.submitted_bootstrap_results == []
+
+
+async def test_run_audit_queues_outbox_on_production_failure_preserving_mode(tmp_path):
+    session = _FakeSession(search_results={"AA001AA": {"success": True, "data": {"count": 0, "results": []}}})
+    production = _FakeProductionClient(fail_submit=True)
+    job, _feed_state, _seen, outbox = _make_job(tmp_path, session, production)
+
+    await job.run_audit(["AA001AA"])
+
+    entries = outbox.list_all()
+    assert len(entries) == 1
+    assert entries[0].kind == KIND_BOOTSTRAP_RESULT
+    assert entries[0].payload == {"car_number": "AA001AA", "fines": [], "mode": "audit"}
+
+
+async def test_run_bootstrap_payload_unaffected_by_run_audit_existing(tmp_path):
+    """Regression guard: _run_bootstrap()'s own wire payload must stay
+    exactly as it was before run_audit() existed — no "mode" key at all
+    (see collector_job.py's own _lookup_and_submit docstring)."""
+    session = _FakeSession({0: _empty_page()}, search_results={"AA001AA": {"success": True, "data": {"count": 0, "results": []}}})
+    production = _FakeProductionClient(active_plates=[], pending_plates=["AA001AA"])
+    job, *_ = _make_job(tmp_path, session, production)
+
+    await job.run(_utc(9))
+
+    assert production.submitted_bootstrap_results[0] == {"car_number": "AA001AA", "fines": []}
+    assert "mode" not in production.submitted_bootstrap_results[0]
 
 
 # ==== no Telegram / production-DB imports (architectural guarantee) ====

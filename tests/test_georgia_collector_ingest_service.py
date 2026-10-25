@@ -168,6 +168,184 @@ async def test_bootstrap_result_no_active_tasks_does_not_complete(tmp_path):
     assert outcome.tasks_affected == 0
 
 
+async def test_bootstrap_result_default_mode_is_bootstrap(tmp_path):
+    """Regression guard for "normal bootstrap submissions must remain
+    completely unchanged": calling ingest_bootstrap_result() WITHOUT a mode=
+    kwarg at all (the only way every pre-existing caller/test in this file
+    already calls it) must behave exactly like mode="bootstrap"."""
+    service, task_repo, _fine_repo, bootstrap_repo = _make_service(tmp_path)
+    _create_task(task_repo, "AA001AA", chat_id=-100111)
+    bootstrap_repo.ensure_pending("AA001AA")
+
+    outcome = await service.ingest_bootstrap_result("AA001AA", [])
+
+    assert outcome.bootstrap_completed is True
+    assert bootstrap_repo.is_completed("AA001AA")
+    assert outcome.customer_notify_messages == [(-100111, texts.format_no_fines_found("AA001AA"))]
+
+
+async def test_bootstrap_mode_zero_fines_missing_bootstrap_row_sends_no_message(tmp_path):
+    """Defense in depth: the K333HY190 gap also existed on the default
+    mode="bootstrap" path itself, not just a mass recheck -- a task created
+    before the bootstrap system existed (so ensure_pending() was never
+    called for it) going through a genuine bootstrap submission must not be
+    reported as bootstrap_completed=True or trigger the zero-fine message
+    either, even though mode="audit" is not involved at all here."""
+    service, task_repo, _fine_repo, bootstrap_repo = _make_service(tmp_path)
+    _create_task(task_repo, "K333HY190", chat_id=-100999)
+    assert bootstrap_repo.get("K333HY190") is None
+
+    outcome = await service.ingest_bootstrap_result("K333HY190", [])
+
+    assert outcome.bootstrap_completed is False
+    assert outcome.customer_notify_messages == []
+    assert bootstrap_repo.get("K333HY190") is None
+
+
+async def test_unauthorized_mode_value_is_rejected(tmp_path):
+    service, task_repo, _fine_repo, bootstrap_repo = _make_service(tmp_path)
+    _create_task(task_repo, "AA001AA")
+    bootstrap_repo.ensure_pending("AA001AA")
+
+    with pytest.raises(ValueError):
+        await service.ingest_bootstrap_result("AA001AA", [], mode="delete_everything")
+
+    # Rejected BEFORE any persistence/state change — same "fail closed,
+    # change nothing" principle as every other guard in this module.
+    assert bootstrap_repo.get("AA001AA").bootstrap_status == "pending"
+
+
+# ---------------------------------------------------------------------------
+# AUDIT MODE (2026-10-25) — background mass recheck. See
+# reader/public_bot/collector_ingest_service.py's own module docstring for
+# the full root-cause explanation (K333HY190 / the 16 bootstrap-row
+# incident) that these tests pin down.
+# ---------------------------------------------------------------------------
+
+async def test_audit_zero_fines_sends_no_customer_message(tmp_path):
+    service, task_repo, _fine_repo, bootstrap_repo = _make_service(tmp_path)
+    _create_task(task_repo, "AA001AA", chat_id=-100111)
+    bootstrap_repo.ensure_pending("AA001AA")
+
+    outcome = await service.ingest_bootstrap_result("AA001AA", [], mode="audit")
+
+    assert outcome.customer_notify_messages == []
+
+
+async def test_audit_zero_fines_leaves_pending_bootstrap_unchanged(tmp_path):
+    service, task_repo, _fine_repo, bootstrap_repo = _make_service(tmp_path)
+    _create_task(task_repo, "AA001AA")
+    bootstrap_repo.ensure_pending("AA001AA")
+
+    outcome = await service.ingest_bootstrap_result("AA001AA", [], mode="audit")
+
+    state = bootstrap_repo.get("AA001AA")
+    assert state.bootstrap_status == "pending"
+    assert state.bootstrap_completed_at is None
+    assert outcome.bootstrap_completed is False
+
+
+async def test_audit_zero_fines_leaves_missing_bootstrap_row_unchanged(tmp_path):
+    """THE production incident this fixes (K333HY190): a fine_monitoring_task
+    exists, but georgia_plate_bootstrap_state has NO row for this car_number
+    at all (e.g. a task created before the bootstrap system existed). Before
+    this fix, ingest_bootstrap_result() would still report
+    bootstrap_completed=True (confirm_no_fines()'s own guard only checks
+    `state is not None and state.is_completed`, which is False for a missing
+    row too) and send the real "штрафов не найдено" message, while
+    GeorgiaPlateBootstrapRepository.mark_completed()'s UPDATE silently
+    no-opped against the nonexistent row -- the customer got a real message
+    for a side effect that never actually happened in the database."""
+    service, task_repo, _fine_repo, bootstrap_repo = _make_service(tmp_path)
+    _create_task(task_repo, "K333HY190", chat_id=-100999)
+    assert bootstrap_repo.get("K333HY190") is None  # confirmed missing, not pending
+
+    outcome = await service.ingest_bootstrap_result("K333HY190", [], mode="audit")
+
+    assert outcome.customer_notify_messages == []
+    assert outcome.bootstrap_completed is False
+    assert bootstrap_repo.get("K333HY190") is None  # still no row at all
+
+
+async def test_audit_zero_fines_leaves_completed_bootstrap_unchanged(tmp_path):
+    service, task_repo, _fine_repo, bootstrap_repo = _make_service(tmp_path)
+    _create_task(task_repo, "AA001AA", chat_id=-100111)
+    bootstrap_repo.ensure_pending("AA001AA")
+    bootstrap_repo.mark_completed("AA001AA", completed_at=datetime(2026, 1, 1, tzinfo=timezone.utc), completed_by_user_id=None)
+
+    outcome = await service.ingest_bootstrap_result("AA001AA", [], mode="audit")
+
+    state = bootstrap_repo.get("AA001AA")
+    assert state.bootstrap_status == "completed"
+    assert state.bootstrap_completed_at == datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert outcome.customer_notify_messages == []
+    assert outcome.bootstrap_completed is True  # honest read of current status, not a new side effect
+
+
+async def test_audit_existing_fine_dedupes_via_mark_seen(tmp_path):
+    service, task_repo, fine_repo, bootstrap_repo = _make_service(tmp_path)
+    task = _create_task(task_repo, "AA001AA")
+    bootstrap_repo.mark_completed("AA001AA", completed_at=datetime.now(timezone.utc), completed_by_user_id=None)
+    record = _record()
+    await service.ingest_bootstrap_result("AA001AA", [record], mode="bootstrap")
+    existing_rows = fine_repo.list_current_for_task(task.id, since=_EPOCH_UTC)
+    assert len(existing_rows) == 1
+    existing_id = existing_rows[0].id
+
+    outcome = await service.ingest_bootstrap_result("AA001AA", [record], mode="audit")
+
+    rows = fine_repo.list_current_for_task(task.id, since=_EPOCH_UTC)
+    assert len(rows) == 1  # deduped, not duplicated
+    assert rows[0].id == existing_id  # same row, re-seen (mark_seen), not recreated
+    assert outcome.fines_persisted == 1
+
+
+async def test_audit_new_fine_creates_row_eligible_for_normal_notification(tmp_path):
+    """New fines in audit mode persist through the exact same canonical path
+    (notification_sent_at=NULL) that feeds the existing NotificationFlushJob
+    -- audit mode changes nothing about new-fine delivery, only suppresses
+    the SEPARATE zero-fine announcement and bootstrap state transition."""
+    service, task_repo, fine_repo, bootstrap_repo = _make_service(tmp_path)
+    task = _create_task(task_repo, "AA001AA")
+    bootstrap_repo.ensure_pending("AA001AA")
+
+    outcome = await service.ingest_bootstrap_result("AA001AA", [_record()], mode="audit")
+
+    rows = fine_repo.list_current_for_task(task.id, since=_EPOCH_UTC)
+    assert len(rows) == 1
+    assert rows[0].notification_sent_at is None  # still eligible for NotificationFlushJob
+    assert outcome.fines_persisted == 1
+    assert outcome.customer_notify_messages == []
+    # Bootstrap state untouched even though a fine WAS found this time.
+    assert bootstrap_repo.get("AA001AA").bootstrap_status == "pending"
+
+
+async def test_audit_multiple_tasks_for_one_physical_plate_both_dedupe_correctly(tmp_path):
+    service, task_repo, fine_repo, bootstrap_repo = _make_service(tmp_path)
+    task1 = _create_task(task_repo, "AA001AA", chat_id=-100111)
+    task2 = _create_task(task_repo, "AA001AA", chat_id=-100222)
+    bootstrap_repo.ensure_pending("AA001AA")
+
+    outcome = await service.ingest_bootstrap_result("AA001AA", [_record()], mode="audit")
+
+    assert outcome.tasks_affected == 2
+    assert len(fine_repo.list_current_for_task(task1.id, since=_EPOCH_UTC)) == 1
+    assert len(fine_repo.list_current_for_task(task2.id, since=_EPOCH_UTC)) == 1
+    assert outcome.customer_notify_messages == []
+    assert bootstrap_repo.get("AA001AA").bootstrap_status == "pending"
+
+
+async def test_audit_unauthorized_mode_value_is_rejected(tmp_path):
+    service, task_repo, _fine_repo, bootstrap_repo = _make_service(tmp_path)
+    _create_task(task_repo, "AA001AA")
+    bootstrap_repo.ensure_pending("AA001AA")
+
+    with pytest.raises(ValueError):
+        await service.ingest_bootstrap_result("AA001AA", [], mode="not-a-real-mode")
+
+    assert bootstrap_repo.get("AA001AA").bootstrap_status == "pending"
+
+
 async def test_collector_bootstrap_completion_is_idempotent_against_already_completed_plate(tmp_path):
     """Race с manual manager bootstrap (см. задачу п. "Collector/manager
     bootstrap race") — менеджер уже завершил bootstrap вручную ДО того, как

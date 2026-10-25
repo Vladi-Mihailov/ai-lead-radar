@@ -150,10 +150,22 @@ def build_collector_api_app(
                 _record_from_payload({**entry, "car_number": car_number})
                 for entry in payload.get("fines", [])
             ]
+            # "mode" (2026-10-25, "Extend REDNET ingestion for a background
+            # mass audit"): optional, defaults to "bootstrap" — an omitted
+            # field reproduces today's behavior exactly (see
+            # collector_ingest_service.py's own module docstring, "AUDIT
+            # MODE" — do not silently infer audit mode from anything else).
+            # Validated here, at the same payload-parsing stage as
+            # car_number/fines, so an unauthorized/malformed value gets the
+            # SAME 400 "malformed payload" response as any other bad field,
+            # rather than reaching persistence at all.
+            mode = payload.get("mode", "bootstrap")
+            if mode not in ("bootstrap", "audit"):
+                raise ValueError(f"invalid mode: {mode!r}")
         except (ValueError, KeyError, TypeError) as exc:
             return web.json_response({"error": f"malformed payload: {exc}"}, status=400)
 
-        outcome = await ingest_service.ingest_bootstrap_result(car_number, records)
+        outcome = await ingest_service.ingest_bootstrap_result(car_number, records, mode=mode)
 
         for chat_id, text in outcome.customer_notify_messages:
             try:
