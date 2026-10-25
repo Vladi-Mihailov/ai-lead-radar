@@ -153,21 +153,38 @@ class _TelethonProgressSender:
             )
 
 
-def validate_collector_api_config(settings, *, manual_bootstrap_available: bool) -> None:
+def bootstrap_infrastructure_needed(fine_monitor) -> bool:
+    """True, если ЭТОТ процесс (@ProtocolGEbot, reader/public_bot/main.py)
+    должен сконструировать plate_bootstrap_repository/manual_bootstrap_
+    service — public_feed_enabled ИЛИ collector_api_enabled, любой из двух
+    (см. задачу "controlled production deployment": production-инцидент
+    2026-10-25, когда здесь проверялся ТОЛЬКО public_feed_enabled —
+    GeorgiaPlateBootstrapRepository(...) ниже и validate_collector_api_
+    config() оба зависят от результата этой функции; именно отсутствие
+    отдельного юнит-теста для этого ОДНОГО boolean-выражения позволило
+    багу остаться незамеченным, поэтому вынесено в отдельную,
+    напрямую тестируемую функцию — см. test_public_bot_main.py)."""
+    return fine_monitor.public_feed_enabled or fine_monitor.collector_api_enabled
+
+
+def validate_collector_api_config(settings) -> None:
     """Fail-fast проверки для "Georgia remote collector architecture
     (REDNET)" — вынесены в отдельную синхронную функцию, чтобы их можно
     было проверить тестом без реального Telegram-клиента (ТОТ ЖЕ приём, что
     и reader/main.py::validate_fine_monitor_config). Ничего не делает, если
-    collector_api_enabled=False (по умолчанию)."""
+    collector_api_enabled=False (по умолчанию).
+
+    ИСПРАВЛЕНО (см. задачу "controlled production deployment"): раньше здесь
+    ещё проверялся manual_bootstrap_available (производная от public_feed_
+    enabled) — удалено как МЁРТВЫЙ код после того, как plate_bootstrap_
+    repository (а с ним и manual_bootstrap_service) стал конструироваться
+    при public_feed_enabled ИЛИ collector_api_enabled (см. run() ниже): раз
+    эта функция уже вернулась бы на строке выше при collector_api_enabled=
+    False, то к этому месту collector_api_enabled гарантированно True, а
+    значит plate_bootstrap_repository/manual_bootstrap_service гарантированно
+    не None — отдельная проверка этого факта больше ничего не может поймать."""
     if not settings.fine_monitor.collector_api_enabled:
         return
-    if not manual_bootstrap_available:
-        raise ConfigError(
-            "fine_monitor.collector_api_enabled=true, но public-feed "
-            "архитектура выключена (нужны те же "
-            "plate_bootstrap_repository/detected_fine_repository) — "
-            "включите fine_monitor.public_feed_enabled."
-        )
     if not settings.fine_monitor.collector_hmac_secret:
         raise ConfigError(
             "fine_monitor.collector_api_enabled=true, но "
@@ -319,12 +336,29 @@ async def run() -> None:
 
         # "Georgia fines incremental public-feed monitoring" — та же БД
         # (settings.app.users_db_file), что и у остальных репозиториев этого
-        # процесса; None при public_feed_enabled=False (см. docstring
-        # SubscriptionService.add_car) — add_car() тогда вообще не трогает
-        # bootstrap state, поведение не меняется.
+        # процесса; None, если НИ public_feed_enabled, НИ collector_api_enabled
+        # не включены (см. docstring SubscriptionService.add_car) — add_car()
+        # тогда вообще не трогает bootstrap state, поведение не меняется.
+        #
+        # ИСПРАВЛЕНО (см. задачу "controlled production deployment" + PR #34
+        # review): раньше здесь проверялся ТОЛЬКО public_feed_enabled —
+        # production-инцидент 2026-10-25 показал, что collector_api_enabled=
+        # true САМ ПО СЕБЕ (без public_feed_enabled) должен быть достаточным
+        # основанием для существования bootstrap-инфраструктуры в ЭТОМ
+        # процессе (REDNET делает polling вместо production — см.
+        # GeorgiaCollectorJob, reader/georgia_collector/), но public_feed_
+        # enabled=true ТАКЖЕ заставляет reader/main.py (другой процесс, своя
+        # копия той же settings.yaml) запланировать in-process
+        # GeorgiaPublicFineFeedJob, который на production не может достучаться
+        # до police.ge (см. задачу "police.ge reachability") — то есть
+        # включение одного флага ради другого процесса ломало цель "ТОЛЬКО
+        # ОДИН scheduled collector path активен" (см. "Critical scheduling
+        # check"). collector_api_enabled теперь decoupled от public_feed_
+        # enabled именно для этого случая — см. bootstrap_infrastructure_
+        # needed() выше (единственное место, где это условие определено).
         plate_bootstrap_repository = (
             GeorgiaPlateBootstrapRepository(settings.app.users_db_file)
-            if settings.fine_monitor.public_feed_enabled
+            if bootstrap_infrastructure_needed(settings.fine_monitor)
             else None
         )
         subscription_service = SubscriptionService(
@@ -370,11 +404,12 @@ async def run() -> None:
         )
 
         # "ВРЕМЕННЫЙ manager workflow для Georgia fines bot" (см. задачу) —
-        # None, когда public-feed архитектура не включена в этой сборке
-        # (ТОТ ЖЕ guard, что и у plate_bootstrap_repository выше) — тогда
-        # georgia_plate_bootstrap_state вообще не используется нигде в этом
-        # процессе, manual-bootstrap кнопки/команда просто не работают (см.
-        # ConversationController._manual_bootstrap докстрок). ТОТ ЖЕ
+        # None, когда НИ public-feed архитектура, НИ collector_api_enabled не
+        # включены в этой сборке (ТОТ ЖЕ guard, что и у plate_bootstrap_
+        # repository выше) — тогда georgia_plate_bootstrap_state вообще не
+        # используется нигде в этом процессе, manual-bootstrap кнопки/команда
+        # просто не работают (см. ConversationController._manual_bootstrap
+        # докстрок). ТОТ ЖЕ
         # task_repository/detected_fine_repository/check_service, что и у
         # всего остального выше — ни второго соединения с БД, ни второго
         # fingerprint/dedup/notification пути не заводится (см.
@@ -388,20 +423,23 @@ async def run() -> None:
         )
 
         # "Georgia remote collector architecture (REDNET)" (см. задачу) —
-        # узкий internal API для REDNET-коллектора, ТОЛЬКО когда
-        # public-feed архитектура уже включена (нужен тот же
-        # plate_bootstrap_repository/manual_bootstrap_service) И явно
-        # включён collector_api_enabled (по умолчанию False — существующий
-        # production ничего не обязан менять). ЖИВЁТ именно в этом
-        # процессе (а не reader/main.py), а не потому что это "главный"
-        # процесс — потому что только здесь есть bot-mode `client`
-        # (@ProtocolGEbot), которым можно отправить клиенту прямое
-        # "штрафов не найдено" (см. collector_ingest_service.py) той же
-        # identity, в которую он уже пишет — отправка из reader/main.py
-        # выглядела бы как сообщение от другого бота.
-        validate_collector_api_config(
-            settings, manual_bootstrap_available=manual_bootstrap_service is not None,
-        )
+        # узкий internal API для REDNET-коллектора, явно включённый через
+        # collector_api_enabled (по умолчанию False — существующий production
+        # ничего не обязан менять). Не требует public_feed_enabled=true (см.
+        # исправленный guard у plate_bootstrap_repository выше) — НАМЕРЕННО:
+        # production-инцидент 2026-10-25 показал, что public_feed_enabled=true
+        # заставил бы ДРУГОЙ процесс (reader/main.py) при своём следующем
+        # restart запланировать in-process GeorgiaPublicFineFeedJob, который
+        # не может достучаться до police.ge с production IP — ломая цель
+        # "только один scheduled collector path активен" (см. "Critical
+        # scheduling check"). ЖИВЁТ именно в этом процессе (а не
+        # reader/main.py), а не потому что это "главный" процесс — потому что
+        # только здесь есть bot-mode `client` (@ProtocolGEbot), которым можно
+        # отправить клиенту прямое "штрафов не найдено" (см.
+        # collector_ingest_service.py) той же identity, в которую он уже
+        # пишет — отправка из reader/main.py выглядела бы как сообщение от
+        # другого бота.
+        validate_collector_api_config(settings)
         collector_api_coroutine = None
         if settings.fine_monitor.collector_api_enabled:
             collector_ingest_service = CollectorIngestService(

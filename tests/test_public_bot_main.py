@@ -80,15 +80,7 @@ class _FakeSettings:
 
 def test_validate_collector_api_config_noop_when_disabled():
     settings = _FakeSettings(_FakeFineMonitorSettings(collector_api_enabled=False))
-    public_bot_main.validate_collector_api_config(settings, manual_bootstrap_available=False)
-
-
-def test_validate_collector_api_config_requires_public_feed_architecture():
-    settings = _FakeSettings(
-        _FakeFineMonitorSettings(collector_api_enabled=True, collector_hmac_secret="s"),
-    )
-    with pytest.raises(ConfigError, match="public_feed_enabled"):
-        public_bot_main.validate_collector_api_config(settings, manual_bootstrap_available=False)
+    public_bot_main.validate_collector_api_config(settings)
 
 
 def test_validate_collector_api_config_requires_hmac_secret():
@@ -96,11 +88,52 @@ def test_validate_collector_api_config_requires_hmac_secret():
         _FakeFineMonitorSettings(collector_api_enabled=True, collector_hmac_secret=None),
     )
     with pytest.raises(ConfigError, match="GEORGIA_COLLECTOR_HMAC_SECRET"):
-        public_bot_main.validate_collector_api_config(settings, manual_bootstrap_available=True)
+        public_bot_main.validate_collector_api_config(settings)
 
 
 def test_validate_collector_api_config_passes_when_fully_configured():
     settings = _FakeSettings(
         _FakeFineMonitorSettings(collector_api_enabled=True, collector_hmac_secret="s"),
     )
-    public_bot_main.validate_collector_api_config(settings, manual_bootstrap_available=True)
+    public_bot_main.validate_collector_api_config(settings)
+
+
+def test_validate_collector_api_config_passes_without_public_feed_enabled():
+    """Регрессия для production-инцидента 2026-10-25: collector_api_enabled=
+    true САМ ПО СЕБЕ (public_feed_enabled не упоминается вовсе — _FakeFine
+    MonitorSettings не имеет такого атрибута) должно быть достаточно —
+    validate_collector_api_config() не должен обращаться к public_feed_
+    enabled вообще."""
+    settings = _FakeSettings(
+        _FakeFineMonitorSettings(collector_api_enabled=True, collector_hmac_secret="s"),
+    )
+    assert not hasattr(settings.fine_monitor, "public_feed_enabled")
+    public_bot_main.validate_collector_api_config(settings)
+
+
+# ---- bootstrap_infrastructure_needed() — вынесено отдельной, напрямую
+# тестируемой функцией именно ПОТОМУ, что отсутствие юнит-теста для этого
+# ОДНОГО boolean-выражения (раньше инлайн в run()) позволило production-
+# инциденту 2026-10-25 остаться незамеченным (см. её докстрок). ----
+
+
+class _FakeFineMonitorSettingsWithPublicFeed:
+    def __init__(self, *, public_feed_enabled, collector_api_enabled):
+        self.public_feed_enabled = public_feed_enabled
+        self.collector_api_enabled = collector_api_enabled
+
+
+@pytest.mark.parametrize(
+    "public_feed_enabled,collector_api_enabled,expected",
+    [
+        (False, False, False),
+        (True, False, True),
+        (False, True, True),
+        (True, True, True),
+    ],
+)
+def test_bootstrap_infrastructure_needed(public_feed_enabled, collector_api_enabled, expected):
+    fine_monitor = _FakeFineMonitorSettingsWithPublicFeed(
+        public_feed_enabled=public_feed_enabled, collector_api_enabled=collector_api_enabled,
+    )
+    assert public_bot_main.bootstrap_infrastructure_needed(fine_monitor) is expected
