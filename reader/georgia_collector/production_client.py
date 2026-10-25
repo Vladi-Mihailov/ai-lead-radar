@@ -8,7 +8,22 @@ Bounded in-call retry/backoff on transport failure ONLY — this client never
 retries forever and never widens police.ge polling cadence when production
 is down (see collector_job.py's local outbox for what happens once these
 bounded retries are exhausted: the submission is queued locally and retried
-on a LATER cycle, not blocked on here)."""
+on a LATER cycle, not blocked on here).
+
+Two timeouts (см. задачу "fix the remaining issues discovered during live
+testing", production-инцидент A500ET197: 7 genuinely new fines took ~2min
+server-side, т.к. production синхронно делает OpenAI-перевод place/
+violation_description ПЕРЕД тем, как ответить — короткий таймаут здесь
+ложно засчитывал это как сбой, хотя persistence уже успешно завершился).
+`client`'s own configured default (см. __main__.py, 30s) остаётся для
+GET-эндпоинтов (plates/bootstrap-pending) и health — лёгкие, должны
+отвечать быстро, долгий hang на НИХ — само по себе плохой знак, падать
+быстро правильно. `submission_timeout` (дольше, см. __main__.py, 180s по
+умолчанию) — ТОЛЬКО для submit_feed_match/submit_bootstrap_result, именно
+того единственного пути, где синхронный OpenAI-перевод реально добавляет
+время. Outbox/retry уже делает ложный таймаут безопасным (ничего не
+теряется) — это не замена им, просто устраняет ШУМНЫЙ/ложный failure mode
+на типичном объёме, а не инфинит-таймаут."""
 
 from __future__ import annotations
 
@@ -40,8 +55,17 @@ class ProductionApiClient:
     hmac_secret: str
     max_attempts: int = 3
     backoff_seconds: float = 5.0
+    # ТОЛЬКО для submit_feed_match/submit_bootstrap_result — см. модульный
+    # докстрок. None передавался бы как есть в httpx и означал бы "без
+    # таймаута вовсе", поэтому __main__.py всегда передаёт явное число
+    # (default 180.0 там же) — здесь дефолт только на случай прямого
+    # конструирования в тестах без этого аргумента.
+    submission_timeout: float = 180.0
 
-    async def _request(self, method: str, path: str, *, json_body: dict | None = None) -> dict:
+    async def _request(
+        self, method: str, path: str, *, json_body: dict | None = None,
+        timeout: float | None = None,
+    ) -> dict:
         body = json.dumps(json_body).encode("utf-8") if json_body is not None else b""
 
         last_exc: Exception | None = None
@@ -55,7 +79,16 @@ class ProductionApiClient:
                 headers["Content-Type"] = "application/json"
 
             try:
-                response = await self.client.request(method, path, content=body, headers=headers)
+                request_kwargs = {"content": body, "headers": headers}
+                # timeout=None здесь -> не передаём kwarg вовсе -> httpx
+                # использует timeout уже настроенный на самом self.client
+                # (см. __main__.py, короткий 30s-дефолт) — явное число
+                # (submission_timeout, см. submit_feed_match/
+                # submit_bootstrap_result ниже) переопределяет ТОЛЬКО этот
+                # один вызов, не трогая client-wide default.
+                if timeout is not None:
+                    request_kwargs["timeout"] = timeout
+                response = await self.client.request(method, path, **request_kwargs)
                 response.raise_for_status()
                 return response.json()
             except (httpx.TransportError, httpx.HTTPStatusError) as exc:
@@ -76,10 +109,14 @@ class ProductionApiClient:
         return list(data["plates"])
 
     async def submit_feed_match(self, payload: dict) -> dict:
-        return await self._request("POST", _FEED_MATCH_PATH, json_body=payload)
+        return await self._request(
+            "POST", _FEED_MATCH_PATH, json_body=payload, timeout=self.submission_timeout,
+        )
 
     async def submit_bootstrap_result(self, payload: dict) -> dict:
-        return await self._request("POST", _BOOTSTRAP_RESULT_PATH, json_body=payload)
+        return await self._request(
+            "POST", _BOOTSTRAP_RESULT_PATH, json_body=payload, timeout=self.submission_timeout,
+        )
 
     async def report_health(self, payload: dict) -> dict:
         return await self._request("POST", _HEALTH_PATH, json_body=payload)
