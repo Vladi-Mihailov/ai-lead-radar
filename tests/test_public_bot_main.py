@@ -65,3 +65,42 @@ def test_session_path_uses_new_protocolgebot_file_not_old_geshtrafbot():
     token (см. audit report)."""
     assert public_bot_main._SESSION_PATH.name == "protocolgebot"
     assert public_bot_main._SESSION_PATH.name != "geshtrafbot"
+
+
+class _FakeFineMonitorSettings:
+    def __init__(self, *, collector_api_enabled=False, collector_hmac_secret=None):
+        self.collector_api_enabled = collector_api_enabled
+        self.collector_hmac_secret = collector_hmac_secret
+
+
+class _FakeSettings:
+    def __init__(self, fine_monitor):
+        self.fine_monitor = fine_monitor
+
+
+def test_validate_collector_api_config_noop_when_disabled():
+    settings = _FakeSettings(_FakeFineMonitorSettings(collector_api_enabled=False))
+    public_bot_main.validate_collector_api_config(settings, manual_bootstrap_available=False)
+
+
+def test_validate_collector_api_config_requires_public_feed_architecture():
+    settings = _FakeSettings(
+        _FakeFineMonitorSettings(collector_api_enabled=True, collector_hmac_secret="s"),
+    )
+    with pytest.raises(ConfigError, match="public_feed_enabled"):
+        public_bot_main.validate_collector_api_config(settings, manual_bootstrap_available=False)
+
+
+def test_validate_collector_api_config_requires_hmac_secret():
+    settings = _FakeSettings(
+        _FakeFineMonitorSettings(collector_api_enabled=True, collector_hmac_secret=None),
+    )
+    with pytest.raises(ConfigError, match="GEORGIA_COLLECTOR_HMAC_SECRET"):
+        public_bot_main.validate_collector_api_config(settings, manual_bootstrap_available=True)
+
+
+def test_validate_collector_api_config_passes_when_fully_configured():
+    settings = _FakeSettings(
+        _FakeFineMonitorSettings(collector_api_enabled=True, collector_hmac_secret="s"),
+    )
+    public_bot_main.validate_collector_api_config(settings, manual_bootstrap_available=True)

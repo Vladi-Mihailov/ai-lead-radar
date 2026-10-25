@@ -520,6 +520,37 @@ async def test_concurrent_nofine_confirm_does_not_double_complete(fx):
     assert second.text == texts.MANUAL_BOOTSTRAP_ALREADY_COMPLETED_TEXT
 
 
+def test_manager_action_safe_after_collector_already_completed_plate(fx):
+    """PR #34 review ("Georgia remote collector architecture"): the
+    collector's bootstrap-result path completes a plate the SAME way a
+    live searchByAuto would — GeorgiaPlateBootstrapRepository.mark_completed
+    with completed_by_user_id=None (see CollectorIngestService.
+    ingest_bootstrap_result -> ManualBootstrapService.confirm_no_fines(...,
+    completed_by_user_id=None)). If a manager's Telegram UI was already open
+    on this plate (buttons rendered before the collector finished) and they
+    press "✅ Штрафов нет" AFTER the collector completed it, the SAME
+    idempotent re-check confirm_no_fines() already does for manager-vs-
+    manager races applies here too, since it only looks at
+    state.is_completed, never at who completed it — this test exercises that
+    cross-component path explicitly rather than relying on manager-vs-
+    manager coverage alone."""
+    fx.make_task()
+    fx.bootstrap_repository.ensure_pending(_PLATE)
+
+    # Simulates the collector's own completion call path (completed_by_
+    # user_id=None, not a manager's telegram_user_id).
+    fx.bootstrap_repository.mark_completed(
+        _PLATE, completed_at=datetime.now(timezone.utc), completed_by_user_id=None,
+    )
+
+    reply = fx.controller.handle_manual_bootstrap_nofine_confirm(_PLATE, telegram_user_id=_ADMIN_ID)
+
+    assert reply.text == texts.MANUAL_BOOTSTRAP_ALREADY_COMPLETED_TEXT
+    assert not getattr(reply, "customer_notify_messages", None)
+    state = fx.bootstrap_repository.get(_PLATE)
+    assert state.bootstrap_completed_by_user_id is None  # collector's completion not overwritten
+
+
 # ---- 17: pending queue shows only pending plates ----
 
 

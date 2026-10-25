@@ -210,6 +210,32 @@ class FineMonitorSettings(BaseModel):
     # это ~4700 строк, тривиально для SQLite.
     public_feed_seen_retention_days: int = 7
 
+    # Внутренний collector API (см. задачу "Georgia remote collector
+    # architecture (REDNET)") — узкий HMAC-подписанный HTTP API, которым
+    # REDNET-коллектор (отдельный процесс на отдельном Georgia-VPS, видит
+    # police.ge напрямую, но НЕ имеет доступа к production DB/Telegram)
+    # передаёт сюда уже нормализованные результаты (plates/bootstrap-pending
+    # запросы, feed-match/bootstrap-result отправки). Production остаётся
+    # единственным источником истины: дедуп/persist/bootstrap-completion
+    # идут через ТЕ ЖЕ canonical FineCheckService.persist_feed_match()/
+    # GeorgiaPlateBootstrapRepository, что и обычный in-process
+    # GeorgiaPublicFineFeedJob — см. reader/public_bot/collector_api.py.
+    # По умолчанию выключен — существующий production config.yaml ничего
+    # менять не обязан.
+    collector_api_enabled: bool = False
+    # 127.0.0.1 по умолчанию — НЕ предназначен быть напрямую доступным из
+    # интернета; REDNET достаёт его через HTTPS reverse-proxy (см.
+    # docs/georgia-remote-collector.md), который разворачивается отдельно,
+    # вручную, при деплое — этот процесс сам TLS не терминирует.
+    collector_api_host: str = "127.0.0.1"
+    collector_api_port: int = 8765
+    # НЕ читается из config.yaml (секрет!) — см. load_settings() ниже:
+    # заполняется ИСКЛЮЧИТЕЛЬНО из переменной окружения
+    # GEORGIA_COLLECTOR_HMAC_SECRET (тот же приём, что и TELEGRAM_API_HASH/
+    # OPENAI_API_KEY — секреты только через .env, никогда через YAML).
+    # None, пока collector_api_enabled=False — ни во что не используется.
+    collector_hmac_secret: str | None = None
+
 
 class InviterWorkerSettings(BaseModel):
     """Постоянный фоновый режим инвайтера (см. reader/inviter/worker.py,
@@ -672,6 +698,10 @@ def load_settings(config_path: Path) -> Settings:
                 public_feed_seen_retention_days=int(
                     fine_monitor_raw.get("public_feed_seen_retention_days", 7)
                 ),
+                collector_api_enabled=bool(fine_monitor_raw.get("collector_api_enabled", False)),
+                collector_api_host=fine_monitor_raw.get("collector_api_host", "127.0.0.1"),
+                collector_api_port=int(fine_monitor_raw.get("collector_api_port", 8765)),
+                collector_hmac_secret=os.getenv("GEORGIA_COLLECTOR_HMAC_SECRET"),
             ),
             inviter=InviterSettings(
                 worker=InviterWorkerSettings(

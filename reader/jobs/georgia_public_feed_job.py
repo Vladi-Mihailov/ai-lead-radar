@@ -12,6 +12,23 @@ daily" + корректирующей задаче "IMPORTANT SCHEDULE UPDATE" (
 settings.fine_monitor.public_feed_times/timezone), тем же способом, что и
 FineJob.run_times/tz (см. reader/jobs/fine_job.py::should_run).
 
+KNOWN TECHNICAL DEBT (см. задачу "Georgia remote collector architecture
+(REDNET)" + её интеграционный review): run()'s DEEP/FAST frontier+one-
+overlap-page state machine below is DUPLICATED (not imported) by
+reader/georgia_collector/collector_job.py::GeorgiaCollectorJob._poll_feed()
+for the REDNET collector process. Extraction into a shared module was
+deliberately reviewed and rejected — this class is already-merged,
+production-tested code, and the collector package is architecturally
+forbidden from importing reader/jobs/ at all (its own "no Telegram/
+production-DB imports" invariant); the two also genuinely differ in what
+happens to a newly-matched row (synchronous local persist here vs. async
+remote submit-with-outbox-fallback there), which would force extra
+parameterization into any shared abstraction for no functional gain.
+**Collector and in-process feed job must be kept behaviorally
+synchronized** — any future change to this pagination/frontier/overlap/
+DEEP-recovery logic MUST be mirrored by hand in collector_job.py's
+_poll_feed() (see the identical note there).
+
 Заменяет per-car scheduled police.ge-опрос (FineJob/ArchiveFineJob на
 bootstrap-completed машинах, см. reader/fines/plate_bootstrap_repository.py)
 ОДНИМ периодическим обходом публичного feed'а "Receipts of fines

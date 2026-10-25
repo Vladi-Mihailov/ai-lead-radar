@@ -42,6 +42,8 @@ from reader.protocol_support.telethon_gateway import (
     TelethonSupportGateway,
     register_support_group_handlers,
 )
+from reader.public_bot.collector_api import run_collector_api_forever
+from reader.public_bot.collector_ingest_service import CollectorIngestService
 from reader.public_bot.conversation import ConversationController
 from reader.public_bot.conversation_state_repository import (
     BotConversationStateRepository,
@@ -149,6 +151,28 @@ class _TelethonProgressSender:
             logger.warning(
                 "fine check-all: не удалось отредактировать progress-сообщение", exc_info=True,
             )
+
+
+def validate_collector_api_config(settings, *, manual_bootstrap_available: bool) -> None:
+    """Fail-fast проверки для "Georgia remote collector architecture
+    (REDNET)" — вынесены в отдельную синхронную функцию, чтобы их можно
+    было проверить тестом без реального Telegram-клиента (ТОТ ЖЕ приём, что
+    и reader/main.py::validate_fine_monitor_config). Ничего не делает, если
+    collector_api_enabled=False (по умолчанию)."""
+    if not settings.fine_monitor.collector_api_enabled:
+        return
+    if not manual_bootstrap_available:
+        raise ConfigError(
+            "fine_monitor.collector_api_enabled=true, но public-feed "
+            "архитектура выключена (нужны те же "
+            "plate_bootstrap_repository/detected_fine_repository) — "
+            "включите fine_monitor.public_feed_enabled."
+        )
+    if not settings.fine_monitor.collector_hmac_secret:
+        raise ConfigError(
+            "fine_monitor.collector_api_enabled=true, но "
+            "GEORGIA_COLLECTOR_HMAC_SECRET не задан в .env."
+        )
 
 
 def read_bot_token() -> str:
@@ -363,6 +387,35 @@ async def run() -> None:
             else None
         )
 
+        # "Georgia remote collector architecture (REDNET)" (см. задачу) —
+        # узкий internal API для REDNET-коллектора, ТОЛЬКО когда
+        # public-feed архитектура уже включена (нужен тот же
+        # plate_bootstrap_repository/manual_bootstrap_service) И явно
+        # включён collector_api_enabled (по умолчанию False — существующий
+        # production ничего не обязан менять). ЖИВЁТ именно в этом
+        # процессе (а не reader/main.py), а не потому что это "главный"
+        # процесс — потому что только здесь есть bot-mode `client`
+        # (@ProtocolGEbot), которым можно отправить клиенту прямое
+        # "штрафов не найдено" (см. collector_ingest_service.py) той же
+        # identity, в которую он уже пишет — отправка из reader/main.py
+        # выглядела бы как сообщение от другого бота.
+        validate_collector_api_config(
+            settings, manual_bootstrap_available=manual_bootstrap_service is not None,
+        )
+        collector_api_coroutine = None
+        if settings.fine_monitor.collector_api_enabled:
+            collector_ingest_service = CollectorIngestService(
+                task_repository, detected_fine_repository, check_service,
+                plate_bootstrap_repository, manual_bootstrap_service,
+            )
+            collector_api_coroutine = run_collector_api_forever(
+                collector_ingest_service,
+                hmac_secret=settings.fine_monitor.collector_hmac_secret,
+                telegram_client=client,
+                host=settings.fine_monitor.collector_api_host,
+                port=settings.fine_monitor.collector_api_port,
+            )
+
         controller = ConversationController(
             conversation_state_repository,
             subscription_service,
@@ -412,10 +465,13 @@ async def run() -> None:
         # ТОТ ЖЕ уже подключённый client через _TelethonBotSender). Ошибка
         # одного не должна тихо остановить другой незамеченной — тот же
         # принцип, что и в reader/main.py::run().
-        await _run_concurrently([
+        background_tasks = [
             client.run_until_disconnected(),
             _run_delivery_poller(delivery_service),
-        ])
+        ]
+        if collector_api_coroutine is not None:
+            background_tasks.append(collector_api_coroutine)
+        await _run_concurrently(background_tasks)
     finally:
         await http_client.aclose()
         await videos_police_ge_http_client.aclose()
