@@ -3,11 +3,15 @@ report п.4/решение "Вариант A": переиспользуем УЖ
 bot-agnostic reader/jobs/{base.py,scheduler.py} ТОЛЬКО через импорт —
 reader/jobs/* не меняется НИ строкой).
 
-Расписание — СТРОГО calendar-based (см. задачу): 13:00 и 21:00
-Europe/Istanbul, никакого "каждые N часов". Europe/Istanbul — ОТДЕЛЬНАЯ,
+Расписание — СТРОГО calendar-based (см. задачу "Change ONLY the scheduled
+Turkey fines monitoring frequency"): ОДИН раз в сутки, 21:00 Europe/
+Istanbul, никакого "каждые N часов". ИСПРАВЛЕНО (та же задача) — раньше
+здесь было ДВА слота (13:00 и 21:00); дневной 13:00-слот убран по явному
+требованию, 21:00 остаётся единственным. Europe/Istanbul — ОТДЕЛЬНАЯ,
 hardcoded константа (НЕ settings.fine_monitor.timezone — тот default
 Asia/Tbilisi, Georgian-бизнес-конфиг, используемый TurkeyStatisticsService
-для другой цели, см. design report)."""
+для другой цели, см. design report) — не менялась этой задачей, уже была
+Europe/Istanbul."""
 
 from __future__ import annotations
 
@@ -21,14 +25,17 @@ logger = logging.getLogger(__name__)
 
 TURKEY_MONITORING_TZ = ZoneInfo("Europe/Istanbul")
 
-# Строго два calendar slots в сутки (см. задачу) — (hour, minute) в
-# Europe/Istanbul. Порядок важен для next_monitoring_slot() ниже.
-_DAILY_SLOTS: tuple[tuple[int, int], ...] = ((13, 0), (21, 0))
+# Строго ОДИН calendar slot в сутки (см. задачу "Change ONLY the scheduled
+# Turkey fines monitoring frequency") — (hour, minute) в Europe/Istanbul.
+# next_monitoring_slot() ниже работает с любым количеством слотов без
+# изменений, порядок остаётся важен, если слотов когда-нибудь снова станет
+# больше одного.
+_DAILY_SLOTS: tuple[tuple[int, int], ...] = ((21, 0),)
 
 
 def next_monitoring_slot(now: datetime) -> datetime:
-    """Ближайший СЛЕДУЮЩИЙ слот (13:00 либо 21:00 Europe/Istanbul) СТРОГО
-    после now — возвращается в UTC (для хранения в
+    """Ближайший СЛЕДУЮЩИЙ слот (21:00 Europe/Istanbul) СТРОГО после now —
+    возвращается в UTC (для хранения в
     turkey_monitoring_subscriptions.next_check_at). Используется и при
     первом включении мониторинга, и после каждой плановой проверки."""
     local_now = now.astimezone(TURKEY_MONITORING_TZ)
@@ -82,7 +89,7 @@ class TurkeyMonitoringRetryJob(Job):
     проходе (см. reader/turkey_bot/monitoring/monitoring_service.py::
     TurkeyMonitoringService._maybe_enqueue_retry/run_due_retries).
     ОТДЕЛЬНЫЙ Job (не часть TurkeyMonitoringJob выше) — should_run здесь
-    не привязан к calendar slot 13:00/21:00, а к тому, наступил ли уже
+    не привязан к calendar slot(ам) _DAILY_SLOTS, а к тому, наступил ли уже
     хотя бы один запланированный retry (тикает вместе с общим poll
     Scheduler'а раз в 30с, см. reader/jobs/scheduler.py — этого достаточно
     для 5-минутного окна)."""

@@ -1,4 +1,6 @@
-"""TurkeyMonitoringService — плановый (13:00/21:00 Europe/Istanbul) цикл
+"""TurkeyMonitoringService — плановый (21:00 Europe/Istanbul, раньше было
+два слота — 13:00 и 21:00 — см. задачу "Change ONLY the scheduled Turkey
+fines monitoring frequency") цикл
 проверки всех активных подписок (см. design report п.8/п.12 задачи
 "Перестроить UX Turkey test bot"): использует ТОТ ЖЕ
 UnifiedTurkeyCheckService, что и ручная "🔎 Проверить сейчас"
@@ -216,7 +218,7 @@ class TurkeyMonitoringService:
         # НИКОГДА не вызывает _maybe_enqueue_retry снова здесь (см. задачу:
         # "После +5 минут третьего retry нет" / "Никаких бесконечных
         # retries") — если провайдер всё ещё ERROR, он остаётся ERROR до
-        # следующего обычного слота (13:00/21:00), next_check_at на это
+        # следующего обычного слота (21:00), next_check_at на это
         # никак не влияет (уже выставлен в первом проходе).
 
     async def _notify_changes(

@@ -7,8 +7,10 @@ deploy/ai-lead-radar-turkeybot.service):
 
 ПЕРЕНЕСЕНО из reader/turkey_bot_test/main.py (см. задачу "Перенос Unified
 Turkey функционала в production", READ-ONLY аудит) — UNIFIED UX: USER ->
-CAR -> UNIFIED CHECK -> MONITORING, calendar-based scheduler СТРОГО 13:00
-и 21:00 Europe/Istanbul, работает ВНУТРИ этого же процесса/systemd-юнита
+CAR -> UNIFIED CHECK -> MONITORING, calendar-based scheduler СТРОГО 21:00
+Europe/Istanbul (раньше было ДВА слота, 13:00 и 21:00 — дневной слот убран,
+см. задачу "Change ONLY the scheduled Turkey fines monitoring frequency"),
+работает ВНУТРИ этого же процесса/systemd-юнита
 (ai-lead-radar-turkeybot.service) — отдельный systemd unit НЕ заводится.
 Планировщик — reader.jobs.{Job,Scheduler} (bot-agnostic инфраструктура,
 уже используется reader/main.py, НЕ изменена ни строкой).
@@ -260,7 +262,7 @@ async def run() -> None:
         await client.start(bot_token=token)
         me = await client.get_me()
         logger.info(f"✔ @{me.username} подключён (id={me.id})")
-        logger.info("✔ Turkey monitoring scheduler запущен (13:00/21:00 Europe/Istanbul)")
+        logger.info("✔ Turkey monitoring scheduler запущен (21:00 Europe/Istanbul)")
 
         await _run_concurrently([
             client.run_until_disconnected(),
