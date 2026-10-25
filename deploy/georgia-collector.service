@@ -1,0 +1,33 @@
+[Unit]
+Description=AI Lead Radar — Georgia police.ge remote collector (REDNET)
+After=network-online.target
+Wants=network-online.target
+
+# NEW server, NEW deployment — this is REDNET, not the existing production
+# VPS. Do NOT assume the same `leadradar` user/paths as
+# ai-lead-radar.service/ai-lead-radar-geshtrafbot.service (deploy/*.service
+# in this repo) — those run on a different machine entirely. Replace
+# User/Group/WorkingDirectory/ExecStart below with REDNET's actual
+# deployment account/path before installing (see
+# docs/georgia-remote-collector.md). This process has NO Telegram
+# credentials, NO production database, and NO notification logic by
+# construction — see reader/georgia_collector/ module docstrings.
+[Service]
+Type=simple
+User=collector
+Group=collector
+WorkingDirectory=/home/collector/georgia-collector
+Environment=PYTHONUNBUFFERED=1
+# .env in WorkingDirectory is picked up by python-dotenv's load_dotenv()
+# (see reader/georgia_collector/__main__.py) — same convention as the rest
+# of this project.
+ExecStart=/home/collector/georgia-collector/.venv/bin/python -m reader.georgia_collector
+
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

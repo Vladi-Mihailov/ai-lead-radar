@@ -124,14 +124,22 @@ class ManualBootstrapService:
             total += len(self._detected_fines.list_current_for_task(task.id, since=_EPOCH_UTC))
         return total
 
-    def confirm_no_fines(self, car_number: str, *, completed_by_user_id: int) -> bool:
+    def confirm_no_fines(self, car_number: str, *, completed_by_user_id: int | None) -> bool:
         """"✅ Штрафов нет" (см. задачу п.4) — НЕ создаёт никакой fake/
         synthetic detected_fines строки (см. задачу: "НЕ записывать
         synthetic zero fine") — только помечает bootstrap завершённым.
         False, если plate уже completed (идемпотентность, см. задачу п.13/
         16 "CONCURRENT MANAGERS"/"completed plate... idempotent") — другой
         менеджер (или этот же менеджер повторно) не переписывает
-        completed_by_user_id/completed_at заново."""
+        completed_by_user_id/completed_at заново.
+
+        completed_by_user_id: int | None (а не только int) — см. задачу
+        "Georgia remote collector architecture (REDNET)": REDNET-коллектор
+        тоже вызывает этот путь (через CollectorIngestService, см. reader/
+        public_bot/collector_ingest_service.py) для автоматически
+        подтверждённого (не менеджером) bootstrap, передавая None — ТОТ ЖЕ
+        "не менеджер" смысл, что GeorgiaPlateBootstrapRepository.
+        mark_completed() уже поддерживает для живого searchByAuto-пути."""
         state = self._bootstrap.get(car_number)
         if state is not None and state.is_completed:
             return False
@@ -140,7 +148,7 @@ class ManualBootstrapService:
         )
         return True
 
-    def finish_after_fines(self, car_number: str, *, completed_by_user_id: int) -> bool:
+    def finish_after_fines(self, car_number: str, *, completed_by_user_id: int | None) -> bool:
         """"✅ Завершить проверку" после одного или нескольких "➕ Добавить
         штраф" (см. задачу п.11) — ТА ЖЕ bootstrap-completion семантика,
         что и confirm_no_fines() (тот же idempotent-guard), отдельное имя

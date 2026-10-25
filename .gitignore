@@ -12,3 +12,10 @@ data/*.db-shm
 
 # Превью пула лидов кампаний (reader/inviter/manage.py build-lead-pool) — username/имена.
 data/output/lead_pool/
+
+# REDNET-коллектор (см. docs/georgia-remote-collector.md) — локальный файл
+# operational state (frontier/outbox), если запускается локально из корня
+# репозитория для разработки; реальный деплой задаёт абсолютный путь через
+# GEORGIA_COLLECTOR_DB_PATH (см. .env.collector.example).
+georgia_collector_state.db*
+.env.collector

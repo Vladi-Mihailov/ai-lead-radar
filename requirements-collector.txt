@@ -1,0 +1,17 @@
+# Minimal dependency set for the REDNET Georgia collector ONLY (see
+# docs/georgia-remote-collector.md and "Georgia remote collector
+# architecture (REDNET)"). Deliberately NOT requirements.txt — REDNET is a
+# 1 vCPU / 1 GB RAM / 20 GB disk box; the full requirements.txt drags in
+# playwright, opencv-python, rapidocr, onnxruntime, pytesseract (all
+# Turkey-bot CAPTCHA-solver only, multi-hundred-MB, unused by anything the
+# collector imports) and telethon (the collector has no Telegram access at
+# all, by design). Verified by actually checking the import closure of
+# reader/georgia_collector/* and the specific reader/fines/* modules it
+# uses (parser.py, models.py, validation.py, police_ge_session.py,
+# police_ge_circuit_breaker.py, public_feed_seen_repository.py,
+# public_feed_state_repository.py, provider.py, collector_auth.py,
+# collector_payload.py) — none of them import pydantic, beautifulsoup4, or
+# playwright; only httpx (+ stdlib).
+httpx>=0.27,<1.0
+python-dotenv>=1.0,<2.0
+tzdata>=2024.1
