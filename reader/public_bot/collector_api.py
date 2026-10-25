@@ -38,6 +38,18 @@ from reader.public_bot.collector_ingest_service import CollectorIngestService
 
 logger = logging.getLogger(__name__)
 
+# Explicit, intentional cap — NOT relying on aiohttp's own 1 MiB library
+# default (undocumented/untested in this codebase). A single ParsedFineRecord
+# is well under 1 KB; even a generously-sized bootstrap-result (dozens of
+# fines for one plate) stays under a few tens of KB — 64 KiB leaves ample
+# headroom while keeping the ceiling tight. aiohttp enforces this while
+# streaming the body (raises HTTPRequestEntityTooLarge from within
+# request.read() itself), so an oversized body is rejected with 413 BEFORE
+# the auth middleware's body = await request.read() call below can return —
+# the HMAC verification's own sha256(body) never runs on an oversized
+# payload, and no handler/business logic ever sees it either.
+_MAX_REQUEST_BODY_SIZE = 64 * 1024
+
 
 def _parse_iso_date(value: object) -> date | None:
     if value in (None, ""):
@@ -109,7 +121,9 @@ def _auth_middleware(secret: str):
 def build_collector_api_app(
     ingest_service: CollectorIngestService, *, hmac_secret: str, telegram_client: TelegramClient,
 ) -> web.Application:
-    app = web.Application(middlewares=[_auth_middleware(hmac_secret)])
+    app = web.Application(
+        middlewares=[_auth_middleware(hmac_secret)], client_max_size=_MAX_REQUEST_BODY_SIZE,
+    )
 
     async def get_plates(request: web.Request) -> web.Response:
         return web.json_response({"plates": ingest_service.active_plates()})

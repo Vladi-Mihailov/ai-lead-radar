@@ -18,6 +18,28 @@ the "no Telegram/production-DB imports" requirement below), but identical
 semantics: exact wall-clock match, no catch-up, no persistence across a
 collector restart.
 
+KNOWN TECHNICAL DEBT (see architecture review, task "PR #34 integration
+sequence"): _poll_feed() below duplicates GeorgiaPublicFineFeedJob.run()'s
+DEEP/FAST frontier+one-overlap-page state machine almost line-for-line
+(same deep_mode/is_true_first_run/in_recovery computation, same pending_
+overlap/page_has_seen_row tracking, same error/retry/retention handling).
+This was reviewed deliberately for extraction into a shared module and
+rejected: GeorgiaPublicFineFeedJob is already-merged, production-tested
+code living in reader/jobs/, which this package is architecturally
+forbidden from importing (see the module-level "no Telegram/production-DB
+imports" invariant, enforced by test) — any shared module would have to
+live elsewhere and be imported by BOTH sites, meaning the extraction would
+itself modify the already-stable in-process job's internals for zero
+functional gain. The two also genuinely differ in what happens to a newly-
+matched row (synchronous local persist vs. async remote submit with
+outbox-fallback-on-failure), which would force an extra parameterization
+axis into any shared abstraction, trading real duplication for added
+indirection. Decision: leave both implementations independent.
+**Collector and in-process feed job must be kept behaviorally
+synchronized** — any future change to the pagination/frontier/overlap/
+DEEP-recovery semantics in one MUST be mirrored in the other by hand (see
+the identical note in georgia_public_feed_job.py's module docstring).
+
 This module (and the production_client.py/outbox_repository.py/__main__.py
 siblings it belongs to) imports NOTHING Telegram-related and NOTHING from
 reader/public_bot, reader/jobs, or reader/users — only the specific,
@@ -58,6 +80,20 @@ from reader.georgia_collector.production_client import (
 logger = logging.getLogger(__name__)
 
 _PAGE_SIZE = 30
+
+# Outbox durability review ("Georgia remote collector architecture"
+# integration, PR #34): once an entry has failed this many cross-cycle
+# attempts (~2.5 days at the 4x/day schedule), escalate its log level from
+# INFO to WARNING on every subsequent cycle so a permanently-stuck entry
+# (e.g. a production-side bug that 400s every retry) becomes visible to an
+# operator instead of retrying silently forever. Deliberately does NOT
+# delete/give up on the entry at any attempt count — requirement G is
+# explicit that the collector "does not lose already fetched matched
+# fines," and an unbounded-but-slow cross-cycle retry (never a tight loop —
+# bounded to once per scheduled 4x/day cycle, with its own 3-attempt
+# in-call backoff per attempt, see production_client.py) is the correct way
+# to honor that during an outage of unknown duration.
+_STUCK_OUTBOX_ATTEMPTS_WARNING_THRESHOLD = 10
 
 
 @dataclass
@@ -302,10 +338,19 @@ class GeorgiaCollectorJob:
                 self._outbox.remove(entry.id)
             except ProductionApiError:
                 self._outbox.record_attempt(entry.id)
-                logger.info(
-                    "GeorgiaCollectorJob: outbox entry %d всё ещё не доставлен (попытка %d)",
-                    entry.id, entry.attempts + 1,
-                )
+                attempts_so_far = entry.attempts + 1
+                if attempts_so_far >= _STUCK_OUTBOX_ATTEMPTS_WARNING_THRESHOLD:
+                    logger.warning(
+                        "GeorgiaCollectorJob: outbox entry %d (kind=%s) stuck after %d "
+                        "attempts — still retrying, not dropped (see module-level "
+                        "_STUCK_OUTBOX_ATTEMPTS_WARNING_THRESHOLD docstring)",
+                        entry.id, entry.kind, attempts_so_far,
+                    )
+                else:
+                    logger.info(
+                        "GeorgiaCollectorJob: outbox entry %d всё ещё не доставлен (попытка %d)",
+                        entry.id, attempts_so_far,
+                    )
 
     def _record_error(self, message: str, *, at: datetime) -> None:
         self.status.error_count += 1

@@ -239,6 +239,50 @@ async def test_bootstrap_result_zero_fines_sends_customer_message_via_telegram_c
     assert bootstrap_repo.is_completed("AA001AA")
 
 
+async def test_health_endpoint_requires_auth(tmp_path):
+    """See security review: EVERY route, including /health, must go through
+    the auth middleware — not just the data-returning ones."""
+    app, *_rest = _make_app(tmp_path)
+    payload = {"status": "ok"}
+    body = json.dumps(payload).encode("utf-8")
+
+    async with TestClient(TestServer(app)) as client:
+        resp_noauth = await client.post(
+            "/internal/georgia/health", data=body, headers={"Content-Type": "application/json"},
+        )
+        assert resp_noauth.status == 401
+
+        resp_wrong_secret = await client.post(
+            "/internal/georgia/health", data=body,
+            headers={**_signed_headers("POST", "/internal/georgia/health", body, secret="wrong-secret"),
+                     "Content-Type": "application/json"},
+        )
+        assert resp_wrong_secret.status == 401
+
+
+async def test_oversized_request_body_rejected_before_auth_check(tmp_path):
+    """See security review: an explicit client_max_size (64 KiB) must reject
+    an oversized body with 413 from within aiohttp's own body-reading, i.e.
+    BEFORE the auth middleware's `body = await request.read()` can return and
+    hand that body to verify()'s sha256() call — an oversized payload must
+    never reach HMAC verification or any handler/business logic at all."""
+    app, *_rest = _make_app(tmp_path)
+    oversized_body = json.dumps({
+        "car_number": "AA001AA",
+        "raw_data": {"padding": "x" * (128 * 1024)},  # well past the 64 KiB cap
+    }).encode("utf-8")
+
+    async with TestClient(TestServer(app)) as client:
+        # Correctly signed for the oversized body — proves rejection happens
+        # on size alone, not because the signature was wrong.
+        headers = _signed_headers("POST", "/internal/georgia/feed-match", oversized_body)
+        headers["Content-Type"] = "application/json"
+        resp = await client.post(
+            "/internal/georgia/feed-match", data=oversized_body, headers=headers,
+        )
+        assert resp.status == 413
+
+
 async def test_health_endpoint_acknowledges(tmp_path):
     app, *_rest = _make_app(tmp_path)
     payload = {"status": "ok", "detail": "test"}

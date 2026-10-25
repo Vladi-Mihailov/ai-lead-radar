@@ -209,6 +209,37 @@ async def test_outbox_entry_still_undeliverable_is_retried_not_dropped(tmp_path)
     assert outbox.list_all()[0].attempts == 1
 
 
+async def test_outbox_entry_never_dropped_even_after_many_failed_attempts(tmp_path, caplog):
+    """Outbox durability review (PR #34 integration): "bounded retry" means
+    bounded BACKOFF/visibility, not "eventually delete the match" — requirement
+    G is explicit that the collector "does not lose already fetched matched
+    fines." A permanently-undeliverable entry must keep being retried every
+    cycle, forever, never silently dropped — only the log level escalates
+    (INFO -> WARNING) once it's clearly stuck, so an operator notices."""
+    import logging
+
+    session = _FakeSession({0: _empty_page()})
+    production = _FakeProductionClient(active_plates=[], fail_submit=True)
+    job, _feed_state, _seen, outbox = _make_job(tmp_path, session, production)
+    outbox.enqueue(KIND_FEED_MATCH, {"car_number": "AA001AA", "fingerprint": "x"})
+
+    with caplog.at_level(logging.INFO, logger="reader.georgia_collector.collector_job"):
+        for _ in range(12):
+            await job._flush_outbox()
+
+    # Still exactly one entry, never removed, no matter how many cycles failed.
+    assert outbox.count() == 1
+    assert outbox.list_all()[0].attempts == 12
+
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING and "stuck" in r.message]
+    assert len(warning_records) >= 1  # escalated once the threshold (10) was crossed
+    info_records = [
+        r for r in caplog.records
+        if r.levelno == logging.INFO and "ещё не доставлен" in r.message
+    ]
+    assert len(info_records) == 9  # attempts 1..9, before the threshold escalation kicks in
+
+
 # ==== police.ge unavailable — circuit breaker gate, safe error recording ====
 
 
