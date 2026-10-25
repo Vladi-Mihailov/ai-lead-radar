@@ -107,6 +107,23 @@ def resolve_allowed_user_ids(settings: Settings) -> list[int]:
     return settings.fine_monitor.allowed_user_ids
 
 
+def _georgia_remote_collector_mode_active(fine_monitor) -> bool:
+    """True, если что-то ДРУГОЕ, помимо per-car FineJob/ArchiveFineJob, уже
+    отвечает за проверку Georgia-номеров через police.ge — public_feed_
+    enabled (in-process public-feed job) ИЛИ collector_api_enabled (REDNET
+    remote collector architecture). См. задачу "fix the remaining issues
+    discovered during live testing" — production-инцидент: с
+    collector_api_enabled=true (REDNET реально опрашивает police.ge), но
+    БЕЗ этой проверки, FineJob/ArchiveFineJob всё равно продолжали
+    планироваться здесь и пытались обратиться к police.ge НАПРЯМУЮ с
+    German IP (заблокирован, см. задачу "police.ge reachability") — каждый
+    цикл проваливался целиком (circuit breaker open, "skipped 220/293
+    task(s)"), ничего не проверяя. ТОТ ЖЕ приём, что и reader/public_bot/
+    main.py::bootstrap_infrastructure_needed() — любой из двух флагов
+    достаточен."""
+    return fine_monitor.public_feed_enabled or fine_monitor.collector_api_enabled
+
+
 def build_fine_monitor_components(
     settings: Settings,
     source: TelegramSource,
@@ -276,7 +293,29 @@ def build_fine_monitor_components(
     # не имеет доступа к notification_coordinator).
     notification_flush_job = NotificationFlushJob(notification_coordinator)
 
-    jobs: list = [fine_job, client_fine_job, archive_fine_job, notification_flush_job]
+    # См. задачу "fix the remaining issues discovered during live testing" —
+    # production-инцидент: fine_job/client_fine_job/archive_fine_job
+    # раньше планировались БЕЗУСЛОВНО, даже когда REDNET remote collector
+    # (или in-process public feed) уже ЕДИНСТВЕННО отвечает за проверку
+    # police.ge для Georgia — каждый их цикл безрезультатно проваливался
+    # (circuit breaker open, German IP заблокирован police.ge, см.
+    # _georgia_remote_collector_mode_active() докстрок). Объекты
+    # fine_job/client_fine_job/archive_fine_job по-прежнему КОНСТРУИРУЮТСЯ
+    # безусловно выше (нужны FineCommand для "fine status"/ручных "fine
+    # check"/"fine update-all" — те остаются доступны даже в remote-режиме
+    # для намеренной ручной диагностики, см. задачу) — меняется ТОЛЬКО то,
+    # планирует ли их Scheduler автоматически.
+    georgia_remote_mode = _georgia_remote_collector_mode_active(fine_monitor)
+    jobs: list = []
+    if not georgia_remote_mode:
+        jobs.extend([fine_job, client_fine_job, archive_fine_job])
+    else:
+        logger.info(
+            "Georgia FineJob/ArchiveFineJob scheduling disabled -- remote "
+            "collector mode active (public_feed_enabled=%s, collector_api_enabled=%s)",
+            fine_monitor.public_feed_enabled, fine_monitor.collector_api_enabled,
+        )
+    jobs.append(notification_flush_job)
 
     # Пятый job — ТОЛЬКО когда public-feed архитектура включена (см. задачу
     # "Georgia fines incremental public-feed monitoring" + докстрок этой

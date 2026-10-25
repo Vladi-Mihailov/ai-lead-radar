@@ -474,11 +474,21 @@ async def test_build_fine_monitor_components_schedules_georgia_public_feed_job_w
     tmp_path, monkeypatch,
 ):
     """public_feed_enabled=True + bootstrap/feed_state/feed_seen репозитории
-    -> ПЯТЫЙ job в Scheduler'е, с run_times/tz взятыми из config.yaml (а не
-    захардкоженными) — см. задачу "schedule Georgia public feed three times
-    daily": "09:00 / 15:00 / 21:00 Asia/Tbilisi" + "это EXACT wall-clock
-    schedule, а не 'каждые 6 часов от момента запуска'", плюс
-    корректирующую задачу "IMPORTANT SCHEDULE UPDATE" (добавлен 23:55)."""
+    -> GeorgiaPublicFineFeedJob регистрируется в Scheduler'е, с run_times/tz
+    взятыми из config.yaml (а не захардкоженными) — см. задачу "schedule
+    Georgia public feed three times daily": "09:00 / 15:00 / 21:00
+    Asia/Tbilisi" + "это EXACT wall-clock schedule, а не 'каждые 6 часов от
+    момента запуска'", плюс корректирующую задачу "IMPORTANT SCHEDULE
+    UPDATE" (добавлен 23:55).
+
+    ИСПРАВЛЕНО (см. задачу "fix the remaining issues discovered during live
+    testing"): раньше здесь ожидалось len==5 (fine_job/client_fine_job/
+    archive_fine_job/notification_flush_job/georgia_public_feed_job) — но
+    public_feed_enabled=True означает, что ЧТО-ТО ДРУГОЕ (этот самый
+    GeorgiaPublicFineFeedJob) теперь отвечает за Georgia police.ge-проверки,
+    поэтому fine_job/client_fine_job/archive_fine_job больше НЕ планируются
+    (см. _georgia_remote_collector_mode_active()) — остаются только
+    notification_flush_job + georgia_public_feed_job, len==2."""
     _set_required_env(monkeypatch)
     config_with_public_feed = _CONFIG_YAML + (
         "  public_feed_enabled: true\n"
@@ -513,9 +523,11 @@ async def test_build_fine_monitor_components_schedules_georgia_public_feed_job_w
             )
         )
 
-        assert len(scheduler._jobs) == 5
-        georgia_job = scheduler._jobs[4]
-        assert isinstance(georgia_job, GeorgiaPublicFineFeedJob)
+        assert len(scheduler._jobs) == 2
+        assert not any(isinstance(job, (FineJob, ArchiveFineJob)) for job in scheduler._jobs)
+        georgia_jobs = [j for j in scheduler._jobs if isinstance(j, GeorgiaPublicFineFeedJob)]
+        assert len(georgia_jobs) == 1
+        georgia_job = georgia_jobs[0]
         assert [t.strftime("%H:%M") for t in georgia_job._run_times] == [
             "09:00", "15:00", "21:00", "23:55",
         ]
@@ -527,6 +539,109 @@ async def test_build_fine_monitor_components_schedules_georgia_public_feed_job_w
         plate_bootstrap_repository.close()
         feed_state_repository.close()
         feed_seen_repository.close()
+        await http_client.aclose()
+
+
+async def test_build_fine_monitor_components_does_not_schedule_georgia_fine_job_when_collector_api_enabled(
+    tmp_path, monkeypatch,
+):
+    """См. задачу "fix the remaining issues discovered during live testing"
+    — production-инцидент: collector_api_enabled=true (REDNET remote
+    collector реально отвечает за Georgia police.ge) должно ТАК ЖЕ, как и
+    public_feed_enabled=true, отключать автоматическое планирование
+    fine_job/client_fine_job/archive_fine_job (см.
+    _georgia_remote_collector_mode_active()) — иначе они продолжают
+    безрезультатно пытаться обратиться к police.ge НАПРЯМУЮ с German IP
+    (заблокирован) каждый цикл. collector_api_enabled НЕ влияет на
+    GeorgiaPublicFineFeedJob (тот остаётся на public_feed_enabled отдельно,
+    здесь оно не задано -> не планируется) — остаётся только
+    notification_flush_job."""
+    _set_required_env(monkeypatch)
+    config_with_collector_api = _CONFIG_YAML + (
+        "  collector_api_enabled: true\n"
+    )
+    config_path = _write_config(tmp_path, config_with_collector_api)
+    settings = load_settings(config_path)
+    assert settings.fine_monitor.collector_api_enabled is True
+    assert settings.fine_monitor.public_feed_enabled is False
+
+    user_repository = UserRepository(tmp_path / "users.db")
+    source = TelegramSource(settings.telegram, groups=[], user_repository=user_repository)
+    task_repository = FineMonitoringTaskRepository(tmp_path / "users.db")
+    detected_fine_repository = DetectedFineRepository(tmp_path / "users.db")
+    http_client = httpx.AsyncClient()
+
+    try:
+        notification_chat_ids = resolve_notification_chat_ids(settings)
+        _fine_job, scheduler, _notification_service, _command_dispatcher, fine_command = (
+            build_fine_monitor_components(
+                settings, source, task_repository, detected_fine_repository,
+                http_client, notification_chat_ids, settings.fine_monitor.allowed_user_ids,
+                user_repository=user_repository,
+            )
+        )
+
+        assert len(scheduler._jobs) == 1
+        assert not any(
+            isinstance(job, (FineJob, ArchiveFineJob, GeorgiaPublicFineFeedJob))
+            for job in scheduler._jobs
+        )
+        assert isinstance(scheduler._jobs[0], NotificationFlushJob)
+
+        # fine_job по-прежнему СКОНСТРУИРОВАН (не None) — FineCommand всё
+        # ещё может показать "fine status" (пусть и "никогда не запускался")
+        # и "fine check"/"fine update-all" остаются доступны для намеренной
+        # ручной диагностики даже в remote-режиме (см. задачу: "Do not
+        # remove the old code").
+        assert fine_command._fine_job is _fine_job
+        assert isinstance(_fine_job, FineJob)
+    finally:
+        user_repository.close()
+        task_repository.close()
+        detected_fine_repository.close()
+        await http_client.aclose()
+
+
+async def test_build_fine_monitor_components_schedules_georgia_fine_job_when_remote_mode_inactive(
+    tmp_path, monkeypatch,
+):
+    """Regression — обе защиты выключены (today's actual production
+    default, до включения remote collector) -> fine_job/client_fine_job/
+    archive_fine_job планируются КАК ОБЫЧНО, порядок/количество не
+    изменились (см. test_build_fine_monitor_components_wires_dependencies_
+    correctly выше, которая уже это проверяет детально — здесь просто явный
+    sanity-check конкретно для _georgia_remote_collector_mode_active())."""
+    _set_required_env(monkeypatch)
+    config_path = _write_config(tmp_path, _CONFIG_YAML)
+    settings = load_settings(config_path)
+    assert settings.fine_monitor.collector_api_enabled is False
+    assert settings.fine_monitor.public_feed_enabled is False
+
+    user_repository = UserRepository(tmp_path / "users.db")
+    source = TelegramSource(settings.telegram, groups=[], user_repository=user_repository)
+    task_repository = FineMonitoringTaskRepository(tmp_path / "users.db")
+    detected_fine_repository = DetectedFineRepository(tmp_path / "users.db")
+    http_client = httpx.AsyncClient()
+
+    try:
+        notification_chat_ids = resolve_notification_chat_ids(settings)
+        _fine_job, scheduler, _notification_service, _command_dispatcher, _fine_command = (
+            build_fine_monitor_components(
+                settings, source, task_repository, detected_fine_repository,
+                http_client, notification_chat_ids, settings.fine_monitor.allowed_user_ids,
+                user_repository=user_repository,
+            )
+        )
+
+        assert len(scheduler._jobs) == 4
+        assert isinstance(scheduler._jobs[0], FineJob)
+        assert isinstance(scheduler._jobs[1], FineJob)  # client_fine_job, same class
+        assert isinstance(scheduler._jobs[2], ArchiveFineJob)
+        assert isinstance(scheduler._jobs[3], NotificationFlushJob)
+    finally:
+        user_repository.close()
+        task_repository.close()
+        detected_fine_repository.close()
         await http_client.aclose()
 
 
