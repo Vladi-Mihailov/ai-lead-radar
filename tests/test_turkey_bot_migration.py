@@ -453,7 +453,9 @@ def test_migration_creates_no_fake_unified_history(tmp_path):
 
 
 def test_next_monitoring_slot_uses_strict_europe_istanbul_schedule(tmp_path):
-    """Явное требование п.7/п.11: 13:00/21:00 Europe/Istanbul — тот же,
+    """Явное требование п.7/п.11: 21:00 Europe/Istanbul (раньше было ДВА
+    слота, 13:00 и 21:00 -- дневной слот убран, см. задачу "Change ONLY
+    the scheduled Turkey fines monitoring frequency") — тот же,
     неизменённый next_monitoring_slot(), что и у остального мониторинга
     (см. reader/turkey_bot/monitoring/scheduler_job.py)."""
     db_path = _make_db(tmp_path)
@@ -468,7 +470,7 @@ def test_next_monitoring_slot_uses_strict_europe_istanbul_schedule(tmp_path):
     expected = next_monitoring_slot(now.astimezone(timezone.utc))
     assert plan.next_monitoring_slot_utc == expected
     local = plan.next_monitoring_slot_utc.astimezone(TURKEY_MONITORING_TZ)
-    assert (local.hour, local.minute) == (13, 0)
+    assert (local.hour, local.minute) == (21, 0)
 
 
 def test_production_db_path_reported_matches_what_was_passed(tmp_path):

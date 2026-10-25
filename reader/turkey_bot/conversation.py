@@ -594,8 +594,10 @@ class ConversationController:
         self, car: TurkeyUserCar, *, chat_id: int, telegram_user_id: int,
     ) -> BotReply:
         """▶️ Включить мониторинг (см. задачу п.5) — active=True,
-        next_check_at по строгому расписанию 13:00/21:00 Europe/Istanbul
-        (см. next_monitoring_slot, НЕ изменено). Карточка перерисовывается
+        next_check_at по строгому расписанию 21:00 Europe/Istanbul (см.
+        next_monitoring_slot — раньше было ДВА слота, см. задачу "Change
+        ONLY the scheduled Turkey fines monitoring frequency"). Карточка
+        перерисовывается
         сразу с обновлённым состоянием (см. _render_car_card) — ОДНО
         сообщение, без отдельного текста-квитанции (см. задачу: "Не
         создавать новое Telegram-сообщение без необходимости... повторить

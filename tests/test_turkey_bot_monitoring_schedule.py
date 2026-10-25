@@ -1,8 +1,9 @@
 """Тесты calendar-based расписания мониторинга (см. design report
-"Перестроить UX Turkey test bot" п.8/п.6): СТРОГО 13:00 и 21:00
-Europe/Istanbul, НЕ "каждые N часов", никакого третьего запуска в день.
-Никаких реальных задач/сети — только TurkeyMonitoringJob.should_run() на
-фиксированных datetime."""
+"Перестроить UX Turkey test bot" п.8/п.6, ИСПРАВЛЕНО задачей "Change ONLY
+the scheduled Turkey fines monitoring frequency" — дневной 13:00-слот
+убран): СТРОГО 21:00 Europe/Istanbul, НЕ "каждые N часов", никакого
+второго запуска в день. Никаких реальных задач/сети — только
+TurkeyMonitoringJob.should_run() на фиксированных datetime."""
 
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -54,20 +55,23 @@ def _istanbul(y, m, d, h, minute) -> datetime:
     return datetime(y, m, d, h, minute, tzinfo=TURKEY_MONITORING_TZ)
 
 
-async def test_should_run_true_exactly_at_13_00_istanbul():
-    job = TurkeyMonitoringJob(_UnusedMonitoringService())
-    now = _istanbul(2026, 9, 20, 13, 0).astimezone(timezone.utc)
-    assert await job.should_run(now) is True
-
-
 async def test_should_run_true_exactly_at_21_00_istanbul():
     job = TurkeyMonitoringJob(_UnusedMonitoringService())
     now = _istanbul(2026, 9, 20, 21, 0).astimezone(timezone.utc)
     assert await job.should_run(now) is True
 
 
+async def test_should_run_false_at_former_13_00_slot():
+    """Regression guard: 13:00 Europe/Istanbul was the daytime slot before
+    "Change ONLY the scheduled Turkey fines monitoring frequency" removed
+    it -- must no longer trigger."""
+    job = TurkeyMonitoringJob(_UnusedMonitoringService())
+    now = _istanbul(2026, 9, 20, 13, 0).astimezone(timezone.utc)
+    assert await job.should_run(now) is False
+
+
 @pytest.mark.parametrize("hour,minute", [
-    (0, 0), (9, 0), (12, 59), (13, 1), (13, 30), (20, 59), (21, 1), (23, 59),
+    (0, 0), (9, 0), (12, 59), (13, 0), (13, 1), (13, 30), (20, 59), (21, 1), (23, 59),
 ])
 async def test_should_run_false_outside_slots(hour, minute):
     job = TurkeyMonitoringJob(_UnusedMonitoringService())
@@ -86,11 +90,11 @@ async def test_13_00_utc_is_not_the_same_as_13_00_istanbul():
 
 
 async def test_should_run_only_once_per_slot_per_day(monkeypatch):
-    """Один и тот же слот (13:00) не должен триггерить run() дважды в
+    """Один и тот же слот (21:00) не должен триггерить run() дважды в
     один день — даже если Scheduler тикнет несколько раз подряд в ту же
     минуту (см. reader/jobs/scheduler.py — poll каждые 30с)."""
     job = TurkeyMonitoringJob(_RecordingMonitoringService())
-    now = _istanbul(2026, 9, 20, 13, 0).astimezone(timezone.utc)
+    now = _istanbul(2026, 9, 20, 21, 0).astimezone(timezone.utc)
     _freeze_run_at(monkeypatch, now)
 
     assert await job.should_run(now) is True
@@ -103,8 +107,8 @@ async def test_should_run_only_once_per_slot_per_day(monkeypatch):
 
 async def test_should_run_again_next_day_same_slot(monkeypatch):
     job = TurkeyMonitoringJob(_RecordingMonitoringService())
-    day1 = _istanbul(2026, 9, 20, 13, 0).astimezone(timezone.utc)
-    day2 = _istanbul(2026, 9, 21, 13, 0).astimezone(timezone.utc)
+    day1 = _istanbul(2026, 9, 20, 21, 0).astimezone(timezone.utc)
+    day2 = _istanbul(2026, 9, 21, 21, 0).astimezone(timezone.utc)
 
     _freeze_run_at(monkeypatch, day1)
     assert await job.should_run(day1) is True
@@ -112,9 +116,10 @@ async def test_should_run_again_next_day_same_slot(monkeypatch):
     assert await job.should_run(day2) is True
 
 
-async def test_no_third_slot_exists_in_a_day():
-    """Ровно 2 calendar slots в сутки — не больше (см. design report:
-    "строго два calendar slots в сутки")."""
+async def test_no_second_slot_exists_in_a_day():
+    """Ровно 1 calendar slot в сутки — не больше (см. задачу "Change ONLY
+    the scheduled Turkey fines monitoring frequency": дневной 13:00-слот
+    убран, 21:00 остаётся единственным)."""
     triggered_hours = []
     for hour in range(24):
         for minute in (0,):
@@ -122,14 +127,14 @@ async def test_no_third_slot_exists_in_a_day():
             fresh_job = TurkeyMonitoringJob(_UnusedMonitoringService())
             if await fresh_job.should_run(now):
                 triggered_hours.append(hour)
-    assert triggered_hours == [13, 21]
+    assert triggered_hours == [21]
 
 
-def test_next_monitoring_slot_from_morning_returns_13_00_today():
+def test_next_monitoring_slot_from_morning_returns_21_00_today():
     now = _istanbul(2026, 9, 20, 8, 0).astimezone(timezone.utc)
     next_slot = next_monitoring_slot(now)
     local = next_slot.astimezone(TURKEY_MONITORING_TZ)
-    assert (local.year, local.month, local.day, local.hour, local.minute) == (2026, 9, 20, 13, 0)
+    assert (local.year, local.month, local.day, local.hour, local.minute) == (2026, 9, 20, 21, 0)
 
 
 def test_next_monitoring_slot_from_afternoon_returns_21_00_today():
@@ -143,7 +148,7 @@ def test_next_monitoring_slot_after_last_slot_rolls_over_to_tomorrow():
     now = _istanbul(2026, 9, 20, 22, 0).astimezone(timezone.utc)
     next_slot = next_monitoring_slot(now)
     local = next_slot.astimezone(TURKEY_MONITORING_TZ)
-    assert (local.year, local.month, local.day, local.hour, local.minute) == (2026, 9, 21, 13, 0)
+    assert (local.year, local.month, local.day, local.hour, local.minute) == (2026, 9, 21, 21, 0)
 
 
 def test_turkey_monitoring_tz_is_europe_istanbul_not_business_tz():
@@ -187,7 +192,7 @@ async def test_retry_job_run_delegates_to_run_due_retries():
 
 
 async def test_retry_job_should_run_not_tied_to_calendar_slot():
-    """В отличие от TurkeyMonitoringJob (строго 13:00/21:00), retry job
+    """В отличие от TurkeyMonitoringJob (строго 21:00), retry job
     может законно сработать в ЛЮБУЮ минуту — если due retry есть, should_run
     истинен независимо от времени суток (см. задачу: retry ЧЕРЕЗ 5 минут,
     не привязан к calendar slot)."""

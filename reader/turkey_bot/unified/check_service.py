@@ -1,7 +1,7 @@
 """UnifiedTurkeyCheckService — единственная точка входа для проверки
 номера через ВСЕ три провайдера (GIB/Avrasya/KGM), используется ОДИНАКОВО
 и для ручной "🔎 Проверить сейчас" (reader/turkey_bot/conversation.py),
-и для планового мониторинга 13:00/21:00 (reader/turkey_bot/monitoring/
+и для планового мониторинга 21:00 (reader/turkey_bot/monitoring/
 monitoring_service.py) — перенесено из reader/turkey_bot_test/unified/
 check_service.py (см. задачу "Перенос Unified Turkey функционала в
 production"): GİB/Avrasya/KGM providers НЕ дублируются — импортируются
