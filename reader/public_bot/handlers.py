@@ -14,6 +14,9 @@ import logging
 from telethon import Button, TelegramClient, events
 from telethon.errors.rpcerrorlist import QueryIdInvalidError
 
+from reader.protocol_support.service import ProtocolSupportService
+from reader.protocol_support.telethon_gateway import handle_private_support
+from reader.public_bot import manager_alerts
 from reader.public_bot.conversation import ConversationController
 from reader.public_bot.keyboards import (
     STOP_NO,
@@ -29,6 +32,18 @@ from reader.public_bot.keyboards import (
     decode_debt_refresh_cancel_callback,
     decode_debt_refresh_confirm_callback,
     decode_debt_refresh_pick_callback,
+    decode_manual_bootstrap_add_another_callback,
+    decode_manual_bootstrap_addfine_cancel_callback,
+    decode_manual_bootstrap_addfine_edit_callback,
+    decode_manual_bootstrap_addfine_save_callback,
+    decode_manual_bootstrap_addfine_start_callback,
+    decode_manual_bootstrap_finish_back_callback,
+    decode_manual_bootstrap_finish_confirm_callback,
+    decode_manual_bootstrap_finish_prompt_callback,
+    decode_manual_bootstrap_nofine_callback,
+    decode_manual_bootstrap_nofine_cancel_callback,
+    decode_manual_bootstrap_nofine_confirm_callback,
+    decode_manual_bootstrap_pending_open_callback,
     decode_my_car_check_now_once_callback,
     decode_my_car_delete_callback,
     decode_my_car_delete_cancel_callback,
@@ -74,10 +89,7 @@ from reader.public_bot.keyboards import (
     trusted_tasks_page_keyboard,
     turkey_bot_link_keyboard,
 )
-from reader.public_bot import manager_alerts
 from reader.public_bot.known_users_repository import BotKnownUsersRepository
-from reader.protocol_support.service import ProtocolSupportService
-from reader.protocol_support.telethon_gateway import handle_private_support
 from reader.public_bot.texts import CALLBACK_NOT_AUTHORIZED_TEXT, MAIN_MENU_TEXT
 
 logger = logging.getLogger(__name__)
@@ -166,10 +178,31 @@ def register(
         text = getattr(reply, "manager_alert_text", None)
         if manager_chat_id is None or not text:
             return
+        raw_buttons = getattr(reply, "manager_alert_buttons", None)
+        buttons = (
+            [[Button.inline(label, data) for label, data in row] for row in raw_buttons]
+            if raw_buttons
+            else None
+        )
         try:
-            await event.client.send_message(manager_chat_id, text, parse_mode="md")
+            await event.client.send_message(manager_chat_id, text, parse_mode="md", buttons=buttons)
         except Exception:
             logger.exception("manager alert: не удалось отправить")
+
+    async def _notify_customers_if_any(event, reply) -> None:
+        """"ВРЕМЕННЫЙ manager workflow для Georgia fines bot" (см. задачу,
+        "✅ Штрафов нет" → клиент получает canonical "штрафов не найдено")
+        — см. BotReply.customer_notify_messages докстрок: fail-open, тот
+        же принцип, что и у _notify_manager_alert_if_any выше (сбой
+        доставки одному клиенту не должен мешать остальным/менеджеру)."""
+        messages = getattr(reply, "customer_notify_messages", None)
+        if not messages:
+            return
+        for chat_id, text in messages:
+            try:
+                await event.client.send_message(chat_id, text, parse_mode="md")
+            except Exception:
+                logger.exception("manual bootstrap: не удалось доставить сообщение клиенту")
 
     @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def _on_message(event: events.NewMessage.Event) -> None:
@@ -480,6 +513,120 @@ def register(
             await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
+        # "ВРЕМЕННЫЙ manager workflow для Georgia fines bot" (см. задачу) —
+        # fine_admin-only, см. ConversationController._is_fine_admin
+        # (перепроверяется внутри каждого handle_manual_bootstrap_* заново,
+        # сам факт валидного car_number в callback_data ничего не доказывает,
+        # см. keyboards.py докстрок).
+        pending_open_plate = decode_manual_bootstrap_pending_open_callback(data)
+        if pending_open_plate is not None:
+            reply = controller.handle_manual_bootstrap_pending_open(
+                pending_open_plate, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        nofine_plate = decode_manual_bootstrap_nofine_callback(data)
+        if nofine_plate is not None:
+            reply = controller.handle_manual_bootstrap_nofine(
+                nofine_plate, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        nofine_cancel_plate = decode_manual_bootstrap_nofine_cancel_callback(data)
+        if nofine_cancel_plate is not None:
+            reply = controller.handle_manual_bootstrap_nofine_cancel(
+                nofine_cancel_plate, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        nofine_confirm_plate = decode_manual_bootstrap_nofine_confirm_callback(data)
+        if nofine_confirm_plate is not None:
+            # customer_notify_messages (см. BotReply докстрок) — отдельная
+            # рассылка клиентам, тот же on_reply-приём, что и у
+            # _notify_manager_alert_if_any в period-callback выше.
+            await _answer_and_send(
+                event,
+                controller.handle_manual_bootstrap_nofine_confirm(
+                    nofine_confirm_plate, telegram_user_id=event.sender_id,
+                ),
+                is_trusted=is_trusted,
+                on_reply=_notify_customers_if_any,
+            )
+            return
+
+        addfine_start_plate = decode_manual_bootstrap_addfine_start_callback(data)
+        if addfine_start_plate is not None:
+            reply = controller.handle_manual_bootstrap_addfine_start(
+                addfine_start_plate, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        addfine_edit_plate = decode_manual_bootstrap_addfine_edit_callback(data)
+        if addfine_edit_plate is not None:
+            # "✏️ Исправить" (см. задачу п.7) — тот же старт с нуля, что и
+            # "➕ Добавить штраф"/"➕ Добавить ещё штраф" (см.
+            # handle_manual_bootstrap_addfine_start докстрок).
+            reply = controller.handle_manual_bootstrap_addfine_start(
+                addfine_edit_plate, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        add_another_plate = decode_manual_bootstrap_add_another_callback(data)
+        if add_another_plate is not None:
+            reply = controller.handle_manual_bootstrap_addfine_start(
+                add_another_plate, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        addfine_cancel_plate = decode_manual_bootstrap_addfine_cancel_callback(data)
+        if addfine_cancel_plate is not None:
+            reply = controller.handle_manual_bootstrap_addfine_cancel(
+                addfine_cancel_plate, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        addfine_save_plate = decode_manual_bootstrap_addfine_save_callback(data)
+        if addfine_save_plate is not None:
+            await _ack_then_await_slow_check(
+                event,
+                controller.handle_manual_bootstrap_addfine_save(
+                    addfine_save_plate, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+                ),
+                is_trusted=is_trusted,
+            )
+            return
+
+        finish_prompt_plate = decode_manual_bootstrap_finish_prompt_callback(data)
+        if finish_prompt_plate is not None:
+            reply = controller.handle_manual_bootstrap_finish_prompt(
+                finish_prompt_plate, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        finish_back_plate = decode_manual_bootstrap_finish_back_callback(data)
+        if finish_back_plate is not None:
+            reply = controller.handle_manual_bootstrap_finish_back(
+                finish_back_plate, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        finish_confirm_plate = decode_manual_bootstrap_finish_confirm_callback(data)
+        if finish_confirm_plate is not None:
+            reply = controller.handle_manual_bootstrap_finish_confirm(
+                finish_confirm_plate, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
         await event.answer("Неизвестная или устаревшая кнопка", alert=True)
 
     # Bot identity switch (см. audit report) — @ProtocolGEbot.
@@ -530,17 +677,24 @@ def _split_telegram_text(text: str, *, limit: int = _TELEGRAM_SAFE_TEXT_LIMIT) -
     return chunks
 
 
-async def _answer_and_send(event, reply, *, is_trusted: bool = False) -> None:
+async def _answer_and_send(event, reply, *, is_trusted: bool = False, on_reply=None) -> None:
     """Общий хвост для callback'ов, которые могут вернуть None (=
     подписка не найдена/не принадлежит этому пользователю, см.
     reader/public_bot/keyboards.py про то, почему сам факт валидного
     subscription_id в callback_data ничего не доказывает) — в этом случае
-    показываем короткий alert и ничего не создаём/не меняем."""
+    показываем короткий alert и ничего не создаём/не меняем.
+
+    on_reply — тот же необязательный side-effect хук, что и у
+    _ack_then_await_slow_check (см. его докстрок) — None для всех call
+    site'ов, кроме manual-bootstrap "✅ Штрафов нет" (см.
+    BotReply.customer_notify_messages)."""
     if reply is None:
         await event.answer(CALLBACK_NOT_AUTHORIZED_TEXT, alert=True)
         return
     await event.answer()
     await _send_reply(event, reply, prefer_edit=True, is_trusted=is_trusted)
+    if on_reply is not None:
+        await on_reply(event, reply)
 
 
 async def _ack_then_await_slow_check(event, coro, *, is_trusted: bool = False, on_reply=None) -> None:
@@ -647,6 +801,14 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False, is_trusted: bo
         )
     elif reply.my_car_inactive_id is not None:
         buttons = my_car_inactive_keyboard(reply.my_car_inactive_id)
+    elif reply.inline_buttons:
+        # "ВРЕМЕННЫЙ manager workflow для Georgia fines bot" (см. задачу) —
+        # тот же приём, что и у cta_buttons ниже, только Button.inline(...)
+        # (callback_data), а не Button.url(...) — см. BotReply.inline_buttons
+        # докстрок.
+        buttons = [
+            [Button.inline(label, data) for label, data in row] for row in reply.inline_buttons
+        ]
     elif reply.cta_buttons:
         # Manual "🔎 Проверить сейчас" — коммерческие CTA (см.
         # ConversationController._owner_cta_buttons); conversation.py

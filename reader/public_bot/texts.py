@@ -170,8 +170,17 @@ def format_check_now_result(outcome) -> str:
             "сейчас не удалось. Попробуйте позже."
         )
     if not outcome.fines:
-        return f"🔎 {format_plate_for_telegram(outcome.car_number)}: штрафов не найдено"
+        return format_no_fines_found(outcome.car_number)
     return format_check_now_fines_message(car_number=outcome.car_number, fines=outcome.fines)
+
+
+def format_no_fines_found(car_number: str) -> str:
+    """Canonical "штрафов не найдено" (см. задачу "ВРЕМЕННЫЙ manager
+    workflow для Georgia fines bot" п.4: "не придумывать второй формат,
+    если стандартный уже есть") — извлечено из format_check_now_result()
+    выше, чтобы manual-bootstrap "✅ Штрафов нет" отправлял клиенту ТОТ ЖЕ
+    текст, без второй копии f-строки."""
+    return f"🔎 {format_plate_for_telegram(car_number)}: штрафов не найдено"
 
 
 def format_stop_success(car_number: str) -> str:
@@ -933,6 +942,119 @@ def _format_duration(seconds: float) -> str:
     if minutes:
         return f"{minutes} мин {secs} сек"
     return f"{secs} сек"
+
+
+# ---- "ВРЕМЕННЫЙ manager workflow для Georgia fines bot" (см. задачу) ----
+# Manual bootstrap нового физического номера менеджером, пока production
+# VPS не имеет сетевого доступа к police.ge — тексты/кнопки ниже видны
+# ТОЛЬКО fine_admin менеджерам (см. ConversationController._is_fine_admin),
+# никогда обычным пользователям.
+
+MANUAL_BOOTSTRAP_NO_FINES_LABEL = "✅ Штрафов нет"
+MANUAL_BOOTSTRAP_ADD_FINE_LABEL = "➕ Добавить штраф"
+MANUAL_BOOTSTRAP_CONFIRM_LABEL = "✅ Подтвердить"
+MANUAL_BOOTSTRAP_CANCEL_ARROW_LABEL = "⬅️ Отмена"
+MANUAL_BOOTSTRAP_SAVE_FINE_LABEL = "✅ Сохранить штраф"
+MANUAL_BOOTSTRAP_EDIT_LABEL = "✏️ Исправить"
+MANUAL_BOOTSTRAP_CANCEL_X_LABEL = "❌ Отмена"
+MANUAL_BOOTSTRAP_ADD_ANOTHER_LABEL = "➕ Добавить ещё штраф"
+MANUAL_BOOTSTRAP_FINISH_LABEL = "✅ Завершить проверку"
+MANUAL_BOOTSTRAP_FINISH_YES_LABEL = "✅ Да, завершить"
+MANUAL_BOOTSTRAP_BACK_LABEL = "⬅️ Назад"
+MANUAL_BOOTSTRAP_PENDING_QUEUE_LABEL = "⏳ Ожидают проверки"
+MANUAL_BOOTSTRAP_OPEN_LABEL = "Открыть"
+MANUAL_BOOTSTRAP_SKIP_COMMAND = "/skip"
+
+MANUAL_BOOTSTRAP_ALREADY_COMPLETED_TEXT = "ℹ️ Проверка этого автомобиля уже завершена."
+MANUAL_BOOTSTRAP_NO_PLATES_TASKS_TEXT = (
+    "⚠️ Для этого номера не найдено активных задач мониторинга."
+)
+MANUAL_BOOTSTRAP_NO_PENDING_TEXT = "✅ Нет автомобилей, ожидающих первичной проверки."
+
+
+def format_manual_bootstrap_nofine_confirm_prompt(car_number: str) -> str:
+    return (
+        f"🚗 {format_plate_for_telegram(car_number)}\n\n"
+        "Подтвердить, что вы вручную проверили автомобиль на police.ge "
+        "и неоплаченных штрафов нет?"
+    )
+
+
+def format_manual_bootstrap_nofine_done_manager_text(car_number: str) -> str:
+    return (
+        "✅ Проверка завершена\n"
+        f"🚗 {format_plate_for_telegram(car_number)}\n"
+        "Штрафов не найдено."
+    )
+
+
+MANUAL_BOOTSTRAP_PROTOCOL_PROMPT_TEXT = "Введите номер протокола/квитанции штрафа:"
+MANUAL_BOOTSTRAP_AMOUNT_PROMPT_TEXT = (
+    "Введите сумму штрафа (как указано на странице police.ge, только число, без валюты):"
+)
+MANUAL_BOOTSTRAP_DATE_PROMPT_TEXT = "Введите дату нарушения (в формате ДД.ММ.ГГГГ):"
+MANUAL_BOOTSTRAP_PLACE_PROMPT_TEXT = (
+    f"Введите место нарушения, если указано (или {MANUAL_BOOTSTRAP_SKIP_COMMAND}, чтобы пропустить):"
+)
+MANUAL_BOOTSTRAP_ARTICLE_PROMPT_TEXT = (
+    f"Введите статью/описание нарушения, если указано "
+    f"(или {MANUAL_BOOTSTRAP_SKIP_COMMAND}, чтобы пропустить):"
+)
+MANUAL_BOOTSTRAP_INVALID_AMOUNT_TEXT = "⚠️ Не удалось распознать сумму. Введите число, например: 50"
+MANUAL_BOOTSTRAP_INVALID_DATE_TEXT = (
+    "⚠️ Не удалось распознать дату. Введите в формате ДД.ММ.ГГГГ, например: 05.10.2026"
+)
+
+
+def format_manual_bootstrap_review(
+    *, car_number: str, protocol_no: str, violation_date: date, amount: float,
+    place: str | None, article: str | None,
+) -> str:
+    lines = [
+        f"🚗 {format_plate_for_telegram(car_number)}",
+        "",
+        f"Протокол: {protocol_no}",
+        f"Дата нарушения: {_fmt_date(violation_date)}",
+        f"Сумма: {amount} GEL",
+        f"Статья: {article or '—'}",
+    ]
+    if place:
+        lines.append(f"Место: {place}")
+    return "\n".join(lines)
+
+
+def format_manual_bootstrap_duplicate_text(car_number: str, *, protocol_no: str) -> str:
+    return (
+        "ℹ️ Этот штраф уже есть в базе.\n"
+        f"🚗 {format_plate_for_telegram(car_number)}\n"
+        f"Протокол: {protocol_no}"
+    )
+
+
+MANUAL_BOOTSTRAP_FINE_SAVED_TEXT = "✅ Штраф сохранён."
+
+
+def format_manual_bootstrap_finish_confirm_prompt(car_number: str) -> str:
+    return (
+        f"🚗 {format_plate_for_telegram(car_number)}\n\n"
+        "Вы подтверждаете, что все найденные штрафы для этого автомобиля внесены?"
+    )
+
+
+def format_manual_bootstrap_finish_done_text(car_number: str, *, fines_added: int) -> str:
+    return (
+        "✅ Первичная проверка завершена\n"
+        f"🚗 {format_plate_for_telegram(car_number)}\n"
+        f"Добавлено штрафов: {fines_added}"
+    )
+
+
+def format_manual_bootstrap_pending_queue(plates: list[str]) -> str:
+    if not plates:
+        return MANUAL_BOOTSTRAP_NO_PENDING_TEXT
+    lines = [MANUAL_BOOTSTRAP_PENDING_QUEUE_LABEL, ""]
+    lines += [f"🚗 {format_plate_for_telegram(plate)}" for plate in plates]
+    return "\n".join(lines)
 
 
 def format_full_check_summary(outcome: FullCheckOutcome) -> str:
