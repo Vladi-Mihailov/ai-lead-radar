@@ -236,6 +236,31 @@ class FineMonitorSettings(BaseModel):
     # None, пока collector_api_enabled=False — ни во что не используется.
     collector_hmac_secret: str | None = None
 
+    # "Fix the Georgia public bot Check Now flow" — противоположное
+    # направление от collector_api_host/port выше: ТАМ production слушает,
+    # СЮДА production стучится (REDNET'овский check-now сервер, см. reader/
+    # georgia_collector/check_now_server.py). Не секрет (как и
+    # collector_api_host выше) — HMAC-секрет тот же самый, общий
+    # collector_hmac_secret. None, пока не настроен — валидируется как
+    # обязательный только когда он реально может понадобиться (см.
+    # validate_collector_api_config() в reader/public_bot/main.py:
+    # collector_api_enabled=true И georgia_checknow_routing != "local").
+    collector_checknow_base_url: str | None = None
+    # "auto" (по умолчанию) — REDNET ОСТАЁТСЯ fallback-транспортом, не
+    # обязательной зависимостью: сначала всегда пробуется локальный
+    # PoliceGeSession (с его же circuit breaker'ом), REDNET — только при
+    # его сбое (см. reader/fines/rednet_check_now_provider.py::
+    # AutoFailoverCheckNowProvider модульный докстрок про то, почему это не
+    # требует отдельного "прощупывания" восстановления: тот же breaker уже
+    # решает, когда снова пробовать local). "local" — поведение БЕЗ единого
+    # изменения (игнорирует REDNET вовсе, даже если collector_api_enabled=
+    # true). "rednet" — наоборот, ВСЕГДА через REDNET, local не трогается
+    # (для диагностики/принудительного тестирования REDNET-пути). Значение
+    # учитывается ТОЛЬКО когда collector_api_enabled=true — при False Check
+    # Now всегда локальный, этот флаг тогда не читается вовсе (см. reader/
+    # public_bot/main.py).
+    georgia_checknow_routing: Literal["auto", "local", "rednet"] = "auto"
+
 
 class InviterWorkerSettings(BaseModel):
     """Постоянный фоновый режим инвайтера (см. reader/inviter/worker.py,
@@ -702,6 +727,8 @@ def load_settings(config_path: Path) -> Settings:
                 collector_api_host=fine_monitor_raw.get("collector_api_host", "127.0.0.1"),
                 collector_api_port=int(fine_monitor_raw.get("collector_api_port", 8765)),
                 collector_hmac_secret=os.getenv("GEORGIA_COLLECTOR_HMAC_SECRET"),
+                collector_checknow_base_url=fine_monitor_raw.get("collector_checknow_base_url"),
+                georgia_checknow_routing=fine_monitor_raw.get("georgia_checknow_routing", "auto"),
             ),
             inviter=InviterSettings(
                 worker=InviterWorkerSettings(

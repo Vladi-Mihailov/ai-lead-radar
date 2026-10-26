@@ -90,6 +90,7 @@ from reader.public_bot.keyboards import (
     turkey_bot_link_keyboard,
 )
 from reader.public_bot.known_users_repository import BotKnownUsersRepository
+from reader.public_bot.subscription_service import CHECK_ALREADY_IN_PROGRESS
 from reader.public_bot.texts import CALLBACK_NOT_AUTHORIZED_TEXT, MAIN_MENU_TEXT
 
 logger = logging.getLogger(__name__)
@@ -278,20 +279,25 @@ def register(
         check_now_id = decode_check_now_callback(data)
         if check_now_id is not None:
             # Production incident O127PX62 (2026-10-21) — см.
-            # _ack_then_await_slow_check.
-            await _ack_then_await_slow_check(
+            # _ack_then_await_slow_check. "⏳" + repeated-click guard (см.
+            # "Fix the Georgia public bot Check Now flow") — см.
+            # _ack_hourglass_then_await_slow_check.
+            await _ack_hourglass_then_await_slow_check(
                 event,
-                controller.handle_check_now_choice(check_now_id, telegram_user_id=event.sender_id),
+                lambda on_check_started: controller.handle_check_now_choice(
+                    check_now_id, telegram_user_id=event.sender_id, on_check_started=on_check_started,
+                ),
                 is_trusted=is_trusted,
             )
             return
 
         my_car_check_now_once = decode_my_car_check_now_once_callback(data)
         if my_car_check_now_once is not None:
-            await _ack_then_await_slow_check(
+            await _ack_hourglass_then_await_slow_check(
                 event,
-                controller.handle_my_car_check_now_once(
+                lambda on_check_started: controller.handle_my_car_check_now_once(
                     my_car_check_now_once, telegram_user_id=event.sender_id,
+                    on_check_started=on_check_started,
                 ),
                 is_trusted=is_trusted,
             )
@@ -389,10 +395,11 @@ def register(
 
         trusted_check_now_once_id = decode_trusted_check_now_once_callback(data)
         if trusted_check_now_once_id is not None:
-            await _ack_then_await_slow_check(
+            await _ack_hourglass_then_await_slow_check(
                 event,
-                controller.handle_trusted_check_now_once(
+                lambda on_check_started: controller.handle_trusted_check_now_once(
                     trusted_check_now_once_id, telegram_user_id=event.sender_id,
+                    on_check_started=on_check_started,
                 ),
                 is_trusted=is_trusted,
             )
@@ -740,12 +747,81 @@ async def _ack_then_await_slow_check(event, coro, *, is_trusted: bool = False, o
         await on_reply(event, reply)
 
 
-async def _send_reply(event, reply, *, prefer_edit: bool = False, is_trusted: bool = False) -> None:
+async def _ack_hourglass_then_await_slow_check(event, coro_factory, *, is_trusted: bool = False) -> None:
+    """Для ровно ТРЁХ callback'ов — check_now_id/my_car_check_now_once/
+    trusted_check_now_once (см. "Fix the Georgia public bot Check Now
+    flow") — "🔎 Проверить сейчас" семейство, и ТОЛЬКО для них: period
+    (onboarding-проверка) и debt_refresh_confirm (батч) намеренно НЕ
+    переведены на этот хелпер, остаются на _ack_then_await_slow_check как
+    раньше — разные UX-контексты, голый "⏳" там не запрашивался.
+
+    Два отличия от _ack_then_await_slow_check выше:
+    1) "⏳" отправляется СРАЗУ после ack, но НЕ раньше гарантированного
+       захвата repeated-click guard'а (см. SubscriptionService.
+       _check_in_progress) — coro_factory принимает on_check_started,
+       вызываемый check_now()/check_now_task_for_search() РОВНО ОДИН раз,
+       сразу после захвата guard'а, ДО медленного police.ge/REDNET-запроса
+       (см. их докстроки). Это гарантирует: дубль-клик, отклонённый guard'ом
+       (CHECK_ALREADY_IN_PROGRESS, см. ниже), никогда не порождает второй
+       "⏳" — on_check_started для него просто не вызывается вовсе.
+    2) Финальный результат РЕДАКТИРУЕТ именно это "⏳"-сообщение
+       (_send_reply(..., edit_message=...)), а не отправляет третье — если
+       "⏳" так и не было отправлено (completed/истёкшая карточка выше в
+       handle_check_now_choice — guard вообще не затрагивается, живой check
+       не запускается), edit_message остаётся None и поведение совпадает с
+       обычным _send_reply(..., edit_message=None): одно новое сообщение,
+       как и раньше.
+
+    coro_factory — callable(on_check_started) -> coroutine (НЕ готовая
+    корутина, как у _ack_then_await_slow_check выше — on_check_started
+    должен попасть внутрь controller.handle_*(...) ДО того, как эта
+    корутина начнёт выполняться, поэтому вызывающий код в _on_callback
+    передаёт лямбду, а не уже построенный coroutine object).
+
+    CHECK_ALREADY_IN_PROGRESS — "acknowledge the callback without starting
+    another check... No additional Telegram message is necessary" (см.
+    задачу): ack уже произошёл выше, здесь просто return — ни "⏳", ни
+    результат, ни CALLBACK_NOT_AUTHORIZED_TEXT (это ДРУГОЕ, уже
+    существующее None-значение, см. ветку ниже) не отправляются."""
+    try:
+        await event.answer()
+    except QueryIdInvalidError:
+        pass
+
+    hourglass_message = None
+
+    async def _show_hourglass() -> None:
+        nonlocal hourglass_message
+        hourglass_message = await event.respond("⏳")
+
+    reply = await coro_factory(_show_hourglass)
+
+    if reply is CHECK_ALREADY_IN_PROGRESS:
+        return
+    if reply is None:
+        await event.respond(CALLBACK_NOT_AUTHORIZED_TEXT)
+        return
+    await _send_reply(event, reply, is_trusted=is_trusted, edit_message=hourglass_message)
+
+
+async def _send_reply(
+    event, reply, *, prefer_edit: bool = False, is_trusted: bool = False, edit_message=None,
+) -> None:
     """is_trusted — ТОЛЬКО для main_menu_keyboard(is_trusted=...) (см.
     "⛔ Остановить мониторинг"/"📊 Статистика"): единственное место,
     решающее, показывать ли эти две кнопки в персистентной reply-
     клавиатуре — вычисляется caller'ом (_on_message/_on_callback) через
-    controller.is_trusted(event.sender_id) один раз на событие."""
+    controller.is_trusted(event.sender_id) один раз на событие.
+
+    edit_message — опционально, Telethon Message (см. "Fix the Georgia
+    public bot Check Now flow" и _ack_hourglass_then_await_slow_check ниже):
+    когда задан, первый chunk редактирует ИМЕННО ЭТО сообщение (edit_message
+    .edit(...), НЕ event.edit() — это другое, более раннее сообщение, не то,
+    на кнопке которого произошёл callback) вместо отправки новой — "⏳"
+    чисто заменяется финальным результатом, без лишнего сообщения-хвоста.
+    Игнорируется, если prefer_edit=True (тот редактирует event-сообщение,
+    см. его собственный смысл выше) — оба параметра вместе не используются
+    ни одним существующим call site'ом."""
     buttons = None
     if reply.show_main_menu:
         buttons = main_menu_keyboard(is_trusted=is_trusted)
@@ -867,6 +943,19 @@ async def _send_reply(event, reply, *, prefer_edit: bool = False, is_trusted: bo
             # до применения).
             logger.warning(
                 "Не удалось отредактировать сообщение @ProtocolGEbot, отправляю новое",
+                exc_info=True,
+            )
+    elif edit_message is not None:
+        try:
+            await edit_message.edit(chunks[0], buttons=buttons if last_index == 0 else None)
+            send_from = 1
+        except Exception:
+            # Тот же fallback, что и у prefer_edit выше (например, "⏳"
+            # удалено пользователем вручную между отправкой и готовностью
+            # результата) — результат всё равно должен дойти, новым
+            # сообщением, а не потеряться.
+            logger.warning(
+                "Не удалось отредактировать '⏳' @ProtocolGEbot, отправляю новое",
                 exc_info=True,
             )
 

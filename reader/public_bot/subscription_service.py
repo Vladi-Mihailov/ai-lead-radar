@@ -7,6 +7,7 @@ reader/public_bot/main.py — сборка). Никакой отдельной �
 provider/check-логики здесь нет.
 """
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
@@ -136,6 +137,16 @@ class AddCarWithoutClientOutcome:
     new_fines_count: int
 
 
+# "Fix the Georgia public bot Check Now flow" — sentinel returned by
+# check_now()/check_now_task_for_search() when a check for the SAME
+# underlying FineMonitoringTask is already running (see SubscriptionService.
+# _check_in_progress below). A module-level `object()` rather than, say, a
+# string — distinct from any real CheckNowOutcome AND from None (which
+# already means "not found/not authorized", a different, pre-existing
+# condition that must keep producing CALLBACK_NOT_AUTHORIZED_TEXT) — `is`
+# comparison at every call site, never confusable with real data.
+CHECK_ALREADY_IN_PROGRESS = object()
+
 _CLAIM_TOKEN_TTL = timedelta(days=7)
 
 # Подписки, которые пользователь может вручную проверить через
@@ -233,6 +244,18 @@ class SubscriptionService:
         self._owner_resolver_client = owner_resolver_client
         self._bot_username = bot_username
         self._plate_bootstrap_repository = plate_bootstrap_repository
+        # "Fix the Georgia public bot Check Now flow" — repeated-click guard
+        # for check_now()/check_now_task_for_search() below, keyed by the
+        # resolved FineMonitoringTask.id (NOT subscription_id — handle_
+        # trusted_check_now_once in conversation.py uses a raw task_id
+        # while the self-service/my-car paths resolve a subscription_id to
+        # a task internally; a set keyed inconsistently across those two
+        # id-spaces would produce wrong collisions/non-collisions). Plain
+        # in-memory set, no asyncio.Lock — a single process, no `await`
+        # between the membership check and the add in check_now()/
+        # check_now_task_for_search() below, so it's already atomic under
+        # asyncio's cooperative scheduling.
+        self._check_in_progress: set[int] = set()
 
     # ---- self-service (обычный пользователь) ----
 
@@ -886,10 +909,15 @@ class SubscriptionService:
 
     async def check_now(
         self, subscription_id: int, *, telegram_user_id: int,
+        on_check_started: Callable[[], Awaitable[None]] | None = None,
     ) -> CheckNowOutcome | None:
         """None — подписка не найдена/не принадлежит/не создана этим
         пользователем (см. get_actionable_subscription) — вызывающий код
         должен показать "недоступно", ничего не проверяя.
+        CHECK_ALREADY_IN_PROGRESS — проверка этой же задачи (task.id) уже
+        выполняется прямо сейчас (см. "Fix the Georgia public bot Check Now
+        flow") — вызывающий код должен ничего не отправлять, кроме уже
+        сделанного event.answer() (см. handlers.py).
 
         Иначе — ТОТ ЖЕ FineCheckService.check_task(), что и у фонового
         FineJob/ClientFineJob и у self-service/delegated add_car — никакой
@@ -898,7 +926,14 @@ class SubscriptionService:
         причина, что и в add_car()/add_delegated_car(): NotificationFlushJob
         (см. reader/jobs/notification_flush_job.py) в main-процессе
         подхватит результат в течение ~30 секунд, без риска double-send
-        между процессами."""
+        между процессами.
+
+        on_check_started — опциональный хук (см. "Fix the Georgia public
+        bot Check Now flow"), awaited РОВНО ОДИН раз, сразу после того, как
+        guard успешно захвачен и ПЕРЕД медленным check_task_or_read_cached()
+        — handlers.py использует это, чтобы отправить "⏳" именно в этот
+        момент, а не раньше (дубль-клик до этой точки не должен порождать
+        второй "⏳", см. CHECK_ALREADY_IN_PROGRESS выше)."""
         subscription = self.get_actionable_subscription(subscription_id, telegram_user_id=telegram_user_id)
         if subscription is None:
             return None
@@ -907,21 +942,34 @@ class SubscriptionService:
         if task is None:
             return None
 
-        # check_task_or_read_cached (не check_task()) — см. задачу "back
-        # off when police.ge is unavailable" + "EMERGENCY MODE USER
-        # BEHAVIOR": circuit breaker открыт -> читаем последнее
-        # достоверное состояние из нашей БД, БЕЗ единого обращения к
-        # police.ge и БЕЗ предупреждения пользователю (см. check_service.py
-        # докстрок).
-        check_result = await self._check_service.check_task_or_read_cached(task)
+        if task.id in self._check_in_progress:
+            return CHECK_ALREADY_IN_PROGRESS
+        self._check_in_progress.add(task.id)
+        try:
+            if on_check_started is not None:
+                await on_check_started()
 
-        return CheckNowOutcome(
-            car_number=subscription.car_number,
-            check_ok=check_result.shows_as_ok,
-            fines=check_result.current_fines if check_result.shows_as_ok else [],
-            is_owner=subscription.telegram_user_id == telegram_user_id,
-            provider_unavailable=check_result.provider_unavailable,
-        )
+            # check_task_or_read_cached (не check_task()) — см. задачу "back
+            # off when police.ge is unavailable" + "EMERGENCY MODE USER
+            # BEHAVIOR": circuit breaker открыт -> читаем последнее
+            # достоверное состояние из нашей БД, БЕЗ единого обращения к
+            # police.ge и БЕЗ предупреждения пользователю (см. check_service.py
+            # докстрок).
+            check_result = await self._check_service.check_task_or_read_cached(task)
+
+            return CheckNowOutcome(
+                car_number=subscription.car_number,
+                check_ok=check_result.shows_as_ok,
+                fines=check_result.current_fines if check_result.shows_as_ok else [],
+                is_owner=subscription.telegram_user_id == telegram_user_id,
+                provider_unavailable=check_result.provider_unavailable,
+            )
+        finally:
+            # try/finally (а не просто код после await) — освобождает guard
+            # на ВСЕХ путях выхода, включая asyncio.CancelledError (см.
+            # задачу: "released after... cancellation") — finally
+            # выполняется даже когда эта корутина отменена снаружи.
+            self._check_in_progress.discard(task.id)
 
     # ---- trusted-operator task-level admin (см. design report: пересмотр
     # архитектуры — fine_monitoring_tasks = source of truth автомобилей/
@@ -1129,7 +1177,9 @@ class SubscriptionService:
             key=lambda t: (t.last_successful_checked_at or datetime.min.replace(tzinfo=timezone.utc), t.id),
         )
 
-    async def check_now_task_for_search(self, task_id: int) -> CheckNowOutcome | None:
+    async def check_now_task_for_search(
+        self, task_id: int, *, on_check_started: Callable[[], Awaitable[None]] | None = None,
+    ) -> CheckNowOutcome | None:
         """Как check_now_task(), но БЕЗ требования status=='active' (см.
         get_task_for_trusted_admin вместо get_active_task_for_trusted_admin)
         — manager/trusted Search (см. задачу) должен показывать реальный
@@ -1137,20 +1187,33 @@ class SubscriptionService:
         manager car list, который тоже показывает OFF-машины, а не только
         активные, см. SubscriptionService.list_all_tasks_page). ТОТ ЖЕ
         FineCheckService.check_task() — никакой отдельной реализации
-        проверки/расчёта штрафов. None — задача не существует."""
+        проверки/расчёта штрафов. None — задача не существует.
+        CHECK_ALREADY_IN_PROGRESS/on_check_started — см. check_now() выше,
+        ТОТ ЖЕ guard (общий self._check_in_progress, ключ — task.id) — так
+        owner-инициированный check_now() и trusted Search для ОДНОЙ и той же
+        задачи корректно не дублируют друг друга."""
         task = self.get_task_for_trusted_admin(task_id)
         if task is None:
             return None
 
-        check_result = await self._check_service.check_task(task)
+        if task.id in self._check_in_progress:
+            return CHECK_ALREADY_IN_PROGRESS
+        self._check_in_progress.add(task.id)
+        try:
+            if on_check_started is not None:
+                await on_check_started()
 
-        return CheckNowOutcome(
-            car_number=task.car_number,
-            check_ok=check_result.shows_as_ok,
-            fines=check_result.current_fines if check_result.shows_as_ok else [],
-            is_owner=False,
-            provider_unavailable=check_result.provider_unavailable,
-        )
+            check_result = await self._check_service.check_task(task)
+
+            return CheckNowOutcome(
+                car_number=task.car_number,
+                check_ok=check_result.shows_as_ok,
+                fines=check_result.current_fines if check_result.shows_as_ok else [],
+                is_owner=False,
+                provider_unavailable=check_result.provider_unavailable,
+            )
+        finally:
+            self._check_in_progress.discard(task.id)
 
     def list_tasks_for_car(self, car_number: str) -> list[FineMonitoringTask]:
         """ВСЕ fine_monitoring_tasks с этим car_number, ЛЮБОГО статуса (см.
