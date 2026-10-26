@@ -41,6 +41,7 @@ from reader.dm_campaigns.repository import DmCampaignRepository  # noqa: E402
 from reader.dm_campaigns.sender_client import build_session_exists  # noqa: E402
 from reader.dm_campaigns.sender_selection import SenderSelector  # noqa: E402
 from reader.dm_campaigns.sender_state import DmSenderStateRepository  # noqa: E402
+from reader.dm_campaigns.source_access import DmSourceAccessRepository  # noqa: E402
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
 from reader.fines.notification_coordinator import FineNotificationCoordinator  # noqa: E402
@@ -580,9 +581,10 @@ def build_dm_outreach_components(
     # без сети) — для формы речи от первого лица в черновике.
     account_repository = TelegramAccountRepository(db_path)
     sender_states = DmSenderStateRepository(db_path)
+    source_access = DmSourceAccessRepository(db_path)
     sender_selection = SenderSelector(
         outreach_repository, campaign_repository, account_repository, sender_states,
-        session_exists=build_session_exists(PROJECT_ROOT),
+        session_exists=build_session_exists(PROJECT_ROOT), source_access=source_access,
     )
 
     def sender_persona(item) -> SenderPersona | None:
@@ -594,7 +596,8 @@ def build_dm_outreach_components(
         return SenderPersona(username=account.name, gender=persona.gender if persona else None)
 
     draft_service = DmDraftService(api_key=settings.ocr.openai_api_key, model=dm.model)
-    closables = [campaign_repository, outreach_repository, recent_repository, account_repository, sender_states]
+    closables = [campaign_repository, outreach_repository, recent_repository, account_repository, sender_states,
+                 source_access]
     feedback_retriever = None
     if dm.feedback_learning_enabled:
         feedback_repository = DmFeedbackRepository(db_path)
