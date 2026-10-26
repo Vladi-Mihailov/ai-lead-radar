@@ -33,6 +33,11 @@ from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapReposit
 from reader.fines.police_ge_circuit_breaker import PoliceGeCircuitBreaker
 from reader.fines.police_ge_provider import PoliceGeProvider
 from reader.fines.police_ge_session import PoliceGeSession
+from reader.fines.provider import FineProvider
+from reader.fines.rednet_check_now_provider import (
+    AutoFailoverCheckNowProvider,
+    RednetCheckNowProvider,
+)
 from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.fines.translation import FineTranslationService
 from reader.logging_setup import setup_logging
@@ -190,6 +195,59 @@ def validate_collector_api_config(settings) -> None:
             "fine_monitor.collector_api_enabled=true, но "
             "GEORGIA_COLLECTOR_HMAC_SECRET не задан в .env."
         )
+    # "Fix the Georgia public bot Check Now flow" — collector_checknow_
+    # base_url нужен ТОЛЬКО когда Check Now реально может постучаться в
+    # REDNET (routing="auto"/"rednet"). routing="local" намеренно никогда
+    # не трогает REDNET (см. _build_check_now_provider ниже) — требовать
+    # здесь base_url в этом режиме было бы ложной зависимостью, которую
+    # потом надо было бы объяснять в .env, хотя она ни во что не
+    # используется.
+    if (
+        settings.fine_monitor.georgia_checknow_routing != "local"
+        and not settings.fine_monitor.collector_checknow_base_url
+    ):
+        raise ConfigError(
+            "fine_monitor.collector_api_enabled=true и "
+            f"georgia_checknow_routing={settings.fine_monitor.georgia_checknow_routing!r}, "
+            "но fine_monitor.collector_checknow_base_url не задан в config.yaml."
+        )
+
+
+def build_check_now_provider(
+    fine_monitor, police_ge_session: PoliceGeSession, *,
+    rednet_client: httpx.AsyncClient | None = None,
+) -> FineProvider:
+    """Собирает FineProvider для 🔎 Проверить сейчас/Add Car onboarding/
+    trusted debt-refresh (ТОТ ЖЕ общий fine_provider, что передаётся в
+    FineCheckService ниже в run() — см. задачу "Fix the Georgia public bot
+    Check Now flow": сознательно ОДИН провайдер на все live-check call
+    site'ы этого процесса, не отдельная реализация только для одной кнопки).
+
+    collector_api_enabled=False ИЛИ georgia_checknow_routing="local" —
+    ровно сегодняшнее поведение, REDNET вообще не упоминается (rednet_client
+    может быть None, не используется). "rednet" — ТОЛЬКО через REDNET,
+    local police.ge не трогается вовсе (диагностика/принудительный тест
+    REDNET-пути). "auto" (по умолчанию, см. reader/settings.py) —
+    AutoFailoverCheckNowProvider: local первым, REDNET — только при его
+    сбое (см. его модульный докстрок про то, почему REDNET остаётся
+    fallback-транспортом, а не обязательной зависимостью).
+
+    Вынесено в отдельную синхронную функцию (ТОТ ЖЕ приём, что и
+    validate_collector_api_config() выше) — тестируется без реального
+    event loop/HTTP-клиента."""
+    local = PoliceGeProvider(police_ge_session)
+    if not fine_monitor.collector_api_enabled or fine_monitor.georgia_checknow_routing == "local":
+        return local
+
+    if rednet_client is None:
+        raise ValueError(
+            "rednet_client обязателен, когда collector_api_enabled=true и "
+            f"georgia_checknow_routing={fine_monitor.georgia_checknow_routing!r} != 'local'"
+        )
+    rednet = RednetCheckNowProvider(rednet_client, hmac_secret=fine_monitor.collector_hmac_secret)
+    if fine_monitor.georgia_checknow_routing == "rednet":
+        return rednet
+    return AutoFailoverCheckNowProvider(local, rednet)
 
 
 def read_bot_token() -> str:
@@ -287,6 +345,10 @@ async def run() -> None:
     )
 
     support_repository = None
+    # None, пока не сконструирован ниже (только когда реально нужен) —
+    # ТОТ ЖЕ приём, что и у support_repository выше: виден в finally,
+    # даже если исключение произошло ДО соответствующего присваивания.
+    rednet_checknow_http_client = None
     try:
         # Тот же PoliceGeSession/PoliceGeProvider/FineCheckService, что и у
         # операторского Fine Monitor (см. reader/main.py::
@@ -310,7 +372,22 @@ async def run() -> None:
             request_timeout=settings.fine_monitor.request_timeout,
             circuit_breaker=police_ge_circuit_breaker,
         )
-        fine_provider = PoliceGeProvider(police_ge_session)
+        # "Fix the Georgia public bot Check Now flow" — rednet_checknow_
+        # http_client только когда он реально может понадобиться
+        # (validate_collector_api_config() выше уже гарантирует
+        # collector_checknow_base_url в этом случае); None иначе, тот же
+        # приём, что и у support_repository ниже (см. finally-блок).
+        rednet_checknow_http_client = (
+            httpx.AsyncClient(base_url=settings.fine_monitor.collector_checknow_base_url)
+            if (
+                settings.fine_monitor.collector_api_enabled
+                and settings.fine_monitor.georgia_checknow_routing != "local"
+            )
+            else None
+        )
+        fine_provider = build_check_now_provider(
+            settings.fine_monitor, police_ge_session, rednet_client=rednet_checknow_http_client,
+        )
         # Тот же общий OPENAI_API_KEY/приём, что и в reader/main.py::
         # build_fine_monitor_components — второй ключ/клиент не заводится.
         translator = (
@@ -513,6 +590,8 @@ async def run() -> None:
     finally:
         await http_client.aclose()
         await videos_police_ge_http_client.aclose()
+        if rednet_checknow_http_client is not None:
+            await rednet_checknow_http_client.aclose()
         task_repository.close()
         detected_fine_repository.close()
         user_repository.close()

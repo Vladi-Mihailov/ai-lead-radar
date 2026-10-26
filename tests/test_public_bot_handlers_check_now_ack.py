@@ -162,6 +162,25 @@ class _FakeTelethonClient:
         return decorator
 
 
+class _FakeMessage:
+    """Minimal stand-in for the real telethon.tl.custom.Message that
+    event.respond() returns — see "Fix the Georgia public bot Check Now
+    flow": _ack_hourglass_then_await_slow_check captures this to edit the
+    "⏳" message in place later. Logs edits as ("message_edit", ...) into
+    the SAME shared calls list, distinguishable from a plain event.edit()
+    ("edit") or a fresh event.respond() ("respond")."""
+
+    def __init__(self, calls_log: list[tuple], text: str, buttons):
+        self._calls_log = calls_log
+        self.text = text
+        self.buttons = buttons
+
+    async def edit(self, text, *, buttons=None):
+        self._calls_log.append(("message_edit", self.text, text, buttons))
+        self.text = text
+        self.buttons = buttons
+
+
 class _FakeCallbackEvent:
     def __init__(self, *, data: bytes, sender_id: int, chat_id: int, answer_error: Exception | None = None):
         self.data = data
@@ -185,6 +204,7 @@ class _FakeCallbackEvent:
 
     async def respond(self, text, *, buttons=None):
         self.calls.append(("respond", text, buttons))
+        return _FakeMessage(self.calls, text, buttons)
 
 
 def _register_and_get_event(fx: _Fixture, *, data: bytes, sender_id=_USER_ID, answer_error=None):
@@ -234,9 +254,14 @@ async def test_expired_callback_token_does_not_prevent_final_reply_with_fine(tmp
 
         call_names = [c[0] for c in event.calls]
         assert "answer" in call_names
-        assert "respond" in call_names
-        respond_call = next(c for c in event.calls if c[0] == "respond")
-        assert "🚨 Обнаружен штраф" in respond_call[1]
+        # "⏳" (see "Fix the Georgia public bot Check Now flow") is the
+        # first respond — the final result EDITS that same message rather
+        # than sending a third one (see _ack_hourglass_then_await_slow_check).
+        respond_calls = [c for c in event.calls if c[0] == "respond"]
+        assert len(respond_calls) == 1
+        assert respond_calls[0][1] == "⏳"
+        edit_call = next(c for c in event.calls if c[0] == "message_edit")
+        assert "🚨 Обнаружен штраф" in edit_call[2]
 
         rows = fx.detected_fine_repository.list_by_car_number("O127PX62")
         assert any(row.fingerprint == "fp-o127px62" for row in rows)
@@ -314,8 +339,10 @@ async def test_check_now_graceful_provider_error_still_reaches_user(tmp_path):
 
         call_names = [c[0] for c in event.calls]
         assert "respond" in call_names
-        respond_call = next(c for c in event.calls if c[0] == "respond")
-        assert "не удалось" in respond_call[1]
+        # Same hourglass-then-edit flow as above — the error text arrives
+        # via the edit of the "⏳" message, not a second respond.
+        edit_call = next(c for c in event.calls if c[0] == "message_edit")
+        assert "не удалось" in edit_call[2]
 
         task = fx.task_repository.get(fx.subscription_repository.get(subscription_id).monitoring_task_id)
         assert task.last_check_status == "error"

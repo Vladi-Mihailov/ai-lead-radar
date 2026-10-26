@@ -32,6 +32,7 @@ from reader.fines.police_ge_circuit_breaker import PoliceGeCircuitBreaker
 from reader.fines.police_ge_session import PoliceGeSession
 from reader.fines.public_feed_seen_repository import GeorgiaPublicFeedSeenRepository
 from reader.fines.public_feed_state_repository import GeorgiaPublicFeedStateRepository
+from reader.georgia_collector.check_now_server import run_check_now_server_forever
 from reader.georgia_collector.collector_job import GeorgiaCollectorJob
 from reader.georgia_collector.outbox_repository import CollectorOutboxRepository
 from reader.georgia_collector.production_client import ProductionApiClient
@@ -94,6 +95,51 @@ def load_timeouts(env: dict[str, str] | None = None) -> tuple[float, float]:
     return request_timeout, submission_timeout
 
 
+# Инбаунд check-now сервер (см. задачу "Fix the Georgia public bot Check Now
+# flow") — ОТДЕЛЬНЫЙ порт от production_base_url (8765, исходящий клиент к
+# production), чтобы не завязывать два независимых направления (REDNET->
+# production push/poll, production->REDNET check-now pull) на один и тот же
+# адрес/порт. 127.0.0.1 по умолчанию — ТОТ ЖЕ принцип, что и у production
+# settings.fine_monitor.collector_api_host: не предназначен быть напрямую
+# доступным из интернета, production достаёт его через WireGuard
+# (production.env задаёт здесь REDNET'овский wg0-адрес, см.
+# docs/georgia-remote-collector.md).
+_DEFAULT_CHECKNOW_HOST = "127.0.0.1"
+_DEFAULT_CHECKNOW_PORT = 8766
+
+
+def load_checknow_server_config(env: dict[str, str] | None = None) -> tuple[str, int]:
+    """(host, port) для run_check_now_server_forever() — та же тестируемая-
+    без-event-loop функция, что и load_timeouts() выше (см. её докстрок про
+    __main__.py's отсутствие юнит-тестов до появления этого приёма)."""
+    if env is None:
+        env = os.environ
+    host = env.get("GEORGIA_COLLECTOR_CHECKNOW_HOST", _DEFAULT_CHECKNOW_HOST)
+    port = int(env.get("GEORGIA_COLLECTOR_CHECKNOW_PORT", str(_DEFAULT_CHECKNOW_PORT)))
+    return host, port
+
+
+async def _run_concurrently(coroutines: list) -> None:
+    """Как asyncio.gather, но при ошибке в одной корутине отменяет
+    остальные — ТОТ ЖЕ приём, что и reader/public_bot/main.py::
+    _run_concurrently (не импортируется оттуда: отдельный, самостоятельный
+    процесс/entrypoint, а не библиотека) — крах polling-loop'а или
+    check-now-сервера не должен молча оставить другой висеть без логов."""
+    tasks = [asyncio.create_task(coro) for coro in coroutines]
+    try:
+        done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    for task in done:
+        exc = task.exception()
+        if exc is not None:
+            raise exc
+
+
 async def _run_forever(job: GeorgiaCollectorJob) -> None:
     while True:
         now = datetime.now(timezone.utc)
@@ -120,6 +166,7 @@ async def main() -> None:
         "GEORGIA_COLLECTOR_SOURCE_URL", "https://police.ge/protocol/index.php?lang=en",
     )
     request_timeout, submission_timeout = load_timeouts()
+    checknow_host, checknow_port = load_checknow_server_config()
     tz = ZoneInfo(os.getenv("GEORGIA_COLLECTOR_TIMEZONE", "Asia/Tbilisi"))
     run_times = _parse_run_times(os.getenv("GEORGIA_COLLECTOR_RUN_TIMES"))
 
@@ -151,13 +198,24 @@ async def main() -> None:
 
     logger.info(
         "Georgia collector starting: production=%s, run_times=%s, tz=%s, db=%s, "
-        "request_timeout=%ss, submission_timeout=%ss",
+        "request_timeout=%ss, submission_timeout=%ss, checknow=%s:%d",
         production_base_url, [t.strftime("%H:%M") for t in run_times], tz, db_path,
-        request_timeout, submission_timeout,
+        request_timeout, submission_timeout, checknow_host, checknow_port,
     )
 
+    # Та же SAME session (= тот же circuit breaker), что и у polling job'а
+    # выше — ОДИН breaker на процесс покрывает и запланированные, и
+    # on-demand (Check Now) обращения к police.ge (см. check_now_server.py
+    # модульный докстрок). Крах одной корутины не должен молча останавливать
+    # другую незамеченной — ТОТ ЖЕ приём, что и в reader/public_bot/main.py
+    # (_run_concurrently выше).
     try:
-        await _run_forever(job)
+        await _run_concurrently([
+            _run_forever(job),
+            run_check_now_server_forever(
+                session, hmac_secret=hmac_secret, host=checknow_host, port=checknow_port,
+            ),
+        ])
     finally:
         await police_http_client.aclose()
         await production_http_client.aclose()

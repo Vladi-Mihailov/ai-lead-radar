@@ -82,6 +82,7 @@ is_trusted() перепроверяется на КАЖДОМ шаге обои�
 РЕАЛЬНОМУ event.sender_id — callback task_id/subscription_id/page
 публичны и НЕ являются доказательством авторизации сами по себе."""
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
@@ -111,7 +112,10 @@ from reader.public_bot.protocol_check_ephemeral_store import ProtocolCheckEpheme
 from reader.public_bot.protocol_check_models import ProtocolCheckStatus
 from reader.public_bot.protocol_check_provider import ProtocolCheckProvider
 from reader.public_bot.statistics_service import BotStatisticsService
-from reader.public_bot.subscription_service import SubscriptionService
+from reader.public_bot.subscription_service import (
+    CHECK_ALREADY_IN_PROGRESS,
+    SubscriptionService,
+)
 from reader.public_bot.validation import (
     UsernameValidationError,
     normalize_telegram_username,
@@ -1993,6 +1997,7 @@ class ConversationController:
 
     async def handle_check_now_choice(
         self, subscription_id: int, *, telegram_user_id: int,
+        on_check_started: Callable[[], Awaitable[None]] | None = None,
     ) -> BotReply | None:
         """None — подписка не найдена/не принадлежит/не создана этим
         telegram_user_id (см. SubscriptionService.get_actionable_subscription) —
@@ -2025,9 +2030,13 @@ class ConversationController:
                 my_car_inactive_id=subscription.id,
             )
 
-        outcome = await self._subscriptions.check_now(subscription_id, telegram_user_id=telegram_user_id)
+        outcome = await self._subscriptions.check_now(
+            subscription_id, telegram_user_id=telegram_user_id, on_check_started=on_check_started,
+        )
         if outcome is None:
             return None
+        if outcome is CHECK_ALREADY_IN_PROGRESS:
+            return CHECK_ALREADY_IN_PROGRESS
         return self._format_check_now_outcome_reply(outcome)
 
     def _format_check_now_outcome_reply(self, outcome) -> BotReply:
@@ -2039,6 +2048,7 @@ class ConversationController:
 
     async def handle_my_car_check_now_once(
         self, subscription_id: int, *, telegram_user_id: int,
+        on_check_started: Callable[[], Awaitable[None]] | None = None,
     ) -> BotReply | None:
         """"🔎 Проверить разово" на ИСТЁК-карточке (см. keyboards.py::
         my_car_inactive_keyboard, задача "align Georgia user check-now
@@ -2053,10 +2063,15 @@ class ConversationController:
         None — не владелец/создатель подписки, ИЛИ подписка не существует
         (см. get_actionable_subscription внутри check_now() — тот же
         принцип: subscription_id публичен, авторизация ИСКЛЮЧИТЕЛЬНО через
-        запрос к БД по РЕАЛЬНОМУ telegram_user_id)."""
-        outcome = await self._subscriptions.check_now(subscription_id, telegram_user_id=telegram_user_id)
+        запрос к БД по РЕАЛЬНОМУ telegram_user_id). CHECK_ALREADY_IN_
+        PROGRESS — см. handle_check_now_choice выше, ТОТ ЖЕ guard."""
+        outcome = await self._subscriptions.check_now(
+            subscription_id, telegram_user_id=telegram_user_id, on_check_started=on_check_started,
+        )
         if outcome is None:
             return None
+        if outcome is CHECK_ALREADY_IN_PROGRESS:
+            return CHECK_ALREADY_IN_PROGRESS
         return self._format_check_now_outcome_reply(outcome)
 
     def handle_my_car_resume_prompt(
@@ -2375,6 +2390,7 @@ class ConversationController:
 
     async def handle_trusted_check_now_once(
         self, task_id: int, *, telegram_user_id: int,
+        on_check_started: Callable[[], Awaitable[None]] | None = None,
     ) -> BotReply | None:
         """"🔎 Проверить разово" на карточке "мониторинг завершён/выключен"
         (см. задачу "expired Georgia Check Now UX" и keyboards.py::
@@ -2405,9 +2421,13 @@ class ConversationController:
         if task is None:
             return None
 
-        outcome = await self._subscriptions.check_now_task_for_search(task_id)
+        outcome = await self._subscriptions.check_now_task_for_search(
+            task_id, on_check_started=on_check_started,
+        )
         if outcome is None:
             return BotReply(text=texts.CAR_ACTION_FAILED_TEXT, show_main_menu=True)
+        if outcome is CHECK_ALREADY_IN_PROGRESS:
+            return CHECK_ALREADY_IN_PROGRESS
 
         text = (
             texts.format_check_now_result(outcome)

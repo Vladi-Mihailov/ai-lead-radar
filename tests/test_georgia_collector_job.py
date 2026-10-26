@@ -331,6 +331,7 @@ def test_collector_job_module_never_imports_telegram_or_production_db():
         "import sys; import reader.georgia_collector.collector_job; "
         "import reader.georgia_collector.production_client; "
         "import reader.georgia_collector.outbox_repository; "
+        "import reader.georgia_collector.check_now_server; "
         "forbidden = ['telethon', 'reader.public_bot', 'reader.jobs', 'reader.users', 'reader.notifications']; "
         "leaked = [m for m in sys.modules if any(m == f or m.startswith(f + '.') for f in forbidden)]; "
         "print(leaked)"

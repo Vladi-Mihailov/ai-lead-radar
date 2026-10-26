@@ -6,6 +6,7 @@ FineCheckService, что использует и операторский FineJo
 никакой отдельной реализации проверки здесь не тестируется.
 """
 
+import asyncio
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -30,6 +31,7 @@ from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E
 from reader.public_bot.owner_resolution import OwnerResolutionError  # noqa: E402
 from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
 from reader.public_bot.subscription_service import (  # noqa: E402
+    CHECK_ALREADY_IN_PROGRESS,
     SubscriptionService,
     extend_client_bot_task_if_still_needed,
 )
@@ -1957,3 +1959,287 @@ async def test_extend_hook_is_noop_for_operator_scope_task(fx):
     # "operator task semantics не менять" — хук не должен трогать
     # операторскую задачу, даже если формально нашёл более позднюю подписку.
     assert updated.end_date == task.end_date
+
+
+# ---- "Fix the Georgia public bot Check Now flow" — check_now()/
+# check_now_task_for_search() repeated-click guard, keyed by task.id ----
+
+
+class _SlowProvider(FineProvider):
+    """search_by_plate() blocks on `gate` until released — lets a test
+    start a check, observe it "in flight", attempt a concurrent duplicate,
+    then let the first complete."""
+
+    def __init__(self):
+        self.gate = asyncio.Event()
+        self.entered = asyncio.Event()
+        self.requested_plates: list[str] = []
+
+    def is_available(self) -> bool:
+        return True
+
+    async def search_by_plate(self, plate: str) -> list[ParsedFineRecord]:
+        self.requested_plates.append(plate)
+        self.entered.set()
+        await self.gate.wait()
+        return []
+
+
+def _make_service_with_provider(tmp_path, provider: FineProvider) -> SubscriptionService:
+    db_path = tmp_path / "users.db"
+    task_repository = FineMonitoringTaskRepository(db_path)
+    subscription_repository = FineSubscriptionRepository(db_path)
+    user_repository = UserRepository(db_path)
+    check_service = FineCheckService(provider, task_repository, DetectedFineRepository(db_path))
+    return SubscriptionService(task_repository, subscription_repository, user_repository, check_service)
+
+
+def _make_client_car_for_service(
+    service: SubscriptionService, *, telegram_user_id=1, car_number="M295YB196",
+    period_days=30, today=date(2026, 9, 3),
+):
+    task = service._task_repository.create(
+        car_number=car_number, label=None, start_date=today, end_date=today + timedelta(days=period_days),
+        telegram_chat_id=telegram_user_id, created_by_user_id=telegram_user_id, monitoring_scope="client_bot",
+    )
+    sub = service._subscription_repository.create(
+        monitoring_task_id=task.id, car_number=car_number, telegram_user_id=telegram_user_id,
+        telegram_chat_id=telegram_user_id, telegram_username="client",
+        start_date=today, end_date=today + timedelta(days=period_days),
+    )
+    return task, sub
+
+
+async def test_check_now_second_call_for_same_task_returns_sentinel_while_running(tmp_path):
+    provider = _SlowProvider()
+    service = _make_service_with_provider(tmp_path, provider)
+    _task, sub = _make_client_car_for_service(service, car_number="AA001AA")
+
+    first = asyncio.ensure_future(service.check_now(sub.id, telegram_user_id=1))
+    await provider.entered.wait()
+
+    second = await service.check_now(sub.id, telegram_user_id=1)
+    assert second is CHECK_ALREADY_IN_PROGRESS
+    assert provider.requested_plates == ["AA001AA"]  # second call never reached the provider
+
+    provider.gate.set()
+    outcome = await first
+    assert outcome is not None and outcome is not CHECK_ALREADY_IN_PROGRESS
+    assert outcome.check_ok is True
+
+    # guard released — a third call now proceeds normally, not blocked.
+    third = await service.check_now(sub.id, telegram_user_id=1)
+    assert third is not CHECK_ALREADY_IN_PROGRESS
+
+
+async def test_check_now_does_not_block_different_tasks(tmp_path):
+    provider = _SlowProvider()
+    service = _make_service_with_provider(tmp_path, provider)
+    _task_a, sub_a = _make_client_car_for_service(service, car_number="AA001AA", telegram_user_id=1)
+    _task_b, sub_b = _make_client_car_for_service(service, car_number="BB002BB", telegram_user_id=2)
+
+    first = asyncio.ensure_future(service.check_now(sub_a.id, telegram_user_id=1))
+    await provider.entered.wait()
+
+    # A different task (different plate/subscriber) must not be blocked by
+    # task A's in-flight check.
+    second = asyncio.ensure_future(service.check_now(sub_b.id, telegram_user_id=2))
+    await asyncio.sleep(0)  # let it reach the provider
+    assert sorted(provider.requested_plates) == ["AA001AA", "BB002BB"]
+
+    provider.gate.set()
+    outcome_a = await first
+    outcome_b = await second
+    assert outcome_a.check_ok is True
+    assert outcome_b.check_ok is True
+
+
+async def test_check_now_guard_released_after_success(fx):
+    _task, sub = _make_client_car(fx)
+    fx.provider._records_by_car = {}
+
+    first = await fx.service.check_now(sub.id, telegram_user_id=1)
+    second = await fx.service.check_now(sub.id, telegram_user_id=1)
+
+    assert first.check_ok is True
+    assert second is not CHECK_ALREADY_IN_PROGRESS
+
+
+async def test_check_now_guard_released_after_zero_fines(fx):
+    _task, sub = _make_client_car(fx)
+
+    first = await fx.service.check_now(sub.id, telegram_user_id=1)
+    second = await fx.service.check_now(sub.id, telegram_user_id=1)
+
+    assert first.check_ok is True
+    assert first.fines == []
+    assert second is not CHECK_ALREADY_IN_PROGRESS
+
+
+async def test_check_now_guard_released_after_provider_failure(tmp_path):
+    service = _make_service_with_provider(
+        tmp_path, _FakeProvider(error=FineProviderError("boom")),
+    )
+    _task, sub = _make_client_car_for_service(service, car_number="AA001AA")
+
+    first = await service.check_now(sub.id, telegram_user_id=1)
+    assert first.check_ok is False
+
+    second = await service.check_now(sub.id, telegram_user_id=1)
+    assert second is not CHECK_ALREADY_IN_PROGRESS
+
+
+async def test_check_now_guard_released_after_circuit_unavailable(tmp_path):
+    """Closest analog in this codebase to "timeout" — PoliceGeUnavailableError
+    is what a slow/unreachable provider surfaces as (see
+    reader/fines/police_ge_session.py)."""
+    service = _make_service_with_provider(
+        tmp_path, _FakeProvider(error=PoliceGeUnavailableError("circuit open")),
+    )
+    _task, sub = _make_client_car_for_service(service, car_number="AA001AA")
+
+    # check_now() uses check_task_or_read_cached(), which deliberately NEVER
+    # surfaces provider_unavailable=True to its own caller (see check_service
+    # .py's docstring: "ни один вызывающий код никогда не увидит provider_
+    # unavailable=True наружу") — a circuit-open result here degrades to a
+    # cached-state read instead of an exception. The guard must still be
+    # released regardless of which of these two branches check_task_or_
+    # read_cached() took.
+    first = await service.check_now(sub.id, telegram_user_id=1)
+    assert first.provider_unavailable is False
+    assert first.check_ok is True
+
+    second = await service.check_now(sub.id, telegram_user_id=1)
+    assert second is not CHECK_ALREADY_IN_PROGRESS
+
+
+class _RaisingProvider(FineProvider):
+    """Raises a plain, non-FineProviderError exception — check_task() only
+    catches FineProviderError, so this propagates all the way up through
+    check_now(), proving its try/finally releases the guard on ANY
+    exception, not just the ones check_task() already handles gracefully."""
+
+    def is_available(self) -> bool:
+        return True
+
+    async def search_by_plate(self, plate: str) -> list[ParsedFineRecord]:
+        raise RuntimeError("unexpected bug")
+
+
+async def test_check_now_guard_released_after_unexpected_exception(tmp_path):
+    service = _make_service_with_provider(tmp_path, _RaisingProvider())
+    task, sub = _make_client_car_for_service(service, car_number="AA001AA")
+
+    with pytest.raises(RuntimeError):
+        await service.check_now(sub.id, telegram_user_id=1)
+
+    assert task.id not in service._check_in_progress
+
+
+async def test_check_now_guard_released_after_cancellation(tmp_path):
+    provider = _SlowProvider()
+    service = _make_service_with_provider(tmp_path, provider)
+    task, sub = _make_client_car_for_service(service, car_number="AA001AA")
+
+    pending = asyncio.ensure_future(service.check_now(sub.id, telegram_user_id=1))
+    await provider.entered.wait()
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    assert task.id not in service._check_in_progress
+    # guard released — a subsequent call proceeds normally.
+    provider.gate.set()
+    outcome = await service.check_now(sub.id, telegram_user_id=1)
+    assert outcome is not CHECK_ALREADY_IN_PROGRESS
+
+
+async def test_check_now_hook_runs_once_after_guard_acquired(tmp_path):
+    calls: list[str] = []
+
+    class _TrackingProvider(FineProvider):
+        def is_available(self) -> bool:
+            return True
+
+        async def search_by_plate(self, plate: str) -> list[ParsedFineRecord]:
+            calls.append("provider")
+            return []
+
+    service = _make_service_with_provider(tmp_path, _TrackingProvider())
+    _task, sub = _make_client_car_for_service(service, car_number="AA001AA")
+
+    async def hook():
+        calls.append("hook")
+
+    await service.check_now(sub.id, telegram_user_id=1, on_check_started=hook)
+
+    assert calls == ["hook", "provider"]
+
+
+async def test_check_now_does_not_invoke_hook_when_already_in_progress(tmp_path):
+    provider = _SlowProvider()
+    service = _make_service_with_provider(tmp_path, provider)
+    _task, sub = _make_client_car_for_service(service, car_number="AA001AA")
+    hook_calls = []
+
+    async def hook():
+        hook_calls.append(1)
+
+    first = asyncio.ensure_future(service.check_now(sub.id, telegram_user_id=1, on_check_started=hook))
+    await provider.entered.wait()
+
+    await service.check_now(sub.id, telegram_user_id=1, on_check_started=hook)
+    assert hook_calls == [1]  # only the first call's hook ran
+
+    provider.gate.set()
+    await first
+
+
+# ---- same guard shared across check_now() (owner/my-car) and
+# check_now_task_for_search() (trusted Search) — same task.id ----
+
+
+async def test_trusted_check_now_once_blocked_by_concurrent_owner_check_now(tmp_path):
+    provider = _SlowProvider()
+    service = _make_service_with_provider(tmp_path, provider)
+    task, sub = _make_client_car_for_service(service, car_number="AA001AA")
+
+    owner_call = asyncio.ensure_future(service.check_now(sub.id, telegram_user_id=1))
+    await provider.entered.wait()
+
+    trusted_result = await service.check_now_task_for_search(task.id)
+    assert trusted_result is CHECK_ALREADY_IN_PROGRESS
+
+    provider.gate.set()
+    await owner_call
+
+
+async def test_check_now_task_for_search_guard_released_after_success(tmp_path):
+    provider = _SlowProvider()
+    service = _make_service_with_provider(tmp_path, provider)
+    task, _sub = _make_client_car_for_service(service, car_number="AA001AA")
+    provider.gate.set()  # don't block this one
+
+    first = await service.check_now_task_for_search(task.id)
+    second = await service.check_now_task_for_search(task.id)
+
+    assert first.check_ok is True
+    assert second is not CHECK_ALREADY_IN_PROGRESS
+
+
+async def test_check_now_task_for_search_guard_released_after_circuit_unavailable(tmp_path):
+    """Unlike check_now() (check_task_or_read_cached(), see the test above),
+    check_now_task_for_search() uses check_task() directly and DOES surface
+    provider_unavailable=True — the guard must still be released afterward
+    regardless."""
+    service = _make_service_with_provider(
+        tmp_path, _FakeProvider(error=PoliceGeUnavailableError("circuit open")),
+    )
+    task, _sub = _make_client_car_for_service(service, car_number="AA001AA")
+
+    first = await service.check_now_task_for_search(task.id)
+    assert first.provider_unavailable is True
+
+    second = await service.check_now_task_for_search(task.id)
+    assert second is not CHECK_ALREADY_IN_PROGRESS
+    assert second is not CHECK_ALREADY_IN_PROGRESS
