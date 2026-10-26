@@ -474,3 +474,63 @@ async def test_fetch_published_protocols_transport_failure_records_against_circu
         await session.fetch_published_protocols(first_result=0)
 
     assert breaker.consecutive_failures == 1
+
+
+# ---- with_timeout() (см. задачу "fix Georgia Check Now local timeout") --
+# reader/public_bot/main.py::build_check_now_provider() uses this to give
+# AUTO's local leg a short 3s probe without touching the shared/global
+# request_timeout used everywhere else. ----
+
+async def test_with_timeout_passes_new_timeout_to_requests():
+    captured: list[float | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        timeout_info = request.extensions.get("timeout")
+        captured.append(timeout_info["connect"] if timeout_info else None)
+        if request.method == "GET":
+            return httpx.Response(200, text=_page_html("tok"))
+        return _json_response({"success": True, "data": {"count": 0, "results": []}})
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(base_url="https://police.ge/protocol/", transport=transport)
+    session = PoliceGeSession(client, page_url=_PAGE_URL, request_timeout=30)
+
+    short_session = session.with_timeout(3.0)
+    await short_session.search_by_plate("O127PX62")
+
+    assert captured == [3.0, 3.0]  # GET (csrf) + POST (search), both at the new timeout
+
+
+async def test_with_timeout_does_not_mutate_the_original_session():
+    log = _CallLog()
+    session = _make_session(
+        pages=[_page_html("tok")],
+        posts=[_json_response({"success": True, "data": {"count": 0, "results": []}})],
+        log=log,
+    )  # constructed with request_timeout=5 (see _make_session)
+
+    session.with_timeout(3.0)  # must not affect `session` itself
+    await session.search_by_plate("O127PX62")  # still usable at its own original timeout
+
+    assert len(log.calls) == 2  # GET + POST happened normally on the ORIGINAL session
+
+
+async def test_with_timeout_shares_the_same_circuit_breaker():
+    """The whole point of sharing (not duplicating) the breaker: a failure
+    recorded via one timeout variant must open the circuit for the OTHER
+    variant too -- "if the local circuit breaker is already open, REDNET
+    fallback remains immediate" only holds if there is exactly one breaker
+    state, not two independent ones."""
+    breaker = PoliceGeCircuitBreaker(failure_threshold=3)
+    for _ in range(3):
+        breaker.record_transport_failure()
+    assert breaker.is_open is True
+
+    log = _CallLog()
+    session = _make_session(pages=["unused"], posts=[], log=log, circuit_breaker=breaker)
+    short_session = session.with_timeout(3.0)
+
+    with pytest.raises(PoliceGeUnavailableError):
+        await short_session.search_by_plate("O127PX62")
+
+    assert log.calls == []  # rejected before any HTTP call, via the SHARED breaker

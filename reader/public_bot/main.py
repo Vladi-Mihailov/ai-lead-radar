@@ -225,19 +225,27 @@ def build_check_now_provider(
 
     collector_api_enabled=False ИЛИ georgia_checknow_routing="local" —
     ровно сегодняшнее поведение, REDNET вообще не упоминается (rednet_client
-    может быть None, не используется). "rednet" — ТОЛЬКО через REDNET,
-    local police.ge не трогается вовсе (диагностика/принудительный тест
-    REDNET-пути). "auto" (по умолчанию, см. reader/settings.py) —
-    AutoFailoverCheckNowProvider: local первым, REDNET — только при его
-    сбое (см. его модульный докстрок про то, почему REDNET остаётся
+    может быть None, не используется), police_ge_session используется КАК
+    ЕСТЬ — с общим fine_monitor.request_timeout, БЕЗ короткого
+    georgia_checknow_local_timeout ниже: у "local" нет fallback-назначения
+    вовсе, короткий probe-timeout имеет смысл только когда есть куда
+    упасть при быстром отказе (см. задачу "fix Georgia Check Now local
+    timeout" — иначе это была бы чистая деградация для единственного
+    режима, где короткий timeout ничем не компенсируется). "rednet" —
+    ТОЛЬКО через REDNET, local police.ge не конструируется и не трогается
+    вовсе (диагностика/принудительный тест REDNET-пути). "auto" (по
+    умолчанию, см. reader/settings.py) — AutoFailoverCheckNowProvider:
+    local первым, но ТОЛЬКО с коротким georgia_checknow_local_timeout (см.
+    PoliceGeSession.with_timeout() — тот же client/circuit breaker, другой
+    per-request timeout), REDNET — только при его сбое (см. AutoFailover
+    CheckNowProvider модульный докстрок про то, почему REDNET остаётся
     fallback-транспортом, а не обязательной зависимостью).
 
     Вынесено в отдельную синхронную функцию (ТОТ ЖЕ приём, что и
     validate_collector_api_config() выше) — тестируется без реального
     event loop/HTTP-клиента."""
-    local = PoliceGeProvider(police_ge_session)
     if not fine_monitor.collector_api_enabled or fine_monitor.georgia_checknow_routing == "local":
-        return local
+        return PoliceGeProvider(police_ge_session)
 
     if rednet_client is None:
         raise ValueError(
@@ -247,6 +255,8 @@ def build_check_now_provider(
     rednet = RednetCheckNowProvider(rednet_client, hmac_secret=fine_monitor.collector_hmac_secret)
     if fine_monitor.georgia_checknow_routing == "rednet":
         return rednet
+
+    local = PoliceGeProvider(police_ge_session.with_timeout(fine_monitor.georgia_checknow_local_timeout))
     return AutoFailoverCheckNowProvider(local, rednet)
 
 
