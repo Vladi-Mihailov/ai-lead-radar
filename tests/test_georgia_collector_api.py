@@ -239,6 +239,90 @@ async def test_bootstrap_result_zero_fines_sends_customer_message_via_telegram_c
     assert bootstrap_repo.is_completed("AA001AA")
 
 
+async def test_bootstrap_result_audit_mode_zero_fines_sends_no_customer_message(tmp_path):
+    """См. задачу "fix the remaining issues discovered during live testing"
+    — production 515-plate audit needed an ad-hoc skip-list workaround
+    precisely because this mode didn't exist at the HTTP layer yet."""
+    app, task_repo, _fine_repo, bootstrap_repo, telegram_client = _make_app(tmp_path)
+    _create_task(task_repo, "AA001AA", chat_id=-100111)
+    bootstrap_repo.ensure_pending("AA001AA")
+
+    payload = {"car_number": "AA001AA", "fines": [], "mode": "audit"}
+    body = json.dumps(payload).encode("utf-8")
+
+    async with TestClient(TestServer(app)) as client:
+        headers = _signed_headers("POST", "/internal/georgia/bootstrap-result", body)
+        headers["Content-Type"] = "application/json"
+        resp = await client.post("/internal/georgia/bootstrap-result", data=body, headers=headers)
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["bootstrap_completed"] is False
+
+    assert telegram_client.sent_messages == []
+    # Still pending -- audit mode never touches bootstrap state.
+    assert not bootstrap_repo.is_completed("AA001AA")
+
+
+async def test_bootstrap_result_invalid_mode_rejected(tmp_path):
+    app, task_repo, *_rest = _make_app(tmp_path)
+    _create_task(task_repo, "AA001AA", chat_id=-100111)
+
+    payload = {"car_number": "AA001AA", "fines": [], "mode": "not-a-real-mode"}
+    body = json.dumps(payload).encode("utf-8")
+
+    async with TestClient(TestServer(app)) as client:
+        headers = _signed_headers("POST", "/internal/georgia/bootstrap-result", body)
+        headers["Content-Type"] = "application/json"
+        resp = await client.post("/internal/georgia/bootstrap-result", data=body, headers=headers)
+        assert resp.status == 400
+
+
+async def test_bootstrap_result_missing_mode_field_defaults_to_bootstrap_behavior(tmp_path):
+    """Backward compatibility -- every call made before this field existed
+    (including the currently-deployed collector's own _run_bootstrap(),
+    which never sends it) must behave byte-for-byte as before."""
+    app, task_repo, _fine_repo, bootstrap_repo, telegram_client = _make_app(tmp_path)
+    _create_task(task_repo, "AA001AA", chat_id=-100111)
+    bootstrap_repo.ensure_pending("AA001AA")
+
+    payload = {"car_number": "AA001AA", "fines": []}  # no "mode" key at all
+    body = json.dumps(payload).encode("utf-8")
+
+    async with TestClient(TestServer(app)) as client:
+        headers = _signed_headers("POST", "/internal/georgia/bootstrap-result", body)
+        headers["Content-Type"] = "application/json"
+        resp = await client.post("/internal/georgia/bootstrap-result", data=body, headers=headers)
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["bootstrap_completed"] is True
+
+    assert telegram_client.sent_messages == [(-100111, format_no_fines_found("AA001AA"))]
+    assert bootstrap_repo.is_completed("AA001AA")
+
+
+async def test_bootstrap_result_missing_bootstrap_row_reports_not_completed(tmp_path):
+    """Regression for the K333HY190 production incident -- a plate with an
+    active task but no bootstrap row at all must report bootstrap_completed
+    as False, not True (mark_completed() silently no-ops on a missing row)."""
+    app, task_repo, _fine_repo, bootstrap_repo, telegram_client = _make_app(tmp_path)
+    _create_task(task_repo, "AA001AA", chat_id=-100111)
+    assert bootstrap_repo.get("AA001AA") is None
+
+    payload = {"car_number": "AA001AA", "fines": []}
+    body = json.dumps(payload).encode("utf-8")
+
+    async with TestClient(TestServer(app)) as client:
+        headers = _signed_headers("POST", "/internal/georgia/bootstrap-result", body)
+        headers["Content-Type"] = "application/json"
+        resp = await client.post("/internal/georgia/bootstrap-result", data=body, headers=headers)
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["bootstrap_completed"] is False  # fixed -- was incorrectly True before
+
+    assert telegram_client.sent_messages == []  # no unwarranted "no fines found" message
+    assert bootstrap_repo.get("AA001AA") is None
+
+
 async def test_health_endpoint_requires_auth(tmp_path):
     """See security review: EVERY route, including /health, must go through
     the auth middleware — not just the data-returning ones."""

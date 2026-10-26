@@ -64,6 +64,36 @@ def _require_env(name: str) -> str:
     return value
 
 
+# Default production-submission timeout (см. задачу "fix the remaining
+# issues discovered during live testing" — production-инцидент A500ET197:
+# 7 genuinely new fines took ~2min server-side из-за синхронного OpenAI-
+# перевода перед ответом). Вынесено в отдельную, напрямую тестируемую
+# функцию (тот же приём, что и reader/public_bot/main.py::
+# validate_collector_api_config() — __main__.py до этой задачи не имел ни
+# одного юнит-теста вовсе, конструирование всего в async main() делало
+# config-парсинг непроверяемым без реального event loop).
+_DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
+_DEFAULT_SUBMISSION_TIMEOUT_SECONDS = 180.0
+
+
+def load_timeouts(env: dict[str, str] | None = None) -> tuple[float, float]:
+    """(request_timeout, submission_timeout) — оба читаются из переданного
+    env (по умолчанию os.environ): GEORGIA_COLLECTOR_REQUEST_TIMEOUT (30s по
+    умолчанию) — police.ge И короткие production-эндпоинты (plates/
+    bootstrap-pending/health); GEORGIA_COLLECTOR_SUBMISSION_TIMEOUT (180s по
+    умолчанию) — ТОЛЬКО submit_feed_match/submit_bootstrap_result (см.
+    reader/georgia_collector/production_client.py модульный докстрок)."""
+    if env is None:
+        env = os.environ
+    request_timeout = float(
+        env.get("GEORGIA_COLLECTOR_REQUEST_TIMEOUT", str(_DEFAULT_REQUEST_TIMEOUT_SECONDS))
+    )
+    submission_timeout = float(
+        env.get("GEORGIA_COLLECTOR_SUBMISSION_TIMEOUT", str(_DEFAULT_SUBMISSION_TIMEOUT_SECONDS))
+    )
+    return request_timeout, submission_timeout
+
+
 async def _run_forever(job: GeorgiaCollectorJob) -> None:
     while True:
         now = datetime.now(timezone.utc)
@@ -89,7 +119,7 @@ async def main() -> None:
     source_url = os.getenv(
         "GEORGIA_COLLECTOR_SOURCE_URL", "https://police.ge/protocol/index.php?lang=en",
     )
-    request_timeout = float(os.getenv("GEORGIA_COLLECTOR_REQUEST_TIMEOUT", "30"))
+    request_timeout, submission_timeout = load_timeouts()
     tz = ZoneInfo(os.getenv("GEORGIA_COLLECTOR_TIMEZONE", "Asia/Tbilisi"))
     run_times = _parse_run_times(os.getenv("GEORGIA_COLLECTOR_RUN_TIMES"))
 
@@ -100,6 +130,9 @@ async def main() -> None:
     police_http_client = httpx.AsyncClient(
         base_url="https://police.ge/protocol/", headers={"User-Agent": _POLICE_GE_USER_AGENT},
     )
+    # client-wide default stays the SHORT request_timeout (plates/bootstrap-
+    # pending/health) — submission_timeout is applied per-call, only for
+    # submit_feed_match/submit_bootstrap_result (см. production_client.py).
     production_http_client = httpx.AsyncClient(base_url=production_base_url, timeout=request_timeout)
 
     circuit_breaker = PoliceGeCircuitBreaker()
@@ -107,7 +140,9 @@ async def main() -> None:
         police_http_client, page_url=source_url, request_timeout=request_timeout,
         circuit_breaker=circuit_breaker,
     )
-    production_client = ProductionApiClient(production_http_client, hmac_secret=hmac_secret)
+    production_client = ProductionApiClient(
+        production_http_client, hmac_secret=hmac_secret, submission_timeout=submission_timeout,
+    )
 
     job = GeorgiaCollectorJob(
         session, production_client, feed_state_repository, seen_repository, outbox_repository,
@@ -115,8 +150,10 @@ async def main() -> None:
     )
 
     logger.info(
-        "Georgia collector starting: production=%s, run_times=%s, tz=%s, db=%s",
+        "Georgia collector starting: production=%s, run_times=%s, tz=%s, db=%s, "
+        "request_timeout=%ss, submission_timeout=%ss",
         production_base_url, [t.strftime("%H:%M") for t in run_times], tz, db_path,
+        request_timeout, submission_timeout,
     )
 
     try:

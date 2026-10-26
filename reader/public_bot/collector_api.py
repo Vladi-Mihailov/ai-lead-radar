@@ -34,7 +34,11 @@ from telethon import TelegramClient
 
 from reader.fines.collector_auth import SIGNATURE_HEADER, TIMESTAMP_HEADER, verify
 from reader.fines.models import ParsedFineRecord
-from reader.public_bot.collector_ingest_service import CollectorIngestService
+from reader.public_bot.collector_ingest_service import (
+    BOOTSTRAP_MODE,
+    VALID_INGEST_MODES,
+    CollectorIngestService,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -150,10 +154,18 @@ def build_collector_api_app(
                 _record_from_payload({**entry, "car_number": car_number})
                 for entry in payload.get("fines", [])
             ]
+            # "bootstrap" (default, absent field) — identical to every call
+            # made before this field existed (см. задачу "fix the remaining
+            # issues discovered during live testing"). "audit" — see
+            # collector_ingest_service.py module docstring.
+            mode = payload.get("mode", BOOTSTRAP_MODE)
         except (ValueError, KeyError, TypeError) as exc:
             return web.json_response({"error": f"malformed payload: {exc}"}, status=400)
 
-        outcome = await ingest_service.ingest_bootstrap_result(car_number, records)
+        if mode not in VALID_INGEST_MODES:
+            return web.json_response({"error": f"invalid mode: {mode!r}"}, status=400)
+
+        outcome = await ingest_service.ingest_bootstrap_result(car_number, records, mode=mode)
 
         for chat_id, text in outcome.customer_notify_messages:
             try:

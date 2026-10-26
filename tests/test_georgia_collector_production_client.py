@@ -85,3 +85,66 @@ async def test_submit_feed_match_sends_signed_headers():
         assert result == {"status": "ok", "tasks_matched": 1}
         assert "x-collector-timestamp" in seen_headers
         assert "x-collector-signature" in seen_headers
+
+
+def _spy_on_requests(http_client: httpx.AsyncClient) -> list[dict]:
+    """Overrides http_client.request with a recording wrapper that still
+    delegates to the real (mock-transport-backed) request. Used to inspect
+    the per-call `timeout` kwarg _request() actually passes to httpx,
+    since httpx.Request itself does not expose the timeout it was sent
+    with (см. задачу "fix the remaining issues discovered during live
+    testing" -- A500ET197 submission-timeout fix)."""
+    captured: list[dict] = []
+    original_request = http_client.request
+
+    async def spy_request(method, path, **kwargs):
+        captured.append(kwargs)
+        return await original_request(method, path, **kwargs)
+
+    http_client.request = spy_request
+    return captured
+
+
+async def test_submit_feed_match_uses_submission_timeout_not_client_default():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "ok", "tasks_matched": 0})
+
+    async with _client_with_transport(httpx.MockTransport(handler)) as http_client:
+        captured = _spy_on_requests(http_client)
+        client = ProductionApiClient(http_client, hmac_secret="s", submission_timeout=123.0)
+        await client.submit_feed_match({"car_number": "AA001AA"})
+        assert captured[-1]["timeout"] == 123.0
+
+
+async def test_submit_bootstrap_result_uses_submission_timeout_not_client_default():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"bootstrap_completed": True})
+
+    async with _client_with_transport(httpx.MockTransport(handler)) as http_client:
+        captured = _spy_on_requests(http_client)
+        client = ProductionApiClient(http_client, hmac_secret="s", submission_timeout=123.0)
+        await client.submit_bootstrap_result({"car_number": "AA001AA", "fines": []})
+        assert captured[-1]["timeout"] == 123.0
+
+
+async def test_short_endpoints_do_not_override_client_default_timeout():
+    """get_active_plates/get_pending_bootstrap_plates/report_health must NOT
+    receive an explicit timeout kwarg -- they fall through to self.client's
+    own short default (см. __main__.py: request_timeout, 30s), unaffected
+    by submission_timeout."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/health"):
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(200, json={"plates": []})
+
+    async with _client_with_transport(httpx.MockTransport(handler)) as http_client:
+        captured = _spy_on_requests(http_client)
+        client = ProductionApiClient(http_client, hmac_secret="s", submission_timeout=123.0)
+        await client.get_active_plates()
+        await client.get_pending_bootstrap_plates()
+        await client.report_health({"status": "ok"})
+
+        assert len(captured) == 3
+        for kwargs in captured:
+            assert "timeout" not in kwargs
