@@ -268,7 +268,7 @@ async def test_add_car_without_username_completes_subscription_successfully(fx):
     )
 
     assert reply is not None
-    assert "✅ Автомобиль добавлен на мониторинг" in reply.text
+    assert "✅ Автомобиль добавлен" in reply.text
     [subscription] = fx.subscription_repository.list_by_user(2)
     assert subscription.telegram_user_id == 2
     assert subscription.telegram_username is None
@@ -298,7 +298,7 @@ async def test_add_car_when_circuit_open_shows_normal_message_and_alerts_manager
         )
 
         assert reply is not None
-        assert "✅ Автомобиль добавлен на мониторинг" in reply.text
+        assert "✅ Автомобиль добавлен" in reply.text
         assert "штрафов нет" in reply.text
         for banned in ("police.ge", "недоступн", "Первичная проверка", "cached", "emergency"):
             assert banned not in reply.text
@@ -330,7 +330,7 @@ async def test_add_car_summary_without_username_has_no_none_or_prompt_text(fx):
     assert "Telegram-логин" not in reply.text
     assert "👤" not in reply.text
     assert f"🚗 {format_plate_for_telegram('M295YB196')}" in reply.text
-    assert "📅 Мониторинг:" in reply.text
+    assert "🔔 Уведомления:" in reply.text
 
 
 # ---- выбор периода: 30/90/180/365 ----
@@ -348,7 +348,7 @@ async def test_period_choice_creates_subscription_with_expected_dates(fx, days):
     today = _today()
     expected_end = today + timedelta(days=days)
     assert reply is not None
-    assert "✅ Автомобиль добавлен на мониторинг" in reply.text
+    assert "✅ Автомобиль добавлен" in reply.text
     assert f"🚗 {format_plate_for_telegram('M295YB196')}" in reply.text
     # Строка "👤 @username" убрана из self-service summary целиком (см.
     # задачу "Georgia должен работать с Telegram identity так же, как
@@ -489,7 +489,7 @@ async def test_conversation_state_survives_restart_simulated_reopen(tmp_path):
         )
 
         assert reply is not None
-        assert "✅ Автомобиль добавлен на мониторинг" in reply.text
+        assert "✅ Автомобиль добавлен" in reply.text
         assert fixture2.conversation_state_repository.get(7) is None
     finally:
         fixture2.close()
@@ -1314,7 +1314,7 @@ async def test_my_car_turn_on_reactivates_without_duplicate(fx):
     on_reply = fx.controller.handle_my_car_turn_on(subscription.id, 0, telegram_user_id=1)
 
     assert on_reply is not None
-    assert "включён" in on_reply.text
+    assert "включены" in on_reply.text
     assert on_reply.car_detail_monitoring_state == "ON"
     reactivated = fx.subscription_repository.get(subscription.id)
     assert reactivated.status == "active"

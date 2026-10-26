@@ -62,7 +62,7 @@ HELP_TEXT = (
     "ℹ️ Справка\n\n"
     "В боте можно:\n\n"
     "• ➕ Добавить авто — сохранить автомобиль и получать уведомления о новых штрафах.\n"
-    "• 📋 Мои авто — посмотреть сохранённые автомобили, включить или выключить мониторинг.\n"
+    "• 📋 Мои авто — посмотреть сохранённые автомобили, включить или выключить уведомления.\n"
     "• 🔎 Проверить сейчас — проверить штрафы прямо сейчас.\n"
     "• 🇹🇷 Штрафы Турции — штрафы и платные дороги Турции в нашем боте @ProtocolTRbot.\n"
     "• 🛡 ОСАГО Грузия — оформить страховку для поездки по Грузии."
@@ -102,7 +102,7 @@ OWNER_USERNAME_PROMPT = "👤 Укажите Telegram владельца авт�
 # OWNER_USERNAME_PROMPT; "Отмена" → мониторинг без клиента (см.
 # reader/public_bot/subscription_service.py::add_delegated_car_without_client).
 ADD_CLIENT_DECISION_PROMPT = "👤 Добавить Telegram клиента?"
-PERIOD_PROMPT = "📅 Выберите срок мониторинга"
+PERIOD_PROMPT = "📅 На какой срок добавить уведомления?"
 
 STALE_DIALOG_TEXT = "⚠️ Диалог устарел, начните заново."
 NO_CARS_TEXT = "У вас пока нет добавленных автомобилей."
@@ -179,8 +179,17 @@ def format_no_fines_found(car_number: str) -> str:
     workflow для Georgia fines bot" п.4: "не придумывать второй формат,
     если стандартный уже есть") — извлечено из format_check_now_result()
     выше, чтобы manual-bootstrap "✅ Штрафов нет" отправлял клиенту ТОТ ЖЕ
-    текст, без второй копии f-строки."""
-    return f"🔎 {format_plate_for_telegram(car_number)}: штрафов не найдено"
+    текст, без второй копии f-строки.
+
+    Вторая строка (см. задачу "remove the word мониторинг from user-facing
+    UI") — НЕ "штрафов нет вообще"/"история чистая": police.ge отдаёт
+    ТОЛЬКО текущие неоплаченные штрафы (см. provider.py), не полный архив
+    уже оплаченных — формулировка "на данный момент неоплаченных" явно это
+    отражает, не обещая того, что реально не проверялось."""
+    return (
+        f"✅ {format_plate_for_telegram(car_number)}: штрафов не найдено\n\n"
+        "На данный момент неоплаченных штрафов нет."
+    )
 
 
 def format_stop_success(car_number: str) -> str:
@@ -234,14 +243,14 @@ def format_add_car_summary(
                 "(сервис police.ge не отвечает) и будет выполнена позже.",
                 "",
                 f"🚗 {formatted_car_number}",
-                f"📅 Мониторинг: {period}",
+                f"🔔 Уведомления: {period}",
             ])
         return "\n".join([
-            "⚠️ Автомобиль добавлен на мониторинг,",
+            "⚠️ Автомобиль добавлен,",
             "но проверить штрафы сейчас не удалось",
             "",
             f"🚗 {formatted_car_number}",
-            f"📅 Мониторинг: {period}",
+            f"🔔 Уведомления: {period}",
         ])
 
     check_line = (
@@ -250,10 +259,10 @@ def format_add_car_summary(
         else "🔎 Штрафы проверены: новых штрафов нет"
     )
     return "\n".join([
-        "✅ Автомобиль добавлен на мониторинг",
+        "✅ Автомобиль добавлен",
         "",
         f"🚗 {formatted_car_number}",
-        f"📅 Мониторинг: {period}",
+        f"🔔 Уведомления: {period}",
         check_line,
     ])
 
@@ -406,16 +415,42 @@ MY_CARS_HEADER = "🚗 Мои автомобили"
 
 
 def format_car_details(subscription: FineMonitoringSubscription, today: date) -> str:
-    emoji, state = car_monitoring_state(subscription, today)
-    date_line = (
-        f"📅 Истёк {_fmt_date(subscription.end_date)}" if state == "ИСТЁК"
-        else f"📅 До {_fmt_date(subscription.end_date)}"
-    )
-    return "\n".join([
+    """См. задачу "remove the word мониторинг from user-facing UI" — опрос
+    показал, что пользователи путали "Добавить/Снять с мониторинга" с
+    проверкой штрафов за прошлый период, хотя реально это два РАЗНЫХ
+    действия (см. SubscriptionService.check_now() vs turn_on_car/
+    turn_off_car): явно разделяем их здесь текстом при КАЖДОМ открытии
+    карточки машины, а не только один раз — та же карточка используется
+    и для объяснения, и для статуса (НЕ отдельный экран, см. задачу: "do
+    not create a separate new screen just for this").
+
+    НЕ "старые штрафы"/"история штрафов" (см. задачу) — police.ge отдаёт
+    ТОЛЬКО текущие неоплаченные штрафы (см. provider.py), поэтому
+    "которые уже есть сейчас" точно описывает реальный охват проверки, не
+    обещая полного архива уже оплаченных.
+
+    ИСТЁК — здесь НЕТ активного ON/OFF-переключателя (см.
+    car_detail_keyboard: для этого state кнопка не показывается вовсе,
+    реактивация требует нового периода через "▶️ Продолжить мониторинг" —
+    этот отдельный экран/кнопка задачей не затронуты, см. design report),
+    поэтому формулировка про текущее состояние уведомлений для него не
+    подходит — только когда период закончился."""
+    _, state = car_monitoring_state(subscription, today)
+    lines = [
         f"🚗 {format_plate_for_telegram(subscription.car_number)}",
-        f"Мониторинг: {emoji} {state}",
-        date_line,
-    ])
+        "",
+        "🔎 Проверить штрафы — покажем неоплаченные штрафы, которые уже есть сейчас.",
+        "",
+    ]
+    if state == "ON":
+        lines.append("🔔 Уведомления: включены — сообщим, если в дальнейшем появятся новые штрафы.")
+        lines.append(f"📅 До {_fmt_date(subscription.end_date)}")
+    elif state == "OFF":
+        lines.append("🔕 Уведомления: выключены — включите, чтобы мы сообщали о новых штрафах.")
+        lines.append(f"📅 До {_fmt_date(subscription.end_date)}")
+    else:  # "ИСТЁК"
+        lines.append(f"⏱ Период уведомлений закончился {_fmt_date(subscription.end_date)}.")
+    return "\n".join(lines)
 
 
 def format_my_car_inactive_card(subscription: FineMonitoringSubscription, *, today: date) -> str:
@@ -433,8 +468,8 @@ def format_my_car_inactive_card(subscription: FineMonitoringSubscription, *, tod
     return f"🚗 {plate}\n\nСрок мониторинга закончился {_fmt_date(subscription.end_date)}."
 
 
-TURN_OFF_BUTTON_LABEL = "⏸ Выключить мониторинг"
-TURN_ON_BUTTON_LABEL = "▶️ Включить мониторинг"
+TURN_OFF_BUTTON_LABEL = "🔕 Отключить уведомления"
+TURN_ON_BUTTON_LABEL = "🔔 Включить уведомления"
 DELETE_CAR_BUTTON_LABEL = "🗑 Удалить автомобиль"
 BACK_BUTTON_LABEL = "⬅️ Назад"
 DELETE_CAR_CONFIRM_BUTTON_LABEL = "🗑 Да, удалить"
@@ -452,11 +487,21 @@ CAR_ACTION_FAILED_TEXT = (
 
 
 def format_turn_off_success(car_number: str) -> str:
-    return f"⏸ Мониторинг {format_plate_for_telegram(car_number)} выключен.\nАвтомобиль сохранён в «Мои авто»."
+    """См. задачу "remove the word мониторинг from user-facing UI" — НЕ
+    подразумевает, что уже найденные штрафы удалены/недоступны (та же
+    осторожность, что и в format_delete_confirm_prompt), машина остаётся в
+    «Мои авто»."""
+    return (
+        f"🔕 Уведомления для {format_plate_for_telegram(car_number)} отключены.\n"
+        "Автомобиль сохранён в «Мои авто»."
+    )
 
 
 def format_turn_on_success(car_number: str) -> str:
-    return f"▶️ Мониторинг {format_plate_for_telegram(car_number)} включён."
+    return (
+        f"✅ Уведомления для {format_plate_for_telegram(car_number)} включены.\n"
+        "Мы сообщим, если появятся новые штрафы для этого автомобиля."
+    )
 
 
 def format_delete_confirm_prompt(car_number: str) -> str:
