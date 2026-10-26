@@ -123,7 +123,7 @@ async def test_suppressed_plate_never_calls_provider_and_looks_like_no_fines(fx)
     text = await _check_now_text(fx, _SUPPRESSED)
 
     assert fx.provider.requested_plates == []
-    assert text == f"🔎 {format_plate_for_telegram(_SUPPRESSED)}: штрафов не найдено"  # тот же стандартный текст, что и у любого номера
+    assert text == texts.format_no_fines_found(_SUPPRESSED)  # тот же стандартный текст, что и у любого номера
     assert "98765" not in text and "недоступн" not in text
     assert fx.fines.list_by_car_number(_SUPPRESSED) == []
 
@@ -140,7 +140,7 @@ async def test_suppressed_plate_with_history_does_not_leak_and_history_is_preser
     text = await _check_now_text(fx, _SUPPRESSED)
 
     assert fx.provider.requested_plates == [] and fx.sleep_log.calls == []  # ...but no request/confirmation
-    assert "98765" not in text and text == f"🔎 {format_plate_for_telegram(_SUPPRESSED)}: штрафов не найдено"
+    assert "98765" not in text and text == texts.format_no_fines_found(_SUPPRESSED)
     assert all(s.car_number != _SUPPRESSED for s in fx.fines.get_stats_by_car())
     assert len(fx.fines.list_by_car_number(_SUPPRESSED)) == 1  # история НЕ удалена
 
@@ -255,8 +255,8 @@ async def test_owner_add_car_and_check_now_identical_to_car_without_fines(fx):
 
     assert fx.provider.requested_plates == [_NORMAL, _NORMAL]   # O687KE761 never requested
     assert _summary(suppressed_add) == _summary(normal_add).replace(format_plate_for_telegram(_NORMAL), format_plate_for_telegram(_SUPPRESSED))
-    assert texts.format_check_now_result(suppressed_now) == f"🔎 {format_plate_for_telegram(_SUPPRESSED)}: штрафов не найдено"
-    assert texts.format_check_now_result(normal_now) == f"🔎 {format_plate_for_telegram(_NORMAL)}: штрафов не найдено"
+    assert texts.format_check_now_result(suppressed_now) == texts.format_no_fines_found(_SUPPRESSED)
+    assert texts.format_check_now_result(normal_now) == texts.format_no_fines_found(_NORMAL)
     for text in (_summary(suppressed_add), texts.format_check_now_result(suppressed_now)):
         assert "98765" not in text
         assert not any(word in text.lower() for word in ("недоступн", "исключ", "suppress", "не удалось"))
@@ -273,7 +273,7 @@ async def test_trusted_check_now_and_search_line_identical_to_car_without_fines(
     search = await fx.service.check_now_task_for_search(suppressed_task.id)
     normal_search = await fx.service.check_now_task_for_search(fx.tasks.get_active_by_car_number(_NORMAL)[0].id)
 
-    assert texts.format_check_now_result(trusted) == f"🔎 {format_plate_for_telegram(_SUPPRESSED)}: штрафов не найдено"
+    assert texts.format_check_now_result(trusted) == texts.format_no_fines_found(_SUPPRESSED)
     line = texts.format_search_money_line(check_ok=search.check_ok, fines=search.fines)
     assert line == texts.format_search_money_line(check_ok=normal_search.check_ok, fines=normal_search.fines)
     assert line == "💰 Штрафы: 0 ₾" and "98765" not in line
