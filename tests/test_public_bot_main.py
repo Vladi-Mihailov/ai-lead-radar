@@ -15,7 +15,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import pytest  # noqa: E402
 
 from reader.public_bot import main as public_bot_main  # noqa: E402
-from reader.settings import ConfigError  # noqa: E402
+from reader.settings import ConfigError, FineMonitorSettings  # noqa: E402
 
 
 def test_module_imports_without_side_effects():
@@ -71,11 +71,13 @@ class _FakeFineMonitorSettings:
     def __init__(
         self, *, collector_api_enabled=False, collector_hmac_secret=None,
         collector_checknow_base_url=None, georgia_checknow_routing="auto",
+        georgia_checknow_local_timeout=3.0,
     ):
         self.collector_api_enabled = collector_api_enabled
         self.collector_hmac_secret = collector_hmac_secret
         self.collector_checknow_base_url = collector_checknow_base_url
         self.georgia_checknow_routing = georgia_checknow_routing
+        self.georgia_checknow_local_timeout = georgia_checknow_local_timeout
 
 
 class _FakeSettings:
@@ -162,16 +164,31 @@ def test_validate_collector_api_config_does_not_require_checknow_base_url_for_lo
 
 
 class _FakePoliceGeSession:
-    """Minimal stand-in — build_check_now_provider() never calls any method
-    on it, only wraps it in PoliceGeProvider(...), so identity is all that
-    matters here."""
+    """Minimal stand-in — build_check_now_provider() only wraps it in
+    PoliceGeProvider(...) directly (local/rednet-only modes) or first calls
+    with_timeout() on it (auto mode, see test_build_check_now_provider_
+    auto_uses_local_timeout_not_global below) — with_timeout() returns a
+    NEW fake recording the requested value, so a test can assert on it
+    without needing a real PoliceGeSession/httpx client."""
+
+    def __init__(self, *, requested_timeout=None):
+        self.requested_timeout = requested_timeout
+
+    def with_timeout(self, request_timeout):
+        return _FakePoliceGeSession(requested_timeout=request_timeout)
 
 
 def test_build_check_now_provider_returns_local_when_collector_api_disabled():
+    session = _FakePoliceGeSession()
     provider = public_bot_main.build_check_now_provider(
-        _FakeFineMonitorSettings(collector_api_enabled=False), _FakePoliceGeSession(),
+        _FakeFineMonitorSettings(collector_api_enabled=False), session,
     )
     assert isinstance(provider, public_bot_main.PoliceGeProvider)
+    # collector_api_enabled=False -- no fallback destination exists at all,
+    # so the original (global-timeout) session must be used as-is, never
+    # shortened (see test_build_check_now_provider_local_mode_never_shortens
+    # _timeout's docstring for why this matters).
+    assert provider._session is session
 
 
 def test_build_check_now_provider_returns_local_for_routing_local():
@@ -189,18 +206,42 @@ def test_build_check_now_provider_returns_local_for_routing_local():
     assert isinstance(provider, public_bot_main.PoliceGeProvider)
 
 
+def test_build_check_now_provider_local_mode_never_shortens_timeout():
+    """"local" mode has NO fallback destination (REDNET is never touched in
+    this mode) -- shortening its timeout the way AUTO's local leg is
+    shortened below would be a pure regression (failing fast with nowhere
+    to fall back to), not a UX improvement. with_timeout() must never be
+    called here -- the original session instance must pass through
+    unchanged (see "fix Georgia Check Now local timeout")."""
+    session = _FakePoliceGeSession()
+    provider = public_bot_main.build_check_now_provider(
+        _FakeFineMonitorSettings(
+            collector_api_enabled=True, collector_hmac_secret="s",
+            georgia_checknow_routing="local", collector_checknow_base_url="http://10.50.0.2:8766",
+        ),
+        session,
+        rednet_client=object(),
+    )
+    assert provider._session is session
+    assert session.requested_timeout is None
+
+
 def test_build_check_now_provider_returns_rednet_only_for_routing_rednet():
     import httpx
 
+    session = _FakePoliceGeSession()
     provider = public_bot_main.build_check_now_provider(
         _FakeFineMonitorSettings(
             collector_api_enabled=True, collector_hmac_secret="s",
             georgia_checknow_routing="rednet", collector_checknow_base_url="http://10.50.0.2:8766",
         ),
-        _FakePoliceGeSession(),
+        session,
         rednet_client=httpx.AsyncClient(base_url="http://10.50.0.2:8766"),
     )
     assert isinstance(provider, public_bot_main.RednetCheckNowProvider)
+    # "rednet" mode never touches local at all -- with_timeout() must not
+    # have been called on the session passed in.
+    assert session.requested_timeout is None
 
 
 def test_build_check_now_provider_returns_auto_failover_by_default():
@@ -215,6 +256,58 @@ def test_build_check_now_provider_returns_auto_failover_by_default():
         rednet_client=httpx.AsyncClient(base_url="http://10.50.0.2:8766"),
     )
     assert isinstance(provider, public_bot_main.AutoFailoverCheckNowProvider)
+
+
+def test_build_check_now_provider_auto_uses_local_timeout_not_global():
+    """The whole point of this fix: AUTO's local leg must use
+    georgia_checknow_local_timeout (3.0s default), NOT whatever timeout the
+    passed-in session already had (the general fine_monitor.request_timeout,
+    ~30s) -- see PoliceGeSession.with_timeout() and the settings field's own
+    docstring for why a 30s wait before falling back to REDNET was the
+    production bug this fixes."""
+    import httpx
+
+    provider = public_bot_main.build_check_now_provider(
+        _FakeFineMonitorSettings(
+            collector_api_enabled=True, collector_hmac_secret="s",
+            georgia_checknow_routing="auto", collector_checknow_base_url="http://10.50.0.2:8766",
+            georgia_checknow_local_timeout=3.0,
+        ),
+        _FakePoliceGeSession(),
+        rednet_client=httpx.AsyncClient(base_url="http://10.50.0.2:8766"),
+    )
+    assert provider._local._session.requested_timeout == 3.0
+
+
+def test_build_check_now_provider_auto_uses_configured_local_timeout_value():
+    """A non-default georgia_checknow_local_timeout must actually be the
+    value used -- proves this is wired through settings, not hardcoded."""
+    import httpx
+
+    provider = public_bot_main.build_check_now_provider(
+        _FakeFineMonitorSettings(
+            collector_api_enabled=True, collector_hmac_secret="s",
+            georgia_checknow_routing="auto", collector_checknow_base_url="http://10.50.0.2:8766",
+            georgia_checknow_local_timeout=1.5,
+        ),
+        _FakePoliceGeSession(),
+        rednet_client=httpx.AsyncClient(base_url="http://10.50.0.2:8766"),
+    )
+    assert provider._local._session.requested_timeout == 1.5
+
+
+def test_georgia_checknow_local_timeout_defaults_to_3_seconds():
+    """New dedicated setting (see "fix Georgia Check Now local timeout") --
+    short on purpose, only for AUTO's local probe."""
+    assert FineMonitorSettings().georgia_checknow_local_timeout == 3.0
+
+
+def test_global_request_timeout_unchanged_by_the_local_checknow_timeout_fix():
+    """Regression guard: adding georgia_checknow_local_timeout must not
+    have touched the pre-existing, widely-shared request_timeout default
+    (scheduled FineJob/ArchiveFineJob, the public feed job, REDNET's own
+    collector all still read/default this independently)."""
+    assert FineMonitorSettings().request_timeout == 30.0
 
 
 def test_build_check_now_provider_raises_without_rednet_client_when_needed():

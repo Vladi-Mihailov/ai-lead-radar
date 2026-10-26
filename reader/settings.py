@@ -260,6 +260,20 @@ class FineMonitorSettings(BaseModel):
     # Now всегда локальный, этот флаг тогда не читается вовсе (см. reader/
     # public_bot/main.py).
     georgia_checknow_routing: Literal["auto", "local", "rednet"] = "auto"
+    # Production incident (2026-10-26): the local leg of AUTO routing above
+    # inherited the general request_timeout (30s) — a user clicking Check
+    # Now could wait up to ~30s before AutoFailoverCheckNowProvider gave up
+    # on Germany and fell back to REDNET. This is a SEPARATE, deliberately
+    # short timeout for ONLY that interactive probe (see PoliceGeSession.
+    # with_timeout()/build_check_now_provider() in reader/public_bot/
+    # main.py) — request_timeout above stays untouched and keeps governing
+    # every other PoliceGeSession consumer (scheduled FineJob/ArchiveFineJob
+    # in reader/main.py, the public feed job, REDNET's own collector, the
+    # "Videos"/protocol-check session). A fast local failure here still
+    # records against the SAME circuit breaker local Check Now otherwise
+    # uses, so "breaker already open -> immediate REDNET fallback" is
+    # unaffected either way.
+    georgia_checknow_local_timeout: float = 3.0
 
 
 class InviterWorkerSettings(BaseModel):
@@ -729,6 +743,9 @@ def load_settings(config_path: Path) -> Settings:
                 collector_hmac_secret=os.getenv("GEORGIA_COLLECTOR_HMAC_SECRET"),
                 collector_checknow_base_url=fine_monitor_raw.get("collector_checknow_base_url"),
                 georgia_checknow_routing=fine_monitor_raw.get("georgia_checknow_routing", "auto"),
+                georgia_checknow_local_timeout=float(
+                    fine_monitor_raw.get("georgia_checknow_local_timeout", 3.0)
+                ),
             ),
             inviter=InviterSettings(
                 worker=InviterWorkerSettings(

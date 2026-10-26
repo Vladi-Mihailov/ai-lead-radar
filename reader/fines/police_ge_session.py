@@ -54,6 +54,23 @@ class PoliceGeSession:
             return True
         return self._circuit_breaker.allow_request()
 
+    def with_timeout(self, request_timeout: float) -> "PoliceGeSession":
+        """Новая PoliceGeSession с тем же client/page_url/circuit_breaker,
+        но другим per-request timeout — для вызывающего кода, которому
+        нужен более быстрый отказ, чем общий request_timeout (см. задачу
+        "fix Georgia Check Now local timeout", reader/public_bot/main.py::
+        build_check_now_provider). ТОТ ЖЕ breaker — разные timeout'ы не
+        означают разные "источники истины" о доступности police.ge, сбой
+        через короткий timeout точно так же считается сбоем, что и через
+        обычный. _csrf_token НЕ переносится (новый экземпляр начинает с
+        None) — это не ошибка: search_by_plate() сам делает GET заново при
+        отсутствии/протухшем токене, максимум один лишний GET при первом
+        вызове новой сессии."""
+        return PoliceGeSession(
+            self._client, page_url=self._page_url, request_timeout=request_timeout,
+            circuit_breaker=self._circuit_breaker,
+        )
+
     async def search_by_plate(self, plate: str) -> dict:
         """Вернуть уже распарсенный JSON-ответ searchByAuto для номера.
 
