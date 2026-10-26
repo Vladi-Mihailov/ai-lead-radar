@@ -22,6 +22,7 @@ from reader.dm_campaigns.repository import DmCampaignRepository
 from reader.dm_campaigns.send_service import DmSendService
 from reader.dm_campaigns.sender_client import build_sender_client_factory, build_session_exists
 from reader.dm_campaigns.sender_state import DmSenderStateRepository
+from reader.dm_campaigns.source_access import DmSourceAccessRepository
 from datetime import timedelta
 
 from reader.groups import load_groups
@@ -128,6 +129,9 @@ async def run() -> None:
     # Feedback learning: пример пишется только после успешной отправки
     # (копится всегда; в prompt — только при dm_outreach.feedback_learning_enabled).
     dm_feedback = DmFeedbackRepository(settings.app.users_db_file)
+    # Доступ отправителей к исходным группам (source_message): пишется при
+    # отправке, учитывается при выборе отправителя.
+    dm_source_access = DmSourceAccessRepository(settings.app.users_db_file)
     dm_send_service = DmSendService(
         dm_outreach_repository, dm_campaign_repository, account_repository, dm_sender_states,
         client_factory=build_sender_client_factory(settings.telegram.api_id, settings.telegram.api_hash, PROJECT_ROOT),
@@ -136,6 +140,7 @@ async def run() -> None:
         sender_daily_cap=settings.dm_outreach.sender_daily_cap,
         sender_daily_cap_overrides=settings.dm_outreach.sender_daily_cap_overrides,
         feedback_repository=dm_feedback,
+        source_access=dm_source_access,
     )
 
     def dm_sender_label(account_id: int) -> str | None:
@@ -184,6 +189,7 @@ async def run() -> None:
         dm_outreach_repository.close()
         dm_sender_states.close()
         dm_feedback.close()
+        dm_source_access.close()
         account_repository.close()
         campaign_repository.close()
         invite_repository.close()

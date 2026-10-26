@@ -64,9 +64,11 @@ from reader.dm_campaigns.sender_selection import (  # noqa: F401 — коды п
     DAILY_LIMIT,
     NO_ELIGIBLE_SENDER,
     NO_PREMIUM_SENDER,
+    NO_SENDER_FOR_SOURCE,
     SENDER_FLOOD_WAIT,
     SenderSelector,
 )
+from reader.dm_campaigns.source_access import DmSourceAccessRepository
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +82,6 @@ NO_TEXT = "no_text"
 RECENT_DM = "blocked_recent_dm"
 SENDER_UNAUTHORIZED = "sender_session_unauthorized"
 NOT_IN_SOURCE_CHAT = "sender_not_in_source_chat"
-NO_SENDER_FOR_SOURCE = "no_eligible_sender_for_source"
 STATE_CHANGED = "send_state_changed"
 IDENTITY_MISMATCH = "recipient_identity_mismatch"
 USERNAME_NOT_FOUND = "username_not_found"
@@ -92,8 +93,9 @@ USER_DEACTIVATED = "user_deactivated"
 FLOOD_WAIT = "flood_wait"
 PEER_FLOOD = "peer_flood"
 
-# Временные причины: строка остаётся draft, оператор сможет повторить позже.
-TEMPORARY_REASONS = frozenset({DAILY_LIMIT, SENDER_FLOOD_WAIT})
+# Временные причины: строка остаётся draft, оператор сможет повторить позже
+# (доступ к исходной группе может появиться — см. source_access.NO_ACCESS_TTL).
+TEMPORARY_REASONS = frozenset({DAILY_LIMIT, SENDER_FLOOD_WAIT, NO_SENDER_FOR_SOURCE})
 
 _RECIPIENT_ERRORS = (
     (errors.UserPrivacyRestrictedError, PRIVACY),
@@ -162,6 +164,7 @@ class DmSendService:
         sender_daily_cap_overrides: dict[int, int] | None = None,
         clock: Callable[[], datetime] = _utcnow,
         feedback_repository=None,  # reader.dm_campaigns.feedback.DmFeedbackRepository
+        source_access: DmSourceAccessRepository | None = None,
     ):
         self._outreach = outreach_repository
         self._campaigns = campaign_repository
@@ -172,9 +175,10 @@ class DmSendService:
         self._cooldown = recipient_cooldown
         self._cap = sender_daily_cap
         self._cap_overrides = dict(sender_daily_cap_overrides or {})
+        self._source_access = source_access
         self._selector = SenderSelector(
             outreach_repository, campaign_repository, account_repository, sender_states,
-            session_exists=session_exists,
+            session_exists=session_exists, source_access=source_access,
         )
         self._clock = clock
         self._lock = asyncio.Lock()
@@ -288,7 +292,9 @@ class DmSendService:
                 self._outreach.release_to_draft(item.id, now=self._clock(), error=SENDER_UNAUTHORIZED)
                 return SendOutcome(KIND_DRAFT, reason=SENDER_UNAUTHORIZED, sender_label=label)
             stage = "resolve"
-            peer, problem = await self._resolve(client, item)
+            peer, problem, access = await self._resolve(client, item)
+            if access is not None:
+                self._record_source_access(sender, item, *access)
             if problem == NOT_IN_SOURCE_CHAT:
                 # Строку не трогаем: решает _deliver_with_fallback.
                 return SendOutcome(KIND_DRAFT, reason=NOT_IN_SOURCE_CHAT, sender_label=label)
@@ -352,32 +358,58 @@ class DmSendService:
         except Exception as exc:  # noqa: BLE001
             logger.warning("dm_outreach id=%s: не удалось сохранить feedback (%s)", outreach_id, type(exc).__name__)
 
+    def _record_source_access(self, sender, item: DmOutreach, has_access: bool, reason: str | None) -> None:
+        """Что показал резолв исходной группы этим отправителем (см.
+        source_access.py). Сбой записи не влияет на отправку."""
+        if self._source_access is None:
+            return
+        try:
+            self._source_access.record(sender.id, item.source_chat_id, has_access=has_access, reason=reason,
+                                       now=self._clock())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("dm_outreach id=%s: не удалось сохранить доступ к исходной группе (%s)",
+                           item.id, type(exc).__name__)
+
     async def _resolve(self, client, item: DmOutreach):
-        """(peer, None) либо (None, причина blocked). FloodWait/PeerFlood и
-        транспорт пробрасываются (обрабатывает _deliver)."""
+        """(peer, None, access) либо (None, причина, access). access —
+        (has_access, причина) по исходной группе для source_access.py или
+        None (путь username; сообщение не найдено/удалено — это не про
+        доступ к группе). FloodWait/PeerFlood и транспорт пробрасываются
+        (обрабатывает _deliver)."""
         if item.sendability == SENDABILITY_USERNAME or (
             item.sendability == SENDABILITY_PREMIUM_REQUIRED and item.recipient_username
         ):
             try:
                 entity = await client.get_entity(item.recipient_username)
             except (ValueError, errors.UsernameInvalidError, errors.UsernameNotOccupiedError):
-                return None, USERNAME_NOT_FOUND
+                return None, USERNAME_NOT_FOUND, None
             if type(entity).__name__ != "User" or getattr(entity, "bot", False):
-                return None, IDENTITY_MISMATCH
+                return None, IDENTITY_MISMATCH, None
             if item.recipient_user_id is not None and entity.id != item.recipient_user_id:
-                return None, IDENTITY_MISMATCH
-            return entity, None
+                return None, IDENTITY_MISMATCH, None
+            return entity, None, None
+        return await resolve_via_source_message(client, item)
 
-        chat_ref = item.source_chat_identifier or item.source_chat_id
-        if isinstance(chat_ref, str) and chat_ref.lstrip("-").isdigit():
-            chat_ref = int(chat_ref)
-        try:
-            chat = await client.get_input_entity(chat_ref)
-            message = await client.get_messages(chat, ids=item.source_message_id)
-        except _SOURCE_CHAT_ERRORS:
-            return None, NOT_IN_SOURCE_CHAT
-        if message is None:
-            return None, NOT_IN_SOURCE_CHAT
-        if message.sender_id != item.recipient_user_id:
-            return None, IDENTITY_MISMATCH
-        return InputPeerUserFromMessage(peer=chat, msg_id=item.source_message_id, user_id=item.recipient_user_id), None
+
+async def resolve_via_source_message(client, item: DmOutreach):
+    """Получатель через исходное сообщение, прочитанное ЭТИМ клиентом (без
+    send_message): (peer, None, access) либо (None, причина, access). access —
+    (has_access, причина) по исходной группе (source_access.py) или None, если
+    про доступ к группе ничего не известно (сообщение не найдено/удалено).
+    Используют отправка и manage check-source-access."""
+    chat_ref = item.source_chat_identifier or item.source_chat_id
+    if isinstance(chat_ref, str) and chat_ref.lstrip("-").isdigit():
+        chat_ref = int(chat_ref)
+    try:
+        chat = await client.get_input_entity(chat_ref)
+        message = await client.get_messages(chat, ids=item.source_message_id)
+    except errors.MsgIdInvalidError:
+        return None, NOT_IN_SOURCE_CHAT, None
+    except _SOURCE_CHAT_ERRORS as exc:
+        return None, NOT_IN_SOURCE_CHAT, (False, type(exc).__name__)
+    if message is None:
+        return None, NOT_IN_SOURCE_CHAT, None
+    if message.sender_id != item.recipient_user_id:
+        return None, IDENTITY_MISMATCH, (True, None)
+    peer = InputPeerUserFromMessage(peer=chat, msg_id=item.source_message_id, user_id=item.recipient_user_id)
+    return peer, None, (True, None)
