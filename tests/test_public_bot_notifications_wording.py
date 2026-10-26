@@ -121,19 +121,21 @@ def test_turn_on_off_callback_data_round_trips_unchanged():
 def test_car_details_on_distinguishes_check_now_from_future_notifications():
     text = format_car_details(_subscription(status="active", end_date=date(2026, 12, 1)), _TODAY)
     assert "мониторинг" not in text.lower()
-    assert "уже есть сейчас" in text  # 🔎 Проверить штрафы: current unpaid fines
+    assert "все неоплаченные штрафы" in text  # 🔎 Проверить штрафы: current unpaid fines
+    assert "выписанные ранее" in text  # no fake "paid fines archive" implied, see banned list below
     assert "появятся новые штрафы" in text  # 🔔 Уведомления: future new fines
     assert "включены" in text
-    for banned in ("старые штрафы", "история штрафов", "штрафы за прошлый период"):
+    for banned in ("вся история штрафов", "все штрафы за всё время", "старые штрафы", "история штрафов", "штрафы за прошлый период"):
         assert banned not in text.lower()
 
 
 def test_car_details_off_distinguishes_check_now_from_future_notifications():
     text = format_car_details(_subscription(status="stopped", end_date=date(2026, 12, 1)), _TODAY)
     assert "мониторинг" not in text.lower()
-    assert "уже есть сейчас" in text
+    assert "все неоплаченные штрафы" in text
+    assert "выписанные ранее" in text
     assert "выключены" in text
-    for banned in ("старые штрафы", "история штрафов", "штрафы за прошлый период"):
+    for banned in ("вся история штрафов", "все штрафы за всё время", "старые штрафы", "история штрафов", "штрафы за прошлый период"):
         assert banned not in text.lower()
 
 
