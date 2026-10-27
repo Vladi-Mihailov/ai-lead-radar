@@ -14,6 +14,7 @@ import pytest  # noqa: E402
 from reader.fines.models import FineMonitoringTask  # noqa: E402
 from reader.fines.validation import (  # noqa: E402
     FineValidationError,
+    looks_like_car_number,
     normalize_car_number,
     parse_date,
     resolve_monitoring_period,
@@ -93,6 +94,85 @@ def test_normalize_car_number_cyrillic_plate_with_dashes_normalizes_to_latin():
 
 def test_normalize_car_number_latin_plate_is_unchanged():
     assert normalize_car_number("M295YB196") == "M295YB196"
+
+
+# ---- looks_like_car_number (см. задачу "Improve the /start UX... Allow
+# direct plate input after /start") — ЛЕНИВЫЙ pre-filter, строже голого
+# normalize_car_number (который принял бы "HELLO"/"12345" — валидный
+# ФОРМАТ, но явно не похоже на реальный номер), используется ТОЛЬКО чтобы
+# решить, стоит ли вообще пробовать add-car flow с home-состояния, см.
+# reader/public_bot/conversation.py::handle_text(). Инвариант: ЛЮБОЙ ввод,
+# для которого looks_like_car_number() вернул True, ВСЕГДА проходит и
+# normalize_car_number() без исключения (strict subset по char-классу) —
+# см. test_looks_like_car_number_is_always_a_subset_of_normalize ниже:
+# "ЕСЛИ выглядит как номер ПО ЭТИМ правилам, ЗНАЧИТ формат уже валиден"
+# сегодня верно по построению, а не совпадение. ----
+
+
+@pytest.mark.parametrize("plate", ["O127PX62", "M295YB196", "AA001AA", "E911EE95", "P201HX31"])
+def test_looks_like_car_number_true_for_real_plate_examples(plate):
+    assert looks_like_car_number(plate) is True
+
+
+def test_looks_like_car_number_true_for_lowercase_and_cyrillic():
+    assert looks_like_car_number("o127px62") is True
+    assert looks_like_car_number("О687КЕ761") is True
+    assert looks_like_car_number("О-687-КЕ-761") is True
+    assert looks_like_car_number("О 687 КЕ 761") is True
+
+
+@pytest.mark.parametrize("text", ["HELLO", "ПРИВЕТ", "СПАСИБО", "YES", "OK"])
+def test_looks_like_car_number_false_for_words_without_digits(text):
+    assert looks_like_car_number(text) is False
+
+
+@pytest.mark.parametrize("text", ["12345", "0001", "999999999"])
+def test_looks_like_car_number_false_for_digits_without_letters(text):
+    assert looks_like_car_number(text) is False
+
+
+def test_looks_like_car_number_false_for_too_short():
+    assert looks_like_car_number("A1") is False
+    assert looks_like_car_number("AB12") is False  # 4 chars, below the 5-char floor
+
+
+def test_looks_like_car_number_false_for_too_long():
+    assert looks_like_car_number("AAAAAAAAAA11111111") is False
+
+
+def test_looks_like_car_number_false_for_ordinary_sentence_with_a_digit():
+    """The exact false-positive this heuristic must avoid: an ordinary
+    multi-word message that happens to contain a number. Spaces are
+    stripped before the check (same as normalize_car_number's own first
+    step), so this must be rejected for another reason -- here, "сегодня"
+    contains Cyrillic letters outside the 12-letter car-plate mapping
+    table (see _CYRILLIC_TO_LATIN), so the normalized candidate is not
+    purely [A-Z0-9] and correctly fails."""
+    assert looks_like_car_number("куплю гараж за 100000") is False
+    assert looks_like_car_number("встречаемся в 19:00 сегодня") is False
+
+
+def test_looks_like_car_number_false_for_empty_or_whitespace():
+    assert looks_like_car_number("") is False
+    assert looks_like_car_number("   ") is False
+
+
+@pytest.mark.parametrize("candidate", [
+    "O127PX62", "M295YB196", "AA001AA", "o127px62", "О687КЕ761", "A1BCD2", "AB1234", "A123456789",
+])
+def test_looks_like_car_number_is_always_a_subset_of_normalize(candidate):
+    """Documents the intentional structural invariant (see this section's
+    own header comment): under the current rules, looks_like_car_number()
+    can never return True for an input that normalize_car_number() then
+    rejects -- there is no "looks like a plate but is invalid" case
+    reachable today. reader/public_bot/conversation.py's direct-input
+    handler still goes through the real normalize_car_number() call (via
+    the existing _handle_car_number_input(), unmodified) on every call, so
+    if this invariant is ever broken by a future change to either
+    function's rules, the existing invalid-plate error response already
+    handles it correctly with no further code change needed."""
+    if looks_like_car_number(candidate):
+        normalize_car_number(candidate)  # must not raise
 
 
 def test_normalize_car_number_all_twelve_supported_cyrillic_letters_translate_correctly():

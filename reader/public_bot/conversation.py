@@ -87,7 +87,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
-from reader.fines.validation import FineValidationError, normalize_car_number
+from reader.fines.validation import FineValidationError, looks_like_car_number, normalize_car_number
 from reader.plate_display import format_plate_for_telegram
 from reader.public_bot import manager_alerts, texts
 from reader.public_bot.conversation_state_repository import (
@@ -1536,8 +1536,25 @@ class ConversationController:
 
         state = self._states.get(chat_id)
         if state is None or state.telegram_user_id != telegram_user_id:
-            # Нет активного диалога у ЭТОГО пользователя в этом chat_id —
-            # мягкая подсказка вместо падения/молчания.
+            # "Improve the /start UX... Allow direct plate input after
+            # /start" — нет активного диалога у ЭТОГО пользователя в этом
+            # chat_id (home/start state) И текст похож на попытку ввести
+            # номер (см. looks_like_car_number() докстрок — строже голого
+            # формата, исключает обычные слова/предложения) -> трактуем
+            # ТОЧНО как если бы пользователь сначала нажал "➕ Добавить
+            # авто" (см. _handle_car_number_input() выше по файлу — тот
+            # же единственный существующий обработчик, никакой второй
+            # реализации: валидация/нормализация/add-car бизнес-логика
+            # переиспользуются как есть, включая invalid-номер ответ и
+            # trusted/self-service ветвление). НЕ перехватывает команды
+            # ("/start" и т.п. не проходят _PLATE_LIKE_RE — содержат "/"),
+            # пункты меню (эти уже обработаны выше в _handle_menu_label,
+            # до этой точки код не доходит) и просто "не похожий на номер"
+            # текст — для него ниже остаётся прежняя мягкая подсказка.
+            if looks_like_car_number(stripped):
+                return self._handle_car_number_input(
+                    stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, username=username,
+                )
             return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
 
         if state.step == STEP_AWAITING_CAR_NUMBER:

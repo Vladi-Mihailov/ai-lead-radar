@@ -184,8 +184,9 @@ async def test_start_shows_main_menu_and_clears_state(fx):
 
 def test_start_welcome_explanation_exact_wording():
     assert texts.START_WELCOME_EXPLANATION_TEXT == (
-        "Добавьте номер авто — я проверю, есть ли неоплаченные штрафы, "
-        "в том числе выписанные ранее, и сообщу, если появятся новые."
+        "🚗 Добавьте номер авто — я проверю неоплаченные штрафы, которые уже есть, "
+        "и сообщу о новых, как только они появятся.\n\n"
+        "Просто отправьте номер авто сообщением."
     )
 
 
@@ -259,6 +260,109 @@ async def test_add_car_invalid_car_number_stays_on_same_step(fx):
     assert "❌" in reply.text
     state = fx.conversation_state_repository.get(1)
     assert state.step == STEP_AWAITING_CAR_NUMBER  # диалог не сброшен, можно ввести заново
+
+
+# ---- "Improve the /start UX... Allow direct plate input after /start" --
+# typing a plate from the home/start state (NO "➕ Добавить авто" press
+# first) must behave IDENTICALLY to the button-first flow above — same
+# _handle_car_number_input(), no second implementation. ----
+
+
+async def test_direct_plate_input_from_home_state_starts_add_car_flow(fx):
+    """No state at all for this chat_id/user (fresh fx, never pressed
+    "➕ Добавить авто") -- sending a plate-shaped message directly must
+    reach the SAME outcome as test_add_car_with_known_username_skips_
+    username_step above."""
+    reply = await fx.controller.handle_text("M295YB196", chat_id=1, telegram_user_id=1, username="alice")
+
+    assert reply.show_period_buttons is True
+    assert reply.text == texts.PERIOD_PROMPT
+    state = fx.conversation_state_repository.get(1)
+    assert state.step == STEP_AWAITING_PERIOD
+    assert state.payload == {"car_number": "M295YB196", "username": "alice"}
+
+
+async def test_direct_plate_input_reuses_cyrillic_normalization(fx):
+    """Same normalize_car_number() call as the button-first flow (see
+    test_add_car_accepts_cyrillic_plate_and_normalizes_to_latin) -- no
+    second, independent plate-processing implementation."""
+    reply = await fx.controller.handle_text("О687КЕ761", chat_id=1, telegram_user_id=1, username="alice")
+
+    assert reply.show_period_buttons is True
+    state = fx.conversation_state_repository.get(1)
+    assert state.payload == {"car_number": "O687KE761", "username": "alice"}
+
+
+async def test_direct_plate_input_completes_full_add_car_flow(fx):
+    """End to end: home state -> type a plate -> choose a period ->
+    subscription actually created, exactly like the button-first flow."""
+    reply = await fx.controller.handle_text("M295YB196", chat_id=5, telegram_user_id=5, username="bob")
+    assert reply.show_period_buttons is True
+
+    period_reply = await fx.controller.handle_period_choice(
+        30, chat_id=5, telegram_user_id=5, first_name=None, last_name=None,
+    )
+
+    assert period_reply is not None
+    assert "M295YB196" in period_reply.text.replace("*", "")  # bold-markup asterisks stripped
+    [subscription] = fx.subscription_repository.list_by_user(5)
+    assert subscription.car_number == "M295YB196"
+
+
+async def test_start_command_from_home_state_is_not_treated_as_plate(fx):
+    reply = await fx.controller.handle_text("/start", chat_id=1, telegram_user_id=1, username=None)
+    assert reply.text == texts.START_GREETING_TEXT
+    assert fx.conversation_state_repository.get(1) is None  # no add-car flow was started
+
+
+@pytest.mark.parametrize("label", [
+    texts.MY_CARS_LABEL, texts.CHECK_NOW_LABEL, texts.HELP_LABEL, texts.TURKEY_BOT_LINK_LABEL, texts.OSAGO_LABEL,
+])
+async def test_menu_labels_from_home_state_are_not_treated_as_plates(fx, label):
+    """Menu button labels never contain a digit, so they can never match
+    looks_like_car_number() -- but _handle_menu_label() is also checked
+    strictly BEFORE the new direct-input branch, so this holds even if a
+    label's wording ever changed to include one."""
+    reply = await fx.controller.handle_text(label, chat_id=1, telegram_user_id=1, username="alice")
+    assert fx.conversation_state_repository.get(1) is None or fx.conversation_state_repository.get(1).step not in (
+        STEP_AWAITING_PERIOD, STEP_AWAITING_CLIENT_DECISION,
+    )
+
+
+@pytest.mark.parametrize("text", [
+    "привет", "спасибо", "как дела?", "куплю гараж за 100000", "hello", "ok", "да", "нет",
+])
+async def test_ordinary_text_from_home_state_is_not_treated_as_plate(fx, text):
+    reply = await fx.controller.handle_text(text, chat_id=1, telegram_user_id=1, username="alice")
+    assert reply.text == texts.MAIN_MENU_TEXT
+    assert reply.show_main_menu is True
+    assert fx.conversation_state_repository.get(1) is None
+
+
+async def test_plate_like_text_during_another_active_flow_is_not_hijacked(fx):
+    """A plate-shaped message sent while the user is mid-flow on a
+    DIFFERENT step (here: STEP_AWAITING_OWNER_USERNAME, trusted delegated
+    flow) must be handled by THAT step's own handler
+    (_handle_owner_username_input()), not re-routed into a fresh add-car
+    attempt -- the new direct-input branch only fires when state is None
+    (see handle_text()). "M295YB196" is deliberately used as BOTH the
+    pre-existing car_number in state AND the message sent, so the two
+    possible handlers are distinguishable by their OTHER effect on the
+    payload: _handle_owner_username_input() keeps car_number unchanged and
+    adds a NEW "owner_username" key; _handle_car_number_input() (what
+    would run if this were wrongly hijacked) would instead overwrite
+    car_number itself and never add "owner_username" at all."""
+    fx.conversation_state_repository.set(
+        chat_id=1, telegram_user_id=_TRUSTED_ID, step=STEP_AWAITING_OWNER_USERNAME,
+        payload={"car_number": "E911EE95"},
+    )
+
+    reply = await fx.controller.handle_text("M295YB196", chat_id=1, telegram_user_id=_TRUSTED_ID, username=None)
+
+    assert reply.text == texts.PERIOD_PROMPT  # both handlers would reach this same next prompt
+    state = fx.conversation_state_repository.get(1)
+    assert state is not None and state.step == STEP_AWAITING_PERIOD
+    assert state.payload == {"car_number": "E911EE95", "owner_username": "M295YB196"}
 
 
 # ---- Add Car: self-service — username больше НИКОГДА не запрашивается

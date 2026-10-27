@@ -49,16 +49,47 @@ class FineValidationError(Exception):
         self.message = message
 
 
-def normalize_car_number(raw: str) -> str:
-    """До проверки формата — тот же порядок нормализации, что и в
-    reader/turkey_bot/validation.py::normalize_plate: uppercase, удалить
-    пробелы/дефисы, затем перевести поддерживаемую кириллицу в латиницу
-    (см. _CYRILLIC_TO_LATIN выше). Буква, отсутствующая среди
-    поддерживаемых 12, остаётся кириллической после .translate() и
-    поэтому не проходит _CAR_NUMBER_RE (только [A-Z0-9]) — номер с такой
-    буквой по-прежнему корректно отклоняется, а не "тихо" пропускается."""
+def _normalize_candidate(raw: str) -> str:
+    """Общий первый шаг и для normalize_car_number(), и для
+    looks_like_car_number() ниже — ЧИСТАЯ нормализация, без решения о
+    валидности: uppercase, удалить пробелы/дефисы, перевести
+    поддерживаемую кириллицу в латиницу (см. _CYRILLIC_TO_LATIN выше).
+    Буква, отсутствующая среди поддерживаемых 12, остаётся кириллической
+    после .translate() — вызывающий код сам решает, что с этим делать
+    (normalize_car_number — отклоняет, looks_like_car_number — тоже
+    отклоняет implicitly, не матчится _CAR_NUMBER_RE)."""
     normalized = raw.strip().upper().replace(" ", "").replace("-", "")
-    normalized = normalized.translate(_CYRILLIC_TO_LATIN)
+    return normalized.translate(_CYRILLIC_TO_LATIN)
+
+
+# "Выглядит как номер" (см. задачу "Improve the /start UX... Allow direct
+# plate input after /start") — НАМЕРЕННО строже голого _CAR_NUMBER_RE
+# (который принял бы и "HELLO", и "12345" — это ВАЛИДНЫЙ формат номера по
+# принятым правилам, но явно НЕ похоже на реальный номер и hijack'нуло бы
+# обычный текст/слова). Реальные номера (см. тесты/примеры по всему
+# проекту: O127PX62, M295YB196, AA001AA, E911EE95) ВСЕГДА смешивают буквы
+# и цифры и имеют длину примерно 5–10 символов — этого достаточно, чтобы
+# отличить "похоже, попытка ввести номер" от "обычное сообщение", не
+# будучи второй, отдельной реализацией валидации формата (та остаётся
+# ТОЛЬКО в normalize_car_number/_CAR_NUMBER_RE — эта функция только решает
+# ВЫЗЫВАТЬ ли её, никогда не заменяет её результат)."""
+_PLATE_LIKE_RE = re.compile(r"^(?=.{5,10}$)(?=.*[A-Z])(?=.*[0-9])[A-Z0-9]+$")
+
+
+def looks_like_car_number(raw: str) -> bool:
+    """True — похоже на попытку ввести номер (см. _PLATE_LIKE_RE докстрок).
+    НЕ гарантирует, что normalize_car_number(raw) не бросит
+    FineValidationError дальше (например, при длине на границе диапазона
+    с недопустимым символом) — вызывающий код (reader/public_bot/
+    conversation.py::handle_text()) всё равно обязан вызвать
+    normalize_car_number()/обработать её ошибку как обычно, эта функция
+    только РЕШАЕТ, стоит ли вообще пробовать."""
+    return bool(_PLATE_LIKE_RE.match(_normalize_candidate(raw)))
+
+
+def normalize_car_number(raw: str) -> str:
+    """См. _normalize_candidate() про сам порядок нормализации."""
+    normalized = _normalize_candidate(raw)
 
     if not normalized:
         raise FineValidationError("Номер автомобиля не может быть пустым")
