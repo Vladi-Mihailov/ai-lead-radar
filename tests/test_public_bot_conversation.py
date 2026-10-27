@@ -436,7 +436,7 @@ async def test_my_cars_shows_only_own_subscriptions(fx):
 
     reply = await fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=10, telegram_user_id=10, username=None)
 
-    assert reply.text == texts.MY_CARS_HEADER
+    assert reply.text == f"{texts.MY_CARS_HEADER}\n\n{texts.MY_CARS_HINT_TEXT}"
     [(_subscription_id, label)] = reply.my_cars_page_options
     assert "AA001AA" in label
     assert "BB002BB" not in label
@@ -460,6 +460,77 @@ async def test_my_cars_shows_expired_state_for_past_end_date(fx):
     [(_subscription_id, label)] = reply.my_cars_page_options
     assert "⏱" in label
     assert "ИСТЁК" in label
+
+
+# ---- "small UX text change" задача — подсказка под списком "Мои авто" ----
+# ОДНА и та же формулировка для ON и OFF (не зависит от state конкретной
+# машины — страница может показывать несколько машин сразу в разных
+# состояниях, см. texts.MY_CARS_HINT_TEXT докстрок).
+
+async def test_my_cars_hint_shown_when_car_is_on(fx):
+    await fx.service.add_car(
+        telegram_user_id=10, telegram_chat_id=10, username="user10",
+        first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=_today(),
+    )
+
+    reply = await fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=10, telegram_user_id=10, username=None)
+
+    [(_subscription_id, label)] = reply.my_cars_page_options
+    assert "ON" in label
+    assert texts.MY_CARS_HINT_TEXT in reply.text
+
+
+async def test_my_cars_hint_shown_when_car_is_off(fx):
+    subscription_id = (await fx.service.add_car(
+        telegram_user_id=10, telegram_chat_id=10, username="user10",
+        first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=_today(),
+    )).subscription.id
+    fx.controller.handle_my_car_turn_off(subscription_id, 0, telegram_user_id=10)
+
+    reply = await fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=10, telegram_user_id=10, username=None)
+
+    [(_subscription_id, label)] = reply.my_cars_page_options
+    assert "OFF" in label
+    assert texts.MY_CARS_HINT_TEXT in reply.text  # same hint text as the ON case above
+
+
+def test_my_cars_hint_text_exact_wording():
+    assert texts.MY_CARS_HINT_TEXT == (
+        "Нажмите на номер авто, чтобы проверить неоплаченные штрафы "
+        "или включить/отключить уведомления о новых штрафах."
+    )
+
+
+def test_my_cars_hint_does_not_imply_full_fine_history():
+    text = texts.MY_CARS_HINT_TEXT.lower()
+    for banned in ("вся история штрафов", "все штрафы за всё время", "старые штрафы"):
+        assert banned not in text
+
+
+async def test_my_cars_list_rendering_unchanged_apart_from_hint(fx):
+    """Header, button label, subscription_id, pagination fields all still
+    behave exactly as before -- only reply.text gained the hint line."""
+    await fx.service.add_car(
+        telegram_user_id=10, telegram_chat_id=10, username="user10",
+        first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=_today(),
+    )
+
+    reply = await fx.controller.handle_text(texts.MY_CARS_LABEL, chat_id=10, telegram_user_id=10, username=None)
+
+    assert reply.text == f"{texts.MY_CARS_HEADER}\n\n{texts.MY_CARS_HINT_TEXT}"
+    assert reply.text.startswith(texts.MY_CARS_HEADER)
+    [(subscription_id, label)] = reply.my_cars_page_options
+    assert "AA001AA" in label
+    assert reply.my_cars_page == 0
+    assert reply.my_cars_total_pages == 1
+
+    # Check Now / toggle callbacks for this exact subscription still work
+    # unchanged -- the hint is purely a text addition, not a data change.
+    detail_reply = fx.controller.handle_my_car_open(subscription_id, 0, telegram_user_id=10)
+    assert detail_reply.car_detail_subscription_id == subscription_id
+    off_reply = fx.controller.handle_my_car_turn_off(subscription_id, 0, telegram_user_id=10)
+    assert off_reply is not None
+    assert off_reply.car_detail_monitoring_state == "OFF"
 
 
 # ---- переживание рестарта (переоткрытие БД) ----
@@ -1297,7 +1368,7 @@ async def test_my_car_turn_off_flow_open_toggle_and_back(fx):
     # "⬅️ Назад" — та же навигация, что и пагинация (см. handlers.py:
     # decode_my_cars_page_callback реиспользуется для Back).
     back_reply = fx.controller.handle_my_cars_page(0, telegram_user_id=1)
-    assert back_reply.text == texts.MY_CARS_HEADER
+    assert back_reply.text == f"{texts.MY_CARS_HEADER}\n\n{texts.MY_CARS_HINT_TEXT}"
     [(_id, back_label)] = back_reply.my_cars_page_options
     assert "OFF" in back_label
 

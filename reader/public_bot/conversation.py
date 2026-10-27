@@ -1476,7 +1476,7 @@ class ConversationController:
 
         options = [(car.id, texts.format_car_button_label(car, today)) for car in page_cars]
         return BotReply(
-            text=texts.MY_CARS_HEADER,
+            text=f"{texts.MY_CARS_HEADER}\n\n{texts.MY_CARS_HINT_TEXT}",
             my_cars_page_options=options,
             my_cars_page=page,
             my_cars_total_pages=total_pages,
