@@ -218,7 +218,8 @@ async def test_existing_menu_buttons_are_unchanged(fx):
         assert fallback.text == texts.MAIN_MENU_TEXT and fallback.show_main_menu is True
 
     start = await fx.controller.handle_text("/start", chat_id=1, telegram_user_id=1, username=None)
-    assert start.text == texts.MAIN_MENU_TEXT and start.show_main_menu is True
+    assert start.text == texts.START_GREETING_TEXT
+    assert start.show_main_menu is True
 
 
 async def test_trusted_statistics_and_search_are_unchanged(trusted_fx):

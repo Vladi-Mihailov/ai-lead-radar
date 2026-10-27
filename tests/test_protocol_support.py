@@ -378,6 +378,29 @@ async def test_main_menu_exit_closes_dialog(db, label):
     assert bot.controller.texts == []
 
 
+@pytest.mark.parametrize("label", [st.SUPPORT_MAIN_MENU_LABEL, "/start"])
+async def test_georgia_main_menu_exit_shows_full_start_greeting(db, label):
+    """Regression test for "Fix the Georgia public bot /start greeting"
+    (production bug): this scenario goes through reader/public_bot/
+    handlers.py::register()'s REAL _on_message/handle_private_support()
+    wiring (via Bot("ge", ...) -- NOT a bare ConversationController.start()
+    call, which handle_private_support() intercepts and returns from
+    BEFORE controller.handle_text() is ever reached, see handlers.py's own
+    comment on main_menu_text=). Previously this path used a bare
+    MAIN_MENU_TEXT with no hint even after ConversationController.start()
+    was fixed -- exactly the "second independent /start text constant"
+    bug class this task warns about. Must show BOTH the title and the
+    explanation, not just one or the other."""
+    bot = Bot("ge", db)
+    await _opened(bot)
+    event = await bot.private(PrivateEvent(label))
+    assert ge_texts.MAIN_MENU_TEXT in event.responses[0]["text"]
+    assert ge_texts.START_WELCOME_EXPLANATION_TEXT in event.responses[0]["text"]
+    assert event.responses[0]["text"] == ge_texts.START_GREETING_TEXT
+    assert bot.service.open_dialog(USER) is None
+    assert bot.controller.texts == []
+
+
 @pytest.mark.parametrize("key", ["ge", "tr"])
 async def test_manager_closes_dialog_idempotently(db, key):
     bot = Bot(key, db)

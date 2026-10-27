@@ -1010,9 +1010,14 @@ class ConversationController:
     def start(self, *, chat_id: int, telegram_user_id: int) -> BotReply:
         """/start — сбрасывает ЛЮБОЙ незавершённый диалог этого chat_id и
         показывает главное меню (см. design: "/start и повторное нажатие
-        Добавить авто очищают старое незавершённое состояние")."""
+        Добавить авто очищают старое незавершённое состояние"). Текст —
+        ТОЛЬКО texts.START_GREETING_TEXT (ЕДИНСТВЕННЫЙ источник истины для
+        полного текста "/start", см. его докстрок про ВТОРОЙ, независимый
+        "/start"-путь в handle_private_support() — production-баг
+        "Fix the Georgia public bot /start greeting": раньше эти два пути
+        собирали текст по-разному, здесь — буквально та же константа)."""
         self._clear_state(chat_id)
-        return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
+        return BotReply(text=texts.START_GREETING_TEXT, show_main_menu=True)
 
     def _handle_start_command(
         self,
