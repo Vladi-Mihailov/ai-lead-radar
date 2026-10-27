@@ -165,13 +165,38 @@ def trusted_fx(tmp_path):
 
 
 async def test_start_shows_main_menu_and_clears_state(fx):
+    """Invokes the ACTUAL /start handler path (ConversationController.
+    handle_text -> _handle_start_command -> start()), not a bare text
+    constant in isolation -- asserts the produced message contains BOTH
+    the title and the explanation (see also test_protocol_support.py::
+    test_georgia_main_menu_exit_shows_full_start_greeting for the OTHER,
+    independent /start path through handle_private_support())."""
     fx.conversation_state_repository.set(chat_id=1, telegram_user_id=1, step=STEP_AWAITING_CAR_NUMBER)
 
     reply = await fx.controller.handle_text("/start", chat_id=1, telegram_user_id=1, username=None)
 
-    assert reply.text == texts.MAIN_MENU_TEXT
+    assert texts.MAIN_MENU_TEXT in reply.text
+    assert texts.START_WELCOME_EXPLANATION_TEXT in reply.text
+    assert reply.text == texts.START_GREETING_TEXT
     assert reply.show_main_menu is True
     assert fx.conversation_state_repository.get(1) is None
+
+
+def test_start_welcome_explanation_exact_wording():
+    assert texts.START_WELCOME_EXPLANATION_TEXT == (
+        "Добавьте номер авто — я проверю, есть ли неоплаченные штрафы, "
+        "в том числе выписанные ранее, и сообщу, если появятся новые."
+    )
+
+
+async def test_other_main_menu_returns_do_not_repeat_start_explanation(fx):
+    """Only the genuine /start command shows the welcome explanation --
+    see texts.START_WELCOME_EXPLANATION_TEXT's own docstring: repeating it
+    on every other "back to main menu" path (cancel/error/STOP_LABEL
+    fallback/etc.) would be noisy, not what was asked."""
+    reply = await fx.controller.handle_text(texts.STOP_LABEL, chat_id=1, telegram_user_id=1, username=None)
+    assert reply.text == texts.MAIN_MENU_TEXT
+    assert texts.START_WELCOME_EXPLANATION_TEXT not in reply.text
 
 
 async def test_my_cars_button_with_no_subscriptions(fx):

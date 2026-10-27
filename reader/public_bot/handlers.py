@@ -91,7 +91,7 @@ from reader.public_bot.keyboards import (
 )
 from reader.public_bot.known_users_repository import BotKnownUsersRepository
 from reader.public_bot.subscription_service import CHECK_ALREADY_IN_PROGRESS
-from reader.public_bot.texts import CALLBACK_NOT_AUTHORIZED_TEXT, MAIN_MENU_TEXT
+from reader.public_bot.texts import CALLBACK_NOT_AUTHORIZED_TEXT, START_GREETING_TEXT
 
 logger = logging.getLogger(__name__)
 
@@ -209,10 +209,18 @@ def register(
     async def _on_message(event: events.NewMessage.Event) -> None:
         # «👨‍💼 Оператор» / открытый диалог с оператором — раньше обычной
         # логики (и раньше отсечения пустого текста: фото/документ без подписи).
+        # main_menu_text=START_GREETING_TEXT — ВТОРОЙ независимый "/start"-
+        # путь (см. handle_private_support(): пользователь печатает
+        # "/start" или жмёт "🏠 Главное меню", чтобы выйти из диалога с
+        # оператором, ДО того, как controller.handle_text() вообще
+        # вызывается) — ТА ЖЕ константа, что и у ConversationController.
+        # start() (см. texts.START_GREETING_TEXT докстрок про production-
+        # баг "Fix the Georgia public bot /start greeting": раньше здесь
+        # был голый MAIN_MENU_TEXT без подсказки).
         trusted = controller.is_trusted(event.sender_id)
         if await handle_private_support(
             event, support, is_trusted=trusted, reset_state=lambda: controller.reset_conversation(event.chat_id),
-            main_menu=main_menu_keyboard(is_trusted=trusted), main_menu_text=MAIN_MENU_TEXT,
+            main_menu=main_menu_keyboard(is_trusted=trusted), main_menu_text=START_GREETING_TEXT,
         ):
             return
 
