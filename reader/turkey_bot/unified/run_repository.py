@@ -64,6 +64,16 @@ CREATE INDEX IF NOT EXISTS idx_turkey_provider_results_provider
     ON turkey_provider_results(provider, status);
 """
 
+# Initiator'ы runs, результат которых считается показанным подписчику (см.
+# get_last_successful_provider_result_for_subscriber) — значения задаёт
+# пишущий код: "manual" — reader/turkey_bot/conversation.py::
+# _INITIATOR_MANUAL, "monitoring_<slot>"/"monitoring_<slot>_retry" —
+# reader/turkey_bot/monitoring/monitoring_service.py. "manager_refresh"
+# (reader/turkey_bot/debt_refresh_service.py) сюда сознательно НЕ входит.
+# "_" в LIKE-шаблоне экранирован — префикс сравнивается буквально.
+_SUBSCRIBER_SEEN_MANUAL_INITIATOR = "manual"
+_SUBSCRIBER_SEEN_MONITORING_LIKE = "monitoring\\_%"
+
 
 def _decimal_or_none(text: str | None) -> Decimal | None:
     return Decimal(text) if text is not None else None
@@ -235,7 +245,11 @@ class TurkeyCheckRunRepository:
         номера (см. design report решение п.10/change_detector.py:
         "если предыдущий successful result HAS_DEBT, а текущий provider
         ERROR — не считать, что долг исчез" — базой для сравнения всегда
-        служит последний УСПЕШНЫЙ результат, не последний run)."""
+        служит последний УСПЕШНЫЙ результат, не последний run).
+
+        По ВСЕМ runs номера, без фильтра по владельцу — поэтому мониторинг
+        больше НЕ использует его как baseline (см.
+        get_last_successful_provider_result_for_subscriber ниже)."""
         row = self._conn.execute(
             "SELECT pr.provider, pr.status, pr.debt_count, pr.principal_amount, pr.penalty_amount, "
             "       pr.total_amount, pr.error_type, pr.items_snapshot, pr.checked_at "
@@ -244,6 +258,52 @@ class TurkeyCheckRunRepository:
             "WHERE r.plate = ? AND pr.provider = ? AND pr.status != 'error' "
             "ORDER BY pr.checked_at DESC, pr.id DESC LIMIT 1",
             (plate, provider),
+        ).fetchone()
+        return self._row_to_provider_result(row) if row is not None else None
+
+    def get_last_successful_provider_result_for_subscriber(
+        self, plate: str, provider: str, *, telegram_user_id: int,
+    ) -> ProviderCheckResult | None:
+        """Baseline ChangeDetector'а для ОДНОГО подписчика мониторинга (см.
+        задачу "TR-0a: база сравнения по подписчику") — как
+        get_last_successful_provider_result() выше (последний НЕ-ERROR
+        результат провайдера), но ТОЛЬКО среди runs, результат которых
+        считается показанным ЭТОМУ telegram_user_id: его собственный
+        плановый мониторинг/retry (изменения по нему отправлялись ему) и
+        его собственная ручная "🔎 Проверить сейчас" (он видел результат
+        на экране — прежняя семантика: после неё плановый прогон не
+        повторяет то же самое).
+
+        НЕ считаются baseline (production-находка: plate-wide baseline
+        "съедал" изменения, и владелец не получал уведомление о новом
+        долге):
+        - чужие runs того же номера — ручная проверка менеджера/другого
+          пользователя, мониторинг ДРУГОГО подписчика этого номера (в том
+          числе в том же батче, раньше в очереди);
+        - manager_refresh — сохраняется под telegram_user_id владельца
+          (см. debt_refresh_service.py), но владелец этот результат не видел.
+
+        Известное ограничение, которое этот метод НЕ закрывает: run
+        мониторинга сохраняется ДО отправки уведомления (см.
+        monitoring_service.py::_check_one/_run_retry), поэтому если send
+        упал, изменение всё равно считается показанным — это отдельная
+        задача (надёжная доставка с повторами).
+
+        Только чтение; схема/данные turkey_check_runs не меняются."""
+        row = self._conn.execute(
+            "SELECT pr.provider, pr.status, pr.debt_count, pr.principal_amount, pr.penalty_amount, "
+            "       pr.total_amount, pr.error_type, pr.items_snapshot, pr.checked_at "
+            "FROM turkey_provider_results pr "
+            "JOIN turkey_check_runs r ON r.id = pr.run_id "
+            "WHERE r.plate = ? AND r.telegram_user_id = ? "
+            "  AND (r.initiator = ? OR r.initiator LIKE ? ESCAPE '\\') "
+            "  AND pr.provider = ? AND pr.status != 'error' "
+            "ORDER BY pr.checked_at DESC, pr.id DESC LIMIT 1",
+            (
+                plate, telegram_user_id,
+                _SUBSCRIBER_SEEN_MANUAL_INITIATOR, _SUBSCRIBER_SEEN_MONITORING_LIKE,
+                provider,
+            ),
         ).fetchone()
         return self._row_to_provider_result(row) if row is not None else None
 

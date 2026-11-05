@@ -155,8 +155,16 @@ class TurkeyMonitoringService:
     async def _check_one(
         self, subscription: TurkeyMonitoringSubscription, *, slot_label: str, now: datetime,
     ) -> UnifiedCheckResult:
+        # Baseline — ПО ПОДПИСЧИКУ, а не по всему номеру (см.
+        # TurkeyCheckRunRepository.get_last_successful_provider_result_for_
+        # subscriber): чужая ручная проверка, manager_refresh или run
+        # другого подписчика того же номера (в том числе раньше в ЭТОМ
+        # батче) больше не "съедают" изменение, о котором этот подписчик
+        # ещё не уведомлён.
         previous_by_provider = {
-            provider: self._runs.get_last_successful_provider_result(subscription.plate, provider)
+            provider: self._runs.get_last_successful_provider_result_for_subscriber(
+                subscription.plate, provider, telegram_user_id=subscription.telegram_user_id,
+            )
             for provider in _PROVIDERS
         }
 
@@ -192,8 +200,11 @@ class TurkeyMonitoringService:
         providers, поэтому providers, уже сравненные и, если нужно,
         уведомлённые в первом проходе, здесь вообще не участвуют — см.
         задачу: "не создавать duplicate user notifications")."""
+        # Тот же baseline по подписчику, что и в _check_one.
         previous_by_provider = {
-            provider: self._runs.get_last_successful_provider_result(retry.plate, provider)
+            provider: self._runs.get_last_successful_provider_result_for_subscriber(
+                retry.plate, provider, telegram_user_id=retry.telegram_user_id,
+            )
             for provider in retry.providers
         }
 
