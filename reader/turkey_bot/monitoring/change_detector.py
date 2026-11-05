@@ -9,9 +9,11 @@ DebtItem докстрок и design report решение п.5).
 КЛЮЧЕВОЕ ПРАВИЛО (см. design report п.10/п.7): ERROR провайдера
 ПОЛНОСТЬЮ игнорируется для сравнения — ни "долг исчез", ни "долг
 появился" никогда не выводится из ERROR-результата. Baseline для
-сравнения всегда — последний НЕ-ERROR результат этого провайдера (см.
-reader/turkey_bot/unified/run_repository.py::
-get_last_successful_provider_result), а не предыдущий run целиком."""
+сравнения всегда — последний НЕ-ERROR результат этого провайдера, который
+считается показанным ИМЕННО этому подписчику (см. reader/turkey_bot/
+unified/run_repository.py::
+get_last_successful_provider_result_for_subscriber), а не предыдущий run
+целиком."""
 
 from __future__ import annotations
 
