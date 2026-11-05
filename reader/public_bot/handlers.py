@@ -63,6 +63,9 @@ from reader.public_bot.keyboards import (
     decode_search_new_callback,
     decode_search_page_callback,
     decode_trusted_check_now_once_callback,
+    decode_trusted_one_off_add_callback,
+    decode_trusted_one_off_another_callback,
+    decode_trusted_one_off_check_callback,
     decode_trusted_stop_confirm_callback,
     decode_trusted_stop_pick_callback,
     decode_trusted_task_continue_callback,
@@ -80,7 +83,6 @@ from reader.public_bot.keyboards import (
     protocol_check_method_keyboard,
     search_entry_keyboard,
     search_result_keyboard,
-    trusted_check_now_inactive_keyboard,
     trusted_stop_confirm_keyboard,
     trusted_stop_options_keyboard,
     trusted_task_detail_keyboard,
@@ -91,7 +93,11 @@ from reader.public_bot.keyboards import (
 )
 from reader.public_bot.known_users_repository import BotKnownUsersRepository
 from reader.public_bot.subscription_service import CHECK_ALREADY_IN_PROGRESS
-from reader.public_bot.texts import CALLBACK_NOT_AUTHORIZED_TEXT, START_GREETING_TEXT
+from reader.public_bot.texts import (
+    CALLBACK_NOT_AUTHORIZED_TEXT,
+    ONE_OFF_CHECK_IN_PROGRESS_TEXT,
+    START_GREETING_TEXT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -242,6 +248,23 @@ def register(
             first_name=first_name,
             last_name=last_name,
         )
+
+        one_off_plate = getattr(reply, "trusted_one_off_plate", None)
+        if one_off_plate is not None:
+            # Разовая проверка без сохранения (см. задачу "GE-2" и
+            # BotReply.trusted_one_off_plate) — "⏳" после захвата guard'а,
+            # затем правка этого сообщения результатом, как у callback'ов
+            # "🔎 Проверить сейчас", только без event.answer().
+            await _hourglass_then_await_slow_check(
+                event,
+                lambda on_check_started: controller.handle_trusted_one_off_check(
+                    one_off_plate, telegram_user_id=event.sender_id, chat_id=event.chat_id,
+                    on_check_started=on_check_started,
+                ),
+                is_trusted=is_trusted,
+                already_in_progress_text=ONE_OFF_CHECK_IN_PROGRESS_TEXT,
+            )
+            return
 
         await _send_reply(event, reply, is_trusted=is_trusted)
 
@@ -411,6 +434,37 @@ def register(
                 ),
                 is_trusted=is_trusted,
             )
+            return
+
+        trusted_one_off_check = decode_trusted_one_off_check_callback(data)
+        if trusted_one_off_check is not None:
+            await _ack_hourglass_then_await_slow_check(
+                event,
+                lambda on_check_started: controller.handle_trusted_plate_choice_check(
+                    trusted_one_off_check, telegram_user_id=event.sender_id,
+                    on_check_started=on_check_started,
+                ),
+                is_trusted=is_trusted,
+            )
+            return
+
+        # "➕ На мониторинг"/"➕ Добавить на мониторинг" и "🔎 Проверить другой
+        # номер" — новым сообщением, а не правкой: кнопка висит под
+        # результатом разовой проверки (полным списком штрафов), его
+        # затирать нельзя.
+        trusted_one_off_add = decode_trusted_one_off_add_callback(data)
+        if trusted_one_off_add is not None:
+            reply = controller.handle_trusted_one_off_add(
+                trusted_one_off_add, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted, prefer_edit=False)
+            return
+
+        if decode_trusted_one_off_another_callback(data):
+            reply = controller.handle_trusted_one_off_another(
+                chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted, prefer_edit=False)
             return
 
         trusted_task_period = decode_trusted_task_period_callback(data)
@@ -692,7 +746,9 @@ def _split_telegram_text(text: str, *, limit: int = _TELEGRAM_SAFE_TEXT_LIMIT) -
     return chunks
 
 
-async def _answer_and_send(event, reply, *, is_trusted: bool = False, on_reply=None) -> None:
+async def _answer_and_send(
+    event, reply, *, is_trusted: bool = False, on_reply=None, prefer_edit: bool = True,
+) -> None:
     """Общий хвост для callback'ов, которые могут вернуть None (=
     подписка не найдена/не принадлежит этому пользователю, см.
     reader/public_bot/keyboards.py про то, почему сам факт валидного
@@ -702,12 +758,14 @@ async def _answer_and_send(event, reply, *, is_trusted: bool = False, on_reply=N
     on_reply — тот же необязательный side-effect хук, что и у
     _ack_then_await_slow_check (см. его докстрок) — None для всех call
     site'ов, кроме manual-bootstrap "✅ Штрафов нет" (см.
-    BotReply.customer_notify_messages)."""
+    BotReply.customer_notify_messages). prefer_edit=False — ответ новым
+    сообщением, когда сообщение с нажатой кнопкой нужно сохранить (см.
+    кнопки под результатом разовой проверки в _on_callback)."""
     if reply is None:
         await event.answer(CALLBACK_NOT_AUTHORIZED_TEXT, alert=True)
         return
     await event.answer()
-    await _send_reply(event, reply, prefer_edit=True, is_trusted=is_trusted)
+    await _send_reply(event, reply, prefer_edit=prefer_edit, is_trusted=is_trusted)
     if on_reply is not None:
         await on_reply(event, reply)
 
@@ -756,9 +814,10 @@ async def _ack_then_await_slow_check(event, coro, *, is_trusted: bool = False, o
 
 
 async def _ack_hourglass_then_await_slow_check(event, coro_factory, *, is_trusted: bool = False) -> None:
-    """Для ровно ТРЁХ callback'ов — check_now_id/my_car_check_now_once/
-    trusted_check_now_once (см. "Fix the Georgia public bot Check Now
-    flow") — "🔎 Проверить сейчас" семейство, и ТОЛЬКО для них: period
+    """Для callback'ов семейства "🔎 Проверить сейчас" — check_now_id/
+    my_car_check_now_once/trusted_check_now_once (см. "Fix the Georgia
+    public bot Check Now flow") и "🔎 Разовая проверка" на экране выбора
+    trusted-менеджера (см. задачу "GE-2"), и ТОЛЬКО для них: period
     (onboarding-проверка) и debt_refresh_confirm (батч) намеренно НЕ
     переведены на этот хелпер, остаются на _ack_then_await_slow_check как
     раньше — разные UX-контексты, голый "⏳" там не запрашивался.
@@ -795,7 +854,20 @@ async def _ack_hourglass_then_await_slow_check(event, coro_factory, *, is_truste
         await event.answer()
     except QueryIdInvalidError:
         pass
+    await _hourglass_then_await_slow_check(event, coro_factory, is_trusted=is_trusted)
 
+
+async def _hourglass_then_await_slow_check(
+    event, coro_factory, *, is_trusted: bool = False, already_in_progress_text: str | None = None,
+) -> None:
+    """Общая часть "⏳ → правка результатом" (см. _ack_hourglass_then_await_
+    slow_check выше) — и для callback'ов (после их ack), и для текстового
+    сообщения с маркером BotReply.trusted_one_off_plate (см. _on_message:
+    это не callback, ack там не нужен).
+
+    already_in_progress_text — ответ на CHECK_ALREADY_IN_PROGRESS: для
+    callback'а None (ack уже был, второе сообщение не нужно), а повторно
+    присланный текстом номер без ответа выглядел бы проигнорированным."""
     hourglass_message = None
 
     async def _show_hourglass() -> None:
@@ -805,6 +877,8 @@ async def _ack_hourglass_then_await_slow_check(event, coro_factory, *, is_truste
     reply = await coro_factory(_show_hourglass)
 
     if reply is CHECK_ALREADY_IN_PROGRESS:
+        if already_in_progress_text is not None:
+            await event.respond(already_in_progress_text)
         return
     if reply is None:
         await event.respond(CALLBACK_NOT_AUTHORIZED_TEXT)
@@ -862,8 +936,6 @@ async def _send_reply(
         buttons = trusted_task_period_choice_keyboard(
             reply.trusted_task_period_id, page=reply.trusted_task_period_page,
         )
-    elif reply.trusted_check_now_inactive_id is not None:
-        buttons = trusted_check_now_inactive_keyboard(reply.trusted_check_now_inactive_id)
     elif reply.my_cars_page_options is not None:
         # car-centric "📋 Мои авто" (см. design report про переработку
         # UX) — пустой список ([]) — валидный (см. design: "показать 0 из

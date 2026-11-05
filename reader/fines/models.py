@@ -343,3 +343,37 @@ class CheckResult:
         (см. FineCheckService._suppressed_result), поэтому никакие реальные
         данные не выходят наружу, а сам факт suppression невидим."""
         return self.status in ("ok", "suppressed")
+
+
+@dataclass(frozen=True)
+class OneOffCheckResult:
+    """Разовая проверка номера менеджером БЕЗ сохранения (см. задачу
+    "GE-1: сервис проверки без сохранения" и FineCheckService.
+    check_plate_readonly) — в отличие от CheckResult, НЕ привязана ни к
+    одной fine_monitoring_task: ничего не записано ни в
+    fine_monitoring_tasks, ни в detected_fines, поэтому и new_fines здесь
+    нет вовсе — fines это просто всё, что police.ge/REDNET вернул на этой
+    проверке (detected_fine_id/task_id у каждого = 0, форматтер их не
+    читает).
+
+    status — та же семантика, что и у CheckResult: "suppressed" (номер в
+    denylist, см. reader/fines/suppression.py) снаружи неотличим от
+    успешной проверки без штрафов. provider_unavailable — True ТОЛЬКО для
+    PoliceGeUnavailableError (тот же смысл, что и у
+    CheckResult.provider_unavailable). zero_confirmed — пустой ответ
+    подтверждён ОДНИМ повторным запросом через 5 с (см. задачу: "при
+    пустом ответе повтор через 5 секунд"); False, если штрафы найдены или
+    проверка не удалась."""
+
+    status: CheckStatus
+    car_number: str
+    fines: list[NewFineEvent]
+    error_message: str | None
+    duration_ms: int
+    provider_unavailable: bool = False
+    zero_confirmed: bool = False
+
+    @property
+    def shows_as_ok(self) -> bool:
+        """См. CheckResult.shows_as_ok — тот же принцип для suppression."""
+        return self.status in ("ok", "suppressed")

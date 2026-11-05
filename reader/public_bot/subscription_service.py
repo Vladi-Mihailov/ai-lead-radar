@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
 from reader.fines.check_service import FineCheckService
-from reader.fines.models import FineMonitoringTask, NewFineEvent
+from reader.fines.models import FineMonitoringTask, NewFineEvent, OneOffCheckResult
 from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository
 from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.public_bot.car_owner_sync import sync_user_and_car
@@ -256,6 +256,11 @@ class SubscriptionService:
         # check_now_task_for_search() below, so it's already atomic under
         # asyncio's cooperative scheduling.
         self._check_in_progress: set[int] = set()
+        # Разовая проверка менеджера без сохранения (см. check_plate_once) —
+        # ОТДЕЛЬНЫЙ guard: у такой проверки нет task.id, поэтому ключи —
+        # номер и менеджер, а _check_in_progress выше не трогается.
+        self._one_off_plates_in_progress: set[str] = set()
+        self._one_off_users_in_progress: set[int] = set()
 
     # ---- self-service (обычный пользователь) ----
 
@@ -1149,6 +1154,71 @@ class SubscriptionService:
         # Обычно у номера ровно одна активная задача — то же допущение,
         # что и в reader/commands/fine.py::_handle_check/_handle_stop.
         return await self.check_now_task(tasks[0].id)
+
+    async def check_now_task_by_car_number_guarded(
+        self, car_number: str, *, on_check_started: Callable[[], Awaitable[None]] | None = None,
+    ) -> CheckNowOutcome | object | None:
+        """То же, что check_now_task_by_car_number() (тот же check_now_task()
+        с check_task_or_read_cached()), но с guard'ом _check_in_progress по
+        task.id и хуком on_check_started, как у check_now(): для кнопок
+        trusted-менеджера (см. ConversationController.
+        _trusted_plate_check_from_button), где двойное нажатие не должно
+        запускать вторую проверку задачи, а "⏳" должно появиться. Текстовый
+        ввод номера по-прежнему идёт через check_now_task_by_car_number().
+        None — у номера нет активной задачи."""
+        tasks = self._task_repository.get_active_by_car_number(car_number)
+        if not tasks:
+            return None
+        task_id = tasks[0].id  # то же допущение, что и в check_now_task_by_car_number()
+        if task_id in self._check_in_progress:
+            return CHECK_ALREADY_IN_PROGRESS
+        self._check_in_progress.add(task_id)
+        try:
+            if on_check_started is not None:
+                await on_check_started()
+            return await self.check_now_task(task_id)
+        finally:
+            self._check_in_progress.discard(task_id)
+
+    def has_active_task_for_car(self, car_number: str) -> bool:
+        """Есть ли у номера active fine_monitoring_task — ТОТ ЖЕ источник,
+        что и у check_now_task_by_car_number() выше, но без проверки: по
+        нему ConversationController решает ДО запроса к police.ge, идти ли
+        существующим task-level путём (активная задача — без изменений)
+        или разовой проверкой без сохранения (см. check_plate_once)."""
+        return bool(self._task_repository.get_active_by_car_number(car_number))
+
+    async def check_plate_once(
+        self, car_number: str, *, telegram_user_id: int,
+        on_check_started: Callable[[], Awaitable[None]] | None = None,
+    ) -> OneOffCheckResult | object:
+        """Разовая проверка номера trusted-менеджером БЕЗ сохранения (см.
+        задачу "GE-1" и FineCheckService.check_plate_readonly) — ни задача,
+        ни подписка, ни detected_fines не создаются и не меняются, поэтому
+        ни одно уведомление не запускается. Авторизация — забота
+        вызывающего кода (ConversationController._is_trusted), как и у
+        остальных trusted-методов этого сервиса.
+
+        CHECK_ALREADY_IN_PROGRESS — не больше одной такой проверки на номер
+        и одной на менеджера одновременно (повторный ввод номера или второй
+        клик, пока первая проверка ещё идёт). on_check_started — тот же
+        хук, что и у check_now(): awaited РОВНО ОДИН раз, сразу после
+        захвата guard'а и ДО медленного запроса к police.ge/REDNET."""
+        if (
+            car_number in self._one_off_plates_in_progress
+            or telegram_user_id in self._one_off_users_in_progress
+        ):
+            return CHECK_ALREADY_IN_PROGRESS
+        self._one_off_plates_in_progress.add(car_number)
+        self._one_off_users_in_progress.add(telegram_user_id)
+        try:
+            if on_check_started is not None:
+                await on_check_started()
+            return await self._check_service.check_plate_readonly(car_number)
+        finally:
+            # См. check_now(): finally освобождает guard и при отмене.
+            self._one_off_plates_in_progress.discard(car_number)
+            self._one_off_users_in_progress.discard(telegram_user_id)
 
     def find_representative_task_for_inactive_car(self, car_number: str) -> FineMonitoringTask | None:
         """Trusted-operator "🔎 Проверить сейчас" по номеру (см. задачу

@@ -82,11 +82,13 @@ is_trusted() перепроверяется на КАЖДОМ шаге обои�
 РЕАЛЬНОМУ event.sender_id — callback task_id/subscription_id/page
 публичны и НЕ являются доказательством авторизации сами по себе."""
 
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
+from reader.fines.models import OneOffCheckResult
 from reader.fines.validation import FineValidationError, looks_like_car_number, normalize_car_number
 from reader.plate_display import format_plate_for_telegram
 from reader.public_bot import manager_alerts, texts
@@ -120,6 +122,8 @@ from reader.public_bot.validation import (
     UsernameValidationError,
     normalize_telegram_username,
 )
+
+logger = logging.getLogger(__name__)
 
 STEP_AWAITING_CAR_NUMBER = "awaiting_car_number"
 STEP_AWAITING_CLIENT_DECISION = "awaiting_client_decision"
@@ -307,15 +311,13 @@ class BotReply:
     task_id/page, см. handle_trusted_task_toggle — переиспользуется как
     no-op показ, задача уже OFF).
 
-    trusted_check_now_inactive_id — карточка "мониторинг завершён/
-    выключен" (см. задачу "expired Georgia Check Now UX") — показывается
-    ВМЕСТО texts.format_trusted_check_now_not_found(), когда trusted
-    "🔎 Проверить сейчас" по номеру не нашёл АКТИВНОЙ задачи, но нашёл
-    историческую (см. _handle_trusted_check_now_car_number_input/
-    SubscriptionService.find_representative_task_for_inactive_car). Та же
-    клавиатура, что и у "▶️ Продолжить мониторинг"/"⬅️ Назад" OFF-детали,
-    плюс "🔎 Проверить разово" (см. keyboards.py::
-    trusted_check_now_inactive_keyboard, handle_trusted_check_now_once).
+    trusted_one_off_plate — НЕ экран, а команда handlers.py (см. задачу
+    "GE-2: UI менеджера"): запустить разовую проверку этого номера без
+    сохранения — отправить "⏳", вызвать handle_trusted_one_off_check() и
+    отредактировать "⏳" её результатом. Сама проверка здесь не
+    выполняется, поэтому шаг ввода номера остаётся активным, пока она идёт
+    (иначе повторно присланный номер ушёл бы в Add Car через ввод номера с
+    главного экрана). text у такого ответа — только запасной "⏳".
 
     my_cars_page_options/my_cars_page/my_cars_total_pages — car-centric
     "📋 Мои авто" для ОБЫЧНОГО (не-trusted) пользователя (см. design
@@ -376,7 +378,7 @@ class BotReply:
     trusted_task_off_page: int | None = None
     trusted_task_period_id: int | None = None
     trusted_task_period_page: int | None = None
-    trusted_check_now_inactive_id: int | None = None
+    trusted_one_off_plate: str | None = None
     my_cars_page_options: list[tuple[int, str]] | None = None
     my_cars_page: int | None = None
     my_cars_total_pages: int | None = None
@@ -1551,7 +1553,12 @@ class ConversationController:
             # пункты меню (эти уже обработаны выше в _handle_menu_label,
             # до этой точки код не доходит) и просто "не похожий на номер"
             # текст — для него ниже остаётся прежняя мягкая подсказка.
+            # Trusted-менеджер вместо Add Car получает выбор "разовая
+            # проверка / на мониторинг" (см. задачу "GE-2", решение 3) —
+            # обычный пользователь и явное "➕ Добавить авто" не меняются.
             if looks_like_car_number(stripped):
+                if self._is_trusted(telegram_user_id):
+                    return self._trusted_plate_choice_reply(stripped)
                 return self._handle_car_number_input(
                     stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, username=username,
                 )
@@ -1733,14 +1740,21 @@ class ConversationController:
     async def _handle_trusted_check_now_car_number_input(
         self, raw_text: str, *, chat_id: int, telegram_user_id: int,
     ) -> BotReply:
-        """Trusted-operator task-level 🔎 Проверить сейчас — ввод номера
-        (см. design report). is_trusted() уже был проверен, чтобы попасть
-        на этот шаг (см. _handle_menu_label), но перепроверяется ЗАНОВО и
-        здесь — тот же принцип "на каждом действии повторно проверять",
-        что и у task-level ⛔. Невалидный формат номера — остаёмся на этом
-        же шаге (тот же UX, что и у self-service _handle_car_number_input),
-        чтобы можно было ввести номер заново без повторного нажатия
-        "🔎 Проверить сейчас"."""
+        """Trusted-operator 🔎 Проверить сейчас — ввод номера (см. design
+        report). is_trusted() уже был проверен, чтобы попасть на этот шаг
+        (см. _handle_menu_label), но перепроверяется ЗАНОВО и здесь — тот же
+        принцип "на каждом действии повторно проверять", что и у task-level
+        ⛔. Невалидный формат номера — остаёмся на этом же шаге (тот же UX,
+        что и у self-service _handle_car_number_input), чтобы можно было
+        ввести номер заново без повторного нажатия "🔎 Проверить сейчас".
+
+        Номер с АКТИВНОЙ задачей — без изменений (см. задачу "GE-2", Q1):
+        task-level check_now_task_by_car_number(), результат пишется в
+        задачу как часть мониторинга. Без активной задачи (только
+        историческая или ни одной) — разовая проверка без сохранения:
+        возвращается маркер trusted_one_off_plate, саму проверку запускает
+        handlers.py (см. handle_trusted_one_off_check), и шаг ввода номера
+        остаётся активным, пока она идёт."""
         if not self._is_trusted(telegram_user_id):
             self._clear_state(chat_id)
             return BotReply(text=texts.CALLBACK_NOT_AUTHORIZED_TEXT, show_main_menu=True)
@@ -1750,22 +1764,203 @@ class ConversationController:
         except FineValidationError as exc:
             return BotReply(text=f"❌ {exc.message}\n\n{texts.CAR_NUMBER_PROMPT}")
 
-        self._clear_state(chat_id)
+        if self._subscriptions.has_active_task_for_car(car_number):
+            self._clear_state(chat_id)
+            outcome = await self._subscriptions.check_now_task_by_car_number(car_number)
+            if outcome is not None:
+                return BotReply(text=texts.format_check_now_result(outcome), show_main_menu=True)
+            # Задача перестала быть активной между двумя запросами — дальше
+            # как у номера без активной задачи.
 
-        outcome = await self._subscriptions.check_now_task_by_car_number(car_number)
+        # Шаг ввода номера остаётся активным, пока идёт разовая проверка, —
+        # с отметкой номера: по ней handle_trusted_one_off_check снимет шаг,
+        # только если менеджер за время проверки не вошёл в него заново.
+        self._states.set(
+            chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_TRUSTED_CHECK_NOW_CAR_NUMBER,
+            payload={"one_off_plate": car_number},
+        )
+        return BotReply(text="⏳", trusted_one_off_plate=car_number)
+
+    # ---- разовая проверка trusted-менеджера без сохранения (см. задачу
+    # "GE-2: UI менеджера"). is_trusted() перепроверяется ЗАНОВО в каждом
+    # методе по РЕАЛЬНОМУ telegram_user_id — номер в callback_data/маркере
+    # ничего не доказывает. ----
+
+    async def handle_trusted_one_off_check(
+        self, car_number: str, *, telegram_user_id: int, chat_id: int | None = None,
+        on_check_started: Callable[[], Awaitable[None]] | None = None,
+    ) -> BotReply | object | None:
+        """Разовая проверка номера без сохранения (см.
+        SubscriptionService.check_plate_once) — handlers.py вызывает её по
+        маркеру BotReply.trusted_one_off_plate, по "🔎 Разовая проверка" на
+        экране выбора и по "🔎 Проверить разово" на старых карточках.
+
+        None — не trusted. CHECK_ALREADY_IN_PROGRESS — проверка этого
+        номера или этого менеджера уже идёт. chat_id — если передан, по
+        завершении снимается шаг ввода номера, но только тот, что поставил
+        ввод ЭТОГО номера (см. отметку one_off_plate в
+        _handle_trusted_check_now_car_number_input): за время проверки
+        менеджер мог начать другой сценарий или снова войти в ввод номера,
+        и это состояние трогать нельзя."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+
+        try:
+            result = await self._subscriptions.check_plate_once(
+                car_number, telegram_user_id=telegram_user_id, on_check_started=on_check_started,
+            )
+        except Exception:
+            # Сбой источника (FineProviderError) уже стал status="error"
+            # внутри check_plate_readonly; сюда доходит только неожиданное.
+            # Менеджер всё равно должен увидеть "❌ Проверка не выполнена", а
+            # не вечное "⏳", и шаг ввода номера не должен застрять.
+            logger.exception("Georgia one-off check plate=%s: неожиданная ошибка", car_number)
+            result = OneOffCheckResult(
+                status="error", car_number=car_number, fines=[], error_message="unexpected error", duration_ms=0,
+            )
+        if result is CHECK_ALREADY_IN_PROGRESS:
+            return CHECK_ALREADY_IN_PROGRESS
+
+        if chat_id is not None:
+            state = self._states.get(chat_id)
+            if (
+                state is not None
+                and state.telegram_user_id == telegram_user_id
+                and state.step == STEP_AWAITING_TRUSTED_CHECK_NOW_CAR_NUMBER
+                and (state.payload or {}).get("one_off_plate") == car_number
+            ):
+                self._clear_state(chat_id)
+
+        return self._format_one_off_reply(result)
+
+    async def _trusted_plate_check_from_button(
+        self, car_number: str, *, telegram_user_id: int,
+        on_check_started: Callable[[], Awaitable[None]] | None = None,
+    ) -> BotReply | object | None:
+        """Кнопки проверки номера — "🔎 Разовая проверка" на экране выбора и
+        "🔎 Проверить разово" на старых карточках — та же развилка, что и у
+        ввода номера после "🔎 Проверить сейчас" (см.
+        _handle_trusted_check_now_car_number_input): номер с активной
+        задачей — существующая task-level проверка (см. задачу "GE-2", Q1),
+        но с guard'ом от двойного нажатия и "⏳", как у остальных кнопок
+        проверки; иначе — разовая проверка без сохранения. on_check_started
+        вызывается не больше одного раза, даже если задача перестала быть
+        активной между двумя запросами и проверка ушла во вторую ветку."""
+        started = False
+
+        async def _check_started_once() -> None:
+            nonlocal started
+            if not started:
+                started = True
+                if on_check_started is not None:
+                    await on_check_started()
+
+        outcome = await self._subscriptions.check_now_task_by_car_number_guarded(
+            car_number, on_check_started=_check_started_once,
+        )
+        if outcome is CHECK_ALREADY_IN_PROGRESS:
+            return CHECK_ALREADY_IN_PROGRESS
         if outcome is not None:
             return BotReply(text=texts.format_check_now_result(outcome), show_main_menu=True)
 
-        representative = self._subscriptions.find_representative_task_for_inactive_car(car_number)
-        if representative is None:
-            return BotReply(
-                text=texts.format_trusted_check_now_not_found(car_number), show_main_menu=True,
-            )
-
-        return BotReply(
-            text=texts.format_trusted_check_now_inactive_card(representative, today=self._today()),
-            trusted_check_now_inactive_id=representative.id,
+        return await self.handle_trusted_one_off_check(
+            car_number, telegram_user_id=telegram_user_id, on_check_started=_check_started_once,
         )
+
+    def _format_one_off_reply(self, result: OneOffCheckResult) -> BotReply:
+        """Кнопки под результатом разовой проверки зависят от того, что
+        известно о номере СЕЙЧАС: активная задача — только "🔎 Проверить
+        другой номер" (мониторинг уже идёт); только историческая задача —
+        хвост "мониторинг завершён/выключен" и "▶️ Продолжить мониторинг"
+        (существующий callback: тот же выбор срока и resume, что и в
+        "📋 Мои авто"); задач нет — "➕ Добавить на мониторинг" (существующий
+        Add Car со сроком, см. handle_trusted_one_off_add). CTA нет."""
+        another = (texts.TRUSTED_ONE_OFF_ANOTHER_LABEL, _mb_kb().encode_trusted_one_off_another_callback())
+        tasks = self._subscriptions.list_tasks_for_car(result.car_number)
+        if any(task.status == "active" for task in tasks):
+            return BotReply(text=texts.format_one_off_check_result(result), inline_buttons=[[another]])
+        if tasks:
+            representative = self._subscriptions.find_representative_task_for_inactive_car(result.car_number)
+            return BotReply(
+                text=texts.format_one_off_check_result(
+                    result, inactive_task=representative, today=self._today(),
+                ),
+                inline_buttons=[
+                    [(
+                        texts.TRUSTED_RESUME_MONITORING_LABEL,
+                        _mb_kb().encode_trusted_task_continue_callback(representative.id, 0),
+                    )],
+                    [another],
+                ],
+            )
+        return BotReply(
+            text=texts.format_one_off_check_result(result),
+            inline_buttons=[
+                [another],
+                [(texts.TRUSTED_ONE_OFF_ADD_LABEL, _mb_kb().encode_trusted_one_off_add_callback(result.car_number))],
+            ],
+        )
+
+    def _trusted_plate_choice_reply(self, raw_text: str) -> BotReply:
+        """Номер с главного экрана от trusted-менеджера (см. задачу "GE-2",
+        решение 3) — состояние не создаётся, номер едет в callback_data
+        обеих кнопок. Невалидный формат — тот же ответ, что и у Add Car."""
+        try:
+            car_number = normalize_car_number(raw_text)
+        except FineValidationError as exc:
+            return BotReply(text=f"❌ {exc.message}\n\n{texts.CAR_NUMBER_PROMPT}")
+        return BotReply(
+            text=texts.format_trusted_plate_choice_prompt(car_number),
+            inline_buttons=[[
+                (texts.TRUSTED_ONE_OFF_CHECK_LABEL, _mb_kb().encode_trusted_one_off_check_callback(car_number)),
+                (texts.TRUSTED_ONE_OFF_MONITOR_LABEL, _mb_kb().encode_trusted_one_off_add_callback(car_number)),
+            ]],
+        )
+
+    async def handle_trusted_plate_choice_check(
+        self, raw_car_number: str, *, telegram_user_id: int,
+        on_check_started: Callable[[], Awaitable[None]] | None = None,
+    ) -> BotReply | object | None:
+        """"🔎 Разовая проверка" на экране выбора — см.
+        _trusted_plate_check_from_button. None — не trusted или номер из
+        callback не проходит нормализацию."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+        try:
+            car_number = normalize_car_number(raw_car_number)
+        except FineValidationError:
+            return None
+
+        return await self._trusted_plate_check_from_button(
+            car_number, telegram_user_id=telegram_user_id, on_check_started=on_check_started,
+        )
+
+    def handle_trusted_one_off_add(
+        self, raw_car_number: str, *, chat_id: int, telegram_user_id: int,
+    ) -> BotReply | None:
+        """"➕ На мониторинг" (экран выбора) и "➕ Добавить на мониторинг"
+        (результат разовой проверки) — ровно то, что делает trusted-ветка
+        _handle_car_number_input(): шаг STEP_AWAITING_CLIENT_DECISION с
+        {"car_number"}, дальше существующий Add Car со сроком. None — не
+        trusted."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+        self._clear_state(chat_id)
+        return self._handle_car_number_input(
+            raw_car_number, chat_id=chat_id, telegram_user_id=telegram_user_id, username=None,
+        )
+
+    def handle_trusted_one_off_another(self, *, chat_id: int, telegram_user_id: int) -> BotReply | None:
+        """"🔎 Проверить другой номер" под результатом разовой проверки — то
+        же, что пункт меню "🔎 Проверить сейчас" у trusted (см.
+        _handle_menu_label): шаг ввода номера. None — не trusted."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+        self._clear_state(chat_id)
+        self._states.set(
+            chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_TRUSTED_CHECK_NOW_CAR_NUMBER,
+        )
+        return BotReply(text=texts.CAR_NUMBER_PROMPT)
 
     # ---- "👤 Добавить Telegram клиента?" (inline-кнопки, trusted-flow) ----
 
@@ -2413,25 +2608,18 @@ class ConversationController:
     async def handle_trusted_check_now_once(
         self, task_id: int, *, telegram_user_id: int,
         on_check_started: Callable[[], Awaitable[None]] | None = None,
-    ) -> BotReply | None:
+    ) -> BotReply | object | None:
         """"🔎 Проверить разово" на карточке "мониторинг завершён/выключен"
-        (см. задачу "expired Georgia Check Now UX" и keyboards.py::
-        trusted_check_now_inactive_keyboard) — РЕАЛЬНАЯ police.ge-проверка
-        даже для completed/stopped/expired задачи, через ТОТ ЖЕ
-        SubscriptionService.check_now_task_for_search(), что уже
-        использует manager/trusted Search (см. design report: "не
-        реализовывать отдельный provider/checker") — никакой отдельной
-        бизнес-логики проверки здесь.
-
-        КРИТИЧНО (см. задачу): check_now_task_for_search() → в итоге
-        FineCheckService.check_task() трогает ТОЛЬКО last_checked_at/
-        last_successful_*/detected_fines — status/start_date/end_date
-        этой задачи НЕ меняются, новый task/subscription НЕ создаются,
-        мониторинг НЕ включается (см. тест test_trusted_check_now_once_
-        does_not_change_task_dates_or_status). Хвост
-        "Мониторинг по-прежнему выключен/завершён" использует task,
-        загруженную ДО проверки — end_date/status заведомо не меняются
-        этой проверкой, повторный запрос не нужен.
+        (см. задачу "expired Georgia Check Now UX"). Саму карточку бот больше
+        не показывает — старая задача сразу даёт разовую проверку (см.
+        _handle_trusted_check_now_car_number_input), — но такие кнопки
+        остались в истории чатов менеджеров. Проверка идёт по task.car_number
+        через ту же развилку, что и остальные кнопки (см.
+        _trusted_plate_check_from_button): пока у номера нет активной
+        задачи — разовая проверка БЕЗ сохранения (см. задачу "GE-2",
+        решение 2), ни задача, ни detected_fines не меняются, мониторинг
+        не включается; если мониторинг номера с тех пор снова включили —
+        существующая task-level проверка (Q1).
 
         None — не trusted, ИЛИ задача не существует (см. handle_trusted_
         task_toggle выше — тот же принцип, callback task_id публичен и не
@@ -2443,19 +2631,9 @@ class ConversationController:
         if task is None:
             return None
 
-        outcome = await self._subscriptions.check_now_task_for_search(
-            task_id, on_check_started=on_check_started,
+        return await self._trusted_plate_check_from_button(
+            task.car_number, telegram_user_id=telegram_user_id, on_check_started=on_check_started,
         )
-        if outcome is None:
-            return BotReply(text=texts.CAR_ACTION_FAILED_TEXT, show_main_menu=True)
-        if outcome is CHECK_ALREADY_IN_PROGRESS:
-            return CHECK_ALREADY_IN_PROGRESS
-
-        text = (
-            texts.format_check_now_result(outcome)
-            + "\n\n" + texts.format_monitoring_still_inactive_line(task, today=self._today())
-        )
-        return BotReply(text=text, trusted_task_off_id=task_id, trusted_task_off_page=0)
 
     # ---- trusted-operator task-level admin (см. design report: пересмотр
     # архитектуры) — 🔎/⛔ работают НАПРЯМУЮ с fine_monitoring_tasks, без

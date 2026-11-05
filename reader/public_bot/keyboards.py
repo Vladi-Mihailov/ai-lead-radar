@@ -56,6 +56,7 @@ from reader.public_bot.texts import (
     SEARCH_MENU_LABEL,
     SEARCH_NEW_LABEL,
     STATISTICS_LABEL,
+    TRUSTED_RESUME_MONITORING_LABEL,
     TURKEY_BOT_LINK_LABEL,
     TURKEY_BOT_URL,
     TURN_OFF_BUTTON_LABEL,
@@ -94,6 +95,9 @@ _TRUSTED_TASK_PERIOD_PREFIX = b"ttaskperiod:"
 # задачу "expired Georgia Check Now UX") — ОТДЕЛЬНЫЙ префикс от
 # _CHECK_NOW_PREFIX (тот — subscription-id self-service, этот — task-id
 # trusted-admin, разные data model, см. decode_check_now_callback выше).
+# Саму карточку бот больше не показывает (старая задача теперь сразу даёт
+# разовую проверку без сохранения, см. задачу "GE-2"), но такие кнопки
+# остаются в истории чатов менеджеров — callback продолжает работать.
 _TRUSTED_CHECK_NOW_ONCE_PREFIX = b"tchecknowonce:"
 
 # car-centric "📋 Мои авто" (см. design report про переработку UX) — для
@@ -348,9 +352,8 @@ def my_car_inactive_keyboard(subscription_id: int) -> list[list[Button]]:
     сейчас" подписка оказалась просроченной (см.
     ConversationController.handle_check_now_choice/texts.
     format_my_car_inactive_card). "⬅️ Назад" ведёт на первую страницу
-    "📋 Мои авто" (та же page=0 семантика, что и у trusted-аналога, см.
-    trusted_check_now_inactive_keyboard — эта карточка открыта НЕ со
-    страницы списка, поэтому "вернуться на ту же page" неприменимо)."""
+    "📋 Мои авто" (page=0: эта карточка открыта НЕ со страницы списка,
+    поэтому "вернуться на ту же page" неприменимо)."""
     return [
         [Button.inline("🔎 Проверить разово", encode_my_car_check_now_once_callback(subscription_id))],
         [Button.inline("▶️ Продолжить мониторинг", encode_my_car_resume_callback(subscription_id))],
@@ -576,26 +579,8 @@ def trusted_task_off_keyboard(task_id: int, *, page: int) -> list[list[Button]]:
     возвращает на "📋 Мои авто" (ту же page, см. design report: "Ещё один
     Назад возвращает в 📋 Мои авто")."""
     return [
-        [Button.inline("▶️ Продолжить мониторинг", encode_trusted_task_continue_callback(task_id, page))],
+        [Button.inline(TRUSTED_RESUME_MONITORING_LABEL, encode_trusted_task_continue_callback(task_id, page))],
         [Button.inline(BACK_BUTTON_LABEL, encode_trusted_tasks_page_callback(page))],
-    ]
-
-
-def trusted_check_now_inactive_keyboard(task_id: int) -> list[list[Button]]:
-    """Карточка "мониторинг завершён/выключен" (см. задачу "expired
-    Georgia Check Now UX") — показывается вместо голого NOT_FOUND после
-    trusted "🔎 Проверить сейчас" по номеру, когда активной задачи нет, но
-    есть историческая (см. ConversationController.
-    _handle_trusted_check_now_car_number_input/SubscriptionService.
-    find_representative_task_for_inactive_car). "▶️ Продолжить
-    мониторинг"/"⬅️ Назад" — ТЕ ЖЕ callbacks, что и на экране OFF-детали
-    (см. trusted_task_off_keyboard выше), page=0 намеренно: эта карточка
-    открывается ПО НОМЕРУ, а не со страницы списка "📋 Мои авто", поэтому
-    "вернуться на ту же page" неприменимо — ведёт на её первую страницу."""
-    return [
-        [Button.inline("🔎 Проверить разово", encode_trusted_check_now_once_callback(task_id))],
-        [Button.inline("▶️ Продолжить мониторинг", encode_trusted_task_continue_callback(task_id, 0))],
-        [Button.inline(BACK_BUTTON_LABEL, encode_trusted_tasks_page_callback(0))],
     ]
 
 
@@ -919,6 +904,42 @@ def _decode_plate(data: bytes | None, prefix: bytes) -> str | None:
         return raw.decode("ascii")
     except UnicodeDecodeError:
         return None
+
+
+# Разовая проверка trusted-менеджера без сохранения (см. задачу "GE-2: UI
+# менеджера") — у номера может не быть ни одной задачи, поэтому в payload
+# номер (уже нормализованный, ascii, до 64 байт с префиксом), а не id — тот
+# же _encode_plate/_decode_plate и тот же инвариант, что и у manual
+# bootstrap выше: номер в callback_data ничего не доказывает, is_trusted()
+# перепроверяется на КАЖДОМ из этих callback'ов. Кнопки строятся в
+# conversation.py через BotReply.inline_buttons.
+_TRUSTED_ONE_OFF_CHECK_PREFIX = b"toneoff:"
+_TRUSTED_ONE_OFF_ADD_PREFIX = b"toneoffadd:"
+_TRUSTED_ONE_OFF_ANOTHER = b"toneoffnew"
+
+
+def encode_trusted_one_off_check_callback(car_number: str) -> bytes:
+    return _encode_plate(_TRUSTED_ONE_OFF_CHECK_PREFIX, car_number)
+
+
+def decode_trusted_one_off_check_callback(data: bytes | None) -> str | None:
+    return _decode_plate(data, _TRUSTED_ONE_OFF_CHECK_PREFIX)
+
+
+def encode_trusted_one_off_add_callback(car_number: str) -> bytes:
+    return _encode_plate(_TRUSTED_ONE_OFF_ADD_PREFIX, car_number)
+
+
+def decode_trusted_one_off_add_callback(data: bytes | None) -> str | None:
+    return _decode_plate(data, _TRUSTED_ONE_OFF_ADD_PREFIX)
+
+
+def encode_trusted_one_off_another_callback() -> bytes:
+    return _TRUSTED_ONE_OFF_ANOTHER
+
+
+def decode_trusted_one_off_another_callback(data: bytes | None) -> bool:
+    return data == _TRUSTED_ONE_OFF_ANOTHER
 
 
 def encode_manual_bootstrap_nofine_callback(car_number: str) -> bytes:
