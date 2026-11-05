@@ -68,6 +68,10 @@ class _BlockingProvider(FineProvider):
         return self._records_by_car.get(plate, [])
 
 
+async def _no_sleep(_seconds: float) -> None:
+    return None
+
+
 def _record(car_number="O127PX62", fingerprint="fp-1") -> ParsedFineRecord:
     return ParsedFineRecord(
         car_number=car_number, external_fine_id="AB123456",
@@ -87,7 +91,11 @@ class _Fixture:
         self.conversation_state_repository = BotConversationStateRepository(db_path)
         self.known_users_repository = BotKnownUsersRepository(db_path)
         self.provider = provider
-        self.check_service = FineCheckService(provider, self.task_repository, self.detected_fine_repository)
+        # Без реальной паузы 5 с перед подтверждающим запросом пустого
+        # результата (разовая проверка без сохранения, false-zero guard).
+        self.check_service = FineCheckService(
+            provider, self.task_repository, self.detected_fine_repository, sleep=_no_sleep,
+        )
         self.subscription_service = SubscriptionService(
             self.task_repository, self.subscription_repository, self.user_repository, self.check_service,
         )

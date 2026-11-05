@@ -34,6 +34,7 @@ from reader.fines.models import (
     CheckResult,
     FineMonitoringTask,
     NewFineEvent,
+    OneOffCheckResult,
     ParsedFineRecord,
 )
 from reader.fines.provider import FineProvider, FineProviderError, PoliceGeUnavailableError
@@ -381,6 +382,77 @@ class FineCheckService:
             task.id: await self._finalize(task, records, started_at)
             for task in tasks
         }
+
+    async def check_plate_readonly(self, car_number: str) -> OneOffCheckResult:
+        """Разовая проверка номера менеджером БЕЗ сохранения (см. задачу
+        "GE-1: сервис проверки без сохранения") — номер не обязан быть на
+        мониторинге, ни одна fine_monitoring_task не нужна:
+
+        - denylist — та же ПЕРВАЯ проверка, что и в check_task(): provider
+          не вызывается вовсе, результат снаружи неотличим от "штрафов нет";
+        - запрос через ТОТ ЖЕ self._provider (в боте это
+          AutoFailoverCheckNowProvider, см. reader/public_bot/main.py::
+          build_check_now_provider) — failover на REDNET и circuit breaker
+          работают ровно так же, как у "🔎 Проверить сейчас";
+        - пустой ответ — ВСЕГДА ОДИН повторный запрос после паузы
+          _zero_confirmation_delay_seconds (5 с): в отличие от
+          _zero_needs_confirmation(), здесь нет snapshot'а, по которому
+          можно отличить честный ноль от false-empty ответа police.ge,
+          поэтому подтверждается любой пустой результат;
+        - перевод — тот же _resolve_translation(), только без кэша из БД
+          (fail-open, как и везде), для всех штрафов параллельно: менеджер
+          ждёт ответ с "⏳";
+        - FineProviderError первого ИЛИ повторного запроса — status="error"
+          без отката к сохранённому состоянию: менеджер должен видеть, что
+          проверка не выполнена, а не устаревшие данные.
+
+        НИКОГДА не вызывает _persist_snapshot/_finalize/_record_error и не
+        пишет ни в один репозиторий: в detected_fines не появляется ни
+        одной строки, поэтому, если номер потом поставят на мониторинг, эти
+        штрафы будут обнаружены как новые и уведомления уйдут как обычно
+        (см. задачу: "без записи результатов в БД и уведомлений")."""
+        started_at = time.monotonic()
+
+        if is_fine_output_suppressed(car_number):
+            return OneOffCheckResult(
+                status="suppressed", car_number=car_number, fines=[], error_message=None, duration_ms=0,
+            )
+
+        zero_confirmed = False
+        try:
+            records = await self._fetch(car_number)
+            if not records:
+                await self._sleep(self._zero_confirmation_delay_seconds)
+                records = await self._fetch(car_number)
+                zero_confirmed = not records
+        except FineProviderError as exc:
+            logger.warning("Georgia one-off check plate=%s не выполнена: %s", car_number, exc)
+            return OneOffCheckResult(
+                status="error", car_number=car_number, fines=[], error_message=str(exc),
+                duration_ms=_elapsed_ms(started_at),
+                provider_unavailable=isinstance(exc, PoliceGeUnavailableError),
+            )
+
+        translations = await asyncio.gather(*(
+            self._resolve_translation(record, existing_place_ru=None, existing_violation_description_ru=None)
+            for record in records
+        ))
+        fines = [
+            NewFineEvent.from_parsed_record(
+                record, detected_fine_id=0, task_id=0, label=None,
+                place_ru=place_ru, violation_description_ru=violation_description_ru,
+            )
+            for record, (place_ru, violation_description_ru) in zip(records, translations)
+        ]
+
+        logger.info(
+            "Georgia one-off check plate=%s result_count=%d total=%s zero_confirmed=%s",
+            car_number, len(records), _format_amount(_records_total(records)), zero_confirmed,
+        )
+        return OneOffCheckResult(
+            status="ok", car_number=car_number, fines=fines, error_message=None,
+            duration_ms=_elapsed_ms(started_at), zero_confirmed=zero_confirmed,
+        )
 
     async def _fetch(self, car_number: str) -> list[ParsedFineRecord]:
         return await self._provider.search_by_plate(car_number)

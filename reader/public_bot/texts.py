@@ -598,41 +598,75 @@ def format_trusted_tasks_page(tasks: list[FineMonitoringTask], *, page: int, tot
     return f"{TRUSTED_TASKS_HEADER}\nСтраница {page + 1} из {total_pages}"
 
 
-def format_trusted_check_now_not_found(car_number: str) -> str:
-    """Trusted-operator task-level 🔎 Проверить сейчас ПО НОМЕРУ (см.
-    design report) — номер не найден среди активных fine_monitoring_tasks.
-    Явное требование: ничего не добавляется автоматически, только эта
-    ошибка."""
-    return f"❌ Автомобиль {format_plate_for_telegram(car_number)} не найден в активном мониторинге."
+# Разовая проверка trusted-менеджера без сохранения (см. задачу "GE-2: UI
+# менеджера") — номер не обязан быть на мониторинге; результат не пишется в
+# БД и уведомлений не вызывает, поэтому в тексте результата это сказано
+# явно (ONE_OFF_CHECK_NOT_SAVED_LINE).
+TRUSTED_ONE_OFF_CHECK_LABEL = "🔎 Разовая проверка"
+TRUSTED_ONE_OFF_MONITOR_LABEL = "➕ На мониторинг"
+TRUSTED_ONE_OFF_ADD_LABEL = "➕ Добавить на мониторинг"
+TRUSTED_ONE_OFF_ANOTHER_LABEL = "🔎 Проверить другой номер"
+TRUSTED_RESUME_MONITORING_LABEL = "▶️ Продолжить мониторинг"
+ONE_OFF_CHECK_NOT_SAVED_LINE = "ℹ️ Разовая проверка: результат не сохранён, мониторинг не включён."
+ONE_OFF_CHECK_IN_PROGRESS_TEXT = "⏳ Проверка уже выполняется, дождитесь результата."
 
 
-def format_trusted_check_now_inactive_card(task: FineMonitoringTask, *, today: date) -> str:
-    """Trusted-operator "🔎 Проверить сейчас" по номеру (см. задачу
-    "expired Georgia Check Now UX") — заменяет голый
-    format_trusted_check_now_not_found(), когда АКТИВНОЙ задачи нет, но
-    есть историческая (completed/stopped), см.
-    SubscriptionService.find_representative_task_for_inactive_car().
-    Различает ДВЕ ситуации по end_date, а не по status (см. design report
-    п.8 — "stopped + end_date>=today" и "stopped/completed + end_date<
-    today" — completed ПО ЖИЗНЕННОМУ ЦИКЛУ всегда означает end_date уже в
-    прошлом, см. reader/jobs/fine_job.py, поэтому одного сравнения дат
-    достаточно для обоих статусов):
-    - end_date < today — срок уже истёк естественным образом;
-    - end_date >= today — мониторинг выключен вручную ДО истечения срока."""
-    plate = format_plate_for_telegram(task.car_number)
-    if task.end_date < today:
-        status_line = f"Срок мониторинга закончился {_fmt_date(task.end_date)}."
+def format_trusted_plate_choice_prompt(car_number: str) -> str:
+    """Номер, присланный trusted-менеджером с главного экрана (см. задачу
+    "GE-2", решение 3) — выбор между разовой проверкой и постановкой на
+    мониторинг. У обычного пользователя тот же ввод по-прежнему сразу
+    запускает Add Car (см. ConversationController.handle_text)."""
+    return (
+        f"🚗 {format_plate_for_telegram(car_number)}\n\n"
+        "Проверить штрафы разово или поставить номер на мониторинг?"
+    )
+
+
+def format_one_off_check_result(
+    result, *, inactive_task: FineMonitoringTask | None = None, today: date | None = None,
+) -> str:
+    """result: reader.fines.models.OneOffCheckResult (см. FineCheckService.
+    check_plate_readonly). ВСЕ штрафы из ответа police.ge/REDNET тем же
+    блоком, что и у "🔎 Проверить сейчас" (delivery_texts.
+    format_check_now_fines_message), плюс количество и сумма (format_search_
+    money_line — "неизвестно", если хотя бы у одного штрафа нет суммы:
+    сумма никогда не занижается). Ошибка — явное "❌ Проверка не
+    выполнена": отката к сохранённому состоянию нет, его у разовой проверки
+    и не бывает. Коммерческих CTA нет — это экран менеджера.
+
+    inactive_task — историческая (completed/stopped) задача номера, если
+    она есть: хвост format_monitoring_still_inactive_line() подтверждает,
+    что разовая проверка мониторинг НЕ включила."""
+    plate = format_plate_for_telegram(result.car_number)
+    if not result.shows_as_ok:
+        if result.provider_unavailable:
+            parts = [
+                "❌ Проверка не выполнена: сервис police.ge сейчас недоступен.\n"
+                f"Попробуйте проверить {plate} позже."
+            ]
+        else:
+            parts = [f"❌ Проверка не выполнена: не удалось получить штрафы для {plate}.\nПопробуйте позже."]
+    elif not result.fines:
+        parts = [format_no_fines_found(result.car_number), ONE_OFF_CHECK_NOT_SAVED_LINE]
     else:
-        status_line = f"Автоматический мониторинг выключен.\nСрок действует до {_fmt_date(task.end_date)}."
-    return f"🚗 {plate}\n\n{status_line}"
+        parts = [
+            f"🔎 {plate}: найдено штрафов — {len(result.fines)}\n"
+            + format_search_money_line(check_ok=True, fines=result.fines),
+            format_check_now_fines_message(car_number=result.car_number, fines=result.fines),
+            ONE_OFF_CHECK_NOT_SAVED_LINE,
+        ]
+    if inactive_task is not None:
+        parts.append(format_monitoring_still_inactive_line(inactive_task, today=today))
+    return "\n\n".join(parts)
 
 
 def format_monitoring_still_inactive_line(task: FineMonitoringTask, *, today: date) -> str:
-    """Хвост экрана после "🔎 Проверить разово" (см. задачу "expired
-    Georgia Check Now UX") — ТА ЖЕ end_date-семантика, что и у
-    format_trusted_check_now_inactive_card(), подтверждает, что разовая
-    проверка НЕ включила мониторинг заново (см.
-    ConversationController.handle_trusted_check_now_once)."""
+    """Хвост результата разовой проверки номера, у которого есть только
+    историческая задача (см. format_one_off_check_result) — различает по
+    end_date, а не по status: completed по жизненному циклу всегда
+    означает end_date в прошлом (см. reader/jobs/fine_job.py), а stopped с
+    end_date >= today — мониторинг выключен вручную до конца срока.
+    Подтверждает, что разовая проверка мониторинг НЕ включила."""
     if task.end_date < today:
         return f"Мониторинг завершён {_fmt_date(task.end_date)}."
     return f"Мониторинг по-прежнему выключен.\nСрок действует до {_fmt_date(task.end_date)}."
