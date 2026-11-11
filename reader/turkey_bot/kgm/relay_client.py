@@ -14,8 +14,12 @@ await client.aclose()), поэтому ни check_service, ни KgmProvider не
 502/503/...), неразборчивый JSON или base64 — превращается в
 KgmTransportError (-> ProviderStatus.ERROR "transport_error", GİB/Avrasya
 не затрагиваются) и ровно одну WARNING-строку: операция, безопасная деталь,
-длительность. Госномер, CAPTCHA-код, тела запроса/ответа, секрет и подпись в
-журнал не попадают. Автоматического перехода на прямой KGM нет (route.py)."""
+длительность. aclose() не бросает Exception никогда: сбой DELETE не должен
+затереть уже полученный результат проверки (relay закроет сессию по TTL).
+Отмена (CancelledError) не перехватывается. Госномер, CAPTCHA-код, тела
+запроса/ответа, секрет, подпись и session_id в журнал не попадают (для
+INFO-строк самого httpx — _RedactRelaySessionIdFilter ниже). Автоматического
+перехода на прямой KGM нет (route.py)."""
 
 import base64
 import json
@@ -40,47 +44,108 @@ SESSIONS_PATH = "/internal/kgm/sessions"
 HEALTH_PATH = "/internal/kgm/health"
 
 _CONNECT_TIMEOUT_SECONDS = 5.0
-# Больше срока операции на relay (relay_server.OPERATION_TIMEOUT_SECONDS =
-# 35 с): relay всегда отвечает раньше, чем истечёт этот таймаут.
-_READ_TIMEOUT_SECONDS = 40.0
-# DELETE в aclose() — best effort: при недоступном relay не задерживать
-# завершение проверки, сессию relay закроет сам по TTL.
-_CLOSE_TIMEOUT_SECONDS = 5.0
+# Read-таймаут на каждый запрос — больше срока той же операции на relay
+# (relay_server.OPERATION_DEADLINES: start 65 с, captcha/submit 35 с), чтобы
+# relay всегда успевал ответить первым. close (DELETE) и health к KGM не
+# обращаются; DELETE — best effort, не задерживать завершение проверки.
+OPERATION_READ_TIMEOUTS = {
+    "start": 70.0,
+    "captcha": 40.0,
+    "submit": 40.0,
+    "close": 5.0,
+    "health": 5.0,
+}
 
 _SESSION_ID_RE = re.compile(r"[0-9a-f]{32}")
 _ERROR_CODE_RE = re.compile(r"[a-z_]{1,32}")
+
 # Из detail relay (session._describe_transport_error: "ConnectError errno=111
-# Connection refused", "HTTPStatusError status=500") в журнал идут только тип
-# исключения и числа — текст ответа по сети не доверяется.
-_DETAIL_PREFIX_RE = re.compile(r"[A-Za-z]{1,40}(?: status=\d{3})?(?: errno=-?\d{1,6})?")
+# Connection refused", "HTTPStatusError status=500"; relay_server:
+# "TimeoutError", "KgmTransportError") в журнал идут только белый список имён
+# исключений, статус и errno; всё остальное — "other". Текст ответа по сети
+# не доверяется.
+_KNOWN_DETAIL_NAMES = frozenset(
+    {name for name, value in vars(httpx).items() if isinstance(value, type) and issubclass(value, Exception)}
+    | {
+        "OSError", "TimeoutError", "ConnectionError", "ConnectionRefusedError", "ConnectionResetError",
+        "ConnectionAbortedError", "BrokenPipeError", "KgmTransportError",
+    }
+)
+_DETAIL_RE = re.compile(r"(?P<name>[A-Za-z]{1,40})(?: status=(?P<status>\d{3}))?(?: errno=(?P<errno>-?\d{1,6}))?")
+_HTTP_DETAIL_RE = re.compile(r"HTTP \d{3}")
+
+_SESSION_PATH_RE = re.compile(r"(/internal/kgm/sessions/)[0-9a-f]{32}")
+_SESSION_PATH_MARKER = "/internal/kgm/sessions/"
 
 _T = TypeVar("_T")
+
+
+class _RedactRelaySessionIdFilter(logging.Filter):
+    """httpx пишет INFO-строку с полным URL каждого запроса ("HTTP Request:
+    POST http://10.50.0.2:8767/internal/kgm/sessions/<id>/submit ...") —
+    session_id заменяется на {session_id}, как в журнале relay. По образцу
+    reader/checkout/tpl_client.py::_RedactEcommerceUrlFilter."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str) and _SESSION_PATH_MARKER in record.msg:
+            record.msg = _SESSION_PATH_RE.sub(r"\1{session_id}", record.msg)
+        args = record.args
+        if isinstance(args, tuple) and args:
+            redacted = tuple(
+                _SESSION_PATH_RE.sub(r"\1{session_id}", str(value)) if _SESSION_PATH_MARKER in str(value) else value
+                for value in args
+            )
+            if redacted != args:
+                record.args = redacted
+        return True
+
+
+def _install_session_id_log_redaction() -> None:
+    httpx_logger = logging.getLogger("httpx")
+    if not any(isinstance(f, _RedactRelaySessionIdFilter) for f in httpx_logger.filters):
+        httpx_logger.addFilter(_RedactRelaySessionIdFilter())
+
+
+_install_session_id_log_redaction()
 
 
 class _MalformedRelayResponse(Exception):
     """Ожидаемый статус, но ответ не той формы — текст для лога безопасен."""
 
 
+def _safe_detail(detail: str) -> str:
+    if _HTTP_DETAIL_RE.match(detail):
+        return detail[:8]
+    match = _DETAIL_RE.match(detail)
+    if match is None or match.group("name") not in _KNOWN_DETAIL_NAMES:
+        return "other"
+    parts = [match.group("name")]
+    if match.group("status"):
+        parts.append(f"status={match.group('status')}")
+    if match.group("errno"):
+        parts.append(f"errno={match.group('errno')}")
+    return " ".join(parts)
+
+
 def _relay_error_suffix(response: httpx.Response) -> str:
     """" error=busy detail=ConnectTimeout" из JSON-ответа relay: код ошибки —
-    только из фиксированного алфавита, от детали — только префикс "тип
-    [status=N] [errno=N]". Произвольный текст ответа (например, HTML-страница
-    чужого прокси) в журнал не идёт."""
+    только из фиксированного алфавита, деталь — через белый список
+    (_safe_detail). Любой сбой разбора (не JSON, слишком глубокая
+    вложенность, не тот тип) — пустой суффикс."""
     try:
         data = response.json()
-    except ValueError:
+        if not isinstance(data, dict):
+            return ""
+        parts = []
+        error = data.get("error")
+        if isinstance(error, str) and _ERROR_CODE_RE.fullmatch(error):
+            parts.append(f"error={error}")
+        detail = data.get("detail")
+        if isinstance(detail, str):
+            parts.append(f"detail={_safe_detail(detail)}")
+        return " " + " ".join(parts) if parts else ""
+    except Exception:
         return ""
-    if not isinstance(data, dict):
-        return ""
-    parts = []
-    error = data.get("error")
-    if isinstance(error, str) and _ERROR_CODE_RE.fullmatch(error):
-        parts.append(f"error={error}")
-    detail = data.get("detail")
-    match = _DETAIL_PREFIX_RE.match(detail) if isinstance(detail, str) else None
-    if match:
-        parts.append(f"detail={match.group(0)}")
-    return " " + " ".join(parts) if parts else ""
 
 
 def _parse_captcha(data: dict[str, Any]) -> KgmCaptchaChallenge:
@@ -106,13 +171,15 @@ def _parse_submitted(data: dict[str, Any]) -> tuple[str, float]:
     if not isinstance(response_text, str):
         raise _MalformedRelayResponse("response_text missing")
     submit_seconds = data.get("submit_seconds")
-    if (
-        isinstance(submit_seconds, bool)
-        or not isinstance(submit_seconds, (int, float))
-        or not math.isfinite(submit_seconds)
-    ):
+    if isinstance(submit_seconds, bool) or not isinstance(submit_seconds, (int, float)):
         raise _MalformedRelayResponse("malformed submit_seconds")
-    return response_text, float(submit_seconds)
+    try:
+        seconds = float(submit_seconds)
+    except OverflowError:
+        raise _MalformedRelayResponse("malformed submit_seconds") from None
+    if not math.isfinite(seconds):
+        raise _MalformedRelayResponse("malformed submit_seconds")
+    return response_text, seconds
 
 
 def _parse_health(data: dict[str, Any]) -> dict[str, Any]:
@@ -139,9 +206,11 @@ class RelayKgmSession:
         self._wall_clock = wall_clock
         # trust_env=False: подписанные запросы идут только напрямую через
         # WireGuard, а не через HTTP(S)_PROXY из окружения процесса бота.
+        # Таймаут клиента — самый короткий; каждый запрос задаёт свой
+        # (OPERATION_READ_TIMEOUTS).
         self._client = httpx.AsyncClient(
             base_url=base_url,
-            timeout=httpx.Timeout(_READ_TIMEOUT_SECONDS, connect=_CONNECT_TIMEOUT_SECONDS),
+            timeout=httpx.Timeout(OPERATION_READ_TIMEOUTS["health"], connect=_CONNECT_TIMEOUT_SECONDS),
             transport=transport,
             trust_env=False,
         )
@@ -189,19 +258,21 @@ class RelayKgmSession:
             return
         try:
             await self._delete_session()
+        except Exception as exc:
+            logger.warning("KGM relay close: %s, relay will expire the session by TTL", type(exc).__name__)
         finally:
             self._closed = True
-            await self._client.aclose()
+            try:
+                await self._client.aclose()
+            except Exception as exc:
+                logger.warning("KGM relay close: client close failed (%s)", type(exc).__name__)
 
     async def _delete_session(self) -> None:
         session_id, self._session_id = self._session_id, None
         if session_id is None:
             return
         try:
-            await self._call(
-                "DELETE", f"{SESSIONS_PATH}/{session_id}",
-                operation="close", expected_status=204, timeout=_CLOSE_TIMEOUT_SECONDS,
-            )
+            await self._call("DELETE", f"{SESSIONS_PATH}/{session_id}", operation="close", expected_status=204)
         except KgmTransportError:
             pass  # WARNING уже записан в _call(); relay закроет сессию по TTL
 
@@ -223,7 +294,6 @@ class RelayKgmSession:
         expected_status: int,
         body: bytes = b"",
         parse: Callable[[dict[str, Any]], _T] | None = None,
-        timeout: float | None = None,
     ) -> _T | None:
         started = time.monotonic()
         if self._closed:
@@ -232,7 +302,7 @@ class RelayKgmSession:
             request = self._client.build_request(
                 method, path, content=body,
                 headers={"Content-Type": "application/json"} if body else None,
-                timeout=timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT,
+                timeout=httpx.Timeout(OPERATION_READ_TIMEOUTS[operation], connect=_CONNECT_TIMEOUT_SECONDS),
             )
             # Подписывается ровно тот путь и те байты тела, что уйдут по сети,
             # со свежим nonce на каждый запрос (повтор relay отклонит).
@@ -251,11 +321,13 @@ class RelayKgmSession:
             return None
         try:
             data = response.json()
-        except ValueError:
-            raise self._failure(operation, "malformed JSON", started) from None
+        except Exception as exc:
+            raise self._failure(operation, f"malformed JSON ({type(exc).__name__})", started) from None
         if not isinstance(data, dict):
             raise self._failure(operation, "malformed JSON", started)
         try:
             return parse(data)
         except _MalformedRelayResponse as exc:
             raise self._failure(operation, str(exc), started) from None
+        except Exception as exc:
+            raise self._failure(operation, f"malformed response ({type(exc).__name__})", started) from None

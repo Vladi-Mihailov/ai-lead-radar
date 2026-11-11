@@ -35,6 +35,9 @@ HAS_DEBT_GRAND_TOTAL = Decimal("2660.00")
 
 SECRET = "kgm-relay-test-secret-0123456789abcdef"
 OTHER_SECRET = "another-relay-secret-fedcba9876543210xyz"
+# Relay в тестах слушает 127.0.0.1 — сеть клиентов задаётся явно (в бою —
+# сеть WireGuard 10.50.0.0/24).
+LOOPBACK = ("127.0.0.0/8",)
 # Заведомо выдуманные значения — по ним тесты ищут утечки в журналах/ответах.
 TEST_PLATE = "34TST987"
 ACCEPTED_CODE = "22 03713"

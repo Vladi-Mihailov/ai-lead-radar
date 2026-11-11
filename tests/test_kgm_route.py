@@ -1,7 +1,9 @@
 """Тесты reader/turkey_bot/kgm/route.py — выбор маршрута KGM: direct по
-умолчанию, relay по TURKEY_KGM_ROUTE=relay, а неверная конфигурация relay —
-одна ERROR-строка при старте и transport_error на каждой проверке KGM, БЕЗ
-перехода на direct."""
+умолчанию, relay по TURKEY_KGM_ROUTE=relay (только http://<IP в сети
+WireGuard>:<порт>), а неверная конфигурация relay — одна ERROR-строка при
+старте и transport_error на каждой проверке KGM, БЕЗ перехода на direct.
+Плюс CLI проверки связи (python -m reader.turkey_bot.kgm.route) и паритет
+HTTP-клиента KGM на relay с прямым маршрутом."""
 
 import logging
 import socket
@@ -9,16 +11,20 @@ import socket
 import pytest
 from aiohttp.test_utils import TestServer
 
+from reader.turkey_bot.kgm import route
 from reader.turkey_bot.kgm.provider import KgmProvider
 from reader.turkey_bot.kgm.relay_client import RelayKgmSession
-from reader.turkey_bot.kgm.relay_server import build_kgm_relay_app
+from reader.turkey_bot.kgm.relay_server import build_kgm_relay_app, default_session_factory
+from reader.turkey_bot.kgm.relay_version import kgm_code_fingerprint
 from reader.turkey_bot.kgm.route import _check_relay, kgm_check_factory_from_env, main, resolve_kgm_route
-from reader.turkey_bot.kgm.session import KgmTransportError
+from reader.turkey_bot.kgm.session import KgmSession, KgmTransportError
+from reader.turkey_bot.unified import check_service
 from reader.turkey_bot.unified.check_service import UnifiedTurkeyCheckService, default_kgm_check_factory
 from reader.turkey_bot.unified.models import OverallStatus, ProviderStatus
 
 from _kgm_relay_fakes import (
     ACCEPTED_CODE,
+    LOOPBACK,
     SECRET,
     TEST_PLATE,
     FakeAvrasyaProvider,
@@ -41,6 +47,15 @@ class _DirectFactorySpy:
         raise AssertionError("the direct KGM route must not be used")
 
 
+class _LoadDotenvSpy:
+    def __init__(self):
+        self.calls: list[tuple[tuple, dict]] = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return False
+
+
 @pytest.fixture
 def _restore_httpx_log_level():
     logger = logging.getLogger("httpx")
@@ -53,8 +68,18 @@ def _relay_env(**overrides) -> dict[str, str]:
     return {"TURKEY_KGM_ROUTE": "relay", "TURKEY_KGM_RELAY_HMAC_SECRET": SECRET} | overrides
 
 
+def _loopback_env(url: str) -> dict[str, str]:
+    return _relay_env(TURKEY_KGM_RELAY_URL=url, TURKEY_KGM_RELAY_ALLOWED_NETWORK="127.0.0.0/8")
+
+
 def _errors(caplog) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.name == _LOGGER and r.levelno == logging.ERROR]
+
+
+def _closed_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 def test_default_route_is_direct_and_returns_the_given_factory_unchanged():
@@ -96,18 +121,35 @@ async def test_relay_route_builds_a_relay_session_and_provider_per_check(caplog)
     assert SECRET not in caplog.text
 
 
-def test_relay_url_defaults_to_the_wireguard_address():
-    route = resolve_kgm_route(_relay_env())
+def test_relay_url_and_network_default_to_wireguard():
+    route_config = resolve_kgm_route(_relay_env())
 
-    assert route.name == "relay"
-    assert route.relay_url == "http://10.50.0.2:8767"
-    assert SECRET not in repr(route)
+    assert route_config.name == "relay"
+    assert route_config.relay_url == "http://10.50.0.2:8767"
+    assert SECRET not in repr(route_config)
+
+
+@pytest.mark.parametrize("url", ["http://10.50.0.2:8767/", "http://10.50.0.77:9000", " http://10.50.0.2:8767 "])
+def test_ip_literal_urls_inside_the_network_are_accepted(url):
+    assert resolve_kgm_route(_relay_env(TURKEY_KGM_RELAY_URL=url)).name == "relay"
+
+
+def test_ipv6_url_inside_a_custom_network_is_accepted():
+    env = _relay_env(TURKEY_KGM_RELAY_URL="http://[fd00::2]:8767", TURKEY_KGM_RELAY_ALLOWED_NETWORK="fd00::/64")
+
+    assert resolve_kgm_route(env).name == "relay"
 
 
 _MISCONFIGURED = [
     pytest.param({"TURKEY_KGM_ROUTE": "relay"}, "TURKEY_KGM_RELAY_HMAC_SECRET: missing", id="no-secret"),
     pytest.param(_relay_env(TURKEY_KGM_RELAY_HMAC_SECRET="s" * 31), "TURKEY_KGM_RELAY_HMAC_SECRET: too_short", id="short"),
+    pytest.param(_relay_env(TURKEY_KGM_RELAY_URL="https://10.50.0.2:8767"), "TURKEY_KGM_RELAY_URL", id="https"),
     pytest.param(_relay_env(TURKEY_KGM_RELAY_URL="ftp://10.50.0.2:8767"), "TURKEY_KGM_RELAY_URL", id="ftp"),
+    pytest.param(_relay_env(TURKEY_KGM_RELAY_URL="http://relay.internal:8767"), "TURKEY_KGM_RELAY_URL", id="hostname"),
+    pytest.param(_relay_env(TURKEY_KGM_RELAY_URL="http://localhost:8767"), "TURKEY_KGM_RELAY_URL", id="localhost"),
+    pytest.param(_relay_env(TURKEY_KGM_RELAY_URL="http://10.51.0.2:8767"), "TURKEY_KGM_RELAY_URL", id="outside-net"),
+    pytest.param(_relay_env(TURKEY_KGM_RELAY_URL="http://127.0.0.1:8767"), "TURKEY_KGM_RELAY_URL", id="loopback"),
+    pytest.param(_relay_env(TURKEY_KGM_RELAY_URL="http://10.50.0.2"), "TURKEY_KGM_RELAY_URL", id="no-port"),
     pytest.param(_relay_env(TURKEY_KGM_RELAY_URL="http://10.50.0.2:8767/x"), "TURKEY_KGM_RELAY_URL", id="path"),
     pytest.param(_relay_env(TURKEY_KGM_RELAY_URL="http://u:pw@10.50.0.2:8767"), "TURKEY_KGM_RELAY_URL", id="userinfo"),
     pytest.param(_relay_env(TURKEY_KGM_RELAY_URL="http://10.50.0.2:8767?a=1"), "TURKEY_KGM_RELAY_URL", id="query"),
@@ -115,7 +157,12 @@ _MISCONFIGURED = [
     pytest.param(_relay_env(TURKEY_KGM_RELAY_URL="http://10.50.0.2:70000"), "TURKEY_KGM_RELAY_URL", id="port-range"),
     pytest.param(_relay_env(TURKEY_KGM_RELAY_URL="10.50.0.2:8767"), "TURKEY_KGM_RELAY_URL", id="no-scheme"),
     pytest.param(_relay_env(TURKEY_KGM_RELAY_URL="http://"), "TURKEY_KGM_RELAY_URL", id="no-host"),
-    pytest.param(_relay_env(TURKEY_KGM_RELAY_URL="http://exa mple:8767"), "TURKEY_KGM_RELAY_URL", id="bad-host"),
+    pytest.param(
+        _relay_env(TURKEY_KGM_RELAY_ALLOWED_NETWORK="10.50.0.0/33"), "TURKEY_KGM_RELAY_ALLOWED_NETWORK", id="bad-net",
+    ),
+    pytest.param(
+        _relay_env(TURKEY_KGM_RELAY_ALLOWED_NETWORK="0.0.0.0/0"), "TURKEY_KGM_RELAY_ALLOWED_NETWORK", id="public-net",
+    ),
     pytest.param({"TURKEY_KGM_ROUTE": "proxy"}, "TURKEY_KGM_ROUTE: unknown value", id="unknown-route"),
 ]
 
@@ -165,19 +212,38 @@ async def test_misconfigured_relay_makes_only_kgm_an_error():
     assert result.overall_status == OverallStatus.PARTIAL
 
 
+async def test_relay_kgm_client_matches_the_direct_route_client():
+    direct_client = check_service._build_client()
+    relay_client, relay_session = default_session_factory()
+    try:
+        assert relay_client.headers["User-Agent"] == direct_client.headers["User-Agent"]
+        assert relay_client.timeout == direct_client.timeout
+        assert relay_client.follow_redirects == direct_client.follow_redirects
+        assert relay_client._trust_env == direct_client._trust_env
+        assert relay_session._timeout == KgmSession(direct_client)._timeout
+    finally:
+        await relay_client.aclose()
+        await direct_client.aclose()
+
+
 # ---- python -m reader.turkey_bot.kgm.route (проверка связи без KGM) ----
 
-def test_cli_reports_the_direct_route(monkeypatch, capsys, _restore_httpx_log_level):
+def test_cli_loads_dotenv_like_the_bot_and_reports_the_direct_route(monkeypatch, capsys, _restore_httpx_log_level):
     monkeypatch.delenv("TURKEY_KGM_ROUTE", raising=False)
+    spy = _LoadDotenvSpy()
+    monkeypatch.setattr(route, "load_dotenv", spy)
 
     assert main([]) == 0
+    assert spy.calls == [((), {})]  # без override: значения от systemd главнее .env
     assert "KGM route: direct" in capsys.readouterr().out
 
 
-def test_cli_reads_the_env_file_and_reports_misconfiguration_without_values(
+def test_cli_env_file_mode_reports_misconfiguration_without_values(
     tmp_path, monkeypatch, capsys, _restore_httpx_log_level,
 ):
     monkeypatch.delenv("TURKEY_KGM_ROUTE", raising=False)
+    spy = _LoadDotenvSpy()
+    monkeypatch.setattr(route, "load_dotenv", spy)
     env_file = tmp_path / "turkeybot-kgm-relay.env"
     env_file.write_text("TURKEY_KGM_ROUTE=relay\nTURKEY_KGM_RELAY_HMAC_SECRET=short-secret-value\n", encoding="utf-8")
 
@@ -185,28 +251,55 @@ def test_cli_reads_the_env_file_and_reports_misconfiguration_without_values(
     out = capsys.readouterr().out
     assert "TURKEY_KGM_RELAY_HMAC_SECRET: too_short" in out
     assert "short-secret-value" not in out
+    assert spy.calls == []
 
 
-async def test_cli_check_reports_relay_health_without_contacting_kgm(capsys):
+async def test_cli_check_reports_relay_health_and_matching_kgm_code_without_contacting_kgm(capsys):
     fake = FakeKgm()
-    async with TestServer(build_kgm_relay_app(hmac_secret=SECRET, session_factory=fake.session_factory)) as server:
+    app = build_kgm_relay_app(hmac_secret=SECRET, allowed_networks=LOOPBACK, session_factory=fake.session_factory)
+    async with TestServer(app) as server:
         url = f"http://{server.host}:{server.port}"
-        code = await _check_relay(_relay_env(TURKEY_KGM_RELAY_URL=url))
+        code = await _check_relay(_loopback_env(url))
 
     out = capsys.readouterr().out
+    local = kgm_code_fingerprint()
     assert code == 0
     assert f"KGM route: relay via {url}" in out
-    assert 'OK: {"ok": true, "open_sessions": 0, "sessions_today": 0, "version": "1"}' in out
+    assert f'"kgm_code": "{local}"' in out
+    assert f"kgm_code: relay={local} local={local}" in out
+    assert "protocol version: relay=1 local=1" in out
+    assert out.rstrip().endswith("OK")
+    assert "MISMATCH" not in out
     assert SECRET not in out
     assert fake.requests == []
 
 
-async def test_cli_check_fails_when_the_relay_is_down(capsys):
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
+async def test_cli_check_reports_mismatch_when_the_relay_runs_other_kgm_code(monkeypatch, capsys):
+    monkeypatch.setattr(route, "kgm_code_fingerprint", lambda: "000000000000")
+    app = build_kgm_relay_app(hmac_secret=SECRET, allowed_networks=LOOPBACK, session_factory=FakeKgm().session_factory)
+    async with TestServer(app) as server:
+        code = await _check_relay(_loopback_env(f"http://{server.host}:{server.port}"))
 
-    code = await _check_relay(_relay_env(TURKEY_KGM_RELAY_URL=f"http://127.0.0.1:{port}"))
+    out = capsys.readouterr().out
+    assert code == 1
+    assert f"kgm_code: relay={kgm_code_fingerprint()} local=000000000000" in out
+    assert "MISMATCH:" in out
+
+
+async def test_cli_check_reports_mismatch_on_another_protocol_version(monkeypatch, capsys):
+    monkeypatch.setattr(route, "RELAY_PROTOCOL_VERSION", "2")
+    app = build_kgm_relay_app(hmac_secret=SECRET, allowed_networks=LOOPBACK, session_factory=FakeKgm().session_factory)
+    async with TestServer(app) as server:
+        code = await _check_relay(_loopback_env(f"http://{server.host}:{server.port}"))
+
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "protocol version: relay=1 local=2" in out
+    assert "MISMATCH:" in out
+
+
+async def test_cli_check_fails_when_the_relay_is_down(capsys):
+    code = await _check_relay(_loopback_env(f"http://127.0.0.1:{_closed_port()}"))
 
     assert code == 1
     assert "FAIL" in capsys.readouterr().out

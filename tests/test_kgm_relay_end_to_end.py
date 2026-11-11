@@ -2,8 +2,9 @@
 aiohttp TestServer на 127.0.0.1 <-> FakeKgm с реальными фикстурами ответов
 KGM -> KgmProvider + parser на стороне production -> UnifiedTurkeyCheckService.
 OCR подменён фиксированным кодом, GİB/Avrasya — фейками; сеть за пределы
-127.0.0.1 не используется."""
+127.0.0.1 не используется (сеть relay в тестах — явно 127.0.0.0/8)."""
 
+import logging
 import socket
 
 import httpx
@@ -21,6 +22,7 @@ from reader.turkey_bot.unified.models import OverallStatus, ProviderStatus
 from _kgm_relay_fakes import (
     ACCEPTED_CODE,
     HAS_DEBT_GRAND_TOTAL,
+    LOOPBACK,
     NO_DEBT_DELTA,
     OTHER_SECRET,
     SECRET,
@@ -34,6 +36,8 @@ from _kgm_relay_fakes import (
     gib_has_debt_outcome,
 )
 
+_RELAY_LOGGERS = ("reader.turkey_bot.kgm.relay_client", "reader.turkey_bot.kgm.relay_server", "httpx")
+
 
 @pytest.fixture(autouse=True)
 def _no_throttle_delay(monkeypatch):
@@ -41,7 +45,9 @@ def _no_throttle_delay(monkeypatch):
 
 
 def _relay_server(fake: FakeKgm, **kwargs) -> TestServer:
-    return TestServer(build_kgm_relay_app(hmac_secret=SECRET, session_factory=fake.session_factory, **kwargs))
+    return TestServer(build_kgm_relay_app(
+        hmac_secret=SECRET, allowed_networks=LOOPBACK, session_factory=fake.session_factory, **kwargs,
+    ))
 
 
 def _url(server: TestServer) -> str:
@@ -56,7 +62,12 @@ def _closed_port_url() -> str:
 
 
 def _relay_env(url: str, secret: str = SECRET) -> dict[str, str]:
-    return {"TURKEY_KGM_ROUTE": "relay", "TURKEY_KGM_RELAY_URL": url, "TURKEY_KGM_RELAY_HMAC_SECRET": secret}
+    return {
+        "TURKEY_KGM_ROUTE": "relay",
+        "TURKEY_KGM_RELAY_URL": url,
+        "TURKEY_KGM_RELAY_ALLOWED_NETWORK": "127.0.0.0/8",
+        "TURKEY_KGM_RELAY_HMAC_SECRET": secret,
+    }
 
 
 def _never_direct():
@@ -72,6 +83,24 @@ def _service(kgm_factory, *, gib_outcome=None, resolver=None) -> UnifiedTurkeyCh
         kgm_factory,
         captcha_resolver=resolver or FixedCaptchaResolver(),
     )
+
+
+class _FailingDeleteTransport(httpx.AsyncBaseTransport):
+    """Настоящий HTTP к relay, кроме DELETE: тот падает так, как задано."""
+
+    def __init__(self, failure):
+        self._inner = httpx.AsyncHTTPTransport()
+        self._failure = failure
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            if isinstance(self._failure, BaseException):
+                raise self._failure
+            return self._failure
+        return await self._inner.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
 
 
 async def test_provider_through_relay_parses_has_debt_on_the_production_side():
@@ -147,6 +176,31 @@ async def test_unified_check_retries_a_rejected_captcha_with_the_refreshed_image
     assert result.provider_result("kgm").status == ProviderStatus.HAS_DEBT
     assert resolver.kgm_images == [captcha_image(1, 1), captcha_image(1, 2)]
     assert fake.created_clients == fake.closed_clients == 1
+
+
+@pytest.mark.parametrize("failure", [
+    pytest.param(RuntimeError(f"DELETE failed for {TEST_PLATE}"), id="exception"),
+    pytest.param(httpx.Response(500, content=b"[" * 100_000 + b"]" * 100_000), id="garbage-500"),
+])
+async def test_failed_delete_keeps_the_successful_kgm_result_and_logs_no_plate(failure, caplog):
+    caplog.set_level(logging.DEBUG)
+    fake = FakeKgm()
+    async with _relay_server(fake) as server:
+        url = _url(server)
+
+        def factory():
+            session = RelayKgmSession(url, SECRET, transport=_FailingDeleteTransport(failure))
+            return session, KgmProvider(session)
+
+        result = await _service(factory).check(TEST_PLATE, max_attempts=3)
+
+    kgm = result.provider_result("kgm")
+    assert kgm.status == ProviderStatus.HAS_DEBT
+    assert kgm.total_amount == HAS_DEBT_GRAND_TOTAL
+    assert result.overall_status == OverallStatus.HAS_DEBT
+    relay_lines = [r.getMessage() for r in caplog.records if r.name in _RELAY_LOGGERS]
+    assert [line for line in relay_lines if line.startswith("KGM relay close:")]
+    assert not [line for line in relay_lines if TEST_PLATE in line]
 
 
 async def test_relay_down_gives_kgm_transport_error_partial_and_keeps_gib_avrasya_results():

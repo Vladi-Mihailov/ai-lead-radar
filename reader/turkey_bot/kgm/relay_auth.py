@@ -102,9 +102,10 @@ def signed_headers(
 
 class NonceCache:
     """Ограниченный in-memory набор уже принятых nonce. Живёт только в
-    процессе relay и никуда не сохраняется: после рестарта он пуст, и
-    перехваченный за последние 60 с запрос теоретически можно повторить
-    один раз — канал при этом и так внутри WireGuard.
+    процессе relay и никуда не сохраняется: после рестарта он пуст, поэтому
+    relay дополнительно отклоняет запросы, подписанные раньше его старта
+    (verify(not_before=...)), — повторить перехваченный до рестарта запрос
+    нельзя.
 
     Время — тот же wall clock, что и у проверки окна в verify(): при
     скачке часов обе проверки сдвигаются вместе и инвариант из
@@ -153,14 +154,21 @@ def verify(
     nonce_cache: NonceCache,
     now: float | None = None,
     max_skew_seconds: float = MAX_CLOCK_SKEW_SECONDS,
+    not_before: int | None = None,
 ) -> tuple[bool, str | None]:
     """(True, None) — запрос подлинный и его nonce увиден впервые (теперь
     запомнен). Иначе (False, reason), reason — только из фиксированного
     набора категорий для лога: invalid_secret / missing_headers /
-    invalid_timestamp / stale_timestamp / invalid_nonce / invalid_signature
-    / replayed_nonce / nonce_cache_full. Nonce запоминается ТОЛЬКО после
-    верной подписи — неподписанный запрос не может ни заполнить кэш, ни
-    "сжечь" чужой nonce заранее."""
+    invalid_timestamp / stale_timestamp / before_start / invalid_nonce /
+    invalid_signature / replayed_nonce / nonce_cache_full. Nonce
+    запоминается ТОЛЬКО после верной подписи — неподписанный запрос не может
+    ни заполнить кэш, ни "сжечь" чужой nonce заранее.
+
+    not_before — секунда старта процесса relay: более ранний timestamp
+    подписан до рестарта, когда NonceCache был другим, и отклоняется
+    (before_start). Требует синхронизированных часов (NTP) на обоих
+    серверах — при расхождении на N секунд первые N секунд после рестарта
+    relay отвечает 401."""
     if secret_problem(secret) is not None:
         return False, "invalid_secret"
     if not timestamp or not nonce or not signature:
@@ -170,6 +178,8 @@ def verify(
     current = time.time() if now is None else now
     if abs(current - int(timestamp)) > max_skew_seconds:
         return False, "stale_timestamp"
+    if not_before is not None and int(timestamp) < not_before:
+        return False, "before_start"
     if not _NONCE_RE.fullmatch(nonce):
         return False, "invalid_nonce"
     if not _SIGNATURE_RE.fullmatch(signature):

@@ -32,6 +32,14 @@ def _headers(**overrides) -> dict[str, str]:
     return relay_auth.signed_headers(SECRET, "POST", PATH, BODY, **kwargs)
 
 
+def _header_kwargs(headers: dict[str, str]) -> dict[str, str]:
+    return {
+        "timestamp": headers[relay_auth.TIMESTAMP_HEADER],
+        "nonce": headers[relay_auth.NONCE_HEADER],
+        "signature": headers[relay_auth.SIGNATURE_HEADER],
+    }
+
+
 def test_canonical_string_covers_timestamp_method_path_nonce_and_body_hash():
     canonical = relay_auth.canonical_string(method="post", path=PATH, timestamp="1800000000", nonce=NONCE, body=BODY)
 
@@ -94,6 +102,19 @@ def test_tampered_timestamp_inside_the_window_is_rejected():
 ])
 def test_clock_skew_window_is_plus_minus_60_seconds(skew, expected):
     assert _verify(_headers(now=NOW + skew)) == expected
+
+
+def test_request_signed_before_the_relay_started_is_rejected():
+    started = int(NOW)
+
+    assert relay_auth.verify(
+        SECRET, method="POST", path=PATH, body=BODY, nonce_cache=NonceCache(), now=NOW, not_before=started,
+        **_header_kwargs(_headers(now=NOW - 1)),
+    ) == (False, "before_start")
+    assert relay_auth.verify(
+        SECRET, method="POST", path=PATH, body=BODY, nonce_cache=NonceCache(), now=NOW, not_before=started,
+        **_header_kwargs(_headers(now=NOW)),
+    ) == (True, None)
 
 
 def test_replayed_request_is_rejected():

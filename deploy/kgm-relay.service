@@ -1,15 +1,18 @@
 [Unit]
 Description=KGM relay - thin HTTP relay to webihlaltakip.kgm.gov.tr for the Turkey bot (Georgian server)
+# Ordered after WireGuard, but does not pull it in: wg-quick@wg0 is managed
+# separately and is shared with georgia-collector.
 After=network-online.target wg-quick@wg0.service
-Wants=network-online.target wg-quick@wg0.service
+Wants=network-online.target
 
 # NOT installed by this change - see docs/kgm-relay.md for the manual install
 # on the Georgian (REDNET) server. A separate unit, user, directory, venv,
 # port and secret: georgia-collector.service is not touched.
 #
-# Listens only on the WireGuard address (KGM_RELAY_HOST, default 10.50.0.2,
-# port 8767); relay_main.py refuses 0.0.0.0/:: and empty hosts. If wg0 is not
-# up yet, the bind fails and Restart=on-failure retries every 10 s.
+# Listens only on an address inside KGM_RELAY_ALLOWED_NETWORK (default
+# 10.50.0.2:8767 in 10.50.0.0/24) and accepts requests only from that
+# network. If wg0 is not up yet, the bind fails (exit 1) and Restart=on-failure
+# retries every 10 s. A configuration error exits 2 and is not retried.
 #
 # EnvironmentFile holds KGM_RELAY_HMAC_SECRET and is read by systemd as root,
 # so it stays root:root 0600. The relay writes nothing to disk, hence
@@ -26,9 +29,11 @@ ExecStart=/opt/kgm-relay/.venv/bin/python -m reader.turkey_bot.kgm.relay_main
 
 Restart=on-failure
 RestartSec=10
+RestartPreventExitStatus=2
 
 # Resource caps: the box has 1 vCPU / ~960 MB RAM shared with
 # georgia-collector, so the relay can never starve it.
+MemoryHigh=160M
 MemoryMax=192M
 CPUQuota=50%
 TasksMax=64
@@ -38,14 +43,24 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
 RestrictSUIDSGID=yes
-LockPersonality=yes
 RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 CapabilityBoundingSet=
+UMask=0077
 
 StandardOutput=journal
 StandardError=journal

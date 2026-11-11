@@ -1,13 +1,15 @@
 """Тесты reader/turkey_bot/kgm/relay_server.py — KGM relay на грузинском
-сервере. Сеть не используется: relay работает в aiohttp TestServer, а KGM
-подменён FakeKgm (httpx.MockTransport, см. tests/_kgm_relay_fakes.py),
-который ведёт себя как ASP.NET и отвечает HTTP 500 на чужие cookie или
-протухшие __VIEWSTATE/hdnx — так проверяется, что состояние сессии
-переживает обновление CAPTCHA и повторный submit."""
+сервере. Сеть не используется: relay работает в aiohttp TestServer на
+127.0.0.1 (сеть клиентов — явно 127.0.0.0/8), а KGM подменён FakeKgm
+(httpx.MockTransport, см. tests/_kgm_relay_fakes.py), который ведёт себя как
+ASP.NET и отвечает HTTP 500 на чужие cookie или протухшие __VIEWSTATE/hdnx —
+так проверяется, что состояние сессии переживает обновление CAPTCHA и
+повторный submit."""
 
 import asyncio
 import base64
 import gc
+import ipaddress
 import json
 import logging
 import re
@@ -20,14 +22,16 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 import reader.turkey_bot.kgm.session as kgm_session
-from reader.turkey_bot.kgm import relay_auth
+from reader.turkey_bot.kgm import relay_auth, relay_server
 from reader.turkey_bot.kgm.parser import parse_submit_response
-from reader.turkey_bot.kgm.relay_server import build_kgm_relay_app
+from reader.turkey_bot.kgm.relay_server import _remote_allowed, build_kgm_relay_app
+from reader.turkey_bot.kgm.relay_version import kgm_code_fingerprint
 from reader.turkey_bot.kgm.session import KgmSession
 
 from _kgm_relay_fakes import (
     ACCEPTED_CODE,
     HAS_DEBT_DELTA,
+    LOOPBACK,
     OTHER_SECRET,
     SECRET,
     TEST_PLATE,
@@ -58,6 +62,7 @@ class _Clock:
 
 
 def _app(fake: FakeKgm, **kwargs):
+    kwargs.setdefault("allowed_networks", LOOPBACK)
     return build_kgm_relay_app(hmac_secret=SECRET, session_factory=fake.session_factory, **kwargs)
 
 
@@ -85,7 +90,14 @@ async def _wait_until(condition, *, timeout: float = 2.0) -> None:
     raise AssertionError("condition was not met in time")
 
 
-# ---- аутентификация ----
+def _relay_warnings(caplog) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == "reader.turkey_bot.kgm.relay_server" and r.levelno == logging.WARNING
+    ]
+
+
+# ---- доступ: сеть WireGuard и подпись ----
 
 _ROUTES = [
     ("POST", SESSIONS),
@@ -111,6 +123,40 @@ async def test_every_route_requires_a_valid_signature(method, path):
     assert fake.created_clients == 0
 
 
+@pytest.mark.parametrize("method, path", _ROUTES)
+async def test_requests_from_outside_the_allowed_networks_are_rejected_before_hmac(method, path, caplog):
+    fake = FakeKgm()
+    async with TestClient(TestServer(_app(fake, allowed_networks=("10.50.0.0/24",)))) as client:
+        signed = await signed_request(client, method, path)
+        oversized = await client.request(method, path, data=b"x" * (17 * 1024))
+
+        assert signed.status == 401
+        assert await signed.json() == {"error": "unauthorized"}
+        # Тело чужого клиента даже не читается — 401, а не 413.
+        assert oversized.status == 401
+    assert fake.requests == []
+    assert _relay_warnings(caplog) == ["KGM relay: запрос отклонён (remote_not_allowed)"] * 2
+    assert "127.0.0.1" not in caplog.text
+
+
+def test_remote_address_matching():
+    networks = (ipaddress.ip_network("10.50.0.0/24"),)
+
+    assert _remote_allowed("10.50.0.1", networks)
+    assert _remote_allowed("::ffff:10.50.0.1", networks)
+    assert not _remote_allowed("10.50.1.1", networks)
+    assert not _remote_allowed("127.0.0.1", networks)
+    assert not _remote_allowed(None, networks)
+    assert not _remote_allowed("not-an-ip", networks)
+
+
+def test_build_app_refuses_a_short_secret_and_empty_networks():
+    with pytest.raises(ValueError):
+        build_kgm_relay_app(hmac_secret="x" * 31, allowed_networks=LOOPBACK)
+    with pytest.raises(ValueError):
+        build_kgm_relay_app(hmac_secret=SECRET, allowed_networks=())
+
+
 async def test_replayed_request_is_rejected():
     async with TestClient(TestServer(_app(FakeKgm()))) as client:
         headers = relay_auth.signed_headers(SECRET, "GET", HEALTH, b"")
@@ -119,6 +165,27 @@ async def test_replayed_request_is_rejected():
 
     assert first.status == 200
     assert second.status == 401
+
+
+async def test_request_signed_before_the_relay_started_is_rejected(caplog):
+    started_at = time.time() + 30
+    async with TestClient(TestServer(_app(FakeKgm(), started_at=started_at))) as client:
+        before_start = await signed_request(client, "GET", HEALTH)
+        after_start = await signed_request(client, "GET", HEALTH, now=started_at)
+
+    assert before_start.status == 401
+    assert after_start.status == 200
+    assert "KGM relay: запрос отклонён (before_start)" in _relay_warnings(caplog)
+
+
+async def test_signature_covers_the_query_string():
+    async with TestClient(TestServer(_app(FakeKgm()))) as client:
+        signed_with_query = await signed_request(client, "GET", HEALTH + "?probe=1")
+        headers = relay_auth.signed_headers(SECRET, "GET", HEALTH, b"")
+        query_added_later = await client.get(HEALTH + "?probe=1", headers=headers)
+
+    assert signed_with_query.status == 200
+    assert query_added_later.status == 401
 
 
 async def test_signature_covers_the_body():
@@ -131,11 +198,6 @@ async def test_signature_covers_the_body():
 
     assert response.status == 401
     assert fake.submits() == []
-
-
-def test_build_app_refuses_a_short_secret():
-    with pytest.raises(ValueError):
-        build_kgm_relay_app(hmac_secret="x" * 31)
 
 
 # ---- контракт: состояние сессии и сырой ответ KGM ----
@@ -216,7 +278,19 @@ async def test_unicode_printable_captcha_code_still_reaches_kgm():
     assert fake.submits()[0]["form"]["txtimgcode"] == "22 0371З"
 
 
-# ---- TTL и фоновая очистка ----
+async def test_captcha_code_of_128_printable_characters_is_accepted():
+    fake = FakeKgm()
+    async with TestClient(TestServer(_app(fake))) as client:
+        session_id = (await _create(client))["session_id"]
+        response = await signed_request(
+            client, "POST", f"{SESSIONS}/{session_id}/submit", body=_submit_body(code="7" * 128),
+        )
+
+        assert response.status == 200
+    assert fake.submits()[0]["form"]["txtimgcode"] == "7" * 128
+
+
+# ---- TTL, фоновая очистка, вытеснение ----
 
 async def test_session_expires_after_ttl_with_404_and_closed_client():
     fake = FakeKgm()
@@ -315,21 +389,48 @@ async def test_shutdown_closes_every_open_session():
     assert all(c.is_closed for c in fake.clients)
 
 
-# ---- лимиты ----
+async def test_full_relay_evicts_the_least_recently_used_idle_session(caplog):
+    caplog.set_level(logging.INFO, logger="reader.turkey_bot.kgm.relay_server")
+    fake = FakeKgm()
+    clock = _Clock()
+    async with TestClient(TestServer(_app(fake, clock=clock))) as client:
+        first = (await _create(client))["session_id"]
+        clock.advance(1)
+        second = (await _create(client))["session_id"]
+        clock.advance(1)
+        assert (await signed_request(client, "POST", f"{SESSIONS}/{first}/captcha")).status == 200
+        clock.advance(2)
 
-async def test_third_session_is_busy_while_two_are_open():
+        third = await signed_request(client, "POST", SESSIONS)
+
+        assert third.status == 201
+        assert fake.clients[1].is_closed
+        assert not fake.clients[0].is_closed
+        assert (await signed_request(client, "POST", f"{SESSIONS}/{second}/captcha")).status == 404
+        assert (await signed_request(client, "POST", f"{SESSIONS}/{first}/captcha")).status == 200
+        assert (await _health(client))["open_sessions"] == 2
+    assert "KGM relay: лимит открытых сессий — закрыта давно не использованная (evicted_idle)" in caplog.text
+
+
+async def test_relay_is_busy_only_when_no_open_session_is_idle():
     fake = FakeKgm()
     async with TestClient(TestServer(_app(fake))) as client:
-        first = await _create(client)
-        await _create(client)
+        first = (await _create(client))["session_id"]
+        second = (await _create(client))["session_id"]
+        fake.delay = 0.5
+        running = [
+            asyncio.create_task(signed_request(client, "POST", f"{SESSIONS}/{sid}/submit", body=_submit_body()))
+            for sid in (first, second)
+        ]
+        await _wait_until(lambda: fake.in_flight > 0)
+        # Второй submit тем временем дошёл до relay и ждёт семафор (in_flight=1).
+        await asyncio.sleep(0.15)
 
         busy = await signed_request(client, "POST", SESSIONS)
         assert busy.status == 503
         assert await busy.json() == {"error": "busy"}
-
-        assert (await signed_request(client, "DELETE", f"{SESSIONS}/{first['session_id']}")).status == 204
-        assert (await signed_request(client, "POST", SESSIONS)).status == 201
-    assert fake.created_clients == 3
+        assert [(await task).status for task in running] == [200, 200]
+    assert fake.created_clients == 2
 
 
 async def test_session_being_created_counts_towards_the_busy_limit():
@@ -343,6 +444,8 @@ async def test_session_being_created_counts_towards_the_busy_limit():
         assert (await pending).status == 201
     assert fake.created_clients == 1
 
+
+# ---- лимиты ----
 
 async def test_token_bucket_allows_a_burst_of_three_then_one_per_two_seconds():
     fake = FakeKgm()
@@ -359,6 +462,22 @@ async def test_token_bucket_allows_a_burst_of_three_then_one_per_two_seconds():
         assert (await signed_request(client, "POST", SESSIONS)).status == 201
         assert (await signed_request(client, "POST", SESSIONS)).status == 429
     assert fake.created_clients == 4
+
+
+async def test_rate_limit_rejection_never_evicts_a_session():
+    fake = FakeKgm()
+    clock = _Clock()
+    async with TestClient(TestServer(_app(fake, clock=clock, session_burst=2))) as client:
+        first = (await _create(client))["session_id"]
+        second = (await _create(client))["session_id"]
+
+        limited = await signed_request(client, "POST", SESSIONS)
+        assert limited.status == 429
+        assert (await _health(client))["open_sessions"] == 2
+        for session_id in (first, second):
+            assert (await signed_request(client, "POST", f"{SESSIONS}/{session_id}/captcha")).status == 200
+        assert not any(c.is_closed for c in fake.clients)
+    assert fake.created_clients == 2
 
 
 async def test_daily_cap_counts_per_utc_day():
@@ -425,7 +544,7 @@ _BAD_BODIES = [
     pytest.param(json.dumps({"plate": "34-TST-987", "captcha_code": ACCEPTED_CODE}).encode(), id="plate-dash"),
     pytest.param(json.dumps({"plate": "34ТСТ987", "captcha_code": ACCEPTED_CODE}).encode(), id="plate-cyrillic"),
     pytest.param(json.dumps({"plate": TEST_PLATE, "captcha_code": ""}).encode(), id="empty-code"),
-    pytest.param(json.dumps({"plate": TEST_PLATE, "captcha_code": "1" * 33}).encode(), id="code-too-long"),
+    pytest.param(json.dumps({"plate": TEST_PLATE, "captcha_code": "1" * 129}).encode(), id="code-too-long"),
     pytest.param(json.dumps({"plate": TEST_PLATE, "captcha_code": "22\n03713"}).encode(), id="code-control-char"),
     pytest.param(b"[" * 5000 + b"]" * 5000, id="deeply-nested"),
 ]
@@ -470,9 +589,10 @@ async def test_unknown_route_and_wrong_method_return_json_errors():
         assert await unknown.json() == {"error": "not_found"}
         assert wrong_method.status == 405
         assert await wrong_method.json() == {"error": "method_not_allowed"}
+        assert wrong_method.headers["Allow"] == "POST"
 
 
-# ---- ошибки KGM -> 502 ----
+# ---- ошибки KGM -> 502, сроки операций ----
 
 async def test_kgm_unreachable_on_create_maps_to_502_and_leaves_nothing_open():
     fake = FakeKgm(page_error=httpx.ConnectError)
@@ -520,9 +640,21 @@ async def test_kgm_http_error_on_submit_maps_to_502_with_status_only():
     assert fake.clients[0].is_closed
 
 
-async def test_slow_kgm_hits_the_operation_deadline_and_maps_to_502():
+def test_operation_deadlines_are_derived_from_the_kgm_timeouts():
+    request_timeout = relay_server.KGM_REQUEST_TIMEOUT_SECONDS
+    # Значение на момент импорта: autouse-фикстура обнуляет паузу в session.py.
+    throttle = relay_server._MIN_REQUEST_INTERVAL_SECONDS
+    margin = relay_server.DEADLINE_MARGIN_SECONDS
+    assert throttle == 1.5
+
+    assert relay_server.START_DEADLINE_SECONDS == 2 * request_timeout + throttle + margin == 65.0
+    assert relay_server.STEP_DEADLINE_SECONDS == request_timeout + throttle + margin == 35.0
+    assert relay_server.OPERATION_DEADLINES == {"start": 65.0, "captcha": 35.0, "submit": 35.0}
+
+
+async def test_slow_kgm_hits_the_start_deadline_and_maps_to_502():
     fake = FakeKgm(delay=1.0)
-    async with TestClient(TestServer(_app(fake, operation_timeout_seconds=0.05))) as client:
+    async with TestClient(TestServer(_app(fake, start_deadline_seconds=0.05))) as client:
         response = await signed_request(client, "POST", SESSIONS)
 
         assert response.status == 502
@@ -531,13 +663,27 @@ async def test_slow_kgm_hits_the_operation_deadline_and_maps_to_502():
     assert fake.clients[0].is_closed
 
 
+async def test_captcha_and_submit_use_the_shorter_step_deadline():
+    fake = FakeKgm(delay=0.1)
+    app = _app(fake, start_deadline_seconds=5.0, step_deadline_seconds=0.05)
+    async with TestClient(TestServer(app)) as client:
+        session_id = (await _create(client))["session_id"]
+
+        captcha = await signed_request(client, "POST", f"{SESSIONS}/{session_id}/captcha")
+        assert captcha.status == 502
+        assert await captcha.json() == {"error": "kgm_transport", "detail": "TimeoutError"}
+        assert (await _health(client))["open_sessions"] == 0
+    assert fake.clients[0].is_closed
+
+
 # ---- health ----
 
-async def test_health_reports_open_sessions_daily_count_and_version():
+async def test_health_reports_open_sessions_daily_count_version_and_kgm_code():
     async with TestClient(TestServer(_app(FakeKgm()))) as client:
-        assert await _health(client) == {"ok": True, "open_sessions": 0, "sessions_today": 0, "version": "1"}
+        expected = {"ok": True, "open_sessions": 0, "sessions_today": 0, "version": "1", "kgm_code": kgm_code_fingerprint()}
+        assert await _health(client) == expected
         await _create(client)
-        assert await _health(client) == {"ok": True, "open_sessions": 1, "sessions_today": 1, "version": "1"}
+        assert await _health(client) == expected | {"open_sessions": 1, "sessions_today": 1}
 
 
 # ---- журнал и ответы без секретов ----
@@ -566,7 +712,7 @@ async def test_logs_and_error_responses_never_contain_plate_captcha_secrets_sess
         await call("POST", f"{base}/submit", _submit_body())
         await call("POST", f"{base}/captcha")
         await call("POST", f"{base}/submit", _submit_body())
-        await call("POST", f"{base}/submit", json.dumps({"plate": TEST_PLATE, "captcha_code": "1" * 40}).encode())
+        await call("POST", f"{base}/submit", json.dumps({"plate": TEST_PLATE, "captcha_code": "1" * 140}).encode())
         await call("POST", f"{base}/submit", _submit_body(), forge=True)
         fake.states["fakeaspnetsession0001"].viewstate = "CHANGED-ON-THE-SERVER"
         await call("POST", f"{base}/submit", _submit_body())
@@ -577,7 +723,7 @@ async def test_logs_and_error_responses_never_contain_plate_captcha_secrets_sess
     forbidden = [
         TEST_PLATE, ACCEPTED_CODE, SECRET, session_id, "fakeaspnetsession", "VS-1-", "HX-1-", "GEN0001",
         "FAKE_VIEWSTATE_PLACEHOLDER_NOT_REAL", "lblGenelCezaToplam", "metin hatası", "CHANGED-ON-THE-SERVER",
-        "1" * 40, *signatures,
+        "1" * 140, *signatures,
     ]
     log_text = "\n".join(record.getMessage() for record in caplog.records)
     assert "KGM relay: POST /internal/kgm/sessions/{session_id}/submit -> 200" in log_text
@@ -585,6 +731,8 @@ async def test_logs_and_error_responses_never_contain_plate_captcha_secrets_sess
         assert value not in log_text, f"{value!r} leaked into the log"
         for body in error_bodies:
             assert value not in body, f"{value!r} leaked into an error response"
+    relay_lines = [r.getMessage() for r in caplog.records if r.name == "reader.turkey_bot.kgm.relay_server"]
+    assert not [line for line in relay_lines if "127.0.0.1" in line]
 
 
 # ---- утечки ресурсов ----

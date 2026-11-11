@@ -3,24 +3,32 @@ relay на грузинском сервере (см. docs/kgm-relay.md). Чит
 старте reader/turkey_bot/main.py, после load_dotenv():
 
   - TURKEY_KGM_ROUTE — direct (по умолчанию) | relay;
-  - TURKEY_KGM_RELAY_URL — по умолчанию http://10.50.0.2:8767 (WireGuard);
+  - TURKEY_KGM_RELAY_URL — по умолчанию http://10.50.0.2:8767. Только
+    http://<IP-адрес внутри TURKEY_KGM_RELAY_ALLOWED_NETWORK>:<порт>, без
+    пути, query и учётных данных: имя хоста и https отклоняются;
+  - TURKEY_KGM_RELAY_ALLOWED_NETWORK — сеть WireGuard, по умолчанию
+    10.50.0.0/24 (только частная сеть);
   - TURKEY_KGM_RELAY_HMAC_SECRET — не короче 32 символов, тот же, что
     KGM_RELAY_HMAC_SECRET на грузинском сервере.
 
-Ошибка конфигурации (неизвестный маршрут, плохой URL, нет или короткий
-секрет) — одна ERROR-строка при старте, после чего каждая проверка KGM
-получает KgmTransportError на start() (-> ERROR "transport_error"), а GİB/
-Avrasya работают как обычно. Автоматического перехода на direct НЕТ — ни при
-ошибке конфигурации, ни при недоступном relay: немецкий адрес KGM сейчас не
-отвечает, а молчаливая смена маршрута только спрятала бы проблему.
+Ошибка конфигурации (неизвестный маршрут, плохой URL или сеть, нет или
+короткий секрет) — одна ERROR-строка при старте, после чего каждая проверка
+KGM получает KgmTransportError на start() (-> ERROR "transport_error"), а
+GİB/Avrasya работают как обычно. Автоматического перехода на direct НЕТ — ни
+при ошибке конфигурации, ни при недоступном relay: немецкий адрес KGM сейчас
+не отвечает, а молчаливая смена маршрута только спрятала бы проблему.
 
-Проверка связи production -> relay без обращения к KGM (тот же разбор
-настроек, что у бота):
+Проверка связи production -> relay без обращения к KGM, с тем же разбором
+окружения, что у бота (на production — через systemd-run, см. docs):
 
-    python -m reader.turkey_bot.kgm.route --env-file /etc/ai-lead-radar/turkeybot-kgm-relay.env"""
+    python -m reader.turkey_bot.kgm.route
+
+Печатает /health relay и сравнивает его kgm_code и версию протокола со
+своими (relay_version.py); при расхождении — строка MISMATCH и код 1."""
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -31,21 +39,26 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 import httpx
+from dotenv import dotenv_values, load_dotenv
 
 from reader.turkey_bot.kgm.models import KgmCaptchaChallenge
 from reader.turkey_bot.kgm.provider import KgmProvider
 from reader.turkey_bot.kgm.relay_auth import MIN_SECRET_LENGTH, secret_problem
 from reader.turkey_bot.kgm.relay_client import RelayKgmSession
+from reader.turkey_bot.kgm.relay_version import RELAY_PROTOCOL_VERSION, kgm_code_fingerprint
 from reader.turkey_bot.kgm.session import KgmTransportError
 
 logger = logging.getLogger(__name__)
 
 ROUTE_ENV = "TURKEY_KGM_ROUTE"
 RELAY_URL_ENV = "TURKEY_KGM_RELAY_URL"
+RELAY_NETWORK_ENV = "TURKEY_KGM_RELAY_ALLOWED_NETWORK"
 RELAY_SECRET_ENV = "TURKEY_KGM_RELAY_HMAC_SECRET"
 DEFAULT_RELAY_URL = "http://10.50.0.2:8767"
+DEFAULT_RELAY_NETWORK = "10.50.0.0/24"
 
-_HOST_RE = re.compile(r"[A-Za-z0-9.:-]+")
+_KGM_CODE_RE = re.compile(r"[0-9a-f]{12}")
+_VERSION_RE = re.compile(r"[0-9A-Za-z.]{1,16}")
 
 
 class _AsyncCloseable(Protocol):
@@ -68,16 +81,23 @@ class KgmRoute:
     problem: str = ""
 
 
-def _relay_url_problem(url: str) -> str | None:
-    """Разбор тем же httpx.URL, которым потом пользуется RelayKgmSession."""
+def _relay_url_problem(url: str, network: ipaddress.IPv4Network | ipaddress.IPv6Network) -> str | None:
+    """relay слушает обычный HTTP внутри WireGuard: имя хоста потребовало бы
+    DNS и могло бы увести подписанные запросы наружу, https там не настроен."""
     try:
         parsed = httpx.URL(url)
     except httpx.InvalidURL:
         return "invalid URL"
-    if parsed.scheme not in ("http", "https") or not parsed.host or not _HOST_RE.fullmatch(parsed.host):
-        return "expected an http(s) URL with a host"
-    if parsed.port is not None and not 0 < parsed.port < 65536:
-        return "invalid port"
+    if parsed.scheme != "http":
+        return "only plain http inside WireGuard is allowed"
+    try:
+        address = ipaddress.ip_address(parsed.host)
+    except ValueError:
+        return "host must be an IP address, not a name"
+    if address not in network:
+        return f"host is outside {RELAY_NETWORK_ENV}"
+    if parsed.port is None or not 0 < parsed.port < 65536:
+        return "an explicit port 1..65535 is required"
     if parsed.userinfo or parsed.query or parsed.fragment or parsed.path != "/":
         return "path, query, fragment and credentials are not allowed"
     return None
@@ -89,8 +109,14 @@ def resolve_kgm_route(env: Mapping[str, str]) -> KgmRoute:
         return KgmRoute(name="direct")
     if route != "relay":
         return KgmRoute(name="misconfigured", problem=f"{ROUTE_ENV}: unknown value (expected direct or relay)")
+    try:
+        network = ipaddress.ip_network((env.get(RELAY_NETWORK_ENV) or DEFAULT_RELAY_NETWORK).strip())
+    except ValueError:
+        return KgmRoute(name="misconfigured", problem=f"{RELAY_NETWORK_ENV}: invalid network")
+    if not network.is_private:
+        return KgmRoute(name="misconfigured", problem=f"{RELAY_NETWORK_ENV}: only a private (WireGuard) network")
     url = (env.get(RELAY_URL_ENV) or DEFAULT_RELAY_URL).strip()
-    url_problem = _relay_url_problem(url)
+    url_problem = _relay_url_problem(url, network)
     if url_problem is not None:
         return KgmRoute(name="misconfigured", problem=f"{RELAY_URL_ENV}: {url_problem}")
     secret = env.get(RELAY_SECRET_ENV)
@@ -157,6 +183,11 @@ def kgm_check_factory_from_env(env: Mapping[str, str], *, direct_factory: KgmChe
     return relay_factory
 
 
+def _printable(value: object, pattern: re.Pattern) -> str:
+    """Значение из ответа relay — в терминал только в ожидаемом виде."""
+    return value if isinstance(value, str) and pattern.fullmatch(value) else "invalid"
+
+
 async def _check_relay(env: Mapping[str, str]) -> int:
     route = resolve_kgm_route(env)
     if route.name == "direct":
@@ -174,25 +205,48 @@ async def _check_relay(env: Mapping[str, str]) -> int:
         return 1
     finally:
         await session.aclose()
-    print("OK: " + json.dumps(health, sort_keys=True))
+
+    print("relay health: " + json.dumps(health, sort_keys=True))
+    relay_code = _printable(health.get("kgm_code"), _KGM_CODE_RE)
+    relay_version = _printable(health.get("version"), _VERSION_RE)
+    local_code = kgm_code_fingerprint()
+    print(f"kgm_code: relay={relay_code} local={local_code}")
+    print(f"protocol version: relay={relay_version} local={RELAY_PROTOCOL_VERSION}")
+    if relay_code != local_code or relay_version != RELAY_PROTOCOL_VERSION:
+        print(
+            "MISMATCH: the relay runs different KGM code or protocol than this checkout — "
+            'install the same commit on both servers (docs/kgm-relay.md, "Update the relay")'
+        )
+        return 1
+    print("OK")
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m reader.turkey_bot.kgm.route",
-        description="Show the KGM route the Turkey bot would use and check the relay /health (KGM is not contacted).",
+        description=(
+            "Show the KGM route the Turkey bot would use and check the relay /health "
+            "and kgm_code (KGM is not contacted)."
+        ),
     )
-    parser.add_argument("--env-file", help="KEY=value file with TURKEY_KGM_* (e.g. the systemd drop-in env file)")
+    parser.add_argument(
+        "--env-file",
+        help="local debugging only: KEY=value file laid over the environment "
+        "(production runs the check through systemd-run, see docs/kgm-relay.md)",
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    env = dict(os.environ)
     if args.env_file:
-        from dotenv import dotenv_values
-
+        env = dict(os.environ)
         env.update({key: value for key, value in dotenv_values(args.env_file).items() if value is not None})
+    else:
+        # Ровно как бот (reader/turkey_bot/main.py): load_dotenv() без override,
+        # затем os.environ — значения от systemd (EnvironmentFile) главнее .env.
+        load_dotenv()
+        env = dict(os.environ)
     return asyncio.run(_check_relay(env))
 
 
