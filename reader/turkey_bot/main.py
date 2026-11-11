@@ -72,6 +72,7 @@ from reader.protocol_support.service import BotProfile, ProtocolSupportService
 from reader.protocol_support.telethon_gateway import TelethonSupportGateway, register_support_group_handlers
 from reader.turkey_bot.handlers import register
 from reader.turkey_bot.keyboards import main_menu_keyboard
+from reader.turkey_bot.kgm.route import kgm_check_factory_from_env
 from reader.turkey_bot.known_users_repository import (
     TurkeyBotKnownUsersRepository,
 )
@@ -206,8 +207,13 @@ async def run() -> None:
     else:
         logger.info("Turkey fine translator выключен (OPENAI_API_KEY не задан)")
 
+    # KGM: direct (по умолчанию) или relay на грузинском сервере — см.
+    # reader/turkey_bot/kgm/route.py и docs/kgm-relay.md. Окружение уже
+    # загружено (load_settings/read_bot_token вызывают load_dotenv()), а
+    # значения из systemd drop-in .env не перекрывает.
     check_service = UnifiedTurkeyCheckService(
-        default_gib_check_factory, default_avrasya_check_factory, default_kgm_check_factory,
+        default_gib_check_factory, default_avrasya_check_factory,
+        kgm_check_factory_from_env(os.environ, direct_factory=default_kgm_check_factory),
         gib_translator=translator,
     )
     # Trusted-manager "🔄 Проверить авто с задолженностью" (см. задачу
