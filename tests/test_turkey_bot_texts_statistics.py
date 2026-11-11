@@ -5,6 +5,7 @@ format_debt_list_messages (см. задачу "manager Statistics / refresh дл
 даты/checked_at/"сегодня"/"вчера"/"≥"-пометки PARTIAL."""
 
 import sys
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -13,7 +14,12 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from reader.plate_display import format_plate_for_telegram
 from reader.turkey_bot import texts
-from reader.turkey_bot.statistics_service import TurkeyStatistics
+from reader.turkey_bot.debt_refresh_service import TurkeyRefreshOutcome
+from reader.turkey_bot.statistics_service import (
+    TurkeyProviderDebtState,
+    TurkeyProviderFreshness,
+    TurkeyStatistics,
+)
 
 _TELEGRAM_LIMIT = 4096
 
@@ -157,6 +163,220 @@ def test_long_debt_list_splits_safely_and_keeps_every_row():
     full_text = "\n".join(messages)
     for i in range(500):
         assert f"CAR{i:04d}" in full_text  # никто не потерян/не обрезан
+
+
+# ---- подтверждённая / последняя известная / нет данных (см. задачу
+# "Turkey debt list: последний успешный результат отдельно по каждому
+# провайдеру и госномеру") ----
+
+_NOV_04 = datetime(2026, 11, 4, 12, 0, tzinfo=timezone.utc)
+_NOV_11 = datetime(2026, 11, 11, 12, 0, tzinfo=timezone.utc)
+
+
+def _state(provider, freshness, amount=Decimal(0), *, last_success_at=None, last_attempt_at=None, error_type=None):
+    return TurkeyProviderDebtState(
+        provider=provider, freshness=freshness, amount=amount,
+        last_success_at=last_success_at, last_attempt_at=last_attempt_at, last_attempt_error_type=error_type,
+    )
+
+
+def test_debt_summary_block_unchanged_when_nothing_is_last_known():
+    expected = "🚨 Задолженность по последней проверке\nАвтомобилей: 2\nОбщая сумма: 1 500 ₺"
+
+    assert texts.format_debt_summary_block(debt_car_count=2, debt_total_amount=Decimal(1500)) == expected
+    assert texts.format_debt_summary_block(
+        debt_car_count=2, debt_total_amount=Decimal(1500), confirmed_amount=Decimal(1500),
+        last_known_amount=Decimal(0), no_data_car_count=0,
+    ) == expected
+
+
+def test_debt_summary_block_separates_confirmed_and_last_known():
+    text = texts.format_debt_summary_block(
+        debt_car_count=17, debt_total_amount=Decimal("120601.50"),
+        confirmed_amount=Decimal(43000), last_known_amount=Decimal("77601.50"),
+    )
+
+    assert text.splitlines() == [
+        "🚨 Задолженность по последней проверке",
+        "Автомобилей: 17",
+        "Общая сумма: 120 601,50 ₺",
+        "✅ Подтверждено последними проверками: 43 000 ₺",
+        "⚠️ Последняя известная (провайдер не ответил): 77 601,50 ₺",
+    ]
+
+
+def test_debt_summary_block_derives_confirmed_amount_when_not_given():
+    text = texts.format_debt_summary_block(
+        debt_car_count=1, debt_total_amount=Decimal(1400), last_known_amount=Decimal(500),
+    )
+
+    assert "✅ Подтверждено последними проверками: 900 ₺" in text
+
+
+def test_debt_summary_block_shows_cars_without_reliable_data():
+    text = texts.format_debt_summary_block(debt_car_count=0, debt_total_amount=Decimal(0), no_data_car_count=3)
+
+    assert text.splitlines()[-1] == "❔ Нет достоверных данных GİB/KGM: 3 авто"
+    assert "Подтверждено" not in text
+
+
+def test_debt_row_with_all_providers_current_stays_one_line():
+    states = (
+        _state("gib", TurkeyProviderFreshness.CURRENT, Decimal(2740), last_success_at=_NOV_11, last_attempt_at=_NOV_11),
+        _state("kgm", TurkeyProviderFreshness.CURRENT, last_success_at=_NOV_11, last_attempt_at=_NOV_11),
+    )
+
+    line = texts.format_debt_row(
+        car_number="M295YB196", owner_displays=["@Mihailov_vm"], total_amount=Decimal(2740), provider_states=states,
+    )
+
+    assert line == f"🚗 {format_plate_for_telegram('M295YB196')}: @Mihailov_vm: 2 740 ₺"
+
+
+def test_debt_row_stale_kgm_reads_as_last_known_with_dates():
+    states = (
+        _state("gib", TurkeyProviderFreshness.CURRENT, Decimal(13336), last_success_at=_NOV_11, last_attempt_at=_NOV_11),
+        _state(
+            "kgm", TurkeyProviderFreshness.STALE, Decimal("20192.50"),
+            last_success_at=_NOV_04, last_attempt_at=_NOV_11, error_type="unexpected",
+        ),
+    )
+
+    text = texts.format_debt_row(
+        car_number="34ABC123", owner_displays=["@user"], total_amount=Decimal("33528.50"), provider_states=states,
+    )
+
+    assert text.splitlines() == [
+        f"🚗 {format_plate_for_telegram('34ABC123')}: @user: ⚠️ 33 528,50 ₺",
+        "   ✅ GİB: 13 336 ₺ — проверка 11.11.2026",
+        "   ⚠️ KGM: 20 192,50 ₺ — последняя известная (успешная проверка 04.11.2026), не ответил 11.11.2026",
+    ]
+
+
+def test_debt_row_provider_without_reliable_data():
+    attempted = (
+        _state("gib", TurkeyProviderFreshness.CURRENT, Decimal(18000), last_success_at=_NOV_11, last_attempt_at=_NOV_11),
+        _state("kgm", TurkeyProviderFreshness.NO_DATA, last_attempt_at=_NOV_11, error_type="transport_error"),
+    )
+    never_checked = (
+        _state("gib", TurkeyProviderFreshness.CURRENT, Decimal(18000), last_success_at=_NOV_11, last_attempt_at=_NOV_11),
+        _state("kgm", TurkeyProviderFreshness.NO_DATA),
+    )
+
+    attempted_text = texts.format_debt_row(
+        car_number="34ABC123", owner_displays=["—"], total_amount=Decimal(18000), provider_states=attempted,
+    )
+    never_text = texts.format_debt_row(
+        car_number="34ABC123", owner_displays=["—"], total_amount=Decimal(18000), provider_states=never_checked,
+    )
+
+    assert attempted_text.splitlines()[0].endswith(": ⚠️ 18 000 ₺")
+    assert attempted_text.splitlines()[-1] == "   ❔ KGM: нет достоверных данных (не ответил 11.11.2026)"
+    assert never_text.splitlines()[-1] == "   ❔ KGM: нет достоверных данных (не проверялся)"
+
+
+def test_debt_row_zero_amount_provider_is_shown_as_no_debt():
+    states = (
+        _state("gib", TurkeyProviderFreshness.CURRENT, last_success_at=_NOV_11, last_attempt_at=_NOV_11),
+        _state("kgm", TurkeyProviderFreshness.STALE, Decimal(3788), last_success_at=_NOV_04, last_attempt_at=_NOV_11),
+    )
+
+    text = texts.format_debt_row(
+        car_number="34ABC123", owner_displays=["—"], total_amount=Decimal(3788), provider_states=states,
+    )
+
+    assert "   ✅ GİB: без долга — проверка 11.11.2026" in text.splitlines()
+
+
+def test_debt_row_dates_use_istanbul_calendar_day():
+    late_evening_utc = datetime(2026, 11, 4, 22, 30, tzinfo=timezone.utc)  # 05.11 01:30 в Стамбуле
+    states = (
+        _state("gib", TurkeyProviderFreshness.CURRENT, last_success_at=_NOV_11, last_attempt_at=_NOV_11),
+        _state("kgm", TurkeyProviderFreshness.STALE, Decimal(59), last_success_at=late_evening_utc, last_attempt_at=_NOV_11),
+    )
+
+    text = texts.format_debt_row(car_number="34ABC123", owner_displays=["—"], total_amount=Decimal(59), provider_states=states)
+
+    assert "(успешная проверка 05.11.2026)" in text
+
+
+def test_refresh_summary_shows_which_providers_did_not_answer():
+    outcome = TurkeyRefreshOutcome(
+        checked=2, failed=2, total_plates=2, partial_plates=2,
+        partial_car_numbers=("34ABC123", "06XYZ789"), partial_failed_providers=(("kgm",), ("gib", "kgm")),
+    )
+
+    summary = texts.format_debt_refresh_summary(outcome)
+
+    assert (
+        f"Частично: {format_plate_for_telegram('34ABC123')} (KGM), {format_plate_for_telegram('06XYZ789')} (GİB, KGM)"
+        in summary
+    )
+
+
+def test_refresh_summary_shows_failed_provider_and_its_last_successful_check_date():
+    """Ревью: при частичной проверке нужна и дата последней успешной
+    проверки упавшего провайдера — номер мог после refresh выпасть из
+    списка совсем, и тогда строка списка с датой не показывается вовсе."""
+    outcome = TurkeyRefreshOutcome(
+        checked=2, failed=2, total_plates=2, partial_plates=2,
+        partial_car_numbers=("34ABC123", "06XYZ789"), partial_failed_providers=(("kgm",), ("gib", "kgm")),
+        partial_last_success_at=(
+            (datetime(2026, 11, 4, 18, 12, tzinfo=timezone.utc),),
+            (None, datetime(2026, 11, 6, 8, 0, tzinfo=timezone.utc)),
+        ),
+    )
+
+    summary = texts.format_debt_refresh_summary(outcome)
+
+    assert (
+        f"Частично: {format_plate_for_telegram('34ABC123')} (KGM — последняя успешная проверка 04.11.2026), "
+        f"{format_plate_for_telegram('06XYZ789')} "
+        "(GİB — успешных проверок не было; KGM — последняя успешная проверка 06.11.2026)"
+    ) in summary
+
+
+def test_debt_list_packs_multi_line_rows_so_handler_never_resplits():
+    """Ревью: строки стали многострочными, а reader/turkey_bot/handlers.py::
+    _split_telegram_text заново режет всё длиннее своего безопасного предела
+    по границам строк — строка провайдера не должна уехать в отдельное
+    сообщение без номера машины."""
+    from reader.turkey_bot.handlers import _TELEGRAM_SAFE_TEXT_LIMIT, _split_telegram_text
+
+    states = (
+        _state("gib", TurkeyProviderFreshness.CURRENT, Decimal(13336),
+               last_success_at=datetime(2026, 11, 11, 15, 55, tzinfo=timezone.utc),
+               last_attempt_at=datetime(2026, 11, 11, 15, 55, tzinfo=timezone.utc)),
+        _state("kgm", TurkeyProviderFreshness.STALE, Decimal("20192.50"),
+               last_success_at=datetime(2026, 11, 4, 15, 43, tzinfo=timezone.utc),
+               last_attempt_at=datetime(2026, 11, 11, 15, 55, tzinfo=timezone.utc), error_type="transport_error"),
+    )
+    rows = [
+        texts.format_debt_row(
+            car_number=f"34ABC{i:03d}", owner_displays=[f"Владелец{'я' * (i % 7)} (@user{i})"],
+            total_amount=Decimal("33528.50"), provider_states=states,
+        )
+        for i in range(60)
+    ]
+
+    messages = texts.format_debt_list_messages(rows)
+
+    assert len(messages) > 1
+    assert texts._DEBT_LIST_MESSAGE_LIMIT <= _TELEGRAM_SAFE_TEXT_LIMIT
+    for message in messages:
+        assert _split_telegram_text(message) == [message]
+        assert message.startswith("🚗")
+    assert "\n".join(messages) == "\n".join(rows)
+
+
+def test_refresh_summary_without_failed_providers_lists_plates_only():
+    outcome = TurkeyRefreshOutcome(
+        checked=1, failed=1, total_plates=1, partial_plates=1, partial_car_numbers=("34ABC123",),
+    )
+
+    summary = texts.format_debt_refresh_summary(outcome)
+
+    assert f"Частично: {format_plate_for_telegram('34ABC123')}" in summary.splitlines()
 
 
 # ---- owner display name sanitization (задача п.2) ----

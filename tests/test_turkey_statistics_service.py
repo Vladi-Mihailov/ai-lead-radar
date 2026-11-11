@@ -15,6 +15,8 @@ from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -24,7 +26,10 @@ from reader.turkey_bot.known_users_repository import (
 from reader.turkey_bot.monitoring.subscription_repository import (
     TurkeyMonitoringSubscriptionRepository,
 )
-from reader.turkey_bot.statistics_service import TurkeyStatisticsService
+from reader.turkey_bot.statistics_service import (
+    TurkeyProviderFreshness,
+    TurkeyStatisticsService,
+)
 from reader.turkey_bot.unified.models import (
     ProviderCheckResult,
     ProviderStatus,
@@ -220,22 +225,30 @@ def _debt_provider(status: ProviderStatus, amount: Decimal, *, provider: str = "
 
 def _save_debt_run(
     runs, *, telegram_user_id: int, plate: str, providers: tuple[ProviderCheckResult, ...], days_ago: int,
+    initiator: str = "manual",
 ) -> None:
     result = UnifiedCheckResult(
         plate=plate, started_at=_NOW, finished_at=_NOW,
         overall_status=derive_overall_status(providers), total_amount=total_amount_for(providers),
         providers=providers,
     )
-    run_id = runs.save(result, telegram_user_id=telegram_user_id, telegram_chat_id=telegram_user_id, initiator="manual")
+    run_id = runs.save(result, telegram_user_id=telegram_user_id, telegram_chat_id=telegram_user_id, initiator=initiator)
     finished_at = (_NOW - timedelta(days=days_ago)).isoformat()
     runs._conn.execute("UPDATE turkey_check_runs SET finished_at = ? WHERE id = ?", (finished_at, run_id))
     runs._conn.commit()
 
 
 def test_debt_rows_include_latest_success_with_debt():
+    """KGM NO_DEBT в том же run — полная проверка: без него KGM был бы
+    NO_DATA ("нет достоверных данных") и строка — is_partial (см.
+    TurkeyProviderFreshness)."""
     service, _known, runs, _subs, garage = _service_with_garage()
     car = garage.add_car(telegram_user_id=1, car_number="34ABC123")
-    _save_debt_run(runs, telegram_user_id=1, plate="34ABC123", providers=(_debt_provider(ProviderStatus.HAS_DEBT, Decimal(100)),), days_ago=0)
+    providers = (
+        _debt_provider(ProviderStatus.HAS_DEBT, Decimal(100)),
+        _debt_provider(ProviderStatus.NO_DEBT, Decimal(0), provider="kgm"),
+    )
+    _save_debt_run(runs, telegram_user_id=1, plate="34ABC123", providers=providers, days_ago=0)
 
     rows = service.get_debt_rows([car])
 
@@ -293,9 +306,12 @@ def test_debt_rows_all_error_history_is_excluded():
 
 
 def test_debt_rows_partial_included_and_marked():
-    """См. задачу п.5: существующая семантика PARTIAL (см.
-    derive_overall_status: хотя бы один ERROR, но не все) — сумма из
-    успешно проверенных provider'ов включается, помеченная is_partial."""
+    """См. задачу п.5: PARTIAL-run (хотя бы один ERROR, но не все) — сумма
+    успешно ответившего GİB включается, строка помечена is_partial. После
+    задачи "Turkey debt list: последний успешный результат отдельно по
+    каждому провайдеру и госномеру" пометка — потому что по KGM нет
+    достоверных данных (он ни разу не отвечал); ошибка Avrasya на сумму
+    не влияет вовсе (Avrasya в сумму не входит)."""
     service, _known, runs, _subs, garage = _service_with_garage()
     car = garage.add_car(telegram_user_id=1, car_number="34ABC123")
     providers = (
@@ -337,18 +353,24 @@ def test_debt_rows_reuse_stored_total_amount_avrasya_not_double_counted():
 
 
 def test_debt_rows_duplicate_plate_different_owners_attributed_correctly():
-    """См. задачу п.8: "не склеивай разных владельцев только по номеру" —
-    один и тот же plate у двух owner'ов, каждый получает СВОЙ total_amount."""
+    """Раньше (задача п.8) каждый владелец одного номера получал СВОЙ
+    total_amount из своих проверок. См. задачу "Turkey debt list:
+    последний успешный результат отдельно по каждому провайдеру и
+    госномеру" — сумма теперь считается по НОМЕРУ (самый свежий успешный
+    результат провайдера любого владельца), поэтому у обоих владельцев
+    одинаковая, свежая сумма. Строки по-прежнему отдельные на каждого
+    владельца (car_id/owner_telegram_user_id) — строки не склеиваются."""
     service, _known, runs, _subs, garage = _service_with_garage()
     car_a = garage.add_car(telegram_user_id=111, car_number="34ABC123")
     car_b = garage.add_car(telegram_user_id=222, car_number="34ABC123")
-    _save_debt_run(runs, telegram_user_id=111, plate="34ABC123", providers=(_debt_provider(ProviderStatus.HAS_DEBT, Decimal(500)),), days_ago=0)
+    _save_debt_run(runs, telegram_user_id=111, plate="34ABC123", providers=(_debt_provider(ProviderStatus.HAS_DEBT, Decimal(500)),), days_ago=1)
     _save_debt_run(runs, telegram_user_id=222, plate="34ABC123", providers=(_debt_provider(ProviderStatus.HAS_DEBT, Decimal(900)),), days_ago=0)
 
     rows = service.get_debt_rows([car_a, car_b])
 
     by_owner = {row.owner_telegram_user_id: row.total_amount for row in rows}
-    assert by_owner == {111: Decimal(500), 222: Decimal(900)}
+    assert by_owner == {111: Decimal(900), 222: Decimal(900)}
+    assert {row.car_id for row in rows} == {car_a.id, car_b.id}
 
 
 def test_debt_rows_sorted_by_amount_desc_then_recency():
@@ -371,7 +393,11 @@ def test_debt_rows_sorted_by_amount_desc_then_recency():
 def test_debt_car_groups_one_plate_one_owner_matches_debt_rows():
     service, _known, runs, _subs, garage = _service_with_garage()
     car = garage.add_car(telegram_user_id=1, car_number="34ABC123")
-    _save_debt_run(runs, telegram_user_id=1, plate="34ABC123", providers=(_debt_provider(ProviderStatus.HAS_DEBT, Decimal(500)),), days_ago=0)
+    providers = (  # полная проверка — см. test_debt_rows_include_latest_success_with_debt
+        _debt_provider(ProviderStatus.HAS_DEBT, Decimal(500)),
+        _debt_provider(ProviderStatus.NO_DEBT, Decimal(0), provider="kgm"),
+    )
+    _save_debt_run(runs, telegram_user_id=1, plate="34ABC123", providers=providers, days_ago=0)
 
     groups = service.get_debt_car_groups([car])
 
@@ -459,3 +485,339 @@ def test_debt_rows_needs_no_check_service_or_network_dependency():
 
     signature = inspect.signature(TurkeyStatisticsService.get_debt_rows)
     assert list(signature.parameters) == ["self", "cars"]
+
+
+# ---- последний успешный результат отдельно по провайдеру и номеру (см.
+# задачу "Turkey debt list: последний успешный результат отдельно по
+# каждому провайдеру и госномеру" — production-находка 11.11: PARTIAL-run с
+# ошибкой KGM считался "достоверным", и его неполный total обнулял/занижал
+# известный долг KGM в списке менеджера) ----
+
+
+def _error_provider(provider: str, error_type: str) -> ProviderCheckResult:
+    return ProviderCheckResult(
+        provider=provider, status=ProviderStatus.ERROR, debt_count=0,
+        principal_amount=None, penalty_amount=None, total_amount=Decimal(0),
+        items=(), error_type=error_type, checked_at=_NOW,
+    )
+
+
+def _ok(provider: str, amount: Decimal = Decimal(0)) -> ProviderCheckResult:
+    """Успешный ответ провайдера: amount > 0 — HAS_DEBT, иначе NO_DEBT."""
+    status = ProviderStatus.HAS_DEBT if amount > 0 else ProviderStatus.NO_DEBT
+    return _debt_provider(status, amount, provider=provider)
+
+
+def _full_check(*, gib=Decimal(0), avrasya=Decimal(0), kgm=Decimal(0)) -> tuple[ProviderCheckResult, ...]:
+    return (_ok("gib", gib), _ok("avrasya", avrasya), _ok("kgm", kgm))
+
+
+def _states(row) -> dict:
+    return {state.provider: state for state in row.provider_states}
+
+
+@pytest.mark.parametrize(
+    "error_type", ["unexpected", "transport_error", "captcha_unavailable", "captcha_rejected", "internal_error"],
+)
+def test_debt_rows_kgm_error_keeps_last_known_kgm_debt(error_type):
+    """Сценарий производства (долг только KGM): полная проверка нашла KGM
+    3788, следующая — PARTIAL с ошибкой KGM (total_amount=0). Машина
+    остаётся в списке с ПОСЛЕДНЕЙ ИЗВЕСТНОЙ суммой KGM (STALE, с датами
+    успешной проверки и неответа), а не исчезает."""
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car = garage.add_car(telegram_user_id=1, car_number="34ABC123")
+    _save_debt_run(runs, telegram_user_id=1, plate="34ABC123", providers=_full_check(kgm=Decimal(3788)), days_ago=6)
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123",
+        providers=(_ok("gib"), _ok("avrasya"), _error_provider("kgm", error_type)), days_ago=0,
+    )
+
+    rows = service.get_debt_rows([car])
+
+    assert len(rows) == 1
+    assert rows[0].total_amount == Decimal(3788)
+    assert rows[0].is_partial is True
+    kgm = _states(rows[0])["kgm"]
+    assert kgm.freshness == TurkeyProviderFreshness.STALE
+    assert kgm.amount == Decimal(3788)
+    assert kgm.last_success_at == _NOW - timedelta(days=6)
+    assert kgm.last_attempt_at == _NOW
+    assert kgm.last_attempt_error_type == error_type
+    assert _states(rows[0])["gib"].freshness == TurkeyProviderFreshness.CURRENT
+    assert rows[0].confirmed_amount == Decimal(0)
+    assert rows[0].last_known_amount == Decimal(3788)
+
+
+def test_debt_rows_new_gib_debt_plus_last_known_kgm_when_kgm_errors():
+    """GİB ответил новой суммой, KGM упал: сумма = НОВЫЙ GİB + последний
+    известный KGM (а не только GİB, как давал total PARTIAL-run'а);
+    Avrasya не прибавляется ни в одном из run'ов."""
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car = garage.add_car(telegram_user_id=1, car_number="34ABC123")
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123",
+        providers=_full_check(gib=Decimal(13336), avrasya=Decimal(2450), kgm=Decimal("20192.50")), days_ago=7,
+    )
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123",
+        providers=(_ok("gib", Decimal(14000)), _ok("avrasya", Decimal(2450)), _error_provider("kgm", "unexpected")),
+        days_ago=0,
+    )
+
+    rows = service.get_debt_rows([car])
+
+    assert rows[0].total_amount == Decimal("34192.50")
+    assert rows[0].confirmed_amount == Decimal(14000)
+    assert rows[0].last_known_amount == Decimal("20192.50")
+    assert rows[0].checked_at == _NOW  # самый свежий из использованных успешных результатов
+    assert _states(rows[0])["gib"].freshness == TurkeyProviderFreshness.CURRENT
+    assert _states(rows[0])["kgm"].freshness == TurkeyProviderFreshness.STALE
+
+
+def test_debt_rows_gib_error_keeps_last_known_gib_debt_while_kgm_current():
+    """Зеркальный случай: упал GİB, KGM ответил — GİB остаётся с последней
+    известной суммой, KGM обновляет свою."""
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car = garage.add_car(telegram_user_id=1, car_number="34ABC123")
+    _save_debt_run(runs, telegram_user_id=1, plate="34ABC123", providers=_full_check(gib=Decimal(500)), days_ago=3)
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123",
+        providers=(_error_provider("gib", "transport_error"), _ok("avrasya"), _ok("kgm", Decimal(900))), days_ago=0,
+    )
+
+    rows = service.get_debt_rows([car])
+
+    assert rows[0].total_amount == Decimal(1400)
+    assert _states(rows[0])["gib"].freshness == TurkeyProviderFreshness.STALE
+    assert _states(rows[0])["gib"].amount == Decimal(500)
+    assert _states(rows[0])["kgm"].freshness == TurkeyProviderFreshness.CURRENT
+    assert rows[0].confirmed_amount == Decimal(900)
+    assert rows[0].last_known_amount == Decimal(500)
+
+
+@pytest.mark.parametrize("avrasya_answered", [True, False])
+def test_debt_rows_both_providers_error_keep_both_last_known_debts(avrasya_answered):
+    """Ошибки ОБОИХ GİB и KGM (PARTIAL при ответившей Avrasya или ERROR,
+    если упали все три) — обе прежние суммы остаются последними
+    известными, ничего не подтверждено свежей проверкой."""
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car = garage.add_car(telegram_user_id=1, car_number="34ABC123")
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123", providers=_full_check(gib=Decimal(500), kgm=Decimal(700)), days_ago=2,
+    )
+    avrasya = _ok("avrasya") if avrasya_answered else _error_provider("avrasya", "rate_limited")
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123",
+        providers=(_error_provider("gib", "unexpected"), avrasya, _error_provider("kgm", "transport_error")),
+        days_ago=0,
+    )
+
+    rows = service.get_debt_rows([car])
+
+    assert rows[0].total_amount == Decimal(1200)
+    assert rows[0].confirmed_amount == Decimal(0)
+    assert rows[0].last_known_amount == Decimal(1200)
+    assert {s.freshness for s in rows[0].provider_states} == {TurkeyProviderFreshness.STALE}
+
+
+def test_debt_rows_confirmed_repayment_removes_car():
+    """Подтверждённое погашение: полная успешная проверка без долга по GİB
+    и KGM — машина уходит из списка и не считается "без данных"."""
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car = garage.add_car(telegram_user_id=1, car_number="34ABC123")
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123", providers=_full_check(gib=Decimal(500), kgm=Decimal(700)), days_ago=2,
+    )
+    _save_debt_run(runs, telegram_user_id=1, plate="34ABC123", providers=_full_check(), days_ago=0)
+
+    assert service.get_debt_rows([car]) == []
+    assert service.count_plates_without_reliable_data([car]) == 0
+
+
+def test_debt_rows_kgm_no_debt_success_replaces_old_kgm_debt():
+    """Успешная проверка KGM без долга заменяет старый долг KGM; долг GİB
+    (подтверждённый той же проверкой) остаётся."""
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car = garage.add_car(telegram_user_id=1, car_number="34ABC123")
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123", providers=_full_check(gib=Decimal(500), kgm=Decimal(700)), days_ago=2,
+    )
+    _save_debt_run(runs, telegram_user_id=1, plate="34ABC123", providers=_full_check(gib=Decimal(500)), days_ago=0)
+
+    rows = service.get_debt_rows([car])
+
+    assert rows[0].total_amount == Decimal(500)
+    assert rows[0].is_partial is False
+    assert _states(rows[0])["kgm"].amount == Decimal(0)
+    assert _states(rows[0])["kgm"].freshness == TurkeyProviderFreshness.CURRENT
+
+
+def test_debt_rows_kgm_repaid_while_gib_errors_keeps_only_last_known_gib():
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car = garage.add_car(telegram_user_id=1, car_number="34ABC123")
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123", providers=_full_check(gib=Decimal(500), kgm=Decimal(700)), days_ago=2,
+    )
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123",
+        providers=(_error_provider("gib", "transport_error"), _ok("avrasya"), _ok("kgm")), days_ago=0,
+    )
+
+    rows = service.get_debt_rows([car])
+
+    assert rows[0].total_amount == Decimal(500)
+    assert rows[0].last_known_amount == Decimal(500)
+    assert rows[0].confirmed_amount == Decimal(0)
+
+
+def test_debt_rows_later_no_debt_by_other_owner_overrides_older_debt():
+    """Номер у двух владельцев: более поздняя успешная проверка без долга
+    (владелец A) перекрывает более старый долг из проверки владельца B —
+    долг — свойство номера, а не владельца. Не попадает ни одна строка."""
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car_a = garage.add_car(telegram_user_id=111, car_number="34ABC123")
+    car_b = garage.add_car(telegram_user_id=222, car_number="34ABC123")
+    _save_debt_run(runs, telegram_user_id=222, plate="34ABC123", providers=_full_check(gib=Decimal(900)), days_ago=3)
+    _save_debt_run(runs, telegram_user_id=111, plate="34ABC123", providers=_full_check(), days_ago=0)
+
+    assert service.get_debt_rows([car_a, car_b]) == []
+    assert service.get_debt_car_groups([car_a, car_b]) == []
+
+
+def test_debt_seen_by_one_owner_lists_every_owner_of_the_plate_once():
+    """Долг найден проверкой владельца A — в списке менеджера номер
+    показывается со ВСЕМИ его владельцами, сумма — один раз."""
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car_a = garage.add_car(telegram_user_id=111, car_number="34ABC123")
+    car_b = garage.add_car(telegram_user_id=222, car_number="34ABC123")
+    _save_debt_run(runs, telegram_user_id=111, plate="34ABC123", providers=_full_check(gib=Decimal(700)), days_ago=0)
+
+    rows = service.get_debt_rows([car_a, car_b])
+    groups = service.get_debt_car_groups([car_a, car_b])
+
+    assert {row.owner_telegram_user_id: row.total_amount for row in rows} == {111: Decimal(700), 222: Decimal(700)}
+    assert len(groups) == 1
+    assert set(groups[0].owner_telegram_user_ids) == {111, 222}
+    assert groups[0].total_amount == Decimal(700)
+
+
+def test_debt_rows_monitoring_retry_subset_run_does_not_zero_gib_debt():
+    """Monitoring retry проверяет ТОЛЬКО упавших на капче провайдеров: run
+    из одного KGM NO_DEBT имеет total_amount=0, но долг GİB из первого
+    прохода никуда не девается."""
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car = garage.add_car(telegram_user_id=1, car_number="34ABC123")
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123",
+        providers=(_ok("gib", Decimal(500)), _ok("avrasya"), _error_provider("kgm", "captcha_unavailable")),
+        days_ago=1, initiator="monitoring_21:00",
+    )
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123", providers=(_ok("kgm"),), days_ago=0,
+        initiator="monitoring_21:00_retry",
+    )
+
+    rows = service.get_debt_rows([car])
+
+    assert rows[0].total_amount == Decimal(500)
+    assert rows[0].is_partial is False
+    assert _states(rows[0])["gib"].freshness == TurkeyProviderFreshness.CURRENT
+    assert _states(rows[0])["kgm"].freshness == TurkeyProviderFreshness.CURRENT
+
+
+def test_debt_rows_kgm_never_succeeded_with_gib_debt_is_listed_with_kgm_no_data():
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car = garage.add_car(telegram_user_id=1, car_number="34ABC123")
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123",
+        providers=(_ok("gib", Decimal(18000)), _ok("avrasya"), _error_provider("kgm", "transport_error")), days_ago=0,
+    )
+
+    rows = service.get_debt_rows([car])
+
+    assert rows[0].total_amount == Decimal(18000)
+    assert rows[0].is_partial is True
+    kgm = _states(rows[0])["kgm"]
+    assert kgm.freshness == TurkeyProviderFreshness.NO_DATA
+    assert kgm.last_success_at is None
+    assert kgm.last_attempt_at == _NOW
+    assert rows[0].confirmed_amount == Decimal(18000)
+    assert rows[0].last_known_amount == Decimal(0)
+
+
+def test_plates_without_reliable_data_counted_once_and_not_listed():
+    """GİB без долга + KGM ни разу не ответил, и номер, который не
+    проверялся вовсе, — не в списке задолженности, но посчитаны как "нет
+    достоверных данных" (по одному разу на номер, даже при двух
+    владельцах). Полностью проверенные номера (с долгом и без) — нет."""
+    service, _known, runs, _subs, garage = _service_with_garage()
+    unknown_a = garage.add_car(telegram_user_id=1, car_number="06AAA001")
+    unknown_b = garage.add_car(telegram_user_id=2, car_number="06AAA001")
+    never_checked = garage.add_car(telegram_user_id=3, car_number="06BBB002")
+    clean = garage.add_car(telegram_user_id=4, car_number="06CCC003")
+    with_debt = garage.add_car(telegram_user_id=5, car_number="06DDD004")
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="06AAA001",
+        providers=(_ok("gib"), _ok("avrasya"), _error_provider("kgm", "unexpected")), days_ago=0,
+    )
+    _save_debt_run(runs, telegram_user_id=4, plate="06CCC003", providers=_full_check(), days_ago=0)
+    _save_debt_run(runs, telegram_user_id=5, plate="06DDD004", providers=_full_check(gib=Decimal(100)), days_ago=0)
+    cars = [unknown_a, unknown_b, never_checked, clean, with_debt]
+
+    assert [row.car_number for row in service.get_debt_rows(cars)] == ["06DDD004"]
+    assert service.count_plates_without_reliable_data(cars) == 2
+
+
+def test_all_error_history_counts_as_no_reliable_data():
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car = garage.add_car(telegram_user_id=1, car_number="34ABC123")
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123",
+        providers=(_error_provider("gib", "transport_error"), _error_provider("kgm", "unexpected")), days_ago=0,
+    )
+
+    assert service.get_debt_rows([car]) == []
+    assert service.count_plates_without_reliable_data([car]) == 1
+
+
+def test_avrasya_debt_never_added_even_when_kgm_errors():
+    """Avrasya не прибавляется и не подменяет упавший KGM: сумма —
+    последний известный KGM (615, он уже включает Avrasya), не 945; номер
+    с Avrasya-долгом, но без единого успешного KGM, в список не попадает
+    (и считается "без данных")."""
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car = garage.add_car(telegram_user_id=1, car_number="34ABC123")
+    no_kgm_car = garage.add_car(telegram_user_id=2, car_number="35XYZ789")
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123", providers=_full_check(avrasya=Decimal(330), kgm=Decimal(615)),
+        days_ago=2,
+    )
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123",
+        providers=(_ok("gib"), _ok("avrasya", Decimal(330)), _error_provider("kgm", "unexpected")), days_ago=0,
+    )
+    _save_debt_run(
+        runs, telegram_user_id=2, plate="35XYZ789",
+        providers=(_ok("gib"), _ok("avrasya", Decimal(330)), _error_provider("kgm", "unexpected")), days_ago=0,
+    )
+
+    rows = service.get_debt_rows([car, no_kgm_car])
+
+    assert [(row.car_number, row.total_amount) for row in rows] == [("34ABC123", Decimal(615))]
+    assert service.count_plates_without_reliable_data([car, no_kgm_car]) == 1
+
+
+def test_debt_rows_sorted_by_total_including_last_known_amounts():
+    service, _known, runs, _subs, garage = _service_with_garage()
+    current = garage.add_car(telegram_user_id=1, car_number="AAA111")
+    stale = garage.add_car(telegram_user_id=2, car_number="BBB222")
+    _save_debt_run(runs, telegram_user_id=1, plate="AAA111", providers=_full_check(gib=Decimal(1000)), days_ago=0)
+    _save_debt_run(runs, telegram_user_id=2, plate="BBB222", providers=_full_check(kgm=Decimal(5000)), days_ago=5)
+    _save_debt_run(
+        runs, telegram_user_id=2, plate="BBB222",
+        providers=(_ok("gib"), _ok("avrasya"), _error_provider("kgm", "unexpected")), days_ago=0,
+    )
+
+    rows = service.get_debt_rows([current, stale])
+
+    assert [row.car_number for row in rows] == ["BBB222", "AAA111"]
