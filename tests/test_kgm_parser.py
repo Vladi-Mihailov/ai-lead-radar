@@ -13,6 +13,8 @@ import sys
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -341,3 +343,148 @@ def test_turkish_amount_format_unparseable_is_none():
     from reader.turkey_bot.kgm.parser import _parse_try_amount
 
     assert _parse_try_amount("not a number ₺") is None
+
+
+# ---- Безопасная диагностика unexpected (см. задачу "KGM diagnostic
+# logging"): kind и message — ПРЕЖНИЕ (семантика не меняется), diagnostics
+# — только фиксированный словарь parser.py, никакого текста сайта,
+# госномера или HTML ----
+
+_PLATE_LIKE = "34ABC123"
+
+
+def _delta(*chunks: tuple[str, str, str]) -> str:
+    return "".join(f"{len(content)}|{ctype}|{cid}|{content}|" for ctype, cid, content in chunks)
+
+
+def _panel(html: str) -> str:
+    return _wrap_panel_in_delta(html)
+
+
+_DIAGNOSTIC_CASES = [
+    pytest.param(
+        "garbage not a delta response", "response_format", "delta_malformed", "chars=28 shape=other",
+        "malformed ASP.NET AJAX delta response", id="garbage",
+    ),
+    pytest.param(
+        "", "response_format", "delta_malformed", "chars=0 shape=empty",
+        "malformed ASP.NET AJAX delta response", id="empty",
+    ),
+    pytest.param(
+        "<!DOCTYPE html><html><head><title>Request Rejected</title></head><body>34ABC123</body></html>",
+        "response_format", "delta_malformed", "chars=93 shape=html title_keywords=engel lblhata_keywords=-",
+        "malformed ASP.NET AJAX delta response", id="full-html-page",
+    ),
+    pytest.param(
+        _delta(("#", "", "4"), ("error", "500", f"Sunucu hatası {_PLATE_LIKE}")),
+        "provider_message", "delta_error_chunk", "error_codes=500",
+        "delta response has no updatePanel/pnlSayfa chunk", id="asp-net-error-chunk",
+    ),
+    pytest.param(
+        _delta(("#", "", "4"), ("pageRedirect", "", f"/WebIhlalSorgulama/Hata.aspx?p={_PLATE_LIKE}")),
+        "provider_message", "delta_page_redirect", "",
+        "delta response has no updatePanel/pnlSayfa chunk", id="page-redirect",
+    ),
+    pytest.param(
+        _delta(("#", "", "4"), ("hiddenField", "__VIEWSTATE", "X")),
+        "response_format", "delta_no_result_panel", "chunks=#+hiddenField",
+        "delta response has no updatePanel/pnlSayfa chunk", id="no-result-panel",
+    ),
+    pytest.param(
+        _panel(f'<span id="lblHata">Sistemde bir hata oluştu, lütfen daha sonra tekrar deneyiniz ({_PLATE_LIKE})</span>'),
+        "provider_message", "lblhata_unrecognized", "chars=71 digits=5 keywords=hata+tekrar_deneyin+sistem",
+        f"unrecognized lblHata text: 'Sistemde bir hata oluştu, lütfen daha sonra tekrar deneyiniz ({_PLATE_LIKE})'",
+        id="lblhata-unknown-text",
+    ),
+    pytest.param(
+        _panel('<span id="lblHata">ERİŞİM ENGELLENDİ</span>'),
+        "provider_message", "lblhata_unrecognized", "chars=17 digits=0 keywords=erisim+engel",
+        "unrecognized lblHata text: 'ERİŞİM ENGELLENDİ'", id="lblhata-turkish-capital-i",
+    ),
+    pytest.param(
+        _panel(_SUCCESS_HTML.replace('id="lblKgm"', 'id="lblKgmRenamed"')),
+        "result_structure", "section_missing", "kgm", "missing operator section: kgm", id="section-missing",
+    ),
+    pytest.param(
+        _panel(_SUCCESS_HTML.replace("KARAYOLLARI GENEL MÜDÜRLÜĞÜ: 2 kayıt", "KARAYOLLARI GENEL MÜDÜRLÜĞÜ: 3 kayıt")),
+        "result_structure", "section_count_mismatch", "kgm", "kgm: declared 3 kayıt but found 2 row(s)",
+        id="section-count-mismatch",
+    ),
+    pytest.param(
+        _panel(_SUCCESS_HTML.replace('<th scope="col">Geçiş Ücreti</th>', '<th scope="col">Ücret</th>', 1)),
+        "result_structure", "section_columns_unrecognized", "kgm", "kgm: unrecognized table columns",
+        id="section-columns",
+    ),
+    pytest.param(
+        _panel(_SUCCESS_HTML.replace("15.09.2026 09:39:48", "tarih yok")),
+        "result_structure", "section_rows_unparsed", "kgm", "kgm: 1/2 rows parsed", id="section-rows",
+    ),
+    pytest.param(
+        _panel(_SUCCESS_HTML.replace("KARAYOLLARI GENEL MÜDÜRLÜĞÜ: 2 kayıt", "KARAYOLLARI GENEL MÜDÜRLÜĞÜ: Kayıt yok.")),
+        "result_structure", "section_label_contradiction", "kgm", "kgm: label says no records but table has rows",
+        id="section-label-contradiction",
+    ),
+    pytest.param(
+        _panel(_SUCCESS_HTML.replace("KARAYOLLARI GENEL MÜDÜRLÜĞÜ: 2 kayıt", "KARAYOLLARI GENEL MÜDÜRLÜĞÜ: iki kayıt")),
+        "result_structure", "section_label_unrecognized", "kgm",
+        "kgm: unrecognized label text: 'KARAYOLLARI GENEL MÜDÜRLÜĞÜ: iki kayıt'", id="section-label-unknown",
+    ),
+    pytest.param(
+        _panel(_SUCCESS_HTML.replace(
+            '<span id="lblKgmCezaToplam" class="mtLabel">80,00 ₺</span>',
+            '<span id="lblKgmCezaToplam" class="mtLabel">40,00 ₺</span>',
+        )),
+        "checksum", "section_subtotal_mismatch", "kgm", "kgm: subtotal does not match parsed rows",
+        id="section-subtotal",
+    ),
+    pytest.param(
+        _panel(_SUCCESS_HTML.replace('id="lblGenelCezaToplam"', 'id="lblGenelCezaToplamRenamed"')),
+        "result_structure", "totals_missing", "grand_total", "missing grand totals", id="totals-missing",
+    ),
+    pytest.param(
+        _panel(_SUCCESS_HTML.replace(
+            '<span id="lblGenelCezaToplam" class="mtLabel">2.660,00 ₺</span>',
+            '<span id="lblGenelCezaToplam" class="mtLabel">9.999,00 ₺</span>',
+        )),
+        "checksum", "totals_mismatch", "", "kgm_total + yid_total != grand_total", id="totals-mismatch",
+    ),
+    pytest.param(
+        _panel(_SUCCESS_HTML.replace(
+            'id="lblKgmToplamParaCezasi" class="mtLabel">80,00 ₺', 'id="lblKgmToplamParaCezasi" class="mtLabel">90,00 ₺',
+        ).replace(
+            'id="lblGenelCezaToplam" class="mtLabel">2.660,00 ₺', 'id="lblGenelCezaToplam" class="mtLabel">2.670,00 ₺',
+        )),
+        "checksum", "group_totals_mismatch", "", "operator subtotals do not match KGM/YİD totals",
+        id="group-totals",
+    ),
+]
+
+
+@pytest.mark.parametrize(("response", "category", "code", "detail", "message"), _DIAGNOSTIC_CASES)
+def test_unexpected_carries_safe_diagnostics_and_unchanged_kind_and_message(response, category, code, detail, message):
+    outcome = parse_submit_response(response)
+
+    assert outcome.kind == "unexpected"
+    assert outcome.message == message
+    assert outcome.diagnostics is not None
+    assert (outcome.diagnostics.category, outcome.diagnostics.code, outcome.diagnostics.detail) == (category, code, detail)
+    assert outcome.operators == ()
+    assert outcome.grand_total is None
+
+
+@pytest.mark.parametrize(("response", "category", "code", "detail", "message"), _DIAGNOSTIC_CASES)
+def test_diagnostics_never_contain_site_text_plate_or_html(response, category, code, detail, message):
+    diagnostics = parse_submit_response(response).diagnostics
+
+    rendered = f"{diagnostics.category} {diagnostics.code} {diagnostics.detail}"
+    for forbidden in (_PLATE_LIKE, "Sistemde", "ERİŞİM", "KARAYOLLARI", "Sunucu", "Hata.aspx", "<", ">", "'"):
+        assert forbidden not in rendered
+
+
+def test_successful_and_rejected_outcomes_have_no_diagnostics():
+    rejected = parse_submit_response(_panel('<span id="lblHata">metin hatası</span>'))
+
+    assert parse_submit_response(_SUCCESS_DELTA).diagnostics is None
+    assert parse_submit_response(_NO_DEBT_REAL_DELTA).diagnostics is None
+    assert rejected.kind == "rejected"
+    assert rejected.diagnostics is None

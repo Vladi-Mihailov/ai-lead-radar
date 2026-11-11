@@ -6,6 +6,7 @@ test_turkey_gib_session.py), который отдаёт заготовленн�
 запоминает, что именно было запрошено.
 """
 
+import logging
 import sys
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -248,3 +249,143 @@ async def test_submit_raises_transport_error_on_unexpected_content_type():
 
     with pytest.raises(KgmTransportError):
         await session.submit(plate="M295YB196", captcha_code="1 2")
+
+
+# ---- Диагностическое логирование транспорта (см. задачу "KGM diagnostic
+# logging" — DNS-сбой 2026-11-11 был виден только как "transport_error"):
+# конкретный тип исключения и длительность — да; госномер, CAPTCHA,
+# cookies, ViewState, URL с параметрами и HTML — никогда. Исключение
+# KgmTransportError по-прежнему поднимается (семантика не меняется). ----
+
+_LOGGER = "reader.turkey_bot.kgm.session"
+_SECRET_PLATE = "34ABC123"
+_SECRET_CAPTCHA = "54 32109"
+
+
+def _warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == _LOGGER and r.levelno == logging.WARNING]
+
+
+def _assert_no_secrets(messages: list[str]) -> None:
+    for message in messages:
+        for secret in (_SECRET_PLATE, _SECRET_CAPTCHA, "INITIAL-VIEWSTATE", "ASP.NET_SessionId", "<html", "https://"):
+            assert secret not in message, f"{secret!r} leaked into log: {message!r}"
+
+
+async def test_start_logs_dns_failure_type_and_duration_and_still_raises(caplog):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("[Errno -3] Temporary failure in name resolution", request=request)
+
+    session = _make_session(handler)
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER), pytest.raises(KgmTransportError):
+        await session.start()
+
+    messages = _warnings(caplog)
+    assert len(messages) == 1
+    assert messages[0].startswith(
+        "KGM page load: transport error (ConnectError: [Errno -3] Temporary failure in name resolution) after "
+    )
+    assert messages[0].endswith("s")
+    _assert_no_secrets(messages)
+
+
+async def test_start_logs_http_status_without_url(caplog):
+    log = _CallLog()
+    handler = _handler_for(page_status=503, captcha_responses=[], log=log)
+    session = _make_session(handler)
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER), pytest.raises(KgmTransportError):
+        await session.start()
+
+    messages = _warnings(caplog)
+    assert len(messages) == 1
+    assert "(HTTPStatusError status=503)" in messages[0]
+    assert "Sorgulama.aspx" not in messages[0]
+    _assert_no_secrets(messages)
+
+
+async def test_refresh_captcha_logs_timeout_type(caplog):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("timed out", request=request)
+
+    session = _make_session(handler)
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER), pytest.raises(KgmTransportError):
+        await session.refresh_captcha()
+
+    messages = _warnings(caplog)
+    assert len(messages) == 1
+    assert messages[0].startswith("KGM captcha load: transport error (ConnectTimeout: timed out) after ")
+    _assert_no_secrets(messages)
+
+
+async def test_refresh_captcha_logs_unexpected_content_type_without_body(caplog):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>blocked page</html>", headers={"content-type": "text/html"})
+
+    session = _make_session(handler)
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER), pytest.raises(KgmTransportError):
+        await session.refresh_captcha()
+
+    messages = _warnings(caplog)
+    assert messages == ["KGM captcha load: unexpected content-type 'text/html' (HTTP 200, 25 bytes)"]
+    assert "blocked page" not in messages[0]
+
+
+async def test_exception_without_text_is_logged_by_type_only(caplog):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("", request=request)
+
+    session = _make_session(handler)
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER), pytest.raises(KgmTransportError):
+        await session.refresh_captcha()
+
+    assert _warnings(caplog)[0].startswith("KGM captcha load: transport error (ReadTimeout) after ")
+
+
+async def test_submit_transport_error_logs_type_and_never_plate_or_captcha(caplog):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    session = _submit_session(handler)
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER), pytest.raises(KgmTransportError):
+        await session.submit(plate=_SECRET_PLATE, captcha_code=_SECRET_CAPTCHA)
+
+    messages = _warnings(caplog)
+    assert len(messages) == 1
+    assert messages[0].startswith("KGM submit: transport error (ReadTimeout: timed out) after ")
+    _assert_no_secrets(messages)
+    assert session.last_submit_seconds is not None
+
+
+async def test_submit_logs_unexpected_content_type_without_body(caplog):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"\x00\x01", headers={"content-type": "application/octet-stream"})
+
+    session = _submit_session(handler)
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER), pytest.raises(KgmTransportError):
+        await session.submit(plate=_SECRET_PLATE, captcha_code=_SECRET_CAPTCHA)
+
+    assert _warnings(caplog) == [
+        "KGM submit: unexpected content-type 'application/octet-stream' (HTTP 200, 2 bytes)",
+    ]
+
+
+async def test_submit_records_server_seconds_and_logs_nothing_on_success(caplog):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=_SUCCESS_DELTA, headers={"content-type": "text/plain"})
+
+    session = _submit_session(handler)
+    assert session.last_submit_seconds is None
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        await session.submit(plate=_SECRET_PLATE, captcha_code=_SECRET_CAPTCHA)
+
+    assert isinstance(session.last_submit_seconds, float)
+    assert session.last_submit_seconds >= 0
+    assert _warnings(caplog) == []

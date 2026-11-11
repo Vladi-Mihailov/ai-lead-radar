@@ -59,6 +59,20 @@ _MIN_REQUEST_INTERVAL_SECONDS = 1.5
 _HIDDEN_INPUT_RE_TEMPLATE = r'name="{name}"[^>]*\bvalue="([^"]*)"'
 
 
+def _describe_transport_error(exc: httpx.HTTPError) -> str:
+    """См. задачу "KGM diagnostic logging" — тип исключения + безопасная
+    деталь для лога: HTTP-статус для HTTPStatusError (без URL), иначе
+    короткий текст исходной сетевой ошибки — например "[Errno -3]
+    Temporary failure in name resolution" (именно так выглядит DNS-сбой
+    KGM 2026-11-11). Госномер уходит только в теле POST, ни в URL, ни в
+    текст httpx-исключения он не попадает; тела ответа и cookies здесь нет."""
+    name = type(exc).__name__
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"{name} status={exc.response.status_code}"
+    detail = " ".join(str(exc).split())[:160]
+    return f"{name}: {detail}" if detail else name
+
+
 def _extract_hidden_value(html: str, name: str) -> str | None:
     """Универсальный разбор ОДНОГО скрытого ASP.NET-поля — работает и на
     обычной HTML-странице (первый GET), и на HTML-фрагменте внутри
@@ -100,6 +114,11 @@ class KgmSession:
         self._viewstate_generator = ""
         self._viewstate_encrypted = ""
         self._hdnx = ""
+        # См. задачу "KGM diagnostic logging" — сколько сервер отвечал на
+        # последний submit() (без паузы _throttle): у массовых unexpected
+        # 2026-11 это ~9.5 с против ~0.05 с у нормального ответа. Читает
+        # KgmProvider для лога unexpected; None — submit() ещё не было.
+        self.last_submit_seconds: float | None = None
 
     async def _throttle(self) -> None:
         if self._last_request_at is not None:
@@ -164,10 +183,15 @@ class KgmSession:
         той же сессии (см. reader/turkey_bot/avrasya/session.py::
         AvrasyaSession.start — тот же принцип)."""
         await self._throttle()
+        started = time.monotonic()
         try:
             response = await self._client.get(_PAGE_URL, headers=_COMMON_HEADERS, timeout=self._timeout)
             response.raise_for_status()
         except httpx.HTTPError as exc:
+            logger.warning(
+                "KGM page load: transport error (%s) after %.2fs",
+                _describe_transport_error(exc), time.monotonic() - started,
+            )
             raise KgmTransportError("failed to load KGM page") from exc
 
         self._capture_state_from_html_page(response.text)
@@ -179,14 +203,23 @@ class KgmSession:
         недействительным код, ожидавшийся для предыдущего fetch, вызывающий
         код обязан показать человеку ИМЕННО картинку из этого вызова)."""
         await self._throttle()
+        started = time.monotonic()
         try:
             response = await self._client.get(_CAPTCHA_URL, headers=_COMMON_HEADERS, timeout=self._timeout)
             response.raise_for_status()
         except httpx.HTTPError as exc:
+            logger.warning(
+                "KGM captcha load: transport error (%s) after %.2fs",
+                _describe_transport_error(exc), time.monotonic() - started,
+            )
             raise KgmTransportError("failed to request KGM captcha") from exc
 
         content_type = response.headers.get("content-type", "")
         if "image" not in content_type:
+            logger.warning(
+                "KGM captcha load: unexpected content-type %r (HTTP %d, %d bytes)",
+                content_type[:60], response.status_code, len(response.content),
+            )
             raise KgmTransportError(
                 f"KGM captcha response has unexpected content-type: {content_type!r}"
             )
@@ -228,17 +261,27 @@ class KgmSession:
         }
 
         await self._throttle()
+        started = time.monotonic()
         try:
             response = await self._client.post(
                 _PAGE_URL, data=form, headers=_ASYNC_POST_HEADERS, timeout=self._timeout,
             )
             response.raise_for_status()
         except httpx.HTTPError as exc:
-            logger.warning("KGM submit: transport error (%s)", type(exc).__name__)
+            self.last_submit_seconds = time.monotonic() - started
+            logger.warning(
+                "KGM submit: transport error (%s) after %.2fs",
+                _describe_transport_error(exc), self.last_submit_seconds,
+            )
             raise KgmTransportError("failed to submit KGM check") from exc
+        self.last_submit_seconds = time.monotonic() - started
 
         content_type = response.headers.get("content-type", "")
         if "text" not in content_type:
+            logger.warning(
+                "KGM submit: unexpected content-type %r (HTTP %d, %d bytes)",
+                content_type[:60], response.status_code, len(response.content),
+            )
             raise KgmTransportError(
                 f"KGM submit response has unexpected content-type: {content_type!r}"
             )

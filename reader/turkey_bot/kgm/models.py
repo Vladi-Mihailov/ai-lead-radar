@@ -92,6 +92,27 @@ KgmSubmitKind = Literal["has_debt", "no_debt", "rejected", "unexpected"]
 
 
 @dataclass(frozen=True)
+class KgmDiagnostics:
+    """Безопасная диагностика kind == "unexpected" (см. задачу "KGM
+    diagnostic logging": массовые unexpected с 2026-11-05, причина нигде
+    не видна) — ЕДИНСТВЕННОЕ, что можно писать в лог. Все три поля — из
+    фиксированного словаря parser.py: category — крупный класс причины
+    ("provider_message" — сайт ответил своей ошибкой/редиректом,
+    "response_format" — пришёл не delta-ответ с результатом,
+    "result_structure" — секции/колонки/подписи не те, "checksum" —
+    суммы не сходятся), code — конкретная причина, detail — только
+    фиксированные идентификаторы (operator_key, типы delta-чанков,
+    числовые коды/длины, ключевые слова из фиксированного списка).
+    Никогда не сырой текст сайта, госномер, CAPTCHA, cookies или HTML — их
+    может нести message (например, текст lblHata), поэтому message сам по
+    себе в лог не пишется."""
+
+    category: str
+    code: str
+    detail: str = ""
+
+
+@dataclass(frozen=True)
 class KgmSubmitOutcome:
     """Результат parser.py::parse_submit_response().
 
@@ -116,7 +137,12 @@ class KgmSubmitOutcome:
     самого понятия здесь нет вовсе, см. design report: "не выдавать
     пользователю частичный результат как достоверный" — сюда никогда не
     попадает то, что могло бы стать текстом пользователю напрямую, см.
-    reader/turkey_bot/texts.py)."""
+    reader/turkey_bot/texts.py).
+
+    diagnostics — ТОЛЬКО для kind == "unexpected" (см. KgmDiagnostics и
+    parser.py::_unexpected), для остальных kind всегда None. На
+    классификацию результата не влияет никак — kind/суммы/message те же,
+    что и без него."""
 
     kind: KgmSubmitKind
     operators: tuple[KgmOperatorResult, ...] = ()
@@ -124,3 +150,4 @@ class KgmSubmitOutcome:
     yid_total: Decimal | None = None
     grand_total: Decimal | None = None
     message: str | None = None
+    diagnostics: KgmDiagnostics | None = None
