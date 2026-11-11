@@ -5,7 +5,7 @@
 
 Единственное добавление (см. задачу "KGM diagnostic logging") — одна
 строка лога на каждый kind == "unexpected": безопасная диагностика
-parser.py (KgmDiagnostics), время ответа сервера (KgmSession.
+parser.py (KgmDiagnostics), длительность POST-запроса (KgmSession.
 last_submit_seconds) и размер ответа. Госномер, CAPTCHA, cookies, message
 (может нести текст сайта) и сам ответ в лог не пишутся; результат проверки
 возвращается без изменений."""
@@ -38,13 +38,13 @@ class KgmProvider:
         outcome = parse_submit_response(response_text)
         if outcome.kind == "unexpected":
             diagnostics = outcome.diagnostics
-            server_seconds = self._session.last_submit_seconds
+            submit_seconds = getattr(self._session, "last_submit_seconds", None)
             logger.warning(
-                "KGM unexpected response: category=%s code=%s detail=%s server_seconds=%s response_chars=%d",
+                "KGM unexpected response: category=%s code=%s detail=%s submit_seconds=%s response_chars=%d",
                 diagnostics.category if diagnostics else "unknown",
                 diagnostics.code if diagnostics else "unknown",
                 (diagnostics.detail if diagnostics else "") or "-",
-                f"{server_seconds:.2f}" if server_seconds is not None else "-",
+                f"{submit_seconds:.2f}" if submit_seconds is not None else "-",
                 len(response_text),
             )
         return outcome

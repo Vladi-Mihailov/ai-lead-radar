@@ -8,6 +8,7 @@ session вместо KgmSession.
 """
 
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -61,7 +62,7 @@ async def test_unexpected_logs_one_safe_line_and_returns_outcome_unchanged(caplo
     assert _provider_warnings(caplog) == [
         "KGM unexpected response: category=provider_message code=lblhata_unrecognized "
         f"detail=chars={len(site_text)} digits=5 keywords=hata+tekrar_deneyin+sistem "
-        f"server_seconds=9.51 response_chars={len(response)}"
+        f"submit_seconds=9.51 response_chars={len(response)}"
     ]
 
 
@@ -80,7 +81,8 @@ async def test_unexpected_log_never_contains_plate_captcha_site_text_or_html(cap
     messages = _provider_warnings(caplog)
     assert len(messages) == len(responses)
     for message in messages:
-        for forbidden in (_PLATE, _CAPTCHA, "Sistem hatası", "Request Rejected", "Hata.aspx", "<", "'"):
+        # Имя .aspx-страницы редиректа можно (только безопасное имя), URL с параметрами — нет.
+        for forbidden in (_PLATE, _CAPTCHA, "Sistem hatası", "Request Rejected", "?p=", "/Hata", "<", "'"):
             assert forbidden not in message, f"{forbidden!r} leaked into log: {message!r}"
 
 
@@ -93,8 +95,47 @@ async def test_unexpected_without_server_time_logs_dash(caplog):
 
     assert _provider_warnings(caplog) == [
         "KGM unexpected response: category=response_format code=delta_malformed "
-        "detail=chars=28 shape=other server_seconds=- response_chars=28"
+        "detail=chars=28 shape=other submit_seconds=- response_chars=28"
     ]
+
+
+async def test_unexpected_log_line_contains_only_fixed_vocabulary_fields(caplog):
+    """Строгий формат всей строки: любые будущие утечки свободного текста
+    (сайта, госномера) сломают этот шаблон."""
+    error_text = f"Sunucu hatası {_PLATE}"
+    responses = [
+        _panel(f'<span id="lblHata">Sistem hatası ({_PLATE})</span>'),
+        f"<html><head><title>Hata {_PLATE}</title></head></html>",
+        f"1|#||4|{len(error_text)}|error|500|{error_text}|",
+        f"1|#||4|1|Sistem hatasi {_PLATE}||x|",
+        "garbage not a delta response",
+    ]
+    line = re.compile(
+        r"KGM unexpected response: category=[a-z_]+ code=[a-z_]+ detail=[A-Za-z0-9_=+#,. -]+ "
+        r"submit_seconds=(\d+\.\d\d|-) response_chars=\d+"
+    )
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        for response in responses:
+            await KgmProvider(_FakeSession(response)).submit(plate=_PLATE, captcha_code=_CAPTCHA)
+
+    messages = _provider_warnings(caplog)
+    assert len(messages) == len(responses)
+    for message in messages:
+        assert line.fullmatch(message), message
+        assert _PLATE not in message and "ABC" not in message
+
+
+async def test_session_without_timing_attribute_still_logs(caplog):
+    class _BareSession:
+        async def submit(self, *, plate: str, captcha_code: str) -> str:
+            return "garbage not a delta response"
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        outcome = await KgmProvider(_BareSession()).submit(plate=_PLATE, captcha_code=_CAPTCHA)
+
+    assert outcome.kind == "unexpected"
+    assert _provider_warnings(caplog)[0].endswith("submit_seconds=- response_chars=28")
 
 
 async def test_has_debt_no_debt_and_rejected_log_nothing(caplog):

@@ -97,9 +97,10 @@ _HAS_DEBT_LABEL_RE = re.compile(r":\s*(\d+)\s*kayıt\s*$")
 
 # См. задачу "KGM diagnostic logging" — фиксированный словарь для
 # БЕЗОПАСНОЙ классификации свободного текста сайта (lblHata, <title>
-# не-delta ответа): в diagnostics попадают только канонические имена из
-# ключей, сам текст — никогда (в нём теоретически может оказаться
-# госномер). Турецкие формы — и с диакритикой, и без (см. _fold).
+# не-delta ответа, текст ASP.NET-исключения в delta-чанке "error"): в
+# diagnostics попадают только канонические имена из ключей, сам текст —
+# никогда (в нём теоретически может оказаться госномер). И текст, и
+# варианты сравниваются после _fold (турецкие буквы -> ASCII).
 _DIAGNOSTIC_KEYWORDS: dict[str, tuple[str, ...]] = {
     "hata": ("hata", "error"),
     "zaman_asimi": ("zaman aşımı", "zaman asimi", "timeout", "timed out"),
@@ -118,45 +119,80 @@ _DIAGNOSTIC_KEYWORDS: dict[str, tuple[str, ...]] = {
     "bulunamadi": ("bulunamadı", "bulunamadi", "not found"),
     "limit": ("limit", "sınır", "sinir", "çok fazla", "cok fazla", "too many"),
     "oturum": ("oturum", "session"),
+    "viewstate": ("viewstate", "view state"),
+    "veritabani": ("veritabanı", "veritabani", "database", "sql"),
 }
 
-# Типы delta-чанков — протокольные слова ASP.NET AJAX (updatePanel,
-# hiddenField, pageRedirect, error, ...); всё, кроме букв и "#", отрезается
-# на всякий случай, прежде чем тип попадёт в diagnostics.
-_UNSAFE_CHUNK_TYPE_CHARS_RE = re.compile(r"[^A-Za-z#]")
+# Турецкие буквы -> ASCII ПОСЛЕ casefold: "ZAMAN AŞIMI".casefold() даёт
+# "zaman aşimi" (I -> i, но Ş остаётся) — без этого не совпал бы ни
+# "zaman aşımı", ни "zaman asimi".
+_TURKISH_TO_ASCII = str.maketrans("ışğçöüâîû", "isgcouaiu")
 
 
 def _fold(text: str) -> str:
-    """casefold + снятие combining dot (U+0307), который даёт турецкая
-    "İ" — иначе "ERİŞİM".casefold() не совпало бы с "erişim"."""
-    return text.casefold().replace("̇", "")
+    """casefold + снятие combining dot (U+0307, его даёт турецкая "İ") +
+    турецкие буквы -> ASCII. Применяется и к тексту, и к вариантам
+    _DIAGNOSTIC_KEYWORDS."""
+    return text.casefold().replace("̇", "").translate(_TURKISH_TO_ASCII)
+
+
+_FOLDED_DIAGNOSTIC_KEYWORDS = {
+    name: tuple(_fold(needle) for needle in needles) for name, needles in _DIAGNOSTIC_KEYWORDS.items()
+}
+
+# Сколько символов свободного текста анализировать (ключевые слова/цифры) и
+# сколько начала НЕ-delta ответа просматривать: ответ присылает сервер,
+# диагностика не должна стоить дороже самого разбора.
+_DIAGNOSTIC_TEXT_SCAN_CHARS = 4096
+_DIAGNOSTIC_RESPONSE_SCAN_CHARS = 65536
+
+# Протокольные типы delta-чанков ASP.NET AJAX — в diagnostics попадают
+# ТОЛЬКО они (тип чанка присылает сервер); остальные лишь считаются.
+_ASP_NET_DELTA_CHUNK_TYPES = frozenset({
+    "#", "updatePanel", "hiddenField", "scriptBlock", "scriptStartupBlock", "scriptDispose", "expando",
+    "onSubmit", "asyncPostBackControlIDs", "postBackControlIDs", "updatePanelIDs", "childUpdatePanelIDs",
+    "panelsToRefreshIDs", "asyncPostBackTimeout", "formAction", "pageTitle", "focus", "pageRedirect",
+    "error", "dataItem", "dataItemJson", "arrayDeclaration",
+})
+# Имена контролов/страниц, которые можно назвать в diagnostics: буквы и "_"
+# (у id панели — максимум две цифры в конце, как "UpdatePanel1"); в
+# турецком госномере цифры есть всегда, поэтому он сюда не пройдёт.
+_SAFE_IDENTIFIER_RE = re.compile(r"[A-Za-z_]{1,40}[0-9]{0,2}")
+_SAFE_ASPX_PAGE_RE = re.compile(r"[A-Za-z_]{1,40}\.aspx")
+# Ограниченные (не "ленивые до конца текста") шаблоны — линейны даже на
+# враждебном ответе вида "<title>" * 20000.
+_TITLE_RE = re.compile(r"<title\b[^>]{0,200}>([^<]{0,512})", re.I)
+_LBLHATA_RE = re.compile(r'id="lblHata"[^>]{0,200}>([^<]{0,512})')
 
 
 def _keywords(text: str) -> str:
-    folded = _fold(text)
-    found = [name for name, needles in _DIAGNOSTIC_KEYWORDS.items() if any(n in folded for n in needles)]
+    folded = _fold(text[:_DIAGNOSTIC_TEXT_SCAN_CHARS])
+    found = [name for name, needles in _FOLDED_DIAGNOSTIC_KEYWORDS.items() if any(n in folded for n in needles)]
     return "+".join(found) or "-"
 
 
 def _text_detail(text: str) -> str:
-    """Безопасная сводка свободного текста сайта: длина, число цифр
-    (подсказка, что в тексте могли быть номер/код — без них самих) и
-    ключевые слова из _DIAGNOSTIC_KEYWORDS."""
-    digits = sum(ch.isdigit() for ch in text)
+    """Безопасная сводка свободного текста сайта: длина, число цифр в
+    начале текста (подсказка, что там могли быть номер/код — без них
+    самих) и ключевые слова из _DIAGNOSTIC_KEYWORDS."""
+    digits = sum(ch.isdigit() for ch in text[:_DIAGNOSTIC_TEXT_SCAN_CHARS])
     return f"chars={len(text)} digits={digits} keywords={_keywords(text)}"
 
 
 def _response_shape(text: str) -> str:
     """Форма НЕ-delta ответа для diagnostics (см. parse_submit_response):
-    пусто / HTML-страница (тогда — ключевые слова её <title> и lblHata,
-    если они есть) / что-то иное. Сам ответ в diagnostics не попадает."""
-    stripped = text.lstrip()
-    if not stripped:
+    пусто / обрезанный или битый delta-ответ / HTML-страница (тогда —
+    ключевые слова её <title> и lblHata, если они есть) / что-то иное.
+    Сам ответ в diagnostics не попадает; просматривается только начало."""
+    head = text[:_DIAGNOSTIC_RESPONSE_SCAN_CHARS].lstrip().lstrip("﻿").lstrip()
+    if not head:
         return f"chars={len(text)} shape=empty"
-    if not stripped.startswith("<"):
+    if re.match(r"\d{1,9}\|", head):
+        return f"chars={len(text)} shape=delta_like"
+    if not head.startswith("<"):
         return f"chars={len(text)} shape=other"
-    title = re.search(r"<title[^>]*>(.*?)</title>", stripped, re.S | re.I)
-    hata = re.search(r'id="lblHata"[^>]*>(.*?)<', stripped, re.S)
+    title = _TITLE_RE.search(head)
+    hata = _LBLHATA_RE.search(head)
     title_keywords = _keywords(title.group(1)) if title else "-"
     hata_keywords = _keywords(hata.group(1)) if hata and hata.group(1).strip() else "-"
     return f"chars={len(text)} shape=html title_keywords={title_keywords} lblhata_keywords={hata_keywords}"
@@ -394,7 +430,14 @@ def parse_result_panel(html: str) -> KgmSubmitOutcome:
 
             subtotal = _parse_subtotal(soup, subtotal_id)
             items_sum = sum((item.payable_amount for item in items), Decimal(0))
-            if subtotal is None or subtotal != items_sum:
+            if subtotal is None:
+                # Подытога нет или он не разбирается — это структура, а не
+                # расхождение сумм (message — прежний, как и раньше).
+                return _unexpected(
+                    f"{operator_key}: subtotal does not match parsed rows",
+                    category="result_structure", code="section_subtotal_unreadable", detail=operator_key,
+                )
+            if subtotal != items_sum:
                 return _unexpected(
                     f"{operator_key}: subtotal does not match parsed rows",
                     category="checksum", code="section_subtotal_mismatch", detail=operator_key,
@@ -505,21 +548,38 @@ def parse_submit_response(response_text: str) -> KgmSubmitOutcome:
 
 def _unexpected_without_result_panel(chunks: dict[tuple[str, str], str]) -> KgmSubmitOutcome:
     """delta разобрался, но чанка ("updatePanel", "pnlSayfa") нет —
-    различаем по ТИПАМ чанков (протокольные слова ASP.NET AJAX, не их
-    содержимое): "error" — серверное исключение ASP.NET (его id — HTTP-код,
-    текст исключения не пишется), "pageRedirect" — сервер перенаправил на
-    другую страницу (URL не пишется). message — прежний для всех трёх."""
+    различаем по ТИПАМ чанков (только известные протокольные слова ASP.NET
+    AJAX, см. _ASP_NET_DELTA_CHUNK_TYPES): "error" — серверное исключение
+    ASP.NET (detail — его 3-значный код и ключевые слова текста, сам текст
+    не пишется), "pageRedirect" — сервер перенаправил на другую страницу
+    (detail — имя .aspx-страницы, только если оно похоже на имя страницы;
+    сам URL не пишется). message — прежний для всех трёх."""
     message = "delta response has no updatePanel/pnlSayfa chunk"
-    types = sorted({ctype for ctype, _cid in chunks})
+    types = {ctype for ctype, _cid in chunks}
     if "error" in types:
-        codes = sorted({cid for ctype, cid in chunks if ctype == "error" and cid.isdigit()})
+        codes = sorted({
+            cid for ctype, cid in chunks if ctype == "error" and cid.isascii() and cid.isdigit() and len(cid) <= 3
+        })
+        error_text = next(content for (ctype, _cid), content in chunks.items() if ctype == "error")
         return _unexpected(
             message, category="provider_message", code="delta_error_chunk",
-            detail=f"error_codes={','.join(codes) or '-'}",
+            detail=f"error_codes={','.join(codes) or '-'} keywords={_keywords(error_text)}",
         )
     if "pageRedirect" in types:
-        return _unexpected(message, category="provider_message", code="delta_page_redirect")
-    safe_types = "+".join(_UNSAFE_CHUNK_TYPE_CHARS_RE.sub("", ctype)[:30] for ctype in types) or "-"
-    return _unexpected(
-        message, category="response_format", code="delta_no_result_panel", detail=f"chunks={safe_types}",
-    )
+        target = next(content for (ctype, _cid), content in chunks.items() if ctype == "pageRedirect")
+        page = re.split(r"[?#]", target, maxsplit=1)[0].rstrip("/").rsplit("/", 1)[-1]
+        return _unexpected(
+            message, category="provider_message", code="delta_page_redirect",
+            detail=f"target={page if _SAFE_ASPX_PAGE_RE.fullmatch(page) else 'other'}",
+        )
+    known = sorted(types & _ASP_NET_DELTA_CHUNK_TYPES)
+    unknown = len(types - _ASP_NET_DELTA_CHUNK_TYPES)
+    panels = sorted(
+        cid for ctype, cid in chunks if ctype == "updatePanel" and _SAFE_IDENTIFIER_RE.fullmatch(cid)
+    )[:5]
+    detail = f"chunks={'+'.join(known) or '-'}"
+    if unknown:
+        detail += f" unknown_chunk_types={unknown}"
+    if panels:
+        detail += f" panels={'+'.join(panels)}"
+    return _unexpected(message, category="response_format", code="delta_no_result_panel", detail=detail)

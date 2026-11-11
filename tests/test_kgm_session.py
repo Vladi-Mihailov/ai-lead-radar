@@ -7,6 +7,7 @@ test_turkey_gib_session.py), который отдаёт заготовленн�
 """
 
 import logging
+import socket
 import sys
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -273,8 +274,12 @@ def _assert_no_secrets(messages: list[str]) -> None:
 
 
 async def test_start_logs_dns_failure_type_and_duration_and_still_raises(caplog):
+    """Цепочка причин — как у настоящего httpx (ConnectError <- ... <-
+    socket.gaierror): в лог идут errno и текст ОС, не str(exc)."""
     def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("[Errno -3] Temporary failure in name resolution", request=request)
+        raise httpx.ConnectError("[Errno -3] Temporary failure in name resolution", request=request) from (
+            socket.gaierror(-3, "Temporary failure in name resolution")
+        )
 
     session = _make_session(handler)
 
@@ -284,10 +289,51 @@ async def test_start_logs_dns_failure_type_and_duration_and_still_raises(caplog)
     messages = _warnings(caplog)
     assert len(messages) == 1
     assert messages[0].startswith(
-        "KGM page load: transport error (ConnectError: [Errno -3] Temporary failure in name resolution) after "
+        "KGM page load: transport error (ConnectError errno=-3 Temporary failure in name resolution) after "
     )
     assert messages[0].endswith("s")
     _assert_no_secrets(messages)
+
+
+async def test_protocol_error_text_with_raw_server_bytes_is_never_logged(caplog):
+    """Ревью: h11 кладёт сырые байты ответа в текст RemoteProtocolError
+    (строку заголовка с cookie, начало HTML) — логируется только тип."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError(
+            f"illegal header line: bytearray(b'Set-Cookie : ASP.NET_SessionId=abc123; {_SECRET_PLATE}')",
+            request=request,
+        )
+
+    session = _make_session(handler)
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER), pytest.raises(KgmTransportError):
+        await session.start()
+
+    messages = _warnings(caplog)
+    assert len(messages) == 1
+    assert messages[0].startswith("KGM page load: transport error (RemoteProtocolError) after ")
+    _assert_no_secrets(messages)
+    assert "abc123" not in messages[0]
+
+
+async def test_connection_refused_inside_exception_group_is_found(caplog):
+    """anyio прячет причины попыток подключения в ExceptionGroup под
+    OSError("All connection attempts failed") — errno берётся оттуда."""
+    group = ExceptionGroup("connection attempts", [ConnectionRefusedError(111, "Connection refused")])
+    all_failed = OSError("All connection attempts failed")
+    all_failed.__cause__ = group
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("All connection attempts failed", request=request) from all_failed
+
+    session = _make_session(handler)
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER), pytest.raises(KgmTransportError):
+        await session.refresh_captcha()
+
+    assert _warnings(caplog)[0].startswith(
+        "KGM captcha load: transport error (ConnectError errno=111 Connection refused) after "
+    )
 
 
 async def test_start_logs_http_status_without_url(caplog):
@@ -316,7 +362,7 @@ async def test_refresh_captcha_logs_timeout_type(caplog):
 
     messages = _warnings(caplog)
     assert len(messages) == 1
-    assert messages[0].startswith("KGM captcha load: transport error (ConnectTimeout: timed out) after ")
+    assert messages[0].startswith("KGM captcha load: transport error (ConnectTimeout) after ")
     _assert_no_secrets(messages)
 
 
@@ -330,8 +376,22 @@ async def test_refresh_captcha_logs_unexpected_content_type_without_body(caplog)
         await session.refresh_captcha()
 
     messages = _warnings(caplog)
-    assert messages == ["KGM captcha load: unexpected content-type 'text/html' (HTTP 200, 25 bytes)"]
+    assert messages == ["KGM captcha load: unexpected content-type text/html (HTTP 200, 25 bytes)"]
     assert "blocked page" not in messages[0]
+
+
+async def test_content_type_is_reduced_to_a_safe_media_type(caplog):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, text="x", headers={"content-type": f"text/html; note={_SECRET_PLATE}<script>"},
+        )
+
+    session = _make_session(handler)
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER), pytest.raises(KgmTransportError):
+        await session.refresh_captcha()
+
+    assert _warnings(caplog) == ["KGM captcha load: unexpected content-type text/html (HTTP 200, 1 bytes)"]
 
 
 async def test_exception_without_text_is_logged_by_type_only(caplog):
@@ -357,7 +417,7 @@ async def test_submit_transport_error_logs_type_and_never_plate_or_captcha(caplo
 
     messages = _warnings(caplog)
     assert len(messages) == 1
-    assert messages[0].startswith("KGM submit: transport error (ReadTimeout: timed out) after ")
+    assert messages[0].startswith("KGM submit: transport error (ReadTimeout) after ")
     _assert_no_secrets(messages)
     assert session.last_submit_seconds is not None
 
@@ -372,7 +432,7 @@ async def test_submit_logs_unexpected_content_type_without_body(caplog):
         await session.submit(plate=_SECRET_PLATE, captcha_code=_SECRET_CAPTCHA)
 
     assert _warnings(caplog) == [
-        "KGM submit: unexpected content-type 'application/octet-stream' (HTTP 200, 2 bytes)",
+        "KGM submit: unexpected content-type application/octet-stream (HTTP 200, 2 bytes)",
     ]
 
 

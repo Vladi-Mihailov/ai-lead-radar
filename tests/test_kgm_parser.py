@@ -9,7 +9,9 @@ report), с вырезанными cookies/ViewState/security-adjacent знач�
 сети/CAPTCHA здесь нет и не может быть.
 """
 
+import re
 import sys
+import time
 from decimal import Decimal
 from pathlib import Path
 
@@ -377,13 +379,48 @@ _DIAGNOSTIC_CASES = [
     ),
     pytest.param(
         _delta(("#", "", "4"), ("error", "500", f"Sunucu hatası {_PLATE_LIKE}")),
-        "provider_message", "delta_error_chunk", "error_codes=500",
+        "provider_message", "delta_error_chunk", "error_codes=500 keywords=hata",
         "delta response has no updatePanel/pnlSayfa chunk", id="asp-net-error-chunk",
     ),
     pytest.param(
+        _delta(("#", "", "4"), ("error", "500", "Timeout expired. The timeout period elapsed (SqlException)")),
+        "provider_message", "delta_error_chunk", "error_codes=500 keywords=zaman_asimi+veritabani",
+        "delta response has no updatePanel/pnlSayfa chunk", id="asp-net-error-chunk-timeout",
+    ),
+    pytest.param(
         _delta(("#", "", "4"), ("pageRedirect", "", f"/WebIhlalSorgulama/Hata.aspx?p={_PLATE_LIKE}")),
-        "provider_message", "delta_page_redirect", "",
+        "provider_message", "delta_page_redirect", "target=Hata.aspx",
         "delta response has no updatePanel/pnlSayfa chunk", id="page-redirect",
+    ),
+    pytest.param(
+        _delta(("#", "", "4"), ("pageRedirect", "", f"/Arac/{_PLATE_LIKE}.aspx")),
+        "provider_message", "delta_page_redirect", "target=other",
+        "delta response has no updatePanel/pnlSayfa chunk", id="page-redirect-unsafe-target",
+    ),
+    pytest.param(
+        _delta(("#", "", "4"), ("error", "5" * 50, "x"), ("error", "٥٠٠", "y")),
+        "provider_message", "delta_error_chunk", "error_codes=- keywords=-",
+        "delta response has no updatePanel/pnlSayfa chunk", id="error-id-not-a-3-digit-ascii-code",
+    ),
+    pytest.param(
+        _delta(("#", "", "4"), (f"Sistem hatasi {_PLATE_LIKE} erisim", "", "x"), ("updatePanel", "UpdatePanel1", "<p/>")),
+        "response_format", "delta_no_result_panel", "chunks=#+updatePanel unknown_chunk_types=1 panels=UpdatePanel1",
+        "delta response has no updatePanel/pnlSayfa chunk", id="unknown-chunk-type-not-echoed",
+    ),
+    pytest.param(
+        "﻿<!DOCTYPE html><html><head><title>Sistem Bakımda</title></head></html>",
+        "response_format", "delta_malformed", "chars=71 shape=html title_keywords=bakim+sistem lblhata_keywords=-",
+        "malformed ASP.NET AJAX delta response", id="html-with-bom",
+    ),
+    pytest.param(
+        "1|#||4|9999|updatePanel|pnlSayfa|<div>truncated",
+        "response_format", "delta_malformed", "chars=47 shape=delta_like",
+        "malformed ASP.NET AJAX delta response", id="truncated-delta",
+    ),
+    pytest.param(
+        _panel('<span id="lblHata">ZAMAN AŞIMI — BAĞLANTI HATASI</span>'),
+        "provider_message", "lblhata_unrecognized", "chars=29 digits=0 keywords=hata+zaman_asimi+baglanti",
+        "unrecognized lblHata text: 'ZAMAN AŞIMI — BAĞLANTI HATASI'", id="lblhata-turkish-dotless-i",
     ),
     pytest.param(
         _delta(("#", "", "4"), ("hiddenField", "__VIEWSTATE", "X")),
@@ -438,6 +475,14 @@ _DIAGNOSTIC_CASES = [
         id="section-subtotal",
     ),
     pytest.param(
+        _panel(_SUCCESS_HTML.replace(
+            '<span id="lblKgmCezaToplam" class="mtLabel">80,00 ₺</span>',
+            '<span id="lblKgmCezaToplam" class="mtLabel">seksen</span>',
+        )),
+        "result_structure", "section_subtotal_unreadable", "kgm", "kgm: subtotal does not match parsed rows",
+        id="section-subtotal-unreadable",
+    ),
+    pytest.param(
         _panel(_SUCCESS_HTML.replace('id="lblGenelCezaToplam"', 'id="lblGenelCezaToplamRenamed"')),
         "result_structure", "totals_missing", "grand_total", "missing grand totals", id="totals-missing",
     ),
@@ -477,8 +522,28 @@ def test_diagnostics_never_contain_site_text_plate_or_html(response, category, c
     diagnostics = parse_submit_response(response).diagnostics
 
     rendered = f"{diagnostics.category} {diagnostics.code} {diagnostics.detail}"
-    for forbidden in (_PLATE_LIKE, "Sistemde", "ERİŞİM", "KARAYOLLARI", "Sunucu", "Hata.aspx", "<", ">", "'"):
+    for forbidden in (_PLATE_LIKE, "MYB", "ABC", "Sistemde", "ERİŞİM", "KARAYOLLARI", "Sunucu", "Timeout expired",
+                      "<", ">", "'", "?"):
         assert forbidden not in rendered
+    # Только фиксированный словарь: строчные/цифры/служебные символы, без свободного текста.
+    assert re.fullmatch(r"[a-z_]+ [a-z_]+ [A-Za-z0-9_=+#,. -]*", rendered), rendered
+
+
+def test_hostile_responses_are_classified_in_bounded_time():
+    """Ревью: "ленивые" шаблоны до конца текста давали десятки секунд на
+    "<title>" * 20000 — а разбор идёт прямо в event loop бота."""
+    hostile = [
+        "<title>" * 20000,
+        "<" + 'id="lblHata">' * 20000,
+        _panel('<span id="lblHata">' + "hata " * 40_000 + "</span>"),
+    ]
+
+    started = time.perf_counter()
+    outcomes = [parse_submit_response(text) for text in hostile]
+    elapsed = time.perf_counter() - started
+
+    assert [o.kind for o in outcomes] == ["unexpected"] * 3
+    assert elapsed < 5.0, f"diagnostics took {elapsed:.1f}s"
 
 
 def test_successful_and_rejected_outcomes_have_no_diagnostics():
