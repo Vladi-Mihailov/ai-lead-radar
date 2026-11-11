@@ -39,7 +39,7 @@ OTHER_SECRET = "another-relay-secret-fedcba9876543210xyz"
 # сеть WireGuard 10.50.0.0/24).
 LOOPBACK = ("127.0.0.0/8",)
 # Заведомо выдуманные значения — по ним тесты ищут утечки в журналах/ответах.
-TEST_PLATE = "34TST987"
+TEST_PLATE = "TESTPLATE0"
 ACCEPTED_CODE = "22 03713"
 WRONG_CODE = "99 99999"
 

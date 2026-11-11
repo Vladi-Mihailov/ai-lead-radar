@@ -69,7 +69,7 @@ def test_wildcard_empty_or_non_ip_host_is_refused(host):
         _config(KGM_RELAY_HOST=host)
 
 
-@pytest.mark.parametrize("host", ["10.50.1.2", "127.0.0.1", "193.0.2.10", "fd00::2"])
+@pytest.mark.parametrize("host", ["10.50.1.2", "127.0.0.1", "203.0.113.10", "fd00::2"])
 def test_host_outside_the_allowed_network_is_refused(host):
     with pytest.raises(RelayConfigError) as excinfo:
         _config(KGM_RELAY_HOST=host)

@@ -461,8 +461,8 @@ async def test_health_returns_the_relay_status():
     ("KgmTransportError", "KgmTransportError"),
     ("ConnectionRefusedError errno=111", "ConnectionRefusedError errno=111"),
     ("HTTP 503", "HTTP 503"),
-    ("plate 34TST987 <html>", "other"),
-    ("34TST987 leaked", "other"),
+    ("plate TESTPLATE0 <html>", "other"),
+    ("TESTPLATE0 leaked", "other"),
     ("SomethingElse", "other"),
     ("", "other"),
 ])

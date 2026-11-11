@@ -13,7 +13,7 @@ from reader.turkey_bot.kgm.relay_auth import NonceCache
 SECRET = "kgm-relay-test-secret-0123456789abcdef"
 NOW = 1_800_000_000.0
 PATH = "/internal/kgm/sessions/0123456789abcdef0123456789abcdef/submit"
-BODY = b'{"plate": "34TST987", "captcha_code": "22 03713"}'
+BODY = b'{"plate": "TESTPLATE0", "captcha_code": "22 03713"}'
 NONCE = "0123456789abcdef0123456789abcdef"
 
 
