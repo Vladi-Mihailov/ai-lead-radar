@@ -103,6 +103,15 @@ def _provider(status: ProviderStatus, amount: Decimal, *, provider: str = "gib")
     )
 
 
+def _full_check(gib_amount: Decimal) -> tuple[ProviderCheckResult, ...]:
+    """Полная проверка: GİB с долгом + KGM без долга. Run только с GİB
+    означал бы "по KGM нет достоверных данных", и строка списка получила
+    бы пометку ⚠️ и пояснения по провайдерам (см. задачу "Turkey debt list:
+    последний успешный результат отдельно по каждому провайдеру и
+    госномеру") — эти тесты проверяют только отображение владельца."""
+    return (_provider(ProviderStatus.HAS_DEBT, gib_amount), _provider(ProviderStatus.NO_DEBT, Decimal(0), provider="kgm"))
+
+
 @pytest.fixture
 def fx():
     return _Fixture()
@@ -185,7 +194,7 @@ async def test_debt_owner_shown_with_name_and_username(fx):
 async def test_debt_owner_shown_with_name_only(fx):
     fx.add_car(telegram_user_id=1, car_number="M295YB196")
     fx.record_known(telegram_user_id=1, first_name="Иван", last_name="Иванов")
-    fx.save_run(telegram_user_id=1, plate="M295YB196", providers=(_provider(ProviderStatus.HAS_DEBT, Decimal(750)),))
+    fx.save_run(telegram_user_id=1, plate="M295YB196", providers=_full_check(Decimal(750)))
 
     reply = await fx.controller.handle_text(texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
 
@@ -196,7 +205,7 @@ async def test_debt_owner_shown_with_name_only(fx):
 async def test_debt_owner_shown_with_username_only(fx):
     fx.add_car(telegram_user_id=1, car_number="M295YB196")
     fx.record_known(telegram_user_id=1, username="alenaogir")
-    fx.save_run(telegram_user_id=1, plate="M295YB196", providers=(_provider(ProviderStatus.HAS_DEBT, Decimal(1250)),))
+    fx.save_run(telegram_user_id=1, plate="M295YB196", providers=_full_check(Decimal(1250)))
 
     reply = await fx.controller.handle_text(texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
 
@@ -207,7 +216,7 @@ async def test_debt_owner_shown_with_username_only(fx):
 async def test_debt_owner_shown_as_dash_when_neither(fx):
     fx.add_car(telegram_user_id=1, car_number="M295YB196")
     # record_known НЕ вызывается вовсе.
-    fx.save_run(telegram_user_id=1, plate="M295YB196", providers=(_provider(ProviderStatus.HAS_DEBT, Decimal(100)),))
+    fx.save_run(telegram_user_id=1, plate="M295YB196", providers=_full_check(Decimal(100)))
 
     reply = await fx.controller.handle_text(texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
 

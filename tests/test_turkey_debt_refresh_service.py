@@ -19,6 +19,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import pytest
 
+from reader.plate_display import format_plate_for_telegram
+from reader.turkey_bot import texts
 from reader.turkey_bot.avrasya.models import AvrasyaDebtItem, AvrasyaSubmitOutcome
 from reader.turkey_bot.debt_refresh_service import (
     TurkeyDebtRefreshService,
@@ -31,8 +33,9 @@ from reader.turkey_bot.known_users_repository import TurkeyBotKnownUsersReposito
 from reader.turkey_bot.monitoring.subscription_repository import (
     TurkeyMonitoringSubscriptionRepository,
 )
-from reader.turkey_bot.statistics_service import TurkeyStatisticsService
+from reader.turkey_bot.statistics_service import TurkeyProviderFreshness, TurkeyStatisticsService
 from reader.turkey_bot.unified.check_service import UnifiedTurkeyCheckService
+from reader.turkey_bot.unified.models import OverallStatus
 from reader.turkey_bot.unified.run_repository import TurkeyCheckRunRepository
 from reader.turkey_bot.user_cars_repository import TurkeyUserCarsRepository
 
@@ -192,7 +195,12 @@ class _Fixture:
         UnifiedTurkeyCheckService.check() + save() + update_last_result() —
         РОВНО та же последовательность, что и ConversationController.
         _run_manual_check(), а не прямой INSERT."""
-        seed_service = _make_check_service(gib=amount)
+        await self.seed_providers(telegram_user_id=telegram_user_id, plate=plate, days_ago=days_ago, gib=amount)
+
+    async def seed_providers(self, *, telegram_user_id: int, plate: str, days_ago: int = 0, **providers) -> None:
+        """Как seed(), но с произвольными суммами/ошибками провайдеров
+        (gib/avrasya/kgm, *_error — см. _make_check_service)."""
+        seed_service = _make_check_service(**providers)
         result = await seed_service.check(plate)
         run_id = self.runs.save(
             result, telegram_user_id=telegram_user_id, telegram_chat_id=telegram_user_id, initiator="manual",
@@ -307,11 +315,12 @@ async def test_error_after_previous_debt_preserves_previous_reliable_debt(fx):
 
 async def test_partial_result_is_stored_and_marked_incomplete_in_summary(fx):
     """См. задачу "PARTIAL" — GİB упал (ERROR), Avrasya/KGM успешны с
-    долгом -> overall PARTIAL, total_amount > 0 (см. derive_overall_status/
-    total_amount_for) — становится НОВЫМ reliable состоянием (см.
-    get_latest_reliable_for_owner — PARTIAL не исключается), но summary
-    честно относит его к "не удалось проверить полностью", а не к
-    "задолженность осталась"."""
+    долгом -> overall PARTIAL; summary честно относит его к "не удалось
+    проверить полностью", а не к "задолженность осталась". Раньше total
+    этого run'а (900, без упавшего GİB) становился новой суммой машины; см.
+    задачу "Turkey debt list: последний успешный результат отдельно по
+    каждому провайдеру и госномеру" — теперь GİB остаётся с последней
+    известной суммой (500), KGM — с новой (900)."""
     fx.add_car(telegram_user_id=1, car_number="AA001AA")
     await fx.seed(telegram_user_id=1, plate="AA001AA", amount=Decimal(500))
     fx.debt_refresh._check_service = _make_check_service(gib_error=True, kgm=Decimal(900))
@@ -322,7 +331,12 @@ async def test_partial_result_is_stored_and_marked_incomplete_in_summary(fx):
     rows = fx.debt_refresh.list_candidates()
     assert len(rows) == 1
     assert rows[0].is_partial is True
-    assert rows[0].total_amount == Decimal(900)
+    assert rows[0].total_amount == Decimal(1400)
+    states = {state.provider: state for state in rows[0].provider_states}
+    assert states["gib"].freshness == TurkeyProviderFreshness.STALE
+    assert states["gib"].amount == Decimal(500)
+    assert states["kgm"].freshness == TurkeyProviderFreshness.CURRENT
+    assert states["kgm"].amount == Decimal(900)
 
 
 # ---- Unique-plate outcome counters (задача "Turkey debt-refresh
@@ -418,6 +432,87 @@ async def test_outcome_mixed_plates_classified_independently(fx):
     assert outcome.error_plates == 1
     assert outcome.partial_car_numbers == ("BB002BB",)
     assert outcome.error_car_numbers == ("CC003CC",)
+
+
+# ---- ошибка провайдера не стирает известный долг (см. задачу "Turkey
+# debt list: последний успешный результат отдельно по каждому провайдеру
+# и госномеру") ----
+
+
+class _PerPlateBehaviorCheckService:
+    """check() с разным поведением провайдеров для разных номеров (см.
+    _make_check_service) — один и тот же refresh() проверяет несколько
+    машин."""
+
+    def __init__(self, behavior_by_plate: dict[str, dict]):
+        self._behavior_by_plate = behavior_by_plate
+
+    async def check(self, plate, **kwargs):
+        return await _make_check_service(**self._behavior_by_plate[plate]).check(plate, **kwargs)
+
+
+class _PoisonCheckService:
+    async def check(self, plate, **kwargs):
+        raise AssertionError(f"UNEXPECTED provider request for {plate}")
+
+
+async def test_refresh_with_kgm_errors_keeps_candidates_and_amounts(fx):
+    """Production-сценарий 10.11: KGM отвечает ошибкой на ВСЕ проверки
+    refresh — список кандидатов (= список менеджера) после refresh тот же:
+    те же номера, те же суммы; KGM-часть — последняя известная."""
+    fx.add_car(telegram_user_id=1, car_number="AA001AA")  # долг только KGM
+    fx.add_car(telegram_user_id=2, car_number="BB002BB")  # GİB + KGM
+    await fx.seed_providers(telegram_user_id=1, plate="AA001AA", days_ago=6, kgm=Decimal(3788))
+    await fx.seed_providers(
+        telegram_user_id=2, plate="BB002BB", days_ago=6, gib=Decimal(13336), kgm=Decimal("20192.50"),
+    )
+    before = [(row.car_number, row.total_amount) for row in fx.debt_refresh.list_candidates()]
+    fx.debt_refresh._check_service = _PerPlateBehaviorCheckService({
+        "AA001AA": {"kgm_error": True},
+        "BB002BB": {"gib": Decimal(13336), "kgm_error": True},
+    })
+
+    outcome = await fx.debt_refresh.refresh()
+
+    rows = fx.debt_refresh.list_candidates()
+    assert [(row.car_number, row.total_amount) for row in rows] == before
+    assert outcome.partial_plates == 2
+    assert outcome.partial_failed_providers == (("kgm",), ("kgm",))
+    by_plate = {row.car_number: row for row in rows}
+    assert by_plate["AA001AA"].last_known_amount == Decimal(3788)
+    assert by_plate["BB002BB"].confirmed_amount == Decimal(13336)
+    assert by_plate["BB002BB"].last_known_amount == Decimal("20192.50")
+
+
+async def test_car_hidden_by_earlier_partial_is_candidate_again(fx):
+    """Форма production-данных: полная проверка нашла долг KGM, затем
+    PARTIAL-run с ошибкой KGM и total_amount=0 — раньше он прятал машину и
+    из списка, и из кандидатов refresh навсегда. Теперь машина — снова
+    кандидат с последней известной суммой, без единого нового provider
+    request."""
+    fx.add_car(telegram_user_id=1, car_number="AA001AA")
+    await fx.seed_providers(telegram_user_id=1, plate="AA001AA", days_ago=40, kgm=Decimal(3100))
+    await fx.seed_providers(telegram_user_id=1, plate="AA001AA", days_ago=39, kgm_error=True)
+    status, total, _finished = fx.runs.get_latest_reliable_for_owner(plate="AA001AA", telegram_user_id=1)
+    assert (status, total) == (OverallStatus.PARTIAL, Decimal(0))  # прежний расчёт видел здесь 0
+    fx.debt_refresh._check_service = _PoisonCheckService()
+
+    rows = fx.debt_refresh.list_candidates()
+
+    assert [(row.car_number, row.total_amount) for row in rows] == [("AA001AA", Decimal(3100))]
+    assert rows[0].last_known_amount == Decimal(3100)
+
+
+async def test_outcome_lists_failed_providers_and_summary_shows_them(fx):
+    fx.add_car(telegram_user_id=1, car_number="AA001AA")
+    await fx.seed(telegram_user_id=1, plate="AA001AA", amount=Decimal(500))
+    fx.debt_refresh._check_service = _make_check_service(gib=Decimal(500), kgm_error=True)
+
+    outcome = await fx.debt_refresh.refresh()
+
+    assert outcome.partial_car_numbers == ("AA001AA",)
+    assert outcome.partial_failed_providers == (("kgm",),)
+    assert f"Частично: {format_plate_for_telegram('AA001AA')} (KGM)" in texts.format_debt_refresh_summary(outcome)
 
 
 # ---- Avrasya/KGM double-counting (задача TESTS п.11-12) ----

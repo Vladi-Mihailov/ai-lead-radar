@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -73,6 +74,34 @@ CREATE INDEX IF NOT EXISTS idx_turkey_provider_results_provider
 # "_" в LIKE-шаблоне экранирован — префикс сравнивается буквально.
 _SUBSCRIBER_SEEN_MANUAL_INITIATOR = "manual"
 _SUBSCRIBER_SEEN_MONITORING_LIKE = "monitoring\\_%"
+
+# См. get_latest_provider_results_for_plate — по ВСЕМ runs номера, без
+# фильтра по владельцу/initiator; порядок — finished_at run'а (тот же, что
+# у get_latest_reliable_for_owner/list_by_plate), затем id. CROSS JOIN —
+# не декорация: в SQLite он фиксирует порядок join (сначала runs номера по
+# idx_turkey_check_runs_plate, затем их provider results по run_id); с
+# обычным JOIN планировщик берёт idx_turkey_provider_results_provider и
+# перебирает ВСЕ результаты провайдера по всем номерам (~1000x медленнее
+# на production-объёме, а 📊 Статистика делает такой запрос на каждый номер).
+_LATEST_PROVIDER_RESULT_FOR_PLATE_SQL = (
+    "SELECT pr.provider, pr.status, pr.debt_count, pr.principal_amount, pr.penalty_amount, "
+    "       pr.total_amount, pr.error_type, pr.items_snapshot, pr.checked_at, r.finished_at "
+    "FROM turkey_check_runs r "
+    "CROSS JOIN turkey_provider_results pr ON pr.run_id = r.id "
+    "WHERE r.plate = ? AND pr.provider = ? {status_filter}"
+    "ORDER BY r.finished_at DESC, r.id DESC, pr.id DESC LIMIT 1"
+)
+
+
+@dataclass(frozen=True)
+class ProviderResultAt:
+    """ProviderCheckResult вместе с finished_at его run'а — моментом, когда
+    проверка завершилась (см. get_latest_provider_results_for_plate):
+    именно finished_at run'а, а не ProviderCheckResult.checked_at, — тот
+    же момент, что показывают 📜 История/get_latest_reliable_for_owner."""
+
+    result: ProviderCheckResult
+    finished_at: datetime
 
 
 def _decimal_or_none(text: str | None) -> Decimal | None:
@@ -306,6 +335,46 @@ class TurkeyCheckRunRepository:
             ),
         ).fetchone()
         return self._row_to_provider_result(row) if row is not None else None
+
+    def get_latest_provider_results_for_plate(
+        self, plate: str, provider: str,
+    ) -> tuple[ProviderResultAt | None, ProviderResultAt | None]:
+        """(последняя попытка, последний успешный результат) провайдера по
+        НОМЕРУ — см. задачу "Turkey debt list: последний успешный результат
+        отдельно по каждому провайдеру и госномеру". По ВСЕМ runs номера:
+        любой владелец, любой initiator (manual/monitoring_*/
+        manager_refresh), включая monitoring retry с подмножеством
+        провайдеров — номер = одна физическая машина, долг GİB/KGM —
+        свойство номера, а не владельца.
+
+        Последняя попытка — любой статус, в том числе ERROR; последний
+        успешный — status != 'error' (HAS_DEBT или NO_DEBT: успешная
+        проверка без долга ЗАМЕНЯЕТ более старый долг этого провайдера).
+        Если последняя попытка успешна, оба элемента — один и тот же
+        результат. None — у номера ещё не было ни одной попытки / ни одного
+        успешного ответа этого провайдера.
+
+        ТОЛЬКО для manager-статистики (см. reader/turkey_bot/
+        statistics_service.py::get_debt_rows, вызывается исключительно из
+        trusted-путей): результат собран по всем владельцам номера и
+        НИКОГДА не должен попадать в self-service ответы обычного
+        пользователя. Только чтение."""
+        last_attempt = self._conn.execute(
+            _LATEST_PROVIDER_RESULT_FOR_PLATE_SQL.format(status_filter=""), (plate, provider),
+        ).fetchone()
+        last_success = self._conn.execute(
+            _LATEST_PROVIDER_RESULT_FOR_PLATE_SQL.format(status_filter="AND pr.status != 'error' "),
+            (plate, provider),
+        ).fetchone()
+        return self._row_to_result_at(last_attempt), self._row_to_result_at(last_success)
+
+    def _row_to_result_at(self, row) -> ProviderResultAt | None:
+        if row is None:
+            return None
+        *provider_row, finished_at = row
+        return ProviderResultAt(
+            result=self._row_to_provider_result(provider_row), finished_at=datetime.fromisoformat(finished_at),
+        )
 
     def count_total(self) -> int:
         return self._conn.execute("SELECT COUNT(*) FROM turkey_check_runs").fetchone()[0]

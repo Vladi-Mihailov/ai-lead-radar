@@ -77,11 +77,26 @@ class _FakeAvrasyaProvider:
 
 
 class _FakeKgmProvider:
+    def __init__(self, *, outcome: KgmSubmitOutcome | None = None):
+        self._outcome = outcome or KgmSubmitOutcome(
+            kind="no_debt", kgm_total=Decimal(0), yid_total=Decimal(0), grand_total=Decimal(0),
+        )
+
     async def start(self):
         return KgmCaptchaChallenge(image_png=b"KGM-PNG")
 
     async def submit(self, *, plate, captcha_code):
-        return KgmSubmitOutcome(kind="no_debt", kgm_total=Decimal(0), yid_total=Decimal(0), grand_total=Decimal(0))
+        return self._outcome
+
+
+def _kgm_outcome(*, amount: Decimal = Decimal(0), unexpected: bool = False) -> KgmSubmitOutcome:
+    """unexpected=True — страница результата KGM не распознана (production
+    11.11: массовые "unexpected"), amount > 0 — найден долг KGM."""
+    if unexpected:
+        return KgmSubmitOutcome(kind="unexpected", message="missing grand totals")
+    if amount > 0:
+        return KgmSubmitOutcome(kind="has_debt", operators=(), kgm_total=amount, yid_total=Decimal(0), grand_total=amount)
+    return KgmSubmitOutcome(kind="no_debt", kgm_total=Decimal(0), yid_total=Decimal(0), grand_total=Decimal(0))
 
 
 class _FakeCaptchaResolver:
@@ -97,7 +112,10 @@ class _PoisonGibProvider:
         raise AssertionError("UNEXPECTED provider request from Statistics/pick")
 
 
-def _make_check_service(*, gib_amount: Decimal = Decimal(0), poison: bool = False) -> UnifiedTurkeyCheckService:
+def _make_check_service(
+    *, gib_amount: Decimal = Decimal(0), poison: bool = False,
+    kgm_amount: Decimal = Decimal(0), kgm_unexpected: bool = False,
+) -> UnifiedTurkeyCheckService:
     gib_outcome = (
         GibSubmitOutcome(kind="no_debt", messages=(), raw_data=None)
         if gib_amount <= 0 else
@@ -110,10 +128,11 @@ def _make_check_service(*, gib_amount: Decimal = Decimal(0), poison: bool = Fals
         )
     )
     gib_provider = _PoisonGibProvider() if poison else _FakeGibProvider(outcome=gib_outcome)
+    kgm_provider = _FakeKgmProvider(outcome=_kgm_outcome(amount=kgm_amount, unexpected=kgm_unexpected))
     return UnifiedTurkeyCheckService(
         lambda: (_FakeCloseable(), gib_provider),
         lambda: (_FakeCloseable(), _FakeAvrasyaProvider()),
-        lambda: (_FakeCloseable(), _FakeKgmProvider()),
+        lambda: (_FakeCloseable(), kgm_provider),
         captcha_resolver=_FakeCaptchaResolver(),
     )
 
@@ -147,8 +166,10 @@ class _Fixture:
     def add_car(self, *, telegram_user_id: int, car_number: str) -> None:
         self.garage.add_car(telegram_user_id=telegram_user_id, car_number=car_number)
 
-    async def seed(self, *, telegram_user_id: int, plate: str, amount: Decimal) -> None:
-        seed_service = _make_check_service(gib_amount=amount)
+    async def seed(
+        self, *, telegram_user_id: int, plate: str, amount: Decimal, kgm_amount: Decimal = Decimal(0),
+    ) -> None:
+        seed_service = _make_check_service(gib_amount=amount, kgm_amount=kgm_amount)
         result = await seed_service.check(plate)
         self.runs.save(result, telegram_user_id=telegram_user_id, telegram_chat_id=telegram_user_id, initiator="manual")
         self.garage.update_last_result(
@@ -416,6 +437,45 @@ async def test_next_refresh_candidates_exclude_car_that_became_zero():
 
     pick_reply = fx.controller.handle_debt_refresh_pick(telegram_user_id=_TRUSTED_ID)
     assert pick_reply.text == texts.DEBT_REFRESH_NONE_TEXT
+
+
+async def test_all_kgm_error_refresh_keeps_debt_block_and_shows_last_known_lines():
+    """Production-сценарий 10.11 (см. задачу "Turkey debt list: последний
+    успешный результат отдельно по каждому провайдеру и госномеру"): KGM
+    отвечает "unexpected" на каждую проверку refresh. "Автомобилей"/"Общая
+    сумма" после нажатия — те же, что до; KGM-часть показана как последняя
+    известная (с датами), а не как подтверждённая сегодня."""
+    fx = _Fixture(poison_check_service=False)
+    fx.add_car(telegram_user_id=1, car_number="AA001AA")  # долг только KGM
+    fx.add_car(telegram_user_id=2, car_number="BB002BB")  # GİB + KGM
+    await fx.seed(telegram_user_id=1, plate="AA001AA", amount=Decimal(0), kgm_amount=Decimal(3788))
+    await fx.seed(telegram_user_id=2, plate="BB002BB", amount=Decimal(13336), kgm_amount=Decimal("20192.50"))
+
+    before = await fx.controller.handle_text(texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
+    assert "Автомобилей: 2" in before.text
+    assert "Общая сумма: 37 316,50 ₺" in before.text
+    assert "Последняя известная" not in before.text
+
+    class _KgmDownCheckService:
+        async def check(self, plate, **kwargs):
+            gib_amount = Decimal(13336) if plate == "BB002BB" else Decimal(0)
+            return await _make_check_service(gib_amount=gib_amount, kgm_unexpected=True).check(plate, **kwargs)
+
+    fx.debt_refresh._check_service = _KgmDownCheckService()
+
+    reply = await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
+
+    full_text = "\n".join((reply.text, *reply.extra_texts))
+    assert "⚠️ Проверено частично: 2" in full_text
+    assert f"{format_plate_for_telegram('AA001AA')} (KGM)" in full_text
+    assert "Автомобилей: 2" in full_text
+    assert "Общая сумма: 37 316,50 ₺" in full_text
+    assert "✅ Подтверждено последними проверками: 13 336 ₺" in full_text
+    assert "⚠️ Последняя известная (провайдер не ответил): 23 980,50 ₺" in full_text
+    kgm_line = next(line for line in full_text.splitlines() if "KGM: 3 788 ₺" in line)
+    assert "последняя известная" in kgm_line
+    assert "не ответил" in kgm_line
+    assert next(line for line in full_text.splitlines() if "GİB: 13 336 ₺" in line).strip().startswith("✅")
 
 
 # ---- 18. Statistics after refresh reflects updated persisted data ----

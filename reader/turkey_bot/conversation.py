@@ -678,9 +678,17 @@ class ConversationController:
         cars = self._garage.list_all_page(offset=0, limit=total_cars) if total_cars else []
         debt_groups = self._statistics.get_debt_car_groups(cars)
 
+        # См. задачу "Turkey debt list: последний успешный результат
+        # отдельно по каждому провайдеру и госномеру" — подтверждённая
+        # последними проверками часть суммы и последняя известная (провайдер
+        # не ответил) показываются раздельно, плюс машины без достоверных
+        # данных (см. texts.format_debt_summary_block).
         debt_total_amount = sum((group.total_amount for group in debt_groups), Decimal(0))
         debt_block = texts.format_debt_summary_block(
             debt_car_count=len(debt_groups), debt_total_amount=debt_total_amount,
+            confirmed_amount=sum((group.confirmed_amount for group in debt_groups), Decimal(0)),
+            last_known_amount=sum((group.last_known_amount for group in debt_groups), Decimal(0)),
+            no_data_car_count=self._statistics.count_plates_without_reliable_data(cars),
         )
 
         debt_lines = []
@@ -695,6 +703,7 @@ class ConversationController:
             debt_lines.append(
                 texts.format_debt_row(
                     car_number=group.car_number, owner_displays=owner_displays, total_amount=group.total_amount,
+                    provider_states=group.provider_states,
                 )
             )
         debt_messages = texts.format_debt_list_messages(debt_lines)

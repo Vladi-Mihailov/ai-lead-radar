@@ -7,17 +7,18 @@ UnifiedTurkeyCheckService/TurkeyStatisticsService.
 debt_refresh_service.py): police.ge не отслеживает оплату, поэтому там
 "задолженность" — это "известные штрафы", монотонно неубывающие. Turkey
 unified check (GİB/Avrasya/KGM) — authoritative live-источник: каждый
-provider явно отвечает "долг сейчас есть/нет", поэтому здесь
-total_amount=0 у НОВОГО достоверного результата ДЕЙСТВИТЕЛЬНО означает
-"задолженность погашена" — машина корректно исчезает из debt-списка (см.
-TurkeyStatisticsService.get_debt_rows — total_amount <= 0 уже
-исключается, никакой новой логики фильтрации здесь не нужно).
+provider явно отвечает "долг сейчас есть/нет", поэтому УСПЕШНЫЙ ответ
+провайдера без долга ДЕЙСТВИТЕЛЬНО означает "долг этого провайдера
+погашен", а ошибка провайдера — "неизвестно" (см.
+TurkeyStatisticsService.get_debt_rows — последний успешный результат
+отдельно по GİB и KGM, никакой своей логики фильтрации здесь нет).
 
-Селекция кандидатов ПОЛНОСТЬЮ переиспользует authoritative selection
-semantics debt statistics block (TurkeyStatisticsService.get_debt_rows +
-TurkeyCheckRunRepository.get_latest_reliable_for_owner) — ERROR никогда не
-"последнее состояние", total_amount<=0 не кандидат, задачи без ни одной
-достоверной проверки не кандидаты. Ничего из этого не переизобретается.
+Селекция кандидатов ПОЛНОСТЬЮ переиспользует расчёт debt statistics
+block (TurkeyStatisticsService.get_debt_rows — тот же список, что видит
+менеджер в 📊 Статистика): машина — кандидат, пока по последним успешным
+результатам GİB/KGM у её номера есть долг, в том числе когда последняя
+проверка провайдера упала (STALE) — такую машину и нужно перепроверить.
+Ничего из этого не переизобретается.
 
 Отсутствие уведомлений владельцам — АРХИТЕКТУРНОЕ свойство: этот класс не
 имеет ссылки ни на TurkeyMonitoringService, ни на любой notifier — он
@@ -52,7 +53,7 @@ from dataclasses import dataclass
 
 from reader.turkey_bot.statistics_service import TurkeyDebtRow, TurkeyStatisticsService
 from reader.turkey_bot.unified.check_service import UnifiedTurkeyCheckService
-from reader.turkey_bot.unified.models import OverallStatus
+from reader.turkey_bot.unified.models import OverallStatus, ProviderStatus
 from reader.turkey_bot.unified.run_repository import TurkeyCheckRunRepository
 from reader.turkey_bot.user_cars_repository import TurkeyUserCarsRepository
 
@@ -95,7 +96,13 @@ class TurkeyRefreshOutcome:
     (каждый физический plate ровно один раз, независимо от числа owners),
     посчитана из того же by_plate group, что уже строит refresh() для
     provider-дедупликации — ИМЕННО это summary UI (format_debt_refresh_
-    summary) обязан использовать для "Проверено"/"⚠️"/"❌"."""
+    summary) обязан использовать для "Проверено"/"⚠️"/"❌".
+
+    partial_failed_providers — для КАЖДОГО номера из partial_car_numbers
+    (тот же порядок) провайдеры, ответившие ошибкой ("gib"/"avrasya"/
+    "kgm"), — чтобы summary показывал, КАКОЙ провайдер не ответил (см.
+    задачу "Turkey debt list: последний успешный результат отдельно по
+    каждому провайдеру и госномеру")."""
 
     checked: int
     failed: int
@@ -106,6 +113,7 @@ class TurkeyRefreshOutcome:
     error_plates: int = 0
     partial_car_numbers: tuple[str, ...] = ()
     error_car_numbers: tuple[str, ...] = ()
+    partial_failed_providers: tuple[tuple[str, ...], ...] = ()
 
 
 class TurkeyRefreshAlreadyInProgressError(Exception):
@@ -138,10 +146,10 @@ class TurkeyDebtRefreshService:
         return self._in_progress
 
     def list_candidates(self) -> list[TurkeyDebtRow]:
-        """ТОЛЬКО чтение — та же authoritative selection semantics, что и
-        "🚨 Задолженность по последней проверке" (см.
-        TurkeyStatisticsService.get_debt_rows) — используется и для
-        превью "Будет проверено автомобилей: N" (см. задачу "FLOW": "до
+        """ТОЛЬКО чтение — РОВНО тот же расчёт, что и "🚨 Задолженность по
+        последней проверке" (см. TurkeyStatisticsService.get_debt_rows —
+        последние успешные результаты GİB/KGM по номеру) — используется и
+        для превью "Будет проверено автомобилей: N" (см. задачу "FLOW": "до
         нажатия подтверждения НИКАКИХ provider requests"), и внутри
         refresh() для собственно списка проверки."""
         total = self._garage.count_all()
@@ -155,16 +163,16 @@ class TurkeyDebtRefreshService:
         КАЖДОГО owner этого plate (см. TurkeyCheckRunRepository.save() —
         уже поддерживает несколько сохранений одного result под разными
         telegram_user_id). ERROR/PARTIAL -> failed (не гарантированно
-        полная проверка, см. задачу "PARTIAL"): для ERROR предыдущее
-        достоверное состояние НЕ считается стёртым — get_latest_reliable_
-        for_owner сама пропустит ERROR-строку и вернёт прежний reliable
-        результат; PARTIAL, наоборот, СТАНОВИТСЯ новым reliable состоянием,
-        как и везде в unified-архитектуре, но помечается failed именно в
-        ЭТОМ summary (см. задачу: "summary должен честно показать, что
-        проверка была неполной"). Актуальный список после refresh — заново
-        перечитанный persisted state (см. list_candidates()/
-        ConversationController._build_debt_section), не накапливается
-        здесь построчно."""
+        полная проверка, см. задачу "PARTIAL" — summary честно показывает,
+        что проверка была неполной, и какие провайдеры не ответили). Ни
+        ERROR, ни PARTIAL не стирают известный долг: список считается по
+        последнему успешному результату КАЖДОГО провайдера (см.
+        TurkeyStatisticsService.get_debt_rows), поэтому упавший провайдер
+        остаётся с последней известной суммой, а успешно ответившие
+        провайдеры того же PARTIAL-run обновляют свою. Актуальный список
+        после refresh — заново перечитанный persisted state (см.
+        list_candidates()/ConversationController._build_debt_section), не
+        накапливается здесь построчно."""
         if self._in_progress:
             raise TurkeyRefreshAlreadyInProgressError()
 
@@ -182,6 +190,7 @@ class TurkeyDebtRefreshService:
             partial_plates = 0
             error_plates = 0
             partial_car_numbers: list[str] = []
+            partial_failed_providers: list[tuple[str, ...]] = []
             error_car_numbers: list[str] = []
 
             for index, (plate, rows) in enumerate(by_plate.items()):
@@ -208,6 +217,9 @@ class TurkeyDebtRefreshService:
                 elif result.overall_status == OverallStatus.PARTIAL:
                     partial_plates += 1
                     partial_car_numbers.append(plate)
+                    partial_failed_providers.append(tuple(
+                        p.provider for p in result.providers if p.status == ProviderStatus.ERROR
+                    ))
                 else:
                     successful_plates += 1
 
@@ -227,6 +239,7 @@ class TurkeyDebtRefreshService:
                 total_plates=len(by_plate), successful_plates=successful_plates,
                 partial_plates=partial_plates, error_plates=error_plates,
                 partial_car_numbers=tuple(partial_car_numbers), error_car_numbers=tuple(error_car_numbers),
+                partial_failed_providers=tuple(partial_failed_providers),
             )
         finally:
             self._in_progress = False

@@ -17,6 +17,7 @@ description) — тихий fallback на турецкий текст, если 
 _translate_fines)."""
 
 import re
+from datetime import datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -26,7 +27,11 @@ from reader.turkey_bot.debt_refresh_service import TurkeyRefreshOutcome
 from reader.turkey_bot.gib.models import GibFineRecord
 from reader.turkey_bot.kgm.models import KgmOperatorResult
 from reader.turkey_bot.models import TurkeyUserCar
-from reader.turkey_bot.statistics_service import TurkeyStatistics
+from reader.turkey_bot.statistics_service import (
+    TurkeyProviderDebtState,
+    TurkeyProviderFreshness,
+    TurkeyStatistics,
+)
 from reader.turkey_bot.unified.models import (
     OverallStatus,
     ProviderCheckResult,
@@ -734,22 +739,43 @@ def format_statistics_header(stats: TurkeyStatistics) -> str:
     ])
 
 
-def format_debt_summary_block(*, debt_car_count: int, debt_total_amount: Decimal) -> str:
+def format_debt_summary_block(
+    *, debt_car_count: int, debt_total_amount: Decimal,
+    confirmed_amount: Decimal | None = None, last_known_amount: Decimal = Decimal(0),
+    no_data_car_count: int = 0,
+) -> str:
     """"🚨 Задолженность по последней проверке" (debt_car_count/
-    debt_total_amount — см. TurkeyStatisticsService.get_debt_rows(),
-    ТОЛЬКО последний ДОСТОВЕРНЫЙ, не-ERROR результат на машину).
-    Переиспользуется И обычным 📊 Статистика, И результатом "🔄 Проверить
-    авто с задолженностью" (см. ConversationController._build_debt_section)
-    — один и тот же блок в обоих местах. См. задачу "manager Statistics /
-    refresh для обоих ботов" — единый компактный формат для Georgia и
-    Turkey: БЕЗ "≥"-пометки PARTIAL (PARTIAL по-прежнему учитывается в
-    персистентном состоянии, см. get_debt_rows()/TurkeyDebtRow.is_partial,
-    просто больше не выделяется визуально)."""
-    return "\n".join([
+    debt_total_amount — см. TurkeyStatisticsService.get_debt_rows():
+    последние УСПЕШНЫЕ результаты GİB и KGM по номеру). Переиспользуется И
+    обычным 📊 Статистика, И результатом "🔄 Проверить авто с
+    задолженностью" (см. ConversationController._build_debt_section) —
+    один и тот же блок в обоих местах. БЕЗ "≥"-пометки PARTIAL (см. задачу
+    "manager Statistics / refresh для обоих ботов").
+
+    См. задачу "Turkey debt list: последний успешный результат отдельно по
+    каждому провайдеру и госномеру" — когда часть суммы известна только по
+    более ранней проверке (last_known_amount > 0, провайдер не ответил),
+    сумма делится на подтверждённую последними проверками и последнюю
+    известную — последняя известная НИКОГДА не выдаётся за подтверждённую
+    сегодня. confirmed_amount по умолчанию = debt_total_amount -
+    last_known_amount (тождество по построению: NO_DATA-провайдеры в сумму
+    не входят). no_data_car_count > 0 — отдельная строка про машины без
+    достоверных данных (см. TurkeyStatisticsService.
+    count_plates_without_reliable_data). Без этих аргументов блок — ровно
+    прежние три строки."""
+    lines = [
         "🚨 Задолженность по последней проверке",
         f"Автомобилей: {debt_car_count}",
         f"Общая сумма: {_format_try_amount(debt_total_amount)}",
-    ])
+    ]
+    if last_known_amount > 0:
+        if confirmed_amount is None:
+            confirmed_amount = debt_total_amount - last_known_amount
+        lines.append(f"✅ Подтверждено последними проверками: {_format_try_amount(confirmed_amount)}")
+        lines.append(f"⚠️ Последняя известная (провайдер не ответил): {_format_try_amount(last_known_amount)}")
+    if no_data_car_count > 0:
+        lines.append(f"❔ Нет достоверных данных GİB/KGM: {no_data_car_count} авто")
+    return "\n".join(lines)
 
 
 def format_statistics_footer(stats: TurkeyStatistics) -> str:
@@ -794,21 +820,62 @@ def format_statistics(
     ])
 
 
-def format_debt_row(*, car_number: str, owner_displays: list[str], total_amount: Decimal) -> str:
+def format_debt_row(
+    *, car_number: str, owner_displays: list[str], total_amount: Decimal,
+    provider_states: tuple[TurkeyProviderDebtState, ...] = (),
+) -> str:
     """"🚗 CAR: owner: amount ₺" (см. задачу "manager Statistics / refresh
     для обоих ботов" п.1 — единый компактный формат, тот же, что и у
     Georgia, БЕЗ даты/checked_at/"сегодня"/"вчера"/"N дней назад" и БЕЗ
-    " — "-разделителей/"≥"/"· частично"). total_amount — уже готовый
-    authoritative unified total (см. TurkeyDebtCarGroup), НЕ пересчитывается
-    здесь. owner_displays — см. задачу "Turkey manager debt statistics
-    aggregation": один физический car_number может принадлежать нескольким
-    владельцам — все перечисляются через " | " (single-owner case — тот
-    же самый вид строки, что и раньше, join одного элемента не меняет
-    текст), а amount печатается РОВНО один раз в конце (не дублируется на
-    каждого owner)."""
+    " — "-разделителей/"≥"/"· частично"). total_amount — уже готовая сумма
+    (см. TurkeyDebtCarGroup), НЕ пересчитывается здесь. owner_displays —
+    см. задачу "Turkey manager debt statistics aggregation": один
+    физический car_number может принадлежать нескольким владельцам — все
+    перечисляются через " | ", а amount печатается РОВНО один раз в конце.
+
+    provider_states — см. задачу "Turkey debt list: последний успешный
+    результат отдельно по каждому провайдеру и госномеру": если ВСЕ
+    провайдеры CURRENT (или состояния не переданы), строка — прежняя одна
+    строка без дат. Иначе сумма помечается "⚠️" (подтверждена не
+    полностью), и под строкой по одной строке на GİB и KGM — что
+    подтверждено последней проверкой, что известно только по более ранней
+    успешной проверке (с её датой и датой неответа), по какому провайдеру
+    достоверных данных нет."""
     amount_text = _format_try_amount(total_amount)
     owners_text = " | ".join(owner_displays)
-    return f"🚗 {format_plate_for_telegram(car_number)}: {owners_text}: {amount_text}"
+    header = f"🚗 {format_plate_for_telegram(car_number)}: {owners_text}: "
+    if all(state.freshness == TurkeyProviderFreshness.CURRENT for state in provider_states):
+        return header + amount_text
+    lines = [f"{header}⚠️ {amount_text}"]
+    lines.extend(f"   {_format_debt_provider_state(state)}" for state in provider_states)
+    return "\n".join(lines)
+
+
+_DEBT_PROVIDER_DISPLAY = {"gib": "GİB", "avrasya": "Avrasya", "kgm": "KGM"}
+
+
+def _format_debt_date(moment: datetime) -> str:
+    return moment.astimezone(_DISPLAY_TZ).strftime("%d.%m.%Y")
+
+
+def _format_debt_provider_state(state: TurkeyProviderDebtState) -> str:
+    """Одна строка-пояснение под строкой задолженности (см. format_debt_row):
+    ✅ — подтверждено последней проверкой провайдера, ⚠️ — последняя
+    известная сумма (последняя попытка — ошибка), ❔ — достоверных данных
+    нет."""
+    name = _DEBT_PROVIDER_DISPLAY.get(state.provider, state.provider)
+    amount_text = _format_try_amount(state.amount) if state.amount > 0 else "без долга"
+    if state.freshness == TurkeyProviderFreshness.CURRENT:
+        return f"✅ {name}: {amount_text} — проверка {_format_debt_date(state.last_success_at)}"
+    if state.freshness == TurkeyProviderFreshness.STALE:
+        return (
+            f"⚠️ {name}: {amount_text} — последняя известная "
+            f"(успешная проверка {_format_debt_date(state.last_success_at)}), "
+            f"не ответил {_format_debt_date(state.last_attempt_at)}"
+        )
+    if state.last_attempt_at is not None:
+        return f"❔ {name}: нет достоверных данных (не ответил {_format_debt_date(state.last_attempt_at)})"
+    return f"❔ {name}: нет достоверных данных (не проверялся)"
 
 
 def format_debt_list_messages(rows: list[str]) -> list[str]:
@@ -877,7 +944,9 @@ def format_debt_refresh_summary(outcome: TurkeyRefreshOutcome) -> str:
     вовсе (ранее "⚠️ Не удалось проверить: 0" показывалось всегда — см.
     задачу). PARTIAL и ERROR остаются различимы: PARTIAL — "⚠️ Проверено
     частично" (часть провайдеров успешна), ERROR — "❌ Не удалось
-    проверить" (полный провал), один не подменяет другой."""
+    проверить" (полный провал), один не подменяет другой. У частично
+    проверенных номеров в скобках — какие провайдеры не ответили (см.
+    TurkeyRefreshOutcome.partial_failed_providers)."""
     lines = ["🔄 Проверка завершена", ""]
 
     if outcome.partial_plates == 0 and outcome.error_plates == 0:
@@ -892,9 +961,7 @@ def format_debt_refresh_summary(outcome: TurkeyRefreshOutcome) -> str:
 
     detail_lines = []
     if outcome.partial_car_numbers:
-        detail_lines.append(
-            "Частично: " + ", ".join(format_plate_for_telegram(p) for p in outcome.partial_car_numbers)
-        )
+        detail_lines.append("Частично: " + ", ".join(_format_partial_plates(outcome)))
     if outcome.error_car_numbers:
         detail_lines.append(
             "Не удалось проверить: " + ", ".join(format_plate_for_telegram(p) for p in outcome.error_car_numbers)
@@ -904,6 +971,24 @@ def format_debt_refresh_summary(outcome: TurkeyRefreshOutcome) -> str:
         lines.extend(detail_lines)
 
     return "\n".join(lines)
+
+
+def _format_partial_plates(outcome: TurkeyRefreshOutcome) -> list[str]:
+    """"PLATE (KGM)" для каждого частично проверенного номера;
+    partial_failed_providers может отсутствовать (outcome, собранный без
+    него) — тогда только номера, как раньше."""
+    failed_by_index = (
+        outcome.partial_failed_providers
+        if len(outcome.partial_failed_providers) == len(outcome.partial_car_numbers)
+        else ((),) * len(outcome.partial_car_numbers)
+    )
+    formatted = []
+    for plate, failed_providers in zip(outcome.partial_car_numbers, failed_by_index):
+        text = format_plate_for_telegram(plate)
+        if failed_providers:
+            text += " (" + ", ".join(_DEBT_PROVIDER_DISPLAY.get(p, p) for p in failed_providers) + ")"
+        formatted.append(text)
+    return formatted
 
 
 # ---- Unified check rendering (см. design report "Перестроить UX Turkey
