@@ -60,8 +60,10 @@ Every request carries three headers (`reader/turkey_bot/kgm/relay_auth.py`):
 
 A repeated nonce is rejected (replay). A nonce is remembered only after its
 signature has been verified. Requests signed before the relay process started
-are rejected too, so a restart does not reopen replay. Both servers therefore
-need NTP-synchronised clocks.
+are rejected too, so a restart does not reopen replay. The relay measures its
+own uptime on the monotonic clock and recomputes that boundary for every
+request, so an NTP step of its clock after start does not block valid
+requests. Both servers still need NTP-synchronised clocks.
 
 | Request | Success | Body |
 |---|---|---|
@@ -84,12 +86,14 @@ the relay protocol version and `kgm_code` a fingerprint of the relay's
 | Wrong method | `405` | `{"error": "method_not_allowed"}` with an `Allow` header |
 | Body over 16 KiB | `413` | `{"error": "payload_too_large"}` |
 | More than 1 new session per 2 s (burst 3), or 600 sessions in the UTC day | `429` | `{"error": "rate_limited"}` |
-| Two sessions open and both in the middle of an operation | `503` | `{"error": "busy"}` |
+| Two sessions open, counting sessions being created, and none of them idle | `503` | `{"error": "busy"}` |
 | KGM failed or missed the deadline (start 65 s, captcha/submit 35 s) | `502` | `{"error": "kgm_transport", "detail": "<exception type, HTTP status or errno>"}` |
 
 When two sessions are open and one of them is idle, a new session closes the
 least recently used idle one (logged as `evicted_idle`) instead of failing
-with `503`. One KGM operation runs at a time (`asyncio.Semaphore(1)`). A
+with `503`. This is safe because production runs one check at a time: when it
+asks for a new session, the open ones are leftovers whose `DELETE` never
+arrived. One KGM operation runs at a time (`asyncio.Semaphore(1)`). A
 session is closed right after any KGM error, because its ASP.NET state is
 unknown and production stops the KGM check after `transport_error` anyway.
 The deadlines follow from KGM's 30 s request timeout and the 1.5 s pause
@@ -110,11 +114,14 @@ the answer (`kgm/parser.py`, `kgm/models.py`). Both servers must run the same
 commit.
 
 - Install the relay **only from a commit that contains the KGM form fix from
-  PR #50**. This command must print the line with `hdnSorguTipi` and
-  `YABANCI`; if it prints nothing, **stop** and do not install:
+  PR #50**. This command must print **both** lines,
+  `_FOREIGN_PLATE_QUERY_TYPE = "YABANCI"` and
+  `"hdnSorguTipi": _FOREIGN_PLATE_QUERY_TYPE,`; if either is missing,
+  **stop** and do not install:
 
   ```bash
-  git grep -n "hdnSorguTipi" <commit> -- reader/turkey_bot/kgm/session.py
+  git grep -n -e '_FOREIGN_PLATE_QUERY_TYPE = "YABANCI"' -e '"hdnSorguTipi": _FOREIGN_PLATE_QUERY_TYPE' \
+      <commit> -- reader/turkey_bot/kgm/session.py
   ```
 
 - Use the commit production runs:
@@ -144,7 +151,8 @@ changes: not its unit, user, install directory (on the live server
    It must show an `ALLOW IN` rule on `wg0` **without a port restriction**
    (for example `Anywhere on wg0  ALLOW IN  Anywhere`). If `wg0` allows only
    port 8766, or there is no `wg0` rule, **stop**: changing UFW needs a
-   separate permission.
+   separate permission. If it prints `Status: inactive`, **stop** and report
+   it: the firewall is not in the state checked on 2026-11-11.
 
 2. Create a dedicated system user:
 
@@ -153,10 +161,11 @@ changes: not its unit, user, install directory (on the live server
    ```
 
 3. Copy only the code the relay needs, from the commit checked in the
-   prerequisite, on a machine with the repository:
+   prerequisite, on a machine with the repository. `core.autocrlf=false`
+   keeps LF line endings even from a Windows checkout:
 
    ```bash
-   git archive --format=tar <commit> \
+   git -c core.autocrlf=false archive --format=tar <commit> \
        reader/__init__.py reader/turkey_bot/__init__.py reader/turkey_bot/kgm \
        requirements-kgm-relay.txt deploy/kgm-relay.service \
      | ssh root@<georgian-server> 'mkdir -p /opt/kgm-relay && tar -x -C /opt/kgm-relay'
@@ -173,7 +182,7 @@ changes: not its unit, user, install directory (on the live server
    /opt/kgm-relay/.venv/bin/pip check
    # Must print "pins match": the venv holds exactly the pinned versions.
    diff <(/opt/kgm-relay/.venv/bin/pip freeze | tr 'A-Z_' 'a-z-' | sort) \
-        <(grep -E '^[A-Za-z]' /opt/kgm-relay/requirements-kgm-relay.txt | tr 'A-Z_' 'a-z-' | sort) \
+        <(grep -E '^[A-Za-z]' /opt/kgm-relay/requirements-kgm-relay.txt | tr -d '\r' | tr 'A-Z_' 'a-z-' | sort) \
      && echo "pins match"
    # The unit makes the file system read-only, so compile the bytecode now.
    /opt/kgm-relay/.venv/bin/python -m compileall -q /opt/kgm-relay/reader
@@ -232,7 +241,7 @@ This needs the merged code on production. It calls only the relay's
    no comments after a value.
 
    ```bash
-   install -d -m 0755 /etc/ai-lead-radar
+   [ -d /etc/ai-lead-radar ] || install -d -m 0755 /etc/ai-lead-radar   # never loosen an existing directory
    install -m 0600 -o root -g root /dev/null /etc/ai-lead-radar/turkeybot-kgm-relay.env
    ```
 
@@ -293,12 +302,16 @@ variables that already exist.
 
    ```
    [Service]
+   Environment=TURKEY_KGM_ROUTE=relay
    EnvironmentFile=-/etc/ai-lead-radar/turkeybot-kgm-relay.env
    ```
 
-   The leading `-` means a missing env file does not stop the bot from
-   starting; the route then stays `direct`. That is why every switch and
-   every rollback is confirmed by the route line in the journal.
+   `Environment=` selects the relay route even if the env file cannot be
+   read. The leading `-` keeps a missing or mistyped env file from stopping
+   the bot: it starts, logs "KGM: маршрут relay не настроен" (no secret),
+   KGM checks end with `transport_error`, and nothing falls back to direct.
+   Values from the env file override `Environment=`, so
+   `TURKEY_KGM_ROUTE=direct` in the file still switches back to direct.
 
 2. Restart only the Turkey bot, outside 17:45–18:45 UTC (the scheduled
    monitoring runs at 21:00 Europe/Istanbul):
@@ -311,9 +324,10 @@ variables that already exist.
    ```
 
    An `ERROR` line "KGM: маршрут relay не настроен — ..." means the env file
-   is wrong. The bot keeps running, KGM checks end with `transport_error`,
-   and nothing falls back to direct. "KGM: маршрут direct" means the env file
-   was not read.
+   is wrong or missing. The bot keeps running, KGM checks end with
+   `transport_error`, and nothing falls back to direct. "KGM: маршрут direct"
+   here means the drop-in was not loaded (check `systemctl daemon-reload` and
+   the file name).
 
 ## Staged switch
 
@@ -335,10 +349,11 @@ variables that already exist.
 Roll out every change to `kgm/session.py`, `parser.py` or `models.py`, and
 every relay change, to the Georgian server with the commit production runs.
 
-1. Copy the code of that commit next to the running one:
+1. Copy the code of that commit next to the running one (LF endings, as in
+   step 3 of the install):
 
    ```bash
-   git archive --format=tar <production-commit> \
+   git -c core.autocrlf=false archive --format=tar <production-commit> \
        reader/__init__.py reader/turkey_bot/__init__.py reader/turkey_bot/kgm \
      | ssh root@<georgian-server> 'rm -rf /opt/kgm-relay/reader.new && mkdir /opt/kgm-relay/reader.new \
          && tar -x -C /opt/kgm-relay/reader.new'
@@ -381,13 +396,15 @@ every relay change, to the Georgian server with the commit production runs.
   # KGM: маршрут direct (прямой запрос к KGM)
   ```
 
-  Because of the `-` in the drop-in, a mistyped path or a missing file does
-  not fail the restart. Confirm the rollback by the line "KGM: маршрут
-  direct", not by the exit status. While KGM still drops production's
-  traffic, KGM checks end with `transport_error`, as they did before the
-  switch. Setting `TURKEY_KGM_ROUTE=direct` in the env file does the same.
-  The code itself needs no rollback: without the env file it stays on
-  `direct`.
+  The rollback is removing the drop-in. Deleting only the env file is not a
+  rollback: the drop-in still sets `TURKEY_KGM_ROUTE=relay`, so the bot logs
+  "маршрут relay не настроен" and KGM ends with `transport_error`. Confirm
+  the rollback by the line "KGM: маршрут direct", not by the exit status.
+  While KGM still drops production's traffic, KGM checks end with
+  `transport_error`, as they did before the switch. Setting
+  `TURKEY_KGM_ROUTE=direct` in the env file also switches back, because the
+  file overrides `Environment=`. The code itself needs no rollback: without
+  the drop-in it stays on `direct`.
 - **Georgian server:** `systemctl disable --now kgm-relay`. To remove it
   completely:
 

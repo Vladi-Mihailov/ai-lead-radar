@@ -87,17 +87,24 @@ class _RedactRelaySessionIdFilter(logging.Filter):
     reader/checkout/tpl_client.py::_RedactEcommerceUrlFilter."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if isinstance(record.msg, str) and _SESSION_PATH_MARKER in record.msg:
-            record.msg = _SESSION_PATH_RE.sub(r"\1{session_id}", record.msg)
-        args = record.args
-        if isinstance(args, tuple) and args:
-            redacted = tuple(
-                _SESSION_PATH_RE.sub(r"\1{session_id}", str(value)) if _SESSION_PATH_MARKER in str(value) else value
-                for value in args
-            )
-            if redacted != args:
-                record.args = redacted
+        try:
+            msg = record.msg
+            if isinstance(msg, str) and _SESSION_PATH_MARKER in msg:
+                msg = _SESSION_PATH_RE.sub(r"\1{session_id}", msg)
+            args = record.args
+            if isinstance(args, tuple) and args:
+                args = tuple(_redact_session_path(value) for value in args)
+        except Exception:
+            # str() аргумента не удался — запись остаётся без изменений, а
+            # фильтр никогда не мешает самому логированию.
+            return True
+        record.msg, record.args = msg, args
         return True
+
+
+def _redact_session_path(value: object) -> object:
+    text = str(value)
+    return _SESSION_PATH_RE.sub(r"\1{session_id}", text) if _SESSION_PATH_MARKER in text else value
 
 
 def _install_session_id_log_redaction() -> None:

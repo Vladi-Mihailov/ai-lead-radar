@@ -168,14 +168,33 @@ async def test_replayed_request_is_rejected():
 
 
 async def test_request_signed_before_the_relay_started_is_rejected(caplog):
-    started_at = time.time() + 30
-    async with TestClient(TestServer(_app(FakeKgm(), started_at=started_at))) as client:
-        before_start = await signed_request(client, "GET", HEALTH)
-        after_start = await signed_request(client, "GET", HEALTH, now=started_at)
+    wall = _Clock(1_800_000_000.0)
+    uptime = _Clock(50.0)
+    async with TestClient(TestServer(_app(FakeKgm(), wall_clock=wall, uptime_clock=uptime))) as client:
+        before_start = await signed_request(client, "GET", HEALTH, now=wall() - 10)
+        after_start = await signed_request(client, "GET", HEALTH, now=wall())
 
     assert before_start.status == 401
     assert after_start.status == 200
     assert "KGM relay: запрос отклонён (before_start)" in _relay_warnings(caplog)
+
+
+async def test_clock_stepped_back_after_start_does_not_block_valid_requests():
+    """Relay стартовал с часами, убежавшими вперёд на 600 с, затем NTP шагнул
+    их назад. Граница "не раньше старта" считается на каждом запросе по
+    монотонным часам и сдвигается вместе с wall clock: корректный запрос
+    принимается сразу, а не через 600 с; подписанный до старта — нет."""
+    true_now = 1_800_000_000.0
+    wall = _Clock(true_now + 600)
+    uptime = _Clock(50.0)
+    async with TestClient(TestServer(_app(FakeKgm(), wall_clock=wall, uptime_clock=uptime))) as client:
+        uptime.advance(5)
+        wall.now = true_now + 5
+        valid = await signed_request(client, "GET", HEALTH, now=true_now + 5)
+        signed_before_start = await signed_request(client, "GET", HEALTH, now=true_now - 30)
+
+    assert valid.status == 200
+    assert signed_before_start.status == 401
 
 
 async def test_signature_covers_the_query_string():

@@ -3,6 +3,7 @@ production -> KGM relay: подпись, окно ±60 с, nonce против re
 ограниченный NonceCache, минимальная длина секрета."""
 
 import hashlib
+import ipaddress
 
 import pytest
 
@@ -254,3 +255,19 @@ def test_verify_rejects_when_nonce_cache_is_full():
     assert _verify(_headers(), cache=cache) == (True, None)
 
     assert _verify(_headers(nonce="f" * 32), cache=cache) == (False, "nonce_cache_full")
+
+
+@pytest.mark.parametrize("network", [
+    "10.50.0.0/24", "127.0.0.0/8", "fd00::/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.1.0/24", "::1/128",
+])
+def test_private_networks_are_accepted(network):
+    assert relay_auth.is_private_network(ipaddress.ip_network(network))
+
+
+@pytest.mark.parametrize("network", [
+    # 0.0.0.0/0 проходил ip_network(...).is_private до CPython 3.12.4 (CVE-2024-4032).
+    "0.0.0.0/0", "0.0.0.0/1", "10.0.0.0/7", "8.8.8.0/24", "172.32.0.0/16", "169.254.0.0/16",
+    "::/0", "fe80::/10", "2001:db8::/32",
+])
+def test_public_or_too_wide_networks_are_rejected(network):
+    assert not relay_auth.is_private_network(ipaddress.ip_network(network))

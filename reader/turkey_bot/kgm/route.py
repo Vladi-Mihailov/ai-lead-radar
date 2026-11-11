@@ -43,7 +43,7 @@ from dotenv import dotenv_values, load_dotenv
 
 from reader.turkey_bot.kgm.models import KgmCaptchaChallenge
 from reader.turkey_bot.kgm.provider import KgmProvider
-from reader.turkey_bot.kgm.relay_auth import MIN_SECRET_LENGTH, secret_problem
+from reader.turkey_bot.kgm.relay_auth import MIN_SECRET_LENGTH, is_private_network, secret_problem
 from reader.turkey_bot.kgm.relay_client import RelayKgmSession
 from reader.turkey_bot.kgm.relay_version import RELAY_PROTOCOL_VERSION, kgm_code_fingerprint
 from reader.turkey_bot.kgm.session import KgmTransportError
@@ -113,7 +113,7 @@ def resolve_kgm_route(env: Mapping[str, str]) -> KgmRoute:
         network = ipaddress.ip_network((env.get(RELAY_NETWORK_ENV) or DEFAULT_RELAY_NETWORK).strip())
     except ValueError:
         return KgmRoute(name="misconfigured", problem=f"{RELAY_NETWORK_ENV}: invalid network")
-    if not network.is_private:
+    if not is_private_network(network):
         return KgmRoute(name="misconfigured", problem=f"{RELAY_NETWORK_ENV}: only a private (WireGuard) network")
     url = (env.get(RELAY_URL_ENV) or DEFAULT_RELAY_URL).strip()
     url_problem = _relay_url_problem(url, network)

@@ -134,8 +134,9 @@ def test_ip_literal_urls_inside_the_network_are_accepted(url):
     assert resolve_kgm_route(_relay_env(TURKEY_KGM_RELAY_URL=url)).name == "relay"
 
 
-def test_ipv6_url_inside_a_custom_network_is_accepted():
-    env = _relay_env(TURKEY_KGM_RELAY_URL="http://[fd00::2]:8767", TURKEY_KGM_RELAY_ALLOWED_NETWORK="fd00::/64")
+@pytest.mark.parametrize("network", ["fd00::/64", "fd00::/8"])
+def test_ipv6_url_inside_a_custom_network_is_accepted(network):
+    env = _relay_env(TURKEY_KGM_RELAY_URL="http://[fd00::2]:8767", TURKEY_KGM_RELAY_ALLOWED_NETWORK=network)
 
     assert resolve_kgm_route(env).name == "relay"
 
@@ -162,6 +163,12 @@ _MISCONFIGURED = [
     ),
     pytest.param(
         _relay_env(TURKEY_KGM_RELAY_ALLOWED_NETWORK="0.0.0.0/0"), "TURKEY_KGM_RELAY_ALLOWED_NETWORK", id="public-net",
+    ),
+    pytest.param(
+        _relay_env(TURKEY_KGM_RELAY_ALLOWED_NETWORK="0.0.0.0/1"), "TURKEY_KGM_RELAY_ALLOWED_NETWORK", id="half-net",
+    ),
+    pytest.param(
+        _relay_env(TURKEY_KGM_RELAY_ALLOWED_NETWORK="10.0.0.0/7"), "TURKEY_KGM_RELAY_ALLOWED_NETWORK", id="wide-net",
     ),
     pytest.param({"TURKEY_KGM_ROUTE": "proxy"}, "TURKEY_KGM_ROUTE: unknown value", id="unknown-route"),
 ]

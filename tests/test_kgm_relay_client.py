@@ -495,6 +495,34 @@ async def test_httpx_request_lines_carry_a_session_id_placeholder_instead_of_the
     assert any('"HTTP/1.1 204 No Content"' in line for line in httpx_lines)
 
 
+def test_session_id_filter_redacts_message_and_arguments_and_always_passes_the_record():
+    record = logging.LogRecord(
+        "httpx", logging.INFO, __file__, 1, f"GET /internal/kgm/sessions/{SESSION_ID} %s %d",
+        (f"http://10.50.0.2:8767/internal/kgm/sessions/{SESSION_ID}/submit", 200), None,
+    )
+
+    assert relay_client._RedactRelaySessionIdFilter().filter(record) is True
+    assert record.getMessage() == (
+        "GET /internal/kgm/sessions/{session_id} http://10.50.0.2:8767/internal/kgm/sessions/{session_id}/submit 200"
+    )
+
+
+def test_session_id_filter_leaves_the_record_unchanged_when_an_argument_cannot_be_stringified():
+    class Unprintable:
+        def __str__(self):
+            raise RuntimeError("no str")
+
+    record = logging.LogRecord(
+        "httpx", logging.INFO, __file__, 1, f"/internal/kgm/sessions/{SESSION_ID} %s %s",
+        (f"/internal/kgm/sessions/{SESSION_ID}", Unprintable()), None,
+    )
+    msg, args = record.msg, record.args
+
+    assert relay_client._RedactRelaySessionIdFilter().filter(record) is True
+    assert record.msg is msg
+    assert record.args is args
+
+
 def test_session_id_redaction_filter_is_installed_once():
     relay_client._install_session_id_log_redaction()
     relay_client._install_session_id_log_redaction()

@@ -77,7 +77,9 @@ def test_host_outside_the_allowed_network_is_refused(host):
     assert "KGM_RELAY_ALLOWED_NETWORK" in str(excinfo.value)
 
 
-@pytest.mark.parametrize("network", ["", "garbage", "10.50.0.2/24", "10.50.0.0/33", "0.0.0.0/0", "8.8.8.0/24"])
+@pytest.mark.parametrize("network", [
+    "", "garbage", "10.50.0.2/24", "10.50.0.0/33", "0.0.0.0/0", "0.0.0.0/1", "10.0.0.0/7", "8.8.8.0/24",
+])
 def test_invalid_or_public_allowed_network_is_refused(network):
     with pytest.raises(RelayConfigError) as excinfo:
         _config(KGM_RELAY_ALLOWED_NETWORK=network)
@@ -89,6 +91,7 @@ def test_invalid_or_public_allowed_network_is_refused(network):
     ("10.50.0.0/24", "10.50.0.2", "10.50.0.2"),
     ("127.0.0.0/8", " 127.0.0.1 ", "127.0.0.1"),
     ("fd00::/64", "[fd00::2]", "fd00::2"),
+    ("fd00::/8", "fd00::2", "fd00::2"),
 ])
 def test_specific_ip_inside_the_network_is_accepted(network, host, expected):
     config = _config(KGM_RELAY_ALLOWED_NETWORK=network, KGM_RELAY_HOST=host)

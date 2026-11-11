@@ -525,14 +525,22 @@ def _build_network_middleware(networks: tuple[IpNetwork, ...]):
     return network_middleware
 
 
-def _build_auth_middleware(hmac_secret: str, wall_clock: Callable[[], float], not_before: int):
+def _build_auth_middleware(
+    hmac_secret: str, wall_clock: Callable[[], float], uptime_clock: Callable[[], float],
+):
     nonce_cache = relay_auth.NonceCache()
+    started_uptime = uptime_clock()
 
     @web.middleware
     async def auth_middleware(request: web.Request, handler) -> web.StreamResponse:
         # read() сам соблюдает client_max_size: больше 16 KiB ->
         # HTTPRequestEntityTooLarge, его превращает в 413 _access_log_middleware.
         body = await request.read()
+        now = wall_clock()
+        # Момент старта процесса в ТЕКУЩЕЙ шкале wall clock, на каждом запросе:
+        # если часы после старта шагнули (NTP поправил убежавшие вперёд),
+        # граница сдвигается вместе с ними и не отклоняет корректные запросы.
+        not_before = int(now - (uptime_clock() - started_uptime))
         is_valid, reason = relay_auth.verify(
             hmac_secret,
             method=request.method,
@@ -542,7 +550,7 @@ def _build_auth_middleware(hmac_secret: str, wall_clock: Callable[[], float], no
             nonce=request.headers.get(relay_auth.NONCE_HEADER),
             signature=request.headers.get(relay_auth.SIGNATURE_HEADER),
             nonce_cache=nonce_cache,
-            now=wall_clock(),
+            now=now,
             not_before=not_before,
         )
         if not is_valid:
@@ -560,7 +568,7 @@ def build_kgm_relay_app(
     session_factory: KgmSessionFactory = default_session_factory,
     clock: Callable[[], float] = time.monotonic,
     wall_clock: Callable[[], float] = time.time,
-    started_at: float | None = None,
+    uptime_clock: Callable[[], float] = time.monotonic,
     session_ttl_seconds: float = SESSION_TTL_SECONDS,
     max_open_sessions: int = MAX_OPEN_SESSIONS,
     session_rate_per_second: float = SESSION_RATE_PER_SECOND,
@@ -572,10 +580,13 @@ def build_kgm_relay_app(
 ) -> web.Application:
     """allowed_networks обязателен и не может быть пустым: relay_main.py
     передаёт KGM_RELAY_ALLOWED_NETWORK (сеть WireGuard), тесты — 127.0.0.0/8.
-    started_at — момент старта процесса (по умолчанию — сборка приложения):
-    запросы, подписанные раньше, отклоняются. clock — монотонные часы для TTL
-    и token bucket, wall_clock — время для подписи и суток UTC; они, сроки
-    операций и лимиты подменяются только в тестах."""
+    Запросы, подписанные раньше старта процесса (сборки приложения),
+    отклоняются; граница — wall_clock() - (uptime_clock() - uptime при
+    старте), на каждом запросе. clock — монотонные часы для TTL и token
+    bucket, uptime_clock — отдельные монотонные часы только для этой границы
+    (тесты TTL замораживают clock, и граница не должна идти за wall clock),
+    wall_clock — время для подписи и суток UTC. Часы, сроки операций и лимиты
+    подменяются только в тестах."""
     relay_auth.require_secret(hmac_secret)
     networks = tuple(ipaddress.ip_network(network) for network in allowed_networks)
     if not networks:
@@ -594,12 +605,11 @@ def build_kgm_relay_app(
         cleanup_interval_seconds=cleanup_interval_seconds,
         kgm_code=kgm_code_fingerprint(),
     )
-    not_before = int(wall_clock() if started_at is None else started_at)
     app = web.Application(
         middlewares=[
             _access_log_middleware,
             _build_network_middleware(networks),
-            _build_auth_middleware(hmac_secret, wall_clock, not_before),
+            _build_auth_middleware(hmac_secret, wall_clock, uptime_clock),
         ],
         client_max_size=MAX_REQUEST_BODY_SIZE,
         # Штатный access log aiohttp пишет строку запроса целиком, а в пути

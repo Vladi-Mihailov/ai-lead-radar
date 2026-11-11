@@ -14,10 +14,12 @@ docs/kgm-relay.md, relay_server.py и relay_client.py этого же пакет
 path это путь запроса ровно в том виде, в каком он ушёл по сети (вместе с
 query, если она есть), body — сырые байты тела (пустое тело тоже
 хэшируется). Только stdlib: модуль импортируют обе стороны, а relay ставится
-с минимальным requirements-kgm-relay.txt."""
+с минимальным requirements-kgm-relay.txt. Здесь же общая для обеих сторон
+проверка "сеть WireGuard — частная" (is_private_network)."""
 
 import hashlib
 import hmac
+import ipaddress
 import re
 import secrets
 import time
@@ -43,6 +45,23 @@ NONCE_CACHE_MAX_SIZE = 4096
 _TIMESTAMP_RE = re.compile(r"[0-9]{1,12}")
 _NONCE_RE = re.compile(r"[0-9a-f]{32}")
 _SIGNATURE_RE = re.compile(r"[0-9a-f]{64}")
+
+# Явный список вместо ip_network(...).is_private: до CPython 3.12.4
+# (CVE-2024-4032) сеть считалась частной по первому и последнему адресу, и
+# 0.0.0.0/0 проходила, а на грузинском сервере Python 3.12.3.
+_PRIVATE_NETWORKS = tuple(
+    ipaddress.ip_network(network)
+    for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "fc00::/7", "::1/128")
+)
+
+
+def is_private_network(network: ipaddress.IPv4Network | ipaddress.IPv6Network) -> bool:
+    """True — сеть целиком внутри одной из частных сетей выше. Общая проверка
+    KGM_RELAY_ALLOWED_NETWORK (relay_main.py) и TURKEY_KGM_RELAY_ALLOWED_NETWORK
+    (route.py): правило "только WireGuard" нельзя отключить сетью 0.0.0.0/0."""
+    return any(
+        network.version == allowed.version and network.subnet_of(allowed) for allowed in _PRIVATE_NETWORKS
+    )
 
 
 def secret_problem(secret: object) -> str | None:

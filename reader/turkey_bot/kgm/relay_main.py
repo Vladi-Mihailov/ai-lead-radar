@@ -73,7 +73,7 @@ def load_config(env: Mapping[str, str]) -> RelayConfig:
         network = ipaddress.ip_network(env.get("KGM_RELAY_ALLOWED_NETWORK", DEFAULT_ALLOWED_NETWORK).strip())
     except ValueError:
         raise RelayConfigError("KGM_RELAY_ALLOWED_NETWORK: нужна сеть вида 10.50.0.0/24") from None
-    if not network.is_private:
+    if not relay_auth.is_private_network(network):
         # 0.0.0.0/0 и любая публичная сеть отключили бы правило "только WireGuard".
         raise RelayConfigError("KGM_RELAY_ALLOWED_NETWORK: допускается только частная сеть (WireGuard)")
 
