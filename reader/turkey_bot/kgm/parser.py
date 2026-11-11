@@ -43,6 +43,7 @@ from reader.turkey_bot.kgm.models import (
     KGM_GROUP_OPERATOR_KEY,
     OPERATOR_DISPLAY_NAMES,
     KgmDebtItem,
+    KgmDiagnostics,
     KgmOperatorResult,
     KgmSubmitOutcome,
 )
@@ -94,9 +95,117 @@ _REQUIRED_COLUMNS = (
 
 _HAS_DEBT_LABEL_RE = re.compile(r":\s*(\d+)\s*kayıt\s*$")
 
+# См. задачу "KGM diagnostic logging" — фиксированный словарь для
+# БЕЗОПАСНОЙ классификации свободного текста сайта (lblHata, <title>
+# не-delta ответа, текст ASP.NET-исключения в delta-чанке "error"): в
+# diagnostics попадают только канонические имена из ключей, сам текст —
+# никогда (в нём теоретически может оказаться госномер). И текст, и
+# варианты сравниваются после _fold (турецкие буквы -> ASCII).
+_DIAGNOSTIC_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "hata": ("hata", "error"),
+    "zaman_asimi": ("zaman aşımı", "zaman asimi", "timeout", "timed out"),
+    "bakim": ("bakım", "bakim", "maintenance"),
+    "yogunluk": ("yoğun", "yogun", "busy"),
+    "tekrar_deneyin": ("tekrar", "daha sonra", "try again", "later"),
+    "sistem": ("sistem", "system"),
+    "servis": ("servis", "service"),
+    "baglanti": ("bağlantı", "baglanti", "connection"),
+    "erisim": ("erişim", "erisim", "access", "denied", "forbidden", "yetki"),
+    "engel": ("engel", "block", "rejected", "reddedildi"),
+    "gecersiz": ("geçersiz", "gecersiz", "invalid"),
+    "guvenlik": ("güvenlik", "guvenlik", "security", "captcha"),
+    "plaka": ("plaka", "plate"),
+    "kayit": ("kayıt", "kayit", "record"),
+    "bulunamadi": ("bulunamadı", "bulunamadi", "not found"),
+    "limit": ("limit", "sınır", "sinir", "çok fazla", "cok fazla", "too many"),
+    "oturum": ("oturum", "session"),
+    "viewstate": ("viewstate", "view state"),
+    "veritabani": ("veritabanı", "veritabani", "database", "sql"),
+}
 
-def _unexpected(message: str) -> KgmSubmitOutcome:
-    return KgmSubmitOutcome(kind="unexpected", message=message)
+# Турецкие буквы -> ASCII ПОСЛЕ casefold: "ZAMAN AŞIMI".casefold() даёт
+# "zaman aşimi" (I -> i, но Ş остаётся) — без этого не совпал бы ни
+# "zaman aşımı", ни "zaman asimi".
+_TURKISH_TO_ASCII = str.maketrans("ışğçöüâîû", "isgcouaiu")
+
+
+def _fold(text: str) -> str:
+    """casefold + снятие combining dot (U+0307, его даёт турецкая "İ") +
+    турецкие буквы -> ASCII. Применяется и к тексту, и к вариантам
+    _DIAGNOSTIC_KEYWORDS."""
+    return text.casefold().replace("̇", "").translate(_TURKISH_TO_ASCII)
+
+
+_FOLDED_DIAGNOSTIC_KEYWORDS = {
+    name: tuple(_fold(needle) for needle in needles) for name, needles in _DIAGNOSTIC_KEYWORDS.items()
+}
+
+# Сколько символов свободного текста анализировать (ключевые слова/цифры) и
+# сколько начала НЕ-delta ответа просматривать: ответ присылает сервер,
+# диагностика не должна стоить дороже самого разбора.
+_DIAGNOSTIC_TEXT_SCAN_CHARS = 4096
+_DIAGNOSTIC_RESPONSE_SCAN_CHARS = 65536
+
+# Протокольные типы delta-чанков ASP.NET AJAX — в diagnostics попадают
+# ТОЛЬКО они (тип чанка присылает сервер); остальные лишь считаются.
+_ASP_NET_DELTA_CHUNK_TYPES = frozenset({
+    "#", "updatePanel", "hiddenField", "scriptBlock", "scriptStartupBlock", "scriptDispose", "expando",
+    "onSubmit", "asyncPostBackControlIDs", "postBackControlIDs", "updatePanelIDs", "childUpdatePanelIDs",
+    "panelsToRefreshIDs", "asyncPostBackTimeout", "formAction", "pageTitle", "focus", "pageRedirect",
+    "error", "dataItem", "dataItemJson", "arrayDeclaration",
+})
+# Имена контролов/страниц, которые можно назвать в diagnostics: буквы и "_"
+# (у id панели — максимум две цифры в конце, как "UpdatePanel1"); в
+# турецком госномере цифры есть всегда, поэтому он сюда не пройдёт.
+_SAFE_IDENTIFIER_RE = re.compile(r"[A-Za-z_]{1,40}[0-9]{0,2}")
+_SAFE_ASPX_PAGE_RE = re.compile(r"[A-Za-z_]{1,40}\.aspx")
+# Ограниченные (не "ленивые до конца текста") шаблоны — линейны даже на
+# враждебном ответе вида "<title>" * 20000.
+_TITLE_RE = re.compile(r"<title\b[^>]{0,200}>([^<]{0,512})", re.I)
+_LBLHATA_RE = re.compile(r'id="lblHata"[^>]{0,200}>([^<]{0,512})')
+
+
+def _keywords(text: str) -> str:
+    folded = _fold(text[:_DIAGNOSTIC_TEXT_SCAN_CHARS])
+    found = [name for name, needles in _FOLDED_DIAGNOSTIC_KEYWORDS.items() if any(n in folded for n in needles)]
+    return "+".join(found) or "-"
+
+
+def _text_detail(text: str) -> str:
+    """Безопасная сводка свободного текста сайта: длина, число цифр в
+    начале текста (подсказка, что там могли быть номер/код — без них
+    самих) и ключевые слова из _DIAGNOSTIC_KEYWORDS."""
+    digits = sum(ch.isdigit() for ch in text[:_DIAGNOSTIC_TEXT_SCAN_CHARS])
+    return f"chars={len(text)} digits={digits} keywords={_keywords(text)}"
+
+
+def _response_shape(text: str) -> str:
+    """Форма НЕ-delta ответа для diagnostics (см. parse_submit_response):
+    пусто / обрезанный или битый delta-ответ / HTML-страница (тогда —
+    ключевые слова её <title> и lblHata, если они есть) / что-то иное.
+    Сам ответ в diagnostics не попадает; просматривается только начало."""
+    head = text[:_DIAGNOSTIC_RESPONSE_SCAN_CHARS].lstrip().lstrip("﻿").lstrip()
+    if not head:
+        return f"chars={len(text)} shape=empty"
+    if re.match(r"\d{1,9}\|", head):
+        return f"chars={len(text)} shape=delta_like"
+    if not head.startswith("<"):
+        return f"chars={len(text)} shape=other"
+    title = _TITLE_RE.search(head)
+    hata = _LBLHATA_RE.search(head)
+    title_keywords = _keywords(title.group(1)) if title else "-"
+    hata_keywords = _keywords(hata.group(1)) if hata and hata.group(1).strip() else "-"
+    return f"chars={len(text)} shape=html title_keywords={title_keywords} lblhata_keywords={hata_keywords}"
+
+
+def _unexpected(message: str, *, category: str, code: str, detail: str = "") -> KgmSubmitOutcome:
+    """message — прежняя короткая причина (может нести текст сайта, в лог
+    не пишется); category/code/detail — безопасная диагностика, см.
+    models.py::KgmDiagnostics. На kind == "unexpected" не влияет."""
+    return KgmSubmitOutcome(
+        kind="unexpected", message=message,
+        diagnostics=KgmDiagnostics(category=category, code=code, detail=detail),
+    )
 
 
 def parse_delta_response(text: str) -> dict[tuple[str, str], str] | None:
@@ -270,7 +379,10 @@ def parse_result_panel(html: str) -> KgmSubmitOutcome:
         if hata_text:
             # Непустой lblHata, но НЕ реально увиденный текст (см. design
             # report: "не гадать схему") — тоже unexpected, не "rejected".
-            return _unexpected(f"unrecognized lblHata text: {hata_text!r}")
+            return _unexpected(
+                f"unrecognized lblHata text: {hata_text!r}",
+                category="provider_message", code="lblhata_unrecognized", detail=_text_detail(hata_text),
+            )
 
     operator_results: list[KgmOperatorResult] = []
 
@@ -278,7 +390,10 @@ def parse_result_panel(html: str) -> KgmSubmitOutcome:
         label = soup.find(id=label_id)
         table = soup.find(id=table_id)
         if label is None or table is None or not isinstance(table, Tag):
-            return _unexpected(f"missing operator section: {operator_key}")
+            return _unexpected(
+                f"missing operator section: {operator_key}",
+                category="result_structure", code="section_missing", detail=operator_key,
+            )
 
         label_text = _normalize_ws(label.get_text())
         has_debt_match = _HAS_DEBT_LABEL_RE.search(label_text)
@@ -291,12 +406,16 @@ def parse_result_panel(html: str) -> KgmSubmitOutcome:
             declared_count = int(has_debt_match.group(1))
             if declared_count == 0 or declared_count != len(rows):
                 return _unexpected(
-                    f"{operator_key}: declared {declared_count} kayıt but found {len(rows)} row(s)"
+                    f"{operator_key}: declared {declared_count} kayıt but found {len(rows)} row(s)",
+                    category="result_structure", code="section_count_mismatch", detail=operator_key,
                 )
 
             index_map = _header_index_map(table)
             if index_map is None:
-                return _unexpected(f"{operator_key}: unrecognized table columns")
+                return _unexpected(
+                    f"{operator_key}: unrecognized table columns",
+                    category="result_structure", code="section_columns_unrecognized", detail=operator_key,
+                )
 
             items = [
                 item
@@ -304,12 +423,25 @@ def parse_result_panel(html: str) -> KgmSubmitOutcome:
                 if (item := _parse_row(row, index_map, operator_key=operator_key)) is not None
             ]
             if len(items) != declared_count:
-                return _unexpected(f"{operator_key}: {len(items)}/{declared_count} rows parsed")
+                return _unexpected(
+                    f"{operator_key}: {len(items)}/{declared_count} rows parsed",
+                    category="result_structure", code="section_rows_unparsed", detail=operator_key,
+                )
 
             subtotal = _parse_subtotal(soup, subtotal_id)
             items_sum = sum((item.payable_amount for item in items), Decimal(0))
-            if subtotal is None or subtotal != items_sum:
-                return _unexpected(f"{operator_key}: subtotal does not match parsed rows")
+            if subtotal is None:
+                # Подытога нет или он не разбирается — это структура, а не
+                # расхождение сумм (message — прежний, как и раньше).
+                return _unexpected(
+                    f"{operator_key}: subtotal does not match parsed rows",
+                    category="result_structure", code="section_subtotal_unreadable", detail=operator_key,
+                )
+            if subtotal != items_sum:
+                return _unexpected(
+                    f"{operator_key}: subtotal does not match parsed rows",
+                    category="checksum", code="section_subtotal_mismatch", detail=operator_key,
+                )
 
             operator_results.append(
                 KgmOperatorResult(
@@ -319,22 +451,37 @@ def parse_result_panel(html: str) -> KgmSubmitOutcome:
             )
         elif is_no_debt and not has_debt_match:
             if rows:
-                return _unexpected(f"{operator_key}: label says no records but table has rows")
+                return _unexpected(
+                    f"{operator_key}: label says no records but table has rows",
+                    category="result_structure", code="section_label_contradiction", detail=operator_key,
+                )
         else:
             # Ни один из двух реально увиденных вживую видов label не
             # совпал (или совпали оба сразу — не должно происходить) — не
             # гадаем, какой из них "правильный" (см. design report:
             # "label/table противоречат друг другу => unexpected").
-            return _unexpected(f"{operator_key}: unrecognized label text: {label_text!r}")
+            return _unexpected(
+                f"{operator_key}: unrecognized label text: {label_text!r}",
+                category="result_structure", code="section_label_unrecognized", detail=operator_key,
+            )
 
     kgm_total = _parse_subtotal(soup, _KGM_TOTAL_ID)
     yid_total = _parse_subtotal(soup, _YID_TOTAL_ID)
     grand_total = _parse_subtotal(soup, _GRAND_TOTAL_ID)
     if kgm_total is None or yid_total is None or grand_total is None:
-        return _unexpected("missing grand totals")
+        missing = [
+            name for name, value in (("kgm_total", kgm_total), ("yid_total", yid_total), ("grand_total", grand_total))
+            if value is None
+        ]
+        return _unexpected(
+            "missing grand totals",
+            category="result_structure", code="totals_missing", detail="+".join(missing),
+        )
 
     if kgm_total + yid_total != grand_total:
-        return _unexpected("kgm_total + yid_total != grand_total")
+        return _unexpected(
+            "kgm_total + yid_total != grand_total", category="checksum", code="totals_mismatch",
+        )
 
     kgm_group_sum = sum(
         (op.subtotal for op in operator_results if op.operator_key == KGM_GROUP_OPERATOR_KEY),
@@ -345,13 +492,17 @@ def parse_result_panel(html: str) -> KgmSubmitOutcome:
         Decimal(0),
     )
     if kgm_group_sum != kgm_total or yid_group_sum != yid_total:
-        return _unexpected("operator subtotals do not match KGM/YİD totals")
+        return _unexpected(
+            "operator subtotals do not match KGM/YİD totals", category="checksum", code="group_totals_mismatch",
+        )
 
     all_items_sum = sum(
         (item.payable_amount for op in operator_results for item in op.items), Decimal(0),
     )
     if all_items_sum != grand_total:
-        return _unexpected("sum of all parsed debt items != grand total")
+        return _unexpected(
+            "sum of all parsed debt items != grand total", category="checksum", code="items_sum_mismatch",
+        )
 
     if operator_results:
         return KgmSubmitOutcome(
@@ -369,7 +520,9 @@ def parse_result_panel(html: str) -> KgmSubmitOutcome:
             kind="no_debt", kgm_total=kgm_total, yid_total=yid_total, grand_total=grand_total,
         )
 
-    return _unexpected("no operator has debt but totals are non-zero")
+    return _unexpected(
+        "no operator has debt but totals are non-zero", category="checksum", code="totals_nonzero_without_debt",
+    )
 
 
 def parse_submit_response(response_text: str) -> KgmSubmitOutcome:
@@ -381,10 +534,52 @@ def parse_submit_response(response_text: str) -> KgmSubmitOutcome:
     ФОРМА ответа, транспорт уже успешно отработал, см. session.py)."""
     chunks = parse_delta_response(response_text)
     if chunks is None:
-        return _unexpected("malformed ASP.NET AJAX delta response")
+        return _unexpected(
+            "malformed ASP.NET AJAX delta response",
+            category="response_format", code="delta_malformed", detail=_response_shape(response_text),
+        )
 
     panel_html = chunks.get(("updatePanel", "pnlSayfa"))
     if panel_html is None:
-        return _unexpected("delta response has no updatePanel/pnlSayfa chunk")
+        return _unexpected_without_result_panel(chunks)
 
     return parse_result_panel(panel_html)
+
+
+def _unexpected_without_result_panel(chunks: dict[tuple[str, str], str]) -> KgmSubmitOutcome:
+    """delta разобрался, но чанка ("updatePanel", "pnlSayfa") нет —
+    различаем по ТИПАМ чанков (только известные протокольные слова ASP.NET
+    AJAX, см. _ASP_NET_DELTA_CHUNK_TYPES): "error" — серверное исключение
+    ASP.NET (detail — его 3-значный код и ключевые слова текста, сам текст
+    не пишется), "pageRedirect" — сервер перенаправил на другую страницу
+    (detail — имя .aspx-страницы, только если оно похоже на имя страницы;
+    сам URL не пишется). message — прежний для всех трёх."""
+    message = "delta response has no updatePanel/pnlSayfa chunk"
+    types = {ctype for ctype, _cid in chunks}
+    if "error" in types:
+        codes = sorted({
+            cid for ctype, cid in chunks if ctype == "error" and cid.isascii() and cid.isdigit() and len(cid) <= 3
+        })
+        error_text = next(content for (ctype, _cid), content in chunks.items() if ctype == "error")
+        return _unexpected(
+            message, category="provider_message", code="delta_error_chunk",
+            detail=f"error_codes={','.join(codes) or '-'} keywords={_keywords(error_text)}",
+        )
+    if "pageRedirect" in types:
+        target = next(content for (ctype, _cid), content in chunks.items() if ctype == "pageRedirect")
+        page = re.split(r"[?#]", target, maxsplit=1)[0].rstrip("/").rsplit("/", 1)[-1]
+        return _unexpected(
+            message, category="provider_message", code="delta_page_redirect",
+            detail=f"target={page if _SAFE_ASPX_PAGE_RE.fullmatch(page) else 'other'}",
+        )
+    known = sorted(types & _ASP_NET_DELTA_CHUNK_TYPES)
+    unknown = len(types - _ASP_NET_DELTA_CHUNK_TYPES)
+    panels = sorted(
+        cid for ctype, cid in chunks if ctype == "updatePanel" and _SAFE_IDENTIFIER_RE.fullmatch(cid)
+    )[:5]
+    detail = f"chunks={'+'.join(known) or '-'}"
+    if unknown:
+        detail += f" unknown_chunk_types={unknown}"
+    if panels:
+        detail += f" panels={'+'.join(panels)}"
+    return _unexpected(message, category="response_format", code="delta_no_result_panel", detail=detail)

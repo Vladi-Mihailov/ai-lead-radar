@@ -25,6 +25,7 @@ from reader.turkey_bot.gib.session import GibTransportError
 from reader.turkey_bot.kgm.models import (
     KgmCaptchaChallenge,
     KgmDebtItem,
+    KgmDiagnostics,
     KgmOperatorResult,
     KgmSubmitOutcome,
 )
@@ -189,6 +190,29 @@ async def test_one_provider_error_gives_partial_not_no_debt():
     assert gib.error_type == "transport_error"
     # PARTIAL никогда не должен молча стать NO_DEBT/HAS_DEBT.
     assert result.overall_status != OverallStatus.NO_DEBT
+
+
+async def test_kgm_unexpected_with_diagnostics_is_still_error_not_no_debt():
+    """См. задачу "KGM diagnostic logging": KgmSubmitOutcome.diagnostics —
+    только для лога (см. kgm/provider.py), результат проверки тот же, что и
+    без него: KGM ERROR("unexpected"), никогда NO_DEBT; итог PARTIAL, KGM в
+    сумму не входит."""
+    kgm_provider = _FakeKgmProvider(outcome=KgmSubmitOutcome(
+        kind="unexpected", message="unrecognized lblHata text: 'Sistem hatası'",
+        diagnostics=KgmDiagnostics(
+            category="provider_message", code="lblhata_unrecognized", detail="chars=13 digits=0 keywords=hata+sistem",
+        ),
+    ))
+    service = _make_service(kgm_provider=kgm_provider)
+
+    result = await service.check("A123AA123")
+
+    kgm = result.provider_result("kgm")
+    assert kgm.status == ProviderStatus.ERROR
+    assert kgm.error_type == "unexpected"
+    assert kgm.total_amount == Decimal(0)
+    assert result.overall_status == OverallStatus.PARTIAL
+    assert result.total_amount == Decimal(0)
 
 
 async def test_all_providers_error_gives_overall_error():
