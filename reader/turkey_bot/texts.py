@@ -878,12 +878,23 @@ def _format_debt_provider_state(state: TurkeyProviderDebtState) -> str:
     return f"❔ {name}: нет достоверных данных (не проверялся)"
 
 
+# Строки debt-списка бывают многострочными (✅/⚠️/❔ по провайдерам, см.
+# format_debt_row), а reader/turkey_bot/handlers.py::_split_telegram_text
+# ЗАНОВО режет по границам строк любой текст длиннее своего
+# _TELEGRAM_SAFE_TEXT_LIMIT (3900) — при упаковке по 4096 строка провайдера
+# могла уехать в отдельное сообщение без номера машины. Поэтому список
+# пакуется по тому же безопасному пределу (тест следит, чтобы он не
+# превышал предел handlers).
+_DEBT_LIST_MESSAGE_LIMIT = 3900
+
+
 def format_debt_list_messages(rows: list[str]) -> list[str]:
     """Список ВСЕХ автомобилей с задолженностью (см. задачу п.7: "если
     список большой — сохранить существующую pagination") — тот же
-    packing-приём, что и раньше: каждая строка — атомарная единица
-    (никогда не разрывается пополам). БЕЗ отдельного заголовка (см.
-    задачу п.7 — пример показывает строки СРАЗУ после аггрегата, без
+    packing-приём, что и раньше: каждая строка (вместе со своими строками
+    провайдеров) — атомарная единица, никогда не разрывается между
+    сообщениями (см. _DEBT_LIST_MESSAGE_LIMIT). БЕЗ отдельного заголовка
+    (см. задачу п.7 — пример показывает строки СРАЗУ после аггрегата, без
     "Автомобили с задолженностью:"). [] — если задолженностей нет вовсе
     (см. вызывающий код — тогда это сообщение не отправляется вообще)."""
     if not rows:
@@ -894,7 +905,7 @@ def format_debt_list_messages(rows: list[str]) -> list[str]:
     current_len = 0
     for row in rows:
         addition = len(row) + (1 if current else 0)  # +1 = "\n", кроме первой строки сообщения
-        if current and current_len + addition > _TELEGRAM_MESSAGE_LIMIT:
+        if current and current_len + addition > _DEBT_LIST_MESSAGE_LIMIT:
             messages.append("\n".join(current))
             current = []
             current_len = 0
@@ -974,18 +985,31 @@ def format_debt_refresh_summary(outcome: TurkeyRefreshOutcome) -> str:
 
 
 def _format_partial_plates(outcome: TurkeyRefreshOutcome) -> list[str]:
-    """"PLATE (KGM)" для каждого частично проверенного номера;
-    partial_failed_providers может отсутствовать (outcome, собранный без
-    него) — тогда только номера, как раньше."""
+    """"PLATE (KGM — последняя успешная проверка DD.MM.YYYY)" для каждого
+    частично проверенного номера (см. задачу: при частичной проверке
+    показывать, какой провайдер не ответил, и дату его последней успешной
+    проверки — в том числе для номера, который после refresh из списка
+    выпал); "успешных проверок не было" — провайдер не отвечал никогда.
+    partial_failed_providers/partial_last_success_at могут отсутствовать
+    (outcome, собранный без них) — тогда, как раньше, "PLATE (KGM)" или
+    только номер."""
+    count = len(outcome.partial_car_numbers)
     failed_by_index = (
-        outcome.partial_failed_providers
-        if len(outcome.partial_failed_providers) == len(outcome.partial_car_numbers)
-        else ((),) * len(outcome.partial_car_numbers)
+        outcome.partial_failed_providers if len(outcome.partial_failed_providers) == count else ((),) * count
+    )
+    dates_by_index = (
+        outcome.partial_last_success_at if len(outcome.partial_last_success_at) == count else (None,) * count
     )
     formatted = []
-    for plate, failed_providers in zip(outcome.partial_car_numbers, failed_by_index):
+    for plate, failed_providers, dates in zip(outcome.partial_car_numbers, failed_by_index, dates_by_index):
         text = format_plate_for_telegram(plate)
-        if failed_providers:
+        if failed_providers and dates is not None and len(dates) == len(failed_providers):
+            text += " (" + "; ".join(
+                f"{_DEBT_PROVIDER_DISPLAY.get(provider, provider)} — "
+                + (f"последняя успешная проверка {_format_debt_date(moment)}" if moment else "успешных проверок не было")
+                for provider, moment in zip(failed_providers, dates)
+            ) + ")"
+        elif failed_providers:
             text += " (" + ", ".join(_DEBT_PROVIDER_DISPLAY.get(p, p) for p in failed_providers) + ")"
         formatted.append(text)
     return formatted

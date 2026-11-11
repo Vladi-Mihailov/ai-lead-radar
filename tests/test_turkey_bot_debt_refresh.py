@@ -467,7 +467,7 @@ async def test_all_kgm_error_refresh_keeps_debt_block_and_shows_last_known_lines
 
     full_text = "\n".join((reply.text, *reply.extra_texts))
     assert "⚠️ Проверено частично: 2" in full_text
-    assert f"{format_plate_for_telegram('AA001AA')} (KGM)" in full_text
+    assert f"{format_plate_for_telegram('AA001AA')} (KGM — последняя успешная проверка " in full_text
     assert "Автомобилей: 2" in full_text
     assert "Общая сумма: 37 316,50 ₺" in full_text
     assert "✅ Подтверждено последними проверками: 13 336 ₺" in full_text

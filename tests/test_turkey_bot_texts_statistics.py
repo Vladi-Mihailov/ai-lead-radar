@@ -314,6 +314,61 @@ def test_refresh_summary_shows_which_providers_did_not_answer():
     )
 
 
+def test_refresh_summary_shows_failed_provider_and_its_last_successful_check_date():
+    """Ревью: при частичной проверке нужна и дата последней успешной
+    проверки упавшего провайдера — номер мог после refresh выпасть из
+    списка совсем, и тогда строка списка с датой не показывается вовсе."""
+    outcome = TurkeyRefreshOutcome(
+        checked=2, failed=2, total_plates=2, partial_plates=2,
+        partial_car_numbers=("34ABC123", "06XYZ789"), partial_failed_providers=(("kgm",), ("gib", "kgm")),
+        partial_last_success_at=(
+            (datetime(2026, 11, 4, 18, 12, tzinfo=timezone.utc),),
+            (None, datetime(2026, 11, 6, 8, 0, tzinfo=timezone.utc)),
+        ),
+    )
+
+    summary = texts.format_debt_refresh_summary(outcome)
+
+    assert (
+        f"Частично: {format_plate_for_telegram('34ABC123')} (KGM — последняя успешная проверка 04.11.2026), "
+        f"{format_plate_for_telegram('06XYZ789')} "
+        "(GİB — успешных проверок не было; KGM — последняя успешная проверка 06.11.2026)"
+    ) in summary
+
+
+def test_debt_list_packs_multi_line_rows_so_handler_never_resplits():
+    """Ревью: строки стали многострочными, а reader/turkey_bot/handlers.py::
+    _split_telegram_text заново режет всё длиннее своего безопасного предела
+    по границам строк — строка провайдера не должна уехать в отдельное
+    сообщение без номера машины."""
+    from reader.turkey_bot.handlers import _TELEGRAM_SAFE_TEXT_LIMIT, _split_telegram_text
+
+    states = (
+        _state("gib", TurkeyProviderFreshness.CURRENT, Decimal(13336),
+               last_success_at=datetime(2026, 11, 11, 15, 55, tzinfo=timezone.utc),
+               last_attempt_at=datetime(2026, 11, 11, 15, 55, tzinfo=timezone.utc)),
+        _state("kgm", TurkeyProviderFreshness.STALE, Decimal("20192.50"),
+               last_success_at=datetime(2026, 11, 4, 15, 43, tzinfo=timezone.utc),
+               last_attempt_at=datetime(2026, 11, 11, 15, 55, tzinfo=timezone.utc), error_type="transport_error"),
+    )
+    rows = [
+        texts.format_debt_row(
+            car_number=f"34ABC{i:03d}", owner_displays=[f"Владелец{'я' * (i % 7)} (@user{i})"],
+            total_amount=Decimal("33528.50"), provider_states=states,
+        )
+        for i in range(60)
+    ]
+
+    messages = texts.format_debt_list_messages(rows)
+
+    assert len(messages) > 1
+    assert texts._DEBT_LIST_MESSAGE_LIMIT <= _TELEGRAM_SAFE_TEXT_LIMIT
+    for message in messages:
+        assert _split_telegram_text(message) == [message]
+        assert message.startswith("🚗")
+    assert "\n".join(messages) == "\n".join(rows)
+
+
 def test_refresh_summary_without_failed_providers_lists_plates_only():
     outcome = TurkeyRefreshOutcome(
         checked=1, failed=1, total_plates=1, partial_plates=1, partial_car_numbers=("34ABC123",),

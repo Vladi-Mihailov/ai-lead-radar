@@ -510,9 +510,26 @@ async def test_outcome_lists_failed_providers_and_summary_shows_them(fx):
 
     outcome = await fx.debt_refresh.refresh()
 
+    last_success = fx.runs.get_latest_provider_results_for_plate("AA001AA", "kgm")[1]
     assert outcome.partial_car_numbers == ("AA001AA",)
     assert outcome.partial_failed_providers == (("kgm",),)
-    assert f"Частично: {format_plate_for_telegram('AA001AA')} (KGM)" in texts.format_debt_refresh_summary(outcome)
+    assert outcome.partial_last_success_at == ((last_success.finished_at,),)
+    assert (
+        f"Частично: {format_plate_for_telegram('AA001AA')} "
+        f"(KGM — последняя успешная проверка {texts._format_debt_date(last_success.finished_at)})"
+    ) in texts.format_debt_refresh_summary(outcome)
+
+
+async def test_outcome_marks_failed_provider_that_never_answered(fx):
+    fx.add_car(telegram_user_id=1, car_number="AA001AA")
+    await fx.seed_providers(telegram_user_id=1, plate="AA001AA", gib=Decimal(500), kgm_error=True)
+    fx.debt_refresh._check_service = _make_check_service(gib=Decimal(500), kgm_error=True)
+
+    outcome = await fx.debt_refresh.refresh()
+
+    assert outcome.partial_failed_providers == (("kgm",),)
+    assert outcome.partial_last_success_at == ((None,),)
+    assert "(KGM — успешных проверок не было)" in texts.format_debt_refresh_summary(outcome)
 
 
 # ---- Avrasya/KGM double-counting (задача TESTS п.11-12) ----
