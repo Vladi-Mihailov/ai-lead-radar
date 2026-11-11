@@ -7,6 +7,7 @@ test_turkey_gib_session.py), который отдаёт заготовленн�
 """
 
 import logging
+import re
 import socket
 import sys
 from pathlib import Path
@@ -449,3 +450,81 @@ async def test_submit_records_server_seconds_and_logs_nothing_on_success(caplog)
     assert isinstance(session.last_submit_seconds, float)
     assert session.last_submit_seconds >= 0
     assert _warnings(caplog) == []
+
+
+# ---- Актуальная форма KGM (интерфейс 2026-11: вкладки Yerli / Yabancı /
+# Resmi Plaka) — tests/fixtures/kgm_sorgulama_2026_11_landing.html: настоящая
+# стартовая страница 2026-11-11, ViewState/генератор заменены плейсхолдерами ----
+
+_CURRENT_LANDING_HTML = (_FIXTURES_DIR / "kgm_sorgulama_2026_11_landing.html").read_text(encoding="utf-8")
+
+
+def _current_form_field_names() -> set[str]:
+    """Имена всех полей формы form1, которые браузер отправляет при нажатии
+    "Sorgula" на вкладке Yabancı (кнопки без name и чекбоксы без name —
+    например, "Bir daha gösterme" — в POST не попадают)."""
+    form = re.search(r'<form\b[^>]*id="form1".*?</form>', _CURRENT_LANDING_HTML, re.S).group(0)
+    return set(re.findall(r'<(?:input|textarea|select)\b[^>]*\bname="([^"]+)"', form))
+
+
+def _posted_form_of_submit() -> dict[str, str]:
+    captured: dict[str, dict[str, str]] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["form"] = {
+            k: v[0] for k, v in parse_qs(request.content.decode("utf-8"), keep_blank_values=True).items()
+        }
+        return httpx.Response(200, text=_SUCCESS_DELTA, headers={"content-type": "text/plain"})
+
+    import asyncio
+    asyncio.run(_submit_session(handler).submit(plate="M295YB196", captcha_code="15 53893"))
+    return captured["form"]
+
+
+def test_submit_selects_the_foreign_plate_tab_like_the_browser():
+    form = _posted_form_of_submit()
+
+    assert form["hdnSorguTipi"] == "YABANCI"
+    assert form["txtTescilSeriNo"] == ""
+    assert form["txtVkn"] == ""
+    assert "lblPlakaText" not in form
+    assert "lblPlakaText_show" not in form
+
+
+def test_submit_fields_are_exactly_the_fields_of_the_current_kgm_form():
+    """Регрессия на смену формы: всё, что отправляет бот (кроме полей,
+    которые добавляет ASP.NET AJAX — ScriptManager1/__ASYNCPOST), есть в
+    актуальной форме, и ни одно поле формы не пропущено."""
+    form = _posted_form_of_submit()
+
+    assert set(form) - {"ScriptManager1", "__ASYNCPOST"} == _current_form_field_names()
+
+
+async def test_start_captures_state_from_the_current_landing_page():
+    log = _CallLog()
+    handler = _handler_for(
+        page_html=_CURRENT_LANDING_HTML,
+        captcha_responses=[httpx.Response(200, content=_SAMPLE_JPEG, headers={"content-type": "image/jpeg"})],
+        log=log,
+    )
+    session = _make_session(handler)
+
+    await session.start()
+
+    assert [c["url"] for c in log.calls] == [_PAGE_URL, _CAPTCHA_URL]
+    assert session._viewstate == "FAKE_VIEWSTATE_PLACEHOLDER_NOT_REAL"
+    assert session._viewstate_generator == "FAKEGEN01"
+    # На новой стартовой странице hdnx без значения — первый submit
+    # отправляет его пустым, как и браузер.
+    assert session._hdnx == ""
+
+
+def test_current_page_keeps_the_endpoints_and_async_postback_the_session_uses():
+    form_tag = re.search(r'<form\b[^>]*id="form1"[^>]*>', _CURRENT_LANDING_HTML).group(0)
+    prm = re.search(r"PageRequestManager\._initialize\(([^;]*)", _CURRENT_LANDING_HTML).group(1)
+
+    assert 'action="./Sorgulama.aspx?lang=tr"' in form_tag
+    assert "Captcha/CaptchaImage.aspx" in _CURRENT_LANDING_HTML
+    assert "'ScriptManager1', 'form1'" in prm
+    assert "'pnlUpdate'" in prm and "'btnSorgula'" in prm
+    assert "sorguModunuUygula('YABANCI')" in _CURRENT_LANDING_HTML

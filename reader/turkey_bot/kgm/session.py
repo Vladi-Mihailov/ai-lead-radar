@@ -56,6 +56,12 @@ _ASYNC_POST_HEADERS = {
 # государственный сайт без нужды).
 _MIN_REQUEST_INTERVAL_SECONDS = 1.5
 
+# Значение скрытого поля hdnSorguTipi на вкладке "Yabancı Plaka" (см.
+# submit()) — ровно то, что пишет JS страницы: sorguModunuUygula('YABANCI').
+# Пользователи бота проверяют иностранные номера; турецкие эта форма
+# отклоняет (они проверяются только через e-Devlet).
+_FOREIGN_PLATE_QUERY_TYPE = "YABANCI"
+
 _HIDDEN_INPUT_RE_TEMPLATE = r'name="{name}"[^>]*\bvalue="([^"]*)"'
 
 
@@ -275,15 +281,27 @@ class KgmSession:
         фиксированное подтверждение информационного текста ("ОКУДУМ
         АНЛАДЫМ" — те же два значения, что и у реального клика по
         чекбоксу, см. design report: это НЕ CAPTCHA и не анти-бот
-        механизм, а обычное обязательное поле формы)."""
+        механизм, а обычное обязательное поле формы).
+
+        Интерфейс KGM 2026-11 (см. tests/fixtures/
+        kgm_sorgulama_2026_11_landing.html): та же страница и та же форма,
+        но с вкладками "Yerli (TR) / Yabancı / Resmi Plaka". Вкладка
+        "Yabancı Plaka" — только JavaScript (sorguModunuUygula('YABANCI')
+        пишет скрытое поле hdnSorguTipi, запроса к серверу нет), а сервер
+        строит ответ по hdnSorguTipi, поэтому оно отправляется явно — как
+        после клика по вкладке. txtTescilSeriNo/txtVkn (поля режима Resmi)
+        браузер в режиме Yabancı отправляет пустыми — здесь так же. Окно
+        согласия чисто клиентское (ни cookie, ни запроса) — отправлять
+        нечего. lblPlakaText/lblPlakaText_show из формы удалены."""
         form = {
             "ScriptManager1": "pnlUpdate|btnSorgula",
             "txtPlk": plate,
+            "hdnSorguTipi": _FOREIGN_PLATE_QUERY_TYPE,
+            "txtTescilSeriNo": "",
+            "txtVkn": "",
             "txtimgcode": captcha_code,
             "chkGuvenlikUyari": "on",
             "txtGuvenlikCheck": "Okay",
-            "lblPlakaText": plate,
-            "lblPlakaText_show": plate,
             "hdnx": self._hdnx,
             "__EVENTTARGET": "",
             "__EVENTARGUMENT": "",
