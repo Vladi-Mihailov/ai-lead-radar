@@ -9,6 +9,8 @@ NO_DEBT — это разные статусы, не путать местами
 
 from __future__ import annotations
 
+import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -68,6 +70,44 @@ class ProviderCheckResult:
             raise ValueError("ProviderCheckResult со статусом ERROR должен иметь error_type")
 
 
+# Частичный ответ провайдера (сейчас только KGM, см. kgm/models.py::
+# KgmSubmitOutcome, kind == "partial"): часть секций не проверена. Такой
+# результат — status ERROR, а НЕ HAS_DEBT/NO_DEBT: "последние успешные"
+# выборки (status != 'error', см. run_repository.py), baseline мониторинга,
+# change_detector.py, total_amount_for() и список долгов его не используют,
+# поэтому непроверенный оператор не может ни обнулить известную
+# задолженность, ни вызвать уведомление о погашении. Разобранные секции при
+# этом сохраняются: items/debt_count/total_amount — только по проверенным
+# секциям (нижняя граница; principal/penalty — None), а список непроверенных
+# секций — в error_type (отдельной колонки в БД нет).
+PARTIAL_ERROR_TYPE_PREFIX = "partial_unchecked:"
+_SECTION_KEY_RE = re.compile(r"[a-z_]{1,40}")
+
+
+def partial_error_type(unchecked_sections: Iterable[str]) -> str:
+    keys = tuple(unchecked_sections)
+    if not keys or not all(_SECTION_KEY_RE.fullmatch(key) for key in keys):
+        raise ValueError(f"Некорректный список непроверенных секций: {keys!r}")
+    return PARTIAL_ERROR_TYPE_PREFIX + ",".join(keys)
+
+
+def unchecked_sections_from_error_type(error_type: str | None) -> tuple[str, ...]:
+    """Ключи непроверенных секций из error_type (см. partial_error_type);
+    () для любого другого error_type и для None."""
+    if not error_type or not error_type.startswith(PARTIAL_ERROR_TYPE_PREFIX):
+        return ()
+    keys = error_type[len(PARTIAL_ERROR_TYPE_PREFIX):].split(",")
+    return tuple(key for key in keys if _SECTION_KEY_RE.fullmatch(key))
+
+
+def unchecked_sections(result: ProviderCheckResult) -> tuple[str, ...]:
+    """Непроверенные секции частичного результата; () для полного
+    результата и для обычной ошибки."""
+    if result.status != ProviderStatus.ERROR:
+        return ()
+    return unchecked_sections_from_error_type(result.error_type)
+
+
 @dataclass(frozen=True)
 class UnifiedCheckResult:
     plate: str
@@ -87,7 +127,12 @@ def derive_overall_status(providers: tuple[ProviderCheckResult, ...]) -> Overall
       - хотя бы один ERROR, но не все -> PARTIAL;
       - все успешны, хотя бы один HAS_DEBT -> HAS_DEBT;
       - все успешны и все NO_DEBT -> NO_DEBT.
-    ERROR никогда не интерпретируется как NO_DEBT (см. задачу п.4/п.7)."""
+    ERROR никогда не интерпретируется как NO_DEBT (см. задачу п.4/п.7).
+    Частичный результат провайдера (см. partial_error_type) — тоже ERROR:
+    run с ним — PARTIAL, а не HAS_DEBT/NO_DEBT. Run, где ВСЕ провайдеры
+    ERROR, остаётся ERROR, даже если один из них частичный: выборки
+    "overall_status != 'error'" не должны принимать run без единого
+    полного ответа за достоверный."""
     statuses = [p.status for p in providers]
     if all(s == ProviderStatus.ERROR for s in statuses):
         return OverallStatus.ERROR

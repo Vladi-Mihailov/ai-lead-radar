@@ -30,7 +30,15 @@ FAIL-CLOSED (см. design report п.5/п.6, задача "Реализация K
 fixture заодно показал, что lblKgm/lblAvrasya сохраняют CSS-класс
 "mtLabelHeader_bt" (обычно означающий "есть записи") ДАЖЕ в состоянии
 "Kayıt yok." — сама реализация никогда не проверяла CSS-класс (только
-текст label), поэтому эта особенность сайта не требует исправления."""
+текст label), поэтому эта особенность сайта не требует исправления.
+
+ЕДИНСТВЕННОЕ исключение из "всё или ничего" — неизвестный ТЕКСТ label
+отдельного оператора (ни "N kayıt", ни "Kayıt yok."; живой ответ
+2026-11-12: 9 из 10 секций разобрались, у Aydın-Denizli — нет): такой
+оператор НЕ ПРОВЕРЕН (его таблица не читается), остальные секции
+разбираются и сверяются как обычно, результат — kind="partial" (см.
+models.py::KgmSubmitOutcome). Любое другое расхождение по-прежнему
+делает недоверенной всю страницу (unexpected)."""
 
 import re
 from datetime import date, datetime
@@ -94,6 +102,11 @@ _REQUIRED_COLUMNS = (
 )
 
 _HAS_DEBT_LABEL_RE = re.compile(r":\s*(\d+)\s*kayıt\s*$")
+# "Kayıt yok." — только В КОНЦЕ label (как и "N kayıt" выше): label с
+# лишним текстом после него ("Kayıt yok. <ошибка>") — неизвестный, то есть
+# оператор не проверен, а не "без долга". У "Avrupa Otoyolu" перед ним нет
+# двоеточия, поэтому двоеточие не требуется.
+_NO_DEBT_LABEL_RE = re.compile(r"kayıt yok\.?$")
 
 # См. задачу "KGM diagnostic logging" — фиксированный словарь для
 # БЕЗОПАСНОЙ классификации свободного текста сайта (lblHata, <title>
@@ -121,6 +134,10 @@ _DIAGNOSTIC_KEYWORDS: dict[str, tuple[str, ...]] = {
     "oturum": ("oturum", "session"),
     "viewstate": ("viewstate", "view state"),
     "veritabani": ("veritabanı", "veritabani", "database", "sql"),
+    "sorgu": ("sorgu",),
+    "yapilamadi": ("yapılamadı", "yapilamadi", "yapılamıyor", "yapilamiyor", "alınamadı", "alinamadi"),
+    "ulasilamiyor": ("ulaşılamıyor", "ulasilamiyor", "unavailable", "unreachable"),
+    "yok": ("yok",),
 }
 
 # Турецкие буквы -> ASCII ПОСЛЕ casefold: "ZAMAN AŞIMI".casefold() даёт
@@ -196,6 +213,12 @@ def _response_shape(text: str) -> str:
     title_keywords = _keywords(title.group(1)) if title else "-"
     hata_keywords = _keywords(hata.group(1)) if hata and hata.group(1).strip() else "-"
     return f"chars={len(text)} shape=html title_keywords={title_keywords} lblhata_keywords={hata_keywords}"
+
+
+def _unchecked_detail(unchecked: list[tuple[str, str]]) -> str:
+    """detail для непроверенных секций: operator_key и безопасная сводка
+    текста его label (см. _text_detail) — сам текст не пишется."""
+    return ", ".join(f"{operator_key} {_text_detail(label_text)}" for operator_key, label_text in unchecked)
 
 
 def _unexpected(message: str, *, category: str, code: str, detail: str = "") -> KgmSubmitOutcome:
@@ -385,6 +408,9 @@ def parse_result_panel(html: str) -> KgmSubmitOutcome:
             )
 
     operator_results: list[KgmOperatorResult] = []
+    # (operator_key, текст label) секций, чей label не совпал ни с одним из
+    # двух реально увиденных видов — см. модуль docstring про kind="partial".
+    unchecked: list[tuple[str, str]] = []
 
     for operator_key, (label_id, table_id, subtotal_id) in _OPERATOR_SECTIONS.items():
         label = soup.find(id=label_id)
@@ -397,7 +423,7 @@ def parse_result_panel(html: str) -> KgmSubmitOutcome:
 
         label_text = _normalize_ws(label.get_text())
         has_debt_match = _HAS_DEBT_LABEL_RE.search(label_text)
-        is_no_debt = "kayıt yok" in label_text.casefold()
+        is_no_debt = _NO_DEBT_LABEL_RE.search(label_text.casefold()) is not None
 
         tbody = table.find("tbody")
         rows = tbody.find_all("tr") if isinstance(tbody, Tag) else []
@@ -458,12 +484,17 @@ def parse_result_panel(html: str) -> KgmSubmitOutcome:
         else:
             # Ни один из двух реально увиденных вживую видов label не
             # совпал (или совпали оба сразу — не должно происходить) — не
-            # гадаем, какой из них "правильный" (см. design report:
-            # "label/table противоречат друг другу => unexpected").
-            return _unexpected(
-                f"{operator_key}: unrecognized label text: {label_text!r}",
-                category="result_structure", code="section_label_unrecognized", detail=operator_key,
-            )
+            # гадаем, есть ли у оператора долг: секция НЕ ПРОВЕРЕНА, её
+            # таблица не читается вовсе (см. kind="partial" ниже).
+            unchecked.append((operator_key, label_text))
+
+    if len(unchecked) == len(_OPERATOR_SECTIONS):
+        # Не проверено ни одной секции — это уже не частичный результат.
+        first_key, first_text = unchecked[0]
+        return _unexpected(
+            f"{first_key}: unrecognized label text: {first_text!r}",
+            category="result_structure", code="section_label_unrecognized", detail=_unchecked_detail(unchecked),
+        )
 
     kgm_total = _parse_subtotal(soup, _KGM_TOTAL_ID)
     yid_total = _parse_subtotal(soup, _YID_TOTAL_ID)
@@ -491,7 +522,15 @@ def parse_result_panel(html: str) -> KgmSubmitOutcome:
         (op.subtotal for op in operator_results if op.operator_key != KGM_GROUP_OPERATOR_KEY),
         Decimal(0),
     )
-    if kgm_group_sum != kgm_total or yid_group_sum != yid_total:
+    # Группа, в которой есть непроверенный оператор, сверяется только как
+    # верхняя граница: его долг (если сайт его знает) может входить в итог
+    # группы, а разобранные секции больше итога быть не могут.
+    unchecked_keys = {operator_key for operator_key, _label_text in unchecked}
+    kgm_group_complete = KGM_GROUP_OPERATOR_KEY not in unchecked_keys
+    yid_group_complete = not (unchecked_keys - {KGM_GROUP_OPERATOR_KEY})
+    kgm_group_ok = kgm_group_sum == kgm_total if kgm_group_complete else kgm_group_sum <= kgm_total
+    yid_group_ok = yid_group_sum == yid_total if yid_group_complete else yid_group_sum <= yid_total
+    if not (kgm_group_ok and yid_group_ok):
         return _unexpected(
             "operator subtotals do not match KGM/YİD totals", category="checksum", code="group_totals_mismatch",
         )
@@ -499,9 +538,28 @@ def parse_result_panel(html: str) -> KgmSubmitOutcome:
     all_items_sum = sum(
         (item.payable_amount for op in operator_results for item in op.items), Decimal(0),
     )
-    if all_items_sum != grand_total:
+    items_ok = all_items_sum <= grand_total if unchecked else all_items_sum == grand_total
+    if not items_ok:
         return _unexpected(
             "sum of all parsed debt items != grand total", category="checksum", code="items_sum_mismatch",
+        )
+
+    if unchecked:
+        # remainder=yes — итог страницы больше суммы разобранных секций:
+        # сайт, похоже, знает долг непроверенного оператора (сумма в лог не
+        # пишется, только признак).
+        remainder = "yes" if all_items_sum < grand_total else "no"
+        return KgmSubmitOutcome(
+            kind="partial", operators=tuple(operator_results),
+            kgm_total=kgm_total, yid_total=yid_total, grand_total=grand_total,
+            message="unchecked operator sections: " + ", ".join(
+                f"{operator_key}: {label_text!r}" for operator_key, label_text in unchecked
+            ),
+            diagnostics=KgmDiagnostics(
+                category="result_structure", code="section_label_unrecognized",
+                detail=f"{_unchecked_detail(unchecked)} remainder={remainder}",
+            ),
+            unchecked_operators=tuple(operator_key for operator_key, _label_text in unchecked),
         )
 
     if operator_results:

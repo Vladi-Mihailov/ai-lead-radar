@@ -25,7 +25,7 @@ from reader.plate_display import format_plate_for_telegram
 from reader.turkey_bot.avrasya.models import AvrasyaDebtItem
 from reader.turkey_bot.debt_refresh_service import TurkeyRefreshOutcome
 from reader.turkey_bot.gib.models import GibFineRecord
-from reader.turkey_bot.kgm.models import KgmOperatorResult
+from reader.turkey_bot.kgm.models import OPERATOR_DISPLAY_NAMES, KgmOperatorResult
 from reader.turkey_bot.models import TurkeyUserCar
 from reader.turkey_bot.statistics_service import (
     TurkeyProviderDebtState,
@@ -37,6 +37,8 @@ from reader.turkey_bot.unified.models import (
     ProviderCheckResult,
     ProviderStatus,
     UnifiedCheckResult,
+    unchecked_sections,
+    unchecked_sections_from_error_type,
 )
 
 # Тот же Europe/Istanbul, что и reader/turkey_bot/monitoring/
@@ -862,20 +864,29 @@ def _format_debt_provider_state(state: TurkeyProviderDebtState) -> str:
     """Одна строка-пояснение под строкой задолженности (см. format_debt_row):
     ✅ — подтверждено последней проверкой провайдера, ⚠️ — последняя
     известная сумма (последняя попытка — ошибка), ❔ — достоверных данных
-    нет."""
+    нет. Последняя попытка, ответившая частично (см.
+    reader/turkey_bot/unified/models.py::partial_error_type), сумму не
+    меняет — показывается только, какие секции не проверены."""
     name = _DEBT_PROVIDER_DISPLAY.get(state.provider, state.provider)
     amount_text = _format_try_amount(state.amount) if state.amount > 0 else "без долга"
+    unchecked = unchecked_sections_from_error_type(state.last_attempt_error_type)
+    if state.last_attempt_at is None:
+        attempt_text = "не проверялся"
+    elif unchecked:
+        attempt_text = (
+            f"{_format_debt_date(state.last_attempt_at)} проверено частично, "
+            f"не проверено: {_unchecked_sections_display(unchecked)}"
+        )
+    else:
+        attempt_text = f"не ответил {_format_debt_date(state.last_attempt_at)}"
     if state.freshness == TurkeyProviderFreshness.CURRENT:
         return f"✅ {name}: {amount_text} — проверка {_format_debt_date(state.last_success_at)}"
     if state.freshness == TurkeyProviderFreshness.STALE:
         return (
             f"⚠️ {name}: {amount_text} — последняя известная "
-            f"(успешная проверка {_format_debt_date(state.last_success_at)}), "
-            f"не ответил {_format_debt_date(state.last_attempt_at)}"
+            f"(успешная проверка {_format_debt_date(state.last_success_at)}), {attempt_text}"
         )
-    if state.last_attempt_at is not None:
-        return f"❔ {name}: нет достоверных данных (не ответил {_format_debt_date(state.last_attempt_at)})"
-    return f"❔ {name}: нет достоверных данных (не проверялся)"
+    return f"❔ {name}: нет достоверных данных ({attempt_text})"
 
 
 # Строки debt-списка бывают многострочными (✅/⚠️/❔ по провайдерам, см.
@@ -1026,8 +1037,28 @@ _UNIFIED_PROVIDER_DISPLAY = {
 }
 
 
+# Названия непроверенных секций (сейчас только операторы KGM, см.
+# reader/turkey_bot/unified/models.py::partial_error_type) — секция самого
+# KGM подписана полным названием: "не проверено: KGM" внутри строки
+# "🛣 KGM (...)" читалось бы как "не проверен весь KGM".
+_UNCHECKED_SECTION_NAMES = {**OPERATOR_DISPLAY_NAMES, "kgm": "Karayolları Genel Müdürlüğü"}
+
+
+def _unchecked_sections_display(keys: tuple[str, ...]) -> str:
+    return ", ".join(_UNCHECKED_SECTION_NAMES.get(key, key) for key in keys)
+
+
 def _format_unified_provider_line(result: ProviderCheckResult) -> str:
     name = _UNIFIED_PROVIDER_DISPLAY.get(result.provider, result.provider)
+    unchecked = unchecked_sections(result)
+    if unchecked:
+        # Частичный ответ — НИКОГДА не "задолженностей нет" по провайдеру
+        # целиком: сумма/отсутствие долга — только по проверенным секциям.
+        found = _format_try_amount(result.total_amount) if result.total_amount > 0 else "задолженностей нет"
+        return (
+            f"{name} — ⚠️ проверено частично: по проверенным дорогам {found}; "
+            f"не проверено: {_unchecked_sections_display(unchecked)}"
+        )
     if result.status == ProviderStatus.ERROR:
         return f"{name} — ⚠️ временно не удалось проверить"
     if result.status == ProviderStatus.NO_DEBT:
@@ -1042,12 +1073,17 @@ def _format_unified_provider_detail_block(result: ProviderCheckResult) -> str | 
     см. reader/turkey_bot/unified/check_service.py::_gib_fine_description/
     _avrasya_item_description/_kgm_item_description, ничего не выдумывается
     здесь). None — если у provider'а вообще нет ни одного элемента с
-    описанием (NO_DEBT/ERROR всегда имеют пустой items — им нечего
-    детализировать, см. _*_outcome_to_result — эти статусы items=())."""
+    описанием (NO_DEBT и обычный ERROR всегда имеют пустой items — им
+    нечего детализировать, см. _*_outcome_to_result). Частичный ERROR (см.
+    reader/turkey_bot/unified/models.py::partial_error_type) несёт долги
+    проверенных секций — они показываются с пометкой, что список неполный."""
     descriptions = [item.description for item in result.items if item.description]
     if not descriptions:
         return None
     name = _UNIFIED_PROVIDER_DISPLAY.get(result.provider, result.provider)
+    unchecked = unchecked_sections(result)
+    if unchecked:
+        name += f" (проверено частично, не проверено: {_unchecked_sections_display(unchecked)})"
     return name + "\n" + "\n\n".join(descriptions)
 
 
