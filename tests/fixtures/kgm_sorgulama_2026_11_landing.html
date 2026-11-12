@@ -1,0 +1,4620 @@
+
+
+<!DOCTYPE html>
+
+
+
+<html>
+
+<head><title>
+
+	KGM - Geçiş İhlal Sorgulama
+
+</title><link href="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/Css/mainV1.css" rel="stylesheet" /><link href="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/Css/modal.css" rel="stylesheet" /><link href="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/Css/kredikart.css" rel="stylesheet" /><link rel="shortcut&#32;icon" href="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/images/kgm.ico" type="image/x-icon" /><link rel="icon" href="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/images/kgm.ico" type="image/ico" /><meta charset="utf-8" /><meta name="viewport" content="width=device-width,&#32;initial-scale=1,&#32;shrink-to-fit=no" /><link rel="stylesheet" href="../bootstrap/css/bootstrap.min.css" /><link rel="stylesheet" href="../bootstrap/css/bootstrap-help.css" /><link rel="stylesheet" href="../bootstrap/css/datatables.css" />
+
+
+
+    <!-- Google tag (gtag.js) --> 
+
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-P1MD63L4M4"></script> 
+
+    <script> window.dataLayer = window.dataLayer || []; function gtag(){dataLayer.push(arguments);} gtag('js', new Date()); gtag('config', 'G-P1MD63L4M4'); </script>
+
+
+
+<style type="text/css">
+
+.updateModal {
+
+    position: fixed;
+
+    z-index: 1000;
+
+    height: 100%;
+
+    width: 100%;
+
+    top: 0;
+
+    left: 0;
+
+    background-color: Black;
+
+    filter: alpha(opacity=60);
+
+    opacity: 0.6;
+
+    -moz-opacity: 0.8;
+
+}
+
+
+
+.updateModalCenter {
+
+    z-index: 1000;
+
+    margin: 300px auto;
+
+    padding: 10px;
+
+    width: 35px;
+
+    background-color: White;
+
+    border-radius: 10px;
+
+    filter: alpha(opacity=100);
+
+    opacity: 1;
+
+    -moz-opacity: 1;
+
+}
+
+
+
+.updateModalCenter img {
+
+    height: 35px;
+
+    width: 35px;
+
+}
+
+
+
+.plaka-wrapper {
+
+    position: relative;
+
+    width: 260px;
+
+}
+
+
+
+.plaka-input {
+
+    width: 100%;
+
+    font-size: 18px;
+
+    text-align: center; 
+
+    direction: ltr !important; 
+
+    unicode-bidi: plaintext !important;
+
+}
+
+
+
+.plate-container {
+
+    max-width: 260px; 
+
+    width: 100%;      
+
+    margin: 0 auto;             
+
+    display: flex;
+
+    flex-direction: column;
+
+    align-items: center;        
+
+}
+
+
+
+.keyboard-toggle {
+
+    margin-top: 6px;
+
+    display: flex;
+
+    gap: 6px;
+
+    justify-content: center; 
+
+}
+
+
+
+
+
+.virtual-keyboard.compact {
+
+    margin-top: 6px;
+
+    width: 100%;            
+
+    max-width: 260px;
+
+    padding: 6px;
+
+
+
+    display: none;
+
+    background: #fff;
+
+    border: 1px solid #d0d0d0;
+
+    border-radius: 8px;
+
+    box-shadow: 0 3px 10px rgba(0,0,0,0.08);
+
+
+
+    justify-content: center; 
+
+}
+
+
+
+.virtual-keyboard.compact button {
+
+    width: 28px;
+
+    height: 28px;
+
+    margin: 2px;
+
+    font-size: 14px;
+
+    border-radius: 4px;
+
+}
+
+
+
+.virtual-keyboard button:hover {
+
+    background: #f0f0f0;
+
+}
+
+
+
+.plaka-input.arabic{
+
+   letter-spacing:1px;
+
+}
+
+
+
+.digit-switch{
+
+ display:flex;
+
+ justify-content:center;
+
+ gap:6px;
+
+ margin-bottom:6px;
+
+}
+
+
+
+.digit-switch button{
+
+ padding:4px 10px;
+
+ border:1px solid #ccc;
+
+ background:#f7f7f7;
+
+ border-radius:6px;
+
+ cursor:pointer;
+
+ font-size:14px;
+
+}
+
+
+
+.digit-switch button.active{
+
+ background:#007bff;
+
+ color:white;
+
+ border-color:#007bff;
+
+}
+
+
+
+/* ---- Başlık: görseller sütuna sığacak kadar küçülür (tablette başlık logonun üzerine binmesin) ---- */
+
+.baslik-satiri img { max-width: 100%; height: auto; }
+
+.baslik-sag { gap: 6px; }
+
+.baslik-sag a, .baslik-sag img { flex: 0 1 auto; min-width: 0; }
+
+.baslik-metin { margin: 6px 0 4px 0; }
+
+
+
+/* ---- Yabancı / Yerli plaka sekmeleri ---- */
+
+.plaka-sekme {
+
+    max-width: 640px;
+
+    margin: 12px auto 16px auto;
+
+}
+
+.plaka-sekme .nav-link {
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: center;
+
+    gap: 8px;
+
+    padding: 10px 12px;
+
+    border: 2px solid #007bff;
+
+    background: #fff;
+
+    color: #0056b3;
+
+    font-size: 17px;
+
+    font-weight: 600;
+
+}
+
+.plaka-sekme .nav-item + .nav-item .nav-link { margin-left: 8px; }
+
+.plaka-sekme .nav-link.active { background: #007bff; color: #fff; }
+
+.plaka-sekme svg { flex-shrink: 0; }
+
+.tr-rozet {
+
+    display: inline-block;
+
+    padding: 2px 5px;
+
+    border-radius: 3px;
+
+    background: #003399;
+
+    color: #fff;
+
+    font-size: 12px;
+
+    font-weight: 700;
+
+    line-height: 1.2;
+
+}
+
+.plaka-sekme .nav-link.active .tr-rozet { background: #fff; color: #003399; }
+
+.yabanci-bilgi {
+
+    text-align: center;
+
+    font-size: 14px;
+
+    color: #495057;
+
+    margin-bottom: 10px;
+
+}
+
+.tr-plaka-inline {
+
+    width: 100%;
+
+    margin: 8px 0 0 0;
+
+    padding: 8px 10px;
+
+    font-size: 13px;
+
+}
+
+/* ---- Resmi Plaka: tescil belge seri no + VKN ---- */
+
+.resmi-alanlar {
+
+    width: 100%;
+
+    max-width: 360px;
+
+    margin: 4px 0 6px 0;
+
+}
+
+.resmi-alanlar label {
+
+    margin-bottom: 2px;
+
+    font-weight: 600;
+
+    font-size: 14px;
+
+}
+
+.resmi-alanlar .form-group { margin-bottom: 10px; }
+
+.resmi-input { letter-spacing: 1px; }
+
+
+
+/* ---- CAPTCHA ---- */
+
+.captcha-kutu {
+
+    display: flex;
+
+    flex-direction: column;
+
+    align-items: flex-end;
+
+    max-width: 100%;
+
+}
+
+.captcha-img {
+
+    display: block;
+
+    max-width: 100%;
+
+    height: auto;
+
+    border: 1px solid #d0d7e2;
+
+    border-radius: 6px;
+
+}
+
+/* Yenile butonu görselin altında; görselin üzerine binip rakam kapatmasın */
+
+.captcha-yenile {
+
+    display: inline-flex;
+
+    align-items: center;
+
+    gap: 4px;
+
+    margin: 4px 0 4px 0;
+
+    padding: 3px 8px;
+
+    line-height: 1.2;
+
+    font-size: 13px;
+
+    color: #1f2d3d;
+
+    border: 1px solid #c5cedb;
+
+    border-radius: 6px;
+
+    background: #fff;
+
+}
+
+.captcha-yenile:hover { background: #f0f3f8; }
+
+
+
+/* ---- Yerli plaka: e-Devlet hizmetleri ---- */
+
+.yerli-bolum {
+
+    max-width: 900px;
+
+    margin: 0 auto 24px auto;
+
+}
+
+.yerli-aciklama {
+
+    text-align: center;
+
+    font-size: 16px;
+
+    margin-bottom: 14px;
+
+}
+
+/* Gerçek Kişi: petrol yeşili (#0b7a75), Tüzel Kişi: mor (#5b3fa0).
+
+   Buton, altındaki panel ve paneldeki kartlar aynı renktedir; seçili buton dolu renk + ✓ ile belirtilir. */
+
+.kisi-secim .nav-link {
+
+    display: flex;
+
+    align-items: center;
+
+    gap: 6px;
+
+    margin: 0 4px;
+
+    padding: 8px 16px;
+
+    border: 2px solid;
+
+    font-weight: 600;
+
+    transition: background .15s, box-shadow .15s;
+
+}
+
+.kisi-secim .nav-link.active::before { content: "\2713"; font-weight: 700; }
+
+.kisi-secim .nav-link.kisi-gercek { border-color: #0b7a75; background: #e8f5f4; color: #0b7a75; }
+
+.kisi-secim .nav-link.kisi-gercek.active { background: #0b7a75; color: #fff; box-shadow: 0 3px 10px rgba(11,122,117,0.4); }
+
+.kisi-secim .nav-link.kisi-tuzel { border-color: #5b3fa0; background: #f1edf9; color: #5b3fa0; }
+
+.kisi-secim .nav-link.kisi-tuzel.active { background: #5b3fa0; color: #fff; box-shadow: 0 3px 10px rgba(91,63,160,0.4); }
+
+.kisi-panel {
+
+    padding: 14px 14px 2px 14px;
+
+    border: 2px solid;
+
+    border-radius: 10px;
+
+}
+
+.kisi-panel-baslik {
+
+    display: flex;
+
+    align-items: center;
+
+    gap: 6px;
+
+    margin-bottom: 12px;
+
+    font-size: 15px;
+
+    font-weight: 700;
+
+}
+
+.kisi-panel-gercek { border-color: #0b7a75; background: #f3faf9; }
+
+.kisi-panel-gercek .kisi-panel-baslik { color: #0b7a75; }
+
+.kisi-panel-gercek .edevlet-kart { border-top-color: #0b7a75; }
+
+.kisi-panel-gercek .edevlet-rozet { border-color: #0b7a75; color: #0b7a75; }
+
+.kisi-panel-gercek .btn-edevlet { background: #0b7a75; border-color: #0b7a75; }
+
+.kisi-panel-gercek .btn-edevlet:hover, .kisi-panel-gercek .btn-edevlet:focus { background: #085c58; border-color: #085c58; }
+
+.kisi-panel-tuzel { border-color: #5b3fa0; background: #f7f4fc; }
+
+.kisi-panel-tuzel .kisi-panel-baslik { color: #5b3fa0; }
+
+.kisi-panel-tuzel .edevlet-kart { border-top-color: #5b3fa0; }
+
+.kisi-panel-tuzel .edevlet-rozet { border-color: #5b3fa0; color: #5b3fa0; }
+
+.kisi-panel-tuzel .btn-edevlet { background: #5b3fa0; border-color: #5b3fa0; }
+
+.kisi-panel-tuzel .btn-edevlet:hover, .kisi-panel-tuzel .btn-edevlet:focus { background: #452e7c; border-color: #452e7c; }
+
+.edevlet-kart {
+
+    border: 1px solid #e1e5eb;
+
+    border-top: 4px solid #e30a17;
+
+    border-radius: 8px;
+
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+
+    transition: box-shadow .15s;
+
+}
+
+.edevlet-kart:hover { box-shadow: 0 4px 14px rgba(0,0,0,0.12); }
+
+.edevlet-rozet {
+
+    align-self: flex-start;
+
+    margin-bottom: 8px;
+
+    padding: 1px 8px;
+
+    border: 1px solid #e30a17;
+
+    border-radius: 10px;
+
+    color: #e30a17;
+
+    font-size: 12px;
+
+    font-weight: 700;
+
+}
+
+.edevlet-baslik {
+
+    margin-bottom: 14px;
+
+    font-size: 16px;
+
+    font-weight: 600;
+
+    line-height: 1.4;
+
+}
+
+/* Başlığın altında, hangi araçların listelendiğini anlatan kısa açıklama; iki kartı ayırt ettiren bilgi olduğu için vurgulu */
+
+.edevlet-aciklama {
+
+    align-self: flex-start;
+
+    margin: -6px 0 14px 0;
+
+    padding: 4px 10px;
+
+    border-left: 4px solid;
+
+    border-radius: 4px;
+
+    font-size: 15px;
+
+    font-weight: 700;
+
+}
+
+.kisi-panel-gercek .edevlet-aciklama { border-color: #0b7a75; background: #e0f2f0; color: #085c58; }
+
+.kisi-panel-tuzel .edevlet-aciklama { border-color: #5b3fa0; background: #ebe5f7; color: #452e7c; }
+
+.btn-edevlet { background: #e30a17; border-color: #e30a17; color: #fff; font-weight: 600; }
+
+.btn-edevlet:hover, .btn-edevlet:focus { background: #b8000f; border-color: #b8000f; color: #fff; }
+
+.mersis-uyari {
+
+    display: flex;
+
+    align-items: flex-start;
+
+    gap: 10px;
+
+    background: #fff8e1;
+
+    border: 1px solid #ffe08a;
+
+    border-left: 5px solid #f0ad00;
+
+    color: #5c4400;
+
+    font-size: 14px;
+
+}
+
+.mersis-uyari svg { flex-shrink: 0; margin-top: 2px; }
+
+.mersis-uyari a { color: #0056b3; font-weight: 600; word-break: break-all; }
+
+
+
+</style>
+
+
+
+
+
+</head>
+
+
+
+<body>
+
+   
+
+<form method="post" action="./Sorgulama.aspx?lang=tr" onsubmit="javascript:return WebForm_OnSubmit();" id="form1">
+
+<div class="aspNetHidden">
+
+<input type="hidden" name="__EVENTTARGET" id="__EVENTTARGET" value="" />
+
+<input type="hidden" name="__EVENTARGUMENT" id="__EVENTARGUMENT" value="" />
+
+<input type="hidden" name="__VIEWSTATE" id="__VIEWSTATE" value="FAKE_VIEWSTATE_PLACEHOLDER_NOT_REAL" />
+
+</div>
+
+
+
+<script type="text/javascript">
+
+//<![CDATA[
+
+var theForm = document.forms['form1'];
+
+if (!theForm) {
+
+    theForm = document.form1;
+
+}
+
+function __doPostBack(eventTarget, eventArgument) {
+
+    if (!theForm.onsubmit || (theForm.onsubmit() != false)) {
+
+        theForm.__EVENTTARGET.value = eventTarget;
+
+        theForm.__EVENTARGUMENT.value = eventArgument;
+
+        theForm.submit();
+
+    }
+
+}
+
+//]]>
+
+</script>
+
+
+
+
+
+<script src="/WebIhlalSorgulama/WebResource.axd?d=pynGkmcFUV13He1Qd6_TZFI00fOHGDPFmkK-BQGRT_iI5cqHSkalkuBHSZ6bPI1u9HT7PR8Bqktdv-m243Qx9Q2&amp;t=638344191423008439" type="text/javascript"></script>
+
+
+
+
+
+<script src="/WebIhlalSorgulama/ScriptResource.axd?d=nv7asgRUU0tRmHNR2D6t1ADHrHnKMaVpLHHJ3N-yawYV6gcqI3Y2tFZnJKCl0dCBC9jDIkZHeiJmL5iqle_tWzn7enFu2aG1wV8i4sJtA42N657iTq3uoWlTuU4CrYyRuVQTUZfXt54t4a2v8PGt2g2&amp;t=fffffffff937e5a5" type="text/javascript"></script>
+
+<script src="/WebIhlalSorgulama/ScriptResource.axd?d=NJmAwtEo3Ipnlaxl6CMhvqTBzNq06gQdDVeiQsZTorojdagMotPCKwUtZpJ9zvOYbkpsqsvUs2e67FBKConQfNiwjw4FQEiAJlnAB-U1qtb_xm9_q-DF1Av-6vKSmTfcq4_WEhgmuhObjEaqCDoEs-gjkdbTbU-W10YY-hr2TV81&amp;t=ffffffffadad19fc" type="text/javascript"></script>
+
+<script src="/WebIhlalSorgulama/ScriptResource.axd?d=dwY9oWetJoJoVpgL6Zq8OPSQS63scPTBoCZiCIG_zHxEhx-m8U0wCuELVGvFbfW2e4yvfaK1QIuqbn0ki-5OspvCYPlm4fi6_3qBb25mw7at3googbaIOCZa0wfn_P_bNJIRM4ZLDFDlp0Mv9BnHwz3Wf6dIaBtufU5jA1NNadE1&amp;t=ffffffffadad19fc" type="text/javascript"></script>
+
+<script type="text/javascript">
+
+//<![CDATA[
+
+function WebForm_OnSubmit() {
+
+if (typeof(ValidatorOnSubmit) == "function" && ValidatorOnSubmit() == false) return false;
+
+return true;
+
+}
+
+//]]>
+
+</script>
+
+
+
+<div class="aspNetHidden">
+
+
+
+	<input type="hidden" name="__VIEWSTATEGENERATOR" id="__VIEWSTATEGENERATOR" value="FAKEGEN01" />
+
+	<input type="hidden" name="__VIEWSTATEENCRYPTED" id="__VIEWSTATEENCRYPTED" value="" />
+
+</div>
+
+
+
+        
+
+
+
+        <div lang="tr">
+
+
+
+            <script type="text/javascript">
+
+//<![CDATA[
+
+Sys.WebForms.PageRequestManager._initialize('ScriptManager1', 'form1', ['tpnlSayfa','pnlSayfa','tpnlUpdate','pnlUpdate','tpnlGuvenlik','pnlGuvenlik','tpnlTum','pnlTum'], ['btnSorgula','btnSorgula'], [], 36000, '');
+
+//]]>
+
+</script>
+
+
+
+
+
+            <div id="UpdateProgress1" style="display:none;">
+
+	
+
+                    <div class="updateModal">
+
+                        <div class="updateModalCenter">
+
+                            
+
+                            <img id="aspImg1" src="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/Images/default.gif" />
+
+                        </div>
+
+                    </div>
+
+                
+
+</div>
+
+
+
+
+
+<div id="pnlSayfa">
+
+	
+
+
+
+<div class="container">
+
+
+
+
+
+<div class="row baslik-satiri align-items-center">
+
+<div class="col-12 col-sm-6 col-lg-4 order-1 d-flex justify-content-start">
+
+<a href="http://www.kgm.gov.tr" id="kgmLogoId">
+
+    <img id="kgmLogoImageId" src="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/Images/kgm_logo_k.png" />
+
+</a>
+
+</div>
+
+<div class="col-12 col-lg-4 order-3 order-lg-2 d-flex justify-content-center">
+
+<p class="h4 text-center baslik-metin">İHLALLİ GEÇİŞ SORGULAMA</p>
+
+</div>
+
+<div class="col-sm-6 col-lg-4 order-2 order-lg-3 d-none d-sm-flex justify-content-end align-items-center baslik-sag">
+
+ <a href="http://www.ubak.gov.tr"><img src="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/Images/udh_logo.png" /></a>
+
+ <img src="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/Images/ataturk.png" />
+
+</div>
+
+</div>
+
+
+
+
+
+<ul class="nav nav-pills nav-justified plaka-sekme" id="plakaSekme" role="tablist">
+
+ <li class="nav-item">
+
+  <a class="nav-link active" id="tabYerli" data-toggle="pill" href="#sekmeYerli" role="tab" aria-controls="sekmeYerli" aria-selected="true">
+
+   <span class="tr-rozet">TR</span>
+
+   <span>Yerli (TR) Plaka</span>
+
+  </a>
+
+ </li>
+
+ <li class="nav-item">
+
+  <a class="nav-link" id="tabYabanci" data-toggle="pill" href="#sekmeYabanci" role="tab" aria-controls="sekmeYabanci" aria-selected="false" onclick="sorguModunuUygula('YABANCI')">
+
+   <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0zM1.03 8.5h2.99c.05 1.07.2 2.08.45 2.99H2.06A6.96 6.96 0 0 1 1.03 8.5zm2.99-1H1.03a6.96 6.96 0 0 1 1.03-2.99h2.41c-.25.91-.4 1.92-.45 2.99zm1 1h2.48v2.99H5.5c-.27-.87-.44-1.88-.48-2.99zm0-1c.04-1.11.21-2.12.48-2.99H7.5V7.5H5.02zM8.5 8.5h2.48c-.04 1.11-.21 2.12-.48 2.99H8.5V8.5zm0-1V4.51h2c.27.87.44 1.88.48 2.99H8.5zm3.48 1h2.99a6.96 6.96 0 0 1-1.03 2.99h-2.41c.25-.91.4-1.92.45-2.99zm0-1c-.05-1.07-.2-2.08-.45-2.99h2.41a6.96 6.96 0 0 1 1.03 2.99h-2.99zM8.5 1.07c.66.2 1.3.97 1.78 2.44H8.5V1.07zm-1 0v2.44H5.72C6.2 2.04 6.84 1.27 7.5 1.07zM4.66 3.51H3.08a7.03 7.03 0 0 1 2.6-2.02c-.4.5-.74 1.19-1.02 2.02zm6.68 0c-.28-.83-.62-1.52-1.02-2.02a7.03 7.03 0 0 1 2.6 2.02h-1.58zM4.66 12.49c.28.83.62 1.52 1.02 2.02a7.03 7.03 0 0 1-2.6-2.02h1.58zm1.06 0H7.5v2.44c-.66-.2-1.3-.97-1.78-2.44zm2.78 0h1.78c-.48 1.47-1.12 2.24-1.78 2.44v-2.44zm2.84 0h1.58a7.03 7.03 0 0 1-2.6 2.02c.4-.5.74-1.19 1.02-2.02z"/></svg>
+
+   <span>Yabancı Plaka</span>
+
+  </a>
+
+ </li>
+
+ <li class="nav-item">
+
+  <a class="nav-link" id="tabResmi" data-toggle="pill" href="#sekmeYabanci" role="tab" aria-controls="sekmeYabanci" aria-selected="false" onclick="sorguModunuUygula('RESMI')">
+
+   <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8.277.084a.5.5 0 0 0-.554 0l-7.5 5A.5.5 0 0 0 .5 6h1.875v7H1.5a.5.5 0 0 0 0 1h13a.5.5 0 1 0 0-1h-.875V6H15.5a.5.5 0 0 0 .277-.916l-7.5-5zM12.375 6v7h-1.25V6h1.25zm-2.5 0v7h-1.25V6h1.25zm-2.5 0v7h-1.25V6h1.25zm-2.5 0v7h-1.25V6h1.25zM8 4a1 1 0 1 1 0-2 1 1 0 0 1 0 2zM.5 15a.5.5 0 0 0 0 1h15a.5.5 0 1 0 0-1H.5z"/></svg>
+
+   <span>Resmi Plaka</span>
+
+  </a>
+
+ </li>
+
+</ul>
+
+
+
+<div class="tab-content">
+
+
+
+
+
+<div class="tab-pane fade" id="sekmeYabanci" role="tabpanel" aria-labelledby="tabYabanci">
+
+
+
+<div class="yabanci-bilgi yabanci-ozel">Bu sayfadan yalnızca yabancı plakalı araçlara ait ihlalli geçişler sorgulanabilir.</div>
+
+<div class="yabanci-bilgi resmi-ozel d-none">Bu sekmeden kamu kurumlarına ait resmi plakalı araçların ihlalli geçişleri; plaka, tescil belge seri no ve aracın sahibi olan kurumun vergi kimlik numarası doğrulanarak sorgulanabilir.</div>
+
+
+
+<div id="pnlUpdate">
+
+		
+
+
+
+<div class="row justify-content-center">
+
+
+
+<div class="col-md-4 d-none d-sm-block d-xs-block">
+
+</div>
+
+
+
+<div class="col-md-4 d-flex justify-content-lg-center justify-content-md-center justify-content-sm-center  justify-content-xs-center">
+
+<div class="plate-container ">
+
+<div class="plaka-wrapper">
+
+    
+
+    <input name="txtPlk" type="text" maxlength="20" id="txtPlk" title="Plaka" class="plaka-input&#32;form-control&#32;input-lg" placeholder="Plaka" data-mode="latin" style="text-transform: uppercase; direction: ltr !important; unicode-bidi: plaintext !important;" />
+
+    <input type="hidden" name="hdnSorguTipi" id="hdnSorguTipi" />
+
+
+
+</div>
+
+
+
+<div id="trPlakaInlineUyari" class="alert alert-warning tr-plaka-inline d-none" role="alert">
+
+    Türkiye (TR) plakaları bu sayfadan sorgulanamaz. Lütfen Yerli (TR) Plaka sekmesindeki e-Devlet hizmetlerini kullanın.
+
+    <button type="button" class="btn btn-sm btn-danger btn-block mt-2" onclick="yerliSekmeyeGec(true)">Yerli plaka işlemlerine git</button>
+
+</div>
+
+
+
+<div id="yabanciPlakaInlineUyari" class="alert alert-warning tr-plaka-inline d-none" role="alert">
+
+    Resmi Plaka sorgusunda yalnızca Türkiye (TR) plakaları kabul edilir.
+
+</div>
+
+
+
+<div class="keyboard-toggle yabanci-ozel">
+
+    <button type="button" onclick="toggleKeyboard('latin')">Latin</button>
+
+    <button type="button" onclick="toggleKeyboard('cyrillic')">Кирил</button>
+
+    <button type="button" onclick="toggleKeyboard('arabic')">عربي</button>
+
+</div>
+
+
+
+  <div id="vk" class="virtual-keyboard compact">
+
+    <div id="digitSwitch" class="digit-switch">
+
+        <button type="button" onclick="setDigits('arabic')" id="btnArabic" title="Arabic digits">٠١٢</button>
+
+        <button type="button" onclick="setDigits('persian')" id="btnPersian" title="Persian digits">۰۱۲</button>
+
+    </div>
+
+  </div>
+
+
+
+</div>
+
+
+
+</div>
+
+
+
+<div class="col-md-2 d-flex justify-content-start">
+
+<span id="cvPlaka" class="vgRegEx" style="visibility:hidden;">*</span>
+
+<span id="rfv1" class="vgRegEx_bt" style="visibility:hidden;">*</span>
+
+
+
+</div>
+
+
+
+<div class="col-md-2 d-none d-sm-block d-xs-block text-right">
+
+
+
+<a href="Odeme/OdemeSorgulama.aspx" target="_parent" class="link-primary">
+
+    Ödeme Sorgula
+
+</a>
+
+
+
+</div>
+
+</div>
+
+
+
+
+
+<div class="row resmi-ozel d-none">
+
+ <div class="col-lg-4 col-md-2 d-none d-sm-block d-xs-block"></div>
+
+ <div class="col-lg-4 col-md-8 d-flex justify-content-center">
+
+  <div class="resmi-alanlar">
+
+   <div class="form-group">
+
+    <label for="txtTescilSeriNo">Tescil Belge Seri No</label>
+
+    <input name="txtTescilSeriNo" type="text" maxlength="8" id="txtTescilSeriNo" class="form-control&#32;input-lg&#32;resmi-input" placeholder="AB123456" autocomplete="off" spellcheck="false" style="text-transform: uppercase;" />
+
+    <div class="invalid-feedback">Tescil Belge Seri No 2 harf ve 6 rakamdan oluşmalıdır (ör. AB123456).</div>
+
+   </div>
+
+   <div class="form-group">
+
+    <label for="txtVkn">Vergi Kimlik No (VKN)</label>
+
+    <input name="txtVkn" type="text" maxlength="10" id="txtVkn" class="form-control&#32;input-lg&#32;resmi-input" placeholder="0123456789" autocomplete="off" inputmode="numeric" />
+
+    <div class="invalid-feedback">Vergi Kimlik No 10 haneli rakamdan oluşmalıdır.</div>
+
+   </div>
+
+  </div>
+
+ </div>
+
+ <div class="col-lg-4 col-md-2 d-none d-sm-block d-xs-block"></div>
+
+</div>
+
+
+
+<div class="row">
+
+ <div class="col-lg-4 col-md-2 d-none d-sm-block d-xs-block"></div>
+
+ <div class="col-lg-4 col-md-8 d-flex justify-content-lg-center justify-content-md-center justify-content-sm-center  justify-content-xs-center">
+
+  <div class="captcha-kutu">
+
+   <img id="Image1" class="captcha-img" src="../Captcha/CaptchaImage.aspx" alt="CAPTCHA" />
+
+   <button type="button" class="captcha-yenile" onclick="captchaYenile()">
+
+    <svg width="18" height="18" viewBox="0 0 16 16" fill="#1f2d3d" aria-hidden="true"><path d="M8 3a5 5 0 1 0 4.55 2.92.5.5 0 0 1 .91-.42A6 6 0 1 1 8 2v1z"/><path d="M8 4.47V.53a.25.25 0 0 1 .41-.19l2.36 1.97a.25.25 0 0 1 0 .38L8.41 4.66A.25.25 0 0 1 8 4.47z"/></svg>
+
+    <span>Görseli yenile</span>
+
+   </button>
+
+  </div>
+
+</div>
+
+ <div class="col-lg-4 col-md-2 d-none d-sm-block d-xs-block"></div>
+
+</div>
+
+
+
+<div class="row">  
+
+ <div class="col-lg-4 col-md-2 d-none d-sm-block d-xs-block"></div>
+
+ <div class="col-lg-4 col-md-8 d-flex justify-content-lg-center justify-content-md-center justify-content-sm-center  justify-content-xs-center">
+
+  <textarea name="txtimgcode" rows="2" cols="20" id="txtimgcode" title="Metni&#32;girin" class="form-control&#32;input-lg&#32;mtTextBoxLarge" placeholder="Matematiksel&#32;ifadenin&#32;sonucunu&#32;ve&#32;yanındaki&#32;sayıyı&#32;arada&#32;bir&#32;boşluk&#32;bırakarak&#32;giriniz." style="height:85px;">
+
+</textarea>
+
+</div>
+
+ <div class="col-lg-4 col-md-2">
+
+   <span id="Label7" class="control-label" style="display:inline-block;color:Red;width:70px;"></span>
+
+</div>
+
+</div>
+
+
+
+
+
+<div class="row">  
+
+<div class="col-lg-4 col-md-2 d-none d-sm-block d-xs-block"></div>
+
+<div class="col-lg-4 col-md-8 d-flex justify-content-lg-center justify-content-md-end justify-content-sm-center  justify-content-xs-center">
+
+
+
+ <span id="lblHata" class="control-label&#32;vgRegEx_bt" style="color:Red;font-size:Small;"></span>
+
+
+
+</div>
+
+<div class="col-lg-4 col-md-2 d-none d-sm-block d-xs-block"></div>
+
+</div>
+
+
+
+<div class="row">   
+
+<div class="col-lg-4 col-md-2 d-none d-sm-block d-xs-block"></div>
+
+<div class="col-lg-4 col-md-8 d-flex justify-content-lg-center justify-content-md-center justify-content-sm-center  justify-content-xs-center">
+
+
+
+<input type="submit" name="btnSorgula" value="Sorgula" onclick="GuvenlikCheckFunc();&#32;if&#32;(!sorguOnKontrol())&#32;return&#32;false;WebForm_DoPostBackWithOptions(new&#32;WebForm_PostBackOptions(&quot;btnSorgula&quot;,&#32;&quot;&quot;,&#32;true,&#32;&quot;val1&quot;,&#32;&quot;&quot;,&#32;false,&#32;false))" id="btnSorgula" class="btn&#32;btn-primary&#32;btn-lg&#32;btn-block" />
+
+
+
+</div>
+
+<div class="col-lg-4 col-md-2 d-none d-sm-block d-xs-block"></div>
+
+</div>
+
+               
+
+
+
+	</div>
+
+
+
+
+
+
+
+<div id="pnlGuvenlik">
+
+		
+
+
+
+
+
+<div class="row">  
+
+<div class="col-md-4 d-none d-sm-block d-xs-block"></div>
+
+<div class="col-md-4 d-flex justify-content-lg-end justify-content-md-end justify-content-sm-center  justify-content-xs-center"> 
+
+ <span id="lblGuvenlikHata" class="vgRegEx_bt" style="color:Red;font-size:Small;"></span>
+
+</div>
+
+<div class="col-md-4 d-none d-sm-block d-xs-block"></div>
+
+</div>
+
+
+
+<div class="row">  
+
+<div class="col-md-12 d-flex justify-content-center"> 
+
+ <div style="font-size:16px; text-align: justify; text-justify: inter-word;">
+
+    KGM tarafından işletilen ücretli otoyol ve köprülerden yapılan son 15 güne ait  geçişler  henüz bu sayfaya yansımamış olabilir. <span style="font-weight: bold">Ücret Toplama Sistemlerimizin esas ödeme kanalı HGS hesaplarıdır. </span>Bu sebeple  cezalı duruma düşmemek için geçiş tarihini izleyen 15 gün içerisinde araç plakanıza ait bir HGS hesabının açılması, hesabı olan araçlar için ise HGS hesabına yeterli bakiye yüklenmesi gerekmektedir.
+
+ </div>
+
+</div>
+
+</div>
+
+
+
+<div class="row">  
+
+<div class="col-md-4 d-none d-sm-block d-xs-block"></div>
+
+<div class="col-md-4 d-flex justify-content-center"> 
+
+ <input id="chkGuvenlikUyari" type="checkbox" name="chkGuvenlikUyari" onclick="GuvenlikCheckFunc();" />
+
+ <span style="font-weight: bold; color: red;">
+
+    OKUDUM ANLADIM
+
+ </span>
+
+ <input name="txtGuvenlikCheck" type="text" id="txtGuvenlikCheck" style="display: none" />
+
+ <span id="RequiredFieldValidator1" class="vgRegEx_bt" style="visibility:hidden;">*</span>
+
+</div>
+
+<div class="col-md-4 d-none d-sm-block d-xs-block"></div>
+
+</div>
+
+
+
+	</div>
+
+
+
+
+
+
+
+<div id="pnlTum">
+
+		
+
+
+
+
+
+	</div>
+
+
+
+
+
+</div>
+
+
+
+
+
+
+
+<div class="tab-pane fade show active" id="sekmeYerli" role="tabpanel" aria-labelledby="tabYerli">
+
+<div class="yerli-bolum">
+
+
+
+ <div id="trPlakaUyari" class="alert alert-info d-none" role="alert">
+
+  <strong>Girdiğiniz plaka Türkiye (TR) plakası olarak değerlendirildi. Yerli plaka işlemleri için aşağıdaki e-Devlet hizmetlerini kullanabilirsiniz.</strong>
+
+  <div class="small mt-1">Aracınız yabancı plakalı olduğu hâlde bu uyarıyı görüyorsanız ALO 123 veya 0 850 460 60 60 numaralı telefonlardan ya da hgs@ptt.gov.tr adresinden bilgi alabilirsiniz.</div>
+
+ </div>
+
+
+
+ <p class="yerli-aciklama">Türkiye (TR) plakalı araçlara ait otoyol, köprü ve tünel geçiş, ihlalli geçiş ve borç sorgulama işlemleri e-Devlet Kapısı üzerinden yapılmaktadır.</p>
+
+
+
+ <ul class="nav nav-pills kisi-secim justify-content-center mb-3" id="kisiSekme" role="tablist">
+
+  <li class="nav-item">
+
+   <a class="nav-link kisi-gercek active" id="tabGercekKisi" data-toggle="pill" href="#kisiGercek" role="tab" aria-controls="kisiGercek" aria-selected="true"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm-5 6s-1 0-1-1 1-4 6-4 6 3 6 4-1 1-1 1H3z"/></svg><span>Gerçek Kişi</span></a>
+
+  </li>
+
+  <li class="nav-item">
+
+   <a class="nav-link kisi-tuzel" id="tabTuzelKisi" data-toggle="pill" href="#kisiTuzel" role="tab" aria-controls="kisiTuzel" aria-selected="false"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M3 0a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h3v-3.5h4V16h3a1 1 0 0 0 1-1V1a1 1 0 0 0-1-1H3zm1 2.5h2v2H4v-2zm0 3.5h2v2H4V6zm0 3.5h2v2H4v-2zm6-7h2v2h-2v-2zM10 6h2v2h-2V6zm0 3.5h2v2h-2v-2z"/></svg><span>Tüzel Kişi</span></a>
+
+  </li>
+
+ </ul>
+
+
+
+ <div class="tab-content">
+
+
+
+  <div class="tab-pane fade show active kisi-panel kisi-panel-gercek" id="kisiGercek" role="tabpanel" aria-labelledby="tabGercekKisi">
+
+   <div class="kisi-panel-baslik"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm-5 6s-1 0-1-1 1-4 6-4 6 3 6 4-1 1-1 1H3z"/></svg>Gerçek Kişi</div>
+
+   <div class="row">
+
+  <div class="col-md-6 mb-3">
+
+   <div class="card edevlet-kart h-100">
+
+    <div class="card-body d-flex flex-column">
+
+     <span class="edevlet-rozet">e-Devlet</span>
+
+     <h2 class="card-title edevlet-baslik">Otoyol, Köprü ve Tünel Geçiş, İhlalli Geçiş ve Borç Sorgulama (Plakaya Bağlı)</h2>
+
+     <p class="edevlet-aciklama">Şu an sahibi olduğunuz araçlar</p>
+
+     <a class="btn btn-edevlet btn-block mt-auto" href="https://www.turkiye.gov.tr/karayollari-otoyol-kopru-ve-tunel-gecis-ihlalli-gecis-ve-borc-sorgulama-plakaya-bagli-gercek-kisi?arac=Liste" target="_blank" rel="noopener noreferrer">e-Devlet'te Aç<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" style="margin-left:4px;vertical-align:-2px"><path d="M8.64 3.5a.5.5 0 0 1 .5-.5h3.86a.5.5 0 0 1 .5.5v3.86a.5.5 0 0 1-1 0V4.71L7.35 9.86a.5.5 0 1 1-.7-.7L11.79 4H9.14a.5.5 0 0 1-.5-.5z"/><path d="M2 5.5A1.5 1.5 0 0 1 3.5 4H6a.5.5 0 0 1 0 1H3.5a.5.5 0 0 0-.5.5v7a.5.5 0 0 0 .5.5h7a.5.5 0 0 0 .5-.5V10a.5.5 0 0 1 1 0v2.5A1.5 1.5 0 0 1 10.5 14h-7A1.5 1.5 0 0 1 2 12.5v-7z"/></svg></a>
+
+    </div>
+
+   </div>
+
+  </div>
+
+  <div class="col-md-6 mb-3">
+
+   <div class="card edevlet-kart h-100">
+
+    <div class="card-body d-flex flex-column">
+
+     <span class="edevlet-rozet">e-Devlet</span>
+
+     <h2 class="card-title edevlet-baslik">Otoyol, Köprü ve Tünel İhlalli Geçiş ve Borç Sorgulama (TCKN'ye Bağlı)</h2>
+
+     <p class="edevlet-aciklama">Geçmişte ve şu an sahibi olduğunuz tüm araçlar</p>
+
+     <a class="btn btn-edevlet btn-block mt-auto" href="https://www.turkiye.gov.tr/karayollari-otoyol-kopru-ve-tunel-ihlalli-gecis-ve-borc-sorgulama-gercek-kisi?ozet=Ihlal" target="_blank" rel="noopener noreferrer">e-Devlet'te Aç<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" style="margin-left:4px;vertical-align:-2px"><path d="M8.64 3.5a.5.5 0 0 1 .5-.5h3.86a.5.5 0 0 1 .5.5v3.86a.5.5 0 0 1-1 0V4.71L7.35 9.86a.5.5 0 1 1-.7-.7L11.79 4H9.14a.5.5 0 0 1-.5-.5z"/><path d="M2 5.5A1.5 1.5 0 0 1 3.5 4H6a.5.5 0 0 1 0 1H3.5a.5.5 0 0 0-.5.5v7a.5.5 0 0 0 .5.5h7a.5.5 0 0 0 .5-.5V10a.5.5 0 0 1 1 0v2.5A1.5 1.5 0 0 1 10.5 14h-7A1.5 1.5 0 0 1 2 12.5v-7z"/></svg></a>
+
+    </div>
+
+   </div>
+
+  </div>
+
+   </div>
+
+  </div>
+
+
+
+  <div class="tab-pane fade kisi-panel kisi-panel-tuzel" id="kisiTuzel" role="tabpanel" aria-labelledby="tabTuzelKisi">
+
+   <div class="kisi-panel-baslik"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M3 0a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h3v-3.5h4V16h3a1 1 0 0 0 1-1V1a1 1 0 0 0-1-1H3zm1 2.5h2v2H4v-2zm0 3.5h2v2H4V6zm0 3.5h2v2H4v-2zm6-7h2v2h-2v-2zM10 6h2v2h-2V6zm0 3.5h2v2h-2v-2z"/></svg>Tüzel Kişi</div>
+
+   <div class="alert mersis-uyari" role="note">
+
+    <svg width="20" height="20" viewBox="0 0 16 16" fill="#b07d00" aria-hidden="true"><path d="M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16zm.93-9.41-1 4.7c-.07.34.03.53.3.53.2 0 .49-.07.69-.25l-.09.42c-.29.35-.92.6-1.46.6-.7 0-1-.42-.8-1.3l.73-3.44c.07-.29.01-.4-.28-.47l-.45-.08.08-.38 2.28-.33zM8 5.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2z"/></svg>
+
+    <div><strong>Ticaret şirketlerinin</strong> bu hizmeti kullanabilmesi için <a href="https://mersis.ticaret.gov.tr" target="_blank" rel="noopener noreferrer">https://mersis.ticaret.gov.tr</a> adresinden giriş yapılmak suretiyle T.C. Ticaret Bakanlığının Merkezi Sicil Kayıt Sistemi (MERSİS) üzerinden güvenli elektronik imza ile yetkilendirme gerekmektedir.</div>
+
+   </div>
+
+   <div class="row">
+
+  <div class="col-md-6 mb-3">
+
+   <div class="card edevlet-kart h-100">
+
+    <div class="card-body d-flex flex-column">
+
+     <span class="edevlet-rozet">e-Devlet</span>
+
+     <h2 class="card-title edevlet-baslik">Otoyol, Köprü ve Tünel Geçiş, İhlalli Geçiş ve Borç Sorgulama (Plakaya Bağlı) (Tüzel Kişi)</h2>
+
+     <p class="edevlet-aciklama">Şu an sahibi olduğunuz araçlar</p>
+
+     <a class="btn btn-edevlet btn-block mt-auto" href="https://www.turkiye.gov.tr/karayollari-otoyol-kopru-ve-tunel-gecis-ihlalli-gecis-ve-borc-sorgulama-plakaya-bagli-tuzel-kisi" target="_blank" rel="noopener noreferrer">e-Devlet'te Aç<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" style="margin-left:4px;vertical-align:-2px"><path d="M8.64 3.5a.5.5 0 0 1 .5-.5h3.86a.5.5 0 0 1 .5.5v3.86a.5.5 0 0 1-1 0V4.71L7.35 9.86a.5.5 0 1 1-.7-.7L11.79 4H9.14a.5.5 0 0 1-.5-.5z"/><path d="M2 5.5A1.5 1.5 0 0 1 3.5 4H6a.5.5 0 0 1 0 1H3.5a.5.5 0 0 0-.5.5v7a.5.5 0 0 0 .5.5h7a.5.5 0 0 0 .5-.5V10a.5.5 0 0 1 1 0v2.5A1.5 1.5 0 0 1 10.5 14h-7A1.5 1.5 0 0 1 2 12.5v-7z"/></svg></a>
+
+    </div>
+
+   </div>
+
+  </div>
+
+  <div class="col-md-6 mb-3">
+
+   <div class="card edevlet-kart h-100">
+
+    <div class="card-body d-flex flex-column">
+
+     <span class="edevlet-rozet">e-Devlet</span>
+
+     <h2 class="card-title edevlet-baslik">Otoyol, Köprü ve Tünel İhlalli Geçiş ve Borç Sorgulama (Tüzel Kişi) (VKN'ye Bağlı)</h2>
+
+     <p class="edevlet-aciklama">Geçmişte ve şu an sahibi olduğunuz tüm araçlar</p>
+
+     <a class="btn btn-edevlet btn-block mt-auto" href="https://www.turkiye.gov.tr/karayollari-otoyol-kopru-ve-tunel-ihlalli-gecis-ve-borc-sorgulama-tuzel-kisi" target="_blank" rel="noopener noreferrer">e-Devlet'te Aç<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" style="margin-left:4px;vertical-align:-2px"><path d="M8.64 3.5a.5.5 0 0 1 .5-.5h3.86a.5.5 0 0 1 .5.5v3.86a.5.5 0 0 1-1 0V4.71L7.35 9.86a.5.5 0 1 1-.7-.7L11.79 4H9.14a.5.5 0 0 1-.5-.5z"/><path d="M2 5.5A1.5 1.5 0 0 1 3.5 4H6a.5.5 0 0 1 0 1H3.5a.5.5 0 0 0-.5.5v7a.5.5 0 0 0 .5.5h7a.5.5 0 0 0 .5-.5V10a.5.5 0 0 1 1 0v2.5A1.5 1.5 0 0 1 10.5 14h-7A1.5 1.5 0 0 1 2 12.5v-7z"/></svg></a>
+
+    </div>
+
+   </div>
+
+  </div>
+
+   </div>
+
+  </div>
+
+
+
+ </div>
+
+
+
+ <p class="small text-muted text-center mb-0">Bağlantılar e-Devlet Kapısı'nda yeni sekmede açılır.</p>
+
+
+
+</div>
+
+</div>
+
+
+
+
+
+</div>
+
+
+
+
+
+<input type="hidden" name="hdnx" id="hdnx" />
+
+
+
+</div>
+
+
+
+
+
+</div>
+
+</div>
+
+
+
+<div class="modal" id="detayliBilgiKgmModalId">
+
+  <div class="modal-dialog">
+
+    <div class="modal-content">
+
+      <div class="modal-header">
+
+        <h4 class="modal-title">KARAYOLLARI GENEL MÜDÜRLÜĞÜ</h4>
+
+        <button type="button" class="close" data-dismiss="modal">&times;</button>
+
+      </div>
+
+      <div class="modal-body">
+
+      <p class="mtLabelBilgi">
+
+        <span style="font-weight: bold">Genel Müdürlüğümüz</span> işletimindeki otoyollar ve köprüler ile erişme kontrolünün uygulandığı karayolları için belirlenen geçiş ücretlerini ödemeden geçiş yapanlardan, <span style="font-weight: bold">ihlalli geçiş tarihini izleyen 15 gün içinde (15. gün resmi tatil ise takip eden ilk iş gününe kadar) yükümlü olduğu geçiş ücretini usulüne uygun olarak ödeyenlere idari para cezası uygulanmayacaktır. İhlalli geçiş tarihini izleyen 16. gün ile  45. gün aralığında  ödeme yapılırsa   geçiş ücretlerinin 1 (bir) katı tutarında idari para cezası uygulanır.</span>
+
+	  </p>
+
+      <p class="mtLabelBilgi">
+
+        <span style="font-weight: bold">Genel Müdürlüğümüz</span> işletimindeki otoyollar ve köprüler ile erişme kontrolünün uygulandığı karayolları için belirlenen geçiş ücretlerini <span style="font-weight: bold"> geçiş tarihinden itibaren 45 gün içinde ödemeden (ihlalli) geçiş yaptığı tespit edilen araç sahiplerine geçiş ücretinin 4 (dört) katı tutarında idarî para cezası uygulanır.</span>
+
+      </p>
+
+      <p class="mtLabelBilgi">
+
+        <span style="font-weight: bold">Aracınız adına kayıtlı ihlalli geçiş öncesi açılmış veya geçiş tarihini izleyen 15 gün içinde açılmış HGS etiket hesabının bulunması halinde, cezasız dönem içerisinde geçiş ücreti, bu hesapların herhangi birinden otomatik olarak tahsil edilmeye çalışılacaktır.</span> Ancak, ihlalli geçişi izleyen 15 gün içinde otomatik tahsilatın yapılamaması araç sahibinin ödemeye ilişkin sorumluluğunu ortadan kaldırmayacaktır.
+
+      </p>
+
+      <p class="mtLabelBilgi">
+
+        Otomatik tahsilatın çalışabilmesi için etiket hesabında bakiye sorunu olmayan, araç plakanıza kayıtlı ve <span style="font-weight: bold">usulüne uygun ön cama yapıştırılmış şekilde,</span> tek bir HGS etiketi olması gerekmektedir.
+
+      </p>
+
+      <p class="mtLabelBilgi">
+
+        Geçiş ücretinin cezasız son ödeme tarihine kadar ödenmemesi durumunda düzenlenen <span style="font-weight: bold">İdari para cezası tebliğ edilmeden önce ve tebliğ edildikten sonraki 30 gün boyunca %25 peşin ödeme indirimli olarak uygulanacaktır. Bu uygulama, Yap-İşlet-Devret modeli ile gerçekleştirilen Avrasya Tüneli, Gebze-Orhangazi-İzmir Otoyolu ile YSS Köprüsü ve Kuzey Çevre Otoyolu, Avrupa Otoyolu, Anadolu Otoyolu, Kuzey Ege Otoyolu, Ankara-Niğde Otoyolu ve Malkara-Çanakkale (1915 Çanakkale Köprüsü Dahil Kesimi)  projeleri için geçerli değildir.</span>
+
+      </p>		
+
+      </div>
+
+    </div>
+
+  </div>
+
+</div>
+
+
+
+<div class="modal" id="detayliBilgiAvrasyaModalId">
+
+  <div class="modal-dialog">
+
+    <div class="modal-content">
+
+      <div class="modal-header">
+
+        <h4 class="modal-title">AVRASYA TÜNELİ İŞLETME İNŞAAT VE YATIRIM A.Ş. (AVRASYA TÜNELİ)</h4>
+
+        <button type="button" class="close" data-dismiss="modal">&times;</button>
+
+      </div>
+
+      <div class="modal-body">
+
+      <p class="mtLabelBilgi">
+
+        İhlalli geçiş(ler)inizi, www.avrasyatuneli.com web sitesinden, Garanti, Yapı Kredi veya Türkiye İş Bankalarının Vezne, İnternet bankacılığı, Mobil bankacılık ve Atm kanallarından ödeyebilirsiniz.
+
+      </p>
+
+        
+
+      <p class="mtLabelBilgi">
+
+        Detaylı bilgi için iletişim kanalları;
+
+        </p>
+
+        
+
+       <p class="mtLabelBilgi">
+
+        Çağrı Merkezi : 0850 222 80 20
+
+       </p>
+
+        
+
+        <p class="mtLabelBilgi">
+
+        E-posta: bilgi@avrasyatuneli.com 
+
+        </p>
+
+        
+
+       <p class="mtLabelBilgi">
+
+        İnternet Sitesi: <a href="https://www.avrasyatuneli.com" id="avrasyaLinkId" target="_new">
+
+            www.avrasyatuneli.com</a>
+
+       </p>
+
+      <p class="mtLabelBilgi">
+
+        İhlalli (ödemesiz) geçiş ücretlerini, geçiş tarihini izleyen 15 gün içinde (15. gün resmî tatil ise takip eden ilk iş gününe kadar) usulüne uygun olarak ödeyenlere herhangi bir ceza uygulanmaz. Ancak, 6001 sayılı kanun gereğince, 15 gün içerisinde ödeme yapılmaması durumunda, geçişi takip eden 16. günden itibaren geçiş ücretine 1 (bir) kat tutarında ceza, 45. gün sonra ise 4 (dört) kat tutarında ceza eklenmektedir. Zamanında ödenmeyen ihlalli geçişler için hukuki süreç başlatılabilecek olup, bu durumda yargılama masrafları, harçlar, vekâlet ücretleri ve yasal faizler de ilgili araç sahibine yükletilmektedir.
+
+      </p>
+
+      </div>
+
+    </div>
+
+  </div>
+
+</div>
+
+
+
+<div class="modal" id="detayliBilgiOtoyolModalId">
+
+  <div class="modal-dialog">
+
+    <div class="modal-content">
+
+      <div class="modal-header">
+
+        <h4 class="modal-title">OTOYOL YATIRIM VE İŞLETME A.Ş. (GEBZE-ORHANGAZİ-İZMİR OTOYOLU)</h4>
+
+        <button type="button" class="close" data-dismiss="modal">&times;</button>
+
+      </div>
+
+      <div class="modal-body">
+
+<p class="mtLabelBilgi">
+
+<span style="font-weight: bold">İhlalli (ödemesiz) geçişe ait borç kayıtları, geçişi takip eden birkaç günlük bir kontrol süreci sonrasında</span> Ziraat Bankası ile Finansbank şubelerinden ve OTOYOL A.Ş ile KGM internet sitesinden <span style="font-weight: bold">görülebilir hale gelmektedir.</span> Geçiş ücretini 15 (onbeş) gün içerisinde (15. Günün Resmî Tatile denk gelmesi durumunda tatili izleyen ilk iş gününün sonuna kadar) <span style="font-weight: bold">ödemediğiniz takdirde geçiş ücretine 1 (bir) kat ceza eklenir.</span> 
+
+Söz konusu <span style="font-weight: bold">toplam tutar 45 (kırkbeş) gün içerisinde de ödenmez ise ceza tutarı 4 (dört) kat olur ve hukuki süreç başlatılır.</span> Bu kapsamda, geçiş ücreti ve 4 (dört) kat ceza tutarının, takip ve yargılama masrafları, avukatlık ücreti ve işleyecek 
+
+yasal faiz ile birlikte takip ve tahsil edileceğini bildiririz. Bu nedenle <span style="font-weight: bold">ihlalli (ödemesiz) geçişiniz varsa </span> geçişi takip eden 15 gün içerisinde muhtelif günlerde öncelikle OTOYOL A.Ş ve KGM internet sitesinden <span style="font-weight: bold">sorgulamaya devam etmenizi öneririz.</span>
+
+</p>
+
+
+
+<p class="mtLabelBilgi">
+
+<span style="font-weight: bold">Ya da çok daha kolay bir yöntem olarak;</span> <span style="color: blue; font-weight: bold">OTOYOL A.Ş. Mobil Uygulaması’nı</span> indirerek <span style="font-weight: bold">uygulamaya araç plakanızı kaydederseniz,</span> 
+
+telefonunuzun <span style="font-weight: bold">“bildirim alma” seçeneğini aktive etmeniz şartıyla;</span> uygulamaya kaydettiğiniz plakaya ait <span style="font-weight: bold">ihlalli (ödemesiz) geçişler varsa</span> birkaç günlük bir kontrol süreci sonrasında <span style="font-weight: bold">uygulama vasıtası ile tarafınıza otomatik olarak bildirilecektir.</span>
+
+</p>
+
+<p class="mtLabelBilgi">
+
+İhlalli (ödemesiz) geçiş öncesi açılmış veya geçiş tarihini izleyen 15 gün içinde yeni açılmış aracınıza kayıtlı HGS 
+
+etiket hesabının bulunması halinde, <span style="font-weight: bold">diğer borç ödeme yöntemlerinin yanı sıra size ödeme konusunda yardımcı olmak için, ihlalli (ödemesiz) geçişi takip eden 15 günlük cezasız dönem içerisinde</span> geçiş ücreti ilgili hesaptan otomatik olarak tahsil edilmeye çalışılacaktır. Ancak, otomatik tahsilatın yapılamaması araç sahibinin ödemeye ilişkin sorumluluğunu ortadan kaldırmayacağı gibi, böyle bir durumda Otoyol Yatırım ve İşletme A.Ş.'ye herhangi bir sorumluluk da atfedilemez. Sorun yaşamamak için PTT’den alınmış HGS etiketinize bağlı <span style="font-weight: bold">hesaplarınızın mevduat hesabı, kredili mevduat hesabı ya da limiti yeterli bir kredi kartı üzerinden verilmiş bir otomatik ödeme talimatının</span> bulunması gerektiğini unutmayınız.
+
+</p>
+
+<p class="mtLabelBilgi">
+
+<span style="font-weight: bold">Otomatik tahsilatın çalışabilmesi için</span> etiket hesabında <span style= "font-weight: bold">bakiye sorunu olmayan, araç plakanıza kayıtlı ve araca montaj talimatına uygun şekilde monte edilmiş, tek bir aktif etiket olması</span> gerektiğini özellikle hatırlatmak isteriz.    
+
+</p>
+
+<p class="mtLabelBilgi">
+
+İhlalli (ödemesiz) geçişe ait <span style="color: red; font-weight: bold">borç kaydına ilişkin ödemeler</span> 
+
+<span style="font-weight: bold">T.C. Ziraat Bankası A.Ş. veya QNB Finansbank A.Ş.</span> şubeleri ile bu bankaların internet bankacılığı sistemlerinden, <span style="color: blue; font-weight: bold">igs.otoyolas.com.tr</span> <span style="font-weight: bold">internet adresinden</span> ihlalli geçiş sorgusu sonrasında “ödeme yap” seçeneği ile ya da <span style="color: blue; font-weight: bold">OTOYOL A.Ş. Mobil Uygulaması</span> <span style="color: red; font-weight: bold">vasıtasıyla yapılabilir.</span>    
+
+</p>
+
+<p class="mtLabelBilgi">
+
+Ziraat Bankası veya Finansbank şubelerinde <span style="font-weight: bold">“Gebze-İzmir Otoyolu”</span> veya <span style="font-weight: bold">“Otoyol A.Ş” hesabı dışında başka banka veya başka hesaba yapılan ödemeler geçersizdir.</span>      
+
+</p>
+
+<p class="mtLabelBilgi">
+
+Borç ödemeleriniz ile ilgili sorun yaşamamak için, mesai saati sonrasında ödeme veya tahsilat yapılamayabileceğini de dikkate alarak, <span style="color: red; font-weight: bold">ödemelerinizi son güne bırakmadan yapmanızı özellikle tavsiye ederiz.</span> 
+
+</p>
+
+<p class="mtLabelBilgi">
+
+Detaylı bilgi için iletişim kanalları;
+
+</p>
+
+<p class="mtLabelBilgi">
+
+Çağrı Merkezi:<span style="font-weight: bold">0 850 399 35 05</span>    
+
+</p>
+
+
+
+<p class="mtLabelBilgi">
+
+İnternet Sitesi:<span style="color:blue; font-weight: bold">https://www.otoyolas.com.tr</span>
+
+</p>
+
+</div>
+
+</div>
+
+</div>
+
+</div>
+
+
+
+<div class="modal" id="detayliBilgiYssModalId">
+
+  <div class="modal-dialog">
+
+    <div class="modal-content">
+
+      <div class="modal-header">
+
+        <h4 class="modal-title">ICA (YSS KÖPRÜSÜ VE KUZEY ÇEVRE OTOYOLU)</h4>
+
+        <button type="button" class="close" data-dismiss="modal">&times;</button>
+
+      </div>
+
+      <div class="modal-body">
+
+<p class="mtLabelBilgi">
+
+ICA Yavuz Sultan Selim Köprüsü ve Kuzey Çevre Otoyolu’ndan geçiş ücretlerini ödemeden geçiş yapanlar, 6001 Sayılı Kanun uyarınca geçiş tarihini izleyen 15 (on beş) gün içinde geçiş ücretini cezasız ödeyebilir.
+
+</p>
+
+<p class="mtLabelBilgi">
+
+Geçiş ücretini geçiş tarihini izleyen 15 (on beş) gün içinde ödemediğiniz takdirde geçiş ücretine 1 (bir) kat ceza eklenir. Söz konusu geçiş ücreti ve 1 (bir) kat cezanın tamamı 45 (kırk beş) gün içinde ödenmez ise ceza tutarı 4 (dört) kat olur.    
+
+</p>
+
+<p class="mtLabelBilgi">
+
+Geçiş tarihini izleyen 45. sonunda geçiş ücreti ve 4 (dört) kat ceza tutarının ödenmemiş olması durumunda takip masrafları, avukatlık ücreti ve işlemiş/işleyecek faizi ile birlikte takip ve tahsili amacıyla hukuki süreç başlatılabilir.  
+
+</p>
+
+<p class="mtLabelBilgi">
+
+Araç plakanıza ait ihlalli geçiş öncesi veya geçiş tarihini izleyen 15 gün içinde açılmış HGS etiket hesabının bulunması halinde, cezasız dönem içerisinde geçiş ücreti, bu hesapların herhangi birinden otomatik olarak tahsil edilmeye çalışılır. Ancak, ihlalli geçişi izleyen 15 gün içinde otomatik tahsilatın yapılamaması araç sahibinin ödemeye ilişkin sorumluluğunu ortadan kaldırmaz. 
+
+</p>
+
+<p class="mtLabelBilgi">
+
+Otomatik tahsilatın çalışabilmesi için etiket hesabında bakiye sorunu olmaması, araç plakanıza kayıtlı ve usulüne uygun ön cama yapıştırılmış şekilde, tek bir HGS etiketi olması gibi çekime uygun koşulların tarafınızca sağlanmış olması gerekmektedir. Etiket hesaplarından tahsilat yapılamaması ya da geçiş tarihini izleyen 15 Gün içinde otomatik ödemenin alınamaması durumunda bunun takibi ve bu durumda ödemenin zamanında yapılması yükümlülüğünün ICA Yavuz Sultan Selim Köprüsü ve Kuzey Çevre Otoyolu’na atfedilemeyecek şekilde araç sahibine ait olduğunu hatırlatırız.
+
+</p>
+
+<p class="mtLabelBilgi">
+
+İhlalli geçişlerinize ait borç bilgilerini <span style="color:blue; font-weight: bold">www.ysskoprusuveotoyolu.com.tr</span> veya KGM’nin internet sitesinden sorgulayabilir, Ödemelerinizi  Ziraat ve Halk Bankası şubeleri ile bu bankaların internet bankacılığı sistemlerinden veya <span style="color:blue; font-weight: bold">www.ysskoprusuveotoyolu.com.tr</span> internet 
+
+adresinden yapabilirsiniz.
+
+</p>
+
+<p class="mtLabelBilgi">
+
+Yasal takip süreci başlatılmış geçiş ve dosyalarınız için <span style="color:blue; font-weight: bold">www.ysskoprusuveotoyolu.com.tr</span> internet adresini ziyaret ederek detay bilgiye ulaşabilirsiniz.
+
+</p>
+
+<p class="mtLabelBilgi">
+
+Detaylı bilgi için;
+
+</p>
+
+<p class="mtLabelBilgi">
+
+<ul>
+
+<li>
+
+Telefon No: <span style="font-weight: bold">0850 502 7100</span></li>
+
+<li>
+
+ İnternet Sitesi: <span style="color:blue; font-weight: bold">https://www.ysskoprusuveotoyolu.com.tr/</span></li>
+
+</ul>
+
+</p>
+
+</div>
+
+</div>
+
+</div>
+
+</div>
+
+
+
+<div class="modal" id="detayliBilgiAvrupaModalId">
+
+  <div class="modal-dialog">
+
+    <div class="modal-content">
+
+      <div class="modal-header">
+
+        <h4 class="modal-title">AVRUPA OTOYOLU YATIRIM VE İŞLETME A.Ş.</h4>
+
+        <button type="button" class="close" data-dismiss="modal">&times;</button>
+
+      </div>
+
+      <div class="modal-body">
+
+<p class="mtLabelBilgi">
+
+<p>
+
+
+
+Kuzey Marmara Otoyolu (Kınalı-Odayeri)‘ndan yapılan ihlalli (ödemesiz) geçiş yapan müşterilerimiz tarafından geçiş ücretleri 15 (onbeş) gün içerisinde cezasız olarak ödenebilir.
+
+</p>
+
+<p>
+
+
+
+Geçiş ücretini 15 (onbeş) gün içerisinde ödemediğiniz takdirde geçiş ücretine 1 (bir) kat ceza eklenir. Söz konusu geçiş ücretini ve 1(bir) kat cezalı toplam tutar 45 (kırkbeş) gün içerisinde de ödenmez ise ceza tutarı 4 (dört) kat olur. Geçiş ücreti ve 4 (dört) kat ceza tutarının ödenmemesi halinde; takip ve yargılama masrafları, avukatlık ücreti ve işleyecek yasal faiz ile birlikte takip ve tahsil edilmek üzere hukuki süreç başlatılabilir.
+
+</p>
+
+<p>
+
+
+
+İhlalli (ödemesiz) geçiş öncesi açılmış veya geçiş tarihini izleyen 15 gün içinde yeni açılmış aracınıza kayıtlı HGS etiket hesabının bulunması halinde, diğer borç ödeme yöntemlerinin yanı sıra size ödeme konusunda yardımcı olmak için, ihlalli (ödemesiz) geçişi takip eden 15 günlük cezasız dönem içerisinde geçiş ücreti ilgili hesaptan otomatik olarak tahsil edilmeye çalışılacaktır. Ancak, otomatik tahsilatın yapılamaması araç sahibinin ödemeye ilişkin sorumluluğunu ortadan kaldırmayacağı gibi, böyle bir durumda Avrupa Otoyolu Yatırım ve İşletme A.Ş.’ye herhangi bir sorumluluk da atfedilemez.
+
+</p>
+
+<p>
+
+
+
+Otomatik tahsilatın çalışabilmesi için etiket hesabında bakiye sorunu olmayan, araç plakanıza kayıtlı ve araca montaj talimatına uygun şekilde monte edilmiş, tek bir aktif etiket olması gerektiğini özellikle hatırlatmak isteriz.
+
+</p>
+
+<p>
+
+
+
+İhlalli geçiş ödemelerinizi alternatif ödeme kanalları olan <span style="color:blue; font-weight: bold">www.avrupaotoyolisletmesi.com</span> web sitemizden, QNB Finansbank Şubeleri, İnternet bankacılığı, ATM ve Türkiye İş Bankası Şubeleri, İnternet bankacılığı, İş Cep, ATM’leri üzerinden yapabilirsiniz.
+
+</p>
+
+<p>
+
+
+
+Borç ödemeleriniz ile ilgili sorun yaşamamak için, mesai saati sonrasında ödeme veya tahsilat yapılamayabileceğini de dikkate alarak, ödemelerinizi son güne bırakmadan yapmanızı özellikle tavsiye ederiz.
+
+</p>
+
+
+
+<p>
+
+ Detaylı bilgi için iletişim kanalları;   
+
+</p>
+
+<ul>
+
+<li>
+
+  Çağrı Merkezi :<span font-weight: bold">0850 259 00 61</span></li>
+
+<li>
+
+    İnternet Sitesi:<a href="https://www.kuzeymarmaraotoyolu.com/" target="_new">www.kuzeymarmaraotoyolu.com</a></li>
+
+</ul>
+
+</p>
+
+
+
+</div>
+
+</div>
+
+</div>
+
+</div>
+
+
+
+
+
+<div class="modal" id="detayliBilgiAnadoluModalId">
+
+  <div class="modal-dialog">
+
+    <div class="modal-content">
+
+      <div class="modal-header">
+
+        <h4 class="modal-title">KMO ANADOLU OTOYOL İŞLETMESİ A.Ş</h4>
+
+        <button type="button" class="close" data-dismiss="modal">&times;</button>
+
+      </div>
+
+      <div class="modal-body">
+
+<p class="mtLabelBilgi">
+
+<p>
+
+
+
+Kuzey Marmara Otoyolu (Kurtköy-Akyazı) ‘ndan yapılan ihlalli (ödemesiz) geçiş yapan müşterilerimiz tarafından geçiş ücretleri 15 (onbeş) gün içerisinde cezasız olarak ödenebilir.
+
+</p>
+
+<p>
+
+
+
+Geçiş ücretini 15 (onbeş) gün içerisinde ödemediğiniz takdirde geçiş ücretine 1 (bir) kat ceza eklenir. Söz konusu geçiş ücretini ve 1(bir) kat cezalı toplam tutar 45 (kırkbeş) gün içerisinde de ödenmez ise ceza tutarı 4 (dört) kat olur. Geçiş ücreti ve 4 (dört) kat ceza tutarının ödenmemesi halinde; takip ve yargılama masrafları, avukatlık ücreti ve işleyecek yasal faiz ile birlikte takip ve tahsil edilmek üzere hukuki süreç başlatılabilir.
+
+</p>
+
+<p>
+
+
+
+İhlalli (ödemesiz) geçiş öncesi açılmış veya geçiş tarihini izleyen 15 gün içinde yeni açılmış aracınıza kayıtlı HGS etiket hesabının bulunması halinde, diğer borç ödeme yöntemlerinin yanı sıra size ödeme konusunda yardımcı olmak için, ihlalli (ödemesiz) geçişi takip eden 15 günlük cezasız dönem içerisinde geçiş ücreti ilgili hesaptan otomatik olarak tahsil edilmeye çalışılacaktır. Ancak, otomatik tahsilatın yapılamaması araç sahibinin ödemeye ilişkin sorumluluğunu ortadan kaldırmayacağı gibi, böyle bir durumda KMO Anadolu Otoyol İşletmesi A.Ş.’ye herhangi bir sorumluluk da atfedilemez.
+
+</p>
+
+<p>
+
+
+
+Otomatik tahsilatın çalışabilmesi için etiket hesabında bakiye sorunu olmayan, araç plakanıza kayıtlı ve araca montaj talimatına uygun şekilde monte edilmiş, tek bir aktif etiket olması gerektiğini özellikle hatırlatmak isteriz.
+
+</p>
+
+<p>
+
+
+
+İhlalli geçiş ödemelerinizi alternatif ödeme kanalları olan <span style="color:blue; font-weight: bold">www.anadoluotoyolisletmesi.com</span> web sitelerimizden, QNB Finansbank Şubeleri, İnternet bankacılığı, ATM ve Türkiye İş Bankası Şubeleri, İnternet bankacılığı, İş Cep, ATM’leri üzerinden yapabilirsiniz.
+
+</p>
+
+<p>
+
+
+
+Borç ödemeleriniz ile ilgili sorun yaşamamak için, mesai saati sonrasında ödeme veya tahsilat yapılamayabileceğini de dikkate alarak, ödemelerinizi son güne bırakmadan yapmanızı özellikle tavsiye ederiz.
+
+</p>
+
+<p>
+
+ Detaylı bilgi için iletişim kanalları; 
+
+</p>
+
+<ul>
+
+<li>
+
+  Çağrı Merkezi :<span font-weight: bold">0850 259 00 61</span></li>
+
+<li>
+
+    İnternet Sitesi:<a href="https://www.kuzeymarmaraotoyolu.com/" target="_new">www.kuzeymarmaraotoyolu.com</a></li>
+
+</ul>
+
+</p>
+
+
+
+</div>
+
+</div>
+
+</div>
+
+</div>
+
+
+
+
+
+<div class="modal" id="detayliBilgiIkaModalId">
+
+  <div class="modal-dialog">
+
+    <div class="modal-content">
+
+      <div class="modal-header">
+
+        <h4 class="modal-title">İKA İZMİR OTOYOL YATIRIM VE İŞLETME A.Ş. (KUZEY EGE OTOYOLU İŞLETMESİ)</h4>
+
+        <button type="button" class="close" data-dismiss="modal">&times;</button>
+
+      </div>
+
+      <div class="modal-body">
+
+<p class="mtLabelBilgi">
+
+
+
+<p>
+
+İKA İzmir Otoyol Yatırım ve İşletme A.Ş. işletmesindeki Menemen-Aliağa-Çandarlı Otoyolu (Kuzey Ege Otoyolu) için belirlenen geçiş ücretlerini ödemeden geçiş yapanlar, 6001 Sayılı Kanun uyarınca geçiş tarihini izleyen 15 (on beş) gün içinde geçiş ücretini cezasız ödeyebilir.
+
+</p>
+
+ 
+
+<p>
+
+Geçiş ücretini 15 (onbeş) gün içerisinde (15. Günün Resmî Tatile denk gelmesi durumunda tatili izleyen ilk iş gününün sonuna kadar) ödemediğiniz takdirde geçiş ücretine 1 (bir) kat ceza eklenir. Söz konusu toplam tutar 45 (kırkbeş) gün içerisinde de (45. Günün Resmî Tatile denk gelmesi durumunda tatili izleyen ilk iş gününün sonuna kadar) ödenmez ise ceza tutarı 4 (dört) kat olur ve hukuki süreç başlatılır. Bu kapsamda, geçiş ücreti ve 4 (dört) kat ceza tutarının, takip ve yargılama masrafları, avukatlık ücreti ve işleyecek yasal faiz ile birlikte takip ve tahsil edilir.
+
+</p>
+
+ 
+
+<p>
+
+Ödemeler QNB Finansbank A.Ş. şubeleri ile bu bankaların internet bankacılığı sistemlerinden ve <span style="color:blue; font-weight: bold">www.kuzeyegeotoyolu.com</span> internet adresinden yapılabilir.
+
+</p>
+
+ 
+
+<p>
+
+Aracınız adına kayıtlı ihlalli geçiş öncesi açılmış veya geçiş tarihini izleyen 15 gün içinde açılmış HGS etiket hesabının bulunması halinde, cezasız dönem içerisinde    geçiş ücreti, bu hesapların herhangi birinden otomatik olarak tahsil edilmeye çalışılır. Ancak, ihlalli geçişi izleyen 15 gün içinde otomatik tahsilatın yapılamaması araç sahibinin ödemeye ilişkin sorumluluğunu ortadan kaldırmaz.
+
+</p>
+
+ 
+
+<p>
+
+Otomatik tahsilatın çalışabilmesi için etiket hesabında bakiye sorunu olmayan, araç plakanıza kayıtlı ve usulüne uygun ön cama yapıştırılmış şekilde, tek bir HGS etiketi olması gerekmektedir. Bakiye sorunu yaşamamak için; HGS etiket hesaplarının, ayrı bir mevduat hesabına veya kredili mevduat hesabına ya da limiti yeterli bir kredi kartına bağlanacak şekilde otomatik ödeme talimatı bulunması gerekmektedir.
+
+</p>
+
+ 
+
+<p>
+
+Etiket hesaplarından tahsilat yapılamaması ya da geçiş tarihini izleyen 15 Gün içinde otomatik ödemenin alınamaması durumunda bunun takibi ve bu durumda ödemenin zamanında yapılması yükümlülüğünün İKA İzmir Otoyol Yatırım ve İşletme A.Ş’ye atfedilemeyecek şekilde araç sahibine ait olduğunu hatırlatırız.
+
+</p>
+
+ 
+
+<p>
+
+6698 sayılı Kişisel Verilerin Korunması Kanunu ve ilgili mevzuat çerçevesinde İKA İzmir Otoyol Yatırım ve İşletme A.Ş. tarafından hazırlanan detaylı bilgilendirme metnine <span style="color:blue; font-weight: bold">www.kuzeyegeotoyolu.com</span> internet adresinden ulaşılabilir.
+
+</p>
+
+ 
+
+<p>
+
+Çağrı Merkezi
+
+</p>
+
+<ul>
+
+<li>
+
+Telefon No:<span style="font-weight: bold">0 850 577 3535</span></li>
+
+<li>
+
+E-posta:<span style="color:blue; font-weight: bold">yardim@kuzeyegeotoyolu.com</span></li>
+
+</ul>
+
+</p>
+
+</div>
+
+</div>
+
+</div>
+
+</div>
+
+
+
+<div class="modal" id="detayliBilgiAnkaraNigdeModalId">
+
+  <div class="modal-dialog">
+
+    <div class="modal-content">
+
+      <div class="modal-header">
+
+        <h4 class="modal-title">ERG OTOYOL YATIRIM VE İŞLETME A.Ş. (ANKARA-NİĞDE OTOYOLU)</h4>
+
+        <button type="button" class="close" data-dismiss="modal">&times;</button>
+
+      </div>
+
+      <div class="modal-body">
+
+<p class="mtLabelBilgi">
+
+
+
+<p><span style="font-weight: bold">
+
+    ERG OTOYOL YATIRIM VE İŞLETME A.Ş. (ANKARA-NİĞDE OTOYOLU)
+
+   </span></p>
+
+
+
+<p>
+
+  Firmamız tarafından işletilen <span style="font-weight: bold">Ankara Niğde Otoyolu</span>’nu kullanarak belirlenen geçiş ücretlerini ödemeden geçiş yapanlardan, ihlalli (ödemesiz) geçiş tarihini izleyen <span style="font-weight: bold">15 gün</span> içinde (15. gün resmî tatil ise takip eden ilk iş gününe kadar) yükümlü olduğu geçiş ücretini usulüne uygun olarak ödeyenlere herhangi bir ceza bedeli uygulanmayacaktır.  <span style="font-weight: bold">15 gün</span> içerisinde ödeme yapılmaması durumunda <span style="font-weight: bold">6001 Sayılı Kanun</span> gereğince, geçişi takip eden <span style="font-weight: bold">16. günden</span> itibaren geçiş ücretine <span style="font-weight: bold">1 (bir) kat ceza</span> tutarı, 45. gün sonra ise 4 (dört) kat ceza tutarı eklenecek ve <span style="font-weight: bold">hukuki süreç</span> başlatılabilecektir.  (Yargılama masrafları, harçlar, vekâlet ücretleri ve yasal faizler borçluya ayrıca yansıtılır)
+
+</p>
+
+
+
+<p>
+
+    İhlalli (ödemesiz) geçişinize ilişkin borcunuzu <span style="font-weight: bold">15 (on beş) gün</span> içerisinde <span style="font-weight: bold">cezasız olarak</span> ödemek için yeterli bakiyeye sahip bir <span style="font-weight: bold">HGS Etiketi</span> alabilir, mevcut <span style="font-weight: bold">HGS</span> Hesabınıza yeterli bakiye yüklemesi yapabilir ya da borç ödemelerinizi <span style="font-weight: bold">Türkiye İş Bankası</span> bankacılık sistemlerinden, <span style="font-weight: bold">www.ankaranigdeotoyolu.com</span> adresimizden veya <span style="font-weight: bold">mobil uygulamamız</span> üzerinden gerçekleştirebilirsiniz. Geçiş ücreti bu 15 günlük sürede HGS hesabınızdan tahsil edilmeye çalışılacaktır.
+
+</p>
+
+<p>
+
+     
+
+</p>
+
+
+
+<p>
+
+    Ödeme sorumluluğu başkasına atfedilemeyecek şekilde <span style="font-weight: bold">araç sahibine</span> aittir.
+
+</p>
+
+
+
+<p>
+
+   Detaylı bilgi için iletişim kanalları;
+
+</p>
+
+<ul>
+
+<li>
+
+    Müşteri Hizmetleri Hattı: <span style="font-weight: bold">0850 460 50 80</span>
+
+</li>
+
+<li> 
+
+    E-posta:<span style="color:blue; font-weight: bold">info@ankaranigdeotoyolu.com</span></li>
+
+<li> 
+
+    İnternet Sitesi:<span style="color:blue; font-weight: bold">www.ankaranigdeotoyolu.com</span></li>
+
+</ul>
+
+
+
+<p>
+
+    Mobil uygulamamızı indirmek için;
+
+</p>
+
+<ul>
+
+<li>IOS: <a href="https://apps.apple.com/tr/app/ankara-ni%C4%9Fde-otoyolu/id1530595876"> <span style="color:blue; font-weight: bold">https://apps.apple.com/tr/app/ankara-ni%C4%9Fde-otoyolu/id1530595876</span></a></li>
+
+<li>Android: <a href="https://play.google.com/store/apps/details?id=com.hiper.ankaranigde&pcampaignid=web_share"> <span style="color:blue; font-weight: bold">https://play.google.com/store/apps/details?id=com.hiper.ankaranigde&pcampaignid=web_share</span></a></li>
+
+</ul>
+
+</p>
+
+</div>
+
+</div>
+
+</div>
+
+</div>
+
+
+
+
+
+<div class="modal" id="detayliBilgiCanakkaleModalId">
+
+  <div class="modal-dialog">
+
+    <div class="modal-content">
+
+      <div class="modal-header">
+
+        <h4 class="modal-title">ÇANAKKALE OTOYOL VE KÖPRÜSÜ İNŞAAT YATIRIM VE İŞLETME A.Ş.</h4>
+
+        <button type="button" class="close" data-dismiss="modal">&times;</button>
+
+      </div>
+
+      <div class="modal-body">
+
+<p class="mtLabelBilgi">
+
+
+
+<p><span style="font-weight: bold">
+
+    ÇANAKKALE OTOYOL VE KÖPRÜSÜ İNŞAAT YATIRIM VE İŞLETME A.Ş.
+
+   </span></p>
+
+
+
+<p>
+
+İhlalli geçiş(ler)inizi, geçiş tarihini izleyen 15 gün içinde cezasız şekilde ödeyebilirsiniz. İhlalli geçiş tarihini izleyen 16. gün ile 45. gün aralığında ödeme yapılırsa geçiş ücretlerinin 1 (bir) katı tutarında idari para cezası uygulanır. İhlali geçiş tarihinden itibaren 45 gün içinde ödemeden (ihlalli) geçiş yaptığı tespit edilen araç sahiplerine geçiş ücretinin 4 (dört) katı tutarında idarî para cezası uygulanır. 
+
+</p>
+
+
+
+
+
+
+
+<p>
+
+Geçiş yapılan araca kayıtlı eski veya geçiş tarihini izleyen 15 gün içinde açılmış yeni HGS etiket hesabının bulunması halinde, cezasız dönem içerisinde geçiş ücreti bu hesapların herhangi birinden otomatik olarak tahsil edilmeye çalışılacaktır. Ancak, otomatik tahsilatın yapılamaması araç sahibinin ödemeye ilişkin sorumluluğunu ortadan kaldırmayacaktır. 
+
+</p>
+
+
+
+<p>
+
+Tüm İhlalli geçişlerinizi <span style="color:blue; font-weight: bold">www.1915canakkale.com</span> web sitesinden, QNB Finansbank ve Türkiye İş Bankası şubeleri, ATM’leri, internet bankacılığı ve mobil bankacılık kanallarından ödeyebilirsiniz. 
+
+</p>
+
+
+
+<p>
+
+Detaylı bilgi için iletişim kanalları;     
+
+</p>
+
+<ul>
+
+<li> 
+
+  Çağrı Merkezi : <span style="font-weight: bold">0850 399 19 15</span></li>
+
+<li>
+
+  E-posta: <span style="color:blue; font-weight: bold">musterihizmetleri@1915canakkale.com</span></li>
+
+<li>
+
+    İnternet Sitesi:<span style="color:blue; font-weight: bold">www.1915canakkale.com</span></li>
+
+</ul>
+
+
+
+</p>
+
+</div>
+
+</div>
+
+</div>
+
+</div>
+
+
+
+<div class="modal" id="detayliBilgiAydinDenizliModalId">
+
+  <div class="modal-dialog">
+
+    <div class="modal-content">
+
+      <div class="modal-header">
+
+        <h4 class="modal-title">FERNAS OTOYOL İŞLETMESİ A.Ş. (AYDIN-DENİZLİ OTOYOLU)</h4>
+
+        <button type="button" class="close" data-dismiss="modal">&times;</button>
+
+      </div>
+
+      <div class="modal-body">
+
+<p class="mtLabelBilgi">
+
+
+
+<p><span style="font-weight: bold">
+
+    FERNAS OTOYOL İŞLETMESİ A.Ş. AYDIN-DENİZLİ OTOYOLU İHLALLİ GEÇİŞ UYARISI
+
+   </span></p>
+
+
+
+<p>
+
+  Fernas Otoyol İşletmesi A.Ş. tarafından işletilen Aydın-Denizli Otoyolu'ndan geçiş ücretlerini ödemeden geçiş yapanlar, 6001 sayılı kanun gereğince 15 gün içinde geçiş ücretini cezasız bir şekilde ödeyebilirler.
+
+</p>
+
+
+
+<p>
+
+    İhlalli geçiş ücretlerinizi ödemediğiniz takdirde geçişi takip eden 16. günden itibaren geçiş ücretine 1 kat ceza tutarı eklenir. 45. gün sonunda ödenmeyen geçiş ücretlerinde ceza tutarı 4 katına çıkar ve ceza tahakkuku bildiriminden 15 gün sonra hukuki süreç başlatılır. Yargılama masrafları, harçlar, vekâlet ücretleri ve yasal faizler borçluya ayrıca yansıtılır.
+
+</p>
+
+<p>
+
+    İhlalli geçiş ücretlerinizi www.aydindenizliotoyolu.com.tr web adresinden, Yapı Kredi veya Ziraat Bankası Vezne, İnternet Bankacılığı, Mobil Uygulama ve ATM kanallarından ödeyebilirsiniz.
+
+</p>
+
+
+
+<p>
+
+   İletişim Bilgileri:
+
+</p>
+
+<ul>
+
+<li>
+
+    Müşteri Hizmetleri Numaramız: 0850 75 75 236
+
+</li>
+
+<li>
+
+    E-posta:<span style="color:blue; font-weight: bold">destek@aydindenizliotoyolu.com.tr</span></li>
+
+<li> 
+
+    İnternet Sitesi:<span style="color:blue; font-weight: bold">www.aydindenizliotoyolu.com.tr</span></li>
+
+</ul>
+
+
+
+<p>
+
+    Unutmayın, ihlalli geçişlerle ilgili borç bilgilerinizi kontrol etmek ve ödemelerinizi zamanında gerçekleştirmek sizin sorumluluğunuzdadır. Ödeme sorumluluğu araç sahibine aittir ve başkasına atfedilemez. Daha fazla bilgi için lütfen yukarıdaki iletişim bilgilerinden bize ulaşabilirsiniz.
+
+</p>
+
+
+
+</p>
+
+</div>
+
+</div>
+
+</div>
+
+</div>
+
+
+
+        <div id="myModal" class="modal">
+
+            <!-- Modal content -->
+
+            <div class="modal-content">
+
+                <span class="close">&times;</span><object type="text/html" id="ifrm" height="520" width="800" class="mtLabelBilgi"></object>
+
+            </div>
+
+        </div>
+
+
+
+        <div id="modalIhlalNo" class="modal">
+
+            <!-- Modal content orj -->
+
+            <div class="modal-content-ihlalNo">
+
+                <span class="closeIhlal">&times;</span>
+
+                <object type="text/html" id="ifrmihlalno" height="70" width="330" class="mtLabelBilgi">
+
+                </object>
+
+            </div>
+
+        </div>
+
+
+
+
+
+
+
+        <div id="popupOdenemezInfo" class="overlayKK">
+
+            <div class="popupKK" style="width: 500px;">
+
+                
+
+                <a class="closeKK" href="#!">&times;</a>
+
+                <div class="contentKK">
+
+                    <span class="mtLabelBilgi">&#07; Bu geçişin ödemesi sadece Maliye Bakanlığı Gelir İdaresi Başkanlığı’na yapılabilir.</span>
+
+                    <br>
+
+                    <span class="mtLabelBilgi">&#07; Bu ödemeyi Maliye Bakanlığı Gelir İdaresi Başkanlığı’nın yetkilendirdiği noktalardan birine yaptı iseniz, bu ihlal bilgisini dikkate almayınız. Ödeme yapıp yapmadığınızı öğrenmek ve yapmadı iseniz internet üzerinden ödeme yapmak için Gelir İdaresi’ne ait aşağıdaki adresi kullanabilirsiniz.</span>
+
+                    <a class="mtLabelBilgi" href="https://intvrg.gib.gov.tr" target="_new">https://intvrg.gib.gov.tr</a>
+
+                </div>
+
+            </div>
+
+        </div>
+
+
+
+
+
+        <a class="buttonKK" style="width: 300px;" id="btnTebUyari" href="#popupKK"></a>
+
+        <div id="popupKK" class="overlayKK">
+
+            <div class="popupKK" style="width: 400px;">
+
+                
+
+                <a class="closeKK" id="btnTebUyariKapat" style="display: none;" onclick="btnUyariKapatCheckBoxKontrol()" href="#!">&times;</a>
+
+                <div class="contentKK">
+
+                    <table>
+
+                        <tr>
+
+                            <td>
+
+                                <span class="mtLabelBilgi">Tebligata bağlı ihlaller birlikte ödenmelidir. Tebligat sütunundaki işaretin (&#9741) üzerine tıklayarak tebligata bağlı tüm ihlalleri seçebilirsiniz/seçimi kaldırabilirsiniz.</span>
+
+                            </td>
+
+                        </tr>
+
+
+
+                        <tr>
+
+                            <td style="text-align: center;">
+
+                                <button type="button" class="btnNormal" style="width: 150px; text-align: center; vertical-align: middle;" id="btnTebUyariGosterme" onclick="TebligatUyariGosterme()"><span class="mtLabelBilgi">Tamam</span></button>
+
+                            </td>
+
+                        </tr>
+
+                        <tr>
+
+                            <td align="right">
+
+                                
+
+                                <input type="checkbox" id="chkTebUyariGosterme" class="detayliBilgiLink" style="color: black;"><span class="detayliBilgiLink" style="color: black;">Bir daha gösterme!</span>
+
+                            </td>
+
+                        </tr>
+
+                    </table>
+
+                </div>
+
+            </div>
+
+        </div>
+
+
+
+
+
+
+
+<!-- Uyari Modal -->
+
+ <div class="modal fade" id="uyariModal" tabindex="-1" aria-labelledby="uyariModalLabel" aria-hidden="true">
+
+  <div class="modal-dialog">
+
+    <div class="modal-content">
+
+      <div class="modal-header">
+
+        <h5 class="modal-title" id="uyariModalLabel">Bilgilendirme</h5>
+
+      </div>
+
+      <div class="modal-body">
+
+<p>Avukat adı kullanarak HGS'den ödenmemiş borcunuz olduğunu, icra başlatılacağını belirtip ödeme yapılması için link paylaşılan dolandırma amaçlı SMS'lere lütfen itibar etmeyiniz.</p>
+
+<p>Ayrıca; İhlalli otoyol ve köprü geçişlerine ait geçiş ücreti ve  cezalarının ödemeleri yalnızca <a href="https://www.kgm.gov.tr/" target="_blank">www.kgm.gov.tr</a>, <a href="https://www.turkiye.gov.tr/" target="_blank">www.turkiye.gov.tr</a> ve özel otoyol İşletmecilerinin  internet sayfalarından yapılmaktadır. </p>
+
+<p>Bunların haricindeki ödeme yapıldığını belirten dolandırma amaçlı internet sayfalarına karşı dikkatli olunuz.</p>
+
+      </div>
+
+      <div class="modal-footer">
+
+        <button type="button" class="btn btn-primary" id="btnCloseUyariModal">Anladım</button>
+
+      </div>
+
+    </div>
+
+  </div>
+
+</div>
+
+
+
+
+
+<script type="text/javascript">
+
+//<![CDATA[
+
+var Page_Validators =  new Array(document.getElementById("cvPlaka"), document.getElementById("rfv1"), document.getElementById("RequiredFieldValidator1"));
+
+//]]>
+
+</script>
+
+
+
+<script type="text/javascript">
+
+//<![CDATA[
+
+var cvPlaka = document.all ? document.all["cvPlaka"] : document.getElementById("cvPlaka");
+
+cvPlaka.controltovalidate = "txtPlk";
+
+cvPlaka.errormessage = "*";
+
+cvPlaka.validationGroup = "val1";
+
+cvPlaka.evaluationfunction = "CustomValidatorEvaluateIsValid";
+
+var rfv1 = document.all ? document.all["rfv1"] : document.getElementById("rfv1");
+
+rfv1.controltovalidate = "txtPlk";
+
+rfv1.errormessage = "*";
+
+rfv1.validationGroup = "val1";
+
+rfv1.evaluationfunction = "RequiredFieldValidatorEvaluateIsValid";
+
+rfv1.initialvalue = "";
+
+var RequiredFieldValidator1 = document.all ? document.all["RequiredFieldValidator1"] : document.getElementById("RequiredFieldValidator1");
+
+RequiredFieldValidator1.controltovalidate = "txtGuvenlikCheck";
+
+RequiredFieldValidator1.errormessage = "*";
+
+RequiredFieldValidator1.validationGroup = "val1";
+
+RequiredFieldValidator1.evaluationfunction = "RequiredFieldValidatorEvaluateIsValid";
+
+RequiredFieldValidator1.initialvalue = "";
+
+//]]>
+
+</script>
+
+
+
+
+
+<script type="text/javascript">
+
+//<![CDATA[
+
+
+
+var Page_ValidationActive = false;
+
+if (typeof(ValidatorOnLoad) == "function") {
+
+    ValidatorOnLoad();
+
+}
+
+
+
+function ValidatorOnSubmit() {
+
+    if (Page_ValidationActive) {
+
+        return ValidatorCommonOnSubmit();
+
+    }
+
+    else {
+
+        return true;
+
+    }
+
+}
+
+        Sys.Application.add_init(function() {
+
+    $create(Sys.UI._UpdateProgress, {"associatedUpdatePanelId":"pnlSayfa","displayAfter":500,"dynamicLayout":true}, null, null, $get("UpdateProgress1"));
+
+});
+
+
+
+document.getElementById('cvPlaka').dispose = function() {
+
+    Array.remove(Page_Validators, document.getElementById('cvPlaka'));
+
+}
+
+
+
+document.getElementById('rfv1').dispose = function() {
+
+    Array.remove(Page_Validators, document.getElementById('rfv1'));
+
+}
+
+
+
+document.getElementById('RequiredFieldValidator1').dispose = function() {
+
+    Array.remove(Page_Validators, document.getElementById('RequiredFieldValidator1'));
+
+}
+
+//]]>
+
+</script>
+
+</form>
+
+
+
+<script src="https://ozelyuk.kgm.gov.tr/WebIhlalStaticContent/js/javascriptObf.js"></script>
+
+
+
+<script src="../bootstrap/js/jquery-3.5.1.slim.min.js"></script>
+
+<script src="../bootstrap/js/bootstrap.bundle.min.js"></script>
+
+<script src="../bootstrap/js/datatables.min.js"></script>
+
+
+
+<script type="text/javascript">  
+
+
+
+function pageLoad() {
+
+
+
+ if (typeof plakaKontrolEt === "function") plakaKontrolEt();
+
+
+
+ new DataTable('#gvKgm', {
+
+    responsive: true,
+
+    paging: false,
+
+    searching: false,
+
+    bInfo: false,
+
+    language: {
+
+        emptyTable: 'Kayıt yok.'
+
+    },
+
+    columnDefs: [{
+
+        "defaultContent": "-",
+
+        "targets": "_all",
+
+        "orderable": false
+
+    }]
+
+ });
+
+   
+
+new DataTable('#gvAvrasya', {
+
+ responsive: true,
+
+ paging: false,
+
+ searching: false,
+
+ bInfo: false,
+
+ language: {
+
+    emptyTable: 'Kayıt yok.'
+
+ },
+
+ columnDefs: [{
+
+    "defaultContent": "-",
+
+    "targets": "_all",
+
+    "orderable": false
+
+ }]
+
+});
+
+
+
+new DataTable('#gvOtoyol', {
+
+ responsive: true,
+
+ paging: false,
+
+ searching: false,
+
+ bInfo: false,
+
+ language: {
+
+    emptyTable: 'Kayıt yok.'
+
+ },
+
+ columnDefs: [{
+
+    "defaultContent": "-",
+
+    "targets": "_all",
+
+    "orderable": false
+
+ }]
+
+});
+
+
+
+new DataTable('#gvYss', {
+
+ responsive: true,
+
+ paging: false,
+
+ searching: false,
+
+ bInfo: false,
+
+ language: {
+
+    emptyTable: 'Kayıt yok.'
+
+ },
+
+ columnDefs: [{
+
+    "defaultContent": "-",
+
+    "targets": "_all",
+
+    "orderable": false
+
+ }]
+
+});
+
+    
+
+new DataTable('#gvAvrupaOtoyolu', {
+
+ responsive: true,
+
+ paging: false,
+
+ searching: false,
+
+ bInfo: false,
+
+ language: {
+
+    emptyTable: 'Kayıt yok.'
+
+ },
+
+ columnDefs: [{
+
+    "defaultContent": "-",
+
+    "targets": "_all",
+
+    "orderable": false
+
+ }]
+
+});
+
+    
+
+new DataTable('#gvAnadoluOtoyolu', {
+
+ responsive: true,
+
+ paging: false,
+
+ searching: false,
+
+ bInfo: false,
+
+ language: {
+
+    emptyTable: 'Kayıt yok.'
+
+ },
+
+ columnDefs: [{
+
+    "defaultContent": "-",
+
+    "targets": "_all",
+
+    "orderable": false
+
+ }]
+
+});
+
+    
+
+new DataTable('#gvIkaOtoyolu', {
+
+ responsive: true,
+
+ paging: false,
+
+ searching: false,
+
+ bInfo: false,
+
+ language: {
+
+    emptyTable: 'Kayıt yok.'
+
+ },
+
+ columnDefs: [{
+
+    "defaultContent": "-",
+
+    "targets": "_all",
+
+    "orderable": false
+
+ }]
+
+});
+
+    
+
+new DataTable('#gvAnkaraNigdeOtoyolu', {
+
+ responsive: true,
+
+ paging: false,
+
+ searching: false,
+
+ bInfo: false,
+
+ language: {
+
+    emptyTable: 'Kayıt yok.'
+
+ },
+
+ columnDefs: [{
+
+    "defaultContent": "-",
+
+    "targets": "_all",
+
+    "orderable": false
+
+ }]
+
+});
+
+    
+
+new DataTable('#gvCanakkaleKoprusu', {
+
+ responsive: true,
+
+ paging: false,
+
+ searching: false,
+
+ bInfo: false,
+
+ language: {
+
+    emptyTable: 'Kayıt yok.'
+
+ },
+
+ columnDefs: [{
+
+    "defaultContent": "-",
+
+    "targets": "_all",
+
+    "orderable": false
+
+ }]
+
+});
+
+    
+
+new DataTable('#gvAydinDenizli', {
+
+ responsive: true,
+
+ paging: false,
+
+ searching: false,
+
+ bInfo: false,
+
+ language: {
+
+    emptyTable: 'Kayıt yok.'
+
+ },
+
+ columnDefs: [{
+
+    "defaultContent": "-",
+
+    "targets": "_all",
+
+    "orderable": false
+
+ }]
+
+});
+
+
+
+};
+
+        
+
+        var onloadCallback = function () {
+
+            grecaptcha.render('recaptcha', {
+
+                'sitekey': '6LedghsUAAAAAHisMfg8vM6lROSSUxgGMqU5DDRH'
+
+            });
+
+        };
+
+
+
+
+
+
+
+        //function openWindow(code) {
+
+        //    console.log(code);
+
+        //    window.open(code, 'open_window', 'toolbar=no,scrollbars=no, width=640, height=480, left=0, top=0');
+
+        //}
+
+
+
+
+
+        var curSelRow = null;
+
+        var curSelGrid = null;
+
+        var uyariGoster = 1;
+
+        var chkLimit = 50;
+
+        var chkLimitSonuc = false;
+
+        var tebligatliMi = false;
+
+        var tebligatTur = 0;
+
+
+
+        function onGridViewRowSelected(rowIdx, gvClientId) {
+
+            var gridViewCtlId = gvClientId;
+
+            var selRow = getSelectedRow(rowIdx, gridViewCtlId);
+
+              
+
+            // console.log(curSelGrid);
+
+            var colorCode;
+
+
+
+
+
+            if (curSelGrid == 'gvOtoyol')
+
+                colorCode = '#d1e0e0';
+
+            else if (curSelGrid == 'gvKgm') {
+
+                colorCode = '#ffc266';
+
+            }
+
+            else if (curSelGrid == 'gvAvrasya')
+
+                colorCode = '#ffffb3';
+
+            else if (curSelGrid == 'gvYss')
+
+                colorCode = '#ccffcc';
+
+            else if (curSelGrid == 'gvAvrupaOtoyolu')
+
+                colorCode = '#ffeedb';
+
+            else if (curSelGrid == 'gvAnadoluOtoyolu')
+
+                colorCode = '#d6c9c9';
+
+            else if (curSelGrid == 'gvIkaOtoyolu')
+
+                colorCode = '#d7f5e4'; //F0FFF0
+
+            else if (curSelGrid == 'gvAnkaraNigdeOtoyolu')
+
+                colorCode = '#d7eef5';
+
+            else if (curSelGrid == 'gvCanakkaleKoprusu')
+
+                colorCode = '#d6c9c9';
+
+            else if (curSelGrid == 'gvAydinDenizli')
+
+                colorCode = '#d6c9c9';
+
+
+
+            if (curSelRow != null) {
+
+                curSelRow.style.backgroundColor = colorCode;
+
+                // console.log(curSelRow.getElementById);
+
+            }
+
+
+
+
+
+            if (null != selRow) {
+
+                curSelGrid = gvClientId
+
+                curSelRow = selRow;
+
+                curSelRow.style.backgroundColor = '#bbc6c9';
+
+            }
+
+        }
+
+
+
+        function getSelectedRow(rowIdx, gridViewCtlId) {
+
+            var gridViewCtl = null;
+
+            if (null == gridViewCtl) {
+
+                gridViewCtl = document.getElementById(gridViewCtlId);
+
+            }
+
+            if (null != gridViewCtl) {
+
+                return gridViewCtl.rows[rowIdx];
+
+            }
+
+            return null;
+
+        }
+
+
+
+        function SelectHeaderCheckboxes(headerchk) {
+
+
+
+            var gvcheck = document.getElementById('gvKgm');
+
+            var i;
+
+            var cnt = 0;
+
+            //Condition to check header checkbox selected or not if that is true checked all checkboxes
+
+            if (headerchk.checked) {
+
+                OdemeButtonDisabled(false);
+
+                for (i = 0; i < gvKgm.rows.length; i++) {
+
+                    // gvKgm.rows[i].cells[8].childNodes[0].checked = true;
+
+                    if (cnt < chkLimit) {
+
+                        cell = gvKgm.rows[i].cells[3];
+
+                        for (j = 0; j < cell.childNodes.length; j++) {
+
+                            //if childNode type is CheckBox          
+
+                            if (cell.childNodes[j].type == "checkbox") {
+
+                                cell.childNodes[j].checked = true;
+
+                                cnt = cnt + 1;
+
+                            }
+
+                        }
+
+                        document.getElementById('lblKgmChkHata2').innerHTML = " ";
+
+                    }
+
+                }
+
+            }
+
+
+
+                //if condition fails uncheck all checkboxes in gridview
+
+            else {
+
+                OdemeButtonDisabled(true);
+
+                for (i = 0; i < gvKgm.rows.length; i++) {
+
+                    cell = gvKgm.rows[i].cells[3];
+
+                    for (j = 0; j < cell.childNodes.length; j++) {
+
+                        //if childNode type is CheckBox                 
+
+                        if (cell.childNodes[j].type == "checkbox") {
+
+                            cell.childNodes[j].checked = false;
+
+                        }
+
+                    }
+
+                }
+
+                document.getElementById('lblKgmChkHata2').innerHTML = "Ödeme için ihlal seçin.";
+
+            }
+
+        }
+
+
+
+
+
+        function CheckOperationsV1(chk) {
+
+            if (chk.checked == true) {
+
+                KontrolCheckTebligat(chk);
+
+            }
+
+            KontrolCheckLimit();
+
+            if (chkLimitSonuc == false) {
+
+                chk.checked = false;
+
+            }
+
+
+
+        }
+
+
+
+        function CheckOperations(chk) {
+
+            if (chk.checked == true) {
+
+                KontrolCheckTebligat(chk);
+
+                if (tebligatliMi == true) {
+
+                    chk.checked = false;
+
+                }
+
+                else {
+
+                    KontrolCheckLimit();
+
+                    if (chkLimitSonuc == false) {
+
+                        chk.checked = false;
+
+                    }
+
+                }
+
+            }
+
+            else {
+
+                KontrolCheckTebligat(chk);
+
+                if (tebligatliMi == true) {
+
+                    chk.checked = true;
+
+                }
+
+                else {
+
+                    chk.checked = false;
+
+                    KontrolCheckLimit();
+
+                }
+
+            }
+
+        }
+
+
+
+        function KontrolCheckTebligat(obj) {
+
+            if (uyariGoster == 1) {
+
+                var rowData = obj.parentNode.parentNode;
+
+                var rowIndex = rowData.rowIndex;
+
+                var tebligatVal;
+
+
+
+                cellTbl = gvKgm.rows[rowIndex].cells[9];
+
+                for (a = 0; a < cellTbl.childNodes.length; a++) {
+
+                    if (cellTbl.childNodes[a].type == "hidden") {
+
+                        tebligatVal = cellTbl.childNodes[a].value;
+
+                    }
+
+                }
+
+                if (tebligatVal != null && tebligatVal.trim() != '') {
+
+                    tebligatliMi = true;
+
+                    var cntTotal = 0;
+
+                    var cntChecked = 0;
+
+
+
+                    for (i = 0; i < gvKgm.rows.length; i++) {
+
+                        cellTbl = gvKgm.rows[i].cells[9];
+
+                        for (j = 0; j < cellTbl.childNodes.length; j++) {
+
+                            //if childNode type is hidden 
+
+                            if (cellTbl.childNodes[j].type == "hidden") {
+
+                                var colVal = cellTbl.childNodes[j].value.trim();
+
+                                if (colVal == tebligatVal) {
+
+                                    cntTotal++;
+
+                                    cellChk = gvKgm.rows[i].cells[9];
+
+                                    for (c = 0; c < cellChk.childNodes.length; c++) {
+
+                                        //if childNode type is CheckBox                 
+
+                                        if (cellChk.childNodes[c].type == "checkbox") {
+
+                                            if (cellChk.childNodes[c].checked) {
+
+                                                cntChecked++;
+
+
+
+                                            }
+
+                                        }
+
+                                    }
+
+                                }
+
+                            }
+
+                        }
+
+                    }
+
+                    if (cntTotal != cntChecked) {
+
+                        showTebligatUyari();
+
+                    }
+
+                }
+
+                else {
+
+                    tebligatliMi = false;
+
+                }
+
+            }
+
+
+
+            return;
+
+        }
+
+
+
+        function showTebligatUyari() {
+
+            var element = document.getElementById('btnTebUyari');
+
+            if (element.click)
+
+                element.click();
+
+            else if (document.createEvent) {
+
+                var eventObj = document.createEvent('MouseEvents');
+
+                eventObj.initEvent('click', true, true);
+
+                element.dispatchEvent(eventObj);
+
+            }
+
+            // document.getElementById("btnTebUyari").click();
+
+        }
+
+
+
+
+
+
+
+        function TebligatUyariGosterme() {
+
+
+
+            var checkBox = document.getElementById("chkTebUyariGosterme");
+
+            if (checkBox.checked == true) {
+
+                uyariGoster = 0;
+
+            }
+
+
+
+            var element = document.getElementById('btnTebUyariKapat');
+
+            if (element.click)
+
+                element.click();
+
+            else if (document.createEvent) {
+
+                var eventObj = document.createEvent('MouseEvents');
+
+                eventObj.initEvent('click', true, true);
+
+                element.dispatchEvent(eventObj);
+
+            }
+
+
+
+            // document.getElementById("btnTebUyariKapat").click();
+
+        }
+
+
+
+        function btnUyariKapatCheckBoxKontrol() {
+
+            var checkBox = document.getElementById("chkTebUyariGosterme");
+
+            checkBox.checked = false;
+
+        }
+
+
+
+        function KontrolCheckLimitV1(cntChk) {
+
+            var cnt = 0;
+
+            if (cntChk != null) {
+
+                cnt = cntChk;
+
+            }
+
+
+
+            if (cnt < chkLimit) {
+
+                for (i = 0; i < gvKgm.rows.length; i++) {
+
+                    cell = gvKgm.rows[i].cells[3];
+
+                    for (j = 0; j < cell.childNodes.length; j++) {
+
+                        //if childNode type is CheckBox                 
+
+                        if (cell.childNodes[j].checked == true) {
+
+                            cnt = cnt + 1;
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+
+
+            if (cnt > chkLimit) {
+
+                var elm = document.getElementById('lblKgmChkHata2');
+
+                document.getElementById('lblKgmChkHata2').innerHTML = 'Ödeme için en fazla ' + chkLimit + ' adet ihlal ya da aynı tebligata bağlı ödemeler seçilebilir.';
+
+                chkLimitSonuc = false;
+
+                // OdemeButtonDisabled(true);
+
+            }
+
+            else {
+
+                chkLimitSonuc = true;
+
+                if (cnt == 0) {
+
+                    
+
+                    document.getElementById('lblKgmChkHata2').innerHTML = 'Ödeme için ihlal seçin.';
+
+                    OdemeButtonDisabled(true);
+
+                }
+
+                else {
+
+                    document.getElementById('lblKgmChkHata2').innerHTML = " ";
+
+                    OdemeButtonDisabled(false);
+
+                }
+
+            }
+
+        }
+
+
+
+        function KontrolCheckLimit(cntChk) {
+
+
+
+            var cnt = 0;
+
+            for (i = 0; i < gvKgm.rows.length; i++) {
+
+                cell = gvKgm.rows[i].cells[3];
+
+                for (j = 0; j < cell.childNodes.length; j++) {
+
+                    //if childNode type is CheckBox                 
+
+                    if (cell.childNodes[j].checked == true) {
+
+                        cnt = cnt + 1;
+
+                    }
+
+                }
+
+            }
+
+
+
+            if (cntChk != null) {
+
+
+
+                if (cnt == 0) {
+
+                    cnt = Number(cnt) + Number(cntChk);
+
+
+
+                    chkLimitSonuc = true;
+
+                    if (cnt == 0) {
+
+                        
+
+                        document.getElementById('lblKgmChkHata2').innerHTML = 'Ödeme için ihlal seçin.';
+
+                        OdemeButtonDisabled(true);
+
+                    }
+
+                    else {
+
+                        document.getElementById('lblKgmChkHata2').innerHTML = " ";
+
+                        OdemeButtonDisabled(false);
+
+                    }
+
+                }
+
+                else {
+
+
+
+                    cnt = Number(cnt) + Number(cntChk);
+
+
+
+                    if (cnt > chkLimit) {
+
+                        var elm = document.getElementById('lblKgmChkHata2');
+
+                        document.getElementById('lblKgmChkHata2').innerHTML = 'Ödeme için en fazla ' + chkLimit + ' adet ihlal ya da aynı tebligata bağlı ödemeler seçilebilir.';
+
+
+
+                        chkLimitSonuc = false;
+
+                        // OdemeButtonDisabled(true);
+
+                    }
+
+                    else {
+
+
+
+                        chkLimitSonuc = true;
+
+                        if (cnt == 0) {
+
+                            
+
+                            document.getElementById('lblKgmChkHata2').innerHTML = 'Ödeme için ihlal seçin.';
+
+                            OdemeButtonDisabled(true);
+
+                        }
+
+                        else {
+
+                            document.getElementById('lblKgmChkHata2').innerHTML = " ";
+
+                            OdemeButtonDisabled(false);
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+            else {
+
+                if (cnt > chkLimit) {
+
+                    var elm = document.getElementById('lblKgmChkHata2');
+
+                    document.getElementById('lblKgmChkHata2').innerHTML = 'Ödeme için en fazla ' + chkLimit + ' adet ihlal ya da aynı tebligata bağlı ödemeler seçilebilir.';
+
+                    chkLimitSonuc = false;
+
+                    // OdemeButtonDisabled(true);
+
+                }
+
+                else {
+
+                    chkLimitSonuc = true;
+
+                    if (cnt == 0) {
+
+                        
+
+                        document.getElementById('lblKgmChkHata2').innerHTML ='Ödeme için ihlal seçin.';
+
+                        OdemeButtonDisabled(true);
+
+                    }
+
+                    else {
+
+                        document.getElementById('lblKgmChkHata2').innerText = " ";
+
+                        OdemeButtonDisabled(false);
+
+                    }
+
+                }
+
+            }
+
+
+
+        }
+
+
+
+        
+
+        function OdemeButtonDisabled(boolDeger) {
+
+            
+
+            if (boolDeger) {
+
+                document.getElementById("btnKgmOdeme2").disabled = true;
+
+                document.getElementById("btnKgmOdeme2").className = "btnTableOdemeLinkDisabled";
+
+            }
+
+            else {
+
+                document.getElementById("btnKgmOdeme2").disabled = false;
+
+                document.getElementById("btnKgmOdeme2").className = "btnTableOdemeLink";
+
+            }
+
+
+
+        }
+
+
+
+        function OdemeButtonKontrol() {
+
+            
+
+            var cnt = 0;
+
+
+
+            for (i = 0; i < gvKgm.rows.length; i++) {
+
+                cell = gvKgm.rows[i].cells[3];
+
+                for (j = 0; j < cell.childNodes.length; j++) {
+
+                    //if childNode type is CheckBox                 
+
+                    if (cell.childNodes[j].checked == true) {
+
+                        cnt = cnt + 1;
+
+                    }
+
+                }
+
+            }
+
+
+
+            if (cnt == 0) {
+
+                OdemeButtonDisabled(true);
+
+            }
+
+            else {
+
+                OdemeButtonDisabled(false);
+
+            }
+
+        }
+
+
+
+        function TebligatOperation(obj, tebligatNo, cntTebligatNo) {
+
+
+
+
+
+            var grid = document.getElementById('gvKgm');
+
+            var rowData = obj.parentNode.parentNode;
+
+            var rowIndex = rowData.rowIndex;
+
+            // var kod = grid.rows[rowIndex].cells[10];
+
+            var tebligatVal = tebligatNo.trim();
+
+            var tabSecilimi = false;
+
+
+
+            KontrolCheckLimit(cntTebligatNo);
+
+
+
+            var cnt = 0;
+
+            for (i = 0; i < gvKgm.rows.length; i++) {
+
+                cellTbl = gvKgm.rows[i].cells[9];
+
+                for (j = 0; j < cellTbl.childNodes.length; j++) {
+
+                    //if childNode type is hidden 
+
+                    if (cellTbl.childNodes[j].type == "hidden") {
+
+                        var colVal = cellTbl.childNodes[j].value.trim();
+
+                        if (colVal == tebligatVal) {
+
+                            cellChk = gvKgm.rows[i].cells[3];
+
+
+
+                            for (c = 0; c < cellChk.childNodes.length; c++) {
+
+                                //if childNode type is CheckBox                 
+
+                                if (cellChk.childNodes[c].type == "checkbox") {
+
+                                    if (cellChk.childNodes[c].checked) {
+
+
+
+                                        cellChk.childNodes[c].checked = false;
+
+                                        tabSecilimi = false;
+
+                                    }
+
+                                    else {
+
+                                        if (chkLimitSonuc) {
+
+                                            cellChk.childNodes[c].checked = true;
+
+                                            tabSecilimi = true;
+
+                                        }
+
+                                    }
+
+                                }
+
+                            }
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+
+
+            if (tabSecilimi) tebligatTur = tebligatTur + 1; else tebligatTur = tebligatTur - 1;
+
+            if (tebligatTur == 0) KontrolCheckLimit();
+
+            
+
+            OdemeButtonKontrol();
+
+        }
+
+
+
+
+
+
+
+        function GuvenlikCheckFunc() {
+
+            var myCheckBox = document.getElementById('chkGuvenlikUyari');
+
+
+
+            if (myCheckBox.checked) {
+
+                //document.getElementById('txtGuvenlikCheck').innerHTML = 'Okay.';
+
+                document.getElementById('txtGuvenlikCheck').value = "Okay";
+
+                document.getElementById('lblGuvenlikHata').disabled = false;
+
+
+
+            }
+
+            else {
+
+
+
+                var elm = document.getElementById('lblGuvenlikHata');
+
+                
+
+                elm.innerHTML = 'Bilgilere ulaşabilmek için aşağıdaki metnin onaylanması gerekmektedir.';
+
+                document.getElementById('lblGuvenlikHata').disabled = true;
+
+                document.getElementById('txtGuvenlikCheck').value = null;
+
+
+
+            }
+
+        }
+
+        
+
+    </script>
+
+
+
+<script>
+
+    $(document).ready(function () {
+
+        // Modal'ı "static" ve ESC ile kapanmaz şekilde aç
+
+        var modalElement = document.getElementById('uyariModal');
+
+        var myModal = new bootstrap.Modal(modalElement, {
+
+            backdrop: 'static',
+
+            keyboard: false
+
+        });
+
+        myModal.show();
+
+
+
+        // Butona basınca modal'ı kapat
+
+        $('#btnCloseUyariModal').on('click', function () {
+
+            myModal.hide();
+
+        });
+
+    });
+
+</script>
+
+
+
+
+
+<script>
+
+
+
+let currentKb = null;
+
+let currentDigits = "persian";
+
+
+
+function tbAl() {
+
+    return document.getElementById("txtPlk");
+
+}
+
+
+
+const arabicLetters = [
+
+"ا","ب","ت","ث","ج","ح","خ",
+
+"د","ذ","ر","ز",
+
+"س","ش","ص","ض","ط","ظ",
+
+"ع","غ","ف","ق","ك","ل",
+
+"م","ن","ه","و","ي"
+
+];
+
+
+
+const digitSets = {
+
+    arabic:["٠","١","٢","٣","٤","٥","٦","٧","٨","٩"],
+
+    persian:["۰","۱","۲","۳","۴","۵","۶","۷","۸","۹"]
+
+};
+
+
+
+const keyboards = {
+
+    latin: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".split(""),
+
+    cyrillic: "АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЫЭЮЯ0123456789".split(""),
+
+    arabic: null // dinamik üretilecek
+
+};
+
+
+
+
+
+function toggleKeyboard(type) {
+
+    const vk = document.getElementById("vk");
+
+
+
+    if (vk.style.display === "block" && currentKb === type) {
+
+        vk.style.display = "none";
+
+        currentKb = null;
+
+        return;
+
+    }
+
+
+
+    currentKb = type;
+
+
+
+    const tb = tbAl();
+
+    tb.dataset.mode = type;
+
+
+
+    if (type === "arabic")
+
+        tb.classList.add("arabic");
+
+    else
+
+        tb.classList.remove("arabic");
+
+
+
+    document.getElementById("digitSwitch").style.display =
+
+    type === "arabic" ? "flex" : "none";
+
+
+
+    vk.style.display = "block";
+
+    renderKeyboard(type);
+
+}
+
+
+
+function renderKeyboard(type) {
+
+    const vk = document.getElementById("vk");
+
+
+
+    vk.querySelectorAll(".key").forEach(e=>e.remove());
+
+
+
+    let chars;
+
+
+
+    if (type === "arabic")
+
+        chars = [...arabicLetters, ...digitSets[currentDigits]];
+
+    else
+
+        chars = keyboards[type];
+
+
+
+    chars.forEach(ch=> {
+
+        const b = document.createElement("button");
+
+        b.className = "key";
+
+        b.type = "button";
+
+        b.textContent = ch;
+
+        b.onclick = () =>insertChar(ch);
+
+        vk.appendChild(b);
+
+    });
+
+}
+
+
+
+function toggleDigits() {
+
+    currentDigits = currentDigits === "arabic" ? "persian" : "arabic";
+
+    setDigits(currentDigits);
+
+
+
+    if (currentKb === "arabic")
+
+        renderKeyboard("arabic");
+
+}
+
+
+
+
+
+const FSI="\u2068";
+
+const PDI="\u2069";
+
+
+
+function insertChar(ch){
+
+
+
+    const tb = tbAl();
+
+    tb.focus();
+
+
+
+    const start=tb.selectionStart;
+
+    const end=tb.selectionEnd;
+
+
+
+    const safe=FSI+ch+PDI;
+
+
+
+    tb.value=
+
+      tb.value.slice(0,start)
+
+    + safe
+
+    + tb.value.slice(end);
+
+
+
+    const pos=start+safe.length;
+
+    tb.setSelectionRange(pos,pos);
+
+
+
+    plakaKontrolEt();
+
+}
+
+
+
+function setDigits(type) {
+
+    currentDigits = type;
+
+
+
+    document.getElementById("btnArabic").classList.remove("active");
+
+    document.getElementById("btnPersian").classList.remove("active");
+
+
+
+    if (type === "arabic")
+
+        document.getElementById("btnArabic").classList.add("active");
+
+    else
+
+        document.getElementById("btnPersian").classList.add("active");
+
+
+
+    if (currentKb === "arabic")
+
+        renderKeyboard("arabic");
+
+}
+
+
+
+setDigits(currentDigits);
+
+
+
+</script>
+
+
+
+<script>
+
+
+
+// Türk plakası tespiti: Destek/PlakaKontrol.cs ile birebir aynı algoritma.
+
+// Değişiklik yapılırsa iki taraf birlikte güncellenmeli. Asıl engel sunucudadır; bu kontrol kullanıcıyı erken uyarmak içindir.
+
+var TR_PLAKA_REGEX = /^(0[1-9]|[1-7][0-9]|8[01])[A-PR-VYZ]{1,3}[0-9]{2,5}$/;
+
+
+
+// Latin harflerle aynı görünen harfler (Türkçe ı, Kiril, Yunan)
+
+var BENZER_HARFLER = {
+
+    "ı": "I",
+
+    "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M",
+
+    "Н": "H", "О": "O", "Р": "P", "С": "C", "Т": "T",
+
+    "У": "Y", "Х": "X", "І": "I", "Ј": "J", "Ѕ": "S",
+
+    "Ү": "Y", "Һ": "H", "Ӏ": "I", "Ԛ": "Q", "Ԝ": "W",
+
+    "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H",
+
+    "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N", "Ο": "O",
+
+    "Ρ": "P", "Τ": "T", "Υ": "Y", "Χ": "X"
+
+};
+
+
+
+var RAKAM_REGEX, HARF_REGEX;
+
+try {
+
+    RAKAM_REGEX = new RegExp("\\p{Nd}", "u");
+
+    HARF_REGEX = new RegExp("\\p{L}", "u");
+
+} catch (e) {
+
+    // Unicode özellik desteği olmayan eski tarayıcılar için yaklaşık karşılık
+
+    RAKAM_REGEX = /[0-9٠-٩۰-۹]/;
+
+    HARF_REGEX = /[A-Za-zÀ-ɏͰ-ϿЀ-ӿԀ-ԯ؀-ۿ]/;
+
+}
+
+
+
+// Herhangi bir ondalık rakamın (Arap-Hint, Fars ...) değeri: rakam blokları 0'dan başlayan 10'lu dizilerdir
+
+function rakamDegeri(ch) {
+
+    var cp = ch.charCodeAt(0);
+
+    var bas = cp;
+
+    while (cp - bas < 9 && RAKAM_REGEX.test(String.fromCharCode(bas - 1))) bas--;
+
+    return cp - bas;
+
+}
+
+
+
+// Plakayı yalnızca TR kontrolü için sadeleştirir; servise gönderilen değer değişmez
+
+function plakaIskeletOlustur(plaka) {
+
+    if (!plaka) return "";
+
+    var metin = plaka.normalize ? plaka.normalize("NFKC") : plaka;
+
+    var sonuc = "";
+
+    for (var i = 0; i < metin.length; i++) {
+
+        var ch = metin.charAt(i);
+
+        var kod = metin.charCodeAt(i);
+
+        if (kod >= 0xD800 && kod <= 0xDFFF) continue; // C# tarafı gibi vekil çiftleri atlanır
+
+
+
+        if (RAKAM_REGEX.test(ch)) {
+
+            sonuc += String(rakamDegeri(ch));
+
+        } else if (HARF_REGEX.test(ch)) {
+
+            var harf = ch.toUpperCase();
+
+            if (harf.length !== 1) harf = ch; // ß -> SS gibi çok karakterli dönüşümleri C# yapmaz
+
+            var ayrik = harf.normalize ? harf.normalize("NFD") : harf; // İ->I, Ş->S, Ç->C ...
+
+            harf = ayrik.charAt(0);
+
+            if (BENZER_HARFLER.hasOwnProperty(harf)) harf = BENZER_HARFLER[harf];
+
+            sonuc += harf;
+
+        }
+
+        // Boşluk, ayraç, görünmez/yön karakterleri atlanır
+
+    }
+
+    return sonuc;
+
+}
+
+
+
+function turkPlakasiMi(plaka) {
+
+    return TR_PLAKA_REGEX.test(plakaIskeletOlustur(plaka));
+
+}
+
+
+
+function gorunurYap(el, gorunur) {
+
+    if (!el) return;
+
+    if (gorunur) el.classList.remove("d-none"); else el.classList.add("d-none");
+
+}
+
+
+
+function resmiModMu() {
+
+    var h = document.getElementById("hdnSorguTipi");
+
+    return !!h && h.value === "RESMI";
+
+}
+
+
+
+// Plaka alanını kontrol eder. Sorgulanabilirse true döner.
+
+//  Yabancı Plaka: TR plakasıysa uyarı gösterir ve Sorgula'yı kapatır.
+
+//  Resmi Plaka  : yalnızca TR plakası kabul edilir; yazarken uyarı açılmaz, yalnızca alan bırakılınca/gönderimde (uyariGoster) gösterilir.
+
+function plakaKontrolEt(uyariGoster) {
+
+    var tb = tbAl();
+
+    if (!tb) return true;
+
+
+
+    var tr = turkPlakasiMi(tb.value);
+
+    var btn = document.getElementById("btnSorgula");
+
+    var trUyari = document.getElementById("trPlakaInlineUyari");
+
+    var yabanciUyari = document.getElementById("yabanciPlakaInlineUyari");
+
+
+
+    if (resmiModMu()) {
+
+        var yabanci = plakaIskeletOlustur(tb.value).length > 0 && !tr;
+
+        gorunurYap(trUyari, false);
+
+        if (!yabanci) gorunurYap(yabanciUyari, false);
+
+        else if (uyariGoster) gorunurYap(yabanciUyari, true);
+
+        if (btn) btn.disabled = false;
+
+        return !yabanci;
+
+    }
+
+
+
+    gorunurYap(yabanciUyari, false);
+
+    gorunurYap(trUyari, tr);
+
+    if (btn) btn.disabled = tr;
+
+
+
+    return !tr;
+
+}
+
+
+
+// Resmi Plaka: tescil belge seri no (2 harf + 6 rakam) ve VKN (10 rakam). Sunucuda da aynı kontrol yapılır (TnbIslem).
+
+var SERI_NO_REGEX = /^[A-Z]{2}[0-9]{6}$/;
+
+var VKN_REGEX = /^[0-9]{10}$/;
+
+
+
+// Hatalı alan yazarken işaretlenmez; düzeltilince işaret kalkar, gönderimde (isaretle) tüm hatalılar işaretlenir
+
+function resmiAlanKontrol(isaretle) {
+
+    var alanlar = [
+
+        { tb: document.getElementById("txtTescilSeriNo"), regex: SERI_NO_REGEX },
+
+        { tb: document.getElementById("txtVkn"), regex: VKN_REGEX }
+
+    ];
+
+    var gecerli = true;
+
+    for (var i = 0; i < alanlar.length; i++) {
+
+        var tb = alanlar[i].tb;
+
+        if (!tb) continue;
+
+        var ok = alanlar[i].regex.test(tb.value.trim().toUpperCase());
+
+        if (!ok) gecerli = false;
+
+        if (ok) tb.classList.remove("is-invalid");
+
+        else if (isaretle) tb.classList.add("is-invalid");
+
+    }
+
+    return gecerli;
+
+}
+
+
+
+function sorguOnKontrol() {
+
+    if (!resmiModMu()) return plakaKontrolEt();
+
+
+
+    var plakaOk = plakaKontrolEt(true);
+
+    var alanlarOk = resmiAlanKontrol(true);
+
+    return plakaOk && alanlarOk;
+
+}
+
+
+
+// Yabancı ve Resmi sekmeleri aynı sorgu formunu kullanır; Resmi modda ek alanlar açılır, sanal klavye ve yabancı plaka bilgisi gizlenir.
+
+// Sunucu da sayfayı hdnSorguTipi'ne göre çizer (ResmiSorguMu), böylece UpdatePanel yenilemesinde seçili sekme korunur.
+
+function sorguModunuUygula(mod) {
+
+    var h = document.getElementById("hdnSorguTipi");
+
+    if (h) h.value = mod;
+
+
+
+    var resmi = mod === "RESMI";
+
+    var i, el;
+
+    el = document.querySelectorAll(".resmi-ozel");
+
+    for (i = 0; i < el.length; i++) gorunurYap(el[i], resmi);
+
+    el = document.querySelectorAll(".yabanci-ozel");
+
+    for (i = 0; i < el.length; i++) gorunurYap(el[i], !resmi);
+
+
+
+    if (resmi) {
+
+        var vk = document.getElementById("vk");
+
+        if (vk) vk.style.display = "none";
+
+        currentKb = null;
+
+        var tb = tbAl();
+
+        if (tb) { tb.dataset.mode = "latin"; tb.classList.remove("arabic"); }
+
+    }
+
+
+
+    plakaKontrolEt();
+
+}
+
+
+
+// Yerli (TR) Plaka sekmesini açar; sunucu TR plakası engellediğinde de çağrılır (trPlakaUyarisiGoster)
+
+function yerliSekmeyeGec(uyariGoster) {
+
+    if (window.jQuery && jQuery.fn.tab) jQuery("#tabYerli").tab("show");
+
+
+
+    var uyari = document.getElementById("trPlakaUyari");
+
+    if (uyari) {
+
+        if (uyariGoster) uyari.classList.remove("d-none"); else uyari.classList.add("d-none");
+
+    }
+
+
+
+    var sekme = document.getElementById("plakaSekme");
+
+    if (sekme && sekme.scrollIntoView) sekme.scrollIntoView({ behavior: "smooth", block: "start" });
+
+}
+
+
+
+function trPlakaUyarisiGoster() {
+
+    yerliSekmeyeGec(true);
+
+}
+
+
+
+function captchaYenile() {
+
+    var img = document.getElementById("Image1");
+
+    if (img) img.src = "/WebIhlalSorgulama/Captcha/CaptchaImage.aspx?r=" + new Date().getTime();
+
+
+
+    var cevap = document.getElementById("txtimgcode");
+
+    if (cevap) cevap.value = "";
+
+}
+
+
+
+// UpdatePanel içeriği yenilense de çalışsın diye olay document üzerinden dinlenir
+
+document.addEventListener("input", function (e) {
+
+    var tb = tbAl();
+
+    if (tb && e.target === tb) plakaKontrolEt();
+
+    if (e.target && e.target.classList && e.target.classList.contains("resmi-input")) resmiAlanKontrol(false);
+
+});
+
+
+
+// Resmi Plaka: plaka alanından çıkılınca yabancı plaka uyarısı gösterilir
+
+document.addEventListener("focusout", function (e) {
+
+    var tb = tbAl();
+
+    if (tb && e.target === tb && resmiModMu()) plakaKontrolEt(true);
+
+});
+
+
+
+</script>
+
+
+
+</body>
+
+</html>
+
+
+
