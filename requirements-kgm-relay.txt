@@ -1,0 +1,32 @@
+# Minimal dependency set for the KGM relay on the Georgian (REDNET) server
+# ONLY (see docs/kgm-relay.md and deploy/kgm-relay.service). Installed into
+# its own venv (/opt/kgm-relay/.venv), separate from georgia-collector's.
+# Deliberately NOT requirements.txt: the relay is transport only - OCR
+# (opencv/rapidocr/onnxruntime/pytesseract), Telegram (telethon) and the
+# result parsing for the bot stay on production. tests/test_kgm_relay_main.py
+# checks the import closure of reader.turkey_bot.kgm.relay_main (relay_server,
+# relay_auth, relay_version and the unchanged KGM session/parser/models).
+#
+# Exact versions, including transitive ones: tested with Python 3.14.3 and
+# 3.12 (python:3.12-slim, the Georgian server runs 3.12); production runs the
+# same aiohttp/httpx/httpcore/beautifulsoup4/soupsieve/yarl/multidict. After
+# installing, `pip check` must pass and `pip freeze` must list exactly these.
+aiohttp==3.14.5
+aiohappyeyeballs==2.7.1
+aiosignal==1.4.0
+attrs==26.1.0
+frozenlist==1.8.0
+multidict==7.2.1
+propcache==0.5.4
+yarl==1.25.1
+httpx==0.28.1
+httpcore==1.0.9
+h11==0.16.0
+anyio==4.14.2
+sniffio==1.3.1
+certifi==2026.7.22
+idna==3.18
+# kgm/session.py captures __VIEWSTATE/hdnx with kgm/parser.py, which imports bs4.
+beautifulsoup4==4.15.0
+soupsieve==2.9.2
+typing_extensions==4.16.0
