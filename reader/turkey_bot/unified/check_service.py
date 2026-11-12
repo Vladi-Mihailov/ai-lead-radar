@@ -83,6 +83,7 @@ from reader.turkey_bot.unified.models import (
     ProviderStatus,
     UnifiedCheckResult,
     derive_overall_status,
+    partial_error_type,
     total_amount_for,
 )
 
@@ -367,6 +368,22 @@ def _kgm_outcome_to_result(outcome: KgmSubmitOutcome, *, checked_at: datetime) -
             provider="kgm", status=ProviderStatus.HAS_DEBT, debt_count=len(all_items),
             principal_amount=principal, penalty_amount=penalty, total_amount=total,
             items=items, error_type=None, checked_at=checked_at,
+        )
+    if outcome.kind == "partial":
+        # Часть операторов не проверена — ERROR с сохранёнными долгами
+        # проверенных секций, см. unified/models.py::partial_error_type
+        # (почему не HAS_DEBT/NO_DEBT). total_amount — сумма разобранных
+        # строк (нижняя граница), principal/penalty неизвестны.
+        items = tuple(
+            DebtItem(reference=None, amount=item.payable_amount, description=_kgm_item_description(item))
+            for operator in outcome.operators
+            for item in operator.items
+        )
+        return ProviderCheckResult(
+            provider="kgm", status=ProviderStatus.ERROR, debt_count=len(items),
+            principal_amount=None, penalty_amount=None,
+            total_amount=sum((item.amount for item in items), Decimal(0)),
+            items=items, error_type=partial_error_type(outcome.unchecked_operators), checked_at=checked_at,
         )
     if outcome.kind == "rejected":
         return _error_result("kgm", "captcha_rejected", checked_at=checked_at)

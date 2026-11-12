@@ -88,14 +88,14 @@ class KgmOperatorResult:
     subtotal: Decimal
 
 
-KgmSubmitKind = Literal["has_debt", "no_debt", "rejected", "unexpected"]
+KgmSubmitKind = Literal["has_debt", "no_debt", "partial", "rejected", "unexpected"]
 
 
 @dataclass(frozen=True)
 class KgmDiagnostics:
-    """Безопасная диагностика kind == "unexpected" (см. задачу "KGM
-    diagnostic logging": массовые unexpected с 2026-11-05, причина нигде
-    не видна) — ЕДИНСТВЕННОЕ, что можно писать в лог. Все три поля — из
+    """Безопасная диагностика kind == "unexpected" и kind == "partial" (см.
+    задачу "KGM diagnostic logging": массовые unexpected с 2026-11-05,
+    причина нигде не видна) — ЕДИНСТВЕННОЕ, что можно писать в лог. Все три поля — из
     фиксированного словаря parser.py: category — крупный класс причины
     ("provider_message" — сайт ответил своей ошибкой/редиректом,
     "response_format" — пришёл не delta-ответ с результатом,
@@ -116,10 +116,21 @@ class KgmDiagnostics:
 class KgmSubmitOutcome:
     """Результат parser.py::parse_submit_response().
 
-    operators — НЕПУСТОЙ ТОЛЬКО при kind == "has_debt", и содержит ТОЛЬКО
-    операторов с реальной задолженностью (см. design report: "Не
-    показывать пустые operator sections") — для любого другого kind
-    остаётся пустым tuple.
+    operators — НЕПУСТОЙ ТОЛЬКО при kind == "has_debt" или "partial", и
+    содержит ТОЛЬКО операторов с реальной задолженностью (см. design
+    report: "Не показывать пустые operator sections") — для любого другого
+    kind остаётся пустым tuple.
+
+    kind == "partial" — страница результата целая, но у части секций
+    (unchecked_operators, всегда непусто) текст label не совпал ни с
+    "N kayıt", ни с "Kayıt yok." (см. parser.py::parse_result_panel):
+    эти операторы НЕ ПРОВЕРЕНЫ, их таблицы не читаются вовсе; остальные
+    секции разобраны и сверены так же строго, как для "has_debt"/"no_debt"
+    (operators — их долги, может быть пустым). Это НЕ "no_debt" и НЕ
+    полный "has_debt": unified-слой превращает его в ERROR-результат
+    провайдера с сохранёнными items (см. unified/check_service.py::
+    _kgm_outcome_to_result), чтобы задолженность не обнулялась и не было
+    уведомлений о погашении.
 
     kgm_total/yid_total/grand_total — три контрольные суммы страницы (см.
     design report п.6: lblKgmToplamParaCezasi/lblYidToplamParaCezası/
@@ -128,7 +139,11 @@ class KgmSubmitOutcome:
     доверена, см. parser.py про fail-closed поведение). Для kind ==
     "has_debt"/"no_debt" ВСЕГДА присутствуют и уже сверены со всеми
     контрольными суммами (см. design report п.6 — все 4 проверки),
-    иначе parser.py вернул бы "unexpected" вместо этого.
+    иначе parser.py вернул бы "unexpected" вместо этого. Для kind ==
+    "partial" тоже присутствуют: kgm_total + yid_total == grand_total и
+    итог группы (KGM/YİD) без непроверенных операторов сверяются точно, а
+    группа с непроверенным оператором — только как верхняя граница
+    разобранных секций (его долг может входить в итог).
 
     message — ТОЛЬКО диагностика (см. design report): реально увиденный
     вживую текст "metin hatası" для kind == "rejected" (см. parser.py::
@@ -139,10 +154,13 @@ class KgmSubmitOutcome:
     попадает то, что могло бы стать текстом пользователю напрямую, см.
     reader/turkey_bot/texts.py).
 
-    diagnostics — ТОЛЬКО для kind == "unexpected" (см. KgmDiagnostics и
-    parser.py::_unexpected), для остальных kind всегда None. На
-    классификацию результата не влияет никак — kind/суммы/message те же,
-    что и без него."""
+    diagnostics — ТОЛЬКО для kind == "unexpected"/"partial" (см.
+    KgmDiagnostics и parser.py::_unexpected), для остальных kind всегда
+    None. На классификацию результата не влияет никак — kind/суммы/message
+    те же, что и без него.
+
+    unchecked_operators — operator_key непроверенных секций в порядке
+    страницы; непусто ТОЛЬКО при kind == "partial"."""
 
     kind: KgmSubmitKind
     operators: tuple[KgmOperatorResult, ...] = ()
@@ -151,3 +169,4 @@ class KgmSubmitOutcome:
     grand_total: Decimal | None = None
     message: str | None = None
     diagnostics: KgmDiagnostics | None = None
+    unchecked_operators: tuple[str, ...] = ()

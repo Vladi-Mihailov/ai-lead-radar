@@ -461,11 +461,8 @@ _DIAGNOSTIC_CASES = [
         "result_structure", "section_label_contradiction", "kgm", "kgm: label says no records but table has rows",
         id="section-label-contradiction",
     ),
-    pytest.param(
-        _panel(_SUCCESS_HTML.replace("KARAYOLLARI GENEL MÜDÜRLÜĞÜ: 2 kayıt", "KARAYOLLARI GENEL MÜDÜRLÜĞÜ: iki kayıt")),
-        "result_structure", "section_label_unrecognized", "kgm",
-        "kgm: unrecognized label text: 'KARAYOLLARI GENEL MÜDÜRLÜĞÜ: iki kayıt'", id="section-label-unknown",
-    ),
+    # Неизвестный текст label ОДНОЙ секции больше не делает недоверенной
+    # всю страницу — это kind="partial", см. test_kgm_partial_sections.py.
     pytest.param(
         _panel(_SUCCESS_HTML.replace(
             '<span id="lblKgmCezaToplam" class="mtLabel">80,00 ₺</span>',
