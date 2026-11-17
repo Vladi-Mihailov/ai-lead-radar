@@ -20,12 +20,14 @@ from reader.public_bot import manager_alerts
 from reader.public_bot.conversation import ConversationController
 from reader.public_bot.keyboards import (
     STOP_NO,
+    add_car_confirm_keyboard,
     add_client_decision_keyboard,
     car_delete_confirm_keyboard,
     car_detail_keyboard,
     check_now_options_keyboard,
     debt_refresh_confirm_keyboard,
     debt_statistics_keyboard,
+    decode_add_car_confirm_callback,
     decode_add_client_decision_callback,
     decode_check_now_callback,
     decode_debt_list_page_callback,
@@ -52,8 +54,8 @@ from reader.public_bot.keyboards import (
     decode_my_car_resume_callback,
     decode_my_car_turn_off_callback,
     decode_my_car_turn_on_callback,
+    decode_legacy_trusted_task_period_callback,
     decode_my_cars_page_callback,
-    decode_period_callback,
     decode_protocol_check_back_to_menu_callback,
     decode_protocol_check_back_to_method_callback,
     decode_protocol_check_back_to_protocol_step1_callback,
@@ -70,13 +72,11 @@ from reader.public_bot.keyboards import (
     decode_trusted_stop_pick_callback,
     decode_trusted_task_continue_callback,
     decode_trusted_task_open_callback,
-    decode_trusted_task_period_callback,
     decode_trusted_task_toggle_callback,
     decode_trusted_tasks_page_callback,
+    is_legacy_period_callback,
     main_menu_keyboard,
-    my_car_inactive_keyboard,
     my_cars_page_keyboard,
-    period_choice_keyboard,
     protocol_check_back_to_method_keyboard,
     protocol_check_back_to_protocol_step1_keyboard,
     protocol_check_back_to_vehicle_step1_keyboard,
@@ -87,7 +87,6 @@ from reader.public_bot.keyboards import (
     trusted_stop_options_keyboard,
     trusted_task_detail_keyboard,
     trusted_task_off_keyboard,
-    trusted_task_period_choice_keyboard,
     trusted_tasks_page_keyboard,
     turkey_bot_link_keyboard,
 )
@@ -288,15 +287,17 @@ def register(
             await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
-        days = decode_period_callback(data)
-        if days is not None:
+        # "✅ Добавить" — и старые кнопки выбора срока из истории чата
+        # (срока больше нет, см. задачу "убрать выбор срока мониторинга":
+        # такое нажатие подтверждает тот же шаг).
+        add_car_confirmed = decode_add_car_confirm_callback(data)
+        if add_car_confirmed or is_legacy_period_callback(data):
             # add_car()/add_delegated_car*() внутри делают немедленную
             # onboarding-проверку (live police.ge) — см.
             # _ack_then_await_slow_check про QueryIdInvalidError.
             await _ack_then_await_slow_check(
                 event,
-                controller.handle_period_choice(
-                    days,
+                controller.handle_add_car_confirm(
                     chat_id=event.chat_id,
                     telegram_user_id=event.sender_id,
                     first_name=first_name,
@@ -305,6 +306,10 @@ def register(
                 is_trusted=is_trusted,
                 on_reply=_notify_manager_alert_if_any,
             )
+            return
+        if add_car_confirmed is False:
+            reply = controller.handle_add_car_cancel(chat_id=event.chat_id, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
         check_now_id = decode_check_now_callback(data)
@@ -334,11 +339,13 @@ def register(
             )
             return
 
+        # "▶️ Продолжить мониторинг" с прежней карточки "срок истёк" (её
+        # бот больше не показывает, кнопка осталась в истории чата) — то же,
+        # что "🔔 Включить уведомления" (см. SubscriptionService.turn_on_car);
+        # карточка открыта не со страницы списка, поэтому page=0.
         my_car_resume = decode_my_car_resume_callback(data)
         if my_car_resume is not None:
-            reply = controller.handle_my_car_resume_prompt(
-                my_car_resume, chat_id=event.chat_id, telegram_user_id=event.sender_id, username=username,
-            )
+            reply = controller.handle_my_car_turn_on(my_car_resume, 0, telegram_user_id=event.sender_id)
             await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
@@ -467,12 +474,13 @@ def register(
             await _answer_and_send(event, reply, is_trusted=is_trusted, prefer_edit=False)
             return
 
-        trusted_task_period = decode_trusted_task_period_callback(data)
-        if trusted_task_period is not None:
-            task_id, days, page = trusted_task_period
-            reply = controller.handle_trusted_task_period_choice(
-                task_id, days, page, telegram_user_id=event.sender_id,
-            )
+        # Старая кнопка менеджера "15/30/90 дней" из истории чата — срока
+        # больше нет, нажатие включает мониторинг так же, как
+        # "▶️ Продолжить мониторинг".
+        legacy_trusted_task_period = decode_legacy_trusted_task_period_callback(data)
+        if legacy_trusted_task_period is not None:
+            task_id, page = legacy_trusted_task_period
+            reply = controller.handle_trusted_task_continue(task_id, page, telegram_user_id=event.sender_id)
             await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
@@ -615,7 +623,7 @@ def register(
         if nofine_confirm_plate is not None:
             # customer_notify_messages (см. BotReply докстрок) — отдельная
             # рассылка клиентам, тот же on_reply-приём, что и у
-            # _notify_manager_alert_if_any в period-callback выше.
+            # _notify_manager_alert_if_any в add-car-callback выше.
             await _answer_and_send(
                 event,
                 controller.handle_manual_bootstrap_nofine_confirm(
@@ -817,7 +825,7 @@ async def _ack_hourglass_then_await_slow_check(event, coro_factory, *, is_truste
     """Для callback'ов семейства "🔎 Проверить сейчас" — check_now_id/
     my_car_check_now_once/trusted_check_now_once (см. "Fix the Georgia
     public bot Check Now flow") и "🔎 Разовая проверка" на экране выбора
-    trusted-менеджера (см. задачу "GE-2"), и ТОЛЬКО для них: period
+    trusted-менеджера (см. задачу "GE-2"), и ТОЛЬКО для них: "✅ Добавить"
     (onboarding-проверка) и debt_refresh_confirm (батч) намеренно НЕ
     переведены на этот хелпер, остаются на _ack_then_await_slow_check как
     раньше — разные UX-контексты, голый "⏳" там не запрашивался.
@@ -907,8 +915,8 @@ async def _send_reply(
     buttons = None
     if reply.show_main_menu:
         buttons = main_menu_keyboard(is_trusted=is_trusted)
-    elif reply.show_period_buttons:
-        buttons = period_choice_keyboard()
+    elif reply.show_add_car_confirm_buttons:
+        buttons = add_car_confirm_keyboard()
     elif reply.show_add_client_decision_buttons:
         buttons = add_client_decision_keyboard()
     elif reply.check_now_options:
@@ -932,10 +940,6 @@ async def _send_reply(
         buttons = trusted_task_detail_keyboard(page=reply.trusted_task_detail_page)
     elif reply.trusted_task_off_id is not None:
         buttons = trusted_task_off_keyboard(reply.trusted_task_off_id, page=reply.trusted_task_off_page)
-    elif reply.trusted_task_period_id is not None:
-        buttons = trusted_task_period_choice_keyboard(
-            reply.trusted_task_period_id, page=reply.trusted_task_period_page,
-        )
     elif reply.my_cars_page_options is not None:
         # car-centric "📋 Мои авто" (см. design report про переработку
         # UX) — пустой список ([]) — валидный (см. design: "показать 0 из
@@ -955,8 +959,6 @@ async def _send_reply(
             monitoring_state=reply.car_detail_monitoring_state,
             page=reply.car_detail_page,
         )
-    elif reply.my_car_inactive_id is not None:
-        buttons = my_car_inactive_keyboard(reply.my_car_inactive_id)
     elif reply.inline_buttons:
         # "ВРЕМЕННЫЙ manager workflow для Georgia fines bot" (см. задачу) —
         # тот же приём, что и у cta_buttons ниже, только Button.inline(...)

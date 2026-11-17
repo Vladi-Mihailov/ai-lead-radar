@@ -18,7 +18,7 @@ from telethon.tl.types import User
 from reader.commands.base import Command, CommandContext, CommandError, CommandResult
 from reader.fines.check_service import FineCheckService
 from reader.fines.detected_fine_repository import DetectedFineRepository
-from reader.fines.models import CarFineStats, FineMonitoringTask
+from reader.fines.models import CarFineStats, FineMonitoringTask, is_unlimited_end_date
 from reader.fines.notification_coordinator import (
     FineNotificationCoordinator,
     format_car_owner_display,
@@ -160,6 +160,13 @@ def _split_bulk_numbers(args: list[str]) -> list[str]:
 
 def _fmt_date(value: date) -> str:
     return value.strftime(_DATE_FORMAT)
+
+
+def _fmt_end_date(value: date) -> str:
+    """Конец периода задачи — "бессрочно" для мониторинга без конечного
+    срока (задачи @GEShtrafbot, см. reader/fines/models.py::
+    UNLIMITED_END_DATE), иначе дата как раньше."""
+    return "бессрочно" if is_unlimited_end_date(value) else _fmt_date(value)
 
 
 def _fmt_datetime(value: datetime) -> str:
@@ -377,7 +384,7 @@ class FineCommand(Command):
             "",
             f"🚗 {task.car_number}",
             f"👤 {owner_display}",
-            f"📅 Мониторинг: {_fmt_date(task.start_date)} — {_fmt_date(task.end_date)}",
+            f"📅 Мониторинг: {_fmt_date(task.start_date)} — {_fmt_end_date(task.end_date)}",
             check_line,
         ])
 
@@ -650,7 +657,7 @@ class FineCommand(Command):
     @staticmethod
     def _format_task_line(task: FineMonitoringTask) -> str:
         lines = [task.car_number + (f" ({task.label})" if task.label else "")]
-        lines.append(f"Период: {_fmt_date(task.start_date)}–{_fmt_date(task.end_date)}")
+        lines.append(f"Период: {_fmt_date(task.start_date)}–{_fmt_end_date(task.end_date)}")
 
         if task.last_checked_at is not None:
             lines.append(

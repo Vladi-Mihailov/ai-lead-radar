@@ -20,7 +20,7 @@ from telethon.tl.types import User as TelethonUser  # noqa: E402
 
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
-from reader.fines.models import ParsedFineRecord  # noqa: E402
+from reader.fines.models import UNLIMITED_END_DATE, ParsedFineRecord  # noqa: E402
 from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository  # noqa: E402
 from reader.fines.provider import (  # noqa: E402
     FineProvider,
@@ -164,12 +164,17 @@ async def test_add_car_creates_new_client_bot_task_when_none_exists(fx):
     outcome = await fx.service.add_car(
         telegram_user_id=42, telegram_chat_id=42, username="client_one",
         first_name="Anna", last_name=None, car_number="M295YB196",
-        period_days=30, today=date(2026, 9, 3),
+        today=date(2026, 9, 3),
     )
 
     assert outcome.task.monitoring_scope == "client_bot"
     assert outcome.task.start_date == date(2026, 9, 3)
-    assert outcome.task.end_date == date(2026, 10, 3)
+    # Бессрочный мониторинг (см. задачу "убрать выбор срока мониторинга") —
+    # срок не выбирается, ни задача, ни подписка не истекают.
+    assert outcome.task.end_date == UNLIMITED_END_DATE
+    assert outcome.subscription.start_date == date(2026, 9, 3)
+    assert outcome.subscription.end_date == UNLIMITED_END_DATE
+    assert outcome.subscription.status == "active"
     assert outcome.subscription.telegram_user_id == 42
     assert outcome.subscription.car_number == "M295YB196"
     assert outcome.subscription.source == "geshtrafbot"
@@ -189,7 +194,7 @@ async def test_add_car_without_username_creates_subscription_bound_by_numeric_id
     outcome = await fx.service.add_car(
         telegram_user_id=42, telegram_chat_id=42, username=None,
         first_name="Anna", last_name=None, car_number="M295YB196",
-        period_days=30, today=date(2026, 9, 3),
+        today=date(2026, 9, 3),
     )
 
     assert outcome.subscription.telegram_user_id == 42
@@ -208,44 +213,44 @@ async def test_add_car_reuses_and_extends_existing_client_bot_task(fx):
     first = await fx.service.add_car(
         telegram_user_id=1, telegram_chat_id=1, username="alice",
         first_name=None, last_name=None, car_number="M295YB196",
-        period_days=30, today=date(2026, 9, 3),
+        today=date(2026, 9, 3),
     )
 
-    # Второй, независимый клиент подписывается на ту же машину с БОЛЬШИМ
-    # периодом — задача должна быть переиспользована (не создана заново) и
-    # продлена, а не пересоздана/сброшена.
+    # Второй, независимый клиент подписывается на ту же машину — задача
+    # должна быть переиспользована (не создана заново), а не
+    # пересоздана/сброшена.
     second = await fx.service.add_car(
         telegram_user_id=2, telegram_chat_id=2, username="bob",
         first_name=None, last_name=None, car_number="M295YB196",
-        period_days=365, today=date(2026, 9, 3),
+        today=date(2026, 9, 3),
     )
 
     assert second.task.id == first.task.id
     assert second.task.monitoring_scope == "client_bot"
-    assert second.task.end_date == date(2027, 9, 3)
+    assert second.task.end_date == UNLIMITED_END_DATE
 
     [task] = fx.task_repository.list_active()
     assert task.id == first.task.id
-    assert task.end_date == date(2027, 9, 3)
+    assert task.end_date == UNLIMITED_END_DATE
 
 
-async def test_add_car_does_not_shorten_existing_task_period(fx):
-    first = await fx.service.add_car(
-        telegram_user_id=1, telegram_chat_id=1, username="alice",
-        first_name=None, last_name=None, car_number="M295YB196",
-        period_days=365, today=date(2026, 9, 3),
-    )
+async def test_add_car_makes_legacy_limited_task_unlimited_without_touching_other_subscriptions(fx):
+    """Задача и подписка, созданные ДО перехода на бессрочный мониторинг
+    (со сроком) — новый клиент на ту же машину делает задачу бессрочной
+    (extend_period_if_shorter никогда не сокращает), а чужую подписку со
+    старым сроком не трогает: подписки независимы."""
+    task, alice = _make_client_car(fx, telegram_user_id=1, today=date(2026, 9, 3))
 
-    # Второй клиент выбирает МЕНЬШИЙ период — задача не должна сократиться.
-    second = await fx.service.add_car(
+    bob = await fx.service.add_car(
         telegram_user_id=2, telegram_chat_id=2, username="bob",
         first_name=None, last_name=None, car_number="M295YB196",
-        period_days=30, today=date(2026, 9, 3),
+        today=date(2026, 9, 3),
     )
 
-    assert second.task.end_date == first.task.end_date == date(2027, 9, 3)
-    # Подписка "bob" при этом сохраняет ЕГО СОБСТВЕННЫЙ (более короткий) период.
-    assert second.subscription.end_date == date(2026, 10, 3)
+    assert bob.task.id == task.id
+    assert bob.task.end_date == UNLIMITED_END_DATE
+    assert bob.subscription.end_date == UNLIMITED_END_DATE
+    assert fx.subscription_repository.get(alice.id).end_date == date(2026, 10, 3)
 
 
 async def test_add_car_extends_own_expired_subscription_without_duplicate_error(fx):
@@ -258,26 +263,24 @@ async def test_add_car_extends_own_expired_subscription_without_duplicate_error(
     существующую строку, create() пытался вставить вторую 'active' на тот
     же (monitoring_task_id, telegram_user_id) и упирался в partial unique
     index. Теперь находит её (см. get_active_subscription_for_user_and_
-    task) и продлевает — ни новой задачи, ни новой подписки."""
-    first = await fx.service.add_car(
-        telegram_user_id=1, telegram_chat_id=1, username="alice",
-        first_name=None, last_name=None, car_number="M295YB196",
-        period_days=30, today=date(2026, 1, 1),
-    )
-    # today=2026-09-03 во втором вызове уже далеко за end_date=2026-01-31
-    # первой подписки — status остаётся 'active' в БД (никакая фоновая job
-    # его не меняет, см. car_monitoring_state докстрок), тот же сценарий,
-    # что и production O127PX62.
+    task) и делает бессрочной — ни новой задачи, ни новой подписки.
+
+    Такую строку новый код уже не создаёт (срок бессрочный) — её создаёт
+    сам тест, как запись, оставшуюся с периода со сроками."""
+    task, legacy = _make_client_car(fx, telegram_user_id=1, today=date(2026, 1, 1))
+    # today=2026-09-03 — уже далеко за end_date=2026-01-31 этой подписки,
+    # status остаётся 'active' в БД (тот же сценарий, что и production
+    # O127PX62).
     second = await fx.service.add_car(
         telegram_user_id=1, telegram_chat_id=1, username="alice",
         first_name=None, last_name=None, car_number="M295YB196",
-        period_days=30, today=date(2026, 9, 3),
+        today=date(2026, 9, 3),
     )
 
-    assert second.task.id == first.task.id
-    assert second.subscription.id == first.subscription.id  # та же строка, не дубликат
+    assert second.task.id == task.id
+    assert second.subscription.id == legacy.id  # та же строка, не дубликат
     assert second.subscription.status == "active"
-    assert second.subscription.end_date == date(2026, 10, 3)
+    assert second.subscription.end_date == UNLIMITED_END_DATE
     assert len(fx.subscription_repository.list_by_user(1)) == 1
 
 
@@ -298,12 +301,12 @@ async def test_add_car_reuses_operator_task_without_changing_scope(fx):
     outcome = await fx.service.add_car(
         telegram_user_id=99, telegram_chat_id=99, username="driver",
         first_name=None, last_name=None, car_number="M295YB196",
-        period_days=90, today=date(2026, 9, 3),
+        today=date(2026, 9, 3),
     )
 
     assert outcome.task.id == operator_task.id
     assert outcome.task.monitoring_scope == "operator"  # НЕ изменился
-    assert outcome.task.end_date == date(2026, 12, 2)  # продлён
+    assert outcome.task.end_date == UNLIMITED_END_DATE  # продлён — бессрочно
 
 
 # ---- повторное добавление тем же клиентом ----
@@ -313,18 +316,18 @@ async def test_repeated_add_car_by_same_user_updates_period_without_duplicate(fx
     first = await fx.service.add_car(
         telegram_user_id=42, telegram_chat_id=42, username="client",
         first_name=None, last_name=None, car_number="M295YB196",
-        period_days=30, today=date(2026, 9, 3),
+        today=date(2026, 9, 3),
     )
 
     second = await fx.service.add_car(
         telegram_user_id=42, telegram_chat_id=42, username="client",
         first_name=None, last_name=None, car_number="M295YB196",
-        period_days=90, today=date(2026, 9, 10),
+        today=date(2026, 9, 10),
     )
 
     assert second.subscription.id == first.subscription.id  # не дубль
     assert second.subscription.start_date == date(2026, 9, 10)
-    assert second.subscription.end_date == date(2026, 12, 9)
+    assert second.subscription.end_date == UNLIMITED_END_DATE
 
     subscriptions = fx.subscription_repository.list_by_user(42)
     assert len(subscriptions) == 1
@@ -342,7 +345,7 @@ async def test_add_car_syncs_user_repository_without_removing_other_cars(fx):
     await fx.service.add_car(
         telegram_user_id=42, telegram_chat_id=42, username="client_one",
         first_name="Anna", last_name="K.", car_number="M295YB196",
-        period_days=30, today=date(2026, 9, 3),
+        today=date(2026, 9, 3),
     )
 
     stored_user = fx.user_repository.get(42)
@@ -363,7 +366,7 @@ async def test_add_car_immediate_check_reports_no_new_fines(fx):
     outcome = await fx.service.add_car(
         telegram_user_id=42, telegram_chat_id=42, username="client",
         first_name=None, last_name=None, car_number="M295YB196",
-        period_days=30, today=date(2026, 9, 3),
+        today=date(2026, 9, 3),
     )
 
     assert outcome.check_ok is True
@@ -376,7 +379,7 @@ async def test_add_car_immediate_check_reports_new_fines(tmp_path):
         outcome = await fixture.service.add_car(
             telegram_user_id=42, telegram_chat_id=42, username="client",
             first_name=None, last_name=None, car_number="M295YB196",
-            period_days=30, today=date(2026, 9, 3),
+            today=date(2026, 9, 3),
         )
 
         assert outcome.check_ok is True
@@ -391,7 +394,7 @@ async def test_add_car_immediate_check_failure_keeps_task_and_subscription(tmp_p
         outcome = await fixture.service.add_car(
             telegram_user_id=42, telegram_chat_id=42, username="client",
             first_name=None, last_name=None, car_number="M295YB196",
-            period_days=30, today=date(2026, 9, 3),
+            today=date(2026, 9, 3),
         )
 
         assert outcome.check_ok is False
@@ -421,7 +424,7 @@ async def test_add_car_when_circuit_open_keeps_subscription_and_marks_provider_u
         outcome = await fixture.service.add_car(
             telegram_user_id=42, telegram_chat_id=42, username="client",
             first_name=None, last_name=None, car_number="M295YB196",
-            period_days=30, today=date(2026, 9, 3),
+            today=date(2026, 9, 3),
         )
 
         assert outcome.check_ok is True
@@ -450,7 +453,7 @@ async def test_add_car_for_first_ever_plate_does_one_live_check_and_completes_bo
         await fixture.service.add_car(
             telegram_user_id=42, telegram_chat_id=42, username="client",
             first_name=None, last_name=None, car_number="M295YB196",
-            period_days=30, today=date(2026, 9, 3),
+            today=date(2026, 9, 3),
         )
 
         assert fixture.provider.requested_plates == ["M295YB196"]  # ОДИН живой запрос
@@ -470,14 +473,14 @@ async def test_add_car_second_subscription_for_same_plate_does_not_reset_bootstr
         await fixture.service.add_car(
             telegram_user_id=42, telegram_chat_id=42, username="client_one",
             first_name=None, last_name=None, car_number="M295YB196",
-            period_days=30, today=date(2026, 9, 3),
+            today=date(2026, 9, 3),
         )
         assert fixture.plate_bootstrap_repository.is_completed("M295YB196") is True
 
         await fixture.service.add_car(
             telegram_user_id=43, telegram_chat_id=43, username="client_two",
             first_name=None, last_name=None, car_number="M295YB196",
-            period_days=30, today=date(2026, 9, 3),
+            today=date(2026, 9, 3),
         )
 
         assert fixture.plate_bootstrap_repository.is_completed("M295YB196") is True
@@ -496,7 +499,7 @@ async def test_add_car_when_circuit_open_keeps_bootstrap_pending(tmp_path):
         await fixture.service.add_car(
             telegram_user_id=42, telegram_chat_id=42, username="client",
             first_name=None, last_name=None, car_number="M295YB196",
-            period_days=30, today=date(2026, 9, 3),
+            today=date(2026, 9, 3),
         )
 
         state = fixture.plate_bootstrap_repository.get("M295YB196")
@@ -622,7 +625,10 @@ def test_turn_off_car_returns_none_for_already_stopped(fx):
     assert result is None
 
 
-def test_turn_on_car_reactivates_within_remaining_period(fx):
+def test_turn_on_car_reactivates_unlimited_keeping_start_date(fx):
+    """Бессрочный мониторинг (см. задачу "убрать выбор срока
+    мониторинга") — после включения подписка не истекает; start_date
+    сохраняется, пока старый срок ещё не прошёл."""
     _task, sub = _make_client_car(fx, today=date(2026, 9, 3), period_days=30)
     fx.service.turn_off_car(sub.id, telegram_user_id=1)
 
@@ -630,16 +636,14 @@ def test_turn_on_car_reactivates_within_remaining_period(fx):
 
     assert result is not None
     assert result.status == "active"
-    # end_date ещё не прошёл — период НЕ меняется (не дарим лишние дни).
     assert result.start_date == date(2026, 9, 3)
-    assert result.end_date == date(2026, 10, 3)
+    assert result.end_date == UNLIMITED_END_DATE
 
 
-def test_turn_on_car_gives_fresh_period_when_old_one_elapsed(fx):
-    """Явное требование задачи: "корректно обработай reactivation", если
-    подписка простояла OFF дольше своего исходного периода — свежий
-    период ТОЙ ЖЕ длины (30 дней), начиная с today, а не оживший в прошлом
-    end_date (что было бы немедленно снова неактуально)."""
+def test_turn_on_car_after_old_period_elapsed_starts_today_unlimited(fx):
+    """Подписка простояла OFF дольше своего прежнего срока — включается
+    бессрочно с today, а не "оживает" с прошедшим end_date (что сразу
+    снова сделало бы её неактивной)."""
     _task, sub = _make_client_car(fx, today=date(2026, 1, 1), period_days=30)
     fx.service.turn_off_car(sub.id, telegram_user_id=1)
 
@@ -648,7 +652,47 @@ def test_turn_on_car_gives_fresh_period_when_old_one_elapsed(fx):
     assert result is not None
     assert result.status == "active"
     assert result.start_date == date(2026, 9, 3)
-    assert result.end_date == date(2026, 10, 3)  # те же 30 дней, от today
+    assert result.end_date == UNLIMITED_END_DATE
+    assert result.is_effectively_active(today=date(2030, 1, 1))
+
+
+def test_turn_on_car_reactivates_legacy_expired_subscription_unlimited(fx):
+    """Подписка, чей срок истёк ДО перехода на бессрочный мониторинг
+    (status='expired', см. expire_elapsed), для пользователя теперь просто
+    выключенный автомобиль — "🔔 Включить уведомления" включает её так же,
+    как 'stopped', бессрочно и без новой строки."""
+    task, sub = _make_client_car(fx, today=date(2026, 1, 1), period_days=30)
+    fx.subscription_repository.expire_elapsed(today=date(2026, 9, 3))
+    assert fx.subscription_repository.get(sub.id).status == "expired"
+
+    result = fx.service.turn_on_car(sub.id, telegram_user_id=1, today=date(2026, 9, 3))
+
+    assert result is not None
+    assert result.id == sub.id
+    assert result.status == "active"
+    assert result.start_date == date(2026, 9, 3)
+    assert result.end_date == UNLIMITED_END_DATE
+    assert [s.id for s in fx.subscription_repository.list_by_user(1)] == [sub.id]
+    assert fx.task_repository.get(task.id).end_date == UNLIMITED_END_DATE
+
+
+def test_expired_subscriptions_stay_expired_until_user_turns_them_on(fx):
+    """"Ранее отключённые или истёкшие мониторинги не активируй массово" —
+    ни одно действие, кроме явного turn_on_car именно этой подписки, её не
+    включает: она не доставляется и не становится активной сама по себе,
+    в том числе после того, как ДРУГОЙ клиент добавил ту же машину."""
+    _task, expired = _make_client_car(fx, telegram_user_id=1, today=date(2026, 1, 1), period_days=30)
+    fx.subscription_repository.expire_elapsed(today=date(2026, 9, 3))
+
+    # Другой клиент добавляет ту же машину бессрочно.
+    _task2, _other = _make_client_car(fx, telegram_user_id=2, today=date(2026, 9, 3), period_days=30)
+    fx.service.turn_off_car(_other.id, telegram_user_id=2)
+    fx.service.turn_on_car(_other.id, telegram_user_id=2, today=date(2026, 9, 3))
+
+    assert fx.subscription_repository.get(expired.id).status == "expired"
+    deliverable_ids = [s.id for s in fx.subscription_repository.list_all_deliverable(today=date(2026, 9, 3))]
+    assert expired.id not in deliverable_ids
+    assert _other.id in deliverable_ids
 
 
 def test_turn_on_car_does_not_create_duplicate_subscription(fx):
@@ -662,8 +706,8 @@ def test_turn_on_car_does_not_create_duplicate_subscription(fx):
 
 
 def test_turn_on_car_returns_none_for_not_stopped(fx):
-    """turn_on_car — ИСКЛЮЧИТЕЛЬНО OFF -> ON; активную подписку "включить"
-    нельзя (нечего включать)."""
+    """turn_on_car — ИСКЛЮЧИТЕЛЬНО OFF (stopped/expired) -> ON; активную
+    подписку "включить" нельзя (нечего включать)."""
     _task, sub = _make_client_car(fx)
 
     result = fx.service.turn_on_car(sub.id, telegram_user_id=1, today=date(2026, 9, 10))
@@ -696,7 +740,7 @@ def test_turn_on_car_reactivates_completed_task(fx):
     assert result is not None
     updated_task = fx.task_repository.get(task.id)
     assert updated_task.status == "active"
-    assert updated_task.end_date >= result.end_date
+    assert updated_task.end_date == result.end_date == UNLIMITED_END_DATE
 
 
 def test_delete_car_archives_active_subscription(fx):
@@ -755,7 +799,7 @@ async def test_readd_car_after_delete_creates_new_subscription(fx):
     outcome = await fx.service.add_car(
         telegram_user_id=1, telegram_chat_id=1, username="alice",
         first_name=None, last_name=None, car_number="M295YB196",
-        period_days=30, today=date(2026, 9, 10),
+        today=date(2026, 9, 10),
     )
 
     assert outcome.subscription.id != sub.id
@@ -774,7 +818,7 @@ async def test_add_delegated_car_resolves_immediately_via_local_user_repository(
 
     outcome = await fx.service.add_delegated_car(
         created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-        owner_username="real_owner", car_number="M295YB196", period_days=90,
+        owner_username="real_owner", car_number="M295YB196", 
         today=date(2026, 9, 3),
     )
 
@@ -798,7 +842,7 @@ async def test_add_delegated_car_resolves_via_live_telegram_lookup(tmp_path):
     try:
         outcome = await fixture.service.add_delegated_car(
             created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-            owner_username="newcomer", car_number="M295YB196", period_days=30,
+            owner_username="newcomer", car_number="M295YB196", 
             today=date(2026, 9, 3),
         )
 
@@ -812,7 +856,7 @@ async def test_add_delegated_car_resolves_via_live_telegram_lookup(tmp_path):
 async def test_add_delegated_car_creates_pending_claim_when_owner_cannot_be_resolved(fx):
     outcome = await fx.service.add_delegated_car(
         created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-        owner_username="unknown_person", car_number="M295YB196", period_days=30,
+        owner_username="unknown_person", car_number="M295YB196", 
         today=date(2026, 9, 3),
     )
 
@@ -835,7 +879,7 @@ async def test_add_delegated_car_monitoring_starts_even_when_owner_unresolved(fx
     владельца не блокирует мониторинг"."""
     outcome = await fx.service.add_delegated_car(
         created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-        owner_username="unknown_person", car_number="M295YB196", period_days=30,
+        owner_username="unknown_person", car_number="M295YB196", 
         today=date(2026, 9, 3),
     )
 
@@ -853,7 +897,7 @@ async def test_add_delegated_car_reuses_operator_task_without_changing_scope(fx)
 
     outcome = await fx.service.add_delegated_car(
         created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-        owner_username="unknown_person", car_number="M295YB196", period_days=30,
+        owner_username="unknown_person", car_number="M295YB196", 
         today=date(2026, 9, 3),
     )
 
@@ -868,7 +912,7 @@ async def test_add_delegated_car_propagates_owner_resolution_error(tmp_path):
         with pytest.raises(OwnerResolutionError):
             await fixture.service.add_delegated_car(
                 created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-                owner_username="flaky", car_number="M295YB196", period_days=30,
+                owner_username="flaky", car_number="M295YB196", 
                 today=date(2026, 9, 3),
             )
 
@@ -888,7 +932,7 @@ async def test_add_delegated_car_without_client_creates_no_subscription(fx):
     активной, ни pending_claim."""
     outcome = await fx.service.add_delegated_car_without_client(
         created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-        car_number="M295YB196", period_days=90, today=date(2026, 9, 3),
+        car_number="M295YB196", today=date(2026, 9, 3),
     )
 
     assert outcome.task.monitoring_scope == "client_bot"
@@ -903,7 +947,7 @@ async def test_add_delegated_car_without_client_starts_monitoring_immediately(fx
     unresolved) — отсутствие клиента не блокирует мониторинг."""
     outcome = await fx.service.add_delegated_car_without_client(
         created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-        car_number="M295YB196", period_days=30, today=date(2026, 9, 3),
+        car_number="M295YB196", today=date(2026, 9, 3),
     )
 
     [task] = fx.task_repository.list_active()
@@ -918,7 +962,7 @@ async def test_add_delegated_car_without_client_does_not_sync_fictitious_owner_t
     из этого flow."""
     await fx.service.add_delegated_car_without_client(
         created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-        car_number="M295YB196", period_days=30, today=date(2026, 9, 3),
+        car_number="M295YB196", today=date(2026, 9, 3),
     )
 
     assert fx.user_repository.find_by_car_number("M295YB196") == []
@@ -931,16 +975,16 @@ async def test_add_delegated_car_without_client_repeat_extends_same_task(fx):
     подписку."""
     first = await fx.service.add_delegated_car_without_client(
         created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-        car_number="M295YB196", period_days=30, today=date(2026, 9, 3),
+        car_number="M295YB196", today=date(2026, 9, 3),
     )
 
     second = await fx.service.add_delegated_car_without_client(
         created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-        car_number="M295YB196", period_days=90, today=date(2026, 9, 3),
+        car_number="M295YB196", today=date(2026, 9, 3),
     )
 
     assert second.task.id == first.task.id
-    assert second.task.end_date == date(2026, 9, 3) + timedelta(days=90)
+    assert second.task.end_date == UNLIMITED_END_DATE
     assert fx.subscription_repository.list_managed_by_creator(_TRUSTED_ID) == []
 
 
@@ -953,7 +997,7 @@ async def test_add_delegated_car_without_client_reuses_operator_task_without_cha
 
     outcome = await fx.service.add_delegated_car_without_client(
         created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-        car_number="M295YB196", period_days=30, today=date(2026, 9, 3),
+        car_number="M295YB196", today=date(2026, 9, 3),
     )
 
     assert outcome.task.id == operator_task.id
@@ -971,12 +1015,12 @@ async def test_add_delegated_car_without_client_then_with_client_attaches_to_sam
     )
     without_client = await fx.service.add_delegated_car_without_client(
         created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-        car_number="M295YB196", period_days=30, today=date(2026, 9, 3),
+        car_number="M295YB196", today=date(2026, 9, 3),
     )
 
     with_client = await fx.service.add_delegated_car(
         created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-        owner_username="real_owner", car_number="M295YB196", period_days=30,
+        owner_username="real_owner", car_number="M295YB196", 
         today=date(2026, 9, 3),
     )
 
@@ -988,7 +1032,7 @@ async def test_add_delegated_car_without_client_then_with_client_attaches_to_sam
 async def test_claim_binds_owner_and_syncs_user_repository(fx):
     outcome = await fx.service.add_delegated_car(
         created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-        owner_username="unknown_person", car_number="M295YB196", period_days=30,
+        owner_username="unknown_person", car_number="M295YB196", 
         today=date(2026, 9, 3),
     )
     token = outcome.claim_link.rsplit("claim_", 1)[1]
@@ -1019,16 +1063,16 @@ def test_claim_returns_none_for_unknown_token(fx):
 async def test_list_managed_cars_returns_only_delegated_by_this_trusted_operator(fx):
     await fx.service.add_delegated_car(
         created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-        owner_username="owner_one", car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+        owner_username="owner_one", car_number="AA001AA", today=date(2026, 9, 3),
     )
     other_trusted_id = 410811386
     await fx.service.add_delegated_car(
         created_by_telegram_user_id=other_trusted_id, created_by_telegram_chat_id=other_trusted_id,
-        owner_username="owner_two", car_number="BB002BB", period_days=30, today=date(2026, 9, 3),
+        owner_username="owner_two", car_number="BB002BB", today=date(2026, 9, 3),
     )
     await fx.service.add_car(
         telegram_user_id=_TRUSTED_ID, telegram_chat_id=_TRUSTED_CHAT_ID, username="trusted_self",
-        first_name=None, last_name=None, car_number="CC003CC", period_days=30, today=date(2026, 9, 3),
+        first_name=None, last_name=None, car_number="CC003CC", today=date(2026, 9, 3),
     )
 
     managed = fx.service.list_managed_cars(_TRUSTED_ID)
@@ -1042,7 +1086,7 @@ async def test_stop_subscription_allows_creator_and_rejects_stranger(fx):
     )
     outcome = await fx.service.add_delegated_car(
         created_by_telegram_user_id=_TRUSTED_ID, created_by_telegram_chat_id=_TRUSTED_CHAT_ID,
-        owner_username="real_owner", car_number="M295YB196", period_days=30, today=date(2026, 9, 3),
+        owner_username="real_owner", car_number="M295YB196", today=date(2026, 9, 3),
     )
     assert outcome.pending_claim is False  # резолвлено сразу — подписка active
 
@@ -1059,11 +1103,11 @@ async def test_list_actionable_subscriptions_combines_own_and_managed_without_du
     )
     own = await fx.service.add_car(
         telegram_user_id=42, telegram_chat_id=42, username="client",
-        first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+        first_name=None, last_name=None, car_number="AA001AA", today=date(2026, 9, 3),
     )
     delegated = await fx.service.add_delegated_car(
         created_by_telegram_user_id=42, created_by_telegram_chat_id=42,
-        owner_username="real_owner", car_number="BB002BB", period_days=30, today=date(2026, 9, 3),
+        owner_username="real_owner", car_number="BB002BB", today=date(2026, 9, 3),
     )
 
     actionable = fx.service.list_actionable_subscriptions(42)
@@ -1149,7 +1193,7 @@ def test_list_actionable_subscriptions_includes_stopped_with_past_end_date(fx):
 async def test_get_actionable_subscription_rejects_stranger(fx):
     outcome = await fx.service.add_car(
         telegram_user_id=42, telegram_chat_id=42, username="client",
-        first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+        first_name=None, last_name=None, car_number="AA001AA", today=date(2026, 9, 3),
     )
 
     assert fx.service.get_actionable_subscription(outcome.subscription.id, telegram_user_id=42) is not None
@@ -1162,7 +1206,7 @@ async def test_check_now_uses_existing_check_service_and_dedup(fx):
     отдельную систему штрафов/обходить дедуп."""
     outcome = await fx.service.add_car(
         telegram_user_id=42, telegram_chat_id=42, username="client",
-        first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+        first_name=None, last_name=None, car_number="AA001AA", today=date(2026, 9, 3),
     )
     assert fx.provider.requested_plates == ["AA001AA"]  # уже проверено внутри add_car
 
@@ -1189,7 +1233,7 @@ async def test_check_now_suppressed_plate_never_calls_provider_and_shows_no_fine
         # denylisted номера (см. SubscriptionService.add_car -> check_task).
         outcome = await fixture.service.add_car(
             telegram_user_id=42, telegram_chat_id=42, username="client",
-            first_name=None, last_name=None, car_number="O687KE761", period_days=30,
+            first_name=None, last_name=None, car_number="O687KE761", 
             today=date(2026, 9, 3),
         )
         assert fixture.provider.requested_plates == []
@@ -1219,7 +1263,7 @@ async def test_check_now_when_circuit_open_shows_last_known_fine_without_disclai
     try:
         outcome = await fixture.service.add_car(
             telegram_user_id=42, telegram_chat_id=42, username="client",
-            first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+            first_name=None, last_name=None, car_number="AA001AA", today=date(2026, 9, 3),
         )
         assert outcome.check_ok is True and outcome.new_fines_count == 1
         requests_before = len(fixture.provider.requested_plates)
@@ -1241,7 +1285,7 @@ async def test_check_now_when_circuit_open_shows_last_known_fine_without_disclai
 async def test_check_now_returns_none_for_unauthorized_user(fx):
     outcome = await fx.service.add_car(
         telegram_user_id=42, telegram_chat_id=42, username="client",
-        first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+        first_name=None, last_name=None, car_number="AA001AA", today=date(2026, 9, 3),
     )
 
     result = await fx.service.check_now(outcome.subscription.id, telegram_user_id=999)
@@ -1256,7 +1300,7 @@ async def test_check_now_returns_none_for_unauthorized_user(fx):
 async def test_check_now_on_stopped_car_succeeds_and_keeps_it_stopped(fx):
     outcome = await fx.service.add_car(
         telegram_user_id=42, telegram_chat_id=42, username="client",
-        first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+        first_name=None, last_name=None, car_number="AA001AA", today=date(2026, 9, 3),
     )
     fx.service.turn_off_car(outcome.subscription.id, telegram_user_id=42)
     assert fx.subscription_repository.get(outcome.subscription.id).status == "stopped"
@@ -1277,7 +1321,7 @@ async def test_check_now_on_stopped_car_error_still_keeps_it_stopped(tmp_path):
     try:
         outcome = await fixture.service.add_car(
             telegram_user_id=42, telegram_chat_id=42, username="client",
-            first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+            first_name=None, last_name=None, car_number="AA001AA", today=date(2026, 9, 3),
         )
         fixture.service.turn_off_car(outcome.subscription.id, telegram_user_id=42)
 
@@ -1302,7 +1346,7 @@ async def test_check_now_picker_shows_duplicate_subscriptions_for_same_car_as_se
     текущее поведение и не расширяй scope")."""
     outcome = await fx.service.add_car(
         telegram_user_id=42, telegram_chat_id=42, username="client",
-        first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+        first_name=None, last_name=None, car_number="AA001AA", today=date(2026, 9, 3),
     )
     fx.service.turn_off_car(outcome.subscription.id, telegram_user_id=42)
 
@@ -1328,7 +1372,7 @@ async def test_check_now_reports_new_fines_found(tmp_path):
     try:
         outcome = await fixture.service.add_car(
             telegram_user_id=42, telegram_chat_id=42, username="client",
-            first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+            first_name=None, last_name=None, car_number="AA001AA", today=date(2026, 9, 3),
         )
         # Провайдер теперь "находит" штраф для следующей проверки.
         fixture.provider._records_by_car["AA001AA"] = [_record(car_number="AA001AA", fingerprint="fp-new")]
@@ -1351,7 +1395,7 @@ async def test_check_now_shows_existing_fine_not_only_new(tmp_path):
         fixture.provider._records_by_car["AA001AA"] = [_record(car_number="AA001AA", fingerprint="fp-existing")]
         outcome = await fixture.service.add_car(
             telegram_user_id=42, telegram_chat_id=42, username="client",
-            first_name=None, last_name=None, car_number="AA001AA", period_days=30, today=date(2026, 9, 3),
+            first_name=None, last_name=None, car_number="AA001AA", today=date(2026, 9, 3),
         )
 
         result = await fixture.service.check_now(outcome.subscription.id, telegram_user_id=42)
@@ -1373,7 +1417,7 @@ async def test_check_now_by_trusted_creator_is_not_owner(tmp_path):
         outcome = await fixture.service.add_delegated_car(
             created_by_telegram_user_id=555, created_by_telegram_chat_id=555,
             car_number="AA001AA", owner_username="unknown_person",
-            period_days=30, today=date(2026, 9, 3),
+            today=date(2026, 9, 3),
         )
 
         result = await fixture.service.check_now(
@@ -1677,18 +1721,18 @@ def test_find_representative_task_for_inactive_car_tie_breaks_on_larger_id(fx):
     assert found.id == task_b.id  # task_b.id > task_a.id (создана второй)
 
 
-def test_resume_task_for_trusted_admin_sets_new_period_and_activates(fx):
+def test_resume_task_for_trusted_admin_activates_unlimited(fx):
     task = fx.task_repository.create(
         car_number="E911EE95", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
         telegram_chat_id=_CHAT_ID, created_by_user_id=_OPERATOR_USER_ID,
     )
     fx.task_repository.set_status(task.id, "stopped")
 
-    resumed = fx.service.resume_task_for_trusted_admin(task.id, days=30, today=date(2026, 9, 21))
+    resumed = fx.service.resume_task_for_trusted_admin(task.id, today=date(2026, 9, 21))
 
     assert resumed.status == "active"
     assert resumed.start_date == date(2026, 9, 21)
-    assert resumed.end_date == date(2026, 10, 21)
+    assert resumed.end_date == UNLIMITED_END_DATE
 
 
 def test_resume_task_for_trusted_admin_works_from_completed_and_archived(fx):
@@ -1705,16 +1749,16 @@ def test_resume_task_for_trusted_admin_works_from_completed_and_archived(fx):
         task.id, next_check_at=datetime(2026, 2, 1),  # noqa: DTZ001
     )
 
-    resumed = fx.service.resume_task_for_trusted_admin(task.id, days=15, today=date(2026, 9, 21))
+    resumed = fx.service.resume_task_for_trusted_admin(task.id, today=date(2026, 9, 21))
 
     assert resumed.status == "active"
     assert resumed.archive_check_enabled is False
     assert resumed.next_archive_check_at is None
-    assert resumed.end_date == date(2026, 10, 6)
+    assert resumed.end_date == UNLIMITED_END_DATE
 
 
 def test_resume_task_for_trusted_admin_returns_none_for_missing_task(fx):
-    assert fx.service.resume_task_for_trusted_admin(999999, days=30, today=date(2026, 9, 21)) is None
+    assert fx.service.resume_task_for_trusted_admin(999999, today=date(2026, 9, 21)) is None
 
 
 def test_resume_task_for_trusted_admin_does_not_touch_other_tasks(fx):
@@ -1730,7 +1774,7 @@ def test_resume_task_for_trusted_admin_does_not_touch_other_tasks(fx):
     )
     fx.task_repository.set_status(task_a.id, "stopped")
 
-    fx.service.resume_task_for_trusted_admin(task_a.id, days=30, today=date(2026, 9, 21))
+    fx.service.resume_task_for_trusted_admin(task_a.id, today=date(2026, 9, 21))
 
     unchanged = fx.task_repository.get(task_b.id)
     assert unchanged.status == "active"

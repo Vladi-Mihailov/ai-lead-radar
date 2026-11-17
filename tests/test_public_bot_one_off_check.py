@@ -25,7 +25,7 @@ from telethon import events  # noqa: E402
 
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
-from reader.fines.models import ParsedFineRecord  # noqa: E402
+from reader.fines.models import UNLIMITED_END_DATE, ParsedFineRecord  # noqa: E402
 from reader.fines.provider import FineProvider, FineProviderError, PoliceGeUnavailableError  # noqa: E402
 from reader.fines.rednet_check_now_provider import AutoFailoverCheckNowProvider  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
@@ -445,8 +445,8 @@ async def test_regular_user_plate_on_home_screen_still_starts_add_car(tmp_path):
     try:
         reply = await fx.controller.handle_text(_PLATE, chat_id=_USER_ID, telegram_user_id=_USER_ID, username=None)
 
-        assert reply.text == texts.PERIOD_PROMPT
-        assert reply.show_period_buttons is True
+        assert reply.text == texts.format_add_car_confirm_prompt(_PLATE)
+        assert reply.show_add_car_confirm_buttons is True
         assert reply.inline_buttons is None
         assert reply.trusted_one_off_plate is None
     finally:
@@ -604,7 +604,10 @@ async def test_choice_check_with_garbage_plate_payload_is_rejected(tmp_path):
         fx.close()
 
 
-async def test_add_to_monitoring_opens_existing_add_car_flow_with_period(tmp_path):
+async def test_add_to_monitoring_opens_existing_add_car_flow_without_period(tmp_path):
+    """"➕ На мониторинг" ведёт в обычный Add Car менеджера: клиент? →
+    подтверждение (срока нет — см. задачу "убрать выбор срока
+    мониторинга") → бессрочная задача."""
     fx = _Fixture(tmp_path, _ScriptedProvider([]))
     try:
         reply = fx.controller.handle_trusted_one_off_add(_PLATE, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
@@ -615,14 +618,17 @@ async def test_add_to_monitoring_opens_existing_add_car_flow_with_period(tmp_pat
         assert state.step == STEP_AWAITING_CLIENT_DECISION
         assert state.payload == {"car_number": _PLATE}
 
-        period_prompt = fx.controller.handle_add_client_decision(
+        confirm_prompt = fx.controller.handle_add_client_decision(
             False, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID,
         )
-        assert period_prompt.text == texts.PERIOD_PROMPT
-        await fx.controller.handle_period_choice(
-            30, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, first_name=None, last_name=None,
+        assert confirm_prompt.text == texts.format_add_car_confirm_prompt(_PLATE)
+        assert confirm_prompt.show_add_car_confirm_buttons is True
+        done = await fx.controller.handle_add_car_confirm(
+            chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, first_name=None, last_name=None,
         )
-        assert len(fx.task_repository.get_active_by_car_number(_PLATE)) == 1
+        assert done.text.startswith(texts.ADD_CAR_DONE_LINE)
+        [task] = fx.task_repository.get_active_by_car_number(_PLATE)
+        assert task.end_date == UNLIMITED_END_DATE
     finally:
         fx.close()
 

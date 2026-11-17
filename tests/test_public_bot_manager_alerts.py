@@ -29,6 +29,7 @@ from telethon import events  # noqa: E402
 
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
+from reader.fines.models import UNLIMITED_END_DATE  # noqa: E402
 from reader.fines.provider import FineProvider  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
 from reader.public_bot import manager_alerts, texts  # noqa: E402
@@ -37,7 +38,7 @@ from reader.public_bot.conversation_state_repository import (  # noqa: E402
     BotConversationStateRepository,
 )
 from reader.public_bot.handlers import register  # noqa: E402
-from reader.public_bot.keyboards import encode_period_callback  # noqa: E402
+from reader.public_bot.keyboards import add_car_confirm_keyboard  # noqa: E402
 from reader.public_bot.known_users_repository import BotKnownUsersRepository  # noqa: E402
 from reader.public_bot.statistics_service import BotStatisticsService  # noqa: E402
 from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
@@ -291,8 +292,15 @@ async def test_new_user_alert_is_noop_when_manager_chat_id_not_configured(tmp_pa
 
 # ==== 9. new user subsequently adds car → manager gets car-number follow-up ====
 
+# "✅ Добавить" на подтверждении Add Car (см. задачу "убрать выбор срока
+# мониторинга") — и старая кнопка "30 дней" из истории чата, которая
+# работает так же (обратная совместимость callback_data).
+_ADD_CAR_CONFIRM_DATA = add_car_confirm_keyboard()[0][0].data
+_LEGACY_PERIOD_DATA = b"period:30"
 
-async def test_new_user_adding_car_sends_followup_alert_with_car_number(tmp_path):
+
+@pytest.mark.parametrize("confirm_data", [_ADD_CAR_CONFIRM_DATA, _LEGACY_PERIOD_DATA])
+async def test_new_user_adding_car_sends_followup_alert_with_car_number(tmp_path, confirm_data):
     fx = _Fixture(tmp_path)
     try:
         client = _register(fx)
@@ -303,14 +311,14 @@ async def test_new_user_adding_car_sends_followup_alert_with_car_number(tmp_path
 
         await _send_text(client, text=texts.ADD_CAR_LABEL, sender_id=_USER_ID, sender=sender)
         await _send_text(client, text="M295YB196", sender_id=_USER_ID, sender=sender)
-        await _send_callback(
-            client, data=encode_period_callback(30), sender_id=_USER_ID, sender=sender,
-        )
+        await _send_callback(client, data=confirm_data, sender_id=_USER_ID, sender=sender)
 
         assert len(client.sent_messages) == 2  # + car-added follow-up
         chat_id, text, _ = client.sent_messages[1]
         assert chat_id == _MANAGER_CHAT_ID
         assert "Пользователь добавил автомобиль" in text
+        [subscription] = fx.subscription_repository.list_by_user(_USER_ID)
+        assert subscription.end_date == UNLIMITED_END_DATE
     finally:
         fx.close()
 
@@ -327,14 +335,14 @@ async def test_existing_user_adding_second_car_sends_no_followup_alert(tmp_path)
         await _send_text(client, text="/start", sender_id=_USER_ID, sender=sender)
         await _send_text(client, text=texts.ADD_CAR_LABEL, sender_id=_USER_ID, sender=sender)
         await _send_text(client, text="M295YB196", sender_id=_USER_ID, sender=sender)
-        await _send_callback(client, data=encode_period_callback(30), sender_id=_USER_ID, sender=sender)
+        await _send_callback(client, data=_ADD_CAR_CONFIRM_DATA, sender_id=_USER_ID, sender=sender)
         messages_after_first_car = len(client.sent_messages)
         assert messages_after_first_car == 2  # new-user + first car-added
 
         # Второй автомобиль того же пользователя.
         await _send_text(client, text=texts.ADD_CAR_LABEL, sender_id=_USER_ID, sender=sender)
         await _send_text(client, text="B111BB11", sender_id=_USER_ID, sender=sender)
-        await _send_callback(client, data=encode_period_callback(30), sender_id=_USER_ID, sender=sender)
+        await _send_callback(client, data=_ADD_CAR_CONFIRM_DATA, sender_id=_USER_ID, sender=sender)
 
         # Ни нового "новый пользователь", ни ещё одного "добавил автомобиль".
         assert len(client.sent_messages) == messages_after_first_car

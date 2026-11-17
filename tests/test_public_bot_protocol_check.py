@@ -522,7 +522,7 @@ async def test_existing_add_car_flow_unaffected(tmp_path):
     reply2 = await fx.controller.handle_text(
         _VALID_CAR_NUMBER, chat_id=_CHAT_ID, telegram_user_id=_ORDINARY_ID, username="someuser",
     )
-    assert reply2.show_period_buttons is True
+    assert reply2.show_add_car_confirm_buttons is True
 
 
 # ---- provider отсутствует в сборке (protocol_check_provider=None) ----

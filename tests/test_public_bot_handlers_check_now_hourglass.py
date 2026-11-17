@@ -326,12 +326,12 @@ async def test_different_subscriptions_do_not_block_each_other(tmp_path):
         fx.close()
 
 
-async def test_check_now_does_not_show_hourglass_for_expired_card(tmp_path):
-    """handle_check_now_choice's "ИСТЁК" branch (status still 'active' in
-    the DB, but end_date already passed — see texts.car_monitoring_state())
-    returns an informative card WITHOUT ever calling check_now() —
-    on_check_started is never invoked, so no "⏳" is shown and the one
-    message sent is the card itself, exactly as before this change."""
+async def test_check_now_shows_hourglass_for_legacy_expired_subscription(tmp_path):
+    """Subscription whose term ran out before Georgia monitoring became
+    unlimited (status still 'active' in the DB, end_date already passed).
+    The separate "ИСТЁК" card is gone (see задачу "убрать выбор срока
+    мониторинга") — to the user this is just an OFF car, so the live check
+    runs with the same "⏳" -> edited result flow as any other car."""
     provider = _BlockingProvider()
     fx = _Fixture(tmp_path, provider=provider)
     try:
@@ -348,11 +348,16 @@ async def test_check_now_does_not_show_hourglass_for_expired_card(tmp_path):
         )
         client, event = _register_and_get_event(fx, data=b"checknow:" + str(sub.id).encode("ascii"))
 
-        await client.callback_handler(event)
+        pending = asyncio.ensure_future(client.callback_handler(event))
+        await provider.entered.wait()
+        assert [c[0] for c in event.calls] == ["answer", "respond"]
+        assert event.calls[1][1] == "⏳"
 
-        assert provider.search_calls == []
-        call_names = [c[0] for c in event.calls]
-        assert call_names == ["answer", "respond"]
-        assert "message_edit" not in call_names
+        provider.gate.set()
+        await pending
+
+        assert provider.search_calls == [car_number]
+        assert [c[0] for c in event.calls] == ["answer", "respond", "message_edit"]
+        assert "Срок" not in event.calls[2][2]
     finally:
         fx.close()

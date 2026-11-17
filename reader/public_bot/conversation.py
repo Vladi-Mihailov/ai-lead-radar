@@ -11,9 +11,10 @@ CommandResult в reader/commands/base.py для операторских ком�
 
 Security-инвариант (см. design report): единственный источник identity —
 telegram_user_id, полученный ВЫЗЫВАЮЩИМ кодом из event.sender_id. Callback
-периода (см. handle_period_choice) несёт только выбранное значение дней —
-кому это применить, решает ИСКЛЮЧИТЕЛЬНО conversation_state (ключ — chat_id,
-сверка владения — telegram_user_id), а не сам callback. То же самое для
+подтверждения Add Car (см. handle_add_car_confirm) не несёт вообще ничего,
+кроме факта нажатия — кому это применить, решает ИСКЛЮЧИТЕЛЬНО
+conversation_state (ключ — chat_id, сверка владения — telegram_user_id), а
+не сам callback. То же самое для
 deep-link claim (см. _handle_claim_start) — claim_token опаден, но
 identity, которой он в итоге биндится, берётся ИСКЛЮЧИТЕЛЬНО из
 event.sender_id этого конкретного /start, а не из чего-либо в payload.
@@ -23,12 +24,20 @@ Self-service Add Car (обычный, не-trusted пользователь, с�
 НИКОГДА не запрашивается вручную — telegram_user_id (event.sender_id)
 остаётся единственной stable identity, username сохраняется ТОЛЬКО если
 его отдал сам Telegram (event.sender.username), иначе остаётся None —
-номер авто ведёт СРАЗУ к STEP_AWAITING_PERIOD в обоих случаях. Раньше
+номер авто ведёт СРАЗУ к STEP_AWAITING_ADD_CONFIRM в обоих случаях. Раньше
 здесь был отдельный STEP_AWAITING_USERNAME/USERNAME_PROMPT для клиентов
 без публичного username — убран целиком (см. _handle_car_number_input),
 username=None для self-service — штатное, а не ошибочное состояние (см.
-handle_period_choice — отличает self-service от delegated по наличию
+handle_add_car_confirm — отличает self-service от delegated по наличию
 ключа "username" в payload, а не по его истинности).
+
+Бессрочный мониторинг (см. задачу "убрать выбор срока мониторинга"):
+выбора срока нет ни в одном сценарии — Add Car (self-service и trusted)
+заканчивается одним подтверждением (STEP_AWAITING_ADD_CONFIRM), "▶️
+Продолжить мониторинг" у менеджера включает задачу сразу. Старые кнопки
+выбора срока из истории чатов продолжают работать как это подтверждение/
+включение (см. keyboards.py::is_legacy_period_callback и
+decode_legacy_trusted_task_period_callback).
 
 Trusted-operator delegated flow (см. design report): пользователь из
 trusted_operator_user_ids — единственная авторизация ТОЛЬКО по numeric
@@ -128,7 +137,14 @@ logger = logging.getLogger(__name__)
 STEP_AWAITING_CAR_NUMBER = "awaiting_car_number"
 STEP_AWAITING_CLIENT_DECISION = "awaiting_client_decision"
 STEP_AWAITING_OWNER_USERNAME = "awaiting_owner_username"
-STEP_AWAITING_PERIOD = "awaiting_period"
+# Последний шаг Add Car — подтверждение (см. texts.
+# format_add_car_confirm_prompt), срок больше не выбирается. Шаг выбора
+# срока ("awaiting_period") заменён им целиком; это значение по-прежнему
+# принимается, потому что bot_conversation_state переживает рестарт —
+# пользователь мог остановиться на выборе срока до обновления бота.
+STEP_AWAITING_ADD_CONFIRM = "awaiting_add_confirm"
+_LEGACY_STEP_AWAITING_PERIOD = "awaiting_period"
+_ADD_CONFIRM_STEPS = (STEP_AWAITING_ADD_CONFIRM, _LEGACY_STEP_AWAITING_PERIOD)
 # Trusted-operator task-level 🔎 Проверить сейчас — ввод номера (см.
 # design report: "искать автомобиль в списке неудобно"), а не список.
 STEP_AWAITING_TRUSTED_CHECK_NOW_CAR_NUMBER = "awaiting_trusted_check_now_car_number"
@@ -155,11 +171,10 @@ _manual_bootstrap_keyboards_module = None
 
 def _mb_kb():
     """Lazy import reader.public_bot.keyboards (см. задачу "ВРЕМЕННЫЙ
-    manager workflow для Georgia fines bot") — keyboards.py само импортирует
-    PERIOD_CHOICES/TRUSTED_TASK_PERIOD_CHOICES ИЗ ЭТОГО модуля (см. его
-    докстрок над _encode_plate), поэтому top-level "from
+    manager workflow для Georgia fines bot") — исторически keyboards.py
+    импортировал константы ИЗ ЭТОГО модуля, и top-level "from
     reader.public_bot.keyboards import encode_manual_bootstrap_*" здесь
-    создал бы circular import уже ПРИ ЗАГРУЗКЕ модуля — импортируем лениво,
+    создавал circular import уже ПРИ ЗАГРУЗКЕ модуля — импортируем лениво,
     при первом реальном вызове (оба модуля к этому моменту уже полностью
     загружены), кэшируем результат, чтобы не повторять import на каждый
     callback."""
@@ -185,18 +200,6 @@ STEP_MANUAL_FINE_DATE = "awaiting_manual_fine_date"
 STEP_MANUAL_FINE_PLACE = "awaiting_manual_fine_place"
 STEP_MANUAL_FINE_ARTICLE = "awaiting_manual_fine_article"
 STEP_MANUAL_FINE_REVIEW = "awaiting_manual_fine_review"
-
-PERIOD_CHOICES = (30, 90, 180, 365)
-
-# Manager-facing "📋 Мои авто" ON/OFF (см. design report про per-car
-# monitoring toggle) — "▶️ Продолжить мониторинг" после OFF: ОТДЕЛЬНЫЙ
-# набор длительностей от PERIOD_CHOICES выше (15/30/90, не 30/90/180/365) —
-# другая клавиатура (3 кнопки + "⬅️ Назад" в один столбец, см. design
-# report layout, не 2x2 grid), другой шаг/действие (продлить УЖЕ
-# существующую task-level задачу менеджера, а не создать новую подписку
-# при "➕ Добавить авто") — поэтому не переиспользует PERIOD_CHOICES/
-# STEP_AWAITING_PERIOD напрямую.
-TRUSTED_TASK_PERIOD_CHOICES = (15, 30, 90)
 
 _START_PREFIX = "/start"
 _CLAIM_PAYLOAD_PREFIX = "claim_"
@@ -270,8 +273,8 @@ class BotReply:
     и НЕ является доказательством авторизации: is_trusted() перепроверяется
     на каждом callback заново, а page вне диапазона клампится сервером.
 
-    trusted_tasks_page_options — (task_id, car_number, owner_display, is_on,
-    end_date) на строку "📋 Мои авто" — РОВНО ТРИ кнопки на машину (см.
+    trusted_tasks_page_options — (task_id, car_number, owner_display, is_on)
+    на строку "📋 Мои авто" — РОВНО ТРИ кнопки на машину (см.
     задачу "унифицировать оба интерфейса Georgia/Turkey":
     [CAR_NUMBER] [@username/—] [STATUS], тот же вид, что и у Turkey bot):
     ЛЕВАЯ — car_number (см. reader/public_bot/keyboards.py::
@@ -280,23 +283,21 @@ class BotReply:
     texts.format_owner_username_button — НИКОГДА "@None"/"None"/пустая
     кнопка), информационная, её callback — безопасный no-op (переоткрывает
     ту же страницу, см. encode_trusted_tasks_page_callback), ПРАВАЯ —
-    is_on + end_date решают "🟢 до ДД.ММ"/"⚪" (см.
-    _format_trusted_task_toggle_label). owner_display — ТОЛЬКО display, не
+    is_on решает "🟢"/"⚪" (см. _format_trusted_task_toggle_label; срока
+    нет — см. задачу "убрать выбор срока мониторинга"). owner_display —
+    ТОЛЬКО display, не
     влияет на callback_data car/status-кнопок (та по-прежнему строится
     исключительно из task_id) и не меняет авторизацию/ownership. task_id
     публичен и НЕ является доказательством авторизации сам по себе — тот
     же принцип, что и везде в этом модуле (is_trusted() + существование
     задачи перепроверяются server-side на каждом действии). Список БЕЗ
     текстового перечня машин (см. design report: Telegram не позволяет
-    inline-кнопку справа от строки текста) — номер/владелец/период/ON-OFF
-    каждой машины ТОЛЬКО в этих кнопках, а не в reply.text. Полный период
-    (start_date — end_date) по-прежнему только в карточке машины (см.
-    texts.format_trusted_task_detail). FineMonitoringTask.end_date —
-    NOT NULL (см. reader/fines/task_repository.py::_SCHEMA), поэтому этот
-    элемент кортежа всегда date, никогда None.
+    inline-кнопку справа от строки текста) — номер/владелец/ON-OFF каждой
+    машины ТОЛЬКО в этих кнопках, а не в reply.text. Последняя проверка —
+    в карточке машины (см. texts.format_trusted_task_detail).
 
     trusted_task_detail_id/trusted_task_detail_page — карточка ОДНОЙ
-    машины (см. design report, format_trusted_task_detail) — период/
+    машины (см. design report, format_trusted_task_detail) — статус/
     последняя проверка, открывается нажатием на кнопку-номер в списке (см.
     handle_trusted_task_open). page — куда вернёт "⬅️ Назад".
 
@@ -304,12 +305,6 @@ class BotReply:
     мониторинг" (см. design report) — показывается после ⚪ OFF в списке
     ИЛИ сразу после ON -> OFF toggle (см. handle_trusted_task_toggle).
     page — куда вернёт "⬅️ Назад" (на "📋 Мои авто", ту же страницу).
-
-    trusted_task_period_id/trusted_task_period_page — экран выбора срока
-    15/30/90 дней (см. design report, TRUSTED_TASK_PERIOD_CHOICES) — "⬅️
-    Назад" отсюда возвращает на экран "▶️ Продолжить мониторинг" (тот же
-    task_id/page, см. handle_trusted_task_toggle — переиспользуется как
-    no-op показ, задача уже OFF).
 
     trusted_one_off_plate — НЕ экран, а команда handlers.py (см. задачу
     "GE-2: UI менеджера"): запустить разовую проверку этого номера без
@@ -329,21 +324,16 @@ class BotReply:
     car_detail_subscription_id/car_detail_monitoring_state/car_detail_page —
     карточка конкретного автомобиля (см. handle_my_car_open/
     handle_my_car_turn_on/handle_my_car_turn_off) — monitoring_state:
-    "ON"/"OFF"/"ИСТЁК" (см. texts.car_monitoring_state) решает, показать
-    ли ⏸/▶️-переключатель и какой именно; page — куда вернёт "⬅️ Назад".
+    "ON"/"OFF" (см. texts.car_monitoring_state) решает, какой
+    переключатель показать; page — куда вернёт "⬅️ Назад".
 
     car_delete_confirm_subscription_id/car_delete_confirm_page — "⚠️
     Удалить {car} из списка?" (см. handle_my_car_delete_prompt) — ОТДЕЛЬНОЕ
     промежуточное подтверждение перед soft delete, ничего ещё не удаляет.
 
-    my_car_inactive_id — ИСТЁК-карточка обычного пользователя (см. задачу
-    "align Georgia user check-now flow", production-пример O127PX62) —
-    показывается ВМЕСТО немедленного check (handle_check_now_choice),
-    когда выбранная подписка просрочена (см. texts.car_monitoring_state).
-    ON/OFF по-прежнему делают обычный немедленный check — эта карточка
-    СТРОГО для ИСТЁК. "🔎 Проверить разово"/"▶️ Продолжить мониторинг"/
-    "⬅️ Назад" — см. keyboards.py::my_car_inactive_keyboard,
-    handle_my_car_check_now_once, handle_my_car_resume_prompt.
+    show_add_car_confirm_buttons — [✅ Добавить][Отмена] под последним
+    шагом Add Car (см. STEP_AWAITING_ADD_CONFIRM, handle_add_car_confirm/
+    handle_add_car_cancel) — вместо прежнего выбора срока.
 
     cta_buttons — коммерческие CTA-кнопки под manual "🔎 Проверить сейчас"
     (см. design report про UX manual check) — ТОЛЬКО когда реальный
@@ -363,7 +353,7 @@ class BotReply:
 
     text: str
     show_main_menu: bool = False
-    show_period_buttons: bool = False
+    show_add_car_confirm_buttons: bool = False
     show_add_client_decision_buttons: bool = False
     check_now_options: list[tuple[int, str]] | None = None
     trusted_stop_options: list[tuple[int, str]] | None = None
@@ -371,13 +361,11 @@ class BotReply:
     trusted_stop_confirm_button_label: str | None = None
     trusted_tasks_page: int | None = None
     trusted_tasks_total_pages: int | None = None
-    trusted_tasks_page_options: list[tuple[int, str, str, bool, date]] | None = None
+    trusted_tasks_page_options: list[tuple[int, str, str, bool]] | None = None
     trusted_task_detail_id: int | None = None
     trusted_task_detail_page: int | None = None
     trusted_task_off_id: int | None = None
     trusted_task_off_page: int | None = None
-    trusted_task_period_id: int | None = None
-    trusted_task_period_page: int | None = None
     trusted_one_off_plate: str | None = None
     my_cars_page_options: list[tuple[int, str]] | None = None
     my_cars_page: int | None = None
@@ -385,7 +373,6 @@ class BotReply:
     car_detail_subscription_id: int | None = None
     car_detail_monitoring_state: str | None = None
     car_detail_page: int | None = None
-    my_car_inactive_id: int | None = None
     car_delete_confirm_subscription_id: int | None = None
     car_delete_confirm_page: int | None = None
     cta_buttons: list[list[tuple[str, str]]] | None = None
@@ -1404,7 +1391,6 @@ class ConversationController:
                     self._owner_username_for_car(task.car_number, today=today),
                 ),
                 task.status == "active",
-                task.end_date,
             )
             for task in tasks
         ]
@@ -1446,14 +1432,13 @@ class ConversationController:
         SubscriptionService.list_actionable_subscriptions) — включает
         OFF/'stopped' машины (см. задачу "fix: allow manual checks for
         stopped Georgia cars": OFF означает только "мониторинг выключен",
-        не "нельзя проверить вручную") И просроченные/ИСТЁК (см. задачу
-        "align Georgia user check-now flow" — O127PX62: больше не
-        пропадает из списка молча), исключает только archived.
-        subscription_id в кнопках, не car_number, чтобы не полагаться на
-        уникальность номера при последующей server-side проверке владения.
-        handle_check_now_choice() сам решает, что показать конкретной
-        выбранной строке (живой check для ON/OFF, informative-карточку для
-        ИСТЁК) — этот picker одинаково ведёт на ЛЮБУЮ из них. Единственный
+        не "нельзя проверить вручную") И подписки с истёкшим до перехода
+        на бессрочный мониторинг сроком (см. задачу "align Georgia user
+        check-now flow" — O127PX62: больше не пропадают из списка молча),
+        исключает только archived. subscription_id в кнопках, не
+        car_number, чтобы не полагаться на уникальность номера при
+        последующей server-side проверке владения. Любая выбранная строка
+        ведёт на живой check (см. handle_check_now_choice). Единственный
         оставшийся потребитель этого picker'а (⛔ для обычного пользователя
         заменена car-centric ON/OFF, см. design report п.8)."""
         subscriptions = self._subscriptions.list_actionable_subscriptions(telegram_user_id)
@@ -1570,7 +1555,7 @@ class ConversationController:
             )
 
         if state.step == STEP_AWAITING_CLIENT_DECISION:
-            # Тот же приём, что и у STEP_AWAITING_PERIOD ниже — выбор
+            # Тот же приём, что и у STEP_AWAITING_ADD_CONFIRM ниже — выбор
             # только inline-кнопкой, текст на этом шаге просто повторно
             # показывает вопрос+кнопки.
             return BotReply(
@@ -1679,10 +1664,14 @@ class ConversationController:
                 stripped, chat_id=chat_id, telegram_user_id=telegram_user_id,
             )
 
-        if state.step == STEP_AWAITING_PERIOD:
-            # Период выбирается ТОЛЬКО inline-кнопкой — текст на этом шаге
-            # просто повторно показывает клавиатуру.
-            return BotReply(text=texts.PERIOD_PROMPT, show_period_buttons=True)
+        if state.step in _ADD_CONFIRM_STEPS:
+            # Подтверждение — ТОЛЬКО inline-кнопкой, текст на этом шаге
+            # просто повторно показывает вопрос+кнопки.
+            payload = state.payload or {}
+            if not payload.get("car_number"):
+                self._clear_state(chat_id)
+                return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
+            return self._add_car_confirm_reply(payload)
 
         return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
 
@@ -1714,13 +1703,31 @@ class ConversationController:
         # как Turkey") — telegram_user_id уже достаточен как stable
         # identity. Если Telegram отдал username — сохраняем как metadata;
         # если нет — payload["username"] = None, штатное состояние (см.
-        # handle_period_choice, различающий self-service от delegated по
+        # handle_add_car_confirm, различающий self-service от delegated по
         # наличию ключа "username" в payload, а не по его истинности).
-        self._states.set(
-            chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_PERIOD,
-            payload={"car_number": car_number, "username": username},
+        return self._ask_add_car_confirm(
+            {"car_number": car_number, "username": username},
+            chat_id=chat_id, telegram_user_id=telegram_user_id,
         )
-        return BotReply(text=texts.PERIOD_PROMPT, show_period_buttons=True)
+
+    def _ask_add_car_confirm(self, payload: dict, *, chat_id: int, telegram_user_id: int) -> BotReply:
+        """Последний шаг Add Car (см. STEP_AWAITING_ADD_CONFIRM) — payload
+        тот же, что раньше уходил на выбор срока: {"car_number", "username"}
+        (self-service), {"car_number", "owner_username"} или {"car_number",
+        "no_client"} (trusted, см. handle_add_car_confirm)."""
+        self._states.set(
+            chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_ADD_CONFIRM, payload=payload,
+        )
+        return self._add_car_confirm_reply(payload)
+
+    @staticmethod
+    def _add_car_confirm_reply(payload: dict) -> BotReply:
+        return BotReply(
+            text=texts.format_add_car_confirm_prompt(
+                payload["car_number"], owner_username=payload.get("owner_username"),
+            ),
+            show_add_car_confirm_buttons=True,
+        )
 
     def _handle_owner_username_input(
         self, raw_text: str, *, chat_id: int, telegram_user_id: int, state_payload: dict | None,
@@ -1732,10 +1739,7 @@ class ConversationController:
 
         payload = dict(state_payload or {})
         payload["owner_username"] = owner_username
-        self._states.set(
-            chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_PERIOD, payload=payload,
-        )
-        return BotReply(text=texts.PERIOD_PROMPT, show_period_buttons=True)
+        return self._ask_add_car_confirm(payload, chat_id=chat_id, telegram_user_id=telegram_user_id)
 
     async def _handle_trusted_check_now_car_number_input(
         self, raw_text: str, *, chat_id: int, telegram_user_id: int,
@@ -1871,10 +1875,10 @@ class ConversationController:
         """Кнопки под результатом разовой проверки зависят от того, что
         известно о номере СЕЙЧАС: активная задача — только "🔎 Проверить
         другой номер" (мониторинг уже идёт); только историческая задача —
-        хвост "мониторинг завершён/выключен" и "▶️ Продолжить мониторинг"
-        (существующий callback: тот же выбор срока и resume, что и в
-        "📋 Мои авто"); задач нет — "➕ Добавить на мониторинг" (существующий
-        Add Car со сроком, см. handle_trusted_one_off_add). CTA нет."""
+        хвост "мониторинг выключен" и "▶️ Продолжить мониторинг"
+        (существующий callback: то же включение, что и в "📋 Мои авто");
+        задач нет — "➕ Добавить на мониторинг" (существующий Add Car, см.
+        handle_trusted_one_off_add). CTA нет."""
         another = (texts.TRUSTED_ONE_OFF_ANOTHER_LABEL, _mb_kb().encode_trusted_one_off_another_callback())
         tasks = self._subscriptions.list_tasks_for_car(result.car_number)
         if any(task.status == "active" for task in tasks):
@@ -1882,9 +1886,7 @@ class ConversationController:
         if tasks:
             representative = self._subscriptions.find_representative_task_for_inactive_car(result.car_number)
             return BotReply(
-                text=texts.format_one_off_check_result(
-                    result, inactive_task=representative, today=self._today(),
-                ),
+                text=texts.format_one_off_check_result(result, inactive_task=representative),
                 inline_buttons=[
                     [(
                         texts.TRUSTED_RESUME_MONITORING_LABEL,
@@ -1941,8 +1943,7 @@ class ConversationController:
         """"➕ На мониторинг" (экран выбора) и "➕ Добавить на мониторинг"
         (результат разовой проверки) — ровно то, что делает trusted-ветка
         _handle_car_number_input(): шаг STEP_AWAITING_CLIENT_DECISION с
-        {"car_number"}, дальше существующий Add Car со сроком. None — не
-        trusted."""
+        {"car_number"}, дальше существующий Add Car. None — не trusted."""
         if not self._is_trusted(telegram_user_id):
             return None
         self._clear_state(chat_id)
@@ -1967,12 +1968,13 @@ class ConversationController:
     def handle_add_client_decision(
         self, wants_client: bool, *, chat_id: int, telegram_user_id: int,
     ) -> BotReply | None:
-        """None — та же server-side проверка, что и у handle_period_choice:
+        """None — та же server-side проверка, что и у handle_add_car_confirm:
         нет активного диалога ИМЕННО на этом шаге у ИМЕННО этого
         telegram_user_id в этом chat_id (chat_id+conversation_state — а не
         что-либо из самого callback_data). wants_client=True (OK) → тот же
-        OWNER_USERNAME_PROMPT, что и раньше; False (Отмена) → сразу период,
-        БЕЗ username вовсе (см. handle_period_choice про payload["no_client"])."""
+        OWNER_USERNAME_PROMPT, что и раньше; False (Отмена) → сразу
+        подтверждение, БЕЗ username вовсе (см. handle_add_car_confirm про
+        payload["no_client"])."""
         state = self._states.get(chat_id)
         if (
             state is None
@@ -1994,34 +1996,49 @@ class ConversationController:
             )
             return BotReply(text=texts.OWNER_USERNAME_PROMPT)
 
-        self._states.set(
-            chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_PERIOD,
-            payload={"car_number": car_number, "no_client": True},
+        return self._ask_add_car_confirm(
+            {"car_number": car_number, "no_client": True},
+            chat_id=chat_id, telegram_user_id=telegram_user_id,
         )
-        return BotReply(text=texts.PERIOD_PROMPT, show_period_buttons=True)
 
-    # ---- выбор периода (inline-кнопки) ----
+    # ---- подтверждение Add Car (inline-кнопки) ----
 
-    async def handle_period_choice(
+    def _owned_add_car_confirm_state(self, chat_id: int, telegram_user_id: int):
+        """Состояние этого chat_id, если оно на шаге подтверждения Add Car
+        (новом или прежнем шаге выбора срока, см. _ADD_CONFIRM_STEPS) И
+        принадлежит ИМЕННО этому telegram_user_id; иначе None."""
+        state = self._states.get(chat_id)
+        if (
+            state is None
+            or state.step not in _ADD_CONFIRM_STEPS
+            or state.telegram_user_id != telegram_user_id
+        ):
+            return None
+        return state
+
+    async def handle_add_car_confirm(
         self,
-        days: int,
         *,
         chat_id: int,
         telegram_user_id: int,
         first_name: str | None,
         last_name: str | None,
     ) -> BotReply | None:
-        """None означает "эту кнопку нельзя обработать сейчас" — Telethon-
+        """"✅ Добавить" (и старые кнопки выбора срока из истории чата, см.
+        keyboards.py::is_legacy_period_callback) — создаёт бессрочный
+        мониторинг (см. задачу "убрать выбор срока мониторинга").
+
+        None означает "эту кнопку нельзя обработать сейчас" — Telethon-
         адаптер (handlers.py) в этом случае отвечает на callback коротким
         предупреждением и НИЧЕГО не создаёт/не меняет.
 
-        Ownership-проверка — ЕДИНСТВЕННЫЙ источник истины здесь: сам days
-        (пришедший из callback_data) публичен и безвреден сам по себе —
-        какую car_number/username/подписку он затронет, решает ТОЛЬКО
-        conversation_state, полученное по chat_id, и сверенное с
-        telegram_user_id (реальным отправителем ЭТОГО события, а не тем,
-        что мог бы нести сам callback_data, если бы там был чей-то id —
-        его там нет и не должно быть, см. reader/public_bot/keyboards.py).
+        Ownership-проверка — ЕДИНСТВЕННЫЙ источник истины здесь: callback
+        не несёт никаких данных — какую car_number/username/подписку он
+        затронет, решает ТОЛЬКО conversation_state, полученное по chat_id,
+        и сверенное с telegram_user_id (реальным отправителем ЭТОГО
+        события, а не тем, что мог бы нести сам callback_data, если бы там
+        был чей-то id — его там нет и не должно быть, см.
+        reader/public_bot/keyboards.py).
 
         Ветвится на self-service/delegated-с-клиентом/delegated-без-клиента
         по содержимому payload (owner_username / no_client — см.
@@ -2031,15 +2048,8 @@ class ConversationController:
         STEP_AWAITING_OWNER_USERNAME или payload["no_client"] — быть
         trusted, см. _handle_car_number_input/handle_add_client_decision),
         этого достаточно."""
-        if days not in PERIOD_CHOICES:
-            return None
-
-        state = self._states.get(chat_id)
-        if (
-            state is None
-            or state.step != STEP_AWAITING_PERIOD
-            or state.telegram_user_id != telegram_user_id
-        ):
+        state = self._owned_add_car_confirm_state(chat_id, telegram_user_id)
+        if state is None:
             return None
 
         payload = state.payload or {}
@@ -2056,7 +2066,7 @@ class ConversationController:
 
         if not car_number or not (owner_username or no_client or is_self_service):
             # Не должно происходить штатно (payload всегда заполняется к
-            # моменту STEP_AWAITING_PERIOD) — но не падаем молча, если
+            # моменту STEP_AWAITING_ADD_CONFIRM) — но не падаем молча, если
             # состояние всё же оказалось повреждено/устарело.
             self._clear_state(chat_id)
             return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
@@ -2065,24 +2075,33 @@ class ConversationController:
 
         if no_client:
             return await self._complete_delegated_add_car_without_client(
-                car_number=car_number, days=days, today=today,
+                car_number=car_number, today=today,
                 chat_id=chat_id, telegram_user_id=telegram_user_id,
             )
 
         if owner_username:
             return await self._complete_delegated_add_car(
-                car_number=car_number, owner_username=owner_username, days=days, today=today,
+                car_number=car_number, owner_username=owner_username, today=today,
                 chat_id=chat_id, telegram_user_id=telegram_user_id,
             )
 
         return await self._complete_self_add_car(
-            car_number=car_number, username=username, days=days, today=today,
+            car_number=car_number, username=username, today=today,
             chat_id=chat_id, telegram_user_id=telegram_user_id,
             first_name=first_name, last_name=last_name,
         )
 
+    def handle_add_car_cancel(self, *, chat_id: int, telegram_user_id: int) -> BotReply | None:
+        """"Отмена" на подтверждении Add Car — ничего не создаёт, диалог
+        сбрасывается. None — та же server-side проверка, что и у
+        handle_add_car_confirm (чужой/устаревший диалог не трогаем)."""
+        if self._owned_add_car_confirm_state(chat_id, telegram_user_id) is None:
+            return None
+        self._clear_state(chat_id)
+        return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
+
     async def _complete_self_add_car(
-        self, *, car_number, username, days, today, chat_id, telegram_user_id, first_name, last_name,
+        self, *, car_number, username, today, chat_id, telegram_user_id, first_name, last_name,
     ) -> BotReply:
         outcome = await self._subscriptions.add_car(
             telegram_user_id=telegram_user_id,
@@ -2091,7 +2110,6 @@ class ConversationController:
             first_name=first_name,
             last_name=last_name,
             car_number=car_number,
-            period_days=days,
             today=today,
         )
         self._clear_state(chat_id)
@@ -2136,8 +2154,6 @@ class ConversationController:
         return BotReply(
             text=texts.format_add_car_summary(
                 car_number=car_number,
-                start_date=outcome.subscription.start_date,
-                end_date=outcome.subscription.end_date,
                 check_ok=outcome.check_ok,
                 new_fines_count=outcome.new_fines_count,
                 provider_unavailable=outcome.provider_unavailable,
@@ -2158,7 +2174,7 @@ class ConversationController:
         ]]
 
     async def _complete_delegated_add_car(
-        self, *, car_number, owner_username, days, today, chat_id, telegram_user_id,
+        self, *, car_number, owner_username, today, chat_id, telegram_user_id,
     ) -> BotReply:
         try:
             outcome = await self._subscriptions.add_delegated_car(
@@ -2166,7 +2182,6 @@ class ConversationController:
                 created_by_telegram_chat_id=chat_id,
                 owner_username=owner_username,
                 car_number=car_number,
-                period_days=days,
                 today=today,
             )
         except OwnerResolutionError:
@@ -2179,8 +2194,6 @@ class ConversationController:
             text=texts.format_delegated_add_car_summary(
                 car_number=car_number,
                 owner_username=owner_username,
-                start_date=outcome.subscription.start_date,
-                end_date=outcome.subscription.end_date,
                 check_ok=outcome.check_ok,
                 new_fines_count=outcome.new_fines_count,
                 pending_claim=outcome.pending_claim,
@@ -2189,13 +2202,12 @@ class ConversationController:
         )
 
     async def _complete_delegated_add_car_without_client(
-        self, *, car_number, days, today, chat_id, telegram_user_id,
+        self, *, car_number, today, chat_id, telegram_user_id,
     ) -> BotReply:
         outcome = await self._subscriptions.add_delegated_car_without_client(
             created_by_telegram_user_id=telegram_user_id,
             created_by_telegram_chat_id=chat_id,
             car_number=car_number,
-            period_days=days,
             today=today,
         )
         self._clear_state(chat_id)
@@ -2203,8 +2215,6 @@ class ConversationController:
         return BotReply(
             text=texts.format_delegated_add_car_without_client_summary(
                 car_number=car_number,
-                start_date=outcome.task.start_date,
-                end_date=outcome.task.end_date,
                 check_ok=outcome.check_ok,
                 new_fines_count=outcome.new_fines_count,
             )
@@ -2224,29 +2234,11 @@ class ConversationController:
         ИСКЛЮЧИТЕЛЬНО через запрос к БД по РЕАЛЬНОМУ event.sender_id, а не
         через факт валидности id.
 
-        ИСТЁК (см. задачу "align Georgia user check-now flow",
-        production-пример O127PX62: раньше такая подписка просто не
-        попадала в picker вовсе, см. SubscriptionService.
-        list_actionable_subscriptions) — ВМЕСТО немедленного check
-        показывает informative-карточку (см. texts.
-        format_my_car_inactive_card/keyboards.py::my_car_inactive_keyboard).
-        ON/OFF — ПРЕЖНЕЕ поведение, НЕ тронуто (см. design report "Check
-        Now должен работать даже если OFF" — немедленный live check,
-        просто как раньше)."""
-        subscription = self._subscriptions.get_actionable_subscription(
-            subscription_id, telegram_user_id=telegram_user_id,
-        )
-        if subscription is None:
-            return None
-
-        today = self._today()
-        _, monitoring_state = texts.car_monitoring_state(subscription, today)
-        if monitoring_state == "ИСТЁК":
-            return BotReply(
-                text=texts.format_my_car_inactive_card(subscription, today=today),
-                my_car_inactive_id=subscription.id,
-            )
-
+        Немедленный live check в любом состоянии (см. design report "Check
+        Now должен работать даже если OFF"). Отдельной карточки "срок
+        истёк" больше нет (см. задачу "убрать выбор срока мониторинга") —
+        подписка с истёкшим до перехода на бессрочный мониторинг сроком
+        для пользователя такая же OFF, как и любая другая."""
         outcome = await self._subscriptions.check_now(
             subscription_id, telegram_user_id=telegram_user_id, on_check_started=on_check_started,
         )
@@ -2267,9 +2259,10 @@ class ConversationController:
         self, subscription_id: int, *, telegram_user_id: int,
         on_check_started: Callable[[], Awaitable[None]] | None = None,
     ) -> BotReply | None:
-        """"🔎 Проверить разово" на ИСТЁК-карточке (см. keyboards.py::
-        my_car_inactive_keyboard, задача "align Georgia user check-now
-        flow") — РЕАЛЬНЫЙ live check через ТОТ ЖЕ SubscriptionService.
+        """"🔎 Проверить разово" на прежней карточке "срок истёк" (см.
+        задачу "align Georgia user check-now flow"; саму карточку бот больше
+        не показывает — см. handle_check_now_choice, — но её кнопки остались
+        в истории чатов) — РЕАЛЬНЫЙ live check через ТОТ ЖЕ SubscriptionService.
         check_now(), что и обычный ON/OFF путь выше — никакой отдельной
         реализации проверки. check_now() -> FineCheckService.check_task()
         не меняет status/start_date/end_date задачи или подписки (см.
@@ -2290,37 +2283,6 @@ class ConversationController:
         if outcome is CHECK_ALREADY_IN_PROGRESS:
             return CHECK_ALREADY_IN_PROGRESS
         return self._format_check_now_outcome_reply(outcome)
-
-    def handle_my_car_resume_prompt(
-        self, subscription_id: int, *, chat_id: int, telegram_user_id: int, username: str | None,
-    ) -> BotReply | None:
-        """"▶️ Продолжить мониторинг" на ИСТЁК-карточке (см. keyboards.py::
-        my_car_inactive_keyboard, задача "align Georgia user check-now
-        flow") — переиспользует ТОТ ЖЕ period-picker (PERIOD_CHOICES) и ту
-        же завершающую бизнес-логику (handle_period_choice ->
-        _complete_self_add_car -> SubscriptionService.add_car), что и
-        "➕ Добавить авто" для нового номера (см. _handle_car_number_input) —
-        car_number уже известен из существующей подписки, поэтому шаг
-        ввода номера пропускается, сразу STEP_AWAITING_PERIOD с тем же
-        payload-форматом ({"car_number", "username"} — is_self_service-
-        ветка handle_period_choice отличает self-service по наличию ключа
-        "username" в payload, см. его докстрок). add_car() сам обнаружит
-        СУЩЕСТВУЮЩУЮ задачу на этот car_number и продлит её — новой задачи
-        не создаст (см. test_add_car_reuses_and_extends_existing_client_
-        bot_task), никакой параллельной бизнес-логики здесь нет.
-
-        None — не владелец/создатель подписки, ИЛИ подписка не существует."""
-        subscription = self._subscriptions.get_actionable_subscription(
-            subscription_id, telegram_user_id=telegram_user_id,
-        )
-        if subscription is None:
-            return None
-
-        self._states.set(
-            chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_PERIOD,
-            payload={"car_number": subscription.car_number, "username": username},
-        )
-        return BotReply(text=texts.PERIOD_PROMPT, show_period_buttons=True)
 
     def handle_stop_cancel(self) -> BotReply:
         """"Отмена" на ⛔-подтверждении — ОБЩАЯ и для trusted task-level
@@ -2473,18 +2435,18 @@ class ConversationController:
         return self._format_car_detail_reply(subscription, page)
 
     # ---- manager-facing "📋 Мои авто" ON/OFF + "▶️ Продолжить мониторинг"
-    # 15/30/90 дней (см. design report про per-car monitoring toggle) —
-    # task-level, ПРЯМО как ⚪/⛔ ниже (fine_monitoring_tasks, subscription
-    # НЕ требуется), is_trusted() перепроверяется ЗАНОВО на каждом шаге по
-    # РЕАЛЬНОМУ telegram_user_id — task_id/days/page в callback_data
-    # публичны и НЕ являются доказательством авторизации сами по себе. ----
+    # (см. design report про per-car monitoring toggle) — task-level, ПРЯМО
+    # как ⚪/⛔ ниже (fine_monitoring_tasks, subscription НЕ требуется),
+    # is_trusted() перепроверяется ЗАНОВО на каждом шаге по РЕАЛЬНОМУ
+    # telegram_user_id — task_id/page в callback_data публичны и НЕ являются
+    # доказательством авторизации сами по себе. ----
 
     def handle_trusted_task_open(
         self, task_id: int, page: int, *, telegram_user_id: int,
     ) -> BotReply | None:
         """Кнопка-номер машины в списке (см. design report про
         переработку "📋 Мои авто" в чистую inline keyboard) — открывает
-        карточку ЭТОЙ машины (период/последняя проверка/ON-OFF, см.
+        карточку ЭТОЙ машины (последняя проверка/ON-OFF, см.
         texts.format_trusted_task_detail) — та же информация, что раньше
         была видна прямо в списке текстом, теперь ТОЛЬКО здесь. Ничего не
         меняет, чисто read-only экран. None — не trusted, ИЛИ задача не
@@ -2512,10 +2474,7 @@ class ConversationController:
             выключения;
           - задача уже OFF — ничего не меняет, просто показывает тот же
             экран (см. design report п.2: "⚪ OFF открывает следующий
-            экран") — ЭТО ЖЕ переиспользуется как "⬅️ Назад" с экрана
-            выбора 15/30/90 (см. keyboards.py::
-            trusted_task_period_choice_keyboard — там кнопка "⬅️ Назад"
-            кодирует ровно этот же callback).
+            экран").
 
         None — не trusted, ИЛИ задача с таким task_id не существует вовсе
         (см. SubscriptionService.get_task_for_trusted_admin — в отличие от
@@ -2547,10 +2506,19 @@ class ConversationController:
         self, task_id: int, page: int, *, telegram_user_id: int,
     ) -> BotReply | None:
         """"▶️ Продолжить мониторинг" на экране OFF-детали (см. design
-        report) — показывает выбор срока 15/30/90 дней, ЕЩЁ НИЧЕГО не
-        меняет (тот же принцип, что и у handle_my_car_delete_prompt:
-        промежуточный экран перед реальным действием). None — не trusted,
-        ИЛИ задача не существует."""
+        report) — включает мониторинг ИМЕННО этой задачи бессрочно (см.
+        задачу "убрать выбор срока мониторинга": экрана выбора 15/30/90
+        дней больше нет; SubscriptionService.resume_task_for_trusted_admin —
+        тот же return_to_active_monitoring(), что и у архивных задач), затем
+        возвращает менеджера в ОБНОВЛЁННОЕ "📋 Мои авто" (та же page, см.
+        design report: "После этого вернуть менеджера в 📋 Мои авто") с
+        подтверждением ПЕРЕД списком — тот же принцип "подтверждение +
+        сразу обновлённый список в одном экране", что и у
+        handle_my_car_turn_off/on (подтверждение + карточка). Старые кнопки
+        выбора срока из истории чата ведут сюда же (см. handlers.py и
+        keyboards.py::decode_legacy_trusted_task_period_callback).
+
+        None — не trusted, ИЛИ задача не существует."""
         if not self._is_trusted(telegram_user_id):
             return None
 
@@ -2558,45 +2526,11 @@ class ConversationController:
         if task is None:
             return None
 
-        return BotReply(
-            text=texts.TRUSTED_TASK_PERIOD_PROMPT,
-            trusted_task_period_id=task.id, trusted_task_period_page=page,
-        )
-
-    def handle_trusted_task_period_choice(
-        self, task_id: int, days: int, page: int, *, telegram_user_id: int,
-    ) -> BotReply | None:
-        """Финальный шаг — 15/30/90 дней (см. design report,
-        TRUSTED_TASK_PERIOD_CHOICES): включает мониторинг ИМЕННО этой
-        задачи на выбранный срок (см. SubscriptionService.resume_task_for_
-        trusted_admin — тот же return_to_active_monitoring(), что и у
-        архивных задач, никакой отдельной реализации), затем возвращает
-        менеджера в ОБНОВЛЁННОЕ "📋 Мои авто" (та же page, см. design
-        report: "После этого вернуть менеджера в 📋 Мои авто") с
-        подтверждением ПЕРЕД списком — тот же принцип "подтверждение +
-        сразу обновлённый список в одном экране", что и у
-        handle_my_car_turn_off/on (подтверждение + карточка), только здесь
-        подтверждение + список, а не подтверждение + карточка.
-
-        None — не trusted, ИЛИ days не входит в TRUSTED_TASK_PERIOD_CHOICES
-        (defensive — keyboards.py::decode_trusted_task_period_callback уже
-        не пропускает произвольные значения, но проверяется и здесь, тот
-        же принцип "allowlist, не любое целое число", что и у
-        decode_period_callback)."""
-        if not self._is_trusted(telegram_user_id):
-            return None
-        if days not in TRUSTED_TASK_PERIOD_CHOICES:
-            return None
-
-        resumed = self._subscriptions.resume_task_for_trusted_admin(
-            task_id, days=days, today=self._today(),
-        )
+        resumed = self._subscriptions.resume_task_for_trusted_admin(task_id, today=self._today())
         if resumed is None:
             return BotReply(text=texts.CAR_ACTION_FAILED_TEXT, show_main_menu=True)
 
-        confirmation = texts.format_trusted_task_resume_success(
-            resumed.car_number, days, resumed.end_date,
-        )
+        confirmation = texts.format_trusted_task_resume_success(resumed.car_number)
         list_reply = self._format_trusted_tasks_page_reply(page)
         return BotReply(
             text=confirmation + "\n\n" + list_reply.text,

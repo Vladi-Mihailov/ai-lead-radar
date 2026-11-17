@@ -7,7 +7,12 @@ Trusted/admin-only screens (format_trusted_task_detail, format_stop_success,
 format_delegated_add_car_summary, "▶️ Продолжить мониторинг" resume flow,
 MANUAL_BOOTSTRAP_*, etc.) are explicitly out of scope for this task (see its
 own "Do NOT blindly rename internal/admin/debug terminology" requirement)
-and are deliberately NOT touched or asserted against here."""
+and are deliberately NOT touched or asserted against here.
+
+Исключение (задача "убрать выбор срока мониторинга"): карточка автомобиля
+(format_car_details) по явному требованию показывает статус "🟢 Мониторинг
+активен"/"⚪ Мониторинг выключен" вместо даты окончания — эта строка
+статуса единственное место карточки со словом "мониторинг"."""
 
 import sys
 from datetime import date, datetime, timezone
@@ -30,6 +35,8 @@ from reader.public_bot.keyboards import (  # noqa: E402
 from reader.public_bot.models import FineMonitoringSubscription  # noqa: E402
 from reader.public_bot.texts import (  # noqa: E402
     DELETE_CAR_BUTTON_LABEL,
+    MONITORING_ACTIVE_LINE,
+    MONITORING_OFF_LINE,
     TURN_OFF_BUTTON_LABEL,
     TURN_ON_BUTTON_LABEL,
     format_car_details,
@@ -86,18 +93,13 @@ def test_car_detail_keyboard_on_shows_disable_notifications_button():
     assert TURN_ON_BUTTON_LABEL not in _labels(rows)
 
 
-def test_car_detail_keyboard_expired_shows_neither_toggle_button():
-    """ИСТЁК has no active ON/OFF toggle (reactivation needs a new period,
-    see car_detail_keyboard's own docstring) -- unaffected by this task."""
-    rows = car_detail_keyboard(1, monitoring_state="ИСТЁК", page=0)
-    labels = _labels(rows)
-    assert TURN_ON_BUTTON_LABEL not in labels
-    assert TURN_OFF_BUTTON_LABEL not in labels
-    assert DELETE_CAR_BUTTON_LABEL in labels
+def test_car_detail_keyboard_off_also_offers_delete():
+    rows = car_detail_keyboard(1, monitoring_state="OFF", page=0)
+    assert DELETE_CAR_BUTTON_LABEL in _labels(rows)
 
 
 def test_car_detail_keyboard_always_offers_check_now():
-    for state in ("ON", "OFF", "ИСТЁК"):
+    for state in ("ON", "OFF"):
         assert CHECK_NOW_LABEL in _labels(car_detail_keyboard(1, monitoring_state=state, page=0))
 
 
@@ -118,32 +120,48 @@ def test_turn_on_off_callback_data_round_trips_unchanged():
 
 # ---- 2. vehicle detail explanation ----
 
+def _without_status_line(text: str) -> str:
+    """Карточка без строки статуса мониторинга (см. модульный докстрок —
+    единственное разрешённое место со словом "мониторинг")."""
+    return text.replace(MONITORING_ACTIVE_LINE, "").replace(MONITORING_OFF_LINE, "")
+
+
 def test_car_details_on_distinguishes_check_now_from_future_notifications():
     text = format_car_details(_subscription(status="active", end_date=date(2026, 12, 1)), _TODAY)
-    assert "мониторинг" not in text.lower()
+    assert "мониторинг" not in _without_status_line(text).lower()
     assert "все неоплаченные штрафы" in text  # 🔎 Проверить штрафы: current unpaid fines
     assert "выписанные ранее" in text  # no fake "paid fines archive" implied, see banned list below
     assert "появятся новые штрафы" in text  # 🔔 Уведомления: future new fines
     assert "включены" in text
+    # Вместо даты окончания — статус (см. задачу "убрать выбор срока мониторинга").
+    assert text.endswith(MONITORING_ACTIVE_LINE)
+    assert "01.12.2026" not in text
     for banned in ("вся история штрафов", "все штрафы за всё время", "старые штрафы", "история штрафов", "штрафы за прошлый период"):
         assert banned not in text.lower()
 
 
 def test_car_details_off_distinguishes_check_now_from_future_notifications():
     text = format_car_details(_subscription(status="stopped", end_date=date(2026, 12, 1)), _TODAY)
-    assert "мониторинг" not in text.lower()
+    assert "мониторинг" not in _without_status_line(text).lower()
     assert "все неоплаченные штрафы" in text
     assert "выписанные ранее" in text
     assert "выключены" in text
+    assert text.endswith(MONITORING_OFF_LINE)
+    assert "01.12.2026" not in text
     for banned in ("вся история штрафов", "все штрафы за всё время", "старые штрафы", "история штрафов", "штрафы за прошлый период"):
         assert banned not in text.lower()
 
 
-def test_car_details_expired_has_no_on_off_claim():
-    text = format_car_details(_subscription(status="active", end_date=date(2026, 1, 1)), _TODAY)
-    assert "мониторинг" not in text.lower()
-    assert "включены" not in text and "выключены" not in text
-    assert "⏱" in text
+@pytest.mark.parametrize("status", ["active", "expired"])
+def test_car_details_legacy_expired_shows_off_without_date(status):
+    """Срок истёк до перехода на бессрочный мониторинг — для пользователя
+    это просто выключенный автомобиль: ни "⏱ Период закончился", ни
+    даты."""
+    text = format_car_details(_subscription(status=status, end_date=date(2026, 1, 1)), _TODAY)
+    assert "выключены" in text
+    assert text.endswith(MONITORING_OFF_LINE)
+    assert "⏱" not in text
+    assert "01.01.2026" not in text
 
 
 def test_car_details_plate_is_dynamic():

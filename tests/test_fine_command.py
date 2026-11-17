@@ -22,7 +22,7 @@ from reader.commands.base import CommandContext, CommandError  # noqa: E402
 from reader.commands.fine import FineCommand  # noqa: E402
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
-from reader.fines.models import CarFineStats, ParsedFineRecord  # noqa: E402
+from reader.fines.models import UNLIMITED_END_DATE, CarFineStats, ParsedFineRecord  # noqa: E402
 from reader.fines.notification_coordinator import FineNotificationCoordinator  # noqa: E402
 from reader.fines.provider import FineProvider, FineProviderError  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
@@ -1652,6 +1652,21 @@ async def test_fine_list_with_tasks(fx):
     assert "01.08.2026–31.08.2026" in result.text
     # Внутренний ID задачи — деталь реализации БД, оператору не нужен.
     assert "ID" not in result.text
+
+
+async def test_fine_list_shows_unlimited_bot_task_as_open_ended(fx):
+    """Задачи @GEShtrafbot бессрочные (см. задачу "убрать выбор срока
+    мониторинга", reader/fines/models.py::UNLIMITED_END_DATE) — оператор
+    видит "бессрочно", а не служебную дату 31.12.9999."""
+    fx.task_repository.create(
+        car_number="AA001AA", label=None, start_date=date(2026, 11, 17), end_date=UNLIMITED_END_DATE,
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID, monitoring_scope="client_bot",
+    )
+
+    result = await fx.command.handle(_ctx(["list"]))
+
+    assert "Период: 17.11.2026–бессрочно" in result.text
+    assert "9999" not in result.text
 
 
 async def test_fine_list_with_no_tasks(fx):

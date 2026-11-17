@@ -13,6 +13,19 @@ FineTaskStatus = Literal["active", "completed", "stopped"]
 # FineMonitoringTaskRepository.ensure_operator_scope), обратно — никогда.
 FineMonitoringScope = Literal["operator", "client_bot"]
 
+# Бессрочный мониторинг Грузии (см. задачу "убрать выбор срока
+# мониторинга"): end_date у fine_monitoring_tasks и
+# fine_monitoring_subscriptions — NOT NULL, поэтому "без конечного срока"
+# хранится как дата, которая никогда не наступит. Все существующие выборки
+# (end_date >= today), FineJob и expire_elapsed() работают с ней без
+# изменений — такая задача/подписка просто никогда не истекает. Наружу эта
+# дата не показывается (см. is_unlimited_end_date).
+UNLIMITED_END_DATE = date(9999, 12, 31)
+
+
+def is_unlimited_end_date(value: date) -> bool:
+    return value >= UNLIMITED_END_DATE
+
 
 @dataclass(frozen=True)
 class FineMonitoringTask:
