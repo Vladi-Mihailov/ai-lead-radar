@@ -2,15 +2,14 @@
 Repository, без сети. Полностью детерминированы, тестируются напрямую.
 """
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 import re
 
-from reader.fines.models import FineMonitoringTask
+from reader.fines.models import UNLIMITED_END_DATE, FineMonitoringTask
 
 _CAR_NUMBER_RE = re.compile(r"^[A-Z0-9]+$")
 _DATE_FORMAT = "%d.%m.%Y"
 _DATE_FORMAT_HINT = "DD.MM.YYYY"
-_DEFAULT_PERIOD_DAYS = 30
 
 # Визуальное соответствие кириллических букв на российских гос. номерах их
 # латинским аналогам (см. design report "исправить Georgian bot: госномер
@@ -117,11 +116,14 @@ def resolve_monitoring_period(
     *,
     today: date,
 ) -> tuple[date, date]:
-    """Обе даты не заданы — период по умолчанию (today..today+30). Заданы
-    обе — парсим и проверяем, что end не раньше start. Задана только одна —
-    ошибка (нет смысла молча достраивать вторую)."""
+    """Обе даты не заданы — бессрочный мониторинг с сегодняшнего дня
+    (today..UNLIMITED_END_DATE, см. задачу "убрать выбор срока
+    мониторинга": мониторинг Грузии без конечного срока, пока его не
+    остановят явно). Заданы обе — парсим и проверяем, что end не раньше
+    start. Задана только одна — ошибка (нет смысла молча достраивать
+    вторую)."""
     if start_raw is None and end_raw is None:
-        return today, today + timedelta(days=_DEFAULT_PERIOD_DAYS)
+        return today, UNLIMITED_END_DATE
 
     if start_raw is None or end_raw is None:
         raise FineValidationError("Укажите обе даты (START_DATE и END_DATE) или ни одной")

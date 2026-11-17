@@ -1,10 +1,11 @@
 """Telethon-клавиатуры/callback_data @GEShtrafbot.
 
 Security-инвариант (см. design report и reader/public_bot/conversation.py):
-callback_data периода несёт ТОЛЬКО выбранное значение (b"period:30" и
-т.п.) — никакого telegram_user_id/task_id. Владение и идентичность
+callback_data подтверждения Add Car (b"addcar:yes:{номер}"/b"addcar:no:{номер}")
+не несёт никакого telegram_user_id/task_id — номер только отсекает
+устаревшую кнопку под вопросом про другой номер. Владение и идентичность
 проверяются ИСКЛЮЧИТЕЛЬНО через event.sender_id + conversation_state (см.
-ConversationController.handle_period_choice) — callback_data сам по себе
+ConversationController.handle_add_car_confirm) — callback_data сам по себе
 не является доказательством ничего, кроме "какая кнопка была нажата"
 (пользователь может переслать сообщение с кнопкой в свой собственный чат с
 ботом или его callback_data теоретически может быть воспроизведён — но это
@@ -30,13 +31,11 @@ page в my-car-* callback'ах — ТОЛЬКО для навигации (ку�
 идентификатор ресурса и не доказательство чего-либо.
 """
 
-from datetime import date
-
 from telethon import Button
 
 from reader.protocol_support.texts import OPERATOR_LABEL
-from reader.public_bot.conversation import PERIOD_CHOICES, TRUSTED_TASK_PERIOD_CHOICES
 from reader.public_bot.texts import (
+    ADD_CAR_CONFIRM_LABEL,
     ADD_CAR_LABEL,
     BACK_BUTTON_LABEL,
     CANCEL_BUTTON_LABEL,
@@ -63,11 +62,23 @@ from reader.public_bot.texts import (
     TURN_ON_BUTTON_LABEL,
 )
 
-_PERIOD_PREFIX = b"period:"
 _CHECK_NOW_PREFIX = b"checknow:"
 STOP_NO = b"stopno"
 _ADD_CLIENT_YES = b"addclient:yes"
 _ADD_CLIENT_NO = b"addclient:no"
+# Подтверждение Add Car (см. задачу "убрать выбор срока мониторинга") —
+# вместо выбора срока. Без id: что подтверждается, решает conversation_state;
+# номер из вопроса (ascii, через _encode_plate) лишь должен с ним совпасть.
+_ADD_CAR_CONFIRM_YES_PREFIX = b"addcar:yes:"
+_ADD_CAR_CONFIRM_NO_PREFIX = b"addcar:no:"
+# Кнопки выбора срока, которые бот больше не показывает, но которые
+# остались в истории чатов (см. is_legacy_period_callback/
+# decode_legacy_trusted_task_period_callback) — принимаются ТОЛЬКО с теми
+# значениями, что бот когда-либо отправлял (allowlist).
+_LEGACY_PERIOD_PREFIX = b"period:"
+_LEGACY_PERIOD_CHOICES = (30, 90, 180, 365)
+_LEGACY_TRUSTED_TASK_PERIOD_PREFIX = b"ttaskperiod:"
+_LEGACY_TRUSTED_TASK_PERIOD_CHOICES = (15, 30, 90)
 # Trusted-operator task-level admin (см. design report: пересмотр
 # архитектуры) — task_id вместо subscription_id, отдельные префиксы, чтобы
 # НИКОГДА не перепутать с subscription-based callback'ами выше (см.
@@ -90,7 +101,6 @@ _TRUSTED_TASKS_PAGE_PREFIX = b"ttaskspage:"
 _TRUSTED_TASK_OPEN_PREFIX = b"ttaskopen:"
 _TRUSTED_TASK_TOGGLE_PREFIX = b"ttasktoggle:"
 _TRUSTED_TASK_CONTINUE_PREFIX = b"ttaskcontinue:"
-_TRUSTED_TASK_PERIOD_PREFIX = b"ttaskperiod:"
 # "🔎 Проверить разово" на карточке "мониторинг завершён/выключен" (см.
 # задачу "expired Georgia Check Now UX") — ОТДЕЛЬНЫЙ префикс от
 # _CHECK_NOW_PREFIX (тот — subscription-id self-service, этот — task-id
@@ -112,11 +122,12 @@ _MY_CAR_TURN_OFF_PREFIX = b"mycaroff:"
 _MY_CAR_DELETE_PREFIX = b"mycardel:"
 _MY_CAR_DELETE_YES_PREFIX = b"mycardelyes:"
 _MY_CAR_DELETE_NO_PREFIX = b"mycardelno:"
-# ИСТЁК-карточка обычного пользователя (см. задачу "align Georgia user
-# check-now flow", O127PX62) — ОТДЕЛЬНЫЕ от _CHECK_NOW_PREFIX (тот всегда
-# делает немедленный check для ON/OFF, см. design report "Check Now
-# должен работать даже если OFF"); эти два — ТОЛЬКО с informative-карточки
-# ИСТЁК, разные data model/назначение.
+# Кнопки прежней карточки "срок истёк" обычного пользователя (см. задачу
+# "align Georgia user check-now flow", O127PX62). Саму карточку бот больше
+# не показывает (срока нет, см. задачу "убрать выбор срока мониторинга"),
+# но её кнопки остались в истории чатов: "🔎 Проверить разово" — живой
+# check, "▶️ Продолжить мониторинг" — то же, что "🔔 Включить уведомления"
+# (см. handlers.py).
 _MY_CAR_CHECK_NOW_ONCE_PREFIX = b"mycarchecknowonce:"
 _MY_CAR_RESUME_PREFIX = b"mycarresume:"
 
@@ -204,23 +215,31 @@ def decode_add_client_decision_callback(data: bytes | None) -> bool | None:
     return None
 
 
-def period_choice_keyboard() -> list[list[Button]]:
-    buttons = [
-        Button.inline(f"{days} дней", encode_period_callback(days)) for days in PERIOD_CHOICES
-    ]
-    # 2x2 — ровно как в макете задачи ([30][90] / [180][365]).
-    return [buttons[0:2], buttons[2:4]]
+def add_car_confirm_keyboard(car_number: str) -> list[list[Button]]:
+    return [[
+        Button.inline(ADD_CAR_CONFIRM_LABEL, _encode_plate(_ADD_CAR_CONFIRM_YES_PREFIX, car_number)),
+        Button.inline(CANCEL_BUTTON_LABEL, _encode_plate(_ADD_CAR_CONFIRM_NO_PREFIX, car_number)),
+    ]]
 
 
-def encode_period_callback(days: int) -> bytes:
-    return _PERIOD_PREFIX + str(days).encode("ascii")
+def decode_add_car_confirm_callback(data: bytes | None) -> tuple[bool, str] | None:
+    """(True, номер) — "✅ Добавить", (False, номер) — "Отмена", None —
+    этот callback_data не про подтверждение Add Car."""
+    car_number = _decode_plate(data, _ADD_CAR_CONFIRM_YES_PREFIX)
+    if car_number is not None:
+        return True, car_number
+    car_number = _decode_plate(data, _ADD_CAR_CONFIRM_NO_PREFIX)
+    if car_number is not None:
+        return False, car_number
+    return None
 
 
-def decode_period_callback(data: bytes | None) -> int | None:
-    """None для чего угодно, кроме РОВНО одного значения из PERIOD_CHOICES —
-    намеренно не парсит произвольные числа из чужого/подделанного
-    callback_data (allowlist, а не "любое целое число")."""
-    return _decode_id(data, _PERIOD_PREFIX, allowlist=PERIOD_CHOICES)
+def is_legacy_period_callback(data: bytes | None) -> bool:
+    """Старая кнопка выбора срока Add Car ("30 дней" и т.п.) из истории
+    чата — срок больше не выбирается, такое нажатие работает как "✅
+    Добавить" (см. handlers.py). Только значения, которые бот когда-либо
+    отправлял (allowlist, а не "любое целое число")."""
+    return _decode_id(data, _LEGACY_PERIOD_PREFIX, allowlist=_LEGACY_PERIOD_CHOICES) is not None
 
 
 def _decode_id(data: bytes | None, prefix: bytes, *, allowlist: tuple[int, ...] | None = None) -> int | None:
@@ -345,22 +364,6 @@ def decode_my_car_resume_callback(data: bytes | None) -> int | None:
     return _decode_id(data, _MY_CAR_RESUME_PREFIX)
 
 
-def my_car_inactive_keyboard(subscription_id: int) -> list[list[Button]]:
-    """ИСТЁК-карточка обычного пользователя (см. задачу "align Georgia
-    user check-now flow", production-пример O127PX62) — показывается
-    вместо немедленного check, когда выбранная через "🔎 Проверить
-    сейчас" подписка оказалась просроченной (см.
-    ConversationController.handle_check_now_choice/texts.
-    format_my_car_inactive_card). "⬅️ Назад" ведёт на первую страницу
-    "📋 Мои авто" (page=0: эта карточка открыта НЕ со страницы списка,
-    поэтому "вернуться на ту же page" неприменимо)."""
-    return [
-        [Button.inline("🔎 Проверить разово", encode_my_car_check_now_once_callback(subscription_id))],
-        [Button.inline("▶️ Продолжить мониторинг", encode_my_car_resume_callback(subscription_id))],
-        [Button.inline(BACK_BUTTON_LABEL, encode_my_cars_page_callback(0))],
-    ]
-
-
 def my_cars_page_keyboard(
     cars: list[tuple[int, str]], *, page: int, total_pages: int,
 ) -> list[list[Button]]:
@@ -389,12 +392,11 @@ def my_cars_page_keyboard(
 def car_detail_keyboard(
     subscription_id: int, *, monitoring_state: str, page: int,
 ) -> list[list[Button]]:
-    """monitoring_state — "ON"/"OFF"/"ИСТЁК" (см.
-    texts.car_monitoring_state) — определяет, какую кнопку-переключатель
-    показать: ON -> "⏸ Выключить", OFF -> "▶️ Включить"; для "ИСТЁК" —
-    БЕЗ переключателя вовсе (см. design report: реактивация истёкшей
-    подписки — не простой toggle, требует нового периода через "➕
-    Добавить авто", а не одну кнопку здесь). 🔎 Проверить сейчас
+    """monitoring_state — "ON"/"OFF" (см. texts.car_monitoring_state) —
+    определяет, какую кнопку-переключатель показать: ON -> "🔕 Отключить
+    уведомления", OFF -> "🔔 Включить уведомления" (в т.ч. для подписки,
+    чей срок истёк до перехода на бессрочный мониторинг — см.
+    SubscriptionService.turn_on_car). 🔎 Проверить сейчас
     переиспользует ТОТ ЖЕ callback/handler, что и обычный picker (см.
     _CHECK_NOW_PREFIX/decode_check_now_callback/handle_check_now_choice) —
     работает независимо от ON/OFF (см. design report: "Check Now должен
@@ -474,55 +476,45 @@ def decode_trusted_check_now_once_callback(data: bytes | None) -> int | None:
     return _decode_id(data, _TRUSTED_CHECK_NOW_ONCE_PREFIX)
 
 
-def encode_trusted_task_period_callback(task_id: int, days: int, page: int) -> bytes:
-    return _TRUSTED_TASK_PERIOD_PREFIX + f"{task_id}:{days}:{page}".encode("ascii")
-
-
-def decode_trusted_task_period_callback(data: bytes | None) -> tuple[int, int, int] | None:
-    """(task_id, days, page) — None для чего угодно, кроме РОВНО трёх
-    числовых сегментов с days из TRUSTED_TASK_PERIOD_CHOICES (allowlist,
-    тот же принцип, что и у decode_period_callback — не парсит
-    произвольное число дней из чужого/подделанного callback_data)."""
-    if not data or not data.startswith(_TRUSTED_TASK_PERIOD_PREFIX):
+def decode_legacy_trusted_task_period_callback(data: bytes | None) -> tuple[int, int] | None:
+    """Старая кнопка менеджера "15/30/90 дней" из истории чата —
+    (task_id, page), если callback_data РОВНО "ttaskperiod:{task_id}:{days}:
+    {page}" с days из тех, что бот отправлял (allowlist); иначе None. Срок
+    больше не выбирается — нажатие работает как "▶️ Продолжить мониторинг"
+    (см. handlers.py, ConversationController.handle_trusted_task_continue)."""
+    if not data or not data.startswith(_LEGACY_TRUSTED_TASK_PERIOD_PREFIX):
         return None
-    parts = data[len(_TRUSTED_TASK_PERIOD_PREFIX):].split(b":")
+    parts = data[len(_LEGACY_TRUSTED_TASK_PERIOD_PREFIX):].split(b":")
     if len(parts) != 3:
         return None
     try:
         task_id, days, page = int(parts[0]), int(parts[1]), int(parts[2])
     except ValueError:
         return None
-    if days not in TRUSTED_TASK_PERIOD_CHOICES:
+    if days not in _LEGACY_TRUSTED_TASK_PERIOD_CHOICES:
         return None
-    return task_id, days, page
+    return task_id, page
 
 
-def _format_trusted_task_toggle_label(*, is_on: bool, end_date: date) -> str:
+def _format_trusted_task_toggle_label(*, is_on: bool) -> str:
     """Правая кнопка (см. design report "переделываем строки" — длинный
-    текст в ЛЕВОЙ кнопке обрезался Telegram'ом, период переехал сюда,
-    слова ON/OFF убраны совсем): "🟢 до ДД.ММ" для ON (дата — тот же
-    end_date, что и в карточке машины), просто "⚪" для OFF (см. design
-    report: "Для OFF дату НЕ показывать" — OFF почти всегда означает, что
-    прежний период уже не актуален/скоро выбирается заново через
-    "▶️ Продолжить мониторинг", показывать его здесь как активный было бы
-    вводящим в заблуждение)."""
-    if is_on:
-        return f"🟢 до {end_date.strftime('%d.%m')}"
-    return "⚪"
+    текст в ЛЕВОЙ кнопке обрезался Telegram'ом, слова ON/OFF убраны
+    совсем): "🟢" для ON, "⚪" для OFF. Срока нет (см. задачу "убрать выбор
+    срока мониторинга") — дата окончания больше не показывается."""
+    return "🟢" if is_on else "⚪"
 
 
 def trusted_tasks_page_keyboard(
-    options: list[tuple[int, str, str, bool, date]], *, page: int, total_pages: int,
+    options: list[tuple[int, str, str, bool]], *, page: int, total_pages: int,
 ) -> list[list[Button]]:
     """Manager-facing "📋 Мои авто" (см. design report про per-car
     monitoring toggle + задачу "унифицировать оба интерфейса Georgia/
     Turkey" — [CAR_NUMBER] [@username/—] [STATUS]) — options: (task_id,
-    car_number, owner_display, is_on, end_date), РОВНО ТРИ кнопки на
-    строку:
+    car_number, owner_display, is_on), РОВНО ТРИ кнопки на строку:
 
-    ЛЕВАЯ — car_number (см. design report "переделываем строки" — 🚗 и
-    "· до ДД.ММ" убраны, иначе длинные номера обрезаются Telegram'ом),
-    открывает карточку этой машины (полный период/последняя проверка, см.
+    ЛЕВАЯ — car_number (см. design report "переделываем строки" — 🚗
+    убран, иначе длинные номера обрезаются Telegram'ом), открывает
+    карточку этой машины (статус/последняя проверка, см.
     encode_trusted_task_open_callback/ConversationController.
     handle_trusted_task_open/texts.format_trusted_task_detail).
 
@@ -536,7 +528,7 @@ def trusted_tasks_page_keyboard(
     страницу, не раскрывает никаких дополнительных данных, отдельный
     callback-тип не понадобился).
 
-    ПРАВАЯ — "🟢 до ДД.ММ"/"⚪"-переключатель (см.
+    ПРАВАЯ — "🟢"/"⚪"-переключатель (см.
     _format_trusted_task_toggle_label, encode_trusted_task_toggle_callback)
     — семантика/действие не изменились.
 
@@ -551,11 +543,11 @@ def trusted_tasks_page_keyboard(
             Button.inline(car_number, encode_trusted_task_open_callback(task_id, page)),
             Button.inline(owner_display, encode_trusted_tasks_page_callback(page)),
             Button.inline(
-                _format_trusted_task_toggle_label(is_on=is_on, end_date=end_date),
+                _format_trusted_task_toggle_label(is_on=is_on),
                 encode_trusted_task_toggle_callback(task_id, page),
             ),
         ]
-        for task_id, car_number, owner_display, is_on, end_date in options
+        for task_id, car_number, owner_display, is_on in options
     ]
     if total_pages > 1:
         back_page = max(page - 1, 0)
@@ -582,21 +574,6 @@ def trusted_task_off_keyboard(task_id: int, *, page: int) -> list[list[Button]]:
         [Button.inline(TRUSTED_RESUME_MONITORING_LABEL, encode_trusted_task_continue_callback(task_id, page))],
         [Button.inline(BACK_BUTTON_LABEL, encode_trusted_tasks_page_callback(page))],
     ]
-
-
-def trusted_task_period_choice_keyboard(task_id: int, *, page: int) -> list[list[Button]]:
-    """Выбор срока 15/30/90 дней (см. design report layout — один столбец,
-    НЕ 2x2 grid, как у period_choice_keyboard выше) — "⬅️ Назад"
-    возвращает на экран "▶️ Продолжить мониторинг" (переиспользует
-    encode_trusted_task_toggle_callback — задача там уже OFF, повторное
-    нажатие ничего не меняет, просто заново показывает тот же экран, см.
-    ConversationController.handle_trusted_task_toggle)."""
-    rows = [
-        [Button.inline(f"{days} дней", encode_trusted_task_period_callback(task_id, days, page))]
-        for days in TRUSTED_TASK_PERIOD_CHOICES
-    ]
-    rows.append([Button.inline(BACK_BUTTON_LABEL, encode_trusted_task_toggle_callback(task_id, page))])
-    return rows
 
 
 def trusted_stop_confirm_keyboard(task_id: int, *, label: str) -> list[list[Button]]:
@@ -734,7 +711,7 @@ def encode_search_page_callback(query_type: str, query: str, page: int) -> bytes
 def decode_search_page_callback(data: bytes | None) -> tuple[str, str, int] | None:
     """None для чего угодно, кроме РОВНО трёх сегментов с query_type из
     _SEARCH_QUERY_TYPES (allowlist, тот же принцип, что и у
-    decode_trusted_task_period_callback — не доверяет произвольному
+    decode_legacy_trusted_task_period_callback — не доверяет произвольному
     query_type/пустому query из чужого/подделанного callback_data)."""
     if not data or not data.startswith(_SEARCH_PAGE_PREFIX):
         return None

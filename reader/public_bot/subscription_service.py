@@ -12,7 +12,13 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
 from reader.fines.check_service import FineCheckService
-from reader.fines.models import FineMonitoringTask, NewFineEvent, OneOffCheckResult
+from reader.fines.models import (
+    UNLIMITED_END_DATE,
+    FineMonitoringTask,
+    NewFineEvent,
+    OneOffCheckResult,
+    is_unlimited_end_date,
+)
 from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository
 from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.public_bot.car_owner_sync import sync_user_and_car
@@ -159,9 +165,7 @@ _CLAIM_TOKEN_TTL = timedelta(days=7)
 # stop_task_for_trusted_admin/stop_all_for_task — оба пишут ровно тот же
 # status, различить их по данным невозможно, и по этой же философии оба
 # должны оставлять ручную проверку доступной, см. design decision в
-# рамках этой задачи). end_date всё ещё проверяется отдельно
-# (list_actionable_subscriptions) — просроченный период остаётся
-# исключённым, как и 'archived'.
+# рамках этой задачи). Исключён только 'archived'.
 #
 # ПЕРЕИМЕНОВАНО из _ACTIONABLE_STATUSES (см. задачу: "не расширяй общий
 # _ACTIONABLE_STATUSES, потому что он используется другими flow") — при
@@ -169,7 +173,13 @@ _CLAIM_TOKEN_TTL = timedelta(days=7)
 # ЕДИНСТВЕННЫМ потребителем этой константы во всём проекте (см. отчёт),
 # поэтому переименование на месте не оставляет orphaned-константу и не
 # требует поддерживать две одинаковые.
-_CHECK_NOW_STATUSES = ("active", "pending_claim", "stopped")
+#
+# 'expired' добавлен с переходом на бессрочный мониторинг (см. задачу
+# "убрать выбор срока мониторинга"): подписка, чей срок истёк до этого
+# перехода, для пользователя теперь просто выключенный автомобиль (см.
+# texts.car_monitoring_state) — ручная проверка доступна ей так же, как
+# 'stopped'.
+_CHECK_NOW_STATUSES = ("active", "pending_claim", "stopped", "expired")
 
 
 async def extend_client_bot_task_if_still_needed(
@@ -273,11 +283,12 @@ class SubscriptionService:
         first_name: str | None,
         last_name: str | None,
         car_number: str,
-        period_days: int,
         today: date,
     ) -> AddCarOutcome:
+        # Мониторинг бессрочный (см. reader/fines/models.py::
+        # UNLIMITED_END_DATE) — срок больше не выбирается.
         start_date = today
-        end_date = today + timedelta(days=period_days)
+        end_date = UNLIMITED_END_DATE
 
         # "NEW USER EMERGENCY WORKFLOW" (см. задачу) — ДО создания новой
         # подписки: ЛЮБАЯ строка этого пользователя, любого статуса (та же
@@ -380,7 +391,6 @@ class SubscriptionService:
         created_by_telegram_chat_id: int,
         owner_username: str,
         car_number: str,
-        period_days: int,
         today: date,
     ) -> DelegatedAddCarOutcome:
         """Trusted-оператор ставит автомобиль на мониторинг ДЛЯ ДРУГОГО
@@ -391,7 +401,7 @@ class SubscriptionService:
         созданное состояние); OwnerResolutionError пробрасывается
         вызывающему коду как есть — ничего не создаётся."""
         start_date = today
-        end_date = today + timedelta(days=period_days)
+        end_date = UNLIMITED_END_DATE
 
         resolved = await resolve_owner_username(
             owner_username,
@@ -473,7 +483,6 @@ class SubscriptionService:
         created_by_telegram_user_id: int,
         created_by_telegram_chat_id: int,
         car_number: str,
-        period_days: int,
         today: date,
     ) -> AddCarWithoutClientOutcome:
         """Trusted-оператор ставит машину на мониторинг БЕЗ указания
@@ -497,7 +506,7 @@ class SubscriptionService:
         add_delegated_car() (архитектура уже поддерживает несколько
         подписок на одну машину) — никакой связи/миграции не требуется."""
         start_date = today
-        end_date = today + timedelta(days=period_days)
+        end_date = UNLIMITED_END_DATE
 
         task = self._create_or_extend_task(
             car_number=car_number,
@@ -781,46 +790,89 @@ class SubscriptionService:
         """OFF -> ON — реактивирует СУЩЕСТВУЮЩУЮ подписку (см.
         FineSubscriptionRepository.reactivate), никогда не создаёт вторую.
         None — подписка не найдена/не принадлежит telegram_user_id, она не
-        'stopped' прямо сейчас, либо реактивация не удалась (см.
+        'stopped'/'expired' прямо сейчас, либо реактивация не удалась (см.
         reactivate() — например, гоночный конфликт с уже активной другой
         строкой того же (task, user)).
 
-        Период: если старый end_date ещё не прошёл — просто возобновляем
-        оставшееся оплаченное время без изменений (выключение/включение не
-        должно ни дарить, ни красть дни). Если end_date уже в прошлом
-        (подписка простояла OFF дольше своего исходного периода) — свежий
-        период ТОЙ ЖЕ длины, начиная с today (та же идея, что и у
-        FineMonitoringTaskRepository.return_to_active_monitoring для
-        архивных задач, см. design report: "корректно обработай
-        reactivation").
+        Мониторинг бессрочный (см. задачу "убрать выбор срока
+        мониторинга") — после включения подписка не истекает
+        (UNLIMITED_END_DATE). Подписка, чей срок истёк до перехода на
+        бессрочный мониторинг ('expired', или ещё 'active' с прошедшим
+        end_date — до ближайшего expire_elapsed()), включается так же, как
+        'stopped': для пользователя это просто выключенный автомобиль (см.
+        texts.car_monitoring_state) — но ТОЛЬКО его явным нажатием, массово
+        такие подписки не включаются. start_date сохраняется, если старый
+        срок ещё не прошёл, иначе — today.
 
         Также приводит саму FineMonitoringTask в активное состояние, если
         она успела стать completed/archived, пока ВСЕ её подписчики были
         stopped/expired (см. _ensure_task_active_for_period) — иначе
         status='active' у подписки ничего бы не значил: фоновый FineJob
-        всё равно не проверял бы неактивную задачу."""
+        всё равно не проверял бы неактивную задачу. Но если номер уже
+        проверяется ДРУГОЙ активной задачей (старая задача завершена, номер
+        позже добавили заново), подписка переезжает на неё, а старая задача
+        не поднимается: две активные задачи на один номер — каждый штраф
+        сохранялся бы и доставлялся дважды.
+
+        Если у владельца на этой машине уже есть другая активная строка
+        (так оставлял прежний сценарий продления через "➕ Добавить авто"),
+        включается она, а устаревший дубль уходит в архив — возвращается
+        та, активная подписка."""
         subscription = self.get_actionable_subscription(subscription_id, telegram_user_id=telegram_user_id)
-        if subscription is None or subscription.status != "stopped":
+        if subscription is None or subscription.is_effectively_active(today=today):
+            return None
+        if subscription.status not in ("stopped", "expired", "active"):
             return None
 
-        if subscription.end_date >= today:
-            start_date, end_date = subscription.start_date, subscription.end_date
-        else:
-            period_length_days = (subscription.end_date - subscription.start_date).days
-            start_date = today
-            end_date = today + timedelta(days=period_length_days)
+        start_date = subscription.start_date if subscription.end_date >= today else today
+        end_date = UNLIMITED_END_DATE
+        task_id = self._task_id_to_monitor(subscription)
 
-        reactivated = self._subscription_repository.reactivate(
+        sibling = self._subscription_repository.get_active_subscription_for_user_and_task(
+            subscription.telegram_user_id, task_id,
+        ) if subscription.telegram_user_id is not None else None
+        if sibling is not None and sibling.id != subscription.id:
+            if not is_unlimited_end_date(sibling.end_date):
+                self._subscription_repository.update_period(
+                    sibling.id,
+                    start_date=sibling.start_date if sibling.end_date >= today else today,
+                    end_date=end_date,
+                )
+            self._subscription_repository.archive(subscription.id)
+            self._ensure_task_active_for_period(task_id, start_date=today, end_date=end_date)
+            return self._subscription_repository.get(sibling.id)
+
+        if task_id != subscription.monitoring_task_id and not self._subscription_repository.move_to_task(
+            subscription.id, task_id,
+        ):
+            return None
+
+        if subscription.status == "active":
+            # Срок уже прошёл, но expire_elapsed() ещё не перевёл строку в
+            # 'expired' — статус и так 'active', меняется только срок.
+            self._subscription_repository.update_period(
+                subscription_id, start_date=start_date, end_date=end_date,
+            )
+        elif not self._subscription_repository.reactivate(
             subscription_id, start_date=start_date, end_date=end_date,
-        )
-        if not reactivated:
+        ):
             return None
 
-        self._ensure_task_active_for_period(
-            subscription.monitoring_task_id, start_date=start_date, end_date=end_date,
-        )
+        self._ensure_task_active_for_period(task_id, start_date=start_date, end_date=end_date)
 
         return self._subscription_repository.get(subscription_id)
+
+    def _task_id_to_monitor(self, subscription: FineMonitoringSubscription) -> int:
+        """Задача, на которой подписка должна оказаться после включения (см.
+        turn_on_car): своя, если она активна; иначе уже активная задача
+        того же номера (то же допущение "одна активная задача на номер",
+        что и у _create_or_extend_task); иначе своя — её поднимет
+        _ensure_task_active_for_period."""
+        task = self._task_repository.get(subscription.monitoring_task_id)
+        if task is not None and task.status == "active":
+            return task.id
+        active = self._task_repository.get_active_by_car_number(subscription.car_number)
+        return active[0].id if active else subscription.monitoring_task_id
 
     def _ensure_task_active_for_period(
         self, task_id: int, *, start_date: date, end_date: date,
@@ -865,20 +917,19 @@ class SubscriptionService:
     ) -> list[FineMonitoringSubscription]:
         """Подписки, которые этот пользователь может вручную проверить
         через "🔎 Проверить сейчас" — свои (owner) плюс delegated, которые
-        он создал (creator), в статусе active/pending_claim/stopped (см.
-        _CHECK_NOW_STATUSES — OFF НЕ исключает ручную проверку, только
+        он создал (creator), в статусе active/pending_claim/stopped/expired
+        (см. _CHECK_NOW_STATUSES — OFF НЕ исключает ручную проверку, только
         фоновый мониторинг). Дедуп по id — та же строка МОЖЕТ оказаться и
         "своей", и "созданной им" одновременно (trusted-оператор поставил
         машину на мониторинг для самого себя).
 
-        Просроченные (end_date < today, см. texts.car_monitoring_state
-        "ИСТЁК") БОЛЬШЕ НЕ исключаются (см. задачу "align Georgia user
+        Просроченные (end_date < today — до перехода на бессрочный
+        мониторинг) НЕ исключаются (см. задачу "align Georgia user
         check-now flow" — production-пример O127PX62: раньше истёкшая
-        машина молча пропадала из этого списка, у обычного пользователя не
-        было ни одного способа дотянуться до неё через "🔎 Проверить
-        сейчас" вовсе). handle_check_now_choice() сам решает, что
-        показать — обычный живой check (ON/OFF) или informative-карточку
-        (ИСТЁК) — только archived по-прежнему исключён (_CHECK_NOW_STATUSES).
+        машина молча пропадала из этого списка) — для пользователя это
+        выключенный автомобиль, handle_check_now_choice() проверяет его
+        так же, как любой другой. Исключён только archived
+        (_CHECK_NOW_STATUSES).
 
         НЕ дедуплицирует по car_number/monitoring_task_id — если у
         пользователя ЕСТЬ две отдельные subscription-строки на один и тот
@@ -1063,19 +1114,18 @@ class SubscriptionService:
         return self._task_repository.get(task_id)
 
     def resume_task_for_trusted_admin(
-        self, task_id: int, *, days: int, today: date,
+        self, task_id: int, *, today: date,
     ) -> FineMonitoringTask | None:
         """▶️ Продолжить мониторинг (см. design report про manager-facing
-        ON/OFF + выбор срока 15/30/90 дней) — переиспользует УЖЕ
-        существующий FineMonitoringTaskRepository.return_to_active_
-        monitoring() (тот же метод, что и у архивных задач, см. его
-        докстрок): новый период [today, today + days] БЕЗУСЛОВНО
-        перезаписывает старый (в отличие от turn_on_car() для client-
-        подписок — здесь нет "оставшегося оплаченного времени", менеджер
-        явно выбирает НОВЫЙ срок), status возвращается в 'active', архивный
-        режим (если был) выключается. Работает независимо от текущего
-        status задачи (active/stopped/completed) — идемпотентно безопасно
-        вызвать даже для уже активной задачи (просто сбросит период).
+        ON/OFF) — переиспользует УЖЕ существующий
+        FineMonitoringTaskRepository.return_to_active_monitoring() (тот же
+        метод, что и у архивных задач, см. его докстрок): мониторинг
+        включается бессрочно ([today, UNLIMITED_END_DATE], срок больше не
+        выбирается — см. задачу "убрать выбор срока мониторинга"), status
+        возвращается в 'active', архивный режим (если был) выключается.
+        Работает независимо от текущего status задачи (active/stopped/
+        completed) — идемпотентно безопасно вызвать даже для уже активной
+        задачи.
 
         Существующие client-подписки этой задачи (если есть) НЕ трогает —
         это отдельный, subscription-based ON/OFF слой (см. turn_on_car/
@@ -1086,9 +1136,8 @@ class SubscriptionService:
         if task is None:
             return None
 
-        end_date = today + timedelta(days=days)
         self._task_repository.return_to_active_monitoring(
-            task_id, start_date=today, end_date=end_date,
+            task_id, start_date=today, end_date=UNLIMITED_END_DATE,
         )
         return self._task_repository.get(task_id)
 

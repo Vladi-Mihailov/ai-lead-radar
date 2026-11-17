@@ -234,14 +234,14 @@ def test_turkey_code_does_not_use_georgia_suppression():
 async def _add_car(fx, plate: str, user_id: int):
     return await fx.service.add_car(
         telegram_user_id=user_id, telegram_chat_id=user_id, username=None, first_name=None, last_name=None,
-        car_number=plate, period_days=30, today=date(2026, 10, 2),
+        car_number=plate, today=date(2026, 10, 2),
     )
 
 
 def _summary(outcome) -> str:
     return texts.format_add_car_summary(
-        car_number=outcome.subscription.car_number, start_date=outcome.subscription.start_date,
-        end_date=outcome.subscription.end_date, check_ok=outcome.check_ok, new_fines_count=outcome.new_fines_count,
+        car_number=outcome.subscription.car_number, check_ok=outcome.check_ok,
+        new_fines_count=outcome.new_fines_count,
     )
 
 

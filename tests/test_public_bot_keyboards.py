@@ -6,14 +6,19 @@
 """
 
 import sys
-from datetime import date
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import pytest  # noqa: E402
+
 from reader.protocol_support.texts import OPERATOR_LABEL
 from reader.public_bot.keyboards import (  # noqa: E402
+    add_car_confirm_keyboard,
+    decode_add_car_confirm_callback,
+    decode_add_client_decision_callback,
+    decode_legacy_trusted_task_period_callback,
     decode_manual_bootstrap_nofine_callback,
     decode_trusted_check_now_once_callback,
     decode_trusted_one_off_add_callback,
@@ -21,7 +26,6 @@ from reader.public_bot.keyboards import (  # noqa: E402
     decode_trusted_one_off_check_callback,
     decode_trusted_task_continue_callback,
     decode_trusted_task_open_callback,
-    decode_trusted_task_period_callback,
     decode_trusted_task_toggle_callback,
     decode_trusted_tasks_page_callback,
     encode_manual_bootstrap_nofine_callback,
@@ -31,12 +35,11 @@ from reader.public_bot.keyboards import (  # noqa: E402
     encode_trusted_one_off_check_callback,
     encode_trusted_task_continue_callback,
     encode_trusted_task_open_callback,
-    encode_trusted_task_period_callback,
     encode_trusted_task_toggle_callback,
+    is_legacy_period_callback,
     main_menu_keyboard,
     trusted_task_detail_keyboard,
     trusted_task_off_keyboard,
-    trusted_task_period_choice_keyboard,
     trusted_tasks_page_keyboard,
     turkey_bot_link_keyboard,
 )
@@ -142,24 +145,27 @@ def test_trusted_task_continue_callback_round_trips():
     assert decode_trusted_task_continue_callback(data) == (42, 3)
 
 
-def test_trusted_task_period_callback_round_trips():
-    data = encode_trusted_task_period_callback(42, 30, 3)
-    assert decode_trusted_task_period_callback(data) == (42, 30, 3)
+@pytest.mark.parametrize("days", [15, 30, 90])
+def test_legacy_trusted_task_period_callback_decodes_task_and_page(days):
+    """Старые кнопки менеджера "15/30/90 дней" из истории чатов (бот их
+    больше не отправляет, см. задачу "убрать выбор срока мониторинга") —
+    те же байты, что раньше кодировал encode_trusted_task_period_callback;
+    срок игнорируется, нужны только task_id/page."""
+    data = f"ttaskperiod:42:{days}:3".encode("ascii")
+    assert decode_legacy_trusted_task_period_callback(data) == (42, 3)
 
 
-def test_trusted_task_period_callback_rejects_days_outside_allowlist():
-    """Тот же принцип, что и у decode_period_callback — allowlist, не
-    любое целое число (подделанный/чужой callback_data не должен
-    пройти)."""
-    forged = b"ttaskperiod:42:45:3"
-    assert decode_trusted_task_period_callback(forged) is None
+def test_legacy_trusted_task_period_callback_rejects_days_outside_allowlist():
+    """Allowlist, не любое целое число — принимаются только значения,
+    которые бот когда-либо отправлял (подделанный callback не пройдёт)."""
+    assert decode_legacy_trusted_task_period_callback(b"ttaskperiod:42:45:3") is None
 
 
-def test_trusted_task_period_callback_rejects_malformed_data():
-    assert decode_trusted_task_period_callback(b"ttaskperiod:42:30") is None
-    assert decode_trusted_task_period_callback(b"ttaskperiod:notanumber:30:3") is None
-    assert decode_trusted_task_period_callback(None) is None
-    assert decode_trusted_task_period_callback(b"somethingelse:42:30:3") is None
+def test_legacy_trusted_task_period_callback_rejects_malformed_data():
+    assert decode_legacy_trusted_task_period_callback(b"ttaskperiod:42:30") is None
+    assert decode_legacy_trusted_task_period_callback(b"ttaskperiod:notanumber:30:3") is None
+    assert decode_legacy_trusted_task_period_callback(None) is None
+    assert decode_legacy_trusted_task_period_callback(b"somethingelse:42:30:3") is None
 
 
 def test_trusted_task_toggle_callback_does_not_collide_with_continue_prefix():
@@ -172,13 +178,14 @@ def test_trusted_task_toggle_callback_does_not_collide_with_continue_prefix():
 def test_trusted_tasks_page_keyboard_shows_plate_owner_and_on_off_buttons_per_row():
     """Явное требование задачи "унифицировать оба интерфейса Georgia/
     Turkey": каждая машина — строка из РОВНО ТРЁХ кнопок —
-    [CAR_NUMBER] [@username/—] [🟢 до ДД.ММ / ⚪] — список БОЛЬШЕ НЕ
-    дублируется текстом (см. design report: Telegram не позволяет inline-
-    кнопку справа от строки текста)."""
+    [CAR_NUMBER] [@username/—] [🟢 / ⚪] — список БОЛЬШЕ НЕ дублируется
+    текстом (см. design report: Telegram не позволяет inline-кнопку справа
+    от строки текста). Даты окончания нет (см. задачу "убрать выбор срока
+    мониторинга")."""
     keyboard = trusted_tasks_page_keyboard(
         [
-            (1, "Y111CA18", "@alenaogir", True, date(2026, 12, 20)),
-            (2, "B641XE89", "—", False, date(2026, 8, 8)),
+            (1, "Y111CA18", "@alenaogir", True),
+            (2, "B641XE89", "—", False),
         ],
         page=0, total_pages=1,
     )
@@ -186,7 +193,7 @@ def test_trusted_tasks_page_keyboard_shows_plate_owner_and_on_off_buttons_per_ro
     assert len(keyboard) == 2  # без пагинации (total_pages=1)
     row0 = [b.text for b in keyboard[0]]
     row1 = [b.text for b in keyboard[1]]
-    assert row0 == ["Y111CA18", "@alenaogir", "🟢 до 20.12"]
+    assert row0 == ["Y111CA18", "@alenaogir", "🟢"]
     assert row1 == ["B641XE89", "—", "⚪"]
 
 
@@ -195,7 +202,7 @@ def test_trusted_tasks_page_keyboard_left_button_is_bare_car_number():
     username и без "· до ДД.ММ" (иначе длинные номера обрезаются
     Telegram'ом)."""
     keyboard = trusted_tasks_page_keyboard(
-        [(1, "K892AC126", "@someone", True, date(2026, 9, 4))], page=0, total_pages=1,
+        [(1, "K892AC126", "@someone", True)], page=0, total_pages=1,
     )
 
     left_label = keyboard[0][0].text
@@ -218,7 +225,7 @@ def test_plate_bolding_never_reaches_button_labels_or_callback_data():
     версии, которая ломает .data в соседних тестах этого файла."""
     plate = "M606OM35"
     keyboard = trusted_tasks_page_keyboard(
-        [(42, plate, "@alenaogir", True, date(2026, 12, 20))], page=0, total_pages=1,
+        [(42, plate, "@alenaogir", True)], page=0, total_pages=1,
     )
 
     left_button = keyboard[0][0]
@@ -231,7 +238,7 @@ def test_trusted_tasks_page_keyboard_middle_button_shows_owner_username():
     """Средняя кнопка — "@username" владельца, если он известен (см.
     задачу: НИКОГДА "@None"/"None"/пустая кнопка)."""
     keyboard = trusted_tasks_page_keyboard(
-        [(1, "K892AC126", "@alenaogir", True, date(2026, 9, 4))], page=0, total_pages=1,
+        [(1, "K892AC126", "@alenaogir", True)], page=0, total_pages=1,
     )
 
     assert keyboard[0][1].text == "@alenaogir"
@@ -239,7 +246,7 @@ def test_trusted_tasks_page_keyboard_middle_button_shows_owner_username():
 
 def test_trusted_tasks_page_keyboard_middle_button_shows_dash_when_owner_unknown():
     keyboard = trusted_tasks_page_keyboard(
-        [(1, "K892AC126", "—", True, date(2026, 9, 4))], page=0, total_pages=1,
+        [(1, "K892AC126", "—", True)], page=0, total_pages=1,
     )
 
     label = keyboard[0][1].text
@@ -253,7 +260,7 @@ def test_trusted_tasks_page_keyboard_middle_button_is_safe_noop():
     что и средний пагинационный индикатор), не адресует конкретный
     task_id."""
     keyboard = trusted_tasks_page_keyboard(
-        [(42, "M295YB196", "@alenaogir", True, date(2026, 9, 4))], page=3, total_pages=1,
+        [(42, "M295YB196", "@alenaogir", True)], page=3, total_pages=1,
     )
 
     middle_button = keyboard[0][1]
@@ -262,25 +269,23 @@ def test_trusted_tasks_page_keyboard_middle_button_is_safe_noop():
     assert decode_trusted_task_toggle_callback(middle_button.data) is None
 
 
-def test_trusted_tasks_page_keyboard_right_button_on_shows_short_end_date():
-    """ON: "🟢 до ДД.ММ" — короткая дата (день.месяц), без года, без слова
-    "ON"."""
+def test_trusted_tasks_page_keyboard_right_button_on_is_just_green_circle():
+    """ON: голый "🟢" — без даты окончания (мониторинг бессрочный, см.
+    задачу "убрать выбор срока мониторинга") и без слова "ON"."""
     keyboard = trusted_tasks_page_keyboard(
-        [(1, "K892AC126", "—", True, date(2026, 9, 4))], page=0, total_pages=1,
+        [(1, "K892AC126", "—", True)], page=0, total_pages=1,
     )
 
     right_label = keyboard[0][2].text
-    assert right_label == "🟢 до 04.09"
-    assert "2026" not in right_label
+    assert right_label == "🟢"
+    assert "до" not in right_label
     assert "ON" not in right_label
 
 
 def test_trusted_tasks_page_keyboard_right_button_off_is_just_grey_circle():
-    """OFF: голый "⚪" — БЕЗ слова "OFF" и БЕЗ даты, даже если у задачи
-    есть последний сохранённый end_date (см. design report: "Для OFF дату
-    НЕ показывать")."""
+    """OFF: голый "⚪" — БЕЗ слова "OFF" и БЕЗ даты."""
     keyboard = trusted_tasks_page_keyboard(
-        [(2, "K892AC126", "—", False, date(2026, 9, 4))], page=0, total_pages=1,
+        [(2, "K892AC126", "—", False)], page=0, total_pages=1,
     )
 
     assert keyboard[0][0].text == "K892AC126"
@@ -292,7 +297,7 @@ def test_trusted_tasks_page_keyboard_plate_button_opens_task_detail():
     encode_trusted_task_open_callback(task_id, page), открывающий
     карточку этой конкретной машины."""
     keyboard = trusted_tasks_page_keyboard(
-        [(42, "M295YB196", "—", True, date(2026, 9, 4))], page=3, total_pages=1,
+        [(42, "M295YB196", "—", True)], page=3, total_pages=1,
     )
 
     plate_button = keyboard[0][0]
@@ -301,7 +306,7 @@ def test_trusted_tasks_page_keyboard_plate_button_opens_task_detail():
 
 def test_trusted_tasks_page_keyboard_adds_pagination_row_when_multiple_pages():
     keyboard = trusted_tasks_page_keyboard(
-        [(1, "M295YB196", "—", True, date(2026, 9, 4))], page=0, total_pages=2,
+        [(1, "M295YB196", "—", True)], page=0, total_pages=2,
     )
 
     assert len(keyboard) == 2  # 1 car row + 1 pagination row
@@ -322,10 +327,13 @@ def test_trusted_task_open_callback_round_trips():
 
 
 def test_trusted_task_off_keyboard_has_continue_and_back():
+    """"▶️ Продолжить мониторинг" ведёт прямо на включение (тот же
+    continue-callback) — экрана выбора 15/30/90 дней больше нет."""
     keyboard = trusted_task_off_keyboard(42, page=1)
 
     labels = [b.text for row in keyboard for b in row]
     assert labels == ["▶️ Продолжить мониторинг", "⬅️ Назад"]
+    assert decode_trusted_task_continue_callback(keyboard[0][0].data) == (42, 1)
 
 
 def test_trusted_check_now_once_callback_round_trips():
@@ -380,11 +388,52 @@ def test_trusted_one_off_callbacks_reject_empty_and_non_ascii_payload():
     assert decode_trusted_one_off_check_callback(None) is None
 
 
-def test_trusted_task_period_choice_keyboard_has_15_30_90_and_back():
-    keyboard = trusted_task_period_choice_keyboard(42, page=1)
+def test_add_car_confirm_keyboard_has_add_and_cancel_instead_of_periods():
+    """Подтверждение Add Car вместо выбора срока (см. задачу "убрать выбор
+    срока мониторинга") — ни одной кнопки "N дней"; номер из вопроса едет в
+    callback_data обеих кнопок."""
+    keyboard = add_car_confirm_keyboard("AA001AA")
 
     labels = [b.text for row in keyboard for b in row]
-    assert labels == ["15 дней", "30 дней", "90 дней", "⬅️ Назад"]
+    assert labels == ["✅ Добавить", "Отмена"]
+    assert not any("дней" in label for label in labels)
+    assert decode_add_car_confirm_callback(keyboard[0][0].data) == (True, "AA001AA")
+    assert decode_add_car_confirm_callback(keyboard[0][1].data) == (False, "AA001AA")
+
+
+def test_add_car_confirm_keyboard_fits_telegram_limit_for_longest_accepted_plate():
+    """Бот принимает номер до 20 символов (см. conversation.py::
+    _MAX_ADD_CAR_NUMBER_LENGTH) — callback_data с ним укладывается в лимит
+    Telegram 64 байта."""
+    for button in add_car_confirm_keyboard("A" * 20)[0]:
+        assert len(button.data) <= 64
+
+
+def test_add_car_confirm_callback_does_not_collide_with_other_callbacks():
+    """"Отмена" подтверждения (не создавать) и "Отмена" выбора клиента
+    (= без клиента) — разные callback'и, decode одного не путает другой."""
+    yes, no = (button.data for button in add_car_confirm_keyboard("AA001AA")[0])
+    assert decode_add_client_decision_callback(yes) is None
+    assert decode_add_client_decision_callback(no) is None
+    assert decode_add_car_confirm_callback(b"addclient:yes") is None
+    assert decode_add_car_confirm_callback(b"addclient:no") is None
+    assert decode_add_car_confirm_callback(b"addcar:yes:") is None
+    assert decode_add_car_confirm_callback(None) is None
+    assert is_legacy_period_callback(yes) is False
+
+
+@pytest.mark.parametrize("days", [30, 90, 180, 365])
+def test_legacy_period_callback_is_accepted_for_values_the_bot_sent(days):
+    """Старые кнопки выбора срока Add Car из истории чатов работают как
+    "✅ Добавить" (см. handlers.py) — те же байты, что раньше кодировал
+    encode_period_callback."""
+    assert is_legacy_period_callback(f"period:{days}".encode("ascii")) is True
+
+
+@pytest.mark.parametrize("data", [b"period:45", b"period:", b"period:abc", b"periodx:30", b"addcar:yes", None])
+def test_legacy_period_callback_rejects_anything_else(data):
+    assert is_legacy_period_callback(data) is False
+
 
 
 def test_main_menu_keyboard_contains_the_turkey_bot_link_as_a_reply_button():

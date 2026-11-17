@@ -18,7 +18,7 @@ from telethon.tl.types import User
 from reader.commands.base import Command, CommandContext, CommandError, CommandResult
 from reader.fines.check_service import FineCheckService
 from reader.fines.detected_fine_repository import DetectedFineRepository
-from reader.fines.models import CarFineStats, FineMonitoringTask
+from reader.fines.models import CarFineStats, FineMonitoringTask, is_unlimited_end_date
 from reader.fines.notification_coordinator import (
     FineNotificationCoordinator,
     format_car_owner_display,
@@ -162,6 +162,13 @@ def _fmt_date(value: date) -> str:
     return value.strftime(_DATE_FORMAT)
 
 
+def _fmt_end_date(value: date) -> str:
+    """Конец периода задачи — "бессрочно" для мониторинга без конечного
+    срока (задачи @GEShtrafbot, см. reader/fines/models.py::
+    UNLIMITED_END_DATE), иначе дата как раньше."""
+    return "бессрочно" if is_unlimited_end_date(value) else _fmt_date(value)
+
+
 def _fmt_datetime(value: datetime) -> str:
     """value — aware UTC datetime (см. FineJobStatus.last_run_at/
     last_success_at/last_error_at, все — datetime.now(timezone.utc)), либо
@@ -285,12 +292,13 @@ class FineCommand(Command):
             # переиспользуется. Период ВСЕГДА перезаписывается
             # относительно СЕГОДНЯШНЕЙ даты (тем же resolve_monitoring_period(
             # None, None, ...), что и для новой задачи по умолчанию — не
-            # второй параллельный расчёт периода), а не продлевается от
-            # старого end_date — независимо от того, что было указано в
-            # команде (см. задачу: "start_date = today, end_date =
-            # today + N дней" при каждом повторном добавлении). Остальные
-            # настройки задачи (label/telegram_chat_id/created_by_user_id/
-            # archive-режим) не трогаем — см. reset_period().
+            # второй параллельный расчёт периода) — независимо от того,
+            # что было указано в команде. По умолчанию это бессрочный
+            # мониторинг (см. задачу "убрать выбор срока мониторинга"),
+            # поэтому повторное "fine add" никогда не сокращает срок
+            # бессрочной задачи клиента. Остальные настройки задачи
+            # (label/telegram_chat_id/created_by_user_id/archive-режим) не
+            # трогаем — см. reset_period().
             # "Обычно у номера ровно одна активная задача (см. _handle_stop)
             # — берём первую, как и остальной код на этом же допущении.
             reset_start, reset_end = resolve_monitoring_period(None, None, today=today)
@@ -377,7 +385,7 @@ class FineCommand(Command):
             "",
             f"🚗 {task.car_number}",
             f"👤 {owner_display}",
-            f"📅 Мониторинг: {_fmt_date(task.start_date)} — {_fmt_date(task.end_date)}",
+            f"📅 Мониторинг: {_fmt_date(task.start_date)} — {_fmt_end_date(task.end_date)}",
             check_line,
         ])
 
@@ -507,9 +515,13 @@ class FineCommand(Command):
             seen_car_numbers.add(car_number)
 
             existing = self._task_repository.get_active_by_car_number(car_number)
-            try:
-                validate_no_overlap(start_date, end_date, existing)
-            except FineValidationError:
+            if existing:
+                # Номер уже на активном мониторинге — с любым сроком, в том
+                # числе с уже прошедшим end_date (такие задачи коллектор
+                # продолжает проверять). Вторую активную задачу не создаём:
+                # каждый штраф сохранялся и доставлялся бы дважды, а новая
+                # задача по умолчанию бессрочная (см. задачу "убрать выбор
+                # срока мониторинга"), так что дубль остался бы навсегда.
                 already_tracked += 1
                 continue
 
@@ -650,7 +662,7 @@ class FineCommand(Command):
     @staticmethod
     def _format_task_line(task: FineMonitoringTask) -> str:
         lines = [task.car_number + (f" ({task.label})" if task.label else "")]
-        lines.append(f"Период: {_fmt_date(task.start_date)}–{_fmt_date(task.end_date)}")
+        lines.append(f"Период: {_fmt_date(task.start_date)}–{_fmt_end_date(task.end_date)}")
 
         if task.last_checked_at is not None:
             lines.append(

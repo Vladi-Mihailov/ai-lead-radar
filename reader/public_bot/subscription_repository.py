@@ -219,20 +219,30 @@ WHERE id = :id
 """
 
 # Реактивация OFF -> ON (см. design report про car-centric "📋 Мои авто" —
-# "▶️ Включить мониторинг"): ТОЛЬКО из status='stopped' — попытка
-# реактивировать что-либо ещё (active/expired/pending_claim/archived) не
-# должна тихо "получиться" через этот путь (expired требует НОВОГО периода
-# через "➕ Добавить авто", а не одностороннего flip статуса, см. design:
-# "не отображать expired как OFF автоматически"). stopped_at = NULL — та
-# же логика, что и у первого создания (NULL, пока не остановлена).
-# start_date/end_date вычисляет вызывающий код (SubscriptionService.
-# turn_on_car) — свежий период, если старый end_date уже прошёл, иначе
-# оставшееся время без изменений.
+# "▶️ Включить мониторинг"): ТОЛЬКО из status='stopped' или 'expired' —
+# попытка реактивировать что-либо ещё (active/pending_claim/archived) не
+# должна тихо "получиться" через этот путь. 'expired' включается так же,
+# как 'stopped', с переходом на бессрочный мониторинг (см. задачу "убрать
+# выбор срока мониторинга": нового срока выбирать больше не нужно, для
+# пользователя истёкшая подписка — просто выключенный автомобиль).
+# stopped_at = NULL — та же логика, что и у первого создания (NULL, пока
+# не остановлена). start_date/end_date вычисляет вызывающий код
+# (SubscriptionService.turn_on_car).
 _REACTIVATE = """
 UPDATE fine_monitoring_subscriptions
 SET status = 'active', start_date = :start_date, end_date = :end_date,
     stopped_at = NULL, updated_at = CURRENT_TIMESTAMP
-WHERE id = :id AND status = 'stopped'
+WHERE id = :id AND status IN ('stopped', 'expired')
+"""
+
+# Подписка переезжает на другую задачу ТОГО ЖЕ номера (см.
+# SubscriptionService.turn_on_car: старая задача подписки завершена, номер
+# уже проверяется другой активной задачей — поднимать вторую нельзя, иначе
+# каждый штраф сохраняется и доставляется дважды). car_number не меняется.
+_MOVE_TO_TASK = """
+UPDATE fine_monitoring_subscriptions
+SET monitoring_task_id = :monitoring_task_id, updated_at = CURRENT_TIMESTAMP
+WHERE id = :id
 """
 
 # Soft delete (см. SubscriptionStatus.archived) — разрешено из ЛЮБОГО
@@ -868,7 +878,7 @@ class FineSubscriptionRepository:
 
     def reactivate(self, subscription_id: int, *, start_date: date, end_date: date) -> bool:
         """OFF -> ON (см. _REACTIVATE) — False, если подписка не найдена
-        или уже не 'stopped' (не тот же гоночный сценарий, что и у
+        или уже не 'stopped'/'expired' (не тот же гоночный сценарий, что и у
         create(): если у этого (monitoring_task_id, telegram_user_id) уже
         каким-то образом существует ДРУГАЯ активная строка — например,
         пользователь заново прошёл "➕ Добавить авто" на тот же номер, пока
@@ -884,6 +894,21 @@ class FineSubscriptionRepository:
                     "start_date": start_date.isoformat(),
                     "end_date": end_date.isoformat(),
                 },
+            )
+        except sqlite3.IntegrityError:
+            self._conn.rollback()
+            return False
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def move_to_task(self, subscription_id: int, monitoring_task_id: int) -> bool:
+        """См. _MOVE_TO_TASK. False — подписка не найдена, ЛИБО (гонка)
+        у её владельца на новой задаче уже есть другая активная строка и
+        partial unique index отклонил UPDATE (тот же приём, что и у
+        reactivate())."""
+        try:
+            cursor = self._conn.execute(
+                _MOVE_TO_TASK, {"id": subscription_id, "monitoring_task_id": monitoring_task_id},
             )
         except sqlite3.IntegrityError:
             self._conn.rollback()

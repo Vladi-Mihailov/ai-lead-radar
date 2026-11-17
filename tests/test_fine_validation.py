@@ -11,7 +11,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import pytest  # noqa: E402
 
-from reader.fines.models import FineMonitoringTask  # noqa: E402
+from reader.fines.models import UNLIMITED_END_DATE, FineMonitoringTask  # noqa: E402
 from reader.fines.validation import (  # noqa: E402
     FineValidationError,
     looks_like_car_number,
@@ -209,13 +209,15 @@ def test_parse_date_rejects_garbage():
 # ---- resolve_monitoring_period ----
 
 
-def test_resolve_monitoring_period_defaults_to_today_plus_30_days():
+def test_resolve_monitoring_period_defaults_to_unlimited_from_today():
+    """Без дат — бессрочный мониторинг (см. задачу "убрать выбор срока
+    мониторинга")."""
     today = date(2026, 8, 3)
 
     start, end = resolve_monitoring_period(None, None, today=today)
 
     assert start == today
-    assert end == date(2026, 9, 2)
+    assert end == UNLIMITED_END_DATE
 
 
 def test_resolve_monitoring_period_parses_explicit_dates():

@@ -116,6 +116,7 @@ OSAGO_LINK_BUTTON_LABEL = "🚗 Оформить ОСАГО Грузия"
 OSAGO_BOT_URL = "https://t.me/OSAGO24GEbot?start=georgia_bot"
 
 CAR_NUMBER_PROMPT = "🚗 Введите госномер автомобиля\n\nНапример: M295YB196"
+CAR_NUMBER_TOO_LONG_TEXT = "❌ Номер автомобиля слишком длинный"
 # Self-service (обычный клиент) больше НЕ имеет своего username-prompt (см.
 # задачу "Georgia должен работать с Telegram identity так же, как Turkey")
 # — telegram_user_id достаточен как identity, username — только auto-
@@ -134,7 +135,31 @@ OWNER_USERNAME_PROMPT = "👤 Укажите Telegram владельца авт�
 # OWNER_USERNAME_PROMPT; "Отмена" → мониторинг без клиента (см.
 # reader/public_bot/subscription_service.py::add_delegated_car_without_client).
 ADD_CLIENT_DECISION_PROMPT = "👤 Добавить Telegram клиента?"
-PERIOD_PROMPT = "📅 На какой срок добавить уведомления?"
+
+# Бессрочный мониторинг (см. задачу "убрать выбор срока мониторинга") —
+# вместо выбора срока Add Car заканчивается одним подтверждением (см.
+# format_add_car_confirm_prompt), после него мониторинг включается без
+# конечной даты (см. reader/fines/models.py::UNLIMITED_END_DATE).
+ADD_CAR_CONFIRM_LABEL = "✅ Добавить"
+ADD_CAR_DONE_LINE = "✅ Автомобиль добавлен. Проверка штрафов включена"
+# Статус вместо даты окончания. Экраны менеджера говорят о мониторинге,
+# клиентские — об уведомлениях (см. задачу "remove the word мониторинг
+# from user-facing UI"; NOTIFICATIONS_*_LINE — карточка автомобиля клиента).
+MONITORING_ACTIVE_LINE = "🟢 Мониторинг активен"
+MONITORING_OFF_LINE = "⚪ Мониторинг выключен"
+NOTIFICATIONS_ON_LINE = "🟢 Уведомления включены — сообщим, если в дальнейшем появятся новые штрафы."
+NOTIFICATIONS_OFF_LINE = "⚪ Уведомления выключены — включите, чтобы мы сообщали о новых штрафах."
+
+
+def format_add_car_confirm_prompt(car_number: str, *, owner_username: str | None = None) -> str:
+    """Последний шаг Add Car перед созданием (self-service и trusted) —
+    номер (и владелец, если trusted указал клиента) ещё раз перед глазами,
+    чтобы опечатка в номере не включала мониторинг молча."""
+    lines = [f"🚗 {format_plate_for_telegram(car_number)}"]
+    if owner_username:
+        lines.append(f"👤 Владелец: @{owner_username}")
+    lines += ["", "Добавить автомобиль и включить проверку штрафов?"]
+    return "\n".join(lines)
 
 STALE_DIALOG_TEXT = "⚠️ Диалог устарел, начните заново."
 NO_CARS_TEXT = "У вас пока нет добавленных автомобилей."
@@ -160,7 +185,6 @@ NO_ACTIVE_TASKS_TEXT = "Активных задач мониторинга не�
 # задачи тоже, просто со статусом ⚪ OFF).
 TRUSTED_TASKS_HEADER = "📋 Мои авто"
 
-TRUSTED_TASK_PERIOD_PROMPT = "📅 На какой срок продолжить мониторинг?"
 TRUSTED_STOP_PICK_PROMPT = "⛔ Выберите автомобиль для остановки мониторинга:"
 TRUSTED_STOP_FAILED_TEXT = "⚠️ Не удалось остановить — попробуйте ещё раз через «⛔ Остановить мониторинг»."
 _TRUSTED_STOP_CONFIRM_PROMPT_NO_CLIENTS = "Остановить мониторинг для {car_number}?"
@@ -237,8 +261,6 @@ def _fmt_date(value: date) -> str:
 def format_add_car_summary(
     *,
     car_number: str,
-    start_date: date,
-    end_date: date,
     check_ok: bool,
     new_fines_count: int,
     provider_unavailable: bool = False,
@@ -263,48 +285,46 @@ def format_add_car_summary(
     ПОСЛЕ создания, никогда не блокирует его), здесь только разные
     формулировки ПОЧЕМУ проверка не удалась: источник временно недоступен
     (circuit breaker) — отдельное, более понятное сообщение; любая другая
-    причина — прежний текст без изменений."""
-    period = f"{_fmt_date(start_date)} — {_fmt_date(end_date)}"
+    причина — общее "проверить штрафы сейчас не удалось".
+
+    Срока нет (см. задачу "убрать выбор срока мониторинга") — первая
+    строка всегда ADD_CAR_DONE_LINE, мониторинг включён бессрочно."""
     formatted_car_number = format_plate_for_telegram(car_number)
 
     if not check_ok:
         if provider_unavailable:
             return "\n".join([
-                "✅ Автомобиль добавлен.",
+                ADD_CAR_DONE_LINE,
                 "⚠️ Первичная проверка штрафов временно недоступна",
                 "(сервис police.ge не отвечает) и будет выполнена позже.",
                 "",
                 f"🚗 {formatted_car_number}",
-                f"🔔 Уведомления: {period}",
             ])
         return "\n".join([
-            "⚠️ Автомобиль добавлен,",
-            "но проверить штрафы сейчас не удалось",
+            ADD_CAR_DONE_LINE,
+            "⚠️ Но проверить штрафы сейчас не удалось",
             "",
             f"🚗 {formatted_car_number}",
-            f"🔔 Уведомления: {period}",
         ])
 
-    check_line = (
-        f"🔎 Штрафы проверены: найдено новых — {new_fines_count}"
-        if new_fines_count
-        else "🔎 Штрафы проверены: новых штрафов нет"
-    )
     return "\n".join([
-        "✅ Автомобиль добавлен",
+        ADD_CAR_DONE_LINE,
         "",
         f"🚗 {formatted_car_number}",
-        f"🔔 Уведомления: {period}",
-        check_line,
+        _format_add_car_check_line(new_fines_count),
     ])
+
+
+def _format_add_car_check_line(new_fines_count: int) -> str:
+    if new_fines_count:
+        return f"🔎 Штрафы проверены: найдено новых — {new_fines_count}"
+    return "🔎 Штрафы проверены: новых штрафов нет"
 
 
 def format_delegated_add_car_summary(
     *,
     car_number: str,
     owner_username: str,
-    start_date: date,
-    end_date: date,
     check_ok: bool,
     new_fines_count: int,
     pending_claim: bool,
@@ -312,32 +332,25 @@ def format_delegated_add_car_summary(
 ) -> str:
     """Итог trusted-operator delegated Add Car flow — показывается
     ТОЛЬКО trusted-оператору (владельцу это же событие ничего не
-    показывает, пока он не claimed, см. design report)."""
-    period = f"{_fmt_date(start_date)} — {_fmt_date(end_date)}"
+    показывает, пока он не claimed, см. design report). Срока нет — та же
+    первая строка, что и у self-service (см. format_add_car_summary)."""
     formatted_car_number = format_plate_for_telegram(car_number)
 
     if not check_ok:
         lines = [
-            "⚠️ Автомобиль добавлен на мониторинг,",
-            "но проверить штрафы сейчас не удалось",
+            ADD_CAR_DONE_LINE,
+            "⚠️ Но проверить штрафы сейчас не удалось",
             "",
             f"🚗 {formatted_car_number}",
             f"👤 Владелец: @{owner_username}",
-            f"📅 Мониторинг: {period}",
         ]
     else:
-        check_line = (
-            f"🔎 Штрафы проверены: найдено новых — {new_fines_count}"
-            if new_fines_count
-            else "🔎 Штрафы проверены: новых штрафов нет"
-        )
         lines = [
-            "✅ Автомобиль добавлен на мониторинг",
+            ADD_CAR_DONE_LINE,
             "",
             f"🚗 {formatted_car_number}",
             f"👤 Владелец: @{owner_username}",
-            f"📅 Мониторинг: {period}",
-            check_line,
+            _format_add_car_check_line(new_fines_count),
         ]
 
     if pending_claim and claim_link:
@@ -357,8 +370,6 @@ def format_delegated_add_car_summary(
 def format_delegated_add_car_without_client_summary(
     *,
     car_number: str,
-    start_date: date,
-    end_date: date,
     check_ok: bool,
     new_fines_count: int,
 ) -> str:
@@ -366,29 +377,21 @@ def format_delegated_add_car_without_client_summary(
     ADD_CLIENT_DECISION_PROMPT) — как format_delegated_add_car_summary, но
     без строки "👤 Владелец: ..." — клиента нет и, возможно, не будет
     никогда (см. design report: username клиента не обязателен)."""
-    period = f"{_fmt_date(start_date)} — {_fmt_date(end_date)}"
     formatted_car_number = format_plate_for_telegram(car_number)
 
     if not check_ok:
         return "\n".join([
-            "⚠️ Автомобиль добавлен на мониторинг,",
-            "но проверить штрафы сейчас не удалось",
+            ADD_CAR_DONE_LINE,
+            "⚠️ Но проверить штрафы сейчас не удалось",
             "",
             f"🚗 {formatted_car_number}",
-            f"📅 Мониторинг: {period}",
         ])
 
-    check_line = (
-        f"🔎 Штрафы проверены: найдено новых — {new_fines_count}"
-        if new_fines_count
-        else "🔎 Штрафы проверены: новых штрафов нет"
-    )
     return "\n".join([
-        "✅ Автомобиль добавлен на мониторинг",
+        ADD_CAR_DONE_LINE,
         "",
         f"🚗 {formatted_car_number}",
-        f"📅 Мониторинг: {period}",
-        check_line,
+        _format_add_car_check_line(new_fines_count),
     ])
 
 
@@ -410,21 +413,16 @@ def car_monitoring_state(subscription: FineMonitoringSubscription, today: date) 
     telegram_user_id обязателен (pending_claim строки его не имеют, см.
     FineSubscriptionRepository.list_by_user).
 
-    'stopped' — ВСЕГДА OFF, независимо от end_date: пользователь сам
-    выключил мониторинг, это осознанное состояние, которое явно можно
-    включить обратно одной кнопкой (см. SubscriptionService.turn_on_car).
-
-    "ИСТЁК" — ОТДЕЛЬНОЕ, третье состояние (не ON и не OFF) для status=
-    'expired' ИЛИ ещё 'active', но с уже прошедшим end_date (см.
-    FineMonitoringSubscription.is_effectively_active) — время истекло
-    само по себе, а не по решению пользователя, и "включить" его нельзя
-    одной кнопкой (реактивация требует НОВОГО периода, см. design report:
-    "не отображать expired как OFF автоматически")."""
-    if subscription.status == "stopped":
-        return "⚪", "OFF"
-    if subscription.status == "active" and subscription.end_date >= today:
+    ON — подписка активна прямо сейчас (см. FineMonitoringSubscription.
+    is_effectively_active). Всё остальное — OFF: 'stopped' (пользователь
+    сам выключил) и подписки, чей срок истёк до перехода на бессрочный
+    мониторинг (см. задачу "убрать выбор срока мониторинга" — отдельного
+    состояния "ИСТЁК" больше нет, срок не показывается). OFF включается
+    обратно одной кнопкой (см. SubscriptionService.turn_on_car) — только
+    явным действием пользователя."""
+    if subscription.is_effectively_active(today=today):
         return "🟢", "ON"
-    return "⏱", "ИСТЁК"
+    return "⚪", "OFF"
 
 
 def format_car_button_label(subscription: FineMonitoringSubscription, today: date) -> str:
@@ -476,12 +474,9 @@ def format_car_details(subscription: FineMonitoringSubscription, today: date) ->
     "которые уже есть сейчас" точно описывает реальный охват проверки, не
     обещая полного архива уже оплаченных.
 
-    ИСТЁК — здесь НЕТ активного ON/OFF-переключателя (см.
-    car_detail_keyboard: для этого state кнопка не показывается вовсе,
-    реактивация требует нового периода через "▶️ Продолжить мониторинг" —
-    этот отдельный экран/кнопка задачей не затронуты, см. design report),
-    поэтому формулировка про текущее состояние уведомлений для него не
-    подходит — только когда период закончился."""
+    Срока нет (см. задачу "убрать выбор срока мониторинга") — вместо даты
+    окончания одна строка статуса уведомлений (NOTIFICATIONS_ON_LINE/
+    NOTIFICATIONS_OFF_LINE)."""
     _, state = car_monitoring_state(subscription, today)
     lines = [
         f"🚗 {format_plate_for_telegram(subscription.car_number)}",
@@ -489,31 +484,9 @@ def format_car_details(subscription: FineMonitoringSubscription, today: date) ->
         "🔎 Проверить штрафы — покажем все неоплаченные штрафы, которые сейчас числятся "
         "по автомобилю, в том числе выписанные ранее.",
         "",
+        NOTIFICATIONS_ON_LINE if state == "ON" else NOTIFICATIONS_OFF_LINE,
     ]
-    if state == "ON":
-        lines.append("🔔 Уведомления: включены — сообщим, если в дальнейшем появятся новые штрафы.")
-        lines.append(f"📅 До {_fmt_date(subscription.end_date)}")
-    elif state == "OFF":
-        lines.append("🔕 Уведомления: выключены — включите, чтобы мы сообщали о новых штрафах.")
-        lines.append(f"📅 До {_fmt_date(subscription.end_date)}")
-    else:  # "ИСТЁК"
-        lines.append(f"⏱ Период уведомлений закончился {_fmt_date(subscription.end_date)}.")
     return "\n".join(lines)
-
-
-def format_my_car_inactive_card(subscription: FineMonitoringSubscription, *, today: date) -> str:
-    """"🔎 Проверить сейчас" для ИСТЁК-подписки обычного пользователя (см.
-    задачу "align Georgia user check-now flow", production-пример
-    O127PX62) — вместо немедленного check (как у ON/OFF, см. design report
-    "Check Now должен работать даже если OFF" — это решение НЕ трогается)
-    показывает карточку с объяснением + [🔎 Проверить разово]
-    [▶️ Продолжить мониторинг][⬅️ Назад]. 'stopped' сюда никогда не
-    попадает (см. car_monitoring_state — 'stopped' безусловно OFF,
-    независимо от даты), поэтому здесь ТОЛЬКО одна формулировка — "срок
-    закончился", без варианта "выключен вручную, но ещё действует" (та
-    ветка — уже существующий OFF-экран, не этот)."""
-    plate = format_plate_for_telegram(subscription.car_number)
-    return f"🚗 {plate}\n\nСрок мониторинга закончился {_fmt_date(subscription.end_date)}."
 
 
 TURN_OFF_BUTTON_LABEL = "🔕 Отключить уведомления"
@@ -564,12 +537,11 @@ def format_trusted_task_detail(task: FineMonitoringTask) -> str:
     перечень из списка, показывать в карточке по нажатию на номер") —
     открывается по нажатию на кнопку-номер в списке "📋 Мои авто" (см.
     keyboards.py::trusted_tasks_page_keyboard/encode_trusted_task_open_
-    callback). ON/OFF + период + последняя проверка — та же информация,
-    что раньше была видна прямо в списке, теперь ТОЛЬКО здесь."""
-    emoji, state = task_monitoring_state(task)
+    callback). ON/OFF + последняя проверка — та же информация, что
+    раньше была видна прямо в списке, теперь ТОЛЬКО здесь. Срока нет (см.
+    задачу "убрать выбор срока мониторинга") — вместо периода статус."""
     lines = [f"🚗 {format_plate_for_telegram(task.car_number)}" + (f" ({task.label})" if task.label else "")]
-    lines.append(f"Мониторинг: {emoji} {state}")
-    lines.append(f"📅 {_fmt_date(task.start_date)} — {_fmt_date(task.end_date)}")
+    lines.append(MONITORING_ACTIVE_LINE if task.status == "active" else MONITORING_OFF_LINE)
     if task.last_checked_at is not None:
         lines.append(f"🔎 Последняя проверка: {_fmt_date(task.last_checked_at.date())}")
     else:
@@ -622,9 +594,7 @@ def format_trusted_plate_choice_prompt(car_number: str) -> str:
     )
 
 
-def format_one_off_check_result(
-    result, *, inactive_task: FineMonitoringTask | None = None, today: date | None = None,
-) -> str:
+def format_one_off_check_result(result, *, inactive_task: FineMonitoringTask | None = None) -> str:
     """result: reader.fines.models.OneOffCheckResult (см. FineCheckService.
     check_plate_readonly). ВСЕ штрафы из ответа police.ge/REDNET тем же
     блоком, что и у "🔎 Проверить сейчас" (delivery_texts.
@@ -635,8 +605,8 @@ def format_one_off_check_result(
     и не бывает. Коммерческих CTA нет — это экран менеджера.
 
     inactive_task — историческая (completed/stopped) задача номера, если
-    она есть: хвост format_monitoring_still_inactive_line() подтверждает,
-    что разовая проверка мониторинг НЕ включила."""
+    она есть: хвост MONITORING_STILL_OFF_LINE подтверждает, что разовая
+    проверка мониторинг НЕ включила."""
     plate = format_plate_for_telegram(result.car_number)
     if not result.shows_as_ok:
         if result.provider_unavailable:
@@ -656,54 +626,32 @@ def format_one_off_check_result(
             ONE_OFF_CHECK_NOT_SAVED_LINE,
         ]
     if inactive_task is not None:
-        parts.append(format_monitoring_still_inactive_line(inactive_task, today=today))
+        parts.append(MONITORING_STILL_OFF_LINE)
     return "\n\n".join(parts)
 
 
-def format_monitoring_still_inactive_line(task: FineMonitoringTask, *, today: date) -> str:
-    """Хвост результата разовой проверки номера, у которого есть только
-    историческая задача (см. format_one_off_check_result) — различает по
-    end_date, а не по status: completed по жизненному циклу всегда
-    означает end_date в прошлом (см. reader/jobs/fine_job.py), а stopped с
-    end_date >= today — мониторинг выключен вручную до конца срока.
-    Подтверждает, что разовая проверка мониторинг НЕ включила."""
-    if task.end_date < today:
-        return f"Мониторинг завершён {_fmt_date(task.end_date)}."
-    return f"Мониторинг по-прежнему выключен.\nСрок действует до {_fmt_date(task.end_date)}."
-
-
-def task_monitoring_state(task: FineMonitoringTask) -> tuple[str, str]:
-    """(emoji, state) для manager-facing "📋 Мои авто" ON/OFF (см. design
-    report про per-car monitoring toggle) — task-level, В ОТЛИЧИЕ от
-    car_monitoring_state() выше (subscription-based, три состояния
-    ON/OFF/ИСТЁК): здесь только ДВА состояния, ON/OFF, ровно как в задаче
-    ("🟢 ON / ⚪ OFF", без отдельного "ИСТЁК") — status='active' САМ ПО
-    СЕБЕ и есть ON (просроченный, но ещё не подхваченный FineJob'ом active
-    — переходное состояние на секунды/минуты до следующего прогона
-    FineJob, не отдельный UI-статус, см. reader/jobs/fine_job.py)."""
-    if task.status == "active":
-        return "🟢", "ON"
-    return "⚪", "OFF"
+# Хвост результата разовой проверки номера, у которого есть только
+# историческая (completed/stopped) задача (см. format_one_off_check_result)
+# — подтверждает, что разовая проверка мониторинг НЕ включила. Без дат (см.
+# задачу "убрать выбор срока мониторинга": срок нигде не показывается).
+MONITORING_STILL_OFF_LINE = "⚪ Мониторинг по-прежнему выключен."
 
 
 def format_trusted_task_off_detail(task: FineMonitoringTask) -> str:
     """Экран "▶️ Продолжить мониторинг" (см. design report) — показывается
     после нажатия ⚪ OFF в списке, ИЛИ сразу после ON -> OFF toggle."""
-    return f"🚗 {format_plate_for_telegram(task.car_number)}\nМониторинг: ⚪ OFF"
+    return f"🚗 {format_plate_for_telegram(task.car_number)}\n{MONITORING_OFF_LINE}"
 
 
 def format_trusted_task_turn_off_success(car_number: str) -> str:
     return f"⏸ Мониторинг {format_plate_for_telegram(car_number)} выключен."
 
 
-def format_trusted_task_resume_success(car_number: str, days: int, end_date: date) -> str:
-    """Подтверждение после выбора 15/30/90 дней (см. design report,
-    ТОЧНЫЙ формат из задачи: "✅ Мониторинг {car} включён на {N} дней\\nДо:
-    {дата}")."""
-    return (
-        f"✅ Мониторинг {format_plate_for_telegram(car_number)} включён на {days} дней\n"
-        f"До: {_fmt_date(end_date)}"
-    )
+def format_trusted_task_resume_success(car_number: str) -> str:
+    """Подтверждение "▶️ Продолжить мониторинг" — мониторинг включён
+    бессрочно (см. задачу "убрать выбор срока мониторинга": выбора 15/30/90
+    дней и строки "До: {дата}" больше нет)."""
+    return f"✅ Мониторинг {format_plate_for_telegram(car_number)} включён"
 
 
 def format_trusted_stop_confirm_prompt(car_number: str, subscriber_count: int) -> str:

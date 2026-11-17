@@ -26,7 +26,7 @@ class _FakeReply:
     def __init__(self, *, text, show_main_menu=False, show_turkey_bot_link=False):
         self.text = text
         self.show_main_menu = show_main_menu
-        self.show_period_buttons = False
+        self.add_car_confirm_plate = None
         self.show_add_client_decision_buttons = False
         self.check_now_options = None
         self.trusted_stop_options = None
@@ -37,12 +37,9 @@ class _FakeReply:
         self.trusted_task_detail_page = None
         self.trusted_task_off_id = None
         self.trusted_task_off_page = None
-        self.trusted_task_period_id = None
-        self.trusted_task_period_page = None
         self.my_cars_page_options = None
         self.car_delete_confirm_subscription_id = None
         self.car_detail_subscription_id = None
-        self.my_car_inactive_id = None
         self.inline_buttons = None
         self.cta_buttons = None
         self.show_turkey_bot_link = show_turkey_bot_link

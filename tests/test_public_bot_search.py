@@ -108,7 +108,7 @@ class _Fixture:
         await self.service.add_car(
             telegram_user_id=telegram_user_id, telegram_chat_id=telegram_user_id,
             username=username, first_name=None, last_name=None,
-            car_number=car_number, period_days=30, today=_today(),
+            car_number=car_number, today=_today(),
         )
 
     def record_known(
