@@ -729,7 +729,7 @@ async def test_my_cars_shows_legacy_expired_subscription_as_off(fx):
     assert "ИСТЁК" not in label
     detail = fx.controller.handle_my_car_open(subscription_id, 0, telegram_user_id=10)
     assert detail.car_detail_monitoring_state == "OFF"
-    assert texts.MONITORING_OFF_LINE in detail.text
+    assert texts.NOTIFICATIONS_OFF_LINE in detail.text
     assert "31.01.2026" not in detail.text
     assert fx.subscription_repository.get(subscription_id).status == "active"  # статус в БД не тронут
 
@@ -1535,7 +1535,7 @@ async def test_turn_on_legacy_expired_subscription_reactivates_unlimited_without
 
     assert reply is not None
     assert reply.car_detail_monitoring_state == "ON"
-    assert texts.MONITORING_ACTIVE_LINE in reply.text
+    assert texts.NOTIFICATIONS_ON_LINE in reply.text
     [resumed] = fx.subscription_repository.list_by_user(1)
     assert resumed.id == subscription.id
     assert resumed.status == "active"

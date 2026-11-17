@@ -142,8 +142,13 @@ ADD_CLIENT_DECISION_PROMPT = "👤 Добавить Telegram клиента?"
 # конечной даты (см. reader/fines/models.py::UNLIMITED_END_DATE).
 ADD_CAR_CONFIRM_LABEL = "✅ Добавить"
 ADD_CAR_DONE_LINE = "✅ Автомобиль добавлен. Проверка штрафов включена"
+# Статус вместо даты окончания. Экраны менеджера говорят о мониторинге,
+# клиентские — об уведомлениях (см. задачу "remove the word мониторинг
+# from user-facing UI"; NOTIFICATIONS_*_LINE — карточка автомобиля клиента).
 MONITORING_ACTIVE_LINE = "🟢 Мониторинг активен"
 MONITORING_OFF_LINE = "⚪ Мониторинг выключен"
+NOTIFICATIONS_ON_LINE = "🟢 Уведомления включены — сообщим, если в дальнейшем появятся новые штрафы."
+NOTIFICATIONS_OFF_LINE = "⚪ Уведомления выключены — включите, чтобы мы сообщали о новых штрафах."
 
 
 def format_add_car_confirm_prompt(car_number: str, *, owner_username: str | None = None) -> str:
@@ -469,8 +474,9 @@ def format_car_details(subscription: FineMonitoringSubscription, today: date) ->
     "которые уже есть сейчас" точно описывает реальный охват проверки, не
     обещая полного архива уже оплаченных.
 
-    Вместо даты окончания — статус мониторинга (см. задачу "убрать выбор
-    срока мониторинга": MONITORING_ACTIVE_LINE/MONITORING_OFF_LINE)."""
+    Срока нет (см. задачу "убрать выбор срока мониторинга") — вместо даты
+    окончания одна строка статуса уведомлений (NOTIFICATIONS_ON_LINE/
+    NOTIFICATIONS_OFF_LINE)."""
     _, state = car_monitoring_state(subscription, today)
     lines = [
         f"🚗 {format_plate_for_telegram(subscription.car_number)}",
@@ -478,13 +484,8 @@ def format_car_details(subscription: FineMonitoringSubscription, today: date) ->
         "🔎 Проверить штрафы — покажем все неоплаченные штрафы, которые сейчас числятся "
         "по автомобилю, в том числе выписанные ранее.",
         "",
+        NOTIFICATIONS_ON_LINE if state == "ON" else NOTIFICATIONS_OFF_LINE,
     ]
-    if state == "ON":
-        lines.append("🔔 Уведомления: включены — сообщим, если в дальнейшем появятся новые штрафы.")
-        lines.append(MONITORING_ACTIVE_LINE)
-    else:
-        lines.append("🔕 Уведомления: выключены — включите, чтобы мы сообщали о новых штрафах.")
-        lines.append(MONITORING_OFF_LINE)
     return "\n".join(lines)
 
 

@@ -237,7 +237,7 @@ async def test_confirm_button_under_an_older_prompt_does_not_add_the_newer_plate
     assert [s.car_number for s in fx.subscription_repository.list_by_user(_USER_ID)] == [_OTHER_PLATE]
 
 
-async def test_my_car_card_shows_monitoring_active_instead_of_end_date(fx):
+async def test_my_car_card_shows_notifications_status_instead_of_end_date(fx):
     await fx.text(_PLATE)
     await fx.press(_confirm_data())
     [subscription] = fx.subscription_repository.list_by_user(_USER_ID)
@@ -245,7 +245,7 @@ async def test_my_car_card_shows_monitoring_active_instead_of_end_date(fx):
     card = await fx.press(f"mycaropen:{subscription.id}:0".encode("ascii"))
 
     [(text, labels)] = card.shown()
-    assert texts.MONITORING_ACTIVE_LINE in text
+    assert texts.NOTIFICATIONS_ON_LINE in text
     assert "📅" not in text
     assert texts.TURN_OFF_BUTTON_LABEL in labels
 
@@ -338,7 +338,7 @@ async def test_legacy_resume_button_from_expired_card_turns_notifications_on(fx,
     assert resumed.status == "active"
     assert resumed.end_date == UNLIMITED_END_DATE
     [(text, labels)] = event.shown()
-    assert texts.MONITORING_ACTIVE_LINE in text
+    assert texts.NOTIFICATIONS_ON_LINE in text
     assert texts.TURN_OFF_BUTTON_LABEL in labels
     assert len(fx.subscription_repository.list_by_user(_USER_ID)) == 1
 

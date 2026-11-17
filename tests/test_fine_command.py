@@ -282,13 +282,20 @@ async def test_fine_add_with_explicit_dates(fx):
     assert task.created_by_user_id == _USER_ID
 
 
-async def test_fine_add_without_dates_defaults_to_today_plus_30_days(fx):
+async def test_fine_add_without_dates_creates_unlimited_task(fx):
+    """Без дат — бессрочная задача (см. задачу "убрать выбор срока
+    мониторинга"); оператор видит "бессрочно", а не служебную дату."""
+    today = datetime.now(timezone.utc).astimezone(_TBILISI).date()
+
     result = await fx.command.handle(_ctx(["add", "AA001AA"]))
 
     assert "✅ Номер добавлен на мониторинг" in result.text
+    assert f"📅 Мониторинг: {today.strftime('%d.%m.%Y')} — бессрочно" in result.text
+    assert "9999" not in result.text
 
     [task] = fx.task_repository.list_active()
-    assert (task.end_date - task.start_date) == timedelta(days=30)
+    assert task.start_date == today
+    assert task.end_date == UNLIMITED_END_DATE
 
 
 async def test_fine_add_rejects_invalid_car_number(fx):
@@ -323,9 +330,9 @@ async def test_fine_add_rejects_end_before_start(fx):
 async def test_fine_add_resets_period_instead_of_rejecting_when_active_task_exists(fx):
     """Повторное добавление автомобиля, уже находящегося на активном
     мониторинге, больше НЕ ошибка (см. задачу про изменение бизнес-логики):
-    период существующей задачи перезаписывается на today..today+30,
-    вторая (дублирующая) задача не создаётся, даже если оператор указал
-    свои собственные (пересекающиеся или нет) даты."""
+    период существующей задачи перезаписывается на бессрочный с сегодняшнего
+    дня, вторая (дублирующая) задача не создаётся, даже если оператор
+    указал свои собственные (пересекающиеся или нет) даты."""
     today = datetime.now(timezone.utc).astimezone(_TBILISI).date()
 
     await fx.command.handle(_ctx(["add", "AA001AA", "01.08.2026", "31.08.2026"]))
@@ -334,12 +341,11 @@ async def test_fine_add_resets_period_instead_of_rejecting_when_active_task_exis
     result = await fx.command.handle(_ctx(["add", "AA001AA", "15.08.2026", "20.09.2026"]))
 
     assert "✅ Номер добавлен на мониторинг" in result.text
-    expected_period = f"{today.strftime('%d.%m.%Y')} — {(today + timedelta(days=30)).strftime('%d.%m.%Y')}"
-    assert f"📅 Мониторинг: {expected_period}" in result.text
+    assert f"📅 Мониторинг: {today.strftime('%d.%m.%Y')} — бессрочно" in result.text
     [task_after] = fx.task_repository.list_active()
     assert task_after.id == task_before.id  # без второй задачи
     assert task_after.start_date == today
-    assert task_after.end_date == today + timedelta(days=30)
+    assert task_after.end_date == UNLIMITED_END_DATE
 
 
 async def test_fine_add_upgrades_existing_client_bot_task_to_operator_scope(fx):
@@ -927,7 +933,7 @@ async def test_fine_add_with_username_already_linked_to_existing_monitoring_upda
         [task_after] = fx.task_repository.list_active()
         assert task_after.id == task_before.id
         assert task_after.start_date == today
-        assert task_after.end_date == today + timedelta(days=30)
+        assert task_after.end_date == UNLIMITED_END_DATE
 
         found = fx.user_repository.find_by_car_number("A123AA777")
         assert [u.user_id for u in found] == [222]  # без дублей
@@ -1091,7 +1097,7 @@ async def test_fine_add_with_username_enrichment_resets_period_but_preserves_oth
         [task_after] = fx.task_repository.list_active()
         assert task_after.id == task_before.id
         assert task_after.start_date == today
-        assert task_after.end_date == today + timedelta(days=30)
+        assert task_after.end_date == UNLIMITED_END_DATE
         assert task_after.status == task_before.status
         assert task_after.telegram_chat_id == task_before.telegram_chat_id
         assert task_after.created_by_user_id == task_before.created_by_user_id
@@ -1108,13 +1114,13 @@ async def test_fine_add_rejects_bare_at_symbol(fx):
 
 
 # ---- fine add: повторное добавление автомобиля с активной задачей -------
-# ---- всегда сбрасывает период на today..today+30 (см. задачу про --------
-# ---- изменение бизнес-логики повторного добавления) ----------------------
+# ---- всегда делает её бессрочной с сегодняшнего дня (см. задачу "убрать -
+# ---- выбор срока мониторинга") -------------------------------------------
 
 
-async def test_fine_add_shortens_period_when_old_end_date_is_later_than_today_plus_30(tmp_path):
-    """Старый end_date позже today+30 — период всё равно заменяется на
-    today..today+30, а не сохраняется/продлевается (см. задачу)."""
+async def test_fine_add_makes_task_with_later_end_date_unlimited(tmp_path):
+    """Старый end_date далеко в будущем — повторное "fine add" делает
+    задачу бессрочной (никогда не сокращает её срок)."""
     today = datetime.now(timezone.utc).astimezone(_TBILISI).date()
     fx = _Fixture(tmp_path, records_by_car={"AA001AA": []})
     try:
@@ -1130,15 +1136,15 @@ async def test_fine_add_shortens_period_when_old_end_date_is_later_than_today_pl
         [task_after] = fx.task_repository.list_active()
         assert task_after.id == task_before.id
         assert task_after.start_date == today
-        assert task_after.end_date == today + timedelta(days=30)
+        assert task_after.end_date == UNLIMITED_END_DATE
         assert "✅ Номер добавлен на мониторинг" in result.text
     finally:
         fx.close()
 
 
-async def test_fine_add_extends_period_when_old_end_date_is_earlier_than_today_plus_30(tmp_path):
-    """Старый end_date раньше today+30 (но ещё не истёк) — период тоже
-    заменяется на today..today+30, а не остаётся коротким (см. задачу)."""
+async def test_fine_add_makes_task_with_near_end_date_unlimited(tmp_path):
+    """Старый end_date скоро (но ещё не истёк) — повторное "fine add" тоже
+    делает задачу бессрочной."""
     today = datetime.now(timezone.utc).astimezone(_TBILISI).date()
     fx = _Fixture(tmp_path, records_by_car={"AA001AA": []})
     try:
@@ -1154,7 +1160,7 @@ async def test_fine_add_extends_period_when_old_end_date_is_earlier_than_today_p
         [task_after] = fx.task_repository.list_active()
         assert task_after.id == task_before.id
         assert task_after.start_date == today
-        assert task_after.end_date == today + timedelta(days=30)
+        assert task_after.end_date == UNLIMITED_END_DATE
         assert "✅ Номер добавлен на мониторинг" in result.text
     finally:
         fx.close()
@@ -1181,7 +1187,7 @@ async def test_fine_add_links_third_owner_on_existing_monitoring_and_updates_per
         [task_after] = fx.task_repository.list_active()
         assert task_after.id == task_before.id
         assert task_after.start_date == today
-        assert task_after.end_date == today + timedelta(days=30)
+        assert task_after.end_date == UNLIMITED_END_DATE
 
         found = fx.user_repository.find_by_car_number("A123AA777")
         assert sorted(u.user_id for u in found) == [1, 2, 3]
@@ -1259,9 +1265,7 @@ async def test_fine_add_summary_no_fines_found_shows_all_required_fields(tmp_pat
         await fx.command.handle(_ctx(["add", "M295YB196", "@MarysuaZ"]))
         result = await fx.command.handle(_ctx(["add", "M295YB196", "@VeronaWarm"]))
 
-        expected_period = (
-            f"{today.strftime('%d.%m.%Y')} — {(today + timedelta(days=30)).strftime('%d.%m.%Y')}"
-        )
+        expected_period = f"{today.strftime('%d.%m.%Y')} — бессрочно"
         assert result.text == (
             "✅ Номер добавлен на мониторинг\n\n"
             "🚗 M295YB196\n"
@@ -1376,7 +1380,7 @@ async def test_fine_add_bulk_with_explicit_dates(fx):
         assert task.created_by_user_id == _USER_ID
 
 
-async def test_fine_add_bulk_without_dates_defaults_to_today_plus_30_days(fx):
+async def test_fine_add_bulk_without_dates_creates_unlimited_tasks(fx):
     result = await fx.command.handle(_ctx(["add", "bulk", "H663KH702", "C072H0977"]))
 
     assert result.text == "✅ Добавлено: 2\n⚠️ Уже отслеживаются: 0\n❌ Ошибок: 0"
@@ -1384,7 +1388,7 @@ async def test_fine_add_bulk_without_dates_defaults_to_today_plus_30_days(fx):
     tasks = fx.task_repository.list_active()
     assert len(tasks) == 2
     for task in tasks:
-        assert (task.end_date - task.start_date) == timedelta(days=30)
+        assert task.end_date == UNLIMITED_END_DATE
 
 
 async def test_fine_add_bulk_normalizes_car_numbers(fx):
@@ -1627,7 +1631,7 @@ async def test_fine_add_bulk_command_uses_default_period_like_single_add(fx):
     await fx.command.handle(_ctx(["add-bulk", "H663KH702"]))
 
     [task] = fx.task_repository.list_active()
-    assert (task.end_date - task.start_date) == timedelta(days=30)
+    assert task.end_date == UNLIMITED_END_DATE
 
 
 async def test_fine_add_bulk_command_does_not_affect_existing_add_bulk_command(fx):

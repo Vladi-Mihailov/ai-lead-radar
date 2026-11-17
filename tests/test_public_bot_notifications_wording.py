@@ -9,10 +9,10 @@ MANUAL_BOOTSTRAP_*, etc.) are explicitly out of scope for this task (see its
 own "Do NOT blindly rename internal/admin/debug terminology" requirement)
 and are deliberately NOT touched or asserted against here.
 
-Исключение (задача "убрать выбор срока мониторинга"): карточка автомобиля
-(format_car_details) по явному требованию показывает статус "🟢 Мониторинг
-активен"/"⚪ Мониторинг выключен" вместо даты окончания — эта строка
-статуса единственное место карточки со словом "мониторинг"."""
+Задача "убрать выбор срока мониторинга": вместо даты окончания карточка
+показывает статус уведомлений ("🟢 Уведомления включены"/"⚪ Уведомления
+выключены") — слово "мониторинг" в клиентской карточке по-прежнему не
+появляется."""
 
 import sys
 from datetime import date, datetime, timezone
@@ -35,8 +35,8 @@ from reader.public_bot.keyboards import (  # noqa: E402
 from reader.public_bot.models import FineMonitoringSubscription  # noqa: E402
 from reader.public_bot.texts import (  # noqa: E402
     DELETE_CAR_BUTTON_LABEL,
-    MONITORING_ACTIVE_LINE,
-    MONITORING_OFF_LINE,
+    NOTIFICATIONS_OFF_LINE,
+    NOTIFICATIONS_ON_LINE,
     TURN_OFF_BUTTON_LABEL,
     TURN_ON_BUTTON_LABEL,
     format_car_details,
@@ -120,21 +120,15 @@ def test_turn_on_off_callback_data_round_trips_unchanged():
 
 # ---- 2. vehicle detail explanation ----
 
-def _without_status_line(text: str) -> str:
-    """Карточка без строки статуса мониторинга (см. модульный докстрок —
-    единственное разрешённое место со словом "мониторинг")."""
-    return text.replace(MONITORING_ACTIVE_LINE, "").replace(MONITORING_OFF_LINE, "")
-
-
 def test_car_details_on_distinguishes_check_now_from_future_notifications():
     text = format_car_details(_subscription(status="active", end_date=date(2026, 12, 1)), _TODAY)
-    assert "мониторинг" not in _without_status_line(text).lower()
+    assert "мониторинг" not in text.lower()
     assert "все неоплаченные штрафы" in text  # 🔎 Проверить штрафы: current unpaid fines
     assert "выписанные ранее" in text  # no fake "paid fines archive" implied, see banned list below
     assert "появятся новые штрафы" in text  # 🔔 Уведомления: future new fines
     assert "включены" in text
     # Вместо даты окончания — статус (см. задачу "убрать выбор срока мониторинга").
-    assert text.endswith(MONITORING_ACTIVE_LINE)
+    assert text.endswith(NOTIFICATIONS_ON_LINE)
     assert "01.12.2026" not in text
     for banned in ("вся история штрафов", "все штрафы за всё время", "старые штрафы", "история штрафов", "штрафы за прошлый период"):
         assert banned not in text.lower()
@@ -142,11 +136,11 @@ def test_car_details_on_distinguishes_check_now_from_future_notifications():
 
 def test_car_details_off_distinguishes_check_now_from_future_notifications():
     text = format_car_details(_subscription(status="stopped", end_date=date(2026, 12, 1)), _TODAY)
-    assert "мониторинг" not in _without_status_line(text).lower()
+    assert "мониторинг" not in text.lower()
     assert "все неоплаченные штрафы" in text
     assert "выписанные ранее" in text
     assert "выключены" in text
-    assert text.endswith(MONITORING_OFF_LINE)
+    assert text.endswith(NOTIFICATIONS_OFF_LINE)
     assert "01.12.2026" not in text
     for banned in ("вся история штрафов", "все штрафы за всё время", "старые штрафы", "история штрафов", "штрафы за прошлый период"):
         assert banned not in text.lower()
@@ -158,8 +152,9 @@ def test_car_details_legacy_expired_shows_off_without_date(status):
     это просто выключенный автомобиль: ни "⏱ Период закончился", ни
     даты."""
     text = format_car_details(_subscription(status=status, end_date=date(2026, 1, 1)), _TODAY)
+    assert "мониторинг" not in text.lower()
     assert "выключены" in text
-    assert text.endswith(MONITORING_OFF_LINE)
+    assert text.endswith(NOTIFICATIONS_OFF_LINE)
     assert "⏱" not in text
     assert "01.01.2026" not in text
 
