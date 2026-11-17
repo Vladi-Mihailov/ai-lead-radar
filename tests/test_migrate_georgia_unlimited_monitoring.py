@@ -219,6 +219,25 @@ def test_migrated_subscription_stays_deliverable_after_old_end_date(db):
     assert db.subscriptions.get(ids["sub_active"]).status == "active"
 
 
+def test_rerun_fixes_task_moved_back_to_a_term_under_an_unlimited_subscription(db):
+    """Процесс операторского чата со старым кодом ("fine add" до своего
+    перезапуска) может перевести бессрочную задачу клиента на срок; когда
+    этот срок пройдёт, повторный запуск всё равно вернёт задаче бессрочность
+    — у неё есть действующая (уже бессрочная) подписка."""
+    ids = _seed(db)
+    conn = db.connect()
+    try:
+        migration.apply_term_migration(conn, today=_TODAY)
+        db.tasks.reset_period(ids["task_active"], start_date=date(2026, 10, 1), end_date=date(2026, 11, 1))
+
+        changed = migration.apply_term_migration(conn, today=_TODAY)
+    finally:
+        conn.close()
+
+    assert changed == {_SUBS: 0, _TASKS: 1}
+    assert db.end_date(_TASKS, ids["task_active"]) == UNLIMITED_END_DATE.isoformat()
+
+
 def test_apply_is_idempotent(db):
     _seed(db)
     conn = db.connect()

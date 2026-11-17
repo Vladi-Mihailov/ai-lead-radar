@@ -10,8 +10,9 @@ reader/fines/models.py) — этот скрипт делает бессрочн�
   FineSubscriptionRepository.list_all_deliverable) И её задача активна
   (подписку на задачу, которую никто не проверяет, бессрочной не делаем —
   клиент навсегда видел бы "активен" без единой проверки);
-- fine_monitoring_tasks: status = 'active' И (end_date >= today ИЛИ это
-  задача такой подписки — у бессрочной подписки задача тоже бессрочная).
+- fine_monitoring_tasks: status = 'active' И (end_date >= today ИЛИ у неё
+  есть действующая подписка — со сроком или уже бессрочная: у такой
+  подписки задача тоже должна быть бессрочной).
 
 НЕ трогает (без отдельного согласования ничего массово не включается):
 stopped/expired/archived подписки, pending_claim с уже прошедшим сроком,
@@ -91,19 +92,21 @@ def _eligible_where(*, include_past_active_tasks: bool) -> dict[str, str]:
     """Условия "активна прямо сейчас" — те же, что у выборок, которые
     решают, проверяется ли машина и доставляются ли уведомления (см.
     модульный докстрок). end_date < :unlimited — уже бессрочные строки не
-    трогаем. Задача подписки, которая становится бессрочной, тоже
-    становится бессрочной, даже если её собственный срок уже прошёл
-    (иначе FineJob, если он снова будет включён, завершил бы задачу, а
-    клиент видел бы "активен"). Подзапрос задач смотрит на ещё не
-    изменённые подписки — поэтому apply_term_migration() меняет задачи
-    первыми."""
-    subscriptions = (
-        "status IN ('active', 'pending_claim') AND end_date >= :today AND end_date < :unlimited "
+    трогаем. Задача с действующей подпиской (со сроком или уже
+    бессрочной) тоже становится бессрочной, даже если её собственный срок
+    уже прошёл — иначе FineJob, если он снова будет включён, завершил бы
+    задачу, а клиент видел бы "уведомления включены". Это же чинит задачу,
+    которую старый код (процесс операторского чата до перезапуска) успел
+    перевести на срок поверх бессрочной подписки."""
+    live_subscription = (
+        "status IN ('active', 'pending_claim') AND end_date >= :today "
         f"AND monitoring_task_id IN ({_ACTIVE_TASK_IDS})"
     )
     task_term = "" if include_past_active_tasks else (
-        f" AND (end_date >= :today OR id IN (SELECT monitoring_task_id FROM {_SUBSCRIPTIONS} WHERE {subscriptions}))"
+        f" AND (end_date >= :today OR id IN (SELECT monitoring_task_id FROM {_SUBSCRIPTIONS} "
+        f"WHERE {live_subscription}))"
     )
+    subscriptions = f"{live_subscription} AND end_date < :unlimited"
     return {
         _SUBSCRIPTIONS: subscriptions,
         _TASKS: f"status = 'active' AND end_date < :unlimited{task_term}",

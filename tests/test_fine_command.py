@@ -1391,6 +1391,24 @@ async def test_fine_add_bulk_without_dates_creates_unlimited_tasks(fx):
         assert task.end_date == UNLIMITED_END_DATE
 
 
+async def test_fine_add_bulk_does_not_duplicate_active_task_with_past_end_date(fx):
+    """Номер уже на активном мониторинге со сроком, который уже прошёл
+    (такие задачи коллектор продолжает проверять), — "fine add bulk" не
+    создаёт вторую, бессрочную задачу на тот же номер (каждый штраф
+    сохранялся и доставлялся бы дважды), а считает номер отслеживаемым."""
+    existing = fx.task_repository.create(
+        car_number="H663KH702", label=None, start_date=date(2026, 1, 1), end_date=date(2026, 1, 31),
+        telegram_chat_id=_CHAT_ID, created_by_user_id=_USER_ID,
+    )
+
+    result = await fx.command.handle(_ctx(["add", "bulk", "H663KH702", "C072H0977"]))
+
+    assert result.text == "✅ Добавлено: 1\n⚠️ Уже отслеживаются: 1\n❌ Ошибок: 0"
+    active_ids = [t.id for t in fx.task_repository.get_active_by_car_number("H663KH702")]
+    assert active_ids == [existing.id]
+    assert fx.task_repository.get(existing.id).end_date == date(2026, 1, 31)
+
+
 async def test_fine_add_bulk_normalizes_car_numbers(fx):
     await fx.command.handle(_ctx(["add", "bulk", "h663kh702", " c072h0977 "]))
 

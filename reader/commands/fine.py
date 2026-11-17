@@ -515,9 +515,13 @@ class FineCommand(Command):
             seen_car_numbers.add(car_number)
 
             existing = self._task_repository.get_active_by_car_number(car_number)
-            try:
-                validate_no_overlap(start_date, end_date, existing)
-            except FineValidationError:
+            if existing:
+                # Номер уже на активном мониторинге — с любым сроком, в том
+                # числе с уже прошедшим end_date (такие задачи коллектор
+                # продолжает проверять). Вторую активную задачу не создаём:
+                # каждый штраф сохранялся и доставлялся бы дважды, а новая
+                # задача по умолчанию бессрочная (см. задачу "убрать выбор
+                # срока мониторинга"), так что дубль остался бы навсегда.
                 already_tracked += 1
                 continue
 
