@@ -17,6 +17,7 @@ from reader.fines.models import (
     FineMonitoringTask,
     NewFineEvent,
     OneOffCheckResult,
+    is_unlimited_end_date,
 )
 from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository
 from reader.fines.task_repository import FineMonitoringTaskRepository
@@ -164,9 +165,7 @@ _CLAIM_TOKEN_TTL = timedelta(days=7)
 # stop_task_for_trusted_admin/stop_all_for_task — оба пишут ровно тот же
 # status, различить их по данным невозможно, и по этой же философии оба
 # должны оставлять ручную проверку доступной, см. design decision в
-# рамках этой задачи). end_date всё ещё проверяется отдельно
-# (list_actionable_subscriptions) — просроченный период остаётся
-# исключённым, как и 'archived'.
+# рамках этой задачи). Исключён только 'archived'.
 #
 # ПЕРЕИМЕНОВАНО из _ACTIONABLE_STATUSES (см. задачу: "не расширяй общий
 # _ACTIONABLE_STATUSES, потому что он используется другими flow") — при
@@ -809,7 +808,16 @@ class SubscriptionService:
         она успела стать completed/archived, пока ВСЕ её подписчики были
         stopped/expired (см. _ensure_task_active_for_period) — иначе
         status='active' у подписки ничего бы не значил: фоновый FineJob
-        всё равно не проверял бы неактивную задачу."""
+        всё равно не проверял бы неактивную задачу. Но если номер уже
+        проверяется ДРУГОЙ активной задачей (старая задача завершена, номер
+        позже добавили заново), подписка переезжает на неё, а старая задача
+        не поднимается: две активные задачи на один номер — каждый штраф
+        сохранялся бы и доставлялся дважды.
+
+        Если у владельца на этой машине уже есть другая активная строка
+        (так оставлял прежний сценарий продления через "➕ Добавить авто"),
+        включается она, а устаревший дубль уходит в архив — возвращается
+        та, активная подписка."""
         subscription = self.get_actionable_subscription(subscription_id, telegram_user_id=telegram_user_id)
         if subscription is None or subscription.is_effectively_active(today=today):
             return None
@@ -818,6 +826,26 @@ class SubscriptionService:
 
         start_date = subscription.start_date if subscription.end_date >= today else today
         end_date = UNLIMITED_END_DATE
+        task_id = self._task_id_to_monitor(subscription)
+
+        sibling = self._subscription_repository.get_active_subscription_for_user_and_task(
+            subscription.telegram_user_id, task_id,
+        ) if subscription.telegram_user_id is not None else None
+        if sibling is not None and sibling.id != subscription.id:
+            if not is_unlimited_end_date(sibling.end_date):
+                self._subscription_repository.update_period(
+                    sibling.id,
+                    start_date=sibling.start_date if sibling.end_date >= today else today,
+                    end_date=end_date,
+                )
+            self._subscription_repository.archive(subscription.id)
+            self._ensure_task_active_for_period(task_id, start_date=today, end_date=end_date)
+            return self._subscription_repository.get(sibling.id)
+
+        if task_id != subscription.monitoring_task_id and not self._subscription_repository.move_to_task(
+            subscription.id, task_id,
+        ):
+            return None
 
         if subscription.status == "active":
             # Срок уже прошёл, но expire_elapsed() ещё не перевёл строку в
@@ -830,11 +858,21 @@ class SubscriptionService:
         ):
             return None
 
-        self._ensure_task_active_for_period(
-            subscription.monitoring_task_id, start_date=start_date, end_date=end_date,
-        )
+        self._ensure_task_active_for_period(task_id, start_date=start_date, end_date=end_date)
 
         return self._subscription_repository.get(subscription_id)
+
+    def _task_id_to_monitor(self, subscription: FineMonitoringSubscription) -> int:
+        """Задача, на которой подписка должна оказаться после включения (см.
+        turn_on_car): своя, если она активна; иначе уже активная задача
+        того же номера (то же допущение "одна активная задача на номер",
+        что и у _create_or_extend_task); иначе своя — её поднимет
+        _ensure_task_active_for_period."""
+        task = self._task_repository.get(subscription.monitoring_task_id)
+        if task is not None and task.status == "active":
+            return task.id
+        active = self._task_repository.get_active_by_car_number(subscription.car_number)
+        return active[0].id if active else subscription.monitoring_task_id
 
     def _ensure_task_active_for_period(
         self, task_id: int, *, start_date: date, end_date: date,

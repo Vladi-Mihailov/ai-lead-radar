@@ -7,8 +7,9 @@
 
 import sqlite3
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -21,8 +22,8 @@ from reader.public_bot.subscription_repository import FineSubscriptionRepository
 from scripts import migrate_georgia_unlimited_monitoring as migration  # noqa: E402
 
 _TODAY = date(2026, 11, 17)
-_FUTURE = date(2026, 12, 17)
-_PAST = date(2026, 11, 1)
+_SUBS = "fine_monitoring_subscriptions"
+_TASKS = "fine_monitoring_tasks"
 
 
 class _Db:
@@ -63,6 +64,9 @@ class _Db:
     def connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path, isolation_level=None)
 
+    def connect_read_only(self) -> sqlite3.Connection:
+        return sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+
     def end_date(self, table, row_id) -> str:
         with sqlite3.connect(self.path) as conn:
             return conn.execute(f"SELECT end_date FROM {table} WHERE id = ?", (row_id,)).fetchone()[0]
@@ -85,33 +89,38 @@ def db(tmp_path):
     database.close()
 
 
-def _seed(db) -> dict[str, int]:
+def _seed(db, *, today=_TODAY) -> dict[str, object]:
     """Все интересные варианты разом: что станет бессрочным, что — нет."""
-    ids = {}
-    ids["task_active"] = db.task("AA001AA", end_date=_FUTURE)
-    ids["sub_active"] = db.subscription(ids["task_active"], "AA001AA", user_id=1, end_date=_FUTURE)
-    ids["sub_pending"] = db.pending_claim(ids["task_active"], "AA001AA", end_date=_FUTURE)
-    ids["sub_stopped"] = db.subscription(ids["task_active"], "AA001AA", user_id=2, end_date=_FUTURE, status="stopped")
-    ids["task_operator"] = db.task("BB002BB", end_date=_FUTURE, scope="operator")
-    ids["task_past_active"] = db.task("CC003CC", end_date=_PAST)
-    ids["sub_expired"] = db.subscription(ids["task_past_active"], "CC003CC", user_id=3, end_date=_PAST, status="expired")
-    ids["sub_archived"] = db.subscription(ids["task_past_active"], "CC003CC", user_id=4, end_date=_FUTURE, status="archived")
-    ids["sub_pending_past"] = db.pending_claim(ids["task_past_active"], "CC003CC", end_date=_PAST)
-    ids["task_completed"] = db.task("DD004DD", end_date=_PAST, status="completed")
-    ids["task_stopped"] = db.task("EE005EE", end_date=_FUTURE, status="stopped")
+    future, past = today + timedelta(days=30), today - timedelta(days=16)
+    ids = {"future": future, "past": past}
+    ids["task_active"] = db.task("AA001AA", end_date=future)
+    ids["sub_active"] = db.subscription(ids["task_active"], "AA001AA", user_id=1, end_date=future)
+    ids["sub_pending"] = db.pending_claim(ids["task_active"], "AA001AA", end_date=future)
+    ids["sub_stopped"] = db.subscription(ids["task_active"], "AA001AA", user_id=2, end_date=future, status="stopped")
+    ids["task_operator"] = db.task("BB002BB", end_date=future, scope="operator")
+    ids["task_past_active"] = db.task("CC003CC", end_date=past)
+    ids["sub_expired"] = db.subscription(ids["task_past_active"], "CC003CC", user_id=3, end_date=past, status="expired")
+    ids["sub_archived"] = db.subscription(ids["task_past_active"], "CC003CC", user_id=4, end_date=future, status="archived")
+    ids["sub_pending_past"] = db.pending_claim(ids["task_past_active"], "CC003CC", end_date=past)
+    ids["task_completed"] = db.task("DD004DD", end_date=past, status="completed")
+    ids["task_stopped"] = db.task("EE005EE", end_date=future, status="stopped")
+    # Подписка "активна", но её задачу никто не проверяет (например,
+    # оператор остановил задачу) — бессрочной её делать нельзя.
+    ids["sub_on_stopped_task"] = db.subscription(ids["task_stopped"], "EE005EE", user_id=5, end_date=future)
     return ids
 
 
 def test_plan_counts_only_currently_active_rows(db):
     _seed(db)
-    with sqlite3.connect(f"file:{db.path}?mode=ro", uri=True) as conn:
+    with db.connect_read_only() as conn:
         plan = migration.build_term_migration_plan(conn, today=_TODAY)
 
     assert plan.subscriptions_to_convert == {"active": 1, "pending_claim": 1}
     assert plan.tasks_to_convert == {"client_bot": 1, "operator": 1}
     assert plan.total_to_convert == 4
     assert plan.subscriptions_untouched == {
-        "archived": 1, "expired (срок прошёл)": 1, "pending_claim (срок прошёл)": 1, "stopped": 1,
+        "active (задача не проверяется)": 1, "archived": 1, "expired (срок прошёл)": 1,
+        "pending_claim (срок прошёл)": 1, "stopped": 1,
     }
     assert plan.tasks_untouched == {
         "client_bot active (срок прошёл)": 1, "client_bot completed (срок прошёл)": 1, "client_bot stopped": 1,
@@ -129,24 +138,46 @@ def test_apply_makes_active_rows_unlimited_and_backs_up_old_dates(db):
     finally:
         conn.close()
 
-    assert changed == {"fine_monitoring_subscriptions": 2, "fine_monitoring_tasks": 2}
+    assert changed == {_SUBS: 2, _TASKS: 2}
     unlimited = UNLIMITED_END_DATE.isoformat()
     for key in ("sub_active", "sub_pending"):
-        assert db.end_date("fine_monitoring_subscriptions", ids[key]) == unlimited
+        assert db.end_date(_SUBS, ids[key]) == unlimited
     for key in ("task_active", "task_operator"):
-        assert db.end_date("fine_monitoring_tasks", ids[key]) == unlimited
+        assert db.end_date(_TASKS, ids[key]) == unlimited
     # Ничего, кроме активного прямо сейчас, не трогается.
-    for key, expected in (("sub_stopped", _FUTURE), ("sub_expired", _PAST), ("sub_archived", _FUTURE),
-                          ("sub_pending_past", _PAST)):
-        assert db.end_date("fine_monitoring_subscriptions", ids[key]) == expected.isoformat()
-    for key, expected in (("task_past_active", _PAST), ("task_completed", _PAST), ("task_stopped", _FUTURE)):
-        assert db.end_date("fine_monitoring_tasks", ids[key]) == expected.isoformat()
+    future, past = ids["future"].isoformat(), ids["past"].isoformat()
+    for key, expected in (("sub_stopped", future), ("sub_expired", past), ("sub_archived", future),
+                          ("sub_pending_past", past), ("sub_on_stopped_task", future)):
+        assert db.end_date(_SUBS, ids[key]) == expected
+    for key, expected in (("task_past_active", past), ("task_completed", past), ("task_stopped", future)):
+        assert db.end_date(_TASKS, ids[key]) == expected
     assert db.backup_rows() == sorted([
-        ("fine_monitoring_subscriptions", ids["sub_active"], _FUTURE.isoformat()),
-        ("fine_monitoring_subscriptions", ids["sub_pending"], _FUTURE.isoformat()),
-        ("fine_monitoring_tasks", ids["task_active"], _FUTURE.isoformat()),
-        ("fine_monitoring_tasks", ids["task_operator"], _FUTURE.isoformat()),
+        (_SUBS, ids["sub_active"], future),
+        (_SUBS, ids["sub_pending"], future),
+        (_TASKS, ids["task_active"], future),
+        (_TASKS, ids["task_operator"], future),
     ])
+
+
+def test_include_past_active_tasks_converts_them_too(db):
+    """Активные задачи с уже прошедшим end_date (их и сейчас проверяет
+    коллектор) — только по явному флагу; статус и подписки не меняются."""
+    ids = _seed(db)
+    with db.connect_read_only() as conn:
+        plan = migration.build_term_migration_plan(conn, today=_TODAY, include_past_active_tasks=True)
+    assert plan.tasks_to_convert == {"client_bot": 1, "client_bot (срок прошёл)": 1, "operator": 1}
+
+    conn = db.connect()
+    try:
+        changed = migration.apply_term_migration(conn, today=_TODAY, include_past_active_tasks=True)
+    finally:
+        conn.close()
+
+    assert changed == {_SUBS: 2, _TASKS: 3}
+    assert db.end_date(_TASKS, ids["task_past_active"]) == UNLIMITED_END_DATE.isoformat()
+    assert db.end_date(_SUBS, ids["sub_expired"]) == ids["past"].isoformat()
+    assert db.subscriptions.get(ids["sub_expired"]).status == "expired"
+    assert db.end_date(_TASKS, ids["task_completed"]) == ids["past"].isoformat()
 
 
 def test_apply_does_not_change_statuses(db):
@@ -172,11 +203,14 @@ def test_migrated_subscription_stays_deliverable_after_old_end_date(db):
         conn.close()
 
     long_after = date(2030, 1, 1)
-    assert db.subscriptions.expire_elapsed(today=long_after) == 0
     deliverable = {s.id for s in db.subscriptions.list_all_deliverable(today=long_after)}
     assert ids["sub_active"] in deliverable
     assert ids["sub_expired"] not in deliverable
     assert ids["sub_stopped"] not in deliverable
+    # Неперенесённая подписка на остановленную задачу истекает по-старому.
+    assert ids["sub_on_stopped_task"] not in deliverable
+    assert db.subscriptions.expire_elapsed(today=long_after) == 1
+    assert db.subscriptions.get(ids["sub_active"]).status == "active"
 
 
 def test_apply_is_idempotent(db):
@@ -189,7 +223,7 @@ def test_apply_is_idempotent(db):
     finally:
         conn.close()
 
-    assert second == {"fine_monitoring_subscriptions": 0, "fine_monitoring_tasks": 0}
+    assert second == {_SUBS: 0, _TASKS: 0}
     assert db.backup_rows() == backup_after_first
 
 
@@ -204,43 +238,66 @@ def test_rollback_restores_old_dates_only_for_migrated_rows(db):
         # (например, операторский "fine add") — её откат не трогает.
         db.tasks.reset_period(ids["task_operator"], start_date=_TODAY, end_date=date(2026, 12, 31))
 
+        assert migration.build_rollback_plan(conn) == {_SUBS: 2, _TASKS: 1}
         restored = migration.rollback_term_migration(conn)
     finally:
         conn.close()
 
-    assert restored == {"fine_monitoring_subscriptions": 2, "fine_monitoring_tasks": 1}
-    assert db.end_date("fine_monitoring_subscriptions", ids["sub_active"]) == _FUTURE.isoformat()
-    assert db.end_date("fine_monitoring_subscriptions", ids["sub_pending"]) == _FUTURE.isoformat()
-    assert db.end_date("fine_monitoring_tasks", ids["task_active"]) == _FUTURE.isoformat()
-    assert db.end_date("fine_monitoring_tasks", ids["task_operator"]) == "2026-12-31"
-    assert db.end_date("fine_monitoring_tasks", new_task) == UNLIMITED_END_DATE.isoformat()
+    future = ids["future"].isoformat()
+    assert restored == {_SUBS: 2, _TASKS: 1}
+    assert db.end_date(_SUBS, ids["sub_active"]) == future
+    assert db.end_date(_SUBS, ids["sub_pending"]) == future
+    assert db.end_date(_TASKS, ids["task_active"]) == future
+    assert db.end_date(_TASKS, ids["task_operator"]) == "2026-12-31"
+    assert db.end_date(_TASKS, new_task) == UNLIMITED_END_DATE.isoformat()
     # Восстановленные строки ушли из backup.
     assert db.backup_rows() == []
 
 
+def test_rollback_plan_before_any_migration_is_empty_and_read_only(db):
+    _seed(db)
+    with db.connect_read_only() as conn:
+        assert migration.build_rollback_plan(conn) == {_SUBS: 0, _TASKS: 0}
+
+
+def _real_today() -> date:
+    """main() берёт "сегодня" из часов (часовой пояс мониторинга)."""
+    return datetime.now(ZoneInfo("Asia/Tbilisi")).date()
+
+
 def test_main_dry_run_writes_nothing(db, capsys):
-    ids = _seed(db)
+    ids = _seed(db, today=_real_today())
 
     assert migration.main(["--db-path", str(db.path)]) == 0
 
     output = capsys.readouterr().out
     assert "Dry-run" in output
-    assert db.end_date("fine_monitoring_subscriptions", ids["sub_active"]) == _FUTURE.isoformat()
+    assert db.end_date(_SUBS, ids["sub_active"]) == ids["future"].isoformat()
     with sqlite3.connect(db.path) as conn:
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert migration.BACKUP_TABLE not in tables
 
 
-def test_main_execute_then_rollback(db, capsys):
-    ids = _seed(db)
+def test_main_execute_then_rollback_dry_run_then_rollback(db, capsys):
+    ids = _seed(db, today=_real_today())
 
     assert migration.main(["--db-path", str(db.path), "--execute"]) == 0
-    assert db.end_date("fine_monitoring_subscriptions", ids["sub_active"]) == UNLIMITED_END_DATE.isoformat()
+    assert db.end_date(_SUBS, ids["sub_active"]) == UNLIMITED_END_DATE.isoformat()
 
+    # --rollback без --execute ничего не пишет.
     assert migration.main(["--db-path", str(db.path), "--rollback"]) == 0
-    assert db.end_date("fine_monitoring_subscriptions", ids["sub_active"]) == _FUTURE.isoformat()
+    assert db.end_date(_SUBS, ids["sub_active"]) == UNLIMITED_END_DATE.isoformat()
+
+    assert migration.main(["--db-path", str(db.path), "--rollback", "--execute"]) == 0
+    assert db.end_date(_SUBS, ids["sub_active"]) == ids["future"].isoformat()
     output = capsys.readouterr().out
+    assert "Откат вернёт старые сроки: подписки 2, задачи 2." in output
     assert "AA001AA" not in output
+
+
+def test_main_rejects_rollback_with_include_flag(db):
+    with pytest.raises(SystemExit):
+        migration.main(["--db-path", str(db.path), "--rollback", "--include-past-active-tasks"])
 
 
 def test_main_reports_missing_database(tmp_path, capsys):

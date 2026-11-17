@@ -236,7 +236,7 @@ async def test_add_car_with_known_username_skips_username_step(fx):
 
     # Срок больше не выбирается (см. задачу "убрать выбор срока
     # мониторинга") — номер ведёт сразу к подтверждению.
-    assert reply.show_add_car_confirm_buttons is True
+    assert reply.add_car_confirm_plate == "M295YB196"
     assert reply.text == texts.format_add_car_confirm_prompt("M295YB196")
 
     state = fx.conversation_state_repository.get(1)
@@ -253,7 +253,7 @@ async def test_add_car_accepts_cyrillic_plate_and_normalizes_to_latin(fx):
 
     reply = await fx.controller.handle_text("О687КЕ761", chat_id=1, telegram_user_id=1, username="alice")
 
-    assert reply.show_add_car_confirm_buttons is True
+    assert reply.add_car_confirm_plate == "O687KE761"
     state = fx.conversation_state_repository.get(1)
     assert state.payload == {"car_number": "O687KE761", "username": "alice"}
 
@@ -281,7 +281,7 @@ async def test_direct_plate_input_from_home_state_starts_add_car_flow(fx):
     username_step above."""
     reply = await fx.controller.handle_text("M295YB196", chat_id=1, telegram_user_id=1, username="alice")
 
-    assert reply.show_add_car_confirm_buttons is True
+    assert reply.add_car_confirm_plate == "M295YB196"
     assert reply.text == texts.format_add_car_confirm_prompt("M295YB196")
     state = fx.conversation_state_repository.get(1)
     assert state.step == STEP_AWAITING_ADD_CONFIRM
@@ -294,7 +294,7 @@ async def test_direct_plate_input_reuses_cyrillic_normalization(fx):
     second, independent plate-processing implementation."""
     reply = await fx.controller.handle_text("О687КЕ761", chat_id=1, telegram_user_id=1, username="alice")
 
-    assert reply.show_add_car_confirm_buttons is True
+    assert reply.add_car_confirm_plate == "O687KE761"
     state = fx.conversation_state_repository.get(1)
     assert state.payload == {"car_number": "O687KE761", "username": "alice"}
 
@@ -303,7 +303,7 @@ async def test_direct_plate_input_completes_full_add_car_flow(fx):
     """End to end: home state -> type a plate -> confirm ->
     subscription actually created, exactly like the button-first flow."""
     reply = await fx.controller.handle_text("M295YB196", chat_id=5, telegram_user_id=5, username="bob")
-    assert reply.show_add_car_confirm_buttons is True
+    assert reply.add_car_confirm_plate == "M295YB196"
 
     confirm_reply = await fx.controller.handle_add_car_confirm(
         chat_id=5, telegram_user_id=5, first_name=None, last_name=None,
@@ -365,7 +365,7 @@ async def test_plate_like_text_during_another_active_flow_is_not_hijacked(fx):
 
     reply = await fx.controller.handle_text("M295YB196", chat_id=1, telegram_user_id=_TRUSTED_ID, username=None)
 
-    assert reply.show_add_car_confirm_buttons is True  # both handlers would reach this same next step
+    assert reply.add_car_confirm_plate == "E911EE95"  # both handlers would reach this same next step
     state = fx.conversation_state_repository.get(1)
     assert state is not None and state.step == STEP_AWAITING_ADD_CONFIRM
     assert state.payload == {"car_number": "E911EE95", "owner_username": "M295YB196"}
@@ -385,7 +385,7 @@ async def test_add_car_without_username_skips_prompt_straight_to_confirm(fx):
     reply = await fx.controller.handle_text("M295YB196", chat_id=2, telegram_user_id=2, username=None)
 
     assert reply.text == texts.format_add_car_confirm_prompt("M295YB196")
-    assert reply.show_add_car_confirm_buttons is True
+    assert reply.add_car_confirm_plate == "M295YB196"
     state = fx.conversation_state_repository.get(2)
     assert state.step == STEP_AWAITING_ADD_CONFIRM
     assert state.payload == {"car_number": "M295YB196", "username": None}
@@ -513,7 +513,7 @@ async def test_add_car_confirm_prompt_is_reshown_on_text_input(fx):
 
     reply = await fx.controller.handle_text("да", chat_id=1, telegram_user_id=1, username="alice")
 
-    assert reply.show_add_car_confirm_buttons is True
+    assert reply.add_car_confirm_plate == "M295YB196"
     assert reply.text == texts.format_add_car_confirm_prompt("M295YB196")
     assert fx.conversation_state_repository.get(1).step == STEP_AWAITING_ADD_CONFIRM
     assert fx.subscription_repository.list_by_user(1) == []
@@ -550,7 +550,7 @@ async def test_add_car_confirm_accepts_dialog_left_on_legacy_period_step(fx):
     )
 
     text_reply = await fx.controller.handle_text("30 дней", chat_id=1, telegram_user_id=1, username="alice")
-    assert text_reply.show_add_car_confirm_buttons is True
+    assert text_reply.add_car_confirm_plate == "M295YB196"
     assert text_reply.text == texts.format_add_car_confirm_prompt("M295YB196")
 
     reply = await fx.controller.handle_add_car_confirm(
@@ -616,6 +616,57 @@ async def test_add_car_confirm_without_active_dialog_returns_none(fx):
         chat_id=6, telegram_user_id=6, first_name=None, last_name=None,
     )
     assert reply is None
+
+
+async def test_add_car_confirm_button_of_an_older_prompt_does_not_add_the_newer_plate(fx):
+    """Номер A → вопрос про A; затем "➕ Добавить авто" и номер B → вопрос
+    про B. Кнопка "✅ Добавить" под СТАРЫМ вопросом (про A) не должна
+    добавить B: номер едет в callback_data и сверяется с диалогом."""
+    await fx.controller.handle_text("AA001AA", chat_id=1, telegram_user_id=1, username=None)
+    await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username=None)
+    await fx.controller.handle_text("BB002BB", chat_id=1, telegram_user_id=1, username=None)
+
+    stale = await fx.controller.handle_add_car_confirm(
+        chat_id=1, telegram_user_id=1, first_name=None, last_name=None, car_number="AA001AA",
+    )
+    assert stale is None
+    assert fx.controller.handle_add_car_cancel(chat_id=1, telegram_user_id=1, car_number="AA001AA") is None
+    assert fx.subscription_repository.list_by_user(1) == []
+    assert fx.conversation_state_repository.get(1).payload["car_number"] == "BB002BB"
+
+    done = await fx.controller.handle_add_car_confirm(
+        chat_id=1, telegram_user_id=1, first_name=None, last_name=None, car_number="BB002BB",
+    )
+    assert done is not None
+    assert [s.car_number for s in fx.subscription_repository.list_by_user(1)] == ["BB002BB"]
+
+
+async def test_add_car_dialog_is_closed_before_the_slow_check(fx):
+    """Пока идёт первичная проверка, повторное "✅ Добавить" и "Отмена"
+    уже ничего не находят: машина добавляется ровно один раз, а "Отмена"
+    не показывает главное меню, будто добавление отменено."""
+    await fx.controller.handle_text("AA001AA", chat_id=1, telegram_user_id=1, username=None)
+    original_add_car = fx.service.add_car
+    during_check = {}
+
+    async def add_car_with_taps_during_check(**kwargs):
+        during_check["cancel"] = fx.controller.handle_add_car_cancel(
+            chat_id=1, telegram_user_id=1, car_number="AA001AA",
+        )
+        during_check["second_confirm"] = await fx.controller.handle_add_car_confirm(
+            chat_id=1, telegram_user_id=1, first_name=None, last_name=None, car_number="AA001AA",
+        )
+        return await original_add_car(**kwargs)
+
+    fx.service.add_car = add_car_with_taps_during_check
+
+    reply = await fx.controller.handle_add_car_confirm(
+        chat_id=1, telegram_user_id=1, first_name=None, last_name=None, car_number="AA001AA",
+    )
+
+    assert reply is not None and reply.text.startswith(texts.ADD_CAR_DONE_LINE)
+    assert during_check == {"cancel": None, "second_confirm": None}
+    assert len(fx.subscription_repository.list_by_user(1)) == 1
 
 
 # ---- "Мои авто" — только свои подписки ----
@@ -788,7 +839,7 @@ async def test_ordinary_user_without_username_never_sees_owner_username_prompt(f
 
     assert reply.text != texts.OWNER_USERNAME_PROMPT
     assert reply.text == texts.format_add_car_confirm_prompt("M295YB196")
-    assert reply.show_add_car_confirm_buttons is True
+    assert reply.add_car_confirm_plate == "M295YB196"
     assert fx.conversation_state_repository.get(1).step == STEP_AWAITING_ADD_CONFIRM
 
 
@@ -845,7 +896,7 @@ async def test_trusted_user_cancel_on_client_decision_skips_straight_to_confirm(
     )
 
     assert reply.text == texts.format_add_car_confirm_prompt("M295YB196")
-    assert reply.show_add_car_confirm_buttons is True
+    assert reply.add_car_confirm_plate == "M295YB196"
     state = trusted_fx.conversation_state_repository.get(_TRUSTED_ID)
     assert state.step == STEP_AWAITING_ADD_CONFIRM
     assert state.payload == {"car_number": "M295YB196", "no_client": True}
@@ -1480,6 +1531,22 @@ async def test_turn_on_legacy_expired_subscription_reactivates_unlimited_without
     resumed_task = fx.task_repository.get(task_id)
     assert resumed_task.status == "active"
     assert resumed_task.end_date == UNLIMITED_END_DATE
+
+
+async def test_legacy_resume_button_on_already_active_car_shows_its_card(fx):
+    """Старая кнопка "▶️ Продолжить мониторинг" на машине, которую уже
+    включили снова, — просто актуальная карточка, а не "не удалось"."""
+    outcome = await fx.service.add_car(
+        telegram_user_id=1, telegram_chat_id=1, username="alice",
+        first_name=None, last_name=None, car_number="AA001AA", today=_today(),
+    )
+
+    reply = fx.controller.handle_my_car_legacy_resume(outcome.subscription.id, telegram_user_id=1)
+
+    assert reply.car_detail_subscription_id == outcome.subscription.id
+    assert reply.car_detail_monitoring_state == "ON"
+    assert reply.text != texts.CAR_ACTION_FAILED_TEXT
+    assert fx.controller.handle_my_car_legacy_resume(outcome.subscription.id, telegram_user_id=999) is None
 
 
 async def test_turn_on_legacy_expired_subscription_rejects_other_user(fx):

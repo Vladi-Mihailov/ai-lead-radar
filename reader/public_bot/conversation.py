@@ -11,10 +11,10 @@ CommandResult в reader/commands/base.py для операторских ком�
 
 Security-инвариант (см. design report): единственный источник identity —
 telegram_user_id, полученный ВЫЗЫВАЮЩИМ кодом из event.sender_id. Callback
-подтверждения Add Car (см. handle_add_car_confirm) не несёт вообще ничего,
-кроме факта нажатия — кому это применить, решает ИСКЛЮЧИТЕЛЬНО
+подтверждения Add Car (см. handle_add_car_confirm) несёт только номер,
+показанный в вопросе, — кому и что применить, решает ИСКЛЮЧИТЕЛЬНО
 conversation_state (ключ — chat_id, сверка владения — telegram_user_id), а
-не сам callback. То же самое для
+номер лишь отсекает устаревшую кнопку под вопросом про ДРУГОЙ номер. То же самое для
 deep-link claim (см. _handle_claim_start) — claim_token опаден, но
 identity, которой он в итоге биндится, берётся ИСКЛЮЧИТЕЛЬНО из
 event.sender_id этого конкретного /start, а не из чего-либо в payload.
@@ -331,9 +331,10 @@ class BotReply:
     Удалить {car} из списка?" (см. handle_my_car_delete_prompt) — ОТДЕЛЬНОЕ
     промежуточное подтверждение перед soft delete, ничего ещё не удаляет.
 
-    show_add_car_confirm_buttons — [✅ Добавить][Отмена] под последним
-    шагом Add Car (см. STEP_AWAITING_ADD_CONFIRM, handle_add_car_confirm/
-    handle_add_car_cancel) — вместо прежнего выбора срока.
+    add_car_confirm_plate — [✅ Добавить][Отмена] под последним шагом
+    Add Car (см. STEP_AWAITING_ADD_CONFIRM, handle_add_car_confirm/
+    handle_add_car_cancel) — вместо прежнего выбора срока; номер из вопроса
+    едет в callback_data обеих кнопок.
 
     cta_buttons — коммерческие CTA-кнопки под manual "🔎 Проверить сейчас"
     (см. design report про UX manual check) — ТОЛЬКО когда реальный
@@ -353,7 +354,7 @@ class BotReply:
 
     text: str
     show_main_menu: bool = False
-    show_add_car_confirm_buttons: bool = False
+    add_car_confirm_plate: str | None = None
     show_add_client_decision_buttons: bool = False
     check_now_options: list[tuple[int, str]] | None = None
     trusted_stop_options: list[tuple[int, str]] | None = None
@@ -1726,7 +1727,7 @@ class ConversationController:
             text=texts.format_add_car_confirm_prompt(
                 payload["car_number"], owner_username=payload.get("owner_username"),
             ),
-            show_add_car_confirm_buttons=True,
+            add_car_confirm_plate=payload["car_number"],
         )
 
     def _handle_owner_username_input(
@@ -2003,16 +2004,21 @@ class ConversationController:
 
     # ---- подтверждение Add Car (inline-кнопки) ----
 
-    def _owned_add_car_confirm_state(self, chat_id: int, telegram_user_id: int):
+    def _owned_add_car_confirm_state(self, chat_id: int, telegram_user_id: int, car_number: str | None):
         """Состояние этого chat_id, если оно на шаге подтверждения Add Car
-        (новом или прежнем шаге выбора срока, см. _ADD_CONFIRM_STEPS) И
-        принадлежит ИМЕННО этому telegram_user_id; иначе None."""
+        (новом или прежнем шаге выбора срока, см. _ADD_CONFIRM_STEPS),
+        принадлежит ИМЕННО этому telegram_user_id и — если кнопка несёт
+        номер — ждёт подтверждения ИМЕННО этого номера (кнопка под вопросом
+        про номер A не должна добавить номер B, введённый позже); иначе
+        None. car_number=None — старые кнопки выбора срока без номера."""
         state = self._states.get(chat_id)
         if (
             state is None
             or state.step not in _ADD_CONFIRM_STEPS
             or state.telegram_user_id != telegram_user_id
         ):
+            return None
+        if car_number is not None and (state.payload or {}).get("car_number") != car_number:
             return None
         return state
 
@@ -2023,22 +2029,28 @@ class ConversationController:
         telegram_user_id: int,
         first_name: str | None,
         last_name: str | None,
+        car_number: str | None = None,
     ) -> BotReply | None:
         """"✅ Добавить" (и старые кнопки выбора срока из истории чата, см.
-        keyboards.py::is_legacy_period_callback) — создаёт бессрочный
-        мониторинг (см. задачу "убрать выбор срока мониторинга").
+        keyboards.py::is_legacy_period_callback, — для них car_number=None)
+        — создаёт бессрочный мониторинг (см. задачу "убрать выбор срока
+        мониторинга").
 
         None означает "эту кнопку нельзя обработать сейчас" — Telethon-
         адаптер (handlers.py) в этом случае отвечает на callback коротким
         предупреждением и НИЧЕГО не создаёт/не меняет.
 
-        Ownership-проверка — ЕДИНСТВЕННЫЙ источник истины здесь: callback
-        не несёт никаких данных — какую car_number/username/подписку он
-        затронет, решает ТОЛЬКО conversation_state, полученное по chat_id,
-        и сверенное с telegram_user_id (реальным отправителем ЭТОГО
-        события, а не тем, что мог бы нести сам callback_data, если бы там
-        был чей-то id — его там нет и не должно быть, см.
-        reader/public_bot/keyboards.py).
+        Ownership-проверка — ЕДИНСТВЕННЫЙ источник истины здесь: какую
+        car_number/username/подписку затронет нажатие, решает ТОЛЬКО
+        conversation_state, полученное по chat_id, и сверенное с
+        telegram_user_id (реальным отправителем ЭТОГО события); номер из
+        callback_data лишь должен совпасть с номером в state (см.
+        _owned_add_car_confirm_state).
+
+        Диалог закрывается ДО медленной первичной проверки: повторное
+        нажатие или "Отмена" во время неё уже ничего не находят (иначе
+        "Отмена" показывала бы главное меню, а машина всё равно
+        добавлялась бы).
 
         Ветвится на self-service/delegated-с-клиентом/delegated-без-клиента
         по содержимому payload (owner_username / no_client — см.
@@ -2048,7 +2060,7 @@ class ConversationController:
         STEP_AWAITING_OWNER_USERNAME или payload["no_client"] — быть
         trusted, см. _handle_car_number_input/handle_add_client_decision),
         этого достаточно."""
-        state = self._owned_add_car_confirm_state(chat_id, telegram_user_id)
+        state = self._owned_add_car_confirm_state(chat_id, telegram_user_id, car_number)
         if state is None:
             return None
 
@@ -2071,6 +2083,7 @@ class ConversationController:
             self._clear_state(chat_id)
             return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
 
+        self._clear_state(chat_id)
         today = self._today()
 
         if no_client:
@@ -2091,11 +2104,13 @@ class ConversationController:
             first_name=first_name, last_name=last_name,
         )
 
-    def handle_add_car_cancel(self, *, chat_id: int, telegram_user_id: int) -> BotReply | None:
+    def handle_add_car_cancel(
+        self, *, chat_id: int, telegram_user_id: int, car_number: str | None = None,
+    ) -> BotReply | None:
         """"Отмена" на подтверждении Add Car — ничего не создаёт, диалог
         сбрасывается. None — та же server-side проверка, что и у
         handle_add_car_confirm (чужой/устаревший диалог не трогаем)."""
-        if self._owned_add_car_confirm_state(chat_id, telegram_user_id) is None:
+        if self._owned_add_car_confirm_state(chat_id, telegram_user_id, car_number) is None:
             return None
         self._clear_state(chat_id)
         return BotReply(text=texts.MAIN_MENU_TEXT, show_main_menu=True)
@@ -2112,7 +2127,6 @@ class ConversationController:
             car_number=car_number,
             today=today,
         )
-        self._clear_state(chat_id)
 
         # "NEW USER EMERGENCY WORKFLOW" (см. задачу) — короткое дополнение
         # менеджеру РОВНО когда это первый автомобиль, когда-либо
@@ -2185,10 +2199,7 @@ class ConversationController:
                 today=today,
             )
         except OwnerResolutionError:
-            self._clear_state(chat_id)
             return BotReply(text=texts.OWNER_RESOLUTION_ERROR_TEXT, show_main_menu=True)
-
-        self._clear_state(chat_id)
 
         return BotReply(
             text=texts.format_delegated_add_car_summary(
@@ -2210,7 +2221,6 @@ class ConversationController:
             car_number=car_number,
             today=today,
         )
-        self._clear_state(chat_id)
 
         return BotReply(
             text=texts.format_delegated_add_car_without_client_summary(
@@ -2353,6 +2363,21 @@ class ConversationController:
             car_detail_monitoring_state=monitoring_state,
             car_detail_page=page,
         )
+
+    def handle_my_car_legacy_resume(self, subscription_id: int, *, telegram_user_id: int) -> BotReply | None:
+        """Старая кнопка "▶️ Продолжить мониторинг" с карточки "срок
+        истёк" (бот её больше не показывает, кнопка осталась в истории
+        чата) — то же, что "🔔 Включить уведомления"; если уведомления уже
+        включены — просто актуальная карточка. Карточка была открыта не со
+        страницы списка, поэтому page=0."""
+        subscription = self._subscriptions.get_actionable_subscription(
+            subscription_id, telegram_user_id=telegram_user_id,
+        )
+        if subscription is None:
+            return None
+        if subscription.is_effectively_active(today=self._today()):
+            return self._format_car_detail_reply(subscription, 0)
+        return self.handle_my_car_turn_on(subscription_id, 0, telegram_user_id=telegram_user_id)
 
     def handle_my_car_turn_on(
         self, subscription_id: int, page: int, *, telegram_user_id: int,

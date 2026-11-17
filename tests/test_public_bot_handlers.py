@@ -26,7 +26,7 @@ class _FakeReply:
     def __init__(self, *, text, show_main_menu=False, show_turkey_bot_link=False):
         self.text = text
         self.show_main_menu = show_main_menu
-        self.show_add_car_confirm_buttons = False
+        self.add_car_confirm_plate = None
         self.show_add_client_decision_buttons = False
         self.check_now_options = None
         self.trusted_stop_options = None

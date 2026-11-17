@@ -40,8 +40,16 @@ _TBILISI = ZoneInfo("Asia/Tbilisi")
 _USER_ID = 42
 _OTHER_USER_ID = 43
 _TRUSTED_ID = 5712994689
-_PLATE = "M295YB196"
-_CONFIRM_DATA, _CANCEL_DATA = (button.data for button in add_car_confirm_keyboard()[0])
+_PLATE = "AA001AA"
+_OTHER_PLATE = "BB002BB"
+
+
+def _confirm_data(car_number: str = _PLATE) -> bytes:
+    return add_car_confirm_keyboard(car_number)[0][0].data
+
+
+def _cancel_data(car_number: str = _PLATE) -> bytes:
+    return add_car_confirm_keyboard(car_number)[0][1].data
 
 
 class _FakeProvider(FineProvider):
@@ -193,7 +201,7 @@ async def test_add_car_flow_shows_confirmation_instead_of_period_choice(fx):
     assert prompt_labels == ["✅ Добавить", "Отмена"]
     assert not any("дней" in label for label in _all_labels(menu, plate))
 
-    done = await fx.press(_CONFIRM_DATA)
+    done = await fx.press(_confirm_data())
 
     [(done_text, _labels)] = done.shown()
     assert done_text.startswith("✅ Автомобиль добавлен. Проверка штрафов включена")
@@ -207,7 +215,7 @@ async def test_add_car_flow_shows_confirmation_instead_of_period_choice(fx):
 async def test_add_car_cancel_creates_nothing(fx):
     await fx.text(_PLATE)
 
-    cancel = await fx.press(_CANCEL_DATA)
+    cancel = await fx.press(_cancel_data())
 
     [(text, _labels)] = cancel.shown()
     assert text == texts.MAIN_MENU_TEXT
@@ -217,9 +225,21 @@ async def test_add_car_cancel_creates_nothing(fx):
     assert fx.conversation_state_repository.get(_USER_ID) is None
 
 
+async def test_confirm_button_under_an_older_prompt_does_not_add_the_newer_plate(fx):
+    await fx.text(_PLATE)
+    await fx.text(texts.ADD_CAR_LABEL)
+    await fx.text(_OTHER_PLATE)
+
+    await fx.press(_confirm_data(_PLATE))
+    assert fx.subscription_repository.list_by_user(_USER_ID) == []
+
+    await fx.press(_confirm_data(_OTHER_PLATE))
+    assert [s.car_number for s in fx.subscription_repository.list_by_user(_USER_ID)] == [_OTHER_PLATE]
+
+
 async def test_my_car_card_shows_monitoring_active_instead_of_end_date(fx):
     await fx.text(_PLATE)
-    await fx.press(_CONFIRM_DATA)
+    await fx.press(_confirm_data())
     [subscription] = fx.subscription_repository.list_by_user(_USER_ID)
 
     card = await fx.press(f"mycaropen:{subscription.id}:0".encode("ascii"))

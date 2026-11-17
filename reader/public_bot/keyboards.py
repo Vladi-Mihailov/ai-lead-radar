@@ -1,9 +1,10 @@
 """Telethon-клавиатуры/callback_data @GEShtrafbot.
 
 Security-инвариант (см. design report и reader/public_bot/conversation.py):
-callback_data подтверждения Add Car (b"addcar:yes"/b"addcar:no") не несёт
-никакого telegram_user_id/task_id. Владение и идентичность проверяются
-ИСКЛЮЧИТЕЛЬНО через event.sender_id + conversation_state (см.
+callback_data подтверждения Add Car (b"addcar:yes:{номер}"/b"addcar:no:{номер}")
+не несёт никакого telegram_user_id/task_id — номер только отсекает
+устаревшую кнопку под вопросом про другой номер. Владение и идентичность
+проверяются ИСКЛЮЧИТЕЛЬНО через event.sender_id + conversation_state (см.
 ConversationController.handle_add_car_confirm) — callback_data сам по себе
 не является доказательством ничего, кроме "какая кнопка была нажата"
 (пользователь может переслать сообщение с кнопкой в свой собственный чат с
@@ -66,9 +67,10 @@ STOP_NO = b"stopno"
 _ADD_CLIENT_YES = b"addclient:yes"
 _ADD_CLIENT_NO = b"addclient:no"
 # Подтверждение Add Car (см. задачу "убрать выбор срока мониторинга") —
-# вместо выбора срока. Без id: что подтверждается, решает conversation_state.
-_ADD_CAR_CONFIRM_YES = b"addcar:yes"
-_ADD_CAR_CONFIRM_NO = b"addcar:no"
+# вместо выбора срока. Без id: что подтверждается, решает conversation_state;
+# номер из вопроса (ascii, через _encode_plate) лишь должен с ним совпасть.
+_ADD_CAR_CONFIRM_YES_PREFIX = b"addcar:yes:"
+_ADD_CAR_CONFIRM_NO_PREFIX = b"addcar:no:"
 # Кнопки выбора срока, которые бот больше не показывает, но которые
 # остались в истории чатов (см. is_legacy_period_callback/
 # decode_legacy_trusted_task_period_callback) — принимаются ТОЛЬКО с теми
@@ -213,21 +215,22 @@ def decode_add_client_decision_callback(data: bytes | None) -> bool | None:
     return None
 
 
-def add_car_confirm_keyboard() -> list[list[Button]]:
+def add_car_confirm_keyboard(car_number: str) -> list[list[Button]]:
     return [[
-        Button.inline(ADD_CAR_CONFIRM_LABEL, _ADD_CAR_CONFIRM_YES),
-        Button.inline(CANCEL_BUTTON_LABEL, _ADD_CAR_CONFIRM_NO),
+        Button.inline(ADD_CAR_CONFIRM_LABEL, _encode_plate(_ADD_CAR_CONFIRM_YES_PREFIX, car_number)),
+        Button.inline(CANCEL_BUTTON_LABEL, _encode_plate(_ADD_CAR_CONFIRM_NO_PREFIX, car_number)),
     ]]
 
 
-def decode_add_car_confirm_callback(data: bytes | None) -> bool | None:
-    """True — "✅ Добавить", False — "Отмена", None — этот callback_data не
-    про подтверждение Add Car (тот же контракт, что и у
-    decode_add_client_decision_callback)."""
-    if data == _ADD_CAR_CONFIRM_YES:
-        return True
-    if data == _ADD_CAR_CONFIRM_NO:
-        return False
+def decode_add_car_confirm_callback(data: bytes | None) -> tuple[bool, str] | None:
+    """(True, номер) — "✅ Добавить", (False, номер) — "Отмена", None —
+    этот callback_data не про подтверждение Add Car."""
+    car_number = _decode_plate(data, _ADD_CAR_CONFIRM_YES_PREFIX)
+    if car_number is not None:
+        return True, car_number
+    car_number = _decode_plate(data, _ADD_CAR_CONFIRM_NO_PREFIX)
+    if car_number is not None:
+        return False, car_number
     return None
 
 

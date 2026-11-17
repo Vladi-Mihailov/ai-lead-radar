@@ -235,6 +235,16 @@ SET status = 'active', start_date = :start_date, end_date = :end_date,
 WHERE id = :id AND status IN ('stopped', 'expired')
 """
 
+# Подписка переезжает на другую задачу ТОГО ЖЕ номера (см.
+# SubscriptionService.turn_on_car: старая задача подписки завершена, номер
+# уже проверяется другой активной задачей — поднимать вторую нельзя, иначе
+# каждый штраф сохраняется и доставляется дважды). car_number не меняется.
+_MOVE_TO_TASK = """
+UPDATE fine_monitoring_subscriptions
+SET monitoring_task_id = :monitoring_task_id, updated_at = CURRENT_TIMESTAMP
+WHERE id = :id
+"""
+
 # Soft delete (см. SubscriptionStatus.archived) — разрешено из ЛЮБОГО
 # статуса, кроме уже archived (идемпотентно: повторное удаление не должно
 # считаться ошибкой, но и не должно сбрасывать updated_at повторно без
@@ -884,6 +894,21 @@ class FineSubscriptionRepository:
                     "start_date": start_date.isoformat(),
                     "end_date": end_date.isoformat(),
                 },
+            )
+        except sqlite3.IntegrityError:
+            self._conn.rollback()
+            return False
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def move_to_task(self, subscription_id: int, monitoring_task_id: int) -> bool:
+        """См. _MOVE_TO_TASK. False — подписка не найдена, ЛИБО (гонка)
+        у её владельца на новой задаче уже есть другая активная строка и
+        partial unique index отклонил UPDATE (тот же приём, что и у
+        reactivate())."""
+        try:
+            cursor = self._conn.execute(
+                _MOVE_TO_TASK, {"id": subscription_id, "monitoring_task_id": monitoring_task_id},
             )
         except sqlite3.IntegrityError:
             self._conn.rollback()

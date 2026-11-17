@@ -5,38 +5,49 @@
 reader/fines/models.py) — этот скрипт делает бессрочными ТОЛЬКО те записи,
 которые активны прямо сейчас:
 
+- fine_monitoring_tasks: status = 'active' И end_date >= today;
 - fine_monitoring_subscriptions: status IN ('active', 'pending_claim') И
   end_date >= today (ровно то, что сейчас доставляется, см.
-  FineSubscriptionRepository.list_all_deliverable);
-- fine_monitoring_tasks: status = 'active' И end_date >= today.
+  FineSubscriptionRepository.list_all_deliverable) И её задача активна
+  (подписку на задачу, которую никто не проверяет, бессрочной не делаем —
+  клиент навсегда видел бы "активен" без единой проверки).
 
 НЕ трогает (без отдельного согласования ничего массово не включается):
 stopped/expired/archived подписки, pending_claim с уже прошедшим сроком,
-completed/stopped задачи и активные задачи с уже прошедшим end_date — их
-статус и даты остаются как есть.
+подписки на неактивные задачи, completed/stopped задачи. Активные задачи с
+уже прошедшим end_date (их и сейчас проверяет коллектор, но клиентам по ним
+ничего не доставляется) по умолчанию тоже не трогаются — только с явным
+--include-past-active-tasks.
 
 Исторические сроки не теряются: перед заменой старый end_date каждой
 изменённой строки сохраняется в отдельную таблицу ge_monitoring_term_backup
 (table_name, row_id, old_end_date, migrated_at); исходные таблицы получают
 только новое значение end_date (схема и остальные колонки, включая
-updated_at, не меняются). --rollback возвращает сохранённые даты строкам,
-которые всё ещё бессрочные. Идемпотентно: повторный --execute ничего не
-меняет (уже бессрочные строки не подходят под условие). Ни одного
+updated_at, не меняются). Идемпотентно: повторный --execute ничего не
+меняет (уже бессрочные строки не подходят под условие). --rollback
+возвращает сохранённые даты строкам, которые всё ещё бессрочные. Ни одного
 обращения к police.ge, Telegram или сети — только локальная БД.
 
 По умолчанию — dry-run: ТОЛЬКО читает БД (mode=ro), печатает план, НИЧЕГО
-не пишет. Номера машин и Telegram-идентификаторы не печатаются — только
-количества.
+не пишет (и для --rollback тоже — реально пишет только с --execute). Номера
+машин и Telegram-идентификаторы не печатаются — только количества.
 
 Использование:
-    python -m scripts.migrate_georgia_unlimited_monitoring                # dry-run (default)
-    python -m scripts.migrate_georgia_unlimited_monitoring --execute      # реально пишет
-    python -m scripts.migrate_georgia_unlimited_monitoring --rollback     # вернуть старые сроки
-    python -m scripts.migrate_georgia_unlimited_monitoring --db-path X.db # другой файл (тесты)
+    python -m scripts.migrate_georgia_unlimited_monitoring                        # dry-run (default)
+    python -m scripts.migrate_georgia_unlimited_monitoring --execute              # реально пишет
+    python -m scripts.migrate_georgia_unlimited_monitoring --rollback             # что вернёт откат
+    python -m scripts.migrate_georgia_unlimited_monitoring --rollback --execute   # вернуть старые сроки
+    python -m scripts.migrate_georgia_unlimited_monitoring --include-past-active-tasks  # + активные задачи
+                                                                                  #   с прошедшим сроком
+    python -m scripts.migrate_georgia_unlimited_monitoring --db-path X.db         # другой файл (тесты)
 
-Перед --execute на production ОБЯЗАТЕЛЕН backup data/users.db (тот же
-паттерн, что и у scripts/migrate_georgia_plate_bootstrap_state.py) — этот
-скрипт backup файла САМ не делает."""
+Порядок на production (тот же день по Тбилиси): backup data/users.db →
+код нового релиза на диске → dry-run → --execute → перезапуск
+@GEShtrafbot. Пока бот не перезапущен, работает старый код — бессрочные
+строки он просто никогда не считает истёкшими. Запускать от того же
+пользователя, что и бот (sudo -u leadradar): БД в WAL-режиме, и -wal/-shm,
+созданные root, бот потом не сможет открыть. Backup файла скрипт САМ не
+делает."""
 
 from __future__ import annotations
 
@@ -70,13 +81,22 @@ CREATE TABLE IF NOT EXISTS {BACKUP_TABLE} (
 )
 """
 
-# Условия "активна прямо сейчас" — те же, что у выборок, которые решают,
-# проверяется ли машина и доставляются ли уведомления (см. модульный
-# докстрок). end_date < :unlimited — уже бессрочные строки не трогаем.
-_ELIGIBLE_WHERE = {
-    _SUBSCRIPTIONS: "status IN ('active', 'pending_claim') AND end_date >= :today AND end_date < :unlimited",
-    _TASKS: "status = 'active' AND end_date >= :today AND end_date < :unlimited",
-}
+_ACTIVE_TASK_IDS = f"SELECT id FROM {_TASKS} WHERE status = 'active'"
+
+
+def _eligible_where(*, include_past_active_tasks: bool) -> dict[str, str]:
+    """Условия "активна прямо сейчас" — те же, что у выборок, которые
+    решают, проверяется ли машина и доставляются ли уведомления (см.
+    модульный докстрок). end_date < :unlimited — уже бессрочные строки не
+    трогаем."""
+    task_term = "" if include_past_active_tasks else " AND end_date >= :today"
+    return {
+        _SUBSCRIPTIONS: (
+            "status IN ('active', 'pending_claim') AND end_date >= :today AND end_date < :unlimited "
+            f"AND monitoring_task_id IN ({_ACTIVE_TASK_IDS})"
+        ),
+        _TASKS: f"status = 'active'{task_term} AND end_date < :unlimited",
+    }
 
 
 @dataclass(frozen=True)
@@ -120,27 +140,31 @@ def _params(today: date) -> dict[str, str]:
     return {"today": today.isoformat(), "unlimited": UNLIMITED_END_DATE.isoformat()}
 
 
-def build_term_migration_plan(conn: sqlite3.Connection, *, today: date) -> TermMigrationPlan:
+def build_term_migration_plan(
+    conn: sqlite3.Connection, *, today: date, include_past_active_tasks: bool = False,
+) -> TermMigrationPlan:
     params = _params(today)
+    where = _eligible_where(include_past_active_tasks=include_past_active_tasks)
     subscriptions_to_convert = dict(conn.execute(
-        f"SELECT status, COUNT(*) FROM {_SUBSCRIPTIONS} WHERE {_ELIGIBLE_WHERE[_SUBSCRIPTIONS]} GROUP BY status",
+        f"SELECT status, COUNT(*) FROM {_SUBSCRIPTIONS} WHERE {where[_SUBSCRIPTIONS]} GROUP BY status",
         params,
     ).fetchall())
     tasks_to_convert = dict(conn.execute(
-        f"SELECT monitoring_scope, COUNT(*) FROM {_TASKS} WHERE {_ELIGIBLE_WHERE[_TASKS]} "
-        "GROUP BY monitoring_scope",
+        f"SELECT monitoring_scope || CASE WHEN end_date < :today THEN ' (срок прошёл)' ELSE '' END, COUNT(*) "
+        f"FROM {_TASKS} WHERE {where[_TASKS]} GROUP BY 1",
         params,
     ).fetchall())
     subscriptions_untouched = dict(conn.execute(
-        f"SELECT status || CASE WHEN end_date < :today THEN ' (срок прошёл)' ELSE '' END, COUNT(*) "
-        f"FROM {_SUBSCRIPTIONS} WHERE end_date < :unlimited AND NOT ({_ELIGIBLE_WHERE[_SUBSCRIPTIONS]}) "
+        "SELECT status || CASE WHEN end_date < :today THEN ' (срок прошёл)' "
+        f"WHEN monitoring_task_id NOT IN ({_ACTIVE_TASK_IDS}) THEN ' (задача не проверяется)' ELSE '' END, "
+        f"COUNT(*) FROM {_SUBSCRIPTIONS} WHERE end_date < :unlimited AND NOT ({where[_SUBSCRIPTIONS]}) "
         "GROUP BY 1",
         params,
     ).fetchall())
     tasks_untouched = dict(conn.execute(
         f"SELECT monitoring_scope || ' ' || status "
         "|| CASE WHEN end_date < :today THEN ' (срок прошёл)' ELSE '' END, COUNT(*) "
-        f"FROM {_TASKS} WHERE end_date < :unlimited AND NOT ({_ELIGIBLE_WHERE[_TASKS]}) GROUP BY 1",
+        f"FROM {_TASKS} WHERE end_date < :unlimited AND NOT ({where[_TASKS]}) GROUP BY 1",
         params,
     ).fetchall())
     already_unlimited_subscriptions = conn.execute(
@@ -159,12 +183,15 @@ def build_term_migration_plan(conn: sqlite3.Connection, *, today: date) -> TermM
     )
 
 
-def apply_term_migration(conn: sqlite3.Connection, *, today: date) -> dict[str, int]:
+def apply_term_migration(
+    conn: sqlite3.Connection, *, today: date, include_past_active_tasks: bool = False,
+) -> dict[str, int]:
     """Одна транзакция (BEGIN IMMEDIATE — бот пишет в ту же БД
     параллельно): сначала старые end_date в BACKUP_TABLE, затем замена на
     UNLIMITED_END_DATE ровно для тех же строк. Возвращает число изменённых
     строк по таблицам."""
     params = _params(today)
+    where = _eligible_where(include_past_active_tasks=include_past_active_tasks)
     changed: dict[str, int] = {}
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -172,12 +199,10 @@ def apply_term_migration(conn: sqlite3.Connection, *, today: date) -> dict[str, 
         for table in (_SUBSCRIPTIONS, _TASKS):
             conn.execute(
                 f"INSERT OR IGNORE INTO {BACKUP_TABLE} (table_name, row_id, old_end_date) "
-                f"SELECT '{table}', id, end_date FROM {table} WHERE {_ELIGIBLE_WHERE[table]}",
+                f"SELECT '{table}', id, end_date FROM {table} WHERE {where[table]}",
                 params,
             )
-            cursor = conn.execute(
-                f"UPDATE {table} SET end_date = :unlimited WHERE {_ELIGIBLE_WHERE[table]}", params,
-            )
+            cursor = conn.execute(f"UPDATE {table} SET end_date = :unlimited WHERE {where[table]}", params)
             changed[table] = cursor.rowcount
         conn.execute("COMMIT")
     except BaseException:
@@ -186,11 +211,39 @@ def apply_term_migration(conn: sqlite3.Connection, *, today: date) -> dict[str, 
     return changed
 
 
+_RESTORABLE_WHERE = (
+    "end_date >= :unlimited AND id IN (SELECT row_id FROM {backup} WHERE table_name = '{table}')"
+)
+
+
+def _backup_table_exists(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (BACKUP_TABLE,),
+    ).fetchone() is not None
+
+
+def build_rollback_plan(conn: sqlite3.Connection) -> dict[str, int]:
+    """Сколько строк вернёт --rollback --execute: сохранённые в
+    BACKUP_TABLE и всё ещё бессрочные. Работает и на read-only соединении
+    (таблицы нет — откатывать нечего)."""
+    if not _backup_table_exists(conn):
+        return {_SUBSCRIPTIONS: 0, _TASKS: 0}
+    params = {"unlimited": UNLIMITED_END_DATE.isoformat()}
+    return {
+        table: conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE {_RESTORABLE_WHERE.format(backup=BACKUP_TABLE, table=table)}",
+            params,
+        ).fetchone()[0]
+        for table in (_SUBSCRIPTIONS, _TASKS)
+    }
+
+
 def rollback_term_migration(conn: sqlite3.Connection) -> dict[str, int]:
     """Возвращает сохранённый end_date строкам, которые всё ещё бессрочные
     (если строку с тех пор кто-то перевёл на другую дату — её не трогаем),
-    и удаляет восстановленные записи из BACKUP_TABLE. Возвращает число
-    восстановленных строк по таблицам."""
+    и удаляет восстановленные записи из BACKUP_TABLE. Строки, ставшие
+    бессрочными уже после перехода (новые добавления), остаются бессрочными.
+    Возвращает число восстановленных строк по таблицам."""
     params = {"unlimited": UNLIMITED_END_DATE.isoformat()}
     restored: dict[str, int] = {}
     conn.execute("BEGIN IMMEDIATE")
@@ -201,9 +254,7 @@ def rollback_term_migration(conn: sqlite3.Connection) -> dict[str, int]:
                 f"UPDATE {table} SET end_date = ("
                 f"    SELECT b.old_end_date FROM {BACKUP_TABLE} b "
                 f"    WHERE b.table_name = '{table}' AND b.row_id = {table}.id"
-                f") WHERE end_date >= :unlimited AND id IN ("
-                f"    SELECT row_id FROM {BACKUP_TABLE} WHERE table_name = '{table}'"
-                ")",
+                f") WHERE {_RESTORABLE_WHERE.format(backup=BACKUP_TABLE, table=table)}",
                 params,
             )
             restored[table] = cursor.rowcount
@@ -236,20 +287,34 @@ def _resolve_db_path_and_today(explicit_db_path: str | None) -> tuple[Path, date
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument(
+    parser.add_argument(
         "--execute", action="store_true",
         help="Реально записать изменения в БД (default: dry-run, ничего не пишет).",
     )
-    mode.add_argument(
+    parser.add_argument(
         "--rollback", action="store_true",
-        help="Вернуть сроки, сохранённые предыдущим --execute.",
+        help="Вернуть сроки, сохранённые предыдущим --execute (пишет только вместе с --execute).",
+    )
+    parser.add_argument(
+        "--include-past-active-tasks", action="store_true",
+        help="Сделать бессрочными и активные задачи с уже прошедшим end_date (по умолчанию не трогаются).",
     )
     parser.add_argument(
         "--db-path", default=None,
         help="Путь к БД (default: settings.app.users_db_file из config/config.yaml).",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.rollback and args.include_past_active_tasks:
+        parser.error("--include-past-active-tasks не сочетается с --rollback")
+    return args
+
+
+def _connect_read_only(db_path: Path) -> sqlite3.Connection:
+    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+
+
+def _connect_for_write(db_path: Path) -> sqlite3.Connection:
+    return sqlite3.connect(db_path, timeout=30, isolation_level=None)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -261,7 +326,16 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.rollback:
-        conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
+        ro_conn = _connect_read_only(db_path)
+        try:
+            restorable = build_rollback_plan(ro_conn)
+        finally:
+            ro_conn.close()
+        print(f"Откат вернёт старые сроки: подписки {restorable[_SUBSCRIPTIONS]}, задачи {restorable[_TASKS]}.")
+        if not args.execute:
+            print("\nDry-run — ничего не записано. Запустите с --rollback --execute, чтобы откатить.")
+            return 0
+        conn = _connect_for_write(db_path)
         try:
             restored = rollback_term_migration(conn)
         finally:
@@ -269,9 +343,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Сроки восстановлены: подписки {restored[_SUBSCRIPTIONS]}, задачи {restored[_TASKS]}.")
         return 0
 
-    ro_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    ro_conn = _connect_read_only(db_path)
     try:
-        plan = build_term_migration_plan(ro_conn, today=today)
+        plan = build_term_migration_plan(
+            ro_conn, today=today, include_past_active_tasks=args.include_past_active_tasks,
+        )
     finally:
         ro_conn.close()
 
@@ -283,9 +359,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print("\n--execute: применяю...")
-    conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
+    conn = _connect_for_write(db_path)
     try:
-        changed = apply_term_migration(conn, today=today)
+        changed = apply_term_migration(
+            conn, today=today, include_past_active_tasks=args.include_past_active_tasks,
+        )
     finally:
         conn.close()
     print(f"Готово: бессрочными стали подписки {changed[_SUBSCRIPTIONS]}, задачи {changed[_TASKS]}.")

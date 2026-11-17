@@ -390,24 +390,26 @@ def test_trusted_one_off_callbacks_reject_empty_and_non_ascii_payload():
 
 def test_add_car_confirm_keyboard_has_add_and_cancel_instead_of_periods():
     """Подтверждение Add Car вместо выбора срока (см. задачу "убрать выбор
-    срока мониторинга") — ни одной кнопки "N дней"."""
-    keyboard = add_car_confirm_keyboard()
+    срока мониторинга") — ни одной кнопки "N дней"; номер из вопроса едет в
+    callback_data обеих кнопок."""
+    keyboard = add_car_confirm_keyboard("AA001AA")
 
     labels = [b.text for row in keyboard for b in row]
     assert labels == ["✅ Добавить", "Отмена"]
     assert not any("дней" in label for label in labels)
-    assert decode_add_car_confirm_callback(keyboard[0][0].data) is True
-    assert decode_add_car_confirm_callback(keyboard[0][1].data) is False
+    assert decode_add_car_confirm_callback(keyboard[0][0].data) == (True, "AA001AA")
+    assert decode_add_car_confirm_callback(keyboard[0][1].data) == (False, "AA001AA")
 
 
 def test_add_car_confirm_callback_does_not_collide_with_other_callbacks():
     """"Отмена" подтверждения (не создавать) и "Отмена" выбора клиента
     (= без клиента) — разные callback'и, decode одного не путает другой."""
-    yes, no = (button.data for button in add_car_confirm_keyboard()[0])
+    yes, no = (button.data for button in add_car_confirm_keyboard("AA001AA")[0])
     assert decode_add_client_decision_callback(yes) is None
     assert decode_add_client_decision_callback(no) is None
     assert decode_add_car_confirm_callback(b"addclient:yes") is None
     assert decode_add_car_confirm_callback(b"addclient:no") is None
+    assert decode_add_car_confirm_callback(b"addcar:yes:") is None
     assert decode_add_car_confirm_callback(None) is None
     assert is_legacy_period_callback(yes) is False
 

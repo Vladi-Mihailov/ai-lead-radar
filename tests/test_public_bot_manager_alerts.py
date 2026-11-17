@@ -295,11 +295,14 @@ async def test_new_user_alert_is_noop_when_manager_chat_id_not_configured(tmp_pa
 # "✅ Добавить" на подтверждении Add Car (см. задачу "убрать выбор срока
 # мониторинга") — и старая кнопка "30 дней" из истории чата, которая
 # работает так же (обратная совместимость callback_data).
-_ADD_CAR_CONFIRM_DATA = add_car_confirm_keyboard()[0][0].data
+def _add_car_confirm_data(car_number: str) -> bytes:
+    return add_car_confirm_keyboard(car_number)[0][0].data
+
+
 _LEGACY_PERIOD_DATA = b"period:30"
 
 
-@pytest.mark.parametrize("confirm_data", [_ADD_CAR_CONFIRM_DATA, _LEGACY_PERIOD_DATA])
+@pytest.mark.parametrize("confirm_data", [_add_car_confirm_data("M295YB196"), _LEGACY_PERIOD_DATA])
 async def test_new_user_adding_car_sends_followup_alert_with_car_number(tmp_path, confirm_data):
     fx = _Fixture(tmp_path)
     try:
@@ -335,14 +338,14 @@ async def test_existing_user_adding_second_car_sends_no_followup_alert(tmp_path)
         await _send_text(client, text="/start", sender_id=_USER_ID, sender=sender)
         await _send_text(client, text=texts.ADD_CAR_LABEL, sender_id=_USER_ID, sender=sender)
         await _send_text(client, text="M295YB196", sender_id=_USER_ID, sender=sender)
-        await _send_callback(client, data=_ADD_CAR_CONFIRM_DATA, sender_id=_USER_ID, sender=sender)
+        await _send_callback(client, data=_add_car_confirm_data("M295YB196"), sender_id=_USER_ID, sender=sender)
         messages_after_first_car = len(client.sent_messages)
         assert messages_after_first_car == 2  # new-user + first car-added
 
         # Второй автомобиль того же пользователя.
         await _send_text(client, text=texts.ADD_CAR_LABEL, sender_id=_USER_ID, sender=sender)
         await _send_text(client, text="B111BB11", sender_id=_USER_ID, sender=sender)
-        await _send_callback(client, data=_ADD_CAR_CONFIRM_DATA, sender_id=_USER_ID, sender=sender)
+        await _send_callback(client, data=_add_car_confirm_data("B111BB11"), sender_id=_USER_ID, sender=sender)
 
         # Ни нового "новый пользователь", ни ещё одного "добавил автомобиль".
         assert len(client.sent_messages) == messages_after_first_car

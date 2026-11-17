@@ -446,7 +446,7 @@ async def test_regular_user_plate_on_home_screen_still_starts_add_car(tmp_path):
         reply = await fx.controller.handle_text(_PLATE, chat_id=_USER_ID, telegram_user_id=_USER_ID, username=None)
 
         assert reply.text == texts.format_add_car_confirm_prompt(_PLATE)
-        assert reply.show_add_car_confirm_buttons is True
+        assert reply.add_car_confirm_plate == _PLATE
         assert reply.inline_buttons is None
         assert reply.trusted_one_off_plate is None
     finally:
@@ -622,7 +622,7 @@ async def test_add_to_monitoring_opens_existing_add_car_flow_without_period(tmp_
             False, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID,
         )
         assert confirm_prompt.text == texts.format_add_car_confirm_prompt(_PLATE)
-        assert confirm_prompt.show_add_car_confirm_buttons is True
+        assert confirm_prompt.add_car_confirm_plate == _PLATE
         done = await fx.controller.handle_add_car_confirm(
             chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID, first_name=None, last_name=None,
         )

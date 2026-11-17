@@ -676,23 +676,120 @@ def test_turn_on_car_reactivates_legacy_expired_subscription_unlimited(fx):
     assert fx.task_repository.get(task.id).end_date == UNLIMITED_END_DATE
 
 
-def test_expired_subscriptions_stay_expired_until_user_turns_them_on(fx):
+async def test_expired_subscriptions_stay_expired_until_user_turns_them_on(fx):
     """"Ранее отключённые или истёкшие мониторинги не активируй массово" —
     ни одно действие, кроме явного turn_on_car именно этой подписки, её не
     включает: она не доставляется и не становится активной сама по себе,
-    в том числе после того, как ДРУГОЙ клиент добавил ту же машину."""
-    _task, expired = _make_client_car(fx, telegram_user_id=1, today=date(2026, 1, 1), period_days=30)
+    в том числе после того, как ДРУГОЙ клиент добавил ту же машину (add_car
+    делает общую задачу бессрочной, но чужую подписку не трогает)."""
+    task, expired = _make_client_car(fx, telegram_user_id=1, today=date(2026, 1, 1), period_days=30)
     fx.subscription_repository.expire_elapsed(today=date(2026, 9, 3))
 
-    # Другой клиент добавляет ту же машину бессрочно.
-    _task2, _other = _make_client_car(fx, telegram_user_id=2, today=date(2026, 9, 3), period_days=30)
-    fx.service.turn_off_car(_other.id, telegram_user_id=2)
-    fx.service.turn_on_car(_other.id, telegram_user_id=2, today=date(2026, 9, 3))
+    other = await fx.service.add_car(
+        telegram_user_id=2, telegram_chat_id=2, username="bob",
+        first_name=None, last_name=None, car_number="M295YB196",
+        today=date(2026, 9, 3),
+    )
 
+    assert other.task.id == task.id
+    assert other.task.end_date == UNLIMITED_END_DATE
     assert fx.subscription_repository.get(expired.id).status == "expired"
     deliverable_ids = [s.id for s in fx.subscription_repository.list_all_deliverable(today=date(2026, 9, 3))]
     assert expired.id not in deliverable_ids
-    assert _other.id in deliverable_ids
+    assert other.subscription.id in deliverable_ids
+
+
+@pytest.mark.parametrize("sibling_term_elapsed", [False, True])
+def test_turn_on_legacy_expired_duplicate_uses_owners_active_subscription(fx, sibling_term_elapsed):
+    """Прежний сценарий продления ("➕ Добавить авто" на истёкшую машину)
+    создавал НОВУЮ строку, старая оставалась 'expired' на той же задаче.
+    "🔔 Включить уведомления" на старой строке не должен упираться в
+    уникальный индекс (одна активная строка на задачу и владельца):
+    включается уже существующая активная подписка (бессрочно), устаревший
+    дубль уходит в архив и пропадает из "Мои авто"."""
+    task, old = _make_client_car(fx, telegram_user_id=1, today=date(2026, 1, 1), period_days=30)
+    fx.subscription_repository.expire_elapsed(today=date(2026, 3, 1))
+    renewed_end = date(2026, 8, 31) if sibling_term_elapsed else date(2026, 12, 31)
+    renewed = fx.subscription_repository.create(
+        monitoring_task_id=task.id, car_number="M295YB196", telegram_user_id=1,
+        telegram_chat_id=1, telegram_username="client", start_date=date(2026, 3, 1), end_date=renewed_end,
+    )
+
+    result = fx.service.turn_on_car(old.id, telegram_user_id=1, today=date(2026, 9, 3))
+
+    assert result is not None
+    assert result.id == renewed.id
+    assert result.status == "active"
+    assert result.end_date == UNLIMITED_END_DATE
+    assert result.start_date == (date(2026, 9, 3) if sibling_term_elapsed else date(2026, 3, 1))
+    assert fx.subscription_repository.get(old.id).status == "archived"
+    assert [s.id for s in fx.service.list_my_cars(1)] == [renewed.id]
+    assert fx.task_repository.get(task.id).end_date == UNLIMITED_END_DATE
+
+
+def _completed_task_with_expired_subscription(fx, *, telegram_user_id=1):
+    old_task, old_sub = _make_client_car(fx, telegram_user_id=telegram_user_id, today=date(2026, 1, 1), period_days=30)
+    fx.subscription_repository.expire_elapsed(today=date(2026, 3, 1))
+    fx.task_repository.set_status(old_task.id, "completed")
+    return old_task, old_sub
+
+
+async def test_turn_on_moves_subscription_to_plates_active_task_instead_of_reviving_old_one(fx):
+    """Старая задача подписки завершена, а номер позже добавили заново
+    (другой клиент) — новая активная задача уже проверяет его. Включение
+    старой подписки НЕ поднимает старую задачу (две активные задачи на один
+    номер — каждый штраф сохранялся бы и доставлялся дважды): подписка
+    переезжает на активную задачу номера."""
+    old_task, old_sub = _completed_task_with_expired_subscription(fx)
+    readded = await fx.service.add_car(
+        telegram_user_id=2, telegram_chat_id=2, username="bob",
+        first_name=None, last_name=None, car_number="M295YB196",
+        today=date(2026, 9, 1),
+    )
+    assert readded.task.id != old_task.id
+
+    result = fx.service.turn_on_car(old_sub.id, telegram_user_id=1, today=date(2026, 9, 3))
+
+    assert result is not None
+    assert result.id == old_sub.id
+    assert result.status == "active"
+    assert result.end_date == UNLIMITED_END_DATE
+    assert result.monitoring_task_id == readded.task.id
+    assert fx.task_repository.get(old_task.id).status == "completed"
+    assert [t.id for t in fx.task_repository.get_active_by_car_number("M295YB196")] == [readded.task.id]
+
+
+async def test_turn_on_after_readd_by_same_owner_keeps_one_active_row(fx):
+    """Тот же владелец сам заново добавил номер (новая задача + новая
+    подписка), а потом нажал "Включить" на старой строке — дублей нет: в
+    работе остаётся одна активная подписка на активной задаче номера."""
+    old_task, old_sub = _completed_task_with_expired_subscription(fx)
+    readded = await fx.service.add_car(
+        telegram_user_id=1, telegram_chat_id=1, username="client",
+        first_name=None, last_name=None, car_number="M295YB196",
+        today=date(2026, 9, 1),
+    )
+
+    result = fx.service.turn_on_car(old_sub.id, telegram_user_id=1, today=date(2026, 9, 3))
+
+    assert result.id == readded.subscription.id
+    assert fx.subscription_repository.get(old_sub.id).status == "archived"
+    assert fx.task_repository.get(old_task.id).status == "completed"
+    assert [s.id for s in fx.service.list_my_cars(1)] == [readded.subscription.id]
+    assert len(fx.task_repository.get_active_by_car_number("M295YB196")) == 1
+
+
+def test_turn_on_revives_own_completed_task_when_plate_is_not_monitored(fx):
+    """Номер больше никто не проверяет — явное включение поднимает старую
+    задачу подписки (иначе подписка была бы "активна" без проверок)."""
+    old_task, old_sub = _completed_task_with_expired_subscription(fx)
+
+    result = fx.service.turn_on_car(old_sub.id, telegram_user_id=1, today=date(2026, 9, 3))
+
+    assert result.monitoring_task_id == old_task.id
+    revived = fx.task_repository.get(old_task.id)
+    assert revived.status == "active"
+    assert revived.end_date == UNLIMITED_END_DATE
 
 
 def test_turn_on_car_does_not_create_duplicate_subscription(fx):

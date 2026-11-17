@@ -289,9 +289,10 @@ def register(
 
         # "✅ Добавить" — и старые кнопки выбора срока из истории чата
         # (срока больше нет, см. задачу "убрать выбор срока мониторинга":
-        # такое нажатие подтверждает тот же шаг).
-        add_car_confirmed = decode_add_car_confirm_callback(data)
-        if add_car_confirmed or is_legacy_period_callback(data):
+        # такое нажатие подтверждает тот же шаг; номера в них нет).
+        add_car_decision = decode_add_car_confirm_callback(data)
+        legacy_period = is_legacy_period_callback(data)
+        if legacy_period or (add_car_decision is not None and add_car_decision[0]):
             # add_car()/add_delegated_car*() внутри делают немедленную
             # onboarding-проверку (live police.ge) — см.
             # _ack_then_await_slow_check про QueryIdInvalidError.
@@ -302,13 +303,16 @@ def register(
                     telegram_user_id=event.sender_id,
                     first_name=first_name,
                     last_name=last_name,
+                    car_number=None if legacy_period else add_car_decision[1],
                 ),
                 is_trusted=is_trusted,
                 on_reply=_notify_manager_alert_if_any,
             )
             return
-        if add_car_confirmed is False:
-            reply = controller.handle_add_car_cancel(chat_id=event.chat_id, telegram_user_id=event.sender_id)
+        if add_car_decision is not None:
+            reply = controller.handle_add_car_cancel(
+                chat_id=event.chat_id, telegram_user_id=event.sender_id, car_number=add_car_decision[1],
+            )
             await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
@@ -340,12 +344,10 @@ def register(
             return
 
         # "▶️ Продолжить мониторинг" с прежней карточки "срок истёк" (её
-        # бот больше не показывает, кнопка осталась в истории чата) — то же,
-        # что "🔔 Включить уведомления" (см. SubscriptionService.turn_on_car);
-        # карточка открыта не со страницы списка, поэтому page=0.
+        # бот больше не показывает, кнопка осталась в истории чата).
         my_car_resume = decode_my_car_resume_callback(data)
         if my_car_resume is not None:
-            reply = controller.handle_my_car_turn_on(my_car_resume, 0, telegram_user_id=event.sender_id)
+            reply = controller.handle_my_car_legacy_resume(my_car_resume, telegram_user_id=event.sender_id)
             await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
@@ -915,8 +917,8 @@ async def _send_reply(
     buttons = None
     if reply.show_main_menu:
         buttons = main_menu_keyboard(is_trusted=is_trusted)
-    elif reply.show_add_car_confirm_buttons:
-        buttons = add_car_confirm_keyboard()
+    elif reply.add_car_confirm_plate is not None:
+        buttons = add_car_confirm_keyboard(reply.add_car_confirm_plate)
     elif reply.show_add_client_decision_buttons:
         buttons = add_client_decision_keyboard()
     elif reply.check_now_options:
