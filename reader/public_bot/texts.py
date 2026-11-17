@@ -116,6 +116,7 @@ OSAGO_LINK_BUTTON_LABEL = "🚗 Оформить ОСАГО Грузия"
 OSAGO_BOT_URL = "https://t.me/OSAGO24GEbot?start=georgia_bot"
 
 CAR_NUMBER_PROMPT = "🚗 Введите госномер автомобиля\n\nНапример: M295YB196"
+CAR_NUMBER_TOO_LONG_TEXT = "❌ Номер автомобиля слишком длинный"
 # Self-service (обычный клиент) больше НЕ имеет своего username-prompt (см.
 # задачу "Georgia должен работать с Telegram identity так же, как Turkey")
 # — telegram_user_id достаточен как identity, username — только auto-

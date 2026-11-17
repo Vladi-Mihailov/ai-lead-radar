@@ -258,6 +258,19 @@ async def test_add_car_accepts_cyrillic_plate_and_normalizes_to_latin(fx):
     assert state.payload == {"car_number": "O687KE761", "username": "alice"}
 
 
+async def test_add_car_rejects_overlong_plate_and_stays_on_same_step(fx):
+    """normalize_car_number() длину не ограничивает, а номер едет в
+    callback_data кнопок подтверждения (у Telegram лимит 64 байта) —
+    слишком длинный ввод получает понятную ошибку вместо падения экрана."""
+    await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username=None)
+
+    reply = await fx.controller.handle_text("A1" * 30, chat_id=1, telegram_user_id=1, username=None)
+
+    assert reply.text.startswith(texts.CAR_NUMBER_TOO_LONG_TEXT)
+    assert reply.add_car_confirm_plate is None
+    assert fx.conversation_state_repository.get(1).step == STEP_AWAITING_CAR_NUMBER
+
+
 async def test_add_car_invalid_car_number_stays_on_same_step(fx):
     await fx.controller.handle_text(texts.ADD_CAR_LABEL, chat_id=1, telegram_user_id=1, username="alice")
 

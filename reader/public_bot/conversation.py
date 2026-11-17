@@ -145,6 +145,11 @@ STEP_AWAITING_OWNER_USERNAME = "awaiting_owner_username"
 STEP_AWAITING_ADD_CONFIRM = "awaiting_add_confirm"
 _LEGACY_STEP_AWAITING_PERIOD = "awaiting_period"
 _ADD_CONFIRM_STEPS = (STEP_AWAITING_ADD_CONFIRM, _LEGACY_STEP_AWAITING_PERIOD)
+# Номер едет в callback_data кнопок подтверждения (см. keyboards.py::
+# add_car_confirm_keyboard), а у Telegram на неё лимит 64 байта —
+# normalize_car_number() длину не ограничивает. 20 символов с запасом
+# покрывают реальные номера.
+_MAX_ADD_CAR_NUMBER_LENGTH = 20
 # Trusted-operator task-level 🔎 Проверить сейчас — ввод номера (см.
 # design report: "искать автомобиль в списке неудобно"), а не список.
 STEP_AWAITING_TRUSTED_CHECK_NOW_CAR_NUMBER = "awaiting_trusted_check_now_car_number"
@@ -1685,6 +1690,8 @@ class ConversationController:
             # Остаёмся на том же шаге — пользователь может ввести номер
             # заново, без необходимости начинать весь flow сначала.
             return BotReply(text=f"❌ {exc.message}\n\n{texts.CAR_NUMBER_PROMPT}")
+        if len(car_number) > _MAX_ADD_CAR_NUMBER_LENGTH:
+            return BotReply(text=f"{texts.CAR_NUMBER_TOO_LONG_TEXT}\n\n{texts.CAR_NUMBER_PROMPT}")
 
         if self._is_trusted(telegram_user_id):
             # Trusted-оператор — сначала явно спрашиваем, есть ли клиент

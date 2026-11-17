@@ -401,6 +401,14 @@ def test_add_car_confirm_keyboard_has_add_and_cancel_instead_of_periods():
     assert decode_add_car_confirm_callback(keyboard[0][1].data) == (False, "AA001AA")
 
 
+def test_add_car_confirm_keyboard_fits_telegram_limit_for_longest_accepted_plate():
+    """Бот принимает номер до 20 символов (см. conversation.py::
+    _MAX_ADD_CAR_NUMBER_LENGTH) — callback_data с ним укладывается в лимит
+    Telegram 64 байта."""
+    for button in add_car_confirm_keyboard("A" * 20)[0]:
+        assert len(button.data) <= 64
+
+
 def test_add_car_confirm_callback_does_not_collide_with_other_callbacks():
     """"Отмена" подтверждения (не создавать) и "Отмена" выбора клиента
     (= без клиента) — разные callback'и, decode одного не путает другой."""

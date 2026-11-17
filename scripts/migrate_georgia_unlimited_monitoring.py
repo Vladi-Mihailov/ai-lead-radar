@@ -5,12 +5,13 @@
 reader/fines/models.py) — этот скрипт делает бессрочными ТОЛЬКО те записи,
 которые активны прямо сейчас:
 
-- fine_monitoring_tasks: status = 'active' И end_date >= today;
 - fine_monitoring_subscriptions: status IN ('active', 'pending_claim') И
   end_date >= today (ровно то, что сейчас доставляется, см.
   FineSubscriptionRepository.list_all_deliverable) И её задача активна
   (подписку на задачу, которую никто не проверяет, бессрочной не делаем —
-  клиент навсегда видел бы "активен" без единой проверки).
+  клиент навсегда видел бы "активен" без единой проверки);
+- fine_monitoring_tasks: status = 'active' И (end_date >= today ИЛИ это
+  задача такой подписки — у бессрочной подписки задача тоже бессрочная).
 
 НЕ трогает (без отдельного согласования ничего массово не включается):
 stopped/expired/archived подписки, pending_claim с уже прошедшим сроком,
@@ -43,11 +44,13 @@ updated_at, не меняются). Идемпотентно: повторный
 
 Порядок на production (тот же день по Тбилиси): backup data/users.db →
 код нового релиза на диске → dry-run → --execute → перезапуск
-@GEShtrafbot. Пока бот не перезапущен, работает старый код — бессрочные
-строки он просто никогда не считает истёкшими. Запускать от того же
-пользователя, что и бот (sudo -u leadradar): БД в WAL-режиме, и -wal/-shm,
-созданные root, бот потом не сможет открыть. Backup файла скрипт САМ не
-делает."""
+@GEShtrafbot → ещё раз --execute (подхватит то, что старый код успел
+создать или продлить со сроком между шагами; повтор безопасен) → dry-run
+должен показать "итого строк: 0". Пока бот не перезапущен, работает
+старый код — бессрочные строки он просто никогда не считает истёкшими.
+Запускать от того же пользователя, что и бот (sudo -u leadradar): БД в
+WAL-режиме, и -wal/-shm, созданные root, бот потом не сможет открыть.
+Backup файла скрипт САМ не делает."""
 
 from __future__ import annotations
 
@@ -88,14 +91,22 @@ def _eligible_where(*, include_past_active_tasks: bool) -> dict[str, str]:
     """Условия "активна прямо сейчас" — те же, что у выборок, которые
     решают, проверяется ли машина и доставляются ли уведомления (см.
     модульный докстрок). end_date < :unlimited — уже бессрочные строки не
-    трогаем."""
-    task_term = "" if include_past_active_tasks else " AND end_date >= :today"
+    трогаем. Задача подписки, которая становится бессрочной, тоже
+    становится бессрочной, даже если её собственный срок уже прошёл
+    (иначе FineJob, если он снова будет включён, завершил бы задачу, а
+    клиент видел бы "активен"). Подзапрос задач смотрит на ещё не
+    изменённые подписки — поэтому apply_term_migration() меняет задачи
+    первыми."""
+    subscriptions = (
+        "status IN ('active', 'pending_claim') AND end_date >= :today AND end_date < :unlimited "
+        f"AND monitoring_task_id IN ({_ACTIVE_TASK_IDS})"
+    )
+    task_term = "" if include_past_active_tasks else (
+        f" AND (end_date >= :today OR id IN (SELECT monitoring_task_id FROM {_SUBSCRIPTIONS} WHERE {subscriptions}))"
+    )
     return {
-        _SUBSCRIPTIONS: (
-            "status IN ('active', 'pending_claim') AND end_date >= :today AND end_date < :unlimited "
-            f"AND monitoring_task_id IN ({_ACTIVE_TASK_IDS})"
-        ),
-        _TASKS: f"status = 'active'{task_term} AND end_date < :unlimited",
+        _SUBSCRIPTIONS: subscriptions,
+        _TASKS: f"status = 'active' AND end_date < :unlimited{task_term}",
     }
 
 
@@ -196,7 +207,7 @@ def apply_term_migration(
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute(_CREATE_BACKUP_TABLE)
-        for table in (_SUBSCRIPTIONS, _TASKS):
+        for table in (_TASKS, _SUBSCRIPTIONS):
             conn.execute(
                 f"INSERT OR IGNORE INTO {BACKUP_TABLE} (table_name, row_id, old_end_date) "
                 f"SELECT '{table}', id, end_date FROM {table} WHERE {where[table]}",
