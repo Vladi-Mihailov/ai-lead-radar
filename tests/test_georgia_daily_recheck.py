@@ -407,14 +407,33 @@ async def test_yesterdays_failures_go_to_the_end_of_the_queue(fx):
     assert second.checked == 1
 
 
-async def test_inactive_task_snapshot_is_refreshed_so_gone_car_leaves_statistics(fx):
-    task = fx.car_with_fines("AA111BB", "GE1", status="completed")
+async def test_inactive_task_gets_snapshot_only_and_new_fine_reaches_operator_once(fx):
+    completed = fx.car_with_fines("AA111BB", "GE1", status="completed")
     active = fx.tasks.create(
         car_number="AA111BB", label=None, start_date=date(2026, 11, 1), end_date=date(2026, 12, 31),
         telegram_chat_id=-1, created_by_user_id=1,
     )
+    tasks, snapshot_only = fx.service._tasks_for_plate("AA111BB")
+    assert [t.id for t in tasks] == [active.id] and [t.id for t in snapshot_only] == [completed.id]
 
-    assert {t.id for t in fx.service._tasks_for_plate("AA111BB")} == {task.id, active.id}
+    fx.provider.records["AA111BB"] = [_record("AA111BB", "GE1"), _record("AA111BB", "GE9", 30)]
+    await fx.service.tick()
+
+    pending = fx.fines.list_pending_notifications()
+    assert [fine.external_fine_id for fine in pending].count("GE9") == 1
+    # снимок неактивной задачи обновлён — статистика долга видит новую сумму
+    assert fx.tasks.get(completed.id).last_successful_total_amount == 80
+    assert not [f for f in fx.fines.list_by_car_number("AA111BB") if f.monitoring_task_id == completed.id
+                and f.external_fine_id == "GE9"]
+
+
+async def test_inactive_only_car_is_checked_through_one_freshest_task(fx):
+    older = fx.car_with_fines("AA111BB", "GE1", checked_at="2026-11-10 10:00:00", status="completed")
+    newer = fx.car_with_fines("AA111BB", "GE1", checked_at="2026-11-12 10:00:00", status="completed")
+
+    tasks, snapshot_only = fx.service._tasks_for_plate("AA111BB")
+
+    assert [t.id for t in tasks] == [newer.id] and [t.id for t in snapshot_only] == [older.id]
 
 
 async def test_stale_running_run_is_closed_outside_window(tmp_path):
@@ -456,9 +475,9 @@ async def test_max_plates_cap(tmp_path):
 async def test_inactive_car_is_checked_through_its_freshest_task(fx):
     task = fx.car_with_fines("AA111BB", "GE1", status="completed")
 
-    tasks = fx.service._tasks_for_plate("AA111BB")
+    tasks, snapshot_only = fx.service._tasks_for_plate("AA111BB")
 
-    assert [t.id for t in tasks] == [task.id]
+    assert [t.id for t in tasks] == [task.id] and snapshot_only == []
 
 
 async def test_invalid_window_is_rejected(fx):

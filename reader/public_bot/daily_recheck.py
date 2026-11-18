@@ -287,6 +287,7 @@ class _TaskRepositoryLike(Protocol):
 class _CheckServiceLike(Protocol):
     async def check_plate_for_tasks(
         self, car_number: str, tasks: list[FineMonitoringTask], *, refresh_page: bool = False,
+        snapshot_only_tasks: list[FineMonitoringTask] | tuple = (),
     ) -> dict[int, CheckResult]: ...
 
 
@@ -382,23 +383,32 @@ class DailyRecheckService:
         plates.sort(key=lambda car: (car in failed_yesterday, last_checked[car] or datetime.min, car))
         return plates[: self._max_plates]
 
-    def _tasks_for_plate(self, car_number: str) -> list[FineMonitoringTask]:
-        """Активные задачи номера и задачи с положительным снимком долга
-        (как у "🔄 Проверить авто со штрафами": иначе снимок неактивной
-        задачи так и остался бы старым и держал машину в статистике). Если
-        таких нет — одна самая свежая задача с известным снимком, иначе
-        самая новая."""
+    def _tasks_for_plate(self, car_number: str) -> tuple[list[FineMonitoringTask], list[FineMonitoringTask]]:
+        """(задачи, по которым создаются строки detected_fines и
+        уведомления; задачи, которым только обновляется снимок суммы).
+
+        Строки — у активных задач номера; если активных нет — у одной самой
+        свежей задачи с положительным снимком (машина могла уйти с
+        мониторинга, но остаться в статистике долга), иначе у самой свежей
+        задачи со снимком или самой новой. Остальным задачам с
+        положительным снимком обновляется только снимок: иначе он так и
+        остался бы старым и держал машину в статистике, а строки по ним
+        прислали бы оператору новый штраф второй раз."""
         tasks = self._tasks.list_by_car_number(car_number)
-        selected = [
+        active = [task for task in tasks if task.status == "active"]
+        positive = [
             task for task in tasks
-            if task.status == "active" or (task.last_successful_total_amount or 0) > 0
+            if task.status != "active" and (task.last_successful_total_amount or 0) > 0
         ]
-        if selected:
-            return selected
+        if active:
+            return active, positive
+        if positive:
+            freshest = max(positive, key=lambda task: (_naive_utc(task.last_successful_checked_at), task.id))
+            return [freshest], [task for task in positive if task.id != freshest.id]
         with_snapshot = [task for task in tasks if task.last_successful_checked_at is not None]
         if with_snapshot:
-            return [max(with_snapshot, key=lambda task: (_naive_utc(task.last_successful_checked_at), task.id))]
-        return [max(tasks, key=lambda task: task.id)] if tasks else []
+            return [max(with_snapshot, key=lambda task: (_naive_utc(task.last_successful_checked_at), task.id))], []
+        return ([max(tasks, key=lambda task: task.id)] if tasks else []), []
 
     async def tick(self, now: datetime | None = None) -> DailyRecheckRun | None:
         """Вызывается фоновым циклом раз в ~30 с. Вне окна и после
@@ -462,7 +472,7 @@ class DailyRecheckService:
                 if not self.in_window(self._clock()):
                     return self._finish(run_date, RUN_POSTPONED, STOP_CUTOFF)
 
-                tasks = self._tasks_for_plate(car_number)
+                tasks, snapshot_only = self._tasks_for_plate(car_number)
                 if not tasks:
                     self._repository.mark_item(run_date, car_number, state=ITEM_SKIPPED, now=self._clock())
                     continue
@@ -471,7 +481,7 @@ class DailyRecheckService:
                 # (дата "Date of update of information") — один GET в день.
                 try:
                     results = await self._check_service.check_plate_for_tasks(
-                        car_number, tasks, refresh_page=first,
+                        car_number, tasks, refresh_page=first, snapshot_only_tasks=snapshot_only,
                     )
                 except Exception:
                     logger.exception("Georgia daily recheck: unexpected error while checking a plate")

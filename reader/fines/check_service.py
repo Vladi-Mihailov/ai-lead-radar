@@ -359,6 +359,7 @@ class FineCheckService:
 
     async def check_plate_for_tasks(
         self, car_number: str, tasks: list[FineMonitoringTask], *, refresh_page: bool = False,
+        snapshot_only_tasks: list[FineMonitoringTask] | tuple = (),
     ) -> dict[int, CheckResult]:
         """См. задачу "Georgia debt deduplication by physical car_number" —
         когда НЕСКОЛЬКО fine_monitoring_tasks делят один и тот же
@@ -406,8 +407,16 @@ class FineCheckService:
         if is_fine_output_suppressed(car_number):
             return {task.id: self._suppressed_result() for task in tasks}
 
+        # snapshot_only_tasks (вечерняя перепроверка, см. reader/public_bot/
+        # daily_recheck.py) — неактивные задачи номера с положительным
+        # снимком: им обновляется только снимок суммы (иначе машина
+        # навсегда осталась бы в статистике долга), без строк detected_fines
+        # и уведомлений — новый штраф уходит оператору ровно по задачам из
+        # tasks. Они же — свидетельство долга для false-zero guard.
         try:
-            search_result, zero_confirmed = await self._fetch_trusted(car_number, tasks, refresh_page=refresh_page)
+            search_result, zero_confirmed = await self._fetch_trusted(
+                car_number, [*tasks, *snapshot_only_tasks], refresh_page=refresh_page,
+            )
         except FineProviderError as exc:
             return {task.id: self._record_error(task, exc, started_at) for task in tasks}
 
@@ -415,7 +424,7 @@ class FineCheckService:
         # Snapshot для ВСЕЙ группы сразу — до медленной обработки штрафов
         # первой же задачи (иначе остальные задачи группы оставались бы со
         # старым snapshot всё время обработки предыдущих).
-        for task in tasks:
+        for task in [*tasks, *snapshot_only_tasks]:
             self._persist_snapshot(task, records)
 
         results = {

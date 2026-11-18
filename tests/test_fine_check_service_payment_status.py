@@ -236,6 +236,17 @@ async def test_check_plate_for_tasks_passes_refresh_flag_and_tracks_once(fx):
     assert [e["event"] for e in fx.tracker.events(status.id)] == ["listed"]
 
 
+async def test_snapshot_only_tasks_get_total_but_no_rows(fx):
+    main_task, other = fx.task(), fx.task()
+    fx.provider.results = [ProviderSearchResult(records=[_record("GE1", 40)])]
+
+    results = await fx.service.check_plate_for_tasks(_CAR, [main_task], snapshot_only_tasks=[other])
+
+    assert list(results) == [main_task.id]
+    assert fx.tasks.get(other.id).last_successful_total_amount == 40
+    assert [fine.monitoring_task_id for fine in fx.fines.list_by_car_number(_CAR)] == [main_task.id]
+
+
 async def test_tracker_failure_does_not_fail_the_check(fx, caplog):
     class _Broken:
         def record_full_check(self, *args, **kwargs):

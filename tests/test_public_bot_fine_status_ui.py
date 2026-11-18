@@ -230,15 +230,34 @@ async def test_statistics_separates_confirmed_paid_and_uncertain(tmp_path):
 
 async def test_car_with_only_gone_receipts_leaves_statistics_despite_old_snapshot(fx):
     task, _ = fx.car(_CAR, [("GE1", 70)])
-    await fx.check(task)  # положительный снимок задачи остаётся старым
-    t0 = datetime(2026, 11, 18, 19, 0)
-    fx.tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=t0)
-    fx.tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=t0 + timedelta(hours=13))
+    await fx.check(task)  # положительный снимок задачи остаётся прежним
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    fx.tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=now - timedelta(hours=13))
+    fx.tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=now + timedelta(seconds=5))
 
     reply = fx.controller._format_statistics_reply()
 
     assert "Автомобилей: 0" in reply.text
     assert "🔴 Подтверждённая задолженность: 0 ₾ (0 шт.)" in reply.text
+
+
+async def test_snapshot_newer_than_statuses_is_still_shown_as_debt(fx):
+    """Квитанция давно ⚪, а потом проверка БЕЗ статусов (операторский
+    процесс, сбой записи статусов) нашла настоящий долг — он не прячется."""
+    task, _ = fx.car(_CAR, [("GE1", 70)])
+    long_ago = datetime(2026, 1, 1, 10, 0)
+    fx.tracker.record_full_check(_CAR, [_record(_CAR, "GE1", 70)], complete=True, at=long_ago)
+    fx.tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=long_ago + timedelta(hours=1))
+    fx.tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=long_ago + timedelta(hours=14))
+    assert fx.status(_CAR, "GE1").presence == "gone"
+    untracked = FineCheckService(fx.provider, fx.tasks, fx.fines, sleep=_instant)  # без статусов
+    fx.provider.records[_CAR] = [_record(_CAR, "GE5", 90)]
+    await untracked.check_task(fx.tasks.get(task.id))
+
+    reply = fx.controller._format_statistics_reply()
+
+    assert "🔴 Подтверждённая задолженность: 90 ₾" in reply.text
+    assert "💰 Задолженность: 90 ₾" in reply.text
 
 
 async def test_statistics_without_statuses_is_unchanged(tmp_path):
@@ -479,6 +498,17 @@ def test_callback_round_trips_and_rejects_garbage():
     assert keyboards.decode_fine_status_back_callback(keyboards.encode_fine_status_back_callback(7)) == 7
     assert keyboards.is_fine_status_ask_callback(b"fstask")
     assert all(len(keyboards.encode_fine_status_action_callback(10**9, a)) <= 64 for a in keyboards.FINE_STATUS_ACTIONS)
+
+
+def test_daily_recheck_line_labels_every_stop_reason():
+    for reason in ("blocked", "unavailable", "errors", "cutoff", "busy", "interrupted"):
+        run = DailyRecheckRun(
+            run_date=date(2026, 11, 18), status="postponed", started_at=datetime(2026, 11, 18, 19, 0),
+            heartbeat_at=datetime(2026, 11, 18, 19, 1), finished_at=datetime(2026, 11, 18, 19, 1),
+            total=5, checked=2, failed=0, stop_reason=reason,
+        )
+        line = texts.format_daily_recheck_line(run)
+        assert reason not in line, line  # у каждой причины — русская подпись
 
 
 def test_statistics_keyboard_has_payment_status_button_only_when_enabled():

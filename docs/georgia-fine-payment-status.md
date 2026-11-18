@@ -173,8 +173,10 @@ The re-check, once a day:
   - Order: least recently checked first; plates the previous pass failed on
     go last, so two always-failing plates cannot stop every pass.
   - At most `daily_recheck_max_plates`.
-  - Checked tasks: all active tasks of the plate plus every task with a
-    positive total.
+  - Fine rows and notifications are created only for the plate's active
+    tasks; with no active task, only for its freshest task with a positive
+    total. Other tasks with a positive total only get their total refreshed,
+    so a new fine reaches the operator once.
 - **How:** the same `FineCheckService.check_plate_for_tasks` as «🔄 Проверить
   авто со штрафами»: `searchByAuto` through REDNET, the false-zero guard,
   normal handling of new fines, no repeat notifications for known ones.
@@ -243,7 +245,11 @@ largest share of police.ge traffic and needs a separate decision.
 ## Configuration
 
 Nothing changes in production until `daily_recheck_enabled` is turned on.
-Statuses and screens work with the defaults. Keys under `fine_monitor:` in
+Statuses and screens work with the defaults.
+
+The one exception: a manual or manager check that gets an empty answer for a
+plate with known (non-⚪) receipts now makes the 5-second confirmation
+request. Plates with a positive total already did this. Keys under `fine_monitor:` in
 `config/config.yaml`, with their defaults:
 
 ```yaml

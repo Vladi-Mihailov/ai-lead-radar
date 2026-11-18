@@ -95,7 +95,7 @@ import logging
 import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from reader.fines.models import OneOffCheckResult
@@ -281,6 +281,20 @@ _DEBT_LIST_PAGE_CHAR_BUDGET = 3000
 # Со статусами оплаты заголовок debt-блока примерно на 350 символов длиннее
 # (три категории, дата обновления базы, строка вечерней перепроверки).
 _DEBT_LIST_PAGE_CHAR_BUDGET_WITH_STATUSES = 2600
+
+
+def _statuses_are_current(observed_at: datetime | None, snapshot_at: datetime | None) -> bool:
+    """Статусы машины сверены с police.ge не раньше её снимка суммы (с
+    запасом в минуту: снимок пишется до обработки штрафов, статусы — после)."""
+    if observed_at is None:
+        return False
+    if snapshot_at is None:
+        return True
+    observed = observed_at.replace(tzinfo=None) if observed_at.tzinfo else observed_at
+    snapshot = (
+        snapshot_at.astimezone(timezone.utc).replace(tzinfo=None) if snapshot_at.tzinfo else snapshot_at
+    )
+    return observed >= snapshot - timedelta(minutes=1)
 
 
 def _paginate_debt_blocks(blocks: list[str], *, char_budget: int = _DEBT_LIST_PAGE_CHAR_BUDGET) -> list[list[str]]:
@@ -1363,23 +1377,25 @@ class ConversationController:
         неопределённый статус, затем оплаченное."""
         assert self._fine_status is not None
         snapshot_totals = {group.car_number: group.total_amount for group in debt_groups}
+        snapshot_times = {group.car_number: group.checked_at for group in debt_groups}
         car_numbers = list(dict.fromkeys(
             [group.car_number for group in debt_groups] + self._fine_status.listed_car_numbers()
         ))
         breakdowns = self._fine_status.breakdown_for_cars(car_numbers)
-        with_statuses = self._fine_status.car_numbers_with_statuses(car_numbers)
+        observed = self._fine_status.latest_observation_by_car(car_numbers)
         rows: list[tuple[str, float, DebtBreakdown | None]] = []
         totals = DebtBreakdown()
         for car_number in car_numbers:
             breakdown = breakdowns.get(car_number)
             snapshot = snapshot_totals.get(car_number, 0.0)
             if breakdown is None or breakdown.listed_count == 0:
-                if snapshot <= 0 or car_number in with_statuses:
-                    # Все квитанции машины уже ⚪ — старый снимок неактивной
-                    # задачи долгом не считается.
+                if snapshot <= 0 or _statuses_are_current(observed.get(car_number), snapshot_times.get(car_number)):
+                    # Все квитанции машины ⚪ по статусам, сверенным не раньше
+                    # снимка, — старый снимок долгом не считается.
                     continue
-                # Снимок долга есть, а квитанций в статусах нет вовсе (старые
-                # записи без номера квитанции) — сумма снимка остаётся
+                # Снимок долга есть, а статусов нет вовсе или они старше
+                # снимка (проверка прошла без статусов: операторский процесс,
+                # сбой записи статусов) — сумма снимка остаётся
                 # неоплаченной, как и раньше; число штрафов неизвестно.
                 breakdown = DebtBreakdown(unpaid_amount=snapshot, unpaid_count=1)
             rows.append((car_number, snapshot, breakdown))

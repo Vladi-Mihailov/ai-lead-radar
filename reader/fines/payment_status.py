@@ -416,6 +416,20 @@ class FineStatusRepository:
         ).fetchall()
         return {row[0] for row in rows}
 
+    def latest_observation_by_car(self, car_numbers: list[str]) -> dict[str, datetime]:
+        """Когда статусы машины последний раз сверялись с ответом police.ge
+        (максимум из last_listed_at/missing_since/gone_at по её квитанциям)."""
+        if not car_numbers:
+            return {}
+        placeholders = ",".join("?" for _ in car_numbers)
+        rows = self._conn.execute(
+            "SELECT car_number, MAX(MAX(last_listed_at, COALESCE(missing_since, last_listed_at), "
+            "COALESCE(gone_at, last_listed_at))) FROM georgia_fine_status "
+            f"WHERE car_number IN ({placeholders}) GROUP BY car_number",
+            list(car_numbers),
+        ).fetchall()
+        return {row[0]: _parse_ts(row[1]) for row in rows if row[1]}
+
     def list_recently_gone_car_numbers(self, *, since: datetime) -> list[str]:
         rows = self._conn.execute(
             f"SELECT DISTINCT car_number FROM georgia_fine_status WHERE presence = '{PRESENCE_GONE}' "
@@ -815,6 +829,9 @@ class FineStatusTracker:
 
     def car_numbers_with_statuses(self, car_numbers: list[str]) -> set[str]:
         return self._repository.list_car_numbers_with_statuses(car_numbers)
+
+    def latest_observation_by_car(self, car_numbers: list[str]) -> dict[str, datetime]:
+        return self._repository.latest_observation_by_car(car_numbers)
 
     def breakdown_for_cars(self, car_numbers: list[str]) -> dict[str, DebtBreakdown]:
         by_car: dict[str, list[FineStatus]] = {}
