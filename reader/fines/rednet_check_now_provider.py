@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import date
 
 import httpx
 
@@ -56,7 +57,10 @@ from reader.fines.models import ParsedFineRecord
 from reader.fines.provider import (
     FineProvider,
     FineProviderError,
+    PoliceGeBlockedError,
     PoliceGeUnavailableError,
+    ProviderSearchResult,
+    search_detailed,
 )
 
 logger = logging.getLogger(__name__)
@@ -87,7 +91,19 @@ class RednetCheckNowProvider(FineProvider):
         self._timeout = timeout
 
     async def search_by_plate(self, plate: str) -> list[ParsedFineRecord]:
-        body = json.dumps({"plate": plate}).encode("utf-8")
+        return (await self.search_by_plate_detailed(plate)).records
+
+    async def search_by_plate_detailed(
+        self, plate: str, *, refresh_page: bool = False,
+    ) -> ProviderSearchResult:
+        """count/source_updated_on — из ответа REDNET, если его версия их
+        присылает (см. check_now_server.py), иначе None. refresh_page
+        передаётся флагом в теле запроса только когда True — обычный запрос
+        остаётся байт в байт прежним."""
+        request_payload: dict = {"plate": plate}
+        if refresh_page:
+            request_payload["refresh_page"] = True
+        body = json.dumps(request_payload).encode("utf-8")
         timestamp = str(time.time())
         signature = sign(
             self._hmac_secret, method="POST", path=_CHECK_NOW_PATH, timestamp=timestamp, body=body,
@@ -114,13 +130,27 @@ class RednetCheckNowProvider(FineProvider):
             # "service temporarily unavailable" message.
             raise PoliceGeUnavailableError("REDNET reports police.ge unavailable (circuit open)")
         if response.status_code != 200:
+            blocked_status = _blocked_http_status(response)
+            if blocked_status is not None:
+                # police.ge ответил REDNET'у 403/429 (см. check_now_server.py)
+                # — отдельный тип, чтобы массовая перепроверка
+                # остановилась сразу, а не после нескольких ошибок подряд.
+                raise PoliceGeBlockedError(
+                    f"REDNET reports police.ge refused the request (HTTP {blocked_status})",
+                    status_code=blocked_status,
+                )
             raise FineProviderError(f"REDNET check-now returned HTTP {response.status_code}")
 
         try:
             data = response.json()
-            return [payload_to_record(entry) for entry in data["records"]]
+            records = [payload_to_record(entry) for entry in data["records"]]
         except (ValueError, KeyError, TypeError) as exc:
             raise FineProviderError(f"REDNET check-now returned a malformed body: {exc}") from exc
+        return ProviderSearchResult(
+            records=records,
+            reported_count=_optional_int(data.get("count")),
+            source_updated_on=_optional_date(data.get("source_updated_on")),
+        )
 
 
 class AutoFailoverCheckNowProvider(FineProvider):
@@ -147,3 +177,44 @@ class AutoFailoverCheckNowProvider(FineProvider):
                 "Check Now: local police.ge provider failed, falling back to REDNET",
             )
             return await self._rednet.search_by_plate(plate)
+
+    async def search_by_plate_detailed(
+        self, plate: str, *, refresh_page: bool = False,
+    ) -> ProviderSearchResult:
+        """Тот же порядок local -> REDNET, что и search_by_plate(), но с
+        метаданными ответа того транспорта, который реально ответил."""
+        try:
+            return await search_detailed(self._local, plate, refresh_page=refresh_page)
+        except FineProviderError:
+            logger.info(
+                "Check Now: local police.ge provider failed, falling back to REDNET",
+            )
+            return await search_detailed(self._rednet, plate, refresh_page=refresh_page)
+
+
+def _blocked_http_status(response: httpx.Response) -> int | None:
+    """HTTP-код отказа police.ge из тела ответа REDNET ({"error": "blocked",
+    "http_status": 403}) — None для любого другого тела (старый REDNET,
+    обычная ошибка источника, не JSON)."""
+    try:
+        data = response.json()
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or data.get("error") != "blocked":
+        return None
+    return _optional_int(data.get("http_status"))
+
+
+def _optional_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _optional_date(value: object) -> date | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None

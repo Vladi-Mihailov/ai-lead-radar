@@ -333,6 +333,12 @@ class CheckResult:
     # понятное сообщение вместо общего "попробуйте позже". Default False
     # сохраняет поведение существующих вызовов CheckResult(...) без правки.
     provider_unavailable: bool = False
+    # True ТОЛЬКО когда error_message пришёл от PoliceGeBlockedError —
+    # police.ge ответил 403/429 (см. reader/fines/provider.py). Вечерняя
+    # перепроверка (reader/public_bot/daily_recheck.py) на таком ответе
+    # останавливается сразу. Default False — существующие вызовы
+    # CheckResult(...) не меняются.
+    provider_blocked: bool = False
     # True ТОЛЬКО когда результат получен через FineCheckService.
     # _read_last_known_state() (см. задачу "Georgia fines incremental
     # public-feed monitoring", emergency-mode чтение из detected_fines

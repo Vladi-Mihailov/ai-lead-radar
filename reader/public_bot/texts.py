@@ -10,6 +10,18 @@ from dataclasses import dataclass
 from datetime import date, datetime
 
 from reader.fines.models import FineMonitoringTask, NewFineEvent
+from reader.fines.payment_status import (
+    DISPLAY_GONE,
+    PAYMENT_NEEDS_REVIEW,
+    PAYMENT_PAID,
+    PAYMENT_UNPAID,
+    PRESENCE_MISSING,
+    SOURCE_PAYMENT_PAGE,
+    SOURCE_RECEIPT,
+    DebtBreakdown,
+    FineStatus,
+    PaymentPageVerdict,
+)
 from reader.plate_display import format_plate_for_telegram
 from reader.public_bot.debt_refresh_service import DebtSummary, RefreshOutcome
 from reader.public_bot.delivery_texts import format_check_now_fines_message
@@ -202,7 +214,7 @@ _TRUSTED_STOP_CONFIRM_BUTTON_NO_CLIENTS = "⛔ Остановить"
 _TRUSTED_STOP_CONFIRM_BUTTON_WITH_CLIENTS = "⛔ Остановить для всех"
 
 
-def format_check_now_result(outcome) -> str:
+def format_check_now_result(outcome, *, statuses: dict[str, str] | None = None) -> str:
     """outcome: reader.public_bot.subscription_service.CheckNowOutcome.
     Без технической детали ошибки в тексте клиенту (см. design: та же
     осторожность, что и в format_add_car_summary/
@@ -229,7 +241,57 @@ def format_check_now_result(outcome) -> str:
         )
     if not outcome.fines:
         return format_no_fines_found(outcome.car_number)
-    return format_check_now_fines_message(car_number=outcome.car_number, fines=outcome.fines)
+    if statuses is None:
+        return format_check_now_fines_message(car_number=outcome.car_number, fines=outcome.fines)
+    # statuses — {protocolNo: display_status} (см. FineStatus.display_status):
+    # у каждого штрафа строка статуса, внизу — что к оплате, а что уже
+    # оплачено или требует проверки (оплаченное в "к оплате" не входит).
+    labels = {
+        fine.external_fine_id: fine_status_label(statuses.get(fine.external_fine_id, PAYMENT_UNPAID))
+        for fine in outcome.fines
+        if fine.external_fine_id
+    }
+    blocks = format_check_now_fines_message(car_number=outcome.car_number, fines=outcome.fines, status_labels=labels)
+    return f"{blocks}\n\n{format_check_now_status_summary(outcome.fines, statuses)}"
+
+
+# ==== Статусы оплаты (см. reader/fines/payment_status.py) ====
+
+FINE_STATUS_LABELS = {
+    PAYMENT_UNPAID: "🔴 Не оплачен",
+    PAYMENT_PAID: "🟢 Оплачен",
+    PAYMENT_NEEDS_REVIEW: "🟡 Оплата требует проверки",
+    DISPLAY_GONE: "⚪ Больше не отображается в базе полиции",
+}
+
+
+def fine_status_label(display_status: str) -> str:
+    return FINE_STATUS_LABELS.get(display_status, FINE_STATUS_LABELS[PAYMENT_UNPAID])
+
+
+def format_check_now_status_summary(fines: list[NewFineEvent], statuses: dict[str, str]) -> str:
+    """Итог под результатом "🔎 Проверить сейчас": к оплате — только 🔴
+    (и штрафы, по которым статуса ещё нет); 🟢 и 🟡 — отдельными строками,
+    только если такие есть."""
+    to_pay = paid = review = 0.0
+    paid_count = review_count = 0
+    for fine in fines:
+        status = statuses.get(fine.external_fine_id or "", PAYMENT_UNPAID)
+        amount = fine.amount or 0.0
+        if status == PAYMENT_PAID:
+            paid += amount
+            paid_count += 1
+        elif status == PAYMENT_NEEDS_REVIEW:
+            review += amount
+            review_count += 1
+        else:
+            to_pay += amount
+    lines = [f"💰 К оплате: {_format_search_amount(to_pay)}"]
+    if paid_count:
+        lines.append(f"🟢 Оплачено, ждёт обновления базы полиции: {_format_search_amount(paid)}")
+    if review_count:
+        lines.append(f"🟡 Оплата требует проверки: {_format_search_amount(review)}")
+    return "\n".join(lines)
 
 
 def format_no_fines_found(car_number: str) -> str:
@@ -815,7 +877,9 @@ def _format_debt_owner_lines(owner: DebtOwner) -> list[str]:
     return [f"👤 Пользователь: {name_text}{mark}", f"🔗 Telegram: {username_text}"]
 
 
-def format_debt_row(*, car_number: str, owners: list[DebtOwner], total_amount: float) -> str:
+def format_debt_row(
+    *, car_number: str, owners: list[DebtOwner], total_amount: float, breakdown: DebtBreakdown | None = None,
+) -> str:
     """Блок одной машины debt-списка (см. задачу "дополнить статистику
     штрафов информацией о пользователях"):
         🚗 Госномер: <номер>
@@ -828,11 +892,25 @@ def format_debt_row(*, car_number: str, owners: list[DebtOwner], total_amount: f
     physical car_number"): пара 👤/🔗 на каждого, сумма — РОВНО один раз
     (не дублируется на каждого владельца и не складывается между ними).
     Пустой owners (машина без клиента, см. add_delegated_car_without_client)
-    -> "👤 Пользователь не привязан"."""
-    lines = [
-        f"🚗 Госномер: {format_plate_for_telegram(car_number)}",
-        f"💰 Задолженность: {_format_search_amount(total_amount)}",
-    ]
+    -> "👤 Пользователь не привязан".
+
+    breakdown (статусы оплаты ведутся) — "💰 Задолженность" это только
+    подтверждённо неоплаченное (🔴), а 🟡/🟢 — отдельными строками, если
+    такие штрафы есть; total_amount тогда не используется."""
+    if breakdown is None:
+        lines = [
+            f"🚗 Госномер: {format_plate_for_telegram(car_number)}",
+            f"💰 Задолженность: {_format_search_amount(total_amount)}",
+        ]
+    else:
+        lines = [
+            f"🚗 Госномер: {format_plate_for_telegram(car_number)}",
+            f"💰 Задолженность: {_format_search_amount(breakdown.unpaid_amount)}",
+        ]
+        if breakdown.needs_review_count:
+            lines.append(f"🟡 Требует проверки: {_format_search_amount(breakdown.needs_review_amount)}")
+        if breakdown.paid_count:
+            lines.append(f"🟢 Оплачено: {_format_search_amount(breakdown.paid_amount)}")
     if not owners:
         lines.append(DEBT_OWNER_NOT_LINKED_LINE)
     for owner in owners:
@@ -858,6 +936,161 @@ def format_debt_list_section(row_lines: list[str], *, page: int, total_pages: in
         parts.append("")
         parts.append(format_search_pagination_footer(page=page, total_pages=total_pages))
     return "\n".join(parts)
+
+
+def format_debt_status_summary_block(
+    *, car_count: int, totals: DebtBreakdown, source_updated_on: date | None, recheck_line: str | None,
+) -> str:
+    """Заголовок "🚨 Штрафы по последней проверке", когда ведутся статусы
+    оплаты (см. задачу: "отдельно показывать подтверждённую задолженность,
+    оплаченные штрафы и случаи с неопределённым статусом")."""
+    lines = [
+        "🚨 Штрафы по последней проверке",
+        f"Автомобилей: {car_count}",
+        f"🔴 Подтверждённая задолженность: {_format_search_amount(totals.unpaid_amount)}"
+        f" ({totals.unpaid_count} шт.)",
+        f"🟡 Неопределённый статус оплаты: {_format_search_amount(totals.needs_review_amount)}"
+        f" ({totals.needs_review_count} шт.)",
+        f"🟢 Оплачено, ещё в базе полиции: {_format_search_amount(totals.paid_amount)}"
+        f" ({totals.paid_count} шт.)",
+    ]
+    if source_updated_on is not None:
+        lines.append(f"🗓 База police.ge обновлена: {_fmt_date(source_updated_on)}")
+    if recheck_line:
+        lines.append(recheck_line)
+    lines.extend([
+        "",
+        "ℹ️ 🟢 — оплата подтверждена, но police.ge ещё показывает штраф. "
+        "🟡 — оплата не прошла по неизвестной причине: это не доказательство оплаты, долг не снят.",
+    ])
+    return "\n".join(lines)
+
+
+_RECHECK_STOP_REASONS = {
+    "blocked": "police.ge ответил отказом (403/429)",
+    "unavailable": "police.ge недоступен",
+    "errors": "ошибки подряд",
+    "cutoff": "закончилось окно проверки",
+    "busy": "шла другая массовая проверка",
+}
+
+
+def format_daily_recheck_line(run) -> str | None:
+    """Последний вечерний проход (см. reader/public_bot/daily_recheck.py) —
+    одной строкой для статистики; None — проходов ещё не было."""
+    if run is None:
+        return None
+    day = run.run_date.strftime("%d.%m")
+    reason = _RECHECK_STOP_REASONS.get(run.stop_reason or "", run.stop_reason or "")
+    progress = f"проверено {run.checked} из {run.total}"
+    if run.status == "running":
+        return f"🌙 Вечерняя перепроверка {day}: идёт — {progress}"
+    if run.status == "completed":
+        if run.total == 0:
+            return f"🌙 Вечерняя перепроверка {day}: проверять было нечего"
+        return f"🌙 Вечерняя перепроверка {day}: завершена — {progress}, ошибок {run.failed}"
+    if run.status == "postponed":
+        return f"🌙 Вечерняя перепроверка {day}: перенесена ({reason}) — {progress}"
+    return f"🌙 Вечерняя перепроверка {day}: остановлена ({reason}) — {progress}, ошибок {run.failed}"
+
+
+FINE_STATUS_BUTTON_LABEL = "🧾 Статусы оплаты"
+FINE_STATUS_PLATE_PROMPT = "🧾 Статусы оплаты\n\nВведите номер автомобиля."
+FINE_STATUS_PLATE_INVALID_TEXT = "❌ Не удалось распознать номер.\n\n" + FINE_STATUS_PLATE_PROMPT
+FINE_STATUS_NOT_FOUND_TEXT = "Штраф не найден — возможно, список уже обновился."
+FINE_STATUS_SAVED_TEXT = "✅ Сохранено."
+FINE_STATUS_CANCELLED_TEXT = "Отменено."
+FINE_STATUS_ACTION_PAID_LABEL = "🟢 Оплачен — есть квитанция"
+FINE_STATUS_ACTION_FAILED_LABEL = "🟡 Оплата не прошла на сайте МВД"
+FINE_STATUS_ACTION_TEXT_LABEL = "📝 Текст со страницы оплаты"
+FINE_STATUS_ACTION_UNPAID_LABEL = "🔴 Снять отметку"
+FINE_STATUS_CONFIRM_LABEL = "✅ Подтвердить"
+FINE_STATUS_CANCEL_LABEL = "❌ Отмена"
+FINE_STATUS_BACK_LABEL = "⬅️ К списку"
+FINE_STATUS_PAYMENT_NOTE_PROMPT = (
+    "🟢 Подтверждение оплаты\n\n"
+    "Отправьте одним сообщением номер квитанции или операции, дату и способ оплаты "
+    "(например: «TBC Pay 123456789, 18.11.2026»).\n"
+    "Без основания отметку «Оплачен» поставить нельзя."
+)
+FINE_STATUS_PAYMENT_NOTE_EMPTY_TEXT = "❌ Основание не может быть пустым.\n\n" + FINE_STATUS_PAYMENT_NOTE_PROMPT
+FINE_STATUS_PAGE_TEXT_PROMPT = (
+    "📝 Текст со страницы оплаты\n\n"
+    "Вставьте одним сообщением текст, который показала страница оплаты или police.ge после попытки оплаты. "
+    "Банковские данные не присылайте."
+)
+FINE_STATUS_PAGE_TEXT_EMPTY_TEXT = "❌ Текст не может быть пустым.\n\n" + FINE_STATUS_PAGE_TEXT_PROMPT
+
+_PAYMENT_SOURCE_TEXT = {
+    SOURCE_RECEIPT: "квитанция",
+    SOURCE_PAYMENT_PAGE: "страница оплаты",
+}
+
+
+def _fine_status_amount(status: FineStatus) -> str:
+    return _format_search_amount(status.amount) if status.amount is not None else "сумма неизвестна"
+
+
+def format_fine_status_car(*, car_number: str, statuses: list[FineStatus], source_updated_on: date | None) -> str:
+    """Экран менеджера "🧾 Статусы оплаты" для одной машины."""
+    lines = [f"🧾 Статусы оплаты: {format_plate_for_telegram(car_number)}"]
+    if source_updated_on is not None:
+        lines.append(f"🗓 База police.ge обновлена: {_fmt_date(source_updated_on)}")
+    lines.append("")
+    if not statuses:
+        lines.append("Штрафов в базе полиции по этому номеру не найдено (по данным последних проверок).")
+        return "\n".join(lines)
+    for index, status in enumerate(statuses, start=1):
+        line = f"{index}. №{status.protocol_no} — {_fine_status_amount(status)} — {fine_status_label(status.display_status)}"
+        if status.presence == PRESENCE_MISSING:
+            line += " · не найден в последней проверке"
+        lines.append(line)
+    if any(status.display_status != DISPLAY_GONE for status in statuses):
+        lines.extend(["", "Нажмите на штраф, чтобы изменить статус оплаты."])
+    return "\n".join(lines)
+
+
+def format_fine_status_detail(status: FineStatus, *, notice: str | None = None) -> str:
+    lines = []
+    if notice:
+        lines.extend([notice, ""])
+    lines.extend([
+        f"🧾 Штраф №{status.protocol_no}",
+        f"🚗 {format_plate_for_telegram(status.car_number)}",
+        f"💰 Сумма: {_fine_status_amount(status)}",
+        f"Статус: {fine_status_label(status.display_status)}",
+    ])
+    if status.presence == PRESENCE_MISSING:
+        lines.append("⏳ Не найден в последней проверке police.ge — ждём подтверждения следующей проверкой.")
+    if status.payment_status != PAYMENT_UNPAID and status.payment_note:
+        source = _PAYMENT_SOURCE_TEXT.get(status.payment_source or "", "менеджер")
+        lines.append(f"Основание ({source}): {escape_telethon_markdown(status.payment_note)}")
+    return "\n".join(lines)
+
+
+def format_fine_status_confirm(status: FineStatus, *, target_label: str, explanation: str | None = None) -> str:
+    lines = [
+        f"Изменить статус штрафа №{status.protocol_no} ({format_plate_for_telegram(status.car_number)})?",
+        "",
+        f"Сейчас: {fine_status_label(status.display_status)}",
+        f"Станет: {target_label}",
+    ]
+    if explanation:
+        lines.extend(["", explanation])
+    return "\n".join(lines)
+
+
+def payment_page_verdict_explanation(verdict: PaymentPageVerdict) -> str:
+    if verdict is PaymentPageVerdict.ALREADY_PAID:
+        return "Официальный сервис явно сообщает, что штраф уже оплачен."
+    if verdict is PaymentPageVerdict.TECHNICAL_ERROR:
+        return "Это техническая ошибка сервиса: статус и задолженность не меняются, сообщение сохранится в журнале."
+    if verdict is PaymentPageVerdict.PAYMENT_FAILED:
+        return (
+            "«ჯარიმის გადახდა ვერ მოხერხდა!» — общий отказ: так выглядит и уже оплаченный штраф, "
+            "и сбой, и отказ по другой причине. Это не доказательство оплаты."
+        )
+    return "Текст не распознан как подтверждение оплаты — причина отказа неизвестна."
 
 
 # ==== manager/trusted Search (см. задачу "manager/trusted Search") —

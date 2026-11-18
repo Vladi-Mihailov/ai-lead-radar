@@ -17,6 +17,7 @@ import asyncio
 import logging
 import os
 import sys
+from datetime import timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -27,8 +28,10 @@ import httpx
 from dotenv import load_dotenv
 from telethon import TelegramClient
 
+from reader.fines.batch_gate import BatchCheckGate
 from reader.fines.check_service import FineCheckService
 from reader.fines.detected_fine_repository import DetectedFineRepository
+from reader.fines.payment_status import FineStatusRepository, FineStatusTracker, PaymentPageMarkers
 from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository
 from reader.fines.police_ge_circuit_breaker import PoliceGeCircuitBreaker
 from reader.fines.police_ge_provider import PoliceGeProvider
@@ -50,6 +53,11 @@ from reader.protocol_support.telethon_gateway import (
 from reader.public_bot.collector_api import run_collector_api_forever
 from reader.public_bot.collector_ingest_service import CollectorIngestService
 from reader.public_bot.conversation import ConversationController
+from reader.public_bot.daily_recheck import (
+    DailyRecheckRepository,
+    DailyRecheckService,
+    run_daily_recheck_loop,
+)
 from reader.public_bot.conversation_state_repository import (
     BotConversationStateRepository,
 )
@@ -295,6 +303,21 @@ async def _run_delivery_poller(delivery_service: ClientDeliveryService) -> None:
         await asyncio.sleep(_DELIVERY_POLL_INTERVAL_SECONDS)
 
 
+def build_payment_page_markers(fine_monitor) -> PaymentPageMarkers:
+    """settings.fine_monitor.payment_page_*_markers -> PaymentPageMarkers
+    (None у payment_failed — встроенный список, см. PaymentPageMarkers)."""
+    defaults = PaymentPageMarkers()
+    return PaymentPageMarkers(
+        already_paid=tuple(fine_monitor.payment_page_already_paid_markers),
+        payment_failed=(
+            tuple(fine_monitor.payment_page_failed_markers)
+            if fine_monitor.payment_page_failed_markers is not None
+            else defaults.payment_failed
+        ),
+        technical_error=tuple(fine_monitor.payment_page_technical_error_markers),
+    )
+
+
 async def _run_concurrently(coroutines: list) -> None:
     """Как asyncio.gather, но при ошибке в одной корутине отменяет
     остальные — тот же приём, что и reader/main.py::_run_concurrently (не
@@ -344,6 +367,22 @@ async def run() -> None:
     conversation_state_repository = BotConversationStateRepository(db_path)
     known_users_repository = BotKnownUsersRepository(db_path)
     delivery_repository = ClientFineDeliveryRepository(db_path)
+    # Статусы оплаты (см. reader/fines/payment_status.py) — та же БД.
+    fine_status_repository = FineStatusRepository(db_path)
+    fine_status_tracker = FineStatusTracker(
+        fine_status_repository,
+        disappearance_min_gap=timedelta(hours=settings.fine_monitor.fine_disappearance_min_gap_hours),
+        markers=build_payment_page_markers(settings.fine_monitor),
+    )
+    # Идемпотентно: статусы для штрафов, которые police.ge показывал на
+    # последней успешной проверке (до появления статусов они жили только
+    # в detected_fines). Повторный запуск ничего не добавляет.
+    seeded = fine_status_tracker.seed_from_detected_fines()
+    if seeded:
+        logger.info("Georgia fine status: seeded %d receipt statuses from detected_fines", seeded)
+    daily_recheck_repository = (
+        DailyRecheckRepository(db_path) if settings.fine_monitor.daily_recheck_enabled else None
+    )
 
     http_client = httpx.AsyncClient(
         base_url="https://police.ge/protocol/",
@@ -410,7 +449,12 @@ async def run() -> None:
         )
         check_service = FineCheckService(
             fine_provider, task_repository, detected_fine_repository, translator,
+            status_tracker=fine_status_tracker,
         )
+        # Один массовый проход по police.ge за раз (ручное "🔄 Проверить
+        # авто", "fine check-all", вечерняя перепроверка) — см.
+        # reader/fines/batch_gate.py.
+        batch_gate = BatchCheckGate()
 
         # client конструируется ДО SubscriptionService — тот же самый бот-
         # клиент передаётся туда как owner_resolver_client (см.
@@ -463,7 +507,7 @@ async def run() -> None:
         # "manager Statistics / refresh для обоих ботов") — переиспользует
         # ТЕ ЖЕ task_repository/check_service, что и всё остальное выше,
         # никакой отдельной проверки police.ge не заводит.
-        debt_refresh_service = DebtRefreshService(task_repository, check_service)
+        debt_refresh_service = DebtRefreshService(task_repository, check_service, gate=batch_gate)
 
         # "📸 Проверить протокол" (см. задачу) — ОТДЕЛЬНЫЙ сайт
         # (videos.police.ge, не police.ge/protocol), поэтому отдельная
@@ -487,8 +531,32 @@ async def run() -> None:
         # fine_monitor.allowed_user_ids (см. задачу п.6) — ОТДЕЛЬНЫЙ список
         # от trusted_operator_user_ids ниже, намеренно не смешиваются.
         full_check_service = FullCheckService(
-            task_repository, check_service, _TelethonProgressSender(client),
+            task_repository, check_service, _TelethonProgressSender(client), gate=batch_gate,
         )
+
+        # Ежедневная вечерняя перепроверка (см. reader/public_bot/
+        # daily_recheck.py) — только когда явно включена в config.yaml:
+        # она добавляет запросы к police.ge через REDNET.
+        daily_recheck_service = None
+        if daily_recheck_repository is not None:
+            fine_monitor = settings.fine_monitor
+            daily_recheck_service = DailyRecheckService(
+                daily_recheck_repository, task_repository, check_service, fine_status_tracker,
+                gate=batch_gate,
+                tz=ZoneInfo(fine_monitor.timezone),
+                start_time=fine_monitor.daily_recheck_time,
+                cutoff_time=fine_monitor.daily_recheck_cutoff_time,
+                inter_car_delay_seconds=fine_monitor.daily_recheck_inter_car_delay_seconds,
+                batch_size=fine_monitor.daily_recheck_batch_size,
+                batch_pause_seconds=fine_monitor.daily_recheck_batch_pause_seconds,
+                max_plates=fine_monitor.daily_recheck_max_plates,
+                max_consecutive_errors=fine_monitor.daily_recheck_max_consecutive_errors,
+            )
+            logger.info(
+                "Georgia daily recheck enabled: %s-%s %s",
+                fine_monitor.daily_recheck_time.strftime("%H:%M"),
+                fine_monitor.daily_recheck_cutoff_time.strftime("%H:%M"), fine_monitor.timezone,
+            )
 
         # "ВРЕМЕННЫЙ manager workflow для Georgia fines bot" (см. задачу) —
         # None, когда НИ public-feed архитектура, НИ collector_api_enabled не
@@ -555,6 +623,8 @@ async def run() -> None:
             full_check_service=full_check_service,
             fine_admin_user_ids=frozenset(settings.fine_monitor.allowed_user_ids),
             manual_bootstrap_service=manual_bootstrap_service,
+            fine_status_tracker=fine_status_tracker,
+            daily_recheck_service=daily_recheck_service,
         )
 
         # «👨‍💼 Оператор»: живой диалог через группу менеджеров (общая
@@ -576,6 +646,7 @@ async def run() -> None:
             _TelethonBotSender(client),
             tz=ZoneInfo(settings.fine_monitor.timezone),
             payment_help_contact_username=settings.public_bot.payment_help_contact_username,
+            status_lookup=fine_status_tracker,
         )
 
         # token передаётся ЗДЕСЬ и только здесь.
@@ -596,6 +667,8 @@ async def run() -> None:
         ]
         if collector_api_coroutine is not None:
             background_tasks.append(collector_api_coroutine)
+        if daily_recheck_service is not None:
+            background_tasks.append(run_daily_recheck_loop(daily_recheck_service))
         await _run_concurrently(background_tasks)
     finally:
         await http_client.aclose()
@@ -611,6 +684,9 @@ async def run() -> None:
         if support_repository is not None:
             support_repository.close()
         delivery_repository.close()
+        fine_status_repository.close()
+        if daily_recheck_repository is not None:
+            daily_recheck_repository.close()
 
 
 def main() -> None:

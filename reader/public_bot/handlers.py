@@ -34,6 +34,11 @@ from reader.public_bot.keyboards import (
     decode_debt_refresh_cancel_callback,
     decode_debt_refresh_confirm_callback,
     decode_debt_refresh_pick_callback,
+    decode_fine_status_action_callback,
+    decode_fine_status_back_callback,
+    decode_fine_status_cancel_callback,
+    decode_fine_status_confirm_callback,
+    decode_fine_status_open_callback,
     decode_manual_bootstrap_add_another_callback,
     decode_manual_bootstrap_addfine_cancel_callback,
     decode_manual_bootstrap_addfine_edit_callback,
@@ -74,6 +79,7 @@ from reader.public_bot.keyboards import (
     decode_trusted_task_open_callback,
     decode_trusted_task_toggle_callback,
     decode_trusted_tasks_page_callback,
+    is_fine_status_ask_callback,
     is_legacy_period_callback,
     main_menu_keyboard,
     my_cars_page_keyboard,
@@ -537,6 +543,54 @@ def register(
             await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
+        # "🧾 Статусы оплаты" (trusted-manager-only, авторизация — внутри
+        # каждого handle_fine_status_*).
+        if is_fine_status_ask_callback(data):
+            reply = controller.handle_fine_status_prompt(chat_id=event.chat_id, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply, is_trusted=is_trusted, prefer_edit=False)
+            return
+
+        fine_status_open = decode_fine_status_open_callback(data)
+        if fine_status_open is not None:
+            reply = controller.handle_fine_status_open(
+                fine_status_open, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        fine_status_action = decode_fine_status_action_callback(data)
+        if fine_status_action is not None:
+            status_id, action = fine_status_action
+            reply = controller.handle_fine_status_action(
+                status_id, action, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        fine_status_confirm = decode_fine_status_confirm_callback(data)
+        if fine_status_confirm is not None:
+            reply = controller.handle_fine_status_confirm(
+                fine_status_confirm, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        fine_status_cancel = decode_fine_status_cancel_callback(data)
+        if fine_status_cancel is not None:
+            reply = controller.handle_fine_status_cancel(
+                fine_status_cancel, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        fine_status_back = decode_fine_status_back_callback(data)
+        if fine_status_back is not None:
+            reply = controller.handle_fine_status_back(
+                fine_status_back, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
         search_page = decode_search_page_callback(data)
         if search_page is not None:
             query_type, query, page = search_page
@@ -932,7 +986,10 @@ async def _send_reply(
     elif reply.debt_refresh_confirm:
         buttons = debt_refresh_confirm_keyboard()
     elif reply.debt_refresh_available:
-        buttons = debt_statistics_keyboard(page=reply.debt_list_page, total_pages=reply.debt_list_total_pages)
+        buttons = debt_statistics_keyboard(
+            page=reply.debt_list_page, total_pages=reply.debt_list_total_pages,
+            fine_status_button=reply.fine_status_available,
+        )
     elif reply.trusted_tasks_page is not None:
         buttons = trusted_tasks_page_keyboard(
             reply.trusted_tasks_page_options or [],
