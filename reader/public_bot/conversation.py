@@ -237,6 +237,44 @@ _SEARCH_PAGE_SIZE = 10
 # остальных manager-экранов выше.
 _DEBT_LIST_PAGE_SIZE = 10
 
+# Блок машины многострочный и перечисляет ВСЕХ её пользователей (см. задачу
+# "дополнить статистику штрафов информацией о пользователях") — 10 машин с
+# несколькими владельцами и длинными именами могли бы не уместиться в одно
+# сообщение, а handlers режет такой текст на несколько сообщений, и
+# пагинация (edit сообщения с кнопками) оставила бы над страницей
+# устаревший кусок. Поэтому страница — не больше _DEBT_LIST_PAGE_SIZE машин
+# И не больше стольких символов блоков: вместе с заголовком 📊 Статистика
+# (~400 символов) или итогом "🔄 Проверить авто со штрафами" (список
+# непроверенных номеров ограничен, см. texts._DEBT_REFRESH_FAILED_PLATES_SHOWN)
+# это остаётся в пределах handlers._TELEGRAM_SAFE_TEXT_LIMIT (3900).
+_DEBT_LIST_PAGE_CHAR_BUDGET = 3000
+
+
+def _paginate_debt_blocks(blocks: list[str]) -> list[list[str]]:
+    """Режет уже отсортированные блоки машин на страницы подряд: не больше
+    _DEBT_LIST_PAGE_SIZE машин и _DEBT_LIST_PAGE_CHAR_BUDGET символов на
+    страницу (с пустой строкой между блоками, см.
+    texts.format_debt_list_section). Блок длиннее бюджета (десятки
+    владельцев одной машины) — отдельной страницей, целиком. Порядок машин
+    не меняется."""
+    separator_length = len("\n\n")
+    pages: list[list[str]] = []
+    current: list[str] = []
+    current_length = 0
+    for block in blocks:
+        addition = len(block) + (separator_length if current else 0)
+        if current and (
+            len(current) >= _DEBT_LIST_PAGE_SIZE or current_length + addition > _DEBT_LIST_PAGE_CHAR_BUDGET
+        ):
+            pages.append(current)
+            current, current_length = [], 0
+            addition = len(block)
+        current.append(block)
+        current_length += addition
+    if current:
+        pages.append(current)
+    return pages
+
 
 @dataclass(frozen=True)
 class _SearchHit:
@@ -1235,65 +1273,92 @@ class ConversationController:
         page: int | None = None
         total_pages: int | None = None
         if debt_groups:
-            total_pages = -(-len(debt_groups) // _DEBT_LIST_PAGE_SIZE)  # ceil division
-            page = max(0, min(debt_page, total_pages - 1))
-            start = page * _DEBT_LIST_PAGE_SIZE
-            page_groups = debt_groups[start:start + _DEBT_LIST_PAGE_SIZE]
-            row_lines = [
+            # Страницы режутся по числу машин И по длине (см.
+            # _paginate_debt_blocks), поэтому блоки строятся для всего списка
+            # — пользователи всех машин читаются теми же тремя запросами.
+            owners_by_car = self._debt_owners_by_car([group.car_number for group in debt_groups])
+            pages = _paginate_debt_blocks([
                 texts.format_debt_row(
                     car_number=group.car_number,
-                    owner_displays=self._debt_group_owner_displays(
-                        task_ids=group.task_ids, car_number=group.car_number,
-                    ),
+                    owners=owners_by_car[group.car_number],
                     total_amount=group.total_amount,
                 )
-                for group in page_groups
-            ]
-            section = texts.format_debt_list_section(row_lines, page=page, total_pages=total_pages)
+                for group in debt_groups
+            ])
+            total_pages = len(pages)
+            page = max(0, min(debt_page, total_pages - 1))
+            section = texts.format_debt_list_section(pages[page], page=page, total_pages=total_pages)
             text = f"{text}\n\n{section}"
 
         return text, page, total_pages
 
-    def _debt_group_owner_displays(self, *, task_ids: tuple[int, ...], car_number: str) -> list[str]:
-        """Владельцы ВСЕХ задач одной физической группы car_number (см.
-        задачу "Georgia debt deduplication by physical car_number") — для
-        КАЖДОЙ task_id та же логика выбора представителя, что и раньше
-        (см. историю этого метода): предпочитаем active-подписчика, иначе
-        первого найденного, "—" если подписок вовсе нет (delegated car без
-        клиента, см. list_tasks_for_car докстрок). Если несколько задач
-        физического номера ведут к ОДНОМУ И ТОМУ ЖЕ telegram_user_id
-        (например: один менеджер добавил тот же номер дважды, см.
-        production-находку P004XC163) — этот owner показывается ОДИН раз
-        (дедуп по telegram_user_id, а НЕ по отформатированной строке).
-        Задачи БЕЗ известного владельца (None) НЕ дедуплицируются друг с
-        другом — "—" может повториться несколько раз, это разные,
-        по-настоящему неизвестные записи, а не один и тот же owner (тот
-        же принцип, что и у Turkey get_debt_car_groups: join одного
-        элемента для одиночного владельца не меняет прежний текст)."""
-        subscriptions = self._subscriptions.list_subscriptions_for_car(car_number)
+    def _debt_owners_by_car(self, car_numbers: list[str]) -> dict[str, list[texts.DebtOwner]]:
+        """Пользователи, привязанные к каждой машине debt-списка (см.
+        задачу "дополнить статистику штрафов информацией о пользователях")
+        — ключ есть для КАЖДОГО car_number, [] — машина без привязанного
+        пользователя ("👤 Пользователь не привязан").
 
-        seen_owner_ids: set[int] = set()
-        displays: list[str] = []
-        for task_id in task_ids:
-            task_subscriptions = [s for s in subscriptions if s.monitoring_task_id == task_id]
-            if not task_subscriptions:
-                displays.append(texts.format_search_owner_display(first_name=None, last_name=None, username=None))
+        Привязка — fine_monitoring_subscriptions.telegram_user_id
+        не-archived подписки на этот физический номер (по car_number, а не
+        только по задачам с известным долгом: клиент мог подписаться на
+        другую задачу того же номера) — та же прямая связь, что и у Search
+        (см. SubscriptionService.list_subscriptions_for_car). Показываются
+        пользователи с действующей подпиской (is_effectively_active); если
+        таких нет — остальные (stopped/expired: машина по-прежнему в их "Мои
+        авто"), чтобы бывший владелец перепроданной машины не стоял рядом с
+        нынешним. pending_claim без telegram_user_id (клиент ещё не принял
+        приглашение) — ещё не привязан. Один и тот же пользователь на
+        нескольких подписках/задачах номера — один раз (дедуп по
+        telegram_user_id).
+
+        Менеджер НИКОГДА не показывается пользователем машины ("не
+        подставлять имя менеджера вместо имени клиента"): ни
+        fine_monitoring_tasks.created_by_*, ни собственные (legacy/
+        тестовые) подписки trusted-операторов не учитываются — машина,
+        привязанная только к менеджеру, -> "Пользователь не привязан".
+
+        Профиль: bot_known_users (обновляется на каждое сообщение боту),
+        для пользователя, ни разу не писавшего боту, — users (см.
+        SubscriptionService.get_telegram_profiles); имя и username берутся
+        независимо — из первого источника, где они есть.
+
+        Не больше трёх SQL-запросов на весь список (подписки,
+        bot_known_users, users), независимо от числа машин и владельцев —
+        без N+1."""
+        today = self._today()
+        active_user_ids: dict[str, list[int]] = {car_number: [] for car_number in car_numbers}
+        inactive_user_ids: dict[str, list[int]] = {car_number: [] for car_number in car_numbers}
+        for subscription in self._subscriptions.list_subscriptions_for_cars(car_numbers):
+            user_id = subscription.telegram_user_id
+            if subscription.car_number not in active_user_ids or user_id is None or self._is_trusted(user_id):
                 continue
+            target = active_user_ids if subscription.is_effectively_active(today=today) else inactive_user_ids
+            if user_id not in target[subscription.car_number]:
+                target[subscription.car_number].append(user_id)
+        user_ids_by_car = {
+            car_number: active_user_ids[car_number] or inactive_user_ids[car_number] for car_number in car_numbers
+        }
 
-            chosen = next((s for s in task_subscriptions if s.status == "active"), task_subscriptions[0])
-            owner_telegram_user_id = chosen.telegram_user_id
-            if owner_telegram_user_id is not None:
-                if owner_telegram_user_id in seen_owner_ids:
-                    continue
-                seen_owner_ids.add(owner_telegram_user_id)
+        all_user_ids = sorted({user_id for user_ids in user_ids_by_car.values() for user_id in user_ids})
+        if not all_user_ids:
+            return {car_number: [] for car_number in car_numbers}
+        known_users = self._known_users.get_many(all_user_ids)
+        profiles = self._subscriptions.get_telegram_profiles(all_user_ids)
 
-            known = self._known_users.get(owner_telegram_user_id) if owner_telegram_user_id is not None else None
-            displays.append(texts.format_search_owner_display(
-                first_name=known.first_name if known else None,
-                last_name=known.last_name if known else None,
-                username=known.telegram_username if known else None,
-            ))
-        return displays
+        owners_by_user_id: dict[int, texts.DebtOwner] = {}
+        for user_id in all_user_ids:
+            known = known_users.get(user_id)
+            profile = profiles.get(user_id)
+            name = texts.debt_owner_name(known.first_name, known.last_name) if known else None
+            if name is None and profile is not None:
+                name = texts.debt_owner_name(profile.first_name, profile.last_name)
+            username = (known.telegram_username if known else None) or (profile.username if profile else None)
+            owners_by_user_id[user_id] = texts.DebtOwner(name=name, username=username)
+
+        return {
+            car_number: [owners_by_user_id[user_id] for user_id in user_ids]
+            for car_number, user_ids in user_ids_by_car.items()
+        }
 
     # ---- "🔄 Обновить задолженности" (см. задачу "OPTIONAL DEBT REFRESH") —
     # trusted-manager-only, is_trusted() перепроверяется ЗАНОВО на каждом

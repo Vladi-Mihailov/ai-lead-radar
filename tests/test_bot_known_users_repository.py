@@ -140,3 +140,22 @@ def test_repeated_activity_does_not_count_old_user_as_new(tmp_path):
         assert repo.count_total() == 1
     finally:
         repo.close()
+
+
+def test_get_many_returns_known_users_by_id_in_one_query(tmp_path):
+    repo = BotKnownUsersRepository(tmp_path / "users.db")
+    try:
+        repo.record_seen(telegram_user_id=1, telegram_chat_id=1, telegram_username="alice", first_name="Алиса")
+        repo.record_seen(telegram_user_id=2, telegram_chat_id=2, telegram_username=None, last_name="Петров")
+        statements: list[str] = []
+        repo._conn.set_trace_callback(statements.append)
+
+        users = repo.get_many([1, 2, 3])
+
+        assert len(statements) == 1
+        assert set(users) == {1, 2}  # 3 никогда не писал боту — его нет в результате
+        assert (users[1].telegram_username, users[1].first_name) == ("alice", "Алиса")
+        assert (users[2].telegram_username, users[2].last_name) == (None, "Петров")
+        assert repo.get_many([]) == {}
+    finally:
+        repo.close()

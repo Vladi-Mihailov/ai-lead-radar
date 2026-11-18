@@ -350,3 +350,12 @@ class TurkeyStatisticsService:
         задачу п.7: Search result должен показывать имя ВМЕСТЕ с username,
         не только username (см. get_known_username() выше)."""
         return self._known_users.get_profile(telegram_user_id)
+
+    def get_known_profiles(
+        self, telegram_user_ids: list[int],
+    ) -> dict[int, tuple[str | None, str | None, str | None]]:
+        """Прокси к TurkeyBotKnownUsersRepository.get_profiles() — профили
+        ВСЕХ владельцев debt-списка одним запросом (см.
+        ConversationController._build_debt_section), вместо
+        get_known_profile() на каждого владельца."""
+        return self._known_users.get_profiles(telegram_user_ids)

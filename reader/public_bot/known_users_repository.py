@@ -164,6 +164,22 @@ class BotKnownUsersRepository:
         row = self._conn.execute(_SELECT, (telegram_user_id,)).fetchone()
         return _row_to_known_user(row) if row else None
 
+    def get_many(self, telegram_user_ids: list[int]) -> dict[int, BotKnownUser]:
+        """get() сразу для нескольких пользователей — ОДИН SELECT на весь
+        список (см. задачу "дополнить статистику штрафов информацией о
+        пользователях": владельцы всех машин страницы 📊 Статистика
+        читаются одним запросом, а не запросом на каждого владельца).
+        Пользователи, ни разу не писавшие боту, в результат не попадают."""
+        if not telegram_user_ids:
+            return {}
+
+        placeholders = ",".join("?" for _ in telegram_user_ids)
+        rows = self._conn.execute(
+            f"SELECT {_SELECT_FIELDS} FROM bot_known_users WHERE telegram_user_id IN ({placeholders})",
+            list(telegram_user_ids),
+        ).fetchall()
+        return {row[0]: _row_to_known_user(row) for row in rows}
+
     def find_by_username(self, username: str) -> BotKnownUser | None:
         """Case-insensitive lookup по telegram_username (см. задачу
         "manager/trusted Search"), НЕ по numeric telegram_user_id (тот —

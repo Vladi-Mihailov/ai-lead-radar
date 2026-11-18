@@ -652,7 +652,7 @@ class ConversationController:
     def handle_statistics(self, *, chat_id: int) -> BotReply:
         """См. задачу "доработать 📊 Статистика Turkey bot" — ТОЛЬКО SQL
         reads поверх уже сохранённых repositories (get_debt_rows/
-        get_known_profile), НИКАКИХ provider/network requests, НИКАКОГО
+        get_known_profiles), НИКАКИХ provider/network requests, НИКАКОГО
         unified check (см. задачу "КРИТИЧЕСКИ ВАЖНО: НИКАКИХ LIVE CHECK")."""
         self._states.clear(chat_id)
         stats = self._statistics.get_statistics(now=datetime.now(timezone.utc), tz=self._tz)
@@ -691,18 +691,33 @@ class ConversationController:
             no_data_car_count=self._statistics.count_plates_without_reliable_data(cars),
         )
 
+        # См. задачу "дополнить статистику штрафов информацией о
+        # пользователях" — владелец машины = turkey_bot_user_cars.
+        # telegram_user_id. Менеджер добавляет машину только в СВОЙ гараж
+        # (клиентской привязки, как у Georgia delegated, здесь нет), поэтому
+        # trusted-операторы владельцами НЕ показываются ("не подставлять имя
+        # менеджера вместо имени клиента"): машина только в гараже
+        # менеджера -> "Пользователь не привязан". Профили ВСЕХ владельцев
+        # списка — одним запросом, без N+1.
+        owner_ids_by_plate = {
+            group.car_number: [
+                owner_telegram_user_id for owner_telegram_user_id in dict.fromkeys(group.owner_telegram_user_ids)
+                if not self._is_trusted(owner_telegram_user_id)
+            ]
+            for group in debt_groups
+        }
+        profiles = self._statistics.get_known_profiles(list(dict.fromkeys(
+            owner_telegram_user_id for owner_ids in owner_ids_by_plate.values() for owner_telegram_user_id in owner_ids
+        )))
         debt_lines = []
         for group in debt_groups:
-            owner_displays = []
-            for owner_telegram_user_id in group.owner_telegram_user_ids:
-                profile = self._statistics.get_known_profile(owner_telegram_user_id)
-                username, first_name, last_name = profile if profile is not None else (None, None, None)
-                owner_displays.append(texts.format_search_owner_display(
-                    first_name=first_name, last_name=last_name, username=username,
-                ))
+            owners = []
+            for owner_telegram_user_id in owner_ids_by_plate[group.car_number]:
+                username, first_name, last_name = profiles.get(owner_telegram_user_id, (None, None, None))
+                owners.append(texts.DebtOwner(name=texts.debt_owner_name(first_name, last_name), username=username))
             debt_lines.append(
                 texts.format_debt_row(
-                    car_number=group.car_number, owner_displays=owner_displays, total_amount=group.total_amount,
+                    car_number=group.car_number, owners=owners, total_amount=group.total_amount,
                     provider_states=group.provider_states,
                 )
             )

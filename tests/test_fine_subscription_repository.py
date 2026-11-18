@@ -600,3 +600,40 @@ def test_archive_returns_false_for_unknown_id(tmp_path):
         assert repo.archive(999999) is False
     finally:
         repo.close()
+
+
+def test_list_by_car_numbers_returns_all_statuses_for_given_plates_only(tmp_path):
+    db_path = tmp_path / "users.db"
+    task_a = _make_task(db_path, car_number="AA111AA")
+    task_b = _make_task(db_path, car_number="BB222BB")
+    task_c = _make_task(db_path, car_number="CC333CC")
+
+    repo = FineSubscriptionRepository(db_path)
+    try:
+        def create(task_id, car_number, telegram_user_id):
+            return repo.create(
+                monitoring_task_id=task_id, car_number=car_number,
+                telegram_user_id=telegram_user_id, telegram_chat_id=telegram_user_id, telegram_username=None,
+                start_date=date(2026, 9, 1), end_date=date(2026, 12, 1),
+            )
+
+        first = create(task_a, "AA111AA", 1)
+        archived = create(task_a, "AA111AA", 2)
+        repo.archive(archived.id)
+        other_plate = create(task_b, "BB222BB", 3)
+        create(task_c, "CC333CC", 4)
+        statements: list[str] = []
+        repo._conn.set_trace_callback(statements.append)
+
+        rows = repo.list_by_car_numbers(["AA111AA", "BB222BB"])
+
+        assert len(statements) == 1
+        # Любой статус (archived фильтрует уже сервис), только запрошенные
+        # номера, порядок — как у list_by_car_number (новые первыми).
+        assert [row.id for row in rows] == [other_plate.id, archived.id, first.id]
+        assert [row.id for row in rows if row.car_number == "AA111AA"] == [
+            row.id for row in repo.list_by_car_number("AA111AA")
+        ]
+        assert repo.list_by_car_numbers([]) == []
+    finally:
+        repo.close()

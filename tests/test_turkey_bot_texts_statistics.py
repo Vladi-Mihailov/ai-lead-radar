@@ -1,8 +1,10 @@
 """
 Тесты reader/turkey_bot/texts.py::format_statistics/format_debt_row/
-format_debt_list_messages (см. задачу "manager Statistics / refresh для
-обоих ботов") — единый компактный формат "🚗 CAR: OWNER: AMOUNT", БЕЗ
-даты/checked_at/"сегодня"/"вчера"/"≥"-пометки PARTIAL."""
+format_debt_list_messages (см. задачи "manager Statistics / refresh для
+обоих ботов" и "дополнить статистику штрафов информацией о
+пользователях") — блок машины "🚗 Госномер / 💰 Задолженность / 👤
+Пользователь / 🔗 Telegram", БЕЗ даты/checked_at/"сегодня"/"вчера"/"≥"-
+пометки PARTIAL."""
 
 import sys
 from datetime import datetime, timezone
@@ -92,45 +94,127 @@ def test_format_statistics_never_uses_partial_marker():
     assert "≥" not in text
 
 
-# ---- format_debt_row: единый компактный формат CAR: OWNER: AMOUNT ----
+# ---- format_debt_row: блок госномер / задолженность / пользователь / Telegram ----
 
 
-def test_debt_row_is_car_colon_owner_colon_amount():
-    line = texts.format_debt_row(
-        car_number="M295YB196", owner_displays=["@Mihailov_vm"], total_amount=Decimal(2740),
+def test_debt_row_is_plate_debt_user_telegram_block():
+    block = texts.format_debt_row(
+        car_number="M295YB196", owners=[texts.DebtOwner(name="Иван Петров", username="ivan_petrov")],
+        total_amount=Decimal(2740),
     )
 
-    assert line == f"🚗 {format_plate_for_telegram('M295YB196')}: @Mihailov_vm: 2 740 ₺"
+    assert block == (
+        f"🚗 Госномер: {format_plate_for_telegram('M295YB196')}\n"
+        "💰 Задолженность: 2 740 ₺\n"
+        "👤 Пользователь: Иван Петров\n"
+        "🔗 Telegram: @ivan_petrov"
+    )
 
 
 def test_debt_row_has_no_partial_marker_or_recency():
-    line = texts.format_debt_row(
-        car_number="34ABC123", owner_displays=["@username"], total_amount=Decimal(1250),
+    block = texts.format_debt_row(
+        car_number="34ABC123", owners=[texts.DebtOwner(name="Иван", username="username")], total_amount=Decimal(1250),
     )
 
-    assert line == f"🚗 {format_plate_for_telegram('34ABC123')}: @username: 1 250 ₺"
-    assert "≥" not in line
-    assert "частично" not in line
-    assert " — " not in line
-    assert "·" not in line
+    assert block.splitlines()[:2] == [
+        f"🚗 Госномер: {format_plate_for_telegram('34ABC123')}",
+        "💰 Задолженность: 1 250 ₺",
+    ]
+    assert "≥" not in block
+    assert "частично" not in block
+    assert " — " not in block
+    assert "·" not in block
 
 
-def test_debt_row_multiple_owners_joined_with_pipe_and_amount_once():
+def test_debt_row_lists_every_owner_and_amount_once():
     """См. задачу "Turkey manager debt statistics aggregation" — один
-    physical plate у нескольких владельцев печатается ОДНОЙ строкой,
-    все owners через " | ", сумма — РОВНО один раз в конце (не
-    дублируется на каждого owner)."""
-    line = texts.format_debt_row(
+    physical plate у нескольких владельцев — ОДИН блок, пара 👤/🔗 на
+    каждого владельца, сумма — РОВНО один раз (не дублируется на каждого
+    owner)."""
+    block = texts.format_debt_row(
         car_number="H401HH95",
-        owner_displays=["V K (@vdhl29)", "Алена (@alenaogir)", "Иброхим (@ibrohim_abu_romadan)"],
+        owners=[
+            texts.DebtOwner(name="Иван Петров", username="ivan_petrov"),
+            texts.DebtOwner(name="Анна", username=None),
+            texts.DebtOwner(name=None, username="giorgi_b"),
+        ],
         total_amount=Decimal("32664.50"),
     )
 
-    assert line == (
-        f"🚗 {format_plate_for_telegram('H401HH95')}: "
-        "V K (@vdhl29) | Алена (@alenaogir) | Иброхим (@ibrohim_abu_romadan): 32 664,50 ₺"
+    assert block.splitlines() == [
+        f"🚗 Госномер: {format_plate_for_telegram('H401HH95')}",
+        "💰 Задолженность: 32 664,50 ₺",
+        "👤 Пользователь: Иван Петров",
+        "🔗 Telegram: @ivan_petrov",
+        "👤 Пользователь: Анна",
+        "🔗 Telegram: Логин не указан",
+        "👤 Пользователь: Имя не указано",
+        "🔗 Telegram: @giorgi_b",
+    ]
+    assert block.count("32 664,50 ₺") == 1
+
+
+def test_debt_row_owner_without_username_shows_login_not_specified():
+    block = texts.format_debt_row(
+        car_number="34ABC123", owners=[texts.DebtOwner(name="Мехмет", username=None)], total_amount=Decimal(500),
     )
-    assert line.count("32 664,50 ₺") == 1
+
+    assert block.splitlines()[2:] == ["👤 Пользователь: Мехмет", "🔗 Telegram: Логин не указан"]
+
+
+def test_debt_row_owner_without_name_shows_name_not_specified():
+    block = texts.format_debt_row(
+        car_number="34ABC123", owners=[texts.DebtOwner(name=None, username="mehmet_k")], total_amount=Decimal(500),
+    )
+
+    assert block.splitlines()[2:] == ["👤 Пользователь: Имя не указано", "🔗 Telegram: @mehmet_k"]
+
+
+def test_debt_row_without_owners_shows_not_linked():
+    block = texts.format_debt_row(car_number="34ABC123", owners=[], total_amount=Decimal(500))
+
+    assert block.splitlines()[2:] == ["👤 Пользователь не привязан"]
+
+
+def test_debt_owner_name_drops_placeholder_names_and_username_is_never_built_from_name():
+    assert texts.debt_owner_name("Иван", "Петров") == "Иван Петров"
+    assert texts.debt_owner_name(".", None) is None
+    assert texts.debt_owner_name("-", "_") is None
+    block = texts.format_debt_row(
+        car_number="34ABC123", owners=[texts.DebtOwner(name=texts.debt_owner_name("Иван", "Петров"), username=None)],
+        total_amount=Decimal(500),
+    )
+    assert "@Иван" not in block
+    assert "🔗 Telegram: Логин не указан" in block
+
+
+def test_debt_row_owner_text_cannot_inject_telegram_markdown():
+    from telethon.extensions import markdown
+    from telethon.tl.types import MessageEntityBold
+
+    block = texts.format_debt_row(
+        car_number="AB123CD",
+        owners=[texts.DebtOwner(name="**Мехмет** `x` [Нажми](http://evil.example)", username="evil__user")],
+        total_amount=Decimal(500),
+    )
+
+    plain_text, entities = markdown.parse(block)
+    assert all(isinstance(entity, MessageEntityBold) for entity in entities)
+    assert len(entities) == 2  # только буквы госномера: AB и CD
+    visible = plain_text.replace("​", "")
+    assert "👤 Пользователь: **Мехмет** ˋxˋ [Нажми](http://evil.example)" in visible
+    assert "🔗 Telegram: Логин не указан" in visible  # "__" — не настоящий Telegram username
+
+
+def test_debt_row_valid_username_is_inserted_unchanged():
+    """Настоящий username вставляется как есть — без невидимых символов,
+    чтобы упоминание оставалось кликабельным и копировалось точно."""
+    block = texts.format_debt_row(
+        car_number="34ABC123", owners=[texts.DebtOwner(name=None, username="@ivan_petrov_77")],
+        total_amount=Decimal(500),
+    )
+
+    assert block.splitlines()[-1] == "🔗 Telegram: @ivan_petrov_77"
 
 
 # ---- format_debt_list_messages ----
@@ -143,12 +227,15 @@ def test_debt_list_empty_returns_no_messages():
 def test_debt_list_has_no_separate_header_and_preserves_order():
     """См. задачу п.7 — пример показывает строки СРАЗУ после аггрегата,
     без отдельного "Автомобили с задолженностью:"."""
-    messages = texts.format_debt_list_messages(["🚗 A: @a: 100 ₺", "🚗 B: @b: 50 ₺"])
+    rows = ["🚗 Госномер: A\n💰 Задолженность: 100 ₺", "🚗 Госномер: B\n💰 Задолженность: 50 ₺"]
+
+    messages = texts.format_debt_list_messages(rows)
 
     assert len(messages) == 1
     assert not messages[0].startswith("Автомобили")
-    assert messages[0] == "🚗 A: @a: 100 ₺\n🚗 B: @b: 50 ₺"
-    assert messages[0].index("🚗 A") < messages[0].index("🚗 B")
+    # Многострочные блоки машин разделены пустой строкой.
+    assert messages[0] == "🚗 Госномер: A\n💰 Задолженность: 100 ₺\n\n🚗 Госномер: B\n💰 Задолженность: 50 ₺"
+    assert messages[0].index("🚗 Госномер: A") < messages[0].index("🚗 Госномер: B")
 
 
 def test_long_debt_list_splits_safely_and_keeps_every_row():
@@ -220,17 +307,25 @@ def test_debt_summary_block_shows_cars_without_reliable_data():
     assert "Подтверждено" not in text
 
 
-def test_debt_row_with_all_providers_current_stays_one_line():
+_OWNER = texts.DebtOwner(name="Иван Петров", username="ivan_petrov")
+
+
+def test_debt_row_with_all_providers_current_has_no_provider_lines():
     states = (
         _state("gib", TurkeyProviderFreshness.CURRENT, Decimal(2740), last_success_at=_NOV_11, last_attempt_at=_NOV_11),
         _state("kgm", TurkeyProviderFreshness.CURRENT, last_success_at=_NOV_11, last_attempt_at=_NOV_11),
     )
 
-    line = texts.format_debt_row(
-        car_number="M295YB196", owner_displays=["@Mihailov_vm"], total_amount=Decimal(2740), provider_states=states,
+    block = texts.format_debt_row(
+        car_number="M295YB196", owners=[_OWNER], total_amount=Decimal(2740), provider_states=states,
     )
 
-    assert line == f"🚗 {format_plate_for_telegram('M295YB196')}: @Mihailov_vm: 2 740 ₺"
+    assert block.splitlines() == [
+        f"🚗 Госномер: {format_plate_for_telegram('M295YB196')}",
+        "💰 Задолженность: 2 740 ₺",
+        "👤 Пользователь: Иван Петров",
+        "🔗 Telegram: @ivan_petrov",
+    ]
 
 
 def test_debt_row_stale_kgm_reads_as_last_known_with_dates():
@@ -243,13 +338,17 @@ def test_debt_row_stale_kgm_reads_as_last_known_with_dates():
     )
 
     text = texts.format_debt_row(
-        car_number="34ABC123", owner_displays=["@user"], total_amount=Decimal("33528.50"), provider_states=states,
+        car_number="34ABC123", owners=[_OWNER], total_amount=Decimal("33528.50"), provider_states=states,
     )
 
+    # Детализация по провайдерам — сразу под суммой, владельцы — после неё.
     assert text.splitlines() == [
-        f"🚗 {format_plate_for_telegram('34ABC123')}: @user: ⚠️ 33 528,50 ₺",
+        f"🚗 Госномер: {format_plate_for_telegram('34ABC123')}",
+        "💰 Задолженность: ⚠️ 33 528,50 ₺",
         "   ✅ GİB: 13 336 ₺ — проверка 11.11.2026",
         "   ⚠️ KGM: 20 192,50 ₺ — последняя известная (успешная проверка 04.11.2026), не ответил 11.11.2026",
+        "👤 Пользователь: Иван Петров",
+        "🔗 Telegram: @ivan_petrov",
     ]
 
 
@@ -264,15 +363,16 @@ def test_debt_row_provider_without_reliable_data():
     )
 
     attempted_text = texts.format_debt_row(
-        car_number="34ABC123", owner_displays=["—"], total_amount=Decimal(18000), provider_states=attempted,
+        car_number="34ABC123", owners=[], total_amount=Decimal(18000), provider_states=attempted,
     )
     never_text = texts.format_debt_row(
-        car_number="34ABC123", owner_displays=["—"], total_amount=Decimal(18000), provider_states=never_checked,
+        car_number="34ABC123", owners=[], total_amount=Decimal(18000), provider_states=never_checked,
     )
 
-    assert attempted_text.splitlines()[0].endswith(": ⚠️ 18 000 ₺")
-    assert attempted_text.splitlines()[-1] == "   ❔ KGM: нет достоверных данных (не ответил 11.11.2026)"
-    assert never_text.splitlines()[-1] == "   ❔ KGM: нет достоверных данных (не проверялся)"
+    assert attempted_text.splitlines()[1] == "💰 Задолженность: ⚠️ 18 000 ₺"
+    assert attempted_text.splitlines()[-2] == "   ❔ KGM: нет достоверных данных (не ответил 11.11.2026)"
+    assert never_text.splitlines()[-2] == "   ❔ KGM: нет достоверных данных (не проверялся)"
+    assert never_text.splitlines()[-1] == "👤 Пользователь не привязан"
 
 
 def test_debt_row_zero_amount_provider_is_shown_as_no_debt():
@@ -282,7 +382,7 @@ def test_debt_row_zero_amount_provider_is_shown_as_no_debt():
     )
 
     text = texts.format_debt_row(
-        car_number="34ABC123", owner_displays=["—"], total_amount=Decimal(3788), provider_states=states,
+        car_number="34ABC123", owners=[], total_amount=Decimal(3788), provider_states=states,
     )
 
     assert "   ✅ GİB: без долга — проверка 11.11.2026" in text.splitlines()
@@ -295,7 +395,7 @@ def test_debt_row_dates_use_istanbul_calendar_day():
         _state("kgm", TurkeyProviderFreshness.STALE, Decimal(59), last_success_at=late_evening_utc, last_attempt_at=_NOV_11),
     )
 
-    text = texts.format_debt_row(car_number="34ABC123", owner_displays=["—"], total_amount=Decimal(59), provider_states=states)
+    text = texts.format_debt_row(car_number="34ABC123", owners=[], total_amount=Decimal(59), provider_states=states)
 
     assert "(успешная проверка 05.11.2026)" in text
 
@@ -353,7 +453,8 @@ def test_debt_list_packs_multi_line_rows_so_handler_never_resplits():
     )
     rows = [
         texts.format_debt_row(
-            car_number=f"34ABC{i:03d}", owner_displays=[f"Владелец{'я' * (i % 7)} (@user{i})"],
+            car_number=f"34ABC{i:03d}",
+            owners=[texts.DebtOwner(name=f"Владелец{'я' * (i % 7)}", username=f"user{i}")] * (1 + i % 3),
             total_amount=Decimal("33528.50"), provider_states=states,
         )
         for i in range(60)
@@ -365,8 +466,8 @@ def test_debt_list_packs_multi_line_rows_so_handler_never_resplits():
     assert texts._DEBT_LIST_MESSAGE_LIMIT <= _TELEGRAM_SAFE_TEXT_LIMIT
     for message in messages:
         assert _split_telegram_text(message) == [message]
-        assert message.startswith("🚗")
-    assert "\n".join(messages) == "\n".join(rows)
+        assert message.startswith("🚗 Госномер:")
+    assert "\n\n".join(messages) == "\n\n".join(rows)
 
 
 def test_refresh_summary_without_failed_providers_lists_plates_only():

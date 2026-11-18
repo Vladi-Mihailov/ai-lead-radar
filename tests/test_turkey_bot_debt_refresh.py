@@ -321,7 +321,10 @@ async def test_confirm_summary_counts_unique_plates_not_owner_rows():
     assert "Автомобилей: 9" in full_text  # долг остался (GİB по-прежнему has_debt=500 на каждый plate)
 
 
-async def test_confirm_row_format_is_car_colon_owner_colon_amount():
+_NO_PROFILE_OWNER_LINES = ("👤 Пользователь: Имя не указано", "🔗 Telegram: Логин не указан")
+
+
+async def test_confirm_row_format_is_plate_debt_user_telegram_block():
     fx = _Fixture(poison_check_service=False)
     fx.add_car(telegram_user_id=1, car_number="BB002BB")
     await fx.seed(telegram_user_id=1, plate="BB002BB", amount=Decimal(1000))
@@ -331,13 +334,17 @@ async def test_confirm_row_format_is_car_colon_owner_colon_amount():
     reply = await fx.controller.handle_debt_refresh_confirm(telegram_user_id=_TRUSTED_ID)
 
     full_text = "\n".join((reply.text, *reply.extra_texts))
-    assert f"🚗 {format_plate_for_telegram('BB002BB')}: —: 1 800 ₺" in full_text
+    assert "\n".join([
+        f"🚗 Госномер: {format_plate_for_telegram('BB002BB')}",
+        "💰 Задолженность: 1 800 ₺",
+        *_NO_PROFILE_OWNER_LINES,
+    ]) in full_text
 
 
 async def test_confirm_display_aggregates_duplicate_plate_one_row_one_amount():
     """См. задачу "Turkey manager debt statistics aggregation" — один
-    physical plate у двух owners показывается ОДНОЙ строкой после
-    refresh, owners через " | ", сумма один раз (не 2x)."""
+    physical plate у двух owners показывается ОДНИМ блоком после
+    refresh, пара 👤/🔗 на каждого owner, сумма один раз (не 2x)."""
     fx = _Fixture(poison_check_service=False)
     fx.add_car(telegram_user_id=1, car_number="BB002BB")
     fx.add_car(telegram_user_id=2, car_number="BB002BB")
@@ -351,9 +358,15 @@ async def test_confirm_display_aggregates_duplicate_plate_one_row_one_amount():
     full_text = "\n".join((reply.text, *reply.extra_texts))
     assert "Автомобилей: 1" in full_text
     assert "Общая сумма: 1 800 ₺" in full_text
-    debt_row_line = next(line for line in full_text.splitlines() if line.startswith(f"🚗 {format_plate_for_telegram('BB002BB')}"))
-    assert debt_row_line == f"🚗 {format_plate_for_telegram('BB002BB')}: — | —: 1 800 ₺"  # оба owner без known-профиля -> "—" x2, amount один раз
-    assert debt_row_line.count("1 800 ₺") == 1
+    # Оба owner без known-профиля — два разных пользователя, оба показаны;
+    # сумма один раз.
+    assert "\n".join([
+        f"🚗 Госномер: {format_plate_for_telegram('BB002BB')}",
+        "💰 Задолженность: 1 800 ₺",
+        *_NO_PROFILE_OWNER_LINES,
+        *_NO_PROFILE_OWNER_LINES,
+    ]) in full_text
+    assert "\n".join(reply.extra_texts).count("1 800 ₺") == 1
 
 
 async def test_refresh_performs_one_provider_check_per_unique_plate_not_per_owner():

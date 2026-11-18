@@ -184,6 +184,25 @@ class TurkeyBotKnownUsersRepository:
             return None
         return row[2], row[5], row[6]  # telegram_username, first_name, last_name
 
+    def get_profiles(
+        self, telegram_user_ids: list[int],
+    ) -> dict[int, tuple[str | None, str | None, str | None]]:
+        """get_profile() сразу для нескольких пользователей — ОДИН SELECT на
+        весь список (см. задачу "дополнить статистику штрафов информацией
+        о пользователях": владельцы всех машин debt-списка 📊 Статистика
+        читаются одним запросом, а не запросом на каждого владельца).
+        Пользователи, никогда не писавшие боту, в результат не попадают."""
+        if not telegram_user_ids:
+            return {}
+
+        placeholders = ",".join("?" for _ in telegram_user_ids)
+        rows = self._conn.execute(
+            "SELECT telegram_user_id, telegram_username, first_name, last_name FROM turkey_bot_known_users "
+            f"WHERE telegram_user_id IN ({placeholders})",
+            list(telegram_user_ids),
+        ).fetchall()
+        return {user_id: (username, first_name, last_name) for user_id, username, first_name, last_name in rows}
+
     def find_by_name(self, query: str) -> list[tuple[int, str | None, str | None, str | None]]:
         """(telegram_user_id, telegram_username, first_name, last_name)
         для КАЖДОГО пользователя, чьё имя (first_name/last_name/полное

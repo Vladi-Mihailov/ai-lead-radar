@@ -749,6 +749,24 @@ class FineSubscriptionRepository:
         rows = self._conn.execute(_SELECT_BY_CAR_NUMBER, (car_number,)).fetchall()
         return [_row_to_subscription(row) for row in rows]
 
+    def list_by_car_numbers(self, car_numbers: list[str]) -> list[FineMonitoringSubscription]:
+        """list_by_car_number() сразу для нескольких номеров — ОДИН SELECT
+        (см. задачу "дополнить статистику штрафов информацией о
+        пользователях": подписки всех машин страницы 📊 Статистика
+        читаются одним запросом, без N+1). ЛЮБОГО статуса и владельца и в
+        том же порядке, что и list_by_car_number() (ORDER BY id DESC —
+        новые подписки первыми, как у Search)."""
+        if not car_numbers:
+            return []
+
+        placeholders = ",".join("?" for _ in car_numbers)
+        rows = self._conn.execute(
+            f"SELECT {_SELECT_FIELDS} FROM fine_monitoring_subscriptions "
+            f"WHERE car_number IN ({placeholders}) ORDER BY id DESC",
+            list(car_numbers),
+        ).fetchall()
+        return [_row_to_subscription(row) for row in rows]
+
     def list_managed_by_creator(self, created_by_telegram_user_id: int) -> list[FineMonitoringSubscription]:
         """Все delegated-подписки, заведённые ЭТИМ trusted-оператором для
         других людей (включая ещё не claimed) — "Мои авто" для trusted

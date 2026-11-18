@@ -6,6 +6,7 @@ reader/public_bot/keyboards.py (Telethon-кнопки), чтобы формул�
 """
 
 import re
+from dataclasses import dataclass
 from datetime import date, datetime
 
 from reader.fines.models import FineMonitoringTask, NewFineEvent
@@ -15,6 +16,7 @@ from reader.public_bot.delivery_texts import format_check_now_fines_message
 from reader.public_bot.full_check_service import FullCheckOutcome
 from reader.public_bot.models import FineMonitoringSubscription
 from reader.public_bot.statistics_service import BotStatistics
+from reader.telegram_markdown import escape_telethon_markdown, safe_telegram_username
 
 MAIN_MENU_TEXT = "🚗 Штрафы Грузии 🇬🇪"
 # Короткое объяснение под заголовком — ТОЛЬКО на настоящем "/start", НЕ на
@@ -737,12 +739,21 @@ def format_debt_refresh_prompt(car_count: int) -> str:
     return f"🔄 Будет проверено автомобилей: {car_count}"
 
 
+# Сколько номеров перечислять в "Не удалось проверить: ..." — при массовом
+# сбое police.ge/REDNET список всех машин вместе с многострочной страницей
+# debt-списка (см. ConversationController._DEBT_LIST_PAGE_CHAR_BUDGET)
+# перерос бы одно сообщение; счётчик "⚠️ Не удалось проверить: N" остаётся
+# точным.
+_DEBT_REFRESH_FAILED_PLATES_SHOWN = 20
+
+
 def format_debt_refresh_summary(outcome: RefreshOutcome) -> str:
     """См. задачу п.7 "RESULT" — БЕЗ "Найдены новые штрафы"/"Без новых
     штрафов"-аналитики: только факт проверки, актуальный список — заново
     построенный "🚨 Штрафы по последней проверке" блок (см.
     ConversationController._build_debt_section), склеиваемый вызывающим
-    кодом ПОСЛЕ этого текста, а не здесь."""
+    кодом ПОСЛЕ этого текста, а не здесь. Непроверенные номера —
+    не больше _DEBT_REFRESH_FAILED_PLATES_SHOWN, остальные — "и ещё N"."""
     lines = [
         "🔄 Проверка завершена",
         "",
@@ -750,29 +761,77 @@ def format_debt_refresh_summary(outcome: RefreshOutcome) -> str:
         f"⚠️ Не удалось проверить: {outcome.failed}",
     ]
     if outcome.failed_car_numbers:
+        shown = outcome.failed_car_numbers[:_DEBT_REFRESH_FAILED_PLATES_SHOWN]
+        hidden_count = len(outcome.failed_car_numbers) - len(shown)
         lines.append("")
         lines.append(
             "Не удалось проверить: "
-            + ", ".join(format_plate_for_telegram(p) for p in outcome.failed_car_numbers)
+            + ", ".join(format_plate_for_telegram(p) for p in shown)
+            + (f" и ещё {hidden_count}" if hidden_count else "")
         )
     return "\n".join(lines)
 
 
-def format_debt_row(*, car_number: str, owner_displays: list[str], total_amount: float) -> str:
-    """"🚗 CAR: owner: amount ₾" (см. задачу "manager Statistics / refresh
-    для обоих ботов" п.1 — единый компактный формат, БЕЗ даты/checked_at/
-    "сегодня"/"вчера" и БЕЗ " — "-разделителей). Каждый owner_display
-    строится вызывающим кодом через format_search_owner_display (те же 4
-    случая, что и у Search: имя+username/только username/только имя/
-    ничего). owner_displays — см. задачу "Georgia debt deduplication by
-    physical car_number": один физический car_number может отслеживаться
-    несколькими задачами/владельцами — все перечисляются через " | "
-    (single-owner case — тот же самый вид строки, что и раньше, join
-    одного элемента не меняет текст), amount печатается РОВНО один раз в
-    конце (не дублируется на каждого owner)."""
-    owners_text = " | ".join(owner_displays)
-    amount_text = _format_search_amount(total_amount)
-    return f"🚗 {format_plate_for_telegram(car_number)}: {owners_text}: {amount_text}"
+DEBT_OWNER_NOT_LINKED_LINE = "👤 Пользователь не привязан"
+_DEBT_OWNER_NAME_MISSING_TEXT = "Имя не указано"
+_DEBT_OWNER_USERNAME_MISSING_TEXT = "Логин не указан"
+
+
+@dataclass(frozen=True)
+class DebtOwner:
+    """Один привязанный к машине пользователь в debt-списке 📊 Статистика
+    (см. задачу "дополнить статистику штрафов информацией о
+    пользователях") — уже выбранные для показа значения (см.
+    ConversationController._debt_owners_by_car): name — имя из Telegram
+    first_name + last_name (см. debt_owner_name), username — Telegram
+    username как он есть (без "@"), НИКОГДА не собранный из имени. None —
+    значение неизвестно (format_debt_row покажет "Имя не указано"/"Логин
+    не указан")."""
+
+    name: str | None
+    username: str | None
+
+
+def debt_owner_name(first_name: str | None, last_name: str | None) -> str | None:
+    """Имя для DebtOwner — Telegram first_name + last_name с тем же
+    отсевом placeholder-мусора ("."/"-"/"_"), что и у Search (см.
+    _sanitize_name_part); None — показывать нечего."""
+    return _full_name(first_name, last_name)
+
+
+def _format_debt_owner_lines(owner: DebtOwner) -> list[str]:
+    """Имя — произвольный пользовательский текст, поэтому обезвреживается
+    для Telethon markdown; username показывается, только если это
+    настоящий Telegram username (см. reader/telegram_markdown.py)."""
+    username = safe_telegram_username(owner.username)
+    name_text = escape_telethon_markdown(owner.name) if owner.name else _DEBT_OWNER_NAME_MISSING_TEXT
+    username_text = f"@{username}" if username else _DEBT_OWNER_USERNAME_MISSING_TEXT
+    return [f"👤 Пользователь: {name_text}", f"🔗 Telegram: {username_text}"]
+
+
+def format_debt_row(*, car_number: str, owners: list[DebtOwner], total_amount: float) -> str:
+    """Блок одной машины debt-списка (см. задачу "дополнить статистику
+    штрафов информацией о пользователях"):
+        🚗 Госномер: <номер>
+        💰 Задолженность: <сумма> ₾
+        👤 Пользователь: <имя>
+        🔗 Telegram: @<username>
+    БЕЗ даты/checked_at/"сегодня"/"вчера" (см. задачу "manager Statistics
+    / refresh для обоих ботов" п.1). owners — ВСЕ пользователи, привязанные
+    к физическому car_number (см. задачу "Georgia debt deduplication by
+    physical car_number"): пара 👤/🔗 на каждого, сумма — РОВНО один раз
+    (не дублируется на каждого владельца и не складывается между ними).
+    Пустой owners (машина без клиента, см. add_delegated_car_without_client)
+    -> "👤 Пользователь не привязан"."""
+    lines = [
+        f"🚗 Госномер: {format_plate_for_telegram(car_number)}",
+        f"💰 Задолженность: {_format_search_amount(total_amount)}",
+    ]
+    if not owners:
+        lines.append(DEBT_OWNER_NOT_LINKED_LINE)
+    for owner in owners:
+        lines.extend(_format_debt_owner_lines(owner))
+    return "\n".join(lines)
 
 
 def format_debt_list_section(row_lines: list[str], *, page: int, total_pages: int) -> str:
@@ -784,10 +843,11 @@ def format_debt_list_section(row_lines: list[str], *, page: int, total_pages: in
     со штрафами:"). Пагинация (см. задачу п.7: "если список большой —
     сохранить существующую pagination") — тот же footer, что и у Search
     (format_search_pagination_footer), показывается ТОЛЬКО когда страниц
-    больше одной."""
+    больше одной. Блоки машин (см. format_debt_row) многострочные —
+    разделяются пустой строкой."""
     if not row_lines:
         return ""
-    parts = ["\n".join(row_lines)]
+    parts = ["\n\n".join(row_lines)]
     if total_pages > 1:
         parts.append("")
         parts.append(format_search_pagination_footer(page=page, total_pages=total_pages))
