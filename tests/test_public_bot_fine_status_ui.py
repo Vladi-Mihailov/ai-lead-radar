@@ -154,7 +154,19 @@ async def test_check_now_shows_statuses_and_excludes_paid_from_amount_to_pay(fx)
     assert reply.cta_buttons  # есть неоплаченный — кнопка оплаты на месте
 
 
-async def test_check_now_without_unpaid_fines_offers_no_payment(fx):
+async def test_check_now_with_only_paid_fines_offers_no_payment(fx):
+    task, subscription = fx.car(_CAR, [("GE1", 50), ("GE2", 100)], owner=_OWNER)
+    await fx.check(task)
+    for protocol in ("GE1", "GE2"):
+        fx.tracker.mark_paid(fx.status(_CAR, protocol).id, actor_user_id=_TRUSTED, note="TBC 1")
+
+    reply = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=_OWNER)
+
+    assert reply.cta_buttons is None
+    assert "💰 К оплате: 0 ₾" in reply.text
+
+
+async def test_check_now_uncertain_payment_stays_in_amount_to_pay(fx):
     task, subscription = fx.car(_CAR, [("GE1", 50), ("GE2", 100)], owner=_OWNER)
     await fx.check(task)
     fx.tracker.mark_paid(fx.status(_CAR, "GE1").id, actor_user_id=_TRUSTED, note="TBC 1")
@@ -162,9 +174,10 @@ async def test_check_now_without_unpaid_fines_offers_no_payment(fx):
 
     reply = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=_OWNER)
 
-    assert reply.cta_buttons is None
-    assert "💰 К оплате: 0 ₾" in reply.text
-    assert "🟡 Оплата требует проверки: 100 ₾" in reply.text
+    # 🟡 — не оплата: долг остаётся, кнопка оплаты тоже
+    assert "💰 К оплате: 100 ₾" in reply.text
+    assert "🟡 Из них оплата требует проверки: 100 ₾" in reply.text
+    assert reply.cta_buttons
 
 
 async def test_check_now_without_statuses_keeps_old_format(tmp_path):
@@ -210,7 +223,22 @@ async def test_statistics_separates_confirmed_paid_and_uncertain(tmp_path):
     assert position["AA111BB"] < position["CC333DD"] < position["BB222CC"]
     paid_block = reply.text[position["BB222CC"]:]
     assert "💰 Задолженность: 0 ₾" in paid_block and "🟢 Оплачено: 30 ₾" in paid_block
+    review_block = reply.text[position["CC333DD"]:position["BB222CC"]]
+    assert "💰 Задолженность: 70 ₾" in review_block and "🟡 Из них требует проверки: 70 ₾" in review_block
     fixture.close()
+
+
+async def test_car_with_only_gone_receipts_leaves_statistics_despite_old_snapshot(fx):
+    task, _ = fx.car(_CAR, [("GE1", 70)])
+    await fx.check(task)  # положительный снимок задачи остаётся старым
+    t0 = datetime(2026, 11, 18, 19, 0)
+    fx.tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=t0)
+    fx.tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=t0 + timedelta(hours=13))
+
+    reply = fx.controller._format_statistics_reply()
+
+    assert "Автомобилей: 0" in reply.text
+    assert "🔴 Подтверждённая задолженность: 0 ₾ (0 шт.)" in reply.text
 
 
 async def test_statistics_without_statuses_is_unchanged(tmp_path):
@@ -229,6 +257,11 @@ async def test_statistics_without_statuses_is_unchanged(tmp_path):
 # ---- 🧾 Статусы оплаты ----
 
 
+def _press_confirm(fx, reply, *, user=_TRUSTED):
+    status_id, token = keyboards.decode_fine_status_confirm_callback(reply.inline_buttons[0][0][1])
+    return fx.controller.handle_fine_status_confirm(status_id, token, chat_id=_CHAT, telegram_user_id=user)
+
+
 async def _open_car(fx, car=_CAR, user=_TRUSTED):
     assert fx.controller.handle_fine_status_prompt(chat_id=_CHAT, telegram_user_id=user) is not None
     return await fx.controller.handle_text(car, chat_id=_CHAT, telegram_user_id=user, username=None)
@@ -242,7 +275,7 @@ async def test_only_trusted_managers_can_use_payment_statuses(fx):
     assert fx.controller.handle_fine_status_prompt(chat_id=_CHAT, telegram_user_id=_OWNER) is None
     assert fx.controller.handle_fine_status_open(status_id, chat_id=_CHAT, telegram_user_id=_OWNER) is None
     assert fx.controller.handle_fine_status_action(status_id, "paid", chat_id=_CHAT, telegram_user_id=_OWNER) is None
-    assert fx.controller.handle_fine_status_confirm(status_id, chat_id=_CHAT, telegram_user_id=_OWNER) is None
+    assert fx.controller.handle_fine_status_confirm(status_id, "abcd1234", chat_id=_CHAT, telegram_user_id=_OWNER) is None
     assert fx.status(_CAR, "GE1").payment_status == PAYMENT_UNPAID
 
 
@@ -264,22 +297,25 @@ async def test_mark_paid_requires_reason_and_confirmation(fx):
 
     prompt = fx.controller.handle_fine_status_action(status_id, "paid", chat_id=_CHAT, telegram_user_id=_TRUSTED)
     assert prompt.text == texts.FINE_STATUS_PAYMENT_NOTE_PROMPT
-    empty = await fx.controller.handle_text("   ", chat_id=_CHAT, telegram_user_id=_TRUSTED, username=None)
-    assert empty is None or "не может быть пустым" in empty.text
-    confirm = await fx.controller.handle_text("TBC Pay 123456, 18.11.2026", chat_id=_CHAT, telegram_user_id=_TRUSTED, username=None)
+    empty = fx.controller._handle_fine_payment_note_input(
+        " \t ", chat_id=_CHAT, telegram_user_id=_TRUSTED, payload={"status_id": status_id},
+    )
+    assert empty.text == texts.FINE_STATUS_PAYMENT_NOTE_EMPTY_TEXT
+    confirm = await fx.controller.handle_text(
+        "TBC Pay 123456, 18.11.2026", chat_id=_CHAT, telegram_user_id=_TRUSTED, username=None,
+    )
     assert "Станет: 🟢 Оплачен" in confirm.text and "TBC Pay 123456" in confirm.text
     assert fx.status(_CAR, "GE1").payment_status == PAYMENT_UNPAID  # до подтверждения — ничего
 
-    done = fx.controller.handle_fine_status_confirm(status_id, chat_id=_CHAT, telegram_user_id=_TRUSTED)
+    done = _press_confirm(fx, confirm)
 
     status = fx.status(_CAR, "GE1")
     assert status.payment_status == PAYMENT_PAID and status.payment_updated_by == _TRUSTED
     assert texts.FINE_STATUS_SAVED_TEXT in done.text and "Основание (квитанция)" in done.text
 
 
-async def test_mia_failure_button_is_needs_review_even_with_bad_config(tmp_path):
-    # даже если кто-то по ошибке внесёт общий отказ в маркеры "уже оплачено"
-    fixture = _Fixture(tmp_path, markers=PaymentPageMarkers(already_paid=(MIA_PAYMENT_FAILED_MESSAGE,)))
+async def test_mia_failure_button_is_needs_review_whatever_the_markers(tmp_path):
+    fixture = _Fixture(tmp_path, markers=PaymentPageMarkers(already_paid=("ქვითარი უკვე გადახდილია",)))
     task, _ = fixture.car(_CAR, [("GE1", 50)])
     await fixture.check(task)
     status_id = fixture.status(_CAR, "GE1").id
@@ -288,10 +324,15 @@ async def test_mia_failure_button_is_needs_review_even_with_bad_config(tmp_path)
         status_id, "failed", chat_id=_CHAT, telegram_user_id=_TRUSTED,
     )
     assert "Станет: 🟡 Оплата требует проверки" in confirm.text
-    fixture.controller.handle_fine_status_confirm(status_id, chat_id=_CHAT, telegram_user_id=_TRUSTED)
+    _press_confirm(fixture, confirm)
 
     assert fixture.status(_CAR, "GE1").payment_status == PAYMENT_NEEDS_REVIEW
     fixture.close()
+
+
+def test_generic_failure_can_never_be_configured_as_paid(tmp_path):
+    with pytest.raises(ValueError):
+        _Fixture(tmp_path, markers=PaymentPageMarkers(already_paid=(MIA_PAYMENT_FAILED_MESSAGE,)))
 
 
 @pytest.mark.parametrize("page_text, expected_status, expected_label", [
@@ -311,7 +352,7 @@ async def test_payment_page_text_classification(tmp_path, page_text, expected_st
     fixture.controller.handle_fine_status_action(status_id, "text", chat_id=_CHAT, telegram_user_id=_TRUSTED)
     confirm = await fixture.controller.handle_text(page_text, chat_id=_CHAT, telegram_user_id=_TRUSTED, username=None)
     assert expected_label in confirm.text
-    fixture.controller.handle_fine_status_confirm(status_id, chat_id=_CHAT, telegram_user_id=_TRUSTED)
+    _press_confirm(fixture, confirm)
 
     assert fixture.status(_CAR, "GE1").payment_status == expected_status
     assert fixture.tracker.events(status_id)[-1]["event"] in (
@@ -324,14 +365,66 @@ async def test_stale_or_foreign_confirmation_changes_nothing(fx):
     task, _ = fx.car(_CAR, [("GE1", 50), ("GE2", 60)])
     await fx.check(task)
     first, second = fx.status(_CAR, "GE1").id, fx.status(_CAR, "GE2").id
-    fx.controller.handle_fine_status_action(first, "failed", chat_id=_CHAT, telegram_user_id=_TRUSTED)
+    confirm = fx.controller.handle_fine_status_action(first, "failed", chat_id=_CHAT, telegram_user_id=_TRUSTED)
+    _, token = keyboards.decode_fine_status_confirm_callback(confirm.inline_buttons[0][0][1])
 
-    other_manager = fx.controller.handle_fine_status_confirm(first, chat_id=_CHAT, telegram_user_id=_OTHER_TRUSTED)
-    wrong_receipt = fx.controller.handle_fine_status_confirm(second, chat_id=_CHAT, telegram_user_id=_TRUSTED)
+    other_manager = _press_confirm(fx, confirm, user=_OTHER_TRUSTED)
+    wrong_receipt = fx.controller.handle_fine_status_confirm(second, token, chat_id=_CHAT, telegram_user_id=_TRUSTED)
 
     assert other_manager.text == texts.STALE_DIALOG_TEXT and wrong_receipt.text == texts.STALE_DIALOG_TEXT
     assert fx.status(_CAR, "GE1").payment_status == PAYMENT_UNPAID
     assert fx.status(_CAR, "GE2").payment_status == PAYMENT_UNPAID
+    # нажатия чужой/неверной кнопки не сбросили настоящий диалог
+    _press_confirm(fx, confirm)
+    assert fx.status(_CAR, "GE1").payment_status == PAYMENT_NEEDS_REVIEW
+
+
+async def test_button_of_an_older_screen_does_not_apply_a_newer_action(tmp_path):
+    fixture = _Fixture(tmp_path, markers=PaymentPageMarkers(already_paid=("ქვითარი უკვე გადახდილია",)))
+    task, _ = fixture.car(_CAR, [("GE1", 50)])
+    await fixture.check(task)
+    status_id = fixture.status(_CAR, "GE1").id
+    old_screen = fixture.controller.handle_fine_status_action(
+        status_id, "failed", chat_id=_CHAT, telegram_user_id=_TRUSTED,
+    )  # «Станет: 🟡»
+    fixture.controller.handle_fine_status_action(status_id, "text", chat_id=_CHAT, telegram_user_id=_TRUSTED)
+    new_screen = await fixture.controller.handle_text(
+        "ქვითარი უკვე გადახდილია", chat_id=_CHAT, telegram_user_id=_TRUSTED, username=None,
+    )  # «Станет: 🟢»
+    assert "Станет: 🟢 Оплачен" in new_screen.text
+
+    stale = _press_confirm(fixture, old_screen)
+
+    assert stale.text == texts.STALE_DIALOG_TEXT
+    assert fixture.status(_CAR, "GE1").payment_status == PAYMENT_UNPAID
+    fixture.close()
+
+
+async def test_confirmation_rejected_when_status_changed_meanwhile(fx):
+    task, _ = fx.car(_CAR, [("GE1", 50)])
+    await fx.check(task)
+    status_id = fx.status(_CAR, "GE1").id
+    confirm = fx.controller.handle_fine_status_action(status_id, "failed", chat_id=_CHAT, telegram_user_id=_TRUSTED)
+    # тем временем другой менеджер подтвердил оплату по квитанции
+    fx.tracker.mark_paid(status_id, actor_user_id=_OTHER_TRUSTED, note="BOG 77")
+
+    reply = _press_confirm(fx, confirm)
+
+    assert texts.FINE_STATUS_CHANGED_TEXT in reply.text
+    assert fx.status(_CAR, "GE1").payment_status == PAYMENT_PAID
+
+
+async def test_manager_note_is_escaped_on_confirmation_screen(fx):
+    task, _ = fx.car(_CAR, [("GE1", 50)])
+    await fx.check(task)
+    status_id = fx.status(_CAR, "GE1").id
+    fx.controller.handle_fine_status_action(status_id, "paid", chat_id=_CHAT, telegram_user_id=_TRUSTED)
+
+    confirm = await fx.controller.handle_text(
+        "**TBC** [x](http://evil) 123", chat_id=_CHAT, telegram_user_id=_TRUSTED, username=None,
+    )
+
+    assert "**TBC**" not in confirm.text and "](" not in confirm.text
 
 
 async def test_cancel_and_clear(fx):
@@ -349,8 +442,8 @@ async def test_cancel_and_clear(fx):
     assert texts.FINE_STATUS_CANCELLED_TEXT in cancelled.text
     assert fx.status(_CAR, "GE1").payment_status == PAYMENT_NEEDS_REVIEW
 
-    fx.controller.handle_fine_status_action(status_id, "unpaid", chat_id=_CHAT, telegram_user_id=_TRUSTED)
-    fx.controller.handle_fine_status_confirm(status_id, chat_id=_CHAT, telegram_user_id=_TRUSTED)
+    confirm = fx.controller.handle_fine_status_action(status_id, "unpaid", chat_id=_CHAT, telegram_user_id=_TRUSTED)
+    _press_confirm(fx, confirm)
     assert fx.status(_CAR, "GE1").payment_status == PAYMENT_UNPAID
 
 
@@ -359,8 +452,8 @@ async def test_gone_receipt_is_shown_but_not_actionable(fx):
     await fx.check(task)
     status_id = fx.status(_CAR, "GE1").id
     t0 = datetime(2026, 11, 18, 19, 0)
-    fx.tracker.record_full_check(_CAR, [], complete=True, at=t0)
-    fx.tracker.record_full_check(_CAR, [], complete=True, at=t0 + timedelta(hours=13))
+    fx.tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=t0)
+    fx.tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=t0 + timedelta(hours=13))
 
     screen = await _open_car(fx)
     action = fx.controller.handle_fine_status_action(status_id, "paid", chat_id=_CHAT, telegram_user_id=_TRUSTED)
@@ -377,7 +470,11 @@ def test_callback_round_trips_and_rejects_garbage():
     ) == (42, "failed")
     assert keyboards.decode_fine_status_action_callback(b"fsta:42:delete") is None
     assert keyboards.decode_fine_status_action_callback(b"fsta:x:paid") is None
-    assert keyboards.decode_fine_status_confirm_callback(keyboards.encode_fine_status_confirm_callback(7)) == 7
+    assert keyboards.decode_fine_status_confirm_callback(
+        keyboards.encode_fine_status_confirm_callback(7, "a1b2c3d4"),
+    ) == (7, "a1b2c3d4")
+    assert keyboards.decode_fine_status_confirm_callback(b"fsty:7") is None
+    assert keyboards.decode_fine_status_confirm_callback(b"fsty:7:..") is None
     assert keyboards.decode_fine_status_cancel_callback(keyboards.encode_fine_status_cancel_callback(7)) == 7
     assert keyboards.decode_fine_status_back_callback(keyboards.encode_fine_status_back_callback(7)) == 7
     assert keyboards.is_fine_status_ask_callback(b"fstask")

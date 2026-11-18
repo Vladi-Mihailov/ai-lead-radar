@@ -28,7 +28,15 @@ delivery_service.py).
 процесса тот же день продолжается с непроверенных номеров, второй запуск
 того же дня не начнётся; номера, до которых не дошли (остановка/окно
 закончилось), завтра окажутся в начале очереди — сортировка по давности
-последней успешной проверки.
+последней успешной проверки; номера, на которых вчерашний проход упал, —
+в конце (два "вечно падающих" номера не останавливают весь проход).
+Прогон, оставшийся 'running' после рестарта вне окна, закрывается как
+прерванный.
+
+Этот модуль сам номеров в журнал не пишет (только счётчики); проверка
+номера идёт через FineCheckService, чья существующая INFO-строка "Georgia
+fine check plate=..." пишет номер так же, как при ручной проверке (см.
+аудит утечек номеров — меняется отдельным решением).
 """
 
 from __future__ import annotations
@@ -64,6 +72,7 @@ STOP_UNAVAILABLE = "unavailable"
 STOP_ERRORS = "errors"
 STOP_CUTOFF = "cutoff"
 STOP_BUSY = "busy"
+STOP_INTERRUPTED = "interrupted"
 
 _GATE_HOLDER = "daily_recheck"
 _TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -198,6 +207,39 @@ class DailyRecheckRepository:
             )
         return cursor.rowcount == 1
 
+    def close_stale_running(self, *, now: datetime, stale_after: timedelta, keep_run_date: date | None) -> int:
+        """Прогоны, оставшиеся 'running' без живого исполнителя (процесс
+        перезапустили, а окно уже закончилось), — 'postponed'/interrupted,
+        чтобы статистика не показывала "идёт" до следующего вечера.
+        keep_run_date — сегодняшний прогон во время окна не трогаем: его
+        продолжает take_over_stale_run."""
+        threshold = _fmt(_naive_utc(now) - stale_after)
+        query = (
+            "UPDATE georgia_daily_recheck_runs SET status = ?, stop_reason = ?, finished_at = ? "
+            "WHERE status = ? AND heartbeat_at <= ?"
+        )
+        params: list = [RUN_POSTPONED, STOP_INTERRUPTED, _fmt(now), RUN_RUNNING, threshold]
+        if keep_run_date is not None:
+            query += " AND run_date != ?"
+            params.append(keep_run_date.isoformat())
+        with self._conn:
+            cursor = self._conn.execute(query, params)
+        return cursor.rowcount
+
+    def failed_plates_of_previous_run(self, before: date) -> set[str]:
+        """Номера, на которых упал последний прогон ДО before."""
+        row = self._conn.execute(
+            "SELECT run_date FROM georgia_daily_recheck_runs WHERE run_date < ? ORDER BY run_date DESC LIMIT 1",
+            (before.isoformat(),),
+        ).fetchone()
+        if row is None:
+            return set()
+        rows = self._conn.execute(
+            "SELECT car_number FROM georgia_daily_recheck_items WHERE run_date = ? AND state = ?",
+            (row[0], ITEM_ERROR),
+        ).fetchall()
+        return {r[0] for r in rows}
+
     def heartbeat(self, run_date: date, *, now: datetime) -> None:
         self._conn.execute(
             "UPDATE georgia_daily_recheck_runs SET heartbeat_at = ? WHERE run_date = ?",
@@ -250,6 +292,8 @@ class _CheckServiceLike(Protocol):
 
 class _StatusTrackerLike(Protocol):
     def listed_car_numbers(self) -> list[str]: ...
+
+    def recently_gone_car_numbers(self) -> list[str]: ...
 
 
 def _utc_now() -> datetime:
@@ -311,16 +355,18 @@ class DailyRecheckService:
         local_time = now.astimezone(self._tz).time()
         return self._start_time <= local_time < self._cutoff_time
 
-    def select_plates(self) -> list[str]:
+    def select_plates(self, *, today: date | None = None) -> list[str]:
         """Номера с известными штрафами в базе полиции: положительный снимок
-        долга (как у "🔄 Проверить авто со штрафами") плюс номера, у которых
-        есть не-⚪ статусы (в т.ч. найденные feed'ом после последней
-        проверки и оплаченные, но ещё видимые на police.ge). Сначала — те,
-        что дольше всего не проверялись."""
+        долга (как у "🔄 Проверить авто со штрафами"), номера с не-⚪
+        статусами (в т.ч. найденные feed'ом после последней проверки и
+        оплаченные, но ещё видимые на police.ge) и номера, у которых штраф
+        стал ⚪ в последние дни (ложное ⚪ сменится на "снова найден").
+        Сначала — те, что дольше всего не проверялись; номера, на которых
+        упал вчерашний проход, — в конце."""
         last_checked: dict[str, datetime | None] = {}
         for group in self._tasks.list_debt_car_groups():
             last_checked[group.car_number] = _naive_utc(group.checked_at)
-        for car_number in self._statuses.listed_car_numbers():
+        for car_number in [*self._statuses.listed_car_numbers(), *self._statuses.recently_gone_car_numbers()]:
             if car_number in last_checked:
                 continue
             stamps = [
@@ -329,19 +375,26 @@ class DailyRecheckService:
                 if task.last_successful_checked_at is not None
             ]
             last_checked[car_number] = max(stamps) if stamps else None
+        failed_yesterday = self._repository.failed_plates_of_previous_run(
+            today or self._clock().astimezone(self._tz).date(),
+        )
         plates = [car for car in last_checked if not is_fine_output_suppressed(car)]
-        plates.sort(key=lambda car: (last_checked[car] or datetime.min, car))
+        plates.sort(key=lambda car: (car in failed_yesterday, last_checked[car] or datetime.min, car))
         return plates[: self._max_plates]
 
     def _tasks_for_plate(self, car_number: str) -> list[FineMonitoringTask]:
-        """Активные задачи номера; если их нет — одна самая свежая задача с
-        известным снимком (машина могла уйти с мониторинга, но остаться в
-        статистике долга). Лишние старые задачи не трогаем — меньше строк
-        detected_fines и уведомлений."""
+        """Активные задачи номера и задачи с положительным снимком долга
+        (как у "🔄 Проверить авто со штрафами": иначе снимок неактивной
+        задачи так и остался бы старым и держал машину в статистике). Если
+        таких нет — одна самая свежая задача с известным снимком, иначе
+        самая новая."""
         tasks = self._tasks.list_by_car_number(car_number)
-        active = [task for task in tasks if task.status == "active"]
-        if active:
-            return active
+        selected = [
+            task for task in tasks
+            if task.status == "active" or (task.last_successful_total_amount or 0) > 0
+        ]
+        if selected:
+            return selected
         with_snapshot = [task for task in tasks if task.last_successful_checked_at is not None]
         if with_snapshot:
             return [max(with_snapshot, key=lambda task: (_naive_utc(task.last_successful_checked_at), task.id))]
@@ -352,12 +405,19 @@ class DailyRecheckService:
         завершённого/остановленного прогона дня — ничего не делает (вторая
         попытка в тот же день не начинается)."""
         now = now or self._clock()
-        if self._running or not self.in_window(now):
+        if self._running:
             return None
+        in_window = self.in_window(now)
         run_date = now.astimezone(self._tz).date()
+        if self._repository.close_stale_running(
+            now=now, stale_after=self._stale_after, keep_run_date=run_date if in_window else None,
+        ):
+            logger.info("Georgia daily recheck: an interrupted run was closed")
+        if not in_window:
+            return None
         existing = self._repository.get_run(run_date)
         if existing is None:
-            plates = self.select_plates()
+            plates = self.select_plates(today=run_date)
             if not self._repository.create_run(run_date, plates, now=now):
                 return None
             if not plates:

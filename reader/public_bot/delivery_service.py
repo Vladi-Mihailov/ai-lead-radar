@@ -117,7 +117,7 @@ class FineStatusLookupLike(Protocol):
     """Ровно то, что нужно отсюда от FineStatusTracker (см.
     reader/fines/payment_status.py)."""
 
-    def undeliverable_protocols(self, car_number: str) -> set[str]: ...
+    def gone_protocols(self, car_number: str) -> set[str]: ...
 
 
 class ClientDeliveryService:
@@ -206,15 +206,16 @@ class ClientDeliveryService:
     def _deliverable_fines(self, subscription: FineMonitoringSubscription) -> list[DetectedFine]:
         """Строки detected_fines номера подписки, по одной на квитанцию
         (самая ранняя строка — каноническая), без квитанций, которых police.ge
-        больше не показывает (⚪) или не показал на последней полной проверке:
-        "новый штраф" о них был бы ложным (см. задачу — подписку могли
-        создать уже после того, как штраф оплатили и он исчез). Строки без
-        номера квитанции (старые записи) — как раньше, каждая отдельно."""
+        больше не показывает (⚪): "новый штраф" о них был бы ложным (см.
+        задачу — подписку могли создать уже после того, как штраф оплатили
+        и он исчез). Не найденные один раз ('missing') доставляются как
+        обычно — это ещё не доказательство. Строки без номера квитанции
+        (старые записи) — как раньше, каждая отдельно."""
         fines = sorted(
             self._detected_fine_repository.list_by_car_number(subscription.car_number), key=lambda fine: fine.id,
         )
         undeliverable = (
-            self._status_lookup.undeliverable_protocols(subscription.car_number)
+            self._status_lookup.gone_protocols(subscription.car_number)
             if self._status_lookup is not None and fines else set()
         )
         result: list[DetectedFine] = []

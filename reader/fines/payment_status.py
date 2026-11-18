@@ -17,10 +17,12 @@ police.ge публикует квитанции ("Receipts of fines published") 
   полных проверках с интервалом не меньше disappearance_min_gap).
 
 Пока штраф не 'gone', он остаётся в своём статусе и, если не 'paid', — в
-задолженности: одна проверка без штрафа (в том числе пустой ответ, который
-police.ge под нагрузкой уже отдавал ложно, см. false-zero guard в
-check_service.py) не доказывает, что он исчез. Ошибки и показ из кэша сюда
-вообще не попадают, неполный ответ (count != len(records)) не учитывается.
+задолженности: одна проверка без штрафа не доказывает, что он исчез. Ошибки
+и показ из кэша сюда вообще не попадают, неполный ответ (count !=
+len(records)) не учитывается, а пустой ответ (police.ge под нагрузкой уже
+отдавал его ложно) засчитывается, только если его подтвердил повторный
+запрос (false-zero guard в check_service.py, который при известных
+статусах номера срабатывает всегда).
 
 Отказ платёжной страницы НИКОГДА не означает 🟢 сам по себе: шлюз Georgian
 Card спрашивает МВД "можно ли оплатить" (ответ code 1/code 2 с произвольным
@@ -77,6 +79,12 @@ SOURCE_MANAGER = "manager"
 MIA_PAYMENT_FAILED_MESSAGE = "ჯარიმის გადახდა ვერ მოხერხდა"
 
 _NOTE_MAX_LENGTH = 300
+# Короче этого маркер текста страницы оплаты не принимается: одно слово или
+# пара символов совпали бы с чем угодно (см. validate_payment_page_markers).
+_MIN_MARKER_LENGTH = 6
+# Сколько дней после ⚪ номер ещё перепроверяется вечером — чтобы ложное ⚪
+# (если оно всё же случится) сменилось на "снова найден" (см. reappeared).
+GONE_FOLLOW_UP = timedelta(days=3)
 
 _SCHEMA = (
     """
@@ -279,10 +287,36 @@ def _normalize_page_text(value: str | None) -> str:
     return _WHITESPACE_RE.sub(" ", (value or "").casefold()).strip(" !. ")
 
 
+def validate_payment_page_markers(markers: PaymentPageMarkers) -> None:
+    """Защита от конфигурации, при которой общий отказ МВД
+    ("ჯარიმის გადახდა ვერ მოხერხდა!") превратился бы в "уже оплачено" или
+    "техническую ошибку": маркер короче _MIN_MARKER_LENGTH символов или
+    являющийся частью этого сообщения не принимается. ValueError с
+    понятным текстом — процесс бота не стартует с такой настройкой."""
+    generic = _normalize_page_text(MIA_PAYMENT_FAILED_MESSAGE)
+    for kind, values in (
+        ("already_paid", markers.already_paid),
+        ("payment_failed", markers.payment_failed),
+        ("technical_error", markers.technical_error),
+    ):
+        for value in values:
+            marker = _normalize_page_text(value)
+            if len(marker) < _MIN_MARKER_LENGTH:
+                raise ValueError(
+                    f"payment_page_{kind}_markers: маркер {value!r} короче {_MIN_MARKER_LENGTH} символов"
+                )
+            if kind != "payment_failed" and marker in generic:
+                raise ValueError(
+                    f"payment_page_{kind}_markers: маркер {value!r} — часть общего отказа МВД, "
+                    "он не может означать ни оплату, ни техническую ошибку"
+                )
+
+
 def classify_payment_page_text(text: str | None, markers: PaymentPageMarkers) -> PaymentPageVerdict:
     """Явное "уже оплачено" важнее всего; техническая ошибка важнее общего
     отказа (при ней задолженность не трогаем); общий отказ и любой
-    нераспознанный текст — "оплата требует проверки"."""
+    нераспознанный текст — "оплата требует проверки". Слишком короткие
+    маркеры игнорируются (см. validate_payment_page_markers)."""
     normalized = _normalize_page_text(text)
     if not normalized:
         return PaymentPageVerdict.UNRECOGNIZED
@@ -293,7 +327,7 @@ def classify_payment_page_text(text: str | None, markers: PaymentPageMarkers) ->
     ):
         for value in values:
             marker = _normalize_page_text(value)
-            if marker and marker in normalized:
+            if len(marker) >= _MIN_MARKER_LENGTH and marker in normalized:
                 return verdict
     return PaymentPageVerdict.UNRECOGNIZED
 
@@ -369,6 +403,24 @@ class FineStatusRepository:
         rows = self._conn.execute(
             f"SELECT DISTINCT car_number FROM georgia_fine_status WHERE presence != '{PRESENCE_GONE}' "
             "ORDER BY car_number",
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def list_car_numbers_with_statuses(self, car_numbers: list[str]) -> set[str]:
+        if not car_numbers:
+            return set()
+        placeholders = ",".join("?" for _ in car_numbers)
+        rows = self._conn.execute(
+            f"SELECT DISTINCT car_number FROM georgia_fine_status WHERE car_number IN ({placeholders})",
+            list(car_numbers),
+        ).fetchall()
+        return {row[0] for row in rows}
+
+    def list_recently_gone_car_numbers(self, *, since: datetime) -> list[str]:
+        rows = self._conn.execute(
+            f"SELECT DISTINCT car_number FROM georgia_fine_status WHERE presence = '{PRESENCE_GONE}' "
+            "AND gone_at >= ? ORDER BY car_number",
+            (_fmt(since),),
         ).fetchall()
         return [row[0] for row in rows]
 
@@ -471,47 +523,63 @@ class FineStatusRepository:
         return date.fromisoformat(row[0]), _parse_ts(row[1])
 
     def seed_from_detected_fines(self, *, at: datetime) -> int:
-        """Однократное (идемпотентное) заполнение статусов для квитанций,
-        которые police.ge показывал на последней успешной проверке своей
-        задачи или нашёл позже (публичный feed), — до появления этой
-        таблицы такие штрафы жили только в detected_fines. Сравнение дат —
-        в Python, а не в SQL: last_seen_at и last_successful_checked_at
-        пишутся разными путями. Возвращает число созданных строк."""
+        """Однократное (идемпотентное, INSERT OR IGNORE) заполнение статусов
+        из detected_fines — до появления этой таблицы штрафы жили только
+        там. Ключ — номер ЗАДАЧИ (тот же, что передают проверки и
+        подписки), а не protocolAuto строки. Квитанция, которую police.ge
+        показал на последней успешной проверке хотя бы одной задачи номера
+        (или нашёл позже feed), — 'listed'; остальные — 'gone' (⚪): их уже
+        не было в базе полиции, и "новым штрафом" для новой подписки они
+        быть не должны. Сравнение дат — в Python, а не в SQL:
+        last_seen_at и last_successful_checked_at пишутся разными путями.
+        Возвращает число созданных строк."""
         tasks = {
-            row[0]: _parse_ts(row[1])
-            for row in self._conn.execute("SELECT id, last_successful_checked_at FROM fine_monitoring_tasks")
+            row[0]: (row[1], _parse_ts(row[2]))
+            for row in self._conn.execute(
+                "SELECT id, car_number, last_successful_checked_at FROM fine_monitoring_tasks"
+            )
         }
-        current: dict[tuple[str, str], tuple[float | None, datetime, datetime]] = {}
+        seeds: dict[tuple[str, str], dict] = {}
         rows = self._conn.execute(
-            "SELECT monitoring_task_id, car_number, external_fine_id, amount, first_detected_at, last_seen_at "
+            "SELECT monitoring_task_id, external_fine_id, amount, first_detected_at, last_seen_at "
             "FROM detected_fines WHERE external_fine_id IS NOT NULL AND external_fine_id != ''"
         ).fetchall()
-        for task_id, car_number, protocol_no, amount, first_detected_at, last_seen_at in rows:
-            if task_id not in tasks or is_fine_output_suppressed(car_number):
+        for task_id, protocol_no, amount, first_detected_at, last_seen_at in rows:
+            if task_id not in tasks:
                 continue
-            snapshot_at = tasks[task_id]
+            car_number, snapshot_at = tasks[task_id]
+            if is_fine_output_suppressed(car_number):
+                continue
             seen_at = _parse_ts(last_seen_at)
-            if snapshot_at is not None and seen_at < snapshot_at - timedelta(seconds=1):
-                continue  # на последней успешной проверке задачи его уже не было
             first_at = _parse_ts(first_detected_at)
-            key = (car_number, protocol_no)
-            previous = current.get(key)
-            if previous is None:
-                current[key] = (amount, first_at, seen_at)
-            else:
-                current[key] = (previous[0] if previous[0] is not None else amount,
-                                min(previous[1], first_at), max(previous[2], seen_at))
+            listed = snapshot_at is None or seen_at >= snapshot_at - timedelta(seconds=1)
+            seed = seeds.setdefault((car_number, protocol_no), {
+                "amount": amount, "first_at": first_at, "seen_at": seen_at, "listed": False, "gone_at": None,
+            })
+            if seed["amount"] is None:
+                seed["amount"] = amount
+            seed["first_at"] = min(seed["first_at"], first_at)
+            seed["seen_at"] = max(seed["seen_at"], seen_at)
+            if listed:
+                seed["listed"] = True
+            elif snapshot_at is not None:
+                seed["gone_at"] = max(seed["gone_at"] or snapshot_at, snapshot_at)
         created = 0
         with self._conn:
-            for (car_number, protocol_no), (amount, first_at, seen_at) in current.items():
+            for (car_number, protocol_no), seed in seeds.items():
+                presence = PRESENCE_LISTED if seed["listed"] else PRESENCE_GONE
+                gone_at = None if seed["listed"] else _fmt(seed["gone_at"] or seed["seen_at"])
                 cursor = self._conn.execute(
                     "INSERT OR IGNORE INTO georgia_fine_status "
-                    "(car_number, protocol_no, amount, first_listed_at, last_listed_at) VALUES (?, ?, ?, ?, ?)",
-                    (car_number, protocol_no, amount, _fmt(first_at), _fmt(seen_at)),
+                    "(car_number, protocol_no, amount, presence, first_listed_at, last_listed_at, gone_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (car_number, protocol_no, seed["amount"], presence, _fmt(seed["first_at"]),
+                     _fmt(seed["seen_at"]), gone_at),
                 )
                 if cursor.rowcount:
                     created += 1
-                    self._log(cursor.lastrowid, "seeded", SOURCE_CHECK, None, None, at)
+                    self._log(cursor.lastrowid, "seeded" if seed["listed"] else "seeded_gone", SOURCE_CHECK,
+                              None, None, at)
         return created
 
 
@@ -551,6 +619,7 @@ class FineStatusTracker:
         self._repository = repository
         self._min_gap = disappearance_min_gap
         self._markers = markers or PaymentPageMarkers()
+        validate_payment_page_markers(self._markers)
         self._clock = clock
 
     @property
@@ -564,7 +633,7 @@ class FineStatusTracker:
 
     def record_full_check(
         self, car_number: str, records: list[ParsedFineRecord], *, complete: bool,
-        at: datetime | None = None, source: str = SOURCE_CHECK,
+        empty_confirmed: bool = False, at: datetime | None = None, source: str = SOURCE_CHECK,
     ) -> FullCheckSummary:
         """Вызывается после КАЖДОЙ успешной полной проверки номера
         (searchByAuto: вечерняя перепроверка, "Проверить сейчас", добавление
@@ -572,13 +641,17 @@ class FineStatusTracker:
         из кэша. Сверка — по номеру квитанции (protocolNo), не по сумме.
 
         complete=False (источник сообщил другое число записей) — найденные
-        квитанции отмечаются, но отсутствующие не считаются исчезнувшими."""
+        квитанции отмечаются, но отсутствующие не считаются исчезнувшими.
+        Пустой ответ считается полным, только если empty_confirmed (его
+        подтвердил повторный запрос, см. FineCheckService._fetch_trusted)."""
         now = self._now(at)
         summary = FullCheckSummary()
         listed: dict[str, ParsedFineRecord] = {}
         for record in records:
             if record.external_fine_id:
                 listed[record.external_fine_id] = record
+        if not listed and not empty_confirmed:
+            complete = False
         for protocol_no, record in listed.items():
             outcome = self._note_listed(car_number, protocol_no, record.amount, at=now, source=source)
             summary.listed += 1
@@ -712,18 +785,36 @@ class FineStatusTracker:
     def statuses_by_protocol(self, car_number: str) -> dict[str, FineStatus]:
         return {status.protocol_no: status for status in self._repository.list_for_car(car_number, include_gone=True)}
 
-    def undeliverable_protocols(self, car_number: str) -> set[str]:
-        """Квитанции, о которых НЕ нужно отправлять "новый штраф": police.ge
-        их уже не показывает (⚪) или не показал на последней полной
-        проверке (ждём подтверждения) — см. ClientDeliveryService."""
+    def gone_protocols(self, car_number: str) -> set[str]:
+        """Квитанции, которых police.ge больше не показывает (⚪) — о них НЕ
+        нужно отправлять "новый штраф" (см. ClientDeliveryService). Не
+        найденные один раз ('missing') сюда не входят: это ещё не
+        доказательство, и настоящий штраф не должен потеряться."""
         return {
             status.protocol_no
             for status in self._repository.list_for_car(car_number, include_gone=True)
-            if status.presence in (PRESENCE_MISSING, PRESENCE_GONE)
+            if status.presence == PRESENCE_GONE
         }
+
+    def has_listed_receipts(self, car_number: str) -> bool:
+        """Есть ли у номера квитанции, ещё не признанные исчезнувшими — это
+        "свидетельство долга" для false-zero guard (см.
+        FineCheckService._fetch_trusted): пустой ответ по такому номеру
+        всегда перепроверяется."""
+        return bool(self._repository.list_for_car(car_number, include_gone=False))
 
     def listed_car_numbers(self) -> list[str]:
         return [car for car in self._repository.list_listed_car_numbers() if not is_fine_output_suppressed(car)]
+
+    def recently_gone_car_numbers(self, *, within: timedelta = GONE_FOLLOW_UP, at: datetime | None = None) -> list[str]:
+        since = self._now(at) - within
+        return [
+            car for car in self._repository.list_recently_gone_car_numbers(since=since)
+            if not is_fine_output_suppressed(car)
+        ]
+
+    def car_numbers_with_statuses(self, car_numbers: list[str]) -> set[str]:
+        return self._repository.list_car_numbers_with_statuses(car_numbers)
 
     def breakdown_for_cars(self, car_numbers: list[str]) -> dict[str, DebtBreakdown]:
         by_car: dict[str, list[FineStatus]] = {}

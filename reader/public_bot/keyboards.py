@@ -691,12 +691,23 @@ def decode_fine_status_action_callback(data: bytes | None) -> tuple[int, str] | 
         return None
 
 
-def encode_fine_status_confirm_callback(status_id: int) -> bytes:
-    return _FINE_STATUS_CONFIRM_PREFIX + str(status_id).encode("ascii")
+def encode_fine_status_confirm_callback(status_id: int, token: str) -> bytes:
+    """token — одноразовый код экрана подтверждения (см.
+    ConversationController._fine_status_confirm_reply): кнопка со старого
+    экрана не применит действие, показанное на другом экране."""
+    return _FINE_STATUS_CONFIRM_PREFIX + f"{status_id}:{token}".encode("ascii")
 
 
-def decode_fine_status_confirm_callback(data: bytes | None) -> int | None:
-    return _decode_id(data, _FINE_STATUS_CONFIRM_PREFIX)
+def decode_fine_status_confirm_callback(data: bytes | None) -> tuple[int, str] | None:
+    if not data or not data.startswith(_FINE_STATUS_CONFIRM_PREFIX):
+        return None
+    raw_id, _, token = data[len(_FINE_STATUS_CONFIRM_PREFIX):].decode("ascii", "replace").partition(":")
+    if not token or not token.isalnum():
+        return None
+    try:
+        return int(raw_id), token
+    except ValueError:
+        return None
 
 
 def encode_fine_status_cancel_callback(status_id: int) -> bytes:

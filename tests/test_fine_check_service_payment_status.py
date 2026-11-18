@@ -68,7 +68,7 @@ class _Provider(FineProvider):
 
 
 class _Fixture:
-    def __init__(self, tmp_path, *, min_gap=timedelta(0)):
+    def __init__(self, tmp_path, *, min_gap=timedelta(0), dedupe=True):
         db_path = tmp_path / "users.db"
         self.tasks = FineMonitoringTaskRepository(db_path)
         self.fines = DetectedFineRepository(db_path)
@@ -77,6 +77,7 @@ class _Fixture:
         self.provider = _Provider()
         self.service = FineCheckService(
             self.provider, self.tasks, self.fines, sleep=_instant_sleep, status_tracker=self.tracker,
+            dedupe_known_receipts=dedupe,
         )
 
     def task(self):
@@ -177,6 +178,40 @@ async def test_false_empty_is_confirmed_and_counts_once(tmp_path):
     fixture.close()
 
 
+async def test_feed_found_receipt_forces_confirmation_even_with_zero_snapshot(fx):
+    """Снимок задачи 0, штраф найден feed'ом (снимок он не обновляет): пустой
+    ответ всё равно перепроверяется, и неподтверждённым он не засчитывается."""
+    task = fx.task()
+    fx.provider.results = [ProviderSearchResult(records=[])]
+    await fx.service.check_task(task)  # снимок = 0
+    await fx.service.persist_feed_match(fx.tasks.get(task.id), _record("GE1"))
+    fx.provider.refresh_flags.clear()
+
+    # пустой ответ, а повторный запрос штраф находит — ложный ноль пойман
+    fx.provider.results = [ProviderSearchResult(records=[]), ProviderSearchResult(records=[_record("GE1")])]
+    await fx.service.check_task(fx.tasks.get(task.id))
+
+    assert len(fx.provider.refresh_flags) == 2
+    assert fx.statuses()["GE1"].presence == PRESENCE_LISTED
+
+
+async def test_second_empty_answer_is_still_double_checked(tmp_path):
+    fixture = _Fixture(tmp_path, min_gap=timedelta(0))
+    task = fixture.task()
+    fixture.provider.results = [ProviderSearchResult(records=[_record("GE1")])]
+    await fixture.service.check_task(task)
+
+    for _ in range(2):
+        fixture.provider.refresh_flags.clear()
+        fixture.provider.results = [ProviderSearchResult(records=[]), ProviderSearchResult(records=[])]
+        await fixture.service.check_task(fixture.tasks.get(task.id))
+        # снимок уже 0, но квитанция ещё не ⚪ — без второго запроса нельзя
+        assert len(fixture.provider.refresh_flags) == 2
+
+    assert fixture.statuses()["GE1"].presence == "gone"
+    fixture.close()
+
+
 async def test_feed_match_lists_receipt_without_touching_others(fx):
     task = fx.task()
     fx.provider.results = [ProviderSearchResult(records=[_record("GE1")])]
@@ -250,6 +285,20 @@ async def test_receipt_still_pending_for_another_task_keeps_per_task_semantics(f
 
     pending = fx.fines.list_pending_notifications()
     assert sorted(fine.monitoring_task_id for fine in pending) == sorted([first.id, second.id])
+
+
+async def test_operator_process_without_flag_keeps_old_behaviour(tmp_path):
+    fixture = _Fixture(tmp_path, dedupe=False)
+    first = fixture.task()
+    fixture.provider.results = [ProviderSearchResult(records=[_record("GE1")])]
+    await fixture.service.check_task(first)
+    for fine in fixture.fines.list_pending_notifications():
+        fixture.fines.mark_notification_sent(fine.id)
+
+    await fixture.service.check_task(fixture.task())
+
+    assert len(fixture.fines.list_pending_notifications()) == 1
+    fixture.close()
 
 
 async def test_new_receipt_for_two_tasks_keeps_per_task_notifications(fx):

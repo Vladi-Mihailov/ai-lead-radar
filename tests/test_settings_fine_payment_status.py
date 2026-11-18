@@ -10,11 +10,12 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import pytest
 import yaml
 
 from reader.fines.payment_status import MIA_PAYMENT_FAILED_MESSAGE
 from reader.public_bot.main import build_payment_page_markers
-from reader.settings import load_settings
+from reader.settings import ConfigError, load_settings
 
 
 def _load(tmp_path, monkeypatch, fine_monitor_overrides: dict):
@@ -45,6 +46,11 @@ def test_defaults_are_safe(tmp_path, monkeypatch):
     assert markers.already_paid == ()
     assert markers.payment_failed == (MIA_PAYMENT_FAILED_MESSAGE,)
     assert markers.technical_error == ()
+
+
+def test_marker_string_instead_of_list_is_rejected(tmp_path, monkeypatch):
+    with pytest.raises(ConfigError):
+        _load(tmp_path, monkeypatch, {"payment_page_already_paid_markers": "ქვითარი უკვე გადახდილია"})
 
 
 def test_overrides_are_parsed(tmp_path, monkeypatch):

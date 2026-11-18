@@ -103,10 +103,12 @@ Rules:
   never mark anything as missing.
 - A response whose `count` differs from the number of records is incomplete.
   Receipts absent from it are not counted as missing.
-- An empty result is accepted only after the existing false-zero
-  confirmation (a second request 5 s later). Even then it is one of the two
-  checks, never both.
-- A ⚪ receipt that shows up again returns to its previous status, without a
+- An empty result counts only if a second request 5 s later is empty too
+  (the false-zero guard). That guard now always fires for a plate that still
+  has non-⚪ receipts, even when the task's saved total is 0. So a ⚪ that
+  rests on empty results takes four empty answers on two different days.
+- A plate stays in the evening re-check for 3 days after a receipt went ⚪.
+  If the receipt shows up again it returns to its previous status, without a
   "new fine" message.
 - Every change is written to `georgia_fine_status_events`: what changed, the
   source, the manager's Telegram id and the reason.
@@ -115,12 +117,16 @@ Where statuses are shown:
 
 - «🔎 Проверить сейчас»:
   - a «Статус: …» line under each fine;
-  - a summary: «💰 К оплате» (🔴 only), 🟢 and 🟡 totals;
-  - the «💳 Оплатить в рублях» button only while at least one 🔴 fine remains.
+  - a summary: «💰 К оплате» covers everything not confirmed as paid. 🟡 is
+    still debt («🟡 Из них оплата требует проверки»), and 🟢 is shown
+    separately;
+  - the «💳 Оплатить в рублях» button disappears only when every fine is 🟢.
 - «📊 Статистика»:
   - confirmed debt (🔴), uncertain (🟡) and paid but still listed (🟢), with
     counts;
-  - per-car lines;
+  - per-car lines: «💰 Задолженность» is 🔴 plus 🟡, then «🟡 Из них…» and
+    «🟢 Оплачено» lines. A car whose receipts are all ⚪ is not shown, even if
+    an old task still has a positive total;
   - «База police.ge обновлена»;
   - the last evening re-check.
 - «🧾 Статусы оплаты» (trusted managers): enter a plate → list → a receipt →
@@ -134,18 +140,22 @@ Where statuses are shown:
     and is only logged. The generic failure or unknown text gives 🟡.
   - **«🔴 Снять отметку»**.
 
-  Every action needs a second «✅ Подтвердить». A stale button or another
-  manager's confirmation changes nothing.
+  Every action needs a second «✅ Подтвердить». Each confirmation screen
+  carries a one-time token. A button from an older screen, another manager's
+  press, or a status changed in the meantime changes nothing.
 
 Client delivery:
 
 - Only one «🚨 Обнаружен новый штраф» per receipt per recipient. Before
   this, a receipt stored under two tasks of a plate reached the same
   subscription twice (5 cases in production).
-- No such message for a receipt police.ge no longer shows (2 cases in
-  production).
-- If the operator was already notified about a receipt through another task,
-  the new task's row is created as already notified.
+- No such message for a ⚪ receipt (2 cases in production).
+  - At first start, receipts already absent at their task's last successful
+    check are seeded as ⚪.
+  - A receipt missing only once is still delivered.
+- In the Georgian bot only, if the operator was already notified about a
+  receipt through another task, the new task's row is created as already
+  notified. The operator process (`reader/main.py`) keeps its old behaviour.
 
 ## Daily evening re-check
 
@@ -157,9 +167,14 @@ The re-check, once a day:
 
 - **Window:** 23:00–23:45 Asia/Tbilisi, between the collector's 21:00 and
   23:55 cycles and after the Turkey batch (22:00 Tbilisi).
-- **Plates:** those with a positive debt snapshot, plus those with
-  non-⚪ statuses (feed-found and paid-but-listed included). The least
-  recently checked come first; at most `daily_recheck_max_plates`.
+- **Plates:** those with a positive debt snapshot, those with non-⚪
+  statuses (feed-found and paid-but-listed included), and those with a
+  receipt that went ⚪ in the last 3 days.
+  - Order: least recently checked first; plates the previous pass failed on
+    go last, so two always-failing plates cannot stop every pass.
+  - At most `daily_recheck_max_plates`.
+  - Checked tasks: all active tasks of the plate plus every task with a
+    positive total.
 - **How:** the same `FineCheckService.check_plate_for_tasks` as «🔄 Проверить
   авто со штрафами»: `searchByAuto` through REDNET, the false-zero guard,
   normal handling of new fines, no repeat notifications for known ones.
@@ -180,6 +195,12 @@ The re-check, once a day:
   - After a restart, the same day resumes with the plates not yet checked.
   - A day never runs twice.
   - Plates not reached are first in line the next day.
+  - A run left "running" by a restart outside the window is closed as
+    interrupted.
+- **Logging:** the pass itself logs counts only. The existing per-check line
+  in `FineCheckService` ("Georgia fine check plate=…") still writes the plate,
+  as it does for every manual check. Removing plates from logs is part of the
+  separate plate-leak cleanup.
 
 ### Load
 
@@ -240,6 +261,10 @@ fine_monitor:
   # payment_page_failed_markers: built-in «ჯარიმის გადახდა ვერ მოხერხდა»
   payment_page_technical_error_markers: []
 ```
+
+Markers must be YAML lists of at least 6 characters. A marker that is part of
+the generic MIA failure message is rejected at start-up, so that message can
+never become "paid" or "technical error".
 
 REDNET side (optional, backward compatible): `reader/georgia_collector/
 check_now_server.py` now returns `count`, `source_updated_on`, accepts

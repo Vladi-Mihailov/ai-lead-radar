@@ -569,8 +569,9 @@ def register(
 
         fine_status_confirm = decode_fine_status_confirm_callback(data)
         if fine_status_confirm is not None:
+            status_id, token = fine_status_confirm
             reply = controller.handle_fine_status_confirm(
-                fine_status_confirm, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+                status_id, token, chat_id=event.chat_id, telegram_user_id=event.sender_id,
             )
             await _answer_and_send(event, reply, is_trusted=is_trusted)
             return

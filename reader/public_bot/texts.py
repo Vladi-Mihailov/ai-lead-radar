@@ -270,9 +270,11 @@ def fine_status_label(display_status: str) -> str:
 
 
 def format_check_now_status_summary(fines: list[NewFineEvent], statuses: dict[str, str]) -> str:
-    """Итог под результатом "🔎 Проверить сейчас": к оплате — только 🔴
-    (и штрафы, по которым статуса ещё нет); 🟢 и 🟡 — отдельными строками,
-    только если такие есть."""
+    """Итог под результатом "🔎 Проверить сейчас": из суммы к оплате
+    исключены только подтверждённо оплаченные (🟢) — 🟡 (оплата не прошла
+    по неизвестной причине) остаётся долгом и показывается отдельной
+    строкой "из них"; ⚪ (может попасть сюда только из кэша при
+    недоступности police.ge) в сумму не входит."""
     to_pay = paid = review = 0.0
     paid_count = review_count = 0
     for fine in fines:
@@ -281,16 +283,18 @@ def format_check_now_status_summary(fines: list[NewFineEvent], statuses: dict[st
         if status == PAYMENT_PAID:
             paid += amount
             paid_count += 1
-        elif status == PAYMENT_NEEDS_REVIEW:
-            review += amount
-            review_count += 1
+        elif status == DISPLAY_GONE:
+            continue
         else:
             to_pay += amount
+            if status == PAYMENT_NEEDS_REVIEW:
+                review += amount
+                review_count += 1
     lines = [f"💰 К оплате: {_format_search_amount(to_pay)}"]
+    if review_count:
+        lines.append(f"🟡 Из них оплата требует проверки: {_format_search_amount(review)}")
     if paid_count:
         lines.append(f"🟢 Оплачено, ждёт обновления базы полиции: {_format_search_amount(paid)}")
-    if review_count:
-        lines.append(f"🟡 Оплата требует проверки: {_format_search_amount(review)}")
     return "\n".join(lines)
 
 
@@ -894,9 +898,9 @@ def format_debt_row(
     Пустой owners (машина без клиента, см. add_delegated_car_without_client)
     -> "👤 Пользователь не привязан".
 
-    breakdown (статусы оплаты ведутся) — "💰 Задолженность" это только
-    подтверждённо неоплаченное (🔴), а 🟡/🟢 — отдельными строками, если
-    такие штрафы есть; total_amount тогда не используется."""
+    breakdown (статусы оплаты ведутся) — "💰 Задолженность" это всё, что
+    не подтверждено оплаченным (🔴 и 🟡), 🟡 — строкой "из них", 🟢 —
+    отдельной строкой; total_amount тогда не используется."""
     if breakdown is None:
         lines = [
             f"🚗 Госномер: {format_plate_for_telegram(car_number)}",
@@ -905,10 +909,10 @@ def format_debt_row(
     else:
         lines = [
             f"🚗 Госномер: {format_plate_for_telegram(car_number)}",
-            f"💰 Задолженность: {_format_search_amount(breakdown.unpaid_amount)}",
+            f"💰 Задолженность: {_format_search_amount(breakdown.unpaid_amount + breakdown.needs_review_amount)}",
         ]
         if breakdown.needs_review_count:
-            lines.append(f"🟡 Требует проверки: {_format_search_amount(breakdown.needs_review_amount)}")
+            lines.append(f"🟡 Из них требует проверки: {_format_search_amount(breakdown.needs_review_amount)}")
         if breakdown.paid_count:
             lines.append(f"🟢 Оплачено: {_format_search_amount(breakdown.paid_amount)}")
     if not owners:
@@ -960,8 +964,7 @@ def format_debt_status_summary_block(
         lines.append(recheck_line)
     lines.extend([
         "",
-        "ℹ️ 🟢 — оплата подтверждена, но police.ge ещё показывает штраф. "
-        "🟡 — оплата не прошла по неизвестной причине: это не доказательство оплаты, долг не снят.",
+        "ℹ️ 🟢 — оплата подтверждена, police.ge ещё показывает штраф. 🟡 — оплата не прошла, долг не снят.",
     ])
     return "\n".join(lines)
 
@@ -998,6 +1001,7 @@ FINE_STATUS_BUTTON_LABEL = "🧾 Статусы оплаты"
 FINE_STATUS_PLATE_PROMPT = "🧾 Статусы оплаты\n\nВведите номер автомобиля."
 FINE_STATUS_PLATE_INVALID_TEXT = "❌ Не удалось распознать номер.\n\n" + FINE_STATUS_PLATE_PROMPT
 FINE_STATUS_NOT_FOUND_TEXT = "Штраф не найден — возможно, список уже обновился."
+FINE_STATUS_CHANGED_TEXT = "⚠️ Статус штрафа уже изменился — проверьте его ещё раз."
 FINE_STATUS_SAVED_TEXT = "✅ Сохранено."
 FINE_STATUS_CANCELLED_TEXT = "Отменено."
 FINE_STATUS_ACTION_PAID_LABEL = "🟢 Оплачен — есть квитанция"

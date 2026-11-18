@@ -148,6 +148,18 @@ async def test_gone_and_missing_receipts_are_not_announced_as_new(fx):
     assert not any("GE1" in text for text in texts_sent)
 
 
+async def test_receipt_missing_once_is_still_delivered(fx):
+    task = fx.task()
+    fx.fine(task, "GE1")
+    fx.tracker.record_full_check(_CAR, [_record("GE1")], complete=True, at=_T0)
+    fx.tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=_T0 + timedelta(hours=1))
+    fx.subscribe(task)
+
+    await fx.service.run_once()
+
+    assert len(fx.sender.sent) == 1  # "не найден один раз" — не доказательство, штраф не теряется
+
+
 async def test_without_status_lookup_dedupe_still_works(tmp_path):
     fixture = _Fixture(tmp_path, with_statuses=False)
     first, second = fixture.task(), fixture.task()

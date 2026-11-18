@@ -789,18 +789,13 @@ def load_settings(config_path: Path) -> Settings:
                 fine_disappearance_min_gap_hours=float(
                     fine_monitor_raw.get("fine_disappearance_min_gap_hours", 12.0)
                 ),
-                payment_page_already_paid_markers=[
-                    str(value) for value in fine_monitor_raw.get("payment_page_already_paid_markers", []) or []
-                ],
-                payment_page_failed_markers=(
-                    [str(value) for value in fine_monitor_raw["payment_page_failed_markers"]]
-                    if fine_monitor_raw.get("payment_page_failed_markers") is not None
-                    else None
-                ),
-                payment_page_technical_error_markers=[
-                    str(value)
-                    for value in fine_monitor_raw.get("payment_page_technical_error_markers", []) or []
-                ],
+                payment_page_already_paid_markers=_parse_marker_list(
+                    fine_monitor_raw, "payment_page_already_paid_markers",
+                ) or [],
+                payment_page_failed_markers=_parse_marker_list(fine_monitor_raw, "payment_page_failed_markers"),
+                payment_page_technical_error_markers=_parse_marker_list(
+                    fine_monitor_raw, "payment_page_technical_error_markers",
+                ) or [],
             ),
             inviter=InviterSettings(
                 worker=InviterWorkerSettings(
@@ -879,6 +874,19 @@ def _parse_forward_targets(raw: str) -> list[int | str]:
             targets.append(token)
 
     return targets
+
+
+def _parse_marker_list(raw: dict, key: str) -> list[str] | None:
+    """fine_monitor.payment_page_*_markers — ТОЛЬКО список строк. Строка
+    вместо списка — ConfigError: перебор строки дал бы маркеры из одной
+    буквы, совпадающие с любым текстом (и общий отказ МВД стал бы
+    "уже оплачено"). None/отсутствует — None (значение по умолчанию)."""
+    value = raw.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ConfigError(f"fine_monitor.{key} должен быть списком строк")
+    return [item.strip() for item in value if item.strip()]
 
 
 def _parse_check_time(value: str) -> time:

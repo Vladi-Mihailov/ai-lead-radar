@@ -84,18 +84,42 @@ def test_absent_once_is_missing_and_still_counts_as_debt(tracker):
 
 def test_gone_only_after_two_successful_checks_with_gap(tracker):
     tracker.record_full_check(_CAR, [_record("GE001")], complete=True, at=_T0)
-    tracker.record_full_check(_CAR, [], complete=True, at=_T0 + timedelta(hours=1))
+    tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=_T0 + timedelta(hours=1))
     # вторая проверка без штрафа слишком быстро — ещё не ⚪
-    tracker.record_full_check(_CAR, [], complete=True, at=_T0 + timedelta(hours=5))
+    tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=_T0 + timedelta(hours=5))
     assert _status(tracker, "GE001").presence == PRESENCE_MISSING
 
-    tracker.record_full_check(_CAR, [], complete=True, at=_T0 + timedelta(hours=13))
+    tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=_T0 + timedelta(hours=13))
 
     gone = _status(tracker, "GE001")
     assert gone.presence == PRESENCE_GONE
     assert gone.display_status == DISPLAY_GONE
     assert tracker.breakdown_for_cars([_CAR]) == {}
     assert [e["event"] for e in tracker.events(gone.id)] == ["listed", "missing", "gone"]
+
+
+def test_unconfirmed_empty_answer_is_never_evidence(tracker):
+    tracker.record_full_check(_CAR, [_record("GE001")], complete=True, at=_T0)
+
+    for hours in (24, 48, 72):
+        tracker.record_full_check(_CAR, [], complete=True, at=_T0 + timedelta(hours=hours))
+
+    assert _status(tracker, "GE001").presence == PRESENCE_LISTED
+
+
+def test_has_listed_receipts_and_gone_protocols(tracker):
+    assert not tracker.has_listed_receipts(_CAR)
+    tracker.record_full_check(_CAR, [_record("GE001"), _record("GE002")], complete=True, at=_T0)
+    tracker.record_full_check(_CAR, [_record("GE002")], complete=True, at=_T0 + timedelta(hours=1))
+    assert tracker.has_listed_receipts(_CAR)
+    assert tracker.gone_protocols(_CAR) == set()  # "missing" — ещё не ⚪
+
+    tracker.record_full_check(_CAR, [_record("GE002")], complete=True, at=_T0 + timedelta(hours=14))
+
+    assert tracker.gone_protocols(_CAR) == {"GE001"}
+    assert tracker.recently_gone_car_numbers(at=_T0 + timedelta(days=1)) == [_CAR]
+    assert tracker.recently_gone_car_numbers(at=_T0 + timedelta(days=5)) == []
+    assert tracker.car_numbers_with_statuses([_CAR, _OTHER_CAR]) == {_CAR}
 
 
 def test_incomplete_response_never_counts_as_disappearance(tracker):
@@ -109,11 +133,11 @@ def test_incomplete_response_never_counts_as_disappearance(tracker):
 
 def test_found_again_resets_missing(tracker):
     tracker.record_full_check(_CAR, [_record("GE001")], complete=True, at=_T0)
-    tracker.record_full_check(_CAR, [], complete=True, at=_T0 + timedelta(hours=24))
+    tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=_T0 + timedelta(hours=24))
     tracker.record_full_check(_CAR, [_record("GE001")], complete=True, at=_T0 + timedelta(hours=30))
     # снова пропал — отсчёт интервала начинается заново
-    tracker.record_full_check(_CAR, [], complete=True, at=_T0 + timedelta(hours=36))
-    tracker.record_full_check(_CAR, [], complete=True, at=_T0 + timedelta(hours=40))
+    tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=_T0 + timedelta(hours=36))
+    tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=_T0 + timedelta(hours=40))
 
     status = _status(tracker, "GE001")
     assert status.presence == PRESENCE_MISSING
@@ -124,8 +148,8 @@ def test_reappeared_after_gone_keeps_payment_status(tracker):
     tracker.record_full_check(_CAR, [_record("GE001")], complete=True, at=_T0)
     status_id = _status(tracker, "GE001").id
     tracker.mark_paid(status_id, actor_user_id=_MANAGER, note="TBC 123")
-    tracker.record_full_check(_CAR, [], complete=True, at=_T0 + timedelta(hours=1))
-    tracker.record_full_check(_CAR, [], complete=True, at=_T0 + timedelta(hours=14))
+    tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=_T0 + timedelta(hours=1))
+    tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=_T0 + timedelta(hours=14))
     assert _status(tracker, "GE001").presence == PRESENCE_GONE
 
     tracker.record_full_check(_CAR, [_record("GE001")], complete=True, at=_T0 + timedelta(hours=30))
@@ -258,6 +282,19 @@ def test_already_paid_only_with_configured_marker(tmp_path):
     repository.close()
 
 
+@pytest.mark.parametrize("markers", [
+    PaymentPageMarkers(already_paid=("paid",)),                      # слишком короткий
+    PaymentPageMarkers(already_paid=("ვერ მოხერხდა",)),              # часть общего отказа МВД
+    PaymentPageMarkers(already_paid=(MIA_PAYMENT_FAILED_MESSAGE,)),
+    PaymentPageMarkers(technical_error=("ჯარიმის გადახდა",)),
+])
+def test_dangerous_markers_are_rejected(tmp_path, markers):
+    repository = FineStatusRepository(tmp_path / "users.db")
+    with pytest.raises(ValueError):
+        FineStatusTracker(repository, markers=markers)
+    repository.close()
+
+
 def test_default_markers_never_confirm_payment():
     markers = PaymentPageMarkers()
     assert markers.already_paid == ()
@@ -325,7 +362,7 @@ def test_source_updated_on_round_trip(tracker):
 # ---- первичное заполнение из detected_fines ----
 
 
-def test_seed_takes_only_receipts_listed_at_last_snapshot(tmp_path):
+def test_seed_marks_historical_receipts_gone_and_keys_by_task_plate(tmp_path):
     db_path = tmp_path / "users.db"
     tasks = FineMonitoringTaskRepository(db_path)
     fines = DetectedFineRepository(db_path)
@@ -341,15 +378,21 @@ def test_seed_takes_only_receipts_listed_at_last_snapshot(tmp_path):
     fines._conn.commit()
     fines.create(monitoring_task_id=task.id, car_number=_CAR, external_fine_id="CUR1", fingerprint="f-cur",
                  penalty_date=None, due_date=None, delivered_status=None, raw_data="{}", amount=60)
+    # строка, у которой protocolAuto записан иначе, чем номер задачи
+    fines.create(monitoring_task_id=task.id, car_number="aa 111 bb", external_fine_id="CUR2", fingerprint="f-c2",
+                 penalty_date=None, due_date=None, delivered_status=None, raw_data="{}", amount=5)
     repository = FineStatusRepository(db_path)
     tracker = FineStatusTracker(repository)
 
-    assert tracker.seed_from_detected_fines() == 1
+    assert tracker.seed_from_detected_fines() == 3
     assert tracker.seed_from_detected_fines() == 0  # идемпотентно
 
     statuses = tracker.statuses_by_protocol(_CAR)
-    assert set(statuses) == {"CUR1"}
-    assert statuses["CUR1"].amount == 60
+    assert set(statuses) == {"OLD1", "CUR1", "CUR2"}
+    assert statuses["CUR1"].presence == PRESENCE_LISTED and statuses["CUR1"].amount == 60
+    assert statuses["CUR2"].presence == PRESENCE_LISTED
+    assert statuses["OLD1"].presence == PRESENCE_GONE  # на последней проверке его уже не было
+    assert tracker.gone_protocols(_CAR) == {"OLD1"}
     repository.close()
     fines.close()
     tasks.close()

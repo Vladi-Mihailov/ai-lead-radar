@@ -92,6 +92,7 @@ is_trusted() перепроверяется на КАЖДОМ шаге обои�
 публичны и НЕ являются доказательством авторизации сами по себе."""
 
 import logging
+import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
@@ -143,6 +144,7 @@ from reader.public_bot.subscription_service import (
     CHECK_ALREADY_IN_PROGRESS,
     SubscriptionService,
 )
+from reader.telegram_markdown import escape_telethon_markdown
 from reader.public_bot.validation import (
     UsernameValidationError,
     normalize_telegram_username,
@@ -276,9 +278,12 @@ _DEBT_LIST_PAGE_SIZE = 10
 # непроверенных номеров ограничен, см. texts._DEBT_REFRESH_FAILED_PLATES_SHOWN)
 # это остаётся в пределах handlers._TELEGRAM_SAFE_TEXT_LIMIT (3900).
 _DEBT_LIST_PAGE_CHAR_BUDGET = 3000
+# Со статусами оплаты заголовок debt-блока примерно на 350 символов длиннее
+# (три категории, дата обновления базы, строка вечерней перепроверки).
+_DEBT_LIST_PAGE_CHAR_BUDGET_WITH_STATUSES = 2600
 
 
-def _paginate_debt_blocks(blocks: list[str]) -> list[list[str]]:
+def _paginate_debt_blocks(blocks: list[str], *, char_budget: int = _DEBT_LIST_PAGE_CHAR_BUDGET) -> list[list[str]]:
     """Режет уже отсортированные блоки машин на страницы подряд: не больше
     _DEBT_LIST_PAGE_SIZE машин и _DEBT_LIST_PAGE_CHAR_BUDGET символов на
     страницу (с пустой строкой между блоками, см.
@@ -292,7 +297,7 @@ def _paginate_debt_blocks(blocks: list[str]) -> list[list[str]]:
     for block in blocks:
         addition = len(block) + (separator_length if current else 0)
         if current and (
-            len(current) >= _DEBT_LIST_PAGE_SIZE or current_length + addition > _DEBT_LIST_PAGE_CHAR_BUDGET
+            len(current) >= _DEBT_LIST_PAGE_SIZE or current_length + addition > char_budget
         ):
             pages.append(current)
             current, current_length = [], 0
@@ -1329,6 +1334,9 @@ class ConversationController:
             # _paginate_debt_blocks), поэтому блоки строятся для всего списка
             # — пользователи всех машин читаются теми же тремя запросами.
             owners_by_car = self._debt_owners_by_car([car_number for car_number, _, _ in rows])
+            # Заголовок со статусами длиннее прежнего — страница меньше, чтобы
+            # всё сообщение осталось одним сообщением Telegram.
+            budget = _DEBT_LIST_PAGE_CHAR_BUDGET if self._fine_status is None else _DEBT_LIST_PAGE_CHAR_BUDGET_WITH_STATUSES
             pages = _paginate_debt_blocks([
                 texts.format_debt_row(
                     car_number=car_number,
@@ -1337,7 +1345,7 @@ class ConversationController:
                     breakdown=breakdown,
                 )
                 for car_number, total_amount, breakdown in rows
-            ])
+            ], char_budget=budget)
             total_pages = len(pages)
             page = max(0, min(debt_page, total_pages - 1))
             section = texts.format_debt_list_section(pages[page], page=page, total_pages=total_pages)
@@ -1359,22 +1367,25 @@ class ConversationController:
             [group.car_number for group in debt_groups] + self._fine_status.listed_car_numbers()
         ))
         breakdowns = self._fine_status.breakdown_for_cars(car_numbers)
+        with_statuses = self._fine_status.car_numbers_with_statuses(car_numbers)
         rows: list[tuple[str, float, DebtBreakdown | None]] = []
         totals = DebtBreakdown()
         for car_number in car_numbers:
             breakdown = breakdowns.get(car_number)
             snapshot = snapshot_totals.get(car_number, 0.0)
             if breakdown is None or breakdown.listed_count == 0:
-                if snapshot <= 0:
+                if snapshot <= 0 or car_number in with_statuses:
+                    # Все квитанции машины уже ⚪ — старый снимок неактивной
+                    # задачи долгом не считается.
                     continue
-                # Снимок долга есть, а квитанций в статусах нет (старые
+                # Снимок долга есть, а квитанций в статусах нет вовсе (старые
                 # записи без номера квитанции) — сумма снимка остаётся
                 # неоплаченной, как и раньше; число штрафов неизвестно.
                 breakdown = DebtBreakdown(unpaid_amount=snapshot, unpaid_count=1)
             rows.append((car_number, snapshot, breakdown))
             totals = totals.add(breakdown)
         rows.sort(key=lambda row: (
-            -row[2].unpaid_amount, -row[2].needs_review_amount, -row[2].paid_amount, row[0],
+            -(row[2].unpaid_amount + row[2].needs_review_amount), -row[2].paid_amount, row[0],
         ))
         return rows, totals
 
@@ -1676,9 +1687,23 @@ class ConversationController:
             chat_id=chat_id, telegram_user_id=telegram_user_id,
         )
 
+    @staticmethod
+    def _fine_status_fingerprint(status: FineStatus) -> str:
+        """Чем был статус на момент показа экрана подтверждения — если он
+        изменился (другой менеджер, перепроверка), подтверждение отклоняется."""
+        updated = status.payment_updated_at.isoformat() if status.payment_updated_at else ""
+        return f"{status.payment_status}|{status.presence}|{updated}"
+
     def _fine_status_confirm_reply(
         self, status: FineStatus, payload: dict, *, chat_id: int, telegram_user_id: int,
     ) -> BotReply:
+        # Новый экран — новый одноразовый код: кнопка "✅ Подтвердить" со
+        # старого экрана (другое действие) больше ничего не применит.
+        payload = {
+            **payload,
+            "token": payload.get("token") or secrets.token_hex(4),
+            "expected": payload.get("expected") or self._fine_status_fingerprint(status),
+        }
         self._states.set(
             chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_FINE_STATUS_CONFIRM, payload=payload,
         )
@@ -1686,7 +1711,7 @@ class ConversationController:
         explanation = None
         if action == "paid":
             target = PAYMENT_PAID
-            explanation = f"Основание: {payload['note']}"
+            explanation = f"Основание: {escape_telethon_markdown(payload['note'])}"
         elif action == "needs_review":
             target = PAYMENT_NEEDS_REVIEW
             explanation = texts.payment_page_verdict_explanation(PaymentPageVerdict.PAYMENT_FAILED)
@@ -1704,15 +1729,18 @@ class ConversationController:
         return BotReply(
             text=texts.format_fine_status_confirm(status, target_label=target_label, explanation=explanation),
             inline_buttons=[[
-                (texts.FINE_STATUS_CONFIRM_LABEL, kb.encode_fine_status_confirm_callback(status.id)),
+                (texts.FINE_STATUS_CONFIRM_LABEL, kb.encode_fine_status_confirm_callback(status.id, payload["token"])),
                 (texts.FINE_STATUS_CANCEL_LABEL, kb.encode_fine_status_cancel_callback(status.id)),
             ]],
         )
 
-    def handle_fine_status_confirm(self, status_id: int, *, chat_id: int, telegram_user_id: int) -> BotReply | None:
+    def handle_fine_status_confirm(
+        self, status_id: int, token: str, *, chat_id: int, telegram_user_id: int,
+    ) -> BotReply | None:
         """Применяет РОВНО то, что было на экране подтверждения (payload
-        состояния), и только если это подтверждение того же штрафа тем же
-        менеджером — устаревшая кнопка ничего не меняет."""
+        состояния), и только если это кнопка ИМЕННО этого экрана (token),
+        того же штрафа, того же менеджера, и статус с тех пор не менялся —
+        устаревшая кнопка ничего не меняет."""
         if not self._fine_status_allowed(telegram_user_id):
             return None
         assert self._fine_status is not None
@@ -1723,9 +1751,15 @@ class ConversationController:
             and state.step == STEP_AWAITING_FINE_STATUS_CONFIRM
             else None
         ) or {}
-        self._clear_state(chat_id)
-        if payload.get("status_id") != status_id:
+        if payload.get("status_id") != status_id or payload.get("token") != token:
+            # Чужая/старая кнопка — текущий диалог (если он есть) не трогаем.
             return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
+        self._clear_state(chat_id)
+        current = self._fine_status.get(status_id)
+        if current is None:
+            return BotReply(text=texts.FINE_STATUS_NOT_FOUND_TEXT, show_main_menu=True)
+        if self._fine_status_fingerprint(current) != payload.get("expected"):
+            return self._format_fine_status_detail_reply(current, notice=texts.FINE_STATUS_CHANGED_TEXT)
         action = payload.get("action")
         if action == "paid":
             status = self._fine_status.mark_paid(status_id, actor_user_id=telegram_user_id, note=payload.get("note", ""))
@@ -2682,20 +2716,22 @@ class ConversationController:
 
     def _format_check_now_outcome_reply(self, outcome) -> BotReply:
         # CTA — ТОЛЬКО реальному владельцу и только когда есть хотя бы один
-        # НЕОПЛАЧЕННЫЙ штраф (см. design report: "CTA — только owner", не
-        # trusted-оператору, управляющему чужой delegated-подпиской; и
-        # задачу "не предлагать повторную оплату подтверждённо оплаченного
-        # штрафа": 🟢 и 🟡 кнопку оплаты не показывают).
+        # штраф, НЕ подтверждённый оплаченным (см. design report: "CTA —
+        # только owner", не trusted-оператору, управляющему чужой
+        # delegated-подпиской; и задачу "не предлагать повторную оплату
+        # подтверждённо оплаченного штрафа": только 🟢 кнопку убирает, 🟡 —
+        # нет).
         statuses = None
         if self._fine_status is not None and outcome.check_ok and outcome.fines:
             statuses = {
                 protocol_no: status.display_status
                 for protocol_no, status in self._fine_status.statuses_by_protocol(outcome.car_number).items()
             }
-        has_unpaid = statuses is None or any(
-            statuses.get(fine.external_fine_id or "", PAYMENT_UNPAID) == PAYMENT_UNPAID for fine in outcome.fines
+        has_payable = statuses is None or any(
+            statuses.get(fine.external_fine_id or "", PAYMENT_UNPAID) not in (PAYMENT_PAID, DISPLAY_GONE)
+            for fine in outcome.fines
         )
-        cta = self._owner_cta_buttons() if outcome.is_owner and outcome.fines and has_unpaid else None
+        cta = self._owner_cta_buttons() if outcome.is_owner and outcome.fines and has_payable else None
         return BotReply(text=texts.format_check_now_result(outcome, statuses=statuses), cta_buttons=cta)
 
     async def handle_my_car_check_now_once(

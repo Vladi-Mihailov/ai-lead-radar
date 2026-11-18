@@ -450,6 +450,10 @@ async def run() -> None:
         check_service = FineCheckService(
             fine_provider, task_repository, detected_fine_repository, translator,
             status_tracker=fine_status_tracker,
+            # Уже известная оператору квитанция номера не уведомляется
+            # повторно через другую задачу (вечерняя перепроверка трогает
+            # и задачи, которые этот штраф раньше не видели).
+            dedupe_known_receipts=True,
         )
         # Один массовый проход по police.ge за раз (ручное "🔄 Проверить
         # авто", "fine check-all", вечерняя перепроверка) — см.

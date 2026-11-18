@@ -102,12 +102,14 @@ class FineStatusTrackerLike(Protocol):
     feed'а, но сам этот модуль про статусы ничего не решает."""
 
     def record_full_check(
-        self, car_number: str, records: list[ParsedFineRecord], *, complete: bool,
+        self, car_number: str, records: list[ParsedFineRecord], *, complete: bool, empty_confirmed: bool,
     ) -> object: ...
 
     def record_listed(self, car_number: str, record: ParsedFineRecord) -> None: ...
 
     def record_source_updated_on(self, updated_on) -> None: ...
+
+    def has_listed_receipts(self, car_number: str) -> bool: ...
 
 
 class FineTranslatorLike(Protocol):
@@ -132,12 +134,19 @@ class FineCheckService:
         zero_confirmation_delay_seconds: float = _ZERO_CONFIRMATION_DELAY_SECONDS,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         status_tracker: FineStatusTrackerLike | None = None,
+        dedupe_known_receipts: bool = False,
     ):
         self._provider = provider
         # None — статусы оплаты не ведутся (операторский процесс
         # reader/main.py и существующие тесты) — поведение проверки не
         # меняется ни в чём.
         self._status_tracker = status_tracker
+        # True — строка для ещё одной задачи номера рождается
+        # "уведомлённой", если оператор уже уведомлён об этой квитанции
+        # через другую задачу (см. _finalize). Включается только в боте
+        # Грузии (reader/public_bot/main.py); операторский процесс и
+        # существующие тесты — прежнее поведение.
+        self._dedupe_known_receipts = dedupe_known_receipts
         self._task_repository = task_repository
         self._detected_fine_repository = detected_fine_repository
         # None — как и everywhere в проекте (см. UserRepository|None в
@@ -333,7 +342,7 @@ class FineCheckService:
             return self._suppressed_result()
 
         try:
-            search_result = await self._fetch_trusted(task.car_number, [task])
+            search_result, zero_confirmed = await self._fetch_trusted(task.car_number, [task])
         except FineProviderError as exc:
             # Ошибка первого ИЛИ подтверждающего запроса — предыдущее
             # достоверное состояние (last_successful_*) остаётся
@@ -345,7 +354,7 @@ class FineCheckService:
         # (перевод/detected_fines), см. _persist_snapshot.
         self._persist_snapshot(task, records)
         result = await self._finalize(task, records, started_at)
-        self._track_full_check(task.car_number, search_result)
+        self._track_full_check(task.car_number, search_result, zero_confirmed=zero_confirmed)
         return result
 
     async def check_plate_for_tasks(
@@ -398,7 +407,7 @@ class FineCheckService:
             return {task.id: self._suppressed_result() for task in tasks}
 
         try:
-            search_result = await self._fetch_trusted(car_number, tasks, refresh_page=refresh_page)
+            search_result, zero_confirmed = await self._fetch_trusted(car_number, tasks, refresh_page=refresh_page)
         except FineProviderError as exc:
             return {task.id: self._record_error(task, exc, started_at) for task in tasks}
 
@@ -414,7 +423,7 @@ class FineCheckService:
             for task in tasks
         }
         # Статусы — ОДИН раз на физический номер (одна внешняя проверка).
-        self._track_full_check(car_number, search_result)
+        self._track_full_check(car_number, search_result, zero_confirmed=zero_confirmed)
         return results
 
     async def check_plate_readonly(self, car_number: str) -> OneOffCheckResult:
@@ -493,22 +502,27 @@ class FineCheckService:
 
     async def _fetch_trusted(
         self, car_number: str, tasks: list[FineMonitoringTask], *, refresh_page: bool = False,
-    ) -> ProviderSearchResult:
+    ) -> tuple[ProviderSearchResult, bool]:
         """Единственная реализация false-zero guard для check_task() и
         check_plate_for_tasks(): запрос к provider и, если результат —
         подозрительный ноль (см. _zero_needs_confirmation), ОДИН
         подтверждающий запрос после паузы; итоговый набор records — тот,
         что вернул последний запрос. FineProviderError любого из запросов
         поднимается — вызывающий код записывает error, НЕ трогая
-        last_successful_*. Возвращает весь ответ последнего запроса (records
-        + count/дата обновления базы, см. ProviderSearchResult)."""
+        last_successful_*. Возвращает (весь ответ последнего запроса —
+        records + count/дата обновления базы, см. ProviderSearchResult;
+        подтверждён ли пустой ответ повторным запросом). Квитанции номера,
+        ещё не признанные исчезнувшими (статусы оплаты), — тоже
+        свидетельство долга: снимок задачи может быть нулевым (feed не
+        обновляет снимок, а первый принятый пустой ответ обнуляет его),
+        и без этого второй пустой ответ проходил бы без повторного запроса."""
         search_result = await self._fetch(car_number, refresh_page=refresh_page)
         records = search_result.records
         first_count = len(records)
         total = _records_total(records)
         confirmation = False
 
-        if total == 0 and self._zero_needs_confirmation(tasks):
+        if total == 0 and (self._zero_needs_confirmation(tasks) or self._has_listed_receipts(car_number)):
             confirmation = True
             await self._sleep(self._zero_confirmation_delay_seconds)
             search_result = await self._fetch(car_number)
@@ -523,7 +537,17 @@ class FineCheckService:
             "Georgia fine check plate=%s result_count=%d total=%s zero_confirmation=%s",
             car_number, len(records), _format_amount(total), confirmation,
         )
-        return search_result
+        return search_result, confirmation and not records
+
+    def _has_listed_receipts(self, car_number: str) -> bool:
+        if self._status_tracker is None:
+            return False
+        try:
+            return self._status_tracker.has_listed_receipts(car_number)
+        except Exception:
+            # Не знаем — подтверждаем пустой ответ повторным запросом.
+            logger.exception("Georgia fine status: не удалось прочитать статусы номера")
+            return True
 
     def _zero_needs_confirmation(self, tasks: list[FineMonitoringTask]) -> bool:
         """Нулевой результат НЕ принимается сразу, если есть положительное
@@ -597,7 +621,9 @@ class FineCheckService:
             provider_blocked=isinstance(exc, PoliceGeBlockedError),
         )
 
-    def _track_full_check(self, car_number: str, search_result: ProviderSearchResult) -> None:
+    def _track_full_check(
+        self, car_number: str, search_result: ProviderSearchResult, *, zero_confirmed: bool,
+    ) -> None:
         """Статусы оплаты после успешной полной проверки (см.
         reader/fines/payment_status.py). Это дополнительный слой поверх уже
         сохранённого результата: его сбой не превращает успешную проверку в
@@ -613,6 +639,7 @@ class FineCheckService:
         try:
             self._status_tracker.record_full_check(
                 car_number, search_result.records, complete=search_result.complete,
+                empty_confirmed=zero_confirmed,
             )
             if search_result.source_updated_on is not None:
                 self._status_tracker.record_source_updated_on(search_result.source_updated_on)
@@ -730,8 +757,10 @@ class FineCheckService:
             # Новая для всех задач квитанция уведомляется как и раньше — по
             # строке на задачу. Клиентам — дедуп по квитанции в
             # ClientDeliveryService.
-            already_known = bool(record.external_fine_id) and (
-                self._detected_fine_repository.has_notified_protocol_for_car(
+            already_known = (
+                self._dedupe_known_receipts
+                and bool(record.external_fine_id)
+                and self._detected_fine_repository.has_notified_protocol_for_car(
                     record.car_number, record.external_fine_id, exclude_task_id=task.id,
                 )
             )
@@ -752,7 +781,7 @@ class FineCheckService:
                     place_ru=place_ru,
                     violation_description_ru=violation_description_ru,
                     notification_sent_at=(
-                        datetime.now(timezone.utc).replace(tzinfo=None) if already_known else None
+                        datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0) if already_known else None
                     ),
                 )
             except sqlite3.IntegrityError:

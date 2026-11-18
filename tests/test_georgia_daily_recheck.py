@@ -37,6 +37,7 @@ from reader.public_bot.daily_recheck import (
     RUN_POSTPONED,
     RUN_RUNNING,
     RUN_STOPPED,
+    STOP_INTERRUPTED,
     DailyRecheckRepository,
     DailyRecheckService,
 )
@@ -102,8 +103,10 @@ class _Fixture:
             self.status_repository, disappearance_min_gap=timedelta(hours=12), clock=self.clock.naive,
         )
         self.provider = _Provider()
+        self.provider_calls_per_plate = {}
         self.check_service = FineCheckService(
             self.provider, self.tasks, self.fines, sleep=_instant, status_tracker=self.tracker,
+            dedupe_known_receipts=True,
         )
         self.gate = BatchCheckGate()
         self.repository = DailyRecheckRepository(self.db_path)
@@ -343,6 +346,86 @@ async def test_paid_fine_disappears_over_two_evenings(fx):
     await fx.make_service().tick()
     status = fx.tracker.get(status_id)
     assert status.presence == PRESENCE_GONE and status.payment_status == "paid"
+
+
+async def test_all_fines_paid_empty_answers_are_confirmed_and_followed_up(fx):
+    fx.car_with_fines("AA111BB", "GE1")
+    status_id = fx.tracker.statuses_by_protocol("AA111BB")["GE1"].id
+    fx.tracker.mark_paid(status_id, actor_user_id=1, note="BOG 7")
+    fx.provider.records["AA111BB"] = []  # police.ge убрал единственный штраф
+
+    await fx.service.tick()
+    # каждый пустой ответ подтверждён вторым запросом
+    assert _plates_checked(fx.provider) == ["AA111BB", "AA111BB"]
+    assert fx.tracker.get(status_id).presence == PRESENCE_MISSING
+
+    fx.clock.now += timedelta(days=1)
+    await fx.make_service().tick()
+    assert fx.tracker.get(status_id).presence == PRESENCE_GONE
+
+    # номер ещё несколько дней в перепроверке (ложное ⚪ сменилось бы на "снова найден")
+    fx.clock.now += timedelta(days=1)
+    assert "AA111BB" in fx.make_service().select_plates()
+    fx.clock.now += timedelta(days=5)
+    assert "AA111BB" not in fx.make_service().select_plates()
+
+
+async def test_false_gone_returns_when_found_again(fx):
+    fx.car_with_fines("AA111BB", "GE1")
+    status_id = fx.tracker.statuses_by_protocol("AA111BB")["GE1"].id
+    fx.provider.records["AA111BB"] = []
+    await fx.service.tick()
+    fx.clock.now += timedelta(days=1)
+    await fx.make_service().tick()
+    assert fx.tracker.get(status_id).presence == PRESENCE_GONE
+
+    fx.provider.records["AA111BB"] = [_record("AA111BB", "GE1")]  # снова в базе полиции
+    fx.clock.now += timedelta(days=1)
+    await fx.make_service().tick()
+
+    assert fx.tracker.get(status_id).presence == "listed"
+    assert fx.fines.list_pending_notifications() == []  # не "новый штраф"
+
+
+async def test_yesterdays_failures_go_to_the_end_of_the_queue(fx):
+    fx.car_with_fines("AA111BB", "GE1", checked_at="2026-11-10 10:00:00")
+    fx.car_with_fines("BB222CC", "GE2", checked_at="2026-11-11 10:00:00")
+    fx.car_with_fines("CC333DD", "GE3", checked_at="2026-11-12 10:00:00")
+    fx.provider.errors["AA111BB"] = FineProviderError("timeout")
+    fx.provider.errors["BB222CC"] = FineProviderError("timeout")
+
+    first = await fx.service.tick()
+    assert first.status == RUN_STOPPED and first.stop_reason == "errors"
+    assert "CC333DD" not in _plates_checked(fx.provider)
+
+    fx.provider.calls.clear()
+    fx.clock.now += timedelta(days=1)
+    second = await fx.make_service().tick()
+
+    # вчерашние "вечно падающие" номера — в конце, остальные проверены
+    assert _plates_checked(fx.provider)[0] == "CC333DD"
+    assert second.checked == 1
+
+
+async def test_inactive_task_snapshot_is_refreshed_so_gone_car_leaves_statistics(fx):
+    task = fx.car_with_fines("AA111BB", "GE1", status="completed")
+    active = fx.tasks.create(
+        car_number="AA111BB", label=None, start_date=date(2026, 11, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=-1, created_by_user_id=1,
+    )
+
+    assert {t.id for t in fx.service._tasks_for_plate("AA111BB")} == {task.id, active.id}
+
+
+async def test_stale_running_run_is_closed_outside_window(tmp_path):
+    fixture = _Fixture(tmp_path, start=datetime(2026, 11, 18, 20, 30, tzinfo=timezone.utc))  # 00:30 Тбилиси
+    fixture.repository.create_run(date(2026, 11, 18), ["AA111BB"], now=datetime(2026, 11, 18, 19, 40, tzinfo=timezone.utc))
+
+    assert await fixture.service.tick() is None
+
+    run = fixture.repository.get_run(date(2026, 11, 18))
+    assert run.status == RUN_POSTPONED and run.stop_reason == STOP_INTERRUPTED
+    fixture.close()
 
 
 async def test_selection_includes_feed_found_cars_and_skips_suppressed(fx, monkeypatch):
