@@ -695,3 +695,20 @@ def test_update_access_hash_leaves_peer_updated_at_untouched_when_skipped(tmp_pa
         assert repository.get_peer_updated_at(911) == before
     finally:
         repository.close()
+
+
+def test_get_many_returns_profiles_by_id_and_never_creates_users(tmp_path):
+    repository = UserRepository(tmp_path / "users.db")
+    try:
+        repository.upsert(TelegramUserInfo(user_id=1, username="nino_b", first_name="Нино", last_name="Беридзе"))
+        repository.upsert(TelegramUserInfo(user_id=2, username=None, first_name="Леван", last_name=None))
+
+        users = repository.get_many([1, 2, 3])
+
+        assert set(users) == {1, 2}
+        assert users[1] == repository.get(1)
+        assert (users[2].username, users[2].first_name) == (None, "Леван")
+        assert repository.get(3) is None  # get_many ничего не создаёт
+        assert repository.get_many([]) == {}
+    finally:
+        repository.close()

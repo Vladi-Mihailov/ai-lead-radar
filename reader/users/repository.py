@@ -189,6 +189,33 @@ class UserRepository:
             peer_type=peer_type,
         )
 
+    def get_many(self, user_ids: list[int]) -> dict[int, TelegramUserInfo]:
+        """get() сразу для нескольких пользователей — ОДИН SELECT на весь
+        список (см. reader/public_bot/conversation.py::_debt_owners_by_car —
+        Telegram-профили владельцев машин страницы 📊 Статистика). Никогда
+        не создаёт пользователя; неизвестные id в результат не попадают."""
+        if not user_ids:
+            return {}
+
+        placeholders = ",".join("?" for _ in user_ids)
+        rows = self._conn.execute(
+            "SELECT user_id, username, first_name, last_name, is_bot, access_hash, peer_type "
+            f"FROM users WHERE user_id IN ({placeholders})",
+            list(user_ids),
+        ).fetchall()
+        return {
+            user_id: TelegramUserInfo(
+                user_id=user_id,
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+                is_bot=bool(is_bot),
+                access_hash=access_hash,
+                peer_type=peer_type,
+            )
+            for user_id, username, first_name, last_name, is_bot, access_hash, peer_type in rows
+        }
+
     def find_by_username(self, username: str) -> TelegramUserInfo | None:
         """username без ведущего '@' (см. reader/commands/fine.py — там же
         он убирается перед вызовом). Сравнение регистронезависимое

@@ -17,11 +17,13 @@ description) — тихий fallback на турецкий текст, если 
 _translate_fines)."""
 
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from reader.plate_display import format_plate_for_telegram
+from reader.telegram_markdown import escape_telethon_markdown, safe_telegram_username
 from reader.turkey_bot.avrasya.models import AvrasyaDebtItem
 from reader.turkey_bot.debt_refresh_service import TurkeyRefreshOutcome
 from reader.turkey_bot.gib.models import GibFineRecord
@@ -822,34 +824,80 @@ def format_statistics(
     ])
 
 
+DEBT_OWNER_NOT_LINKED_LINE = "👤 Пользователь не привязан"
+_DEBT_OWNER_NAME_MISSING_TEXT = "Имя не указано"
+_DEBT_OWNER_USERNAME_MISSING_TEXT = "Логин не указан"
+
+
+@dataclass(frozen=True)
+class DebtOwner:
+    """Один владелец машины в debt-списке 📊 Статистика (см. задачу
+    "дополнить статистику штрафов информацией о пользователях", тот же
+    принцип, что и reader/public_bot/texts.py::DebtOwner) — уже выбранные
+    для показа значения: name — Telegram first_name + last_name (см.
+    debt_owner_name), username — Telegram username как он есть (без "@"),
+    НИКОГДА не собранный из имени. None — значение неизвестно
+    (format_debt_row покажет "Имя не указано"/"Логин не указан")."""
+
+    name: str | None
+    username: str | None
+
+
+def debt_owner_name(first_name: str | None, last_name: str | None) -> str | None:
+    """Имя для DebtOwner — Telegram first_name + last_name с тем же
+    отсевом placeholder-мусора, что и у Search (см. _sanitize_name_part);
+    None — показывать нечего."""
+    return _full_name(first_name, last_name)
+
+
+def _format_debt_owner_lines(owner: DebtOwner) -> list[str]:
+    """Имя — произвольный пользовательский текст, поэтому обезвреживается
+    для Telethon markdown; username показывается, только если это
+    настоящий Telegram username (см. reader/telegram_markdown.py)."""
+    username = safe_telegram_username(owner.username)
+    name_text = escape_telethon_markdown(owner.name) if owner.name else _DEBT_OWNER_NAME_MISSING_TEXT
+    username_text = f"@{username}" if username else _DEBT_OWNER_USERNAME_MISSING_TEXT
+    return [f"👤 Пользователь: {name_text}", f"🔗 Telegram: {username_text}"]
+
+
 def format_debt_row(
-    *, car_number: str, owner_displays: list[str], total_amount: Decimal,
+    *, car_number: str, owners: list[DebtOwner], total_amount: Decimal,
     provider_states: tuple[TurkeyProviderDebtState, ...] = (),
 ) -> str:
-    """"🚗 CAR: owner: amount ₺" (см. задачу "manager Statistics / refresh
-    для обоих ботов" п.1 — единый компактный формат, тот же, что и у
-    Georgia, БЕЗ даты/checked_at/"сегодня"/"вчера"/"N дней назад" и БЕЗ
-    " — "-разделителей/"≥"/"· частично"). total_amount — уже готовая сумма
-    (см. TurkeyDebtCarGroup), НЕ пересчитывается здесь. owner_displays —
-    см. задачу "Turkey manager debt statistics aggregation": один
-    физический car_number может принадлежать нескольким владельцам — все
-    перечисляются через " | ", а amount печатается РОВНО один раз в конце.
+    """Блок одной машины debt-списка (см. задачу "дополнить статистику
+    штрафов информацией о пользователях"):
+        🚗 Госномер: <номер>
+        💰 Задолженность: <сумма> ₺
+        👤 Пользователь: <имя>
+        🔗 Telegram: @<username>
+    БЕЗ даты/checked_at/"сегодня"/"вчера"/"N дней назад" и БЕЗ "≥"/"·
+    частично" (см. задачу "manager Statistics / refresh для обоих ботов"
+    п.1). total_amount — уже готовая сумма (см. TurkeyDebtCarGroup), НЕ
+    пересчитывается здесь. owners — см. задачу "Turkey manager debt
+    statistics aggregation": один физический car_number может
+    принадлежать нескольким владельцам — пара 👤/🔗 на каждого, сумма
+    печатается РОВНО один раз. Пустой owners -> "👤 Пользователь не
+    привязан".
 
     provider_states — см. задачу "Turkey debt list: последний успешный
     результат отдельно по каждому провайдеру и госномеру": если ВСЕ
-    провайдеры CURRENT (или состояния не переданы), строка — прежняя одна
-    строка без дат. Иначе сумма помечается "⚠️" (подтверждена не
-    полностью), и под строкой по одной строке на GİB и KGM — что
-    подтверждено последней проверкой, что известно только по более ранней
-    успешной проверке (с её датой и датой неответа), по какому провайдеру
-    достоверных данных нет."""
+    провайдеры CURRENT (или состояния не переданы), строка суммы — без
+    дат. Иначе сумма помечается "⚠️" (подтверждена не полностью), и сразу
+    под ней по одной строке на GİB и KGM — что подтверждено последней
+    проверкой, что известно только по более ранней успешной проверке (с
+    её датой и датой неответа), по какому провайдеру достоверных данных
+    нет."""
     amount_text = _format_try_amount(total_amount)
-    owners_text = " | ".join(owner_displays)
-    header = f"🚗 {format_plate_for_telegram(car_number)}: {owners_text}: "
+    lines = [f"🚗 Госномер: {format_plate_for_telegram(car_number)}"]
     if all(state.freshness == TurkeyProviderFreshness.CURRENT for state in provider_states):
-        return header + amount_text
-    lines = [f"{header}⚠️ {amount_text}"]
-    lines.extend(f"   {_format_debt_provider_state(state)}" for state in provider_states)
+        lines.append(f"💰 Задолженность: {amount_text}")
+    else:
+        lines.append(f"💰 Задолженность: ⚠️ {amount_text}")
+        lines.extend(f"   {_format_debt_provider_state(state)}" for state in provider_states)
+    if not owners:
+        lines.append(DEBT_OWNER_NOT_LINKED_LINE)
+    for owner in owners:
+        lines.extend(_format_debt_owner_lines(owner))
     return "\n".join(lines)
 
 
@@ -898,13 +946,19 @@ def _format_debt_provider_state(state: TurkeyProviderDebtState) -> str:
 # превышал предел handlers).
 _DEBT_LIST_MESSAGE_LIMIT = 3900
 
+# Блоки машин многострочные (номер/сумма/владельцы, см. format_debt_row) —
+# между блоками пустая строка.
+_DEBT_ROW_SEPARATOR = "\n\n"
+
 
 def format_debt_list_messages(rows: list[str]) -> list[str]:
     """Список ВСЕХ автомобилей с задолженностью (см. задачу п.7: "если
     список большой — сохранить существующую pagination") — тот же
-    packing-приём, что и раньше: каждая строка (вместе со своими строками
-    провайдеров) — атомарная единица, никогда не разрывается между
-    сообщениями (см. _DEBT_LIST_MESSAGE_LIMIT). БЕЗ отдельного заголовка
+    packing-приём, что и раньше: блок машины (вместе со строками
+    провайдеров и владельцев) — атомарная единица, не разрывается между
+    сообщениями (см. _DEBT_LIST_MESSAGE_LIMIT); исключение — блок, который
+    сам длиннее предела (десятки владельцев одной машины): он уходит
+    отдельным сообщением, и handlers режет его по строкам. БЕЗ отдельного заголовка
     (см. задачу п.7 — пример показывает строки СРАЗУ после аггрегата, без
     "Автомобили с задолженностью:"). [] — если задолженностей нет вовсе
     (см. вызывающий код — тогда это сообщение не отправляется вообще)."""
@@ -915,9 +969,10 @@ def format_debt_list_messages(rows: list[str]) -> list[str]:
     current: list[str] = []
     current_len = 0
     for row in rows:
-        addition = len(row) + (1 if current else 0)  # +1 = "\n", кроме первой строки сообщения
+        # + разделитель перед блоком, кроме первого блока сообщения
+        addition = len(row) + (len(_DEBT_ROW_SEPARATOR) if current else 0)
         if current and current_len + addition > _DEBT_LIST_MESSAGE_LIMIT:
-            messages.append("\n".join(current))
+            messages.append(_DEBT_ROW_SEPARATOR.join(current))
             current = []
             current_len = 0
             addition = len(row)
@@ -925,7 +980,7 @@ def format_debt_list_messages(rows: list[str]) -> list[str]:
         current_len += addition
 
     if current:
-        messages.append("\n".join(current))
+        messages.append(_DEBT_ROW_SEPARATOR.join(current))
 
     return messages
 

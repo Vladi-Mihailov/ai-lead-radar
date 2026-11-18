@@ -34,6 +34,7 @@ from reader.public_bot.subscription_repository import (
     default_claim_token_expiry,
     generate_claim_token,
 )
+from reader.users.models import TelegramUserInfo
 from reader.users.repository import UserRepository
 
 _SOURCE = "geshtrafbot"
@@ -1360,6 +1361,27 @@ class SubscriptionService:
             subscription for subscription in self._subscription_repository.list_by_car_number(car_number)
             if subscription.status != "archived"
         ]
+
+    def list_subscriptions_for_cars(self, car_numbers: list[str]) -> list[FineMonitoringSubscription]:
+        """list_subscriptions_for_car() сразу для нескольких номеров — ОДИН
+        запрос (см. FineSubscriptionRepository.list_by_car_numbers),
+        источник привязанных пользователей для debt-списка 📊 Статистика
+        (см. ConversationController._debt_owners_by_car). archived
+        исключается по тому же принципу: удалённый пользователем
+        автомобиль больше не "его"."""
+        return [
+            subscription for subscription in self._subscription_repository.list_by_car_numbers(car_numbers)
+            if subscription.status != "archived"
+        ]
+
+    def get_telegram_profiles(self, telegram_user_ids: list[int]) -> dict[int, TelegramUserInfo]:
+        """Telegram-профили (имя/username) из users одним запросом — запасной
+        источник для debt-списка 📊 Статистика: клиент, которому машину
+        добавил менеджер (add_delegated_car), мог ни разу не написать боту
+        (его нет в bot_known_users), но его профиль сохранён в users при
+        добавлении (см. sync_user_and_car). Только чтение по numeric id
+        САМОГО подписчика — никаких новых записей пользователей."""
+        return self._user_repository.get_many(telegram_user_ids)
 
     def stop_task_for_trusted_admin(self, task_id: int) -> bool:
         """Task-level ⛔ Остановить мониторинг для trusted-оператора —

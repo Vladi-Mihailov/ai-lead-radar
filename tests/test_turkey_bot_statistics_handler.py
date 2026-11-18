@@ -3,7 +3,7 @@
 РЕАЛЬНЫЙ ConversationController (не изолированные texts.py/
 statistics_service.py unit-тесты, см. tests/test_turkey_bot_texts_statistics.py
 /tests/test_turkey_statistics_service.py) — покрывает orchestration
-(get_debt_rows + get_known_profile + форматирование), authorization и,
+(get_debt_car_groups + get_known_profiles + форматирование), authorization и,
 КРИТИЧЕСКИ ВАЖНО, отсутствие любых provider/network вызовов."""
 
 import sys
@@ -188,7 +188,24 @@ async def test_debt_owner_shown_with_name_and_username(fx):
     reply = await fx.controller.handle_text(texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
 
     full_text = "\n".join((reply.text, *reply.extra_texts))
-    assert "Иван Иванов (@ivanov_i)" in full_text
+    assert "👤 Пользователь: Иван Иванов\n🔗 Telegram: @ivanov_i" in full_text
+
+
+def _debt_block(car_number: str, amount: str, *owner_lines: str) -> str:
+    """Ожидаемый блок машины debt-списка (см. texts.format_debt_row) — для
+    полной проверки (GİB + KGM, без строк по провайдерам)."""
+    return "\n".join([
+        f"🚗 Госномер: {format_plate_for_telegram(car_number)}",
+        f"💰 Задолженность: {amount}",
+        *owner_lines,
+    ])
+
+
+async def _statistics_text(fx, telegram_user_id: int = _TRUSTED_ID) -> str:
+    reply = await fx.controller.handle_text(
+        texts.STATISTICS_LABEL, chat_id=telegram_user_id, telegram_user_id=telegram_user_id,
+    )
+    return "\n".join((reply.text, *reply.extra_texts))
 
 
 async def test_debt_owner_shown_with_name_only(fx):
@@ -196,33 +213,174 @@ async def test_debt_owner_shown_with_name_only(fx):
     fx.record_known(telegram_user_id=1, first_name="Иван", last_name="Иванов")
     fx.save_run(telegram_user_id=1, plate="M295YB196", providers=_full_check(Decimal(750)))
 
-    reply = await fx.controller.handle_text(texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
+    full_text = await _statistics_text(fx)
 
-    full_text = "\n".join((reply.text, *reply.extra_texts))
-    assert f"🚗 {format_plate_for_telegram('M295YB196')}: Иван Иванов: 750 ₺" in full_text
+    assert _debt_block(
+        "M295YB196", "750 ₺", "👤 Пользователь: Иван Иванов", "🔗 Telegram: Логин не указан",
+    ) in full_text
 
 
 async def test_debt_owner_shown_with_username_only(fx):
     fx.add_car(telegram_user_id=1, car_number="M295YB196")
-    fx.record_known(telegram_user_id=1, username="alenaogir")
+    fx.record_known(telegram_user_id=1, username="anna_k")
     fx.save_run(telegram_user_id=1, plate="M295YB196", providers=_full_check(Decimal(1250)))
 
-    reply = await fx.controller.handle_text(texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
+    full_text = await _statistics_text(fx)
 
-    full_text = "\n".join((reply.text, *reply.extra_texts))
-    assert f"🚗 {format_plate_for_telegram('M295YB196')}: @alenaogir: 1 250 ₺" in full_text
+    assert _debt_block(
+        "M295YB196", "1 250 ₺", "👤 Пользователь: Имя не указано", "🔗 Telegram: @anna_k",
+    ) in full_text
 
 
-async def test_debt_owner_shown_as_dash_when_neither(fx):
+async def test_debt_owner_without_profile_shows_both_placeholders(fx):
     fx.add_car(telegram_user_id=1, car_number="M295YB196")
     # record_known НЕ вызывается вовсе.
     fx.save_run(telegram_user_id=1, plate="M295YB196", providers=_full_check(Decimal(100)))
 
+    full_text = await _statistics_text(fx)
+
+    assert _debt_block(
+        "M295YB196", "100 ₺", "👤 Пользователь: Имя не указано", "🔗 Telegram: Логин не указан",
+    ) in full_text
+    assert "None" not in full_text
+
+
+# ---- пользователи в debt-списке (задача "дополнить статистику штрафов
+# информацией о пользователях") ----
+
+
+async def test_several_owners_of_one_plate_each_listed_and_debt_shown_once(fx):
+    for user_id in (1, 2):
+        fx.add_car(telegram_user_id=user_id, car_number="34ABC123")
+    fx.record_known(telegram_user_id=1, username="mehmet_k", first_name="Мехмет", last_name="Кая")
+    fx.record_known(telegram_user_id=2, first_name="Айше")
+    fx.save_run(telegram_user_id=1, plate="34ABC123", providers=_full_check(Decimal(2500)))
+
+    reply = await fx.controller.handle_text(texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
+    full_text = "\n".join((reply.text, *reply.extra_texts))
+
+    # Порядок — как у manager car list/Search: новые записи гаража первыми.
+    assert _debt_block(
+        "34ABC123", "2 500 ₺",
+        "👤 Пользователь: Айше", "🔗 Telegram: Логин не указан",
+        "👤 Пользователь: Мехмет Кая", "🔗 Telegram: @mehmet_k",
+    ) in full_text
+    assert "Автомобилей: 1" in reply.text
+    assert "Общая сумма: 2 500 ₺" in reply.text
+    assert full_text.count("2 500 ₺") == 2  # итог + одна строка задолженности, без дублей на владельца
+
+
+async def test_sums_order_and_totals_unchanged_with_owner_lines(fx):
+    fx.add_car(telegram_user_id=1, car_number="34AAA111")
+    fx.add_car(telegram_user_id=2, car_number="34BBB222")
+    fx.add_car(telegram_user_id=3, car_number="34BBB222")
+    fx.save_run(telegram_user_id=1, plate="34AAA111", providers=_full_check(Decimal(300)))
+    fx.save_run(telegram_user_id=2, plate="34BBB222", providers=_full_check(Decimal("1200.50")))
+
+    reply = await fx.controller.handle_text(texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
+    debt_list = "\n".join(reply.extra_texts)
+
+    assert "Автомобилей: 2" in reply.text
+    assert "Общая сумма: 1 500,50 ₺" in reply.text
+    # Сортировка прежняя — по сумме по убыванию.
+    assert debt_list.index(format_plate_for_telegram("34BBB222")) < debt_list.index(format_plate_for_telegram("34AAA111"))
+    assert debt_list.count("💰 Задолженность:") == 2
+
+
+async def test_owner_text_from_profile_cannot_inject_telegram_markdown(fx):
+    from telethon.extensions import markdown
+    from telethon.tl.types import MessageEntityBold
+
+    fx.add_car(telegram_user_id=1, car_number="34ABC123")
+    fx.record_known(telegram_user_id=1, username="evil__user", first_name="**Мехмет**", last_name="[Нажми](http://evil.example)")
+    fx.save_run(telegram_user_id=1, plate="34ABC123", providers=_full_check(Decimal(500)))
+
     reply = await fx.controller.handle_text(texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
 
-    full_text = "\n".join((reply.text, *reply.extra_texts))
-    assert f"🚗 {format_plate_for_telegram('M295YB196')}: —: 100 ₺" in full_text
-    assert "None" not in full_text
+    for message in reply.extra_texts:
+        plain_text, entities = markdown.parse(message)
+        assert all(isinstance(entity, MessageEntityBold) for entity in entities)
+    plain_text, entities = markdown.parse("\n".join(reply.extra_texts))
+    assert len(entities) == 1  # только буквы госномера ABC
+    visible = plain_text.replace("​", "")
+    assert "👤 Пользователь: **Мехмет** [Нажми](http://evil.example)" in visible
+    assert "🔗 Telegram: Логин не указан" in visible  # "__" — не настоящий Telegram username
+
+
+async def test_manager_garage_row_is_never_shown_as_car_user(fx):
+    """Менеджер добавляет машину только в СВОЙ гараж — как пользователь
+    машины он не показывается (только клиент; без клиента — "не
+    привязан")."""
+    fx.add_car(telegram_user_id=_TRUSTED_ID, car_number="34ABC123")
+    fx.add_car(telegram_user_id=7, car_number="34ABC123")
+    fx.add_car(telegram_user_id=_TRUSTED_ID, car_number="34XYZ789")
+    fx.record_known(telegram_user_id=_TRUSTED_ID, username="manager_login", first_name="Менеджер")
+    fx.record_known(telegram_user_id=7, username="client7", first_name="Клиент")
+    fx.save_run(telegram_user_id=7, plate="34ABC123", providers=_full_check(Decimal(800)))
+    fx.save_run(telegram_user_id=_TRUSTED_ID, plate="34XYZ789", providers=_full_check(Decimal(600)))
+
+    full_text = await _statistics_text(fx)
+
+    assert _debt_block("34ABC123", "800 ₺", "👤 Пользователь: Клиент", "🔗 Telegram: @client7") in full_text
+    assert _debt_block("34XYZ789", "600 ₺", "👤 Пользователь не привязан") in full_text
+    assert "manager_login" not in full_text
+    assert "Менеджер" not in full_text
+
+
+async def test_debt_list_profile_queries_do_not_grow_with_cars_and_owners(fx):
+    """Без N+1: профили владельцев читаются фиксированным числом запросов,
+    сколько бы машин и владельцев ни было в списке."""
+    statements: list[str] = []
+    fx.known_users._conn.set_trace_callback(statements.append)
+
+    async def count_profile_queries() -> int:
+        statements.clear()
+        await fx.controller.handle_text(texts.STATISTICS_LABEL, chat_id=_TRUSTED_ID, telegram_user_id=_TRUSTED_ID)
+        return len(statements)
+
+    fx.add_car(telegram_user_id=1000, car_number="34NA000")
+    fx.record_known(telegram_user_id=1000, username="u1000")
+    fx.save_run(telegram_user_id=1000, plate="34NA000", providers=_full_check(Decimal(100)))
+    queries_for_one_car = await count_profile_queries()
+
+    for i in range(1, 10):
+        plate = f"34NA{i:03d}"
+        for j in range(3):
+            user_id = 1000 + i * 10 + j
+            fx.add_car(telegram_user_id=user_id, car_number=plate)
+            fx.record_known(telegram_user_id=user_id, username=f"u{user_id}")
+        fx.save_run(telegram_user_id=1000 + i * 10, plate=plate, providers=_full_check(Decimal(100 + i)))
+    full_text = await _statistics_text(fx)
+    queries_for_ten_cars = await count_profile_queries()
+
+    assert full_text.count("👤 Пользователь:") == 1 + 9 * 3
+    assert queries_for_ten_cars == queries_for_one_car
+
+
+async def test_client_screens_never_show_other_owners_of_the_same_car(fx):
+    """Имя/логин владельцев машины видит только менеджер в 📊 Статистика —
+    не обычный клиент: ни в "Мои авто", ни в карточке своей машины, ни при
+    попытке открыть статистику."""
+    fx.add_car(telegram_user_id=_ORDINARY_ID, car_number="34ABC123")
+    fx.add_car(telegram_user_id=2, car_number="34ABC123")
+    fx.record_known(telegram_user_id=_ORDINARY_ID, username="me_client", first_name="Я")
+    fx.record_known(telegram_user_id=2, username="other_owner", first_name="Чужой", last_name="Владелец")
+    fx.save_run(telegram_user_id=2, plate="34ABC123", providers=_full_check(Decimal(900)))
+    own_car = next(car for car in fx.garage.list_cars(_ORDINARY_ID) if car.car_number == "34ABC123")
+
+    replies = [
+        fx.controller.handle_my_cars(chat_id=_ORDINARY_ID, telegram_user_id=_ORDINARY_ID),
+        fx.controller.handle_car_open(own_car.id, telegram_user_id=_ORDINARY_ID),
+        await fx.controller.handle_text(texts.STATISTICS_LABEL, chat_id=_ORDINARY_ID, telegram_user_id=_ORDINARY_ID),
+    ]
+
+    for reply in replies:
+        assert reply is not None
+        everything_shown = repr(reply)  # текст, extra_texts И все кнопки/опции ответа
+        assert "other_owner" not in everything_shown
+        assert "Чужой" not in everything_shown
+        assert "👤 Пользователь" not in everything_shown
+        assert "🔗 Telegram" not in everything_shown
 
 
 # ---- Telegram message limit (см. задачу п.11) ----

@@ -62,3 +62,23 @@ def test_uses_its_own_table_not_georgian_bots_table(tmp_path):
         assert "bot_known_users" not in tables
     finally:
         repo.close()
+
+
+def test_get_profiles_returns_profiles_by_id_in_one_query(tmp_path):
+    repo = TurkeyBotKnownUsersRepository(tmp_path / "users.db")
+    try:
+        repo.record_seen(
+            telegram_user_id=1, telegram_chat_id=1, telegram_username="mehmet_k", first_name="Мехмет", last_name="Кая",
+        )
+        repo.record_seen(telegram_user_id=2, telegram_chat_id=2, telegram_username=None, first_name="Айше")
+        statements: list[str] = []
+        repo._conn.set_trace_callback(statements.append)
+
+        profiles = repo.get_profiles([1, 2, 3])
+
+        assert len(statements) == 1
+        assert profiles == {1: ("mehmet_k", "Мехмет", "Кая"), 2: (None, "Айше", None)}  # 3 не писал боту
+        assert profiles[1] == repo.get_profile(1)
+        assert repo.get_profiles([]) == {}
+    finally:
+        repo.close()
