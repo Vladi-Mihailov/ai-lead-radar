@@ -13,9 +13,10 @@ protocolAuto/plate, ни сумма, ни место, ни статья, ни о
 деталей штрафа, только как "видели ли мы уже эту запись feed'а".
 
 first_seen_at — когда запись встретилась впервые (UTC, формат
-CURRENT_TIMESTAMP). DEEP-восстановление (см. seen_before) по нему отличает
-строки, обработанные ДО последнего успешного цикла, от строк, отмеченных
-позже (в том числе сбойными попытками над ещё не дочитанной "дырой").
+CURRENT_TIMESTAMP). DEEP-восстановление (см. seen_at_or_before) по нему
+отличает строки, обработанные последним успешным циклом или раньше, от
+строк, отмеченных позже (в том числе сбойными или прерванными попытками
+над ещё не дочитанной "дырой").
 
 Ограничено по времени (см. retention_days в GeorgiaPublicFineFeedJob) —
 при наблюдаемой скорости публикации (~5–6,3 тыс./день в ноябре 2026, а
@@ -51,8 +52,8 @@ _MARK_SEEN_AT = (
     "VALUES (:protocol_no, :publish_date, :first_seen_at)"
 )
 
-_SELECT_SEEN_BEFORE = (
-    "SELECT 1 FROM georgia_public_feed_seen WHERE protocol_no = ? AND first_seen_at < ?"
+_SELECT_SEEN_AT_OR_BEFORE = (
+    "SELECT 1 FROM georgia_public_feed_seen WHERE protocol_no = ? AND first_seen_at <= ?"
 )
 
 _DELETE_OLDER_THAN = "DELETE FROM georgia_public_feed_seen WHERE publish_date < ?"
@@ -89,12 +90,13 @@ class GeorgiaPublicFeedSeenRepository:
             self._conn.execute(_MARK_SEEN_AT, {**params, "first_seen_at": _sqlite_utc(seen_at)})
         self._conn.commit()
 
-    def seen_before(self, protocol_no: str, at: datetime) -> bool:
-        """Запись впервые отмечена СТРОГО раньше at (только чтение) — см.
-        DEEP-горизонт восстановления в GeorgiaPublicFineFeedJob/
-        GeorgiaCollectorJob: строки, увиденные до последнего успешного
-        цикла, уже обработаны."""
-        row = self._conn.execute(_SELECT_SEEN_BEFORE, (protocol_no, _sqlite_utc(at))).fetchone()
+    def seen_at_or_before(self, protocol_no: str, at: datetime) -> bool:
+        """Запись впервые отмечена не позже at, с точностью до секунды
+        (только чтение) — см. DEEP-горизонт восстановления в
+        GeorgiaPublicFineFeedJob/GeorgiaCollectorJob: всё, что отметил
+        последний успешный цикл (first_seen_at = его run_at) или более
+        ранние, уже обработано."""
+        row = self._conn.execute(_SELECT_SEEN_AT_OR_BEFORE, (protocol_no, _sqlite_utc(at))).fetchone()
         return row is not None
 
     def cleanup_older_than(self, cutoff: date) -> int:

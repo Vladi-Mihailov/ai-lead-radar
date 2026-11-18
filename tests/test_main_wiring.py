@@ -207,6 +207,23 @@ def test_load_settings_defaults_public_feed_schedule(tmp_path, monkeypatch):
     ]
 
 
+def test_load_settings_defaults_public_feed_page_caps_to_the_collector_limits(tmp_path, monkeypatch):
+    """Лимиты страниц in-process feed job'а по умолчанию те же, что у
+    REDNET-коллектора: прежние 30/100 рассчитаны на ~670 публикаций в
+    сутки, а их ~5–6,3 тыс. (самый загруженный цикл — ~120 страниц)."""
+    from reader.georgia_collector.__main__ import load_page_limits
+
+    _set_required_env(monkeypatch)
+    config_path = _write_config(tmp_path, _CONFIG_YAML)
+
+    settings = load_settings(config_path)
+
+    assert (
+        settings.fine_monitor.public_feed_max_pages_per_cycle,
+        settings.fine_monitor.public_feed_first_run_max_pages,
+    ) == load_page_limits(env={}) == (300, 300)
+
+
 def test_load_settings_parses_explicit_public_feed_schedule(tmp_path, monkeypatch):
     _set_required_env(monkeypatch)
     config_with_public_feed = _CONFIG_YAML + (

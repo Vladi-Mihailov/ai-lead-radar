@@ -92,7 +92,7 @@ def test_state_persists_across_repository_instances(tmp_path):
         repo2.close()
 
 
-# ==== first_seen_at / seen_before (DEEP-горизонт восстановления) ====
+# ==== first_seen_at / seen_at_or_before (DEEP-горизонт восстановления) ====
 
 
 def _first_seen_at(repo, protocol_no: str) -> str:
@@ -121,21 +121,23 @@ def test_naive_seen_at_is_treated_as_utc(tmp_path):
         repo.mark_seen("AB123456", publish_date=date(2026, 10, 22), seen_at=datetime(2026, 10, 22, 17, 0, 5))
 
         assert _first_seen_at(repo, "AB123456") == "2026-10-22 17:00:05"
-        assert repo.seen_before("AB123456", datetime(2026, 10, 22, 17, 0, 6, tzinfo=timezone.utc)) is True
+        assert repo.seen_at_or_before("AB123456", datetime(2026, 10, 22, 17, 0, 5, tzinfo=timezone.utc)) is True
+        assert repo.seen_at_or_before("AB123456", datetime(2026, 10, 22, 17, 0, 4, tzinfo=timezone.utc)) is False
     finally:
         repo.close()
 
 
-def test_seen_before_is_strict_and_false_for_unknown_rows(tmp_path):
+def test_seen_at_or_before_includes_the_same_moment_and_is_false_for_unknown_rows(tmp_path):
     repo = GeorgiaPublicFeedSeenRepository(tmp_path / "users.db")
     try:
         at = datetime(2026, 10, 22, 11, 0, tzinfo=timezone.utc)
         repo.mark_seen("AB123456", publish_date=date(2026, 10, 22), seen_at=at)
 
-        assert repo.seen_before("AB123456", at) is False  # отмечена В ЭТОМ цикле — не раньше
-        assert repo.seen_before("AB123456", at + timedelta(seconds=1)) is True
-        assert repo.seen_before("AB123456", at - timedelta(hours=1)) is False
-        assert repo.seen_before("UNKNOWN1", at + timedelta(days=1)) is False
+        # Отмечена циклом с run_at == at — этот цикл её обработал.
+        assert repo.seen_at_or_before("AB123456", at) is True
+        assert repo.seen_at_or_before("AB123456", at + timedelta(seconds=1)) is True
+        assert repo.seen_at_or_before("AB123456", at - timedelta(seconds=1)) is False
+        assert repo.seen_at_or_before("UNKNOWN1", at + timedelta(days=1)) is False
     finally:
         repo.close()
 
@@ -161,7 +163,7 @@ def test_rows_with_default_current_timestamp_compare_correctly(tmp_path):
         repo.mark_seen("AB123456", publish_date=date(2026, 10, 22))
         now = datetime.now(timezone.utc)
 
-        assert repo.seen_before("AB123456", now + timedelta(minutes=5)) is True
-        assert repo.seen_before("AB123456", now - timedelta(minutes=5)) is False
+        assert repo.seen_at_or_before("AB123456", now + timedelta(minutes=5)) is True
+        assert repo.seen_at_or_before("AB123456", now - timedelta(minutes=5)) is False
     finally:
         repo.close()

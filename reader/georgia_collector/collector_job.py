@@ -10,15 +10,19 @@ the production client's own bounded retries) queues the payload in the
 local outbox (outbox_repository.py) instead of aborting the cycle, so a
 production-side outage never loses an already-fetched match.
 
-DEEP mode (true first run, or recovery after a failed cycle) completes at an
-empty page OR at a page whose rows are all already processed (see
-_page_already_processed): on the true first run, rows published before
+DEEP mode (true first run, or recovery after a failed or interrupted cycle)
+completes at an empty page OR at a page whose rows are all already processed
+(see _page_already_processed): on the true first run, rows published before
 today; in recovery, rows published before the newest publish date of the
-last successful cycle OR first seen before that cycle (first_seen_at; rows
-marked by failed attempts after it don't count, so a gap below them is still
+last successful cycle (capped at that cycle's own day) OR first seen by that
+cycle or earlier (first_seen_at <= its run_at; rows marked by failed or
+interrupted attempts after it don't count, so a gap below them is still
 read). The real feed has ~10k pages (~5–6.3k publications a day), so an
 empty page is unreachable — without this horizon DEEP never completed and
-re-read max_pages pages every cycle. FAST mode is unchanged.
+re-read max_pages pages every cycle. Each cycle first records "cycle in
+progress" as last_error, so a cycle killed midway (SIGTERM, OOM,
+CancelledError) is followed by DEEP recovery, not FAST. FAST mode is
+unchanged.
 
 should_run()/run_times/_last_run_slot is the SAME exact-wall-clock pattern
 as reader/jobs/fine_job.py::FineJob.should_run()/reader/jobs/
@@ -90,6 +94,18 @@ from reader.georgia_collector.production_client import (
 logger = logging.getLogger(__name__)
 
 _PAGE_SIZE = 30
+
+# Отметка "цикл идёт" в georgia_public_feed_state.last_error (см. отметку
+# перед циклом страниц): если она осталась, цикл был прерван.
+_CYCLE_IN_PROGRESS = (
+    "cycle in progress (if this stays, the cycle was interrupted "
+    "and the next one runs deep recovery)"
+)
+
+# Настройки лимита страниц, которые называет _safety_cap_message() —
+# переменные окружения (см. __main__.load_page_limits).
+_FIRST_RUN_PAGES_SETTING = "GEORGIA_COLLECTOR_FIRST_RUN_MAX_PAGES"
+_PAGES_PER_CYCLE_SETTING = "GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE"
 
 # Outbox durability review ("Georgia remote collector architecture"
 # integration, PR #34): once an entry has failed this many cross-cycle
@@ -200,23 +216,44 @@ class GeorgiaCollectorJob:
         #   ранние штрафы отслеживаемых номеров находит bootstrap-поиск при
         #   добавлении номера.
         # - Восстановление — строки, опубликованные раньше даты самой новой
-        #   строки последнего успешного цикла, ЛИБО впервые увиденные раньше
-        #   него (first_seen_at). Отмеченные во время/после него (в т.ч.
-        #   сбойной попыткой над недочитанной "дырой") не считаются — дыра
-        #   будет дочитана. Весь последний день заново не перечитывается,
-        #   иначе восстановление после двух сбоев подряд не помещалось бы в
-        #   лимит страниц.
+        #   строки последнего успешного цикла (но не позже дня самого цикла:
+        #   строка, датированная будущим, горизонт не сдвигает), ЛИБО впервые
+        #   увиденные этим циклом или раньше (first_seen_at <= его run_at —
+        #   всё, что он отметил, обработано). Отмеченные позже (в т.ч.
+        #   сбойной или прерванной попыткой над недочитанной "дырой") не
+        #   считаются — дыра будет дочитана. Весь последний день заново не
+        #   перечитывается, иначе восстановление после двух сбоев подряд не
+        #   помещалось бы в лимит страниц.
         if is_true_first_run:
             processed_before_date = run_at.astimezone(self._tz).date()
             processed_before_time = None
         else:
-            processed_before_date = feed_state.newest_seen_publish_date
-            processed_before_time = feed_state.last_successful_poll_at
+            last_success = _as_utc(feed_state.last_successful_poll_at)
+            success_day = last_success.astimezone(self._tz).date()
+            newest = feed_state.newest_seen_publish_date
+            processed_before_date = success_day if newest is None else min(newest, success_day)
+            processed_before_time = last_success
+            if deep_mode and last_success.replace(microsecond=0) >= _as_utc(run_at).replace(microsecond=0):
+                # Успех записан с часами "впереди": по first_seen_at строки
+                # этого и прошлых сбойных циклов сошли бы за обработанные.
+                logger.warning(
+                    "GeorgiaCollectorJob: last successful cycle %s is not earlier than this cycle %s "
+                    "(clock skew?) — recovery ignores first-seen times this cycle",
+                    last_success.isoformat(), run_at.isoformat(),
+                )
+                processed_before_time = None
 
         pages_fetched = 0
         newest_seen_this_cycle: date | None = None
         completed = False
         pending_overlap = False
+
+        # Отметка "цикл идёт": если процесс остановят посреди цикла (SIGTERM,
+        # OOM, CancelledError — их не ловит ни один except ниже), last_error
+        # останется, и следующий цикл пойдёт DEEP-восстановлением, а не FAST
+        # (FAST остановился бы на строках прерванного цикла и не вернулся бы
+        # к недочитанным под ними). Успех её снимает, ошибка перезаписывает.
+        self._feed_state.record_error(_CYCLE_IN_PROGRESS, at=run_at)
 
         try:
             for page_index in range(max_pages):
@@ -255,7 +292,7 @@ class GeorgiaCollectorJob:
 
                 if deep_mode and _page_already_processed(
                     raw_results, self._seen,
-                    published_before=processed_before_date, seen_before=processed_before_time,
+                    published_before=processed_before_date, seen_at_or_before=processed_before_time,
                 ):
                     # DEEP дошёл до уже обработанных строк — цикл завершён
                     # честно, а не упором в лимит страниц.
@@ -280,10 +317,11 @@ class GeorgiaCollectorJob:
             return
 
         if not completed:
-            self._record_error(
-                "safety cap reached before an empty page, the frontier or already-processed rows",
-                at=run_at,
+            message = _safety_cap_message(
+                max_pages, is_true_first_run=is_true_first_run, deep_mode=deep_mode,
             )
+            logger.warning("GeorgiaCollectorJob: %s", message)
+            self._record_error(message, at=run_at)
             return
 
         if newest_seen_this_cycle is not None:
@@ -417,12 +455,12 @@ def _page_already_processed(
     seen: GeorgiaPublicFeedSeenRepository,
     *,
     published_before: date | None,
-    seen_before: datetime | None,
+    seen_at_or_before: datetime | None,
 ) -> bool:
     """DEEP-горизонт (см. _poll_feed()): КАЖДАЯ строка страницы опубликована
-    раньше published_before ЛИБО впервые увидена раньше seen_before (до
-    последнего успешного цикла). Строка без даты публикации и без такой
-    отметки — не обработанная: обход продолжается."""
+    раньше published_before ЛИБО впервые увидена не позже seen_at_or_before
+    (последним успешным циклом или раньше). Строка без даты публикации и
+    без такой отметки — не обработанная: обход продолжается."""
     if not entries:
         return False
     for entry in entries:
@@ -430,8 +468,40 @@ def _page_already_processed(
         if published_before is not None and entry_date is not None and entry_date < published_before:
             continue
         protocol_no = entry.get("protocolNo")
-        if seen_before is not None and protocol_no and seen.seen_before(protocol_no, seen_before):
+        if (
+            seen_at_or_before is not None
+            and protocol_no
+            and seen.seen_at_or_before(protocol_no, seen_at_or_before)
+        ):
             continue
         return False
     return True
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Naive datetime считается UTC (как и first_seen_at в
+    GeorgiaPublicFeedSeenRepository)."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _safety_cap_message(max_pages: int, *, is_true_first_run: bool, deep_mode: bool) -> str:
+    """Свой текст для каждого режима, с именем настройки лимита.
+    Восстановление, не дошедшее до строк последнего успеха за max_pages
+    страниц, само уже не завершится: новые строки только отодвигают их."""
+    if is_true_first_run:
+        return (
+            f"first-run catch-up: safety cap of {max_pages} pages reached before rows published "
+            f"before today; retrying in deep mode next cycle (raise {_FIRST_RUN_PAGES_SETTING} "
+            "if this repeats)"
+        )
+    if deep_mode:
+        return (
+            "recovery could not reach rows covered by the last successful cycle within "
+            f"{max_pages} pages; it keeps failing until {_PAGES_PER_CYCLE_SETTING} is raised"
+        )
+    return (
+        f"safety cap of {max_pages} pages reached before the frontier (already-seen rows); "
+        "the next cycle runs deep recovery, which needs even more pages — raise "
+        f"{_PAGES_PER_CYCLE_SETTING}"
+    )
 

@@ -6,6 +6,7 @@ as FineJob/GeorgiaPublicFineFeedJob), production-API-unavailable handling
 breaker gate, error recording via the local feed_state), and the
 no-Telegram-import architectural guarantee."""
 
+import asyncio
 import sys
 from datetime import date, datetime, timezone
 from datetime import time as dt_time
@@ -565,12 +566,13 @@ async def test_recovery_after_two_failed_cycles_fits_the_page_cap(tmp_path):
 
 
 async def test_rows_marked_by_an_earlier_successful_cycle_complete_a_later_recovery(tmp_path):
-    """End-to-end check of first_seen_at = run_at: rows marked by the first
-    successful cycle complete a later recovery; rows of the most recent
-    successful cycle (first_seen_at == its run_at) do not."""
+    """End-to-end check of first_seen_at = run_at: rows marked by the last
+    successful cycle (first_seen_at == its run_at) complete a later
+    recovery; rows of a later failed attempt do not."""
     production = _FakeProductionClient(active_plates=["AA001AA"])
     rows_a = _rows("A0_", 30, publish_date="2026-10-22")
     rows_b = _rows("B0_", 30, publish_date="2026-10-22")
+    rows_k = _rows("K0_", 30, publish_date="2026-10-22")
     yesterday = _rows("Y0_", 30, publish_date="2026-10-21")
 
     first = _FakeSession({0: _page(rows_a), 30: _page(yesterday)})
@@ -583,19 +585,230 @@ async def test_rows_marked_by_an_earlier_successful_cycle_complete_a_later_recov
     await job2.run(_utc(21))
     assert second.requested_offsets == [0, 30, 60]
 
-    failing = _FakeSession(errors={0: FineProviderError("ConnectTimeout")})
+    failing = _FakeSession({0: _page(rows_k)}, errors={30: FineProviderError("ConnectTimeout")})
     job3, *_ = _make_job(tmp_path, failing, production)
     await job3.run(_utc(23, 55))
     assert feed_state_repo.get().last_error is not None
 
     recovery = _FakeSession({
         0: _page(_rows("C0_", 30, publish_date="2026-10-23")),
-        30: _page(rows_b),
-        60: _page(rows_a),
-        90: _page(yesterday),
+        30: _page(rows_k),
+        60: _page(rows_b),
+        90: _page(rows_a),
+        120: _page(yesterday),
     })
     job4, feed_state_repo4, *_ = _make_job(tmp_path, recovery, production)
     await job4.run(_utc(9, day=23))
 
     assert recovery.requested_offsets == [0, 30, 60]
     assert feed_state_repo4.get().last_error is None
+
+
+def _submitted(production) -> list[str]:
+    return [m["external_fine_id"] for m in production.submitted_feed_matches]
+
+
+async def test_interrupted_cycle_is_followed_by_deep_recovery_that_reads_below_the_kill_point(tmp_path):
+    """A cycle killed midway (SIGTERM/OOM/CancelledError — past every except)
+    leaves the "cycle in progress" marker: the next cycle runs DEEP, not
+    FAST, and reads the rows below the kill point."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    rows_s = _rows("S0_", 30, publish_date="2026-10-22")
+    yesterday = _rows("Y0_", 30, publish_date="2026-10-21")
+    first = _FakeSession({0: _page(rows_s), 30: _page(yesterday)})
+    job1, feed_state_repo, *_ = _make_job(tmp_path, first, production)
+    await job1.run(_utc(15))
+    assert feed_state_repo.get().last_error is None
+
+    k0 = _rows("K0_", 30, publish_date="2026-10-22")
+    k1 = _rows("K1_", 30, publish_date="2026-10-22")
+    k2 = _rows("K2_", 29, publish_date="2026-10-22") + [
+        _entry(protocol_no="LOST_MATCH", plate="AA001AA", publish_date="2026-10-22"),
+    ]
+    killed = _FakeSession(
+        {0: _page(k0), 30: _page(k1), 60: _page(k2), 90: _page(rows_s)},
+        errors={30: asyncio.CancelledError()},
+    )
+    job2, *_ = _make_job(tmp_path, killed, production)
+    with pytest.raises(asyncio.CancelledError):
+        await job2.run(_utc(21))
+    assert feed_state_repo.get().last_error is not None
+
+    recovery = _FakeSession({
+        0: _page(_rows("N0_", 30, publish_date="2026-10-22")),
+        30: _page(k0),
+        60: _page(k1),
+        90: _page(k2),
+        120: _page(rows_s),
+        150: _page(yesterday),
+    })
+    job3, feed_state_repo3, *_ = _make_job(tmp_path, recovery, production)
+    await job3.run(_utc(23, 55))
+
+    assert recovery.requested_offsets == [0, 30, 60, 90, 120]
+    assert _submitted(production) == ["LOST_MATCH"]
+    assert feed_state_repo3.get().last_error is None
+
+
+async def test_recovery_ignores_first_seen_times_when_last_success_is_not_in_the_past(tmp_path, caplog):
+    """A success recorded with the clock a day ahead would make rows of the
+    failed attempt and of the recovery itself look processed; the guard drops
+    the first-seen criterion and keeps the date one."""
+    import logging
+
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    g0 = _rows("G0_", 30, publish_date="2026-10-22")
+    g1 = _rows("G1_", 29, publish_date="2026-10-22") + [
+        _entry(protocol_no="SKEW_MATCH", plate="AA001AA", publish_date="2026-10-22"),
+    ]
+    failing = _FakeSession({0: _page(g0)}, errors={30: FineProviderError("ConnectTimeout")})
+    job1, feed_state_repo, *_ = _make_job(tmp_path, failing, production)
+    feed_state_repo.record_successful_cycle(
+        newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(21, day=23),
+    )
+    await job1.run(_utc(21))
+    assert feed_state_repo.get().last_error is not None
+
+    recovery = _FakeSession({
+        0: _page(_rows("N0_", 30, publish_date="2026-10-22")),
+        30: _page(g0),
+        60: _page(g1),
+        90: _page(_rows("Y0_", 30, publish_date="2026-10-21")),
+    })
+    job2, feed_state_repo2, *_ = _make_job(tmp_path, recovery, production)
+    with caplog.at_level(logging.WARNING, logger="reader.georgia_collector.collector_job"):
+        await job2.run(_utc(23, 55))
+
+    assert recovery.requested_offsets == [0, 30, 60, 90]
+    assert _submitted(production) == ["SKEW_MATCH"]
+    assert any("clock skew" in r.getMessage() for r in caplog.records)
+    assert feed_state_repo2.get().last_error is None
+
+
+async def test_future_dated_row_does_not_move_the_recovery_date_horizon_past_the_success_day(tmp_path):
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    future_row = _entry(protocol_no="FUT0001", plate="ZZ990ZZ", publish_date="2026-10-23")
+    s0_rows = _rows("S0_", 29, publish_date="2026-10-22")
+    first = _FakeSession({
+        0: _page([future_row] + s0_rows),
+        30: _page(_rows("Y0_", 30, publish_date="2026-10-21")),
+    })
+    job1, feed_state_repo, *_ = _make_job(tmp_path, first, production)
+    await job1.run(_utc(21))
+    assert feed_state_repo.get().newest_seen_publish_date == date(2026, 10, 23)
+
+    failing = _FakeSession(errors={0: FineProviderError("ConnectTimeout")})
+    job2, *_ = _make_job(tmp_path, failing, production)
+    await job2.run(_utc(23, 55))
+
+    g0 = _rows("G0_", 30, publish_date="2026-10-22")
+    g1 = _rows("G1_", 29, publish_date="2026-10-22") + [
+        _entry(protocol_no="FUT_GAP_MATCH", plate="AA001AA", publish_date="2026-10-22"),
+    ]
+    recovery = _FakeSession({
+        0: _page([future_row] + _rows("H0_", 29, publish_date="2026-10-23")),
+        30: _page(g0),
+        60: _page(g1),
+        90: _page(s0_rows),
+    })
+    job3, feed_state_repo3, *_ = _make_job(tmp_path, recovery, production)
+    await job3.run(_utc(9, day=23))
+
+    assert recovery.requested_offsets == [0, 30, 60, 90]
+    assert _submitted(production) == ["FUT_GAP_MATCH"]
+    assert feed_state_repo3.get().last_error is None
+
+
+async def test_capped_recovery_says_it_cannot_reach_the_last_success_and_names_the_setting(tmp_path, caplog):
+    import logging
+
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    session = _FakeSession({i * 30: _page(_rows(f"N{i}_", 30, publish_date="2026-10-22")) for i in range(5)})
+    job, feed_state_repo, *_ = _make_job(tmp_path, session, production, max_pages_per_cycle=3)
+    feed_state_repo.record_successful_cycle(newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15))
+    feed_state_repo.record_error("ConnectTimeout", at=_utc(21))
+
+    with caplog.at_level(logging.WARNING, logger="reader.georgia_collector.collector_job"):
+        await job.run(_utc(23, 55))
+
+    assert session.requested_offsets == [0, 30, 60]
+    error = feed_state_repo.get().last_error
+    assert "recovery could not reach rows covered by the last successful cycle within 3 pages" in error
+    assert "GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE" in error
+    assert any(r.levelno == logging.WARNING and error in r.getMessage() for r in caplog.records)
+
+
+async def test_first_run_cap_has_its_own_message(tmp_path):
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    session = _FakeSession({
+        0: _page(_rows("T0_", 30, publish_date="2026-10-22")),
+        30: _page(_rows("T1_", 30, publish_date="2026-10-22")),
+    })
+    job, feed_state_repo, *_ = _make_job(tmp_path, session, production, first_run_max_pages=2)
+
+    await job.run(_utc(21))
+
+    error = feed_state_repo.get().last_error
+    assert error.startswith("first-run catch-up: safety cap of 2 pages")
+    assert "GEORGIA_COLLECTOR_FIRST_RUN_MAX_PAGES" in error
+    assert "recovery could not reach" not in error
+
+
+async def test_fast_cap_has_its_own_message(tmp_path):
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    session = _FakeSession({i * 30: _page(_rows(f"N{i}_", 30, publish_date="2026-10-22")) for i in range(3)})
+    job, feed_state_repo, *_ = _make_job(tmp_path, session, production, max_pages_per_cycle=2)
+    feed_state_repo.record_successful_cycle(newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15))
+
+    await job.run(_utc(21))
+
+    error = feed_state_repo.get().last_error
+    assert error.startswith("safety cap of 2 pages reached before the frontier")
+    assert "GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE" in error
+
+
+async def test_fast_page_of_rows_seen_before_last_success_still_gets_its_overlap_page(tmp_path):
+    """The DEEP horizon does not apply in FAST: a page of rows seen before the
+    last success is an ordinary frontier, followed by one overlap page."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    old = _rows("OLD_", 30, publish_date="2026-10-22")
+    session = _FakeSession({0: _page(old), 30: _page(_rows("OLDER_", 30, publish_date="2026-10-22"))})
+    job, feed_state_repo, seen_repo, _outbox = _make_job(tmp_path, session, production)
+    feed_state_repo.record_successful_cycle(newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15))
+    _mark_seen_at(seen_repo, old, seen_at=_utc(9))
+
+    await job.run(_utc(21))
+
+    assert session.requested_offsets == [0, 30]
+
+
+async def test_match_on_the_page_that_completes_deep_is_still_processed(tmp_path):
+    """The page that completes DEEP is processed in full first (the detection
+    loop is unchanged); only then does it stop the traversal."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    horizon_page = _rows("Y0_", 29, publish_date="2026-10-21") + [
+        _entry(protocol_no="H_MATCH", plate="AA001AA", publish_date="2026-10-21"),
+    ]
+    session = _FakeSession({0: _page(_rows("T0_", 30, publish_date="2026-10-22")), 30: _page(horizon_page)})
+    job, _feed_state, seen_repo, _outbox = _make_job(tmp_path, session, production, first_run_max_pages=10)
+
+    await job.run(_utc(21))
+
+    assert session.requested_offsets == [0, 30]
+    assert _submitted(production) == ["H_MATCH"]
+    assert seen_repo.is_seen("Y0_000")
+
+
+async def test_first_run_horizon_uses_the_tbilisi_date_not_utc(tmp_path):
+    """01:00 Tbilisi on 23.10 is 21:00 UTC on 22.10: "today" is 23.10."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    session = _FakeSession({
+        0: _page(_rows("D23_", 30, publish_date="2026-10-23")),
+        30: _page(_rows("D22_", 30, publish_date="2026-10-22")),
+        60: _page(_rows("D22B_", 30, publish_date="2026-10-22")),
+    })
+    job, *_ = _make_job(tmp_path, session, production, first_run_max_pages=10)
+
+    await job.run(_utc(1, day=23))
+
+    assert session.requested_offsets == [0, 30]
