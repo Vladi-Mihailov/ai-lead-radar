@@ -74,6 +74,16 @@ DISPLAY_GONE = "gone"
 # ⏳ — неоплаченная квитанция в состоянии 'unverified' (см. модульный докстрок).
 DISPLAY_UNVERIFIED = "unverified"
 
+# Допуск при сверке времени ответа police.ge со снимком суммы задачи
+# (last_successful_checked_at): сейчас снимок пишется до обработки штрафов,
+# а в старых версиях писался после неё — на секунды позже строк
+# detected_fines. Один и тот же допуск у первичного заполнения (квитанция
+# была в ответе, по которому сделан снимок, см. seed_from_detected_fines) и
+# у статистики (статусы машины не старше её снимка, см.
+# conversation._statuses_are_current): при разных допусках машина с долгом
+# выпадала бы из списка — строки уже ⏳, а статусы ещё считаются свежими.
+SNAPSHOT_TOLERANCE = timedelta(minutes=1)
+
 # Источник записи в журнале/последнего изменения статуса оплаты.
 SOURCE_CHECK = "check"
 SOURCE_FEED = "feed"
@@ -232,7 +242,8 @@ class DebtBreakdown:
     paid_count: int = 0
     needs_review_amount: float = 0.0
     needs_review_count: int = 0
-    # ⏳ 'unverified' — ни долг, ни оплачено: присутствие ещё не перепроверено.
+    # ⏳ — неоплаченные 'unverified': ни долг, ни оплачено, присутствие ещё не
+    # перепроверено ('unverified' с отметкой менеджера считается по ней).
     unverified_amount: float = 0.0
     unverified_count: int = 0
 
@@ -254,20 +265,24 @@ class DebtBreakdown:
 
 
 def breakdown_of(statuses: Iterable[FineStatus]) -> DebtBreakdown:
+    """По тому же статусу, что видит менеджер (FineStatus.display_status):
+    ⏳ — только неоплаченные квитанции 'unverified'; 'unverified' с
+    отметкой менеджера считается по ней — 🟡 остаётся в долге (отказ
+    платёжной страницы — не оплата), 🟢 — в оплаченном."""
     unpaid_amount = paid_amount = review_amount = unverified_amount = 0.0
     unpaid_count = paid_count = review_count = unverified_count = 0
     for status in statuses:
         amount = status.amount or 0.0
-        if status.presence == PRESENCE_UNVERIFIED:
+        display = status.display_status
+        if display == DISPLAY_GONE:
+            continue
+        if display == DISPLAY_UNVERIFIED:
             unverified_amount += amount
             unverified_count += 1
-            continue
-        if not status.counts_as_listed:
-            continue
-        if status.payment_status == PAYMENT_PAID:
+        elif display == PAYMENT_PAID:
             paid_amount += amount
             paid_count += 1
-        elif status.payment_status == PAYMENT_NEEDS_REVIEW:
+        elif display == PAYMENT_NEEDS_REVIEW:
             review_amount += amount
             review_count += 1
         else:
@@ -567,48 +582,62 @@ class FineStatusRepository:
         """Однократное (идемпотентное, INSERT OR IGNORE) заполнение статусов
         из detected_fines — до появления этой таблицы штрафы жили только
         там. Ключ — номер ЗАДАЧИ (тот же, что передают проверки и
-        подписки), а не protocolAuto строки. Квитанция, которую police.ge
-        показал на последней успешной проверке хотя бы одной задачи номера
-        (или нашёл позже feed), — 'listed'; остальные — 'unverified' (⏳):
-        их не было в старом ответе, полученном ещё без нынешней защиты от
-        ложно пустых ответов, поэтому исчезновение не считается
-        подтверждённым — ⚪ только после двух НОВЫХ полных проверок (см.
-        record_full_check). Сравнение дат — в Python, а не в SQL:
-        last_seen_at и last_successful_checked_at пишутся разными путями.
-        Возвращает число созданных строк."""
-        tasks = {
-            row[0]: (row[1], _parse_ts(row[2]))
-            for row in self._conn.execute(
-                "SELECT id, car_number, last_successful_checked_at FROM fine_monitoring_tasks"
-            )
-        }
+        подписки), а не protocolAuto строки.
+
+        Квитанция — 'listed', если police.ge показал её на опорной проверке
+        номера (или feed нашёл её позже), иначе — 'unverified' (⏳): её не
+        было в старом ответе, полученном ещё без нынешней защиты от ложно
+        пустых ответов, поэтому исчезновение не считается подтверждённым —
+        ⚪ только после двух НОВЫХ полных проверок (см. record_full_check).
+        Опорная проверка — одна на номер, по всем его задачам: та же, что у
+        прежней статистики долга (list_debt_car_groups — самая свежая
+        задача номера с положительным снимком), чтобы ни одна машина не
+        потеряла долг; у номера без такого снимка — самая свежая успешная
+        проверка любой его задачи. Номер, у которого ни одна задача не
+        записала успешной проверки (задачи старше поля
+        last_successful_checked_at), — только ⏳: опоры нет, а прежняя
+        статистика долгом его не считала. Сравнение дат — в Python, а не в
+        SQL: last_seen_at и last_successful_checked_at пишутся разными
+        путями. Возвращает число созданных строк."""
+        task_plates: dict[int, str] = {}
+        debt_reference: dict[str, datetime] = {}
+        any_reference: dict[str, datetime] = {}
+        for task_id, car_number, total, checked_raw in self._conn.execute(
+            "SELECT id, car_number, last_successful_total_amount, last_successful_checked_at "
+            "FROM fine_monitoring_tasks"
+        ):
+            task_plates[task_id] = car_number
+            checked_at = _parse_ts(checked_raw)
+            if checked_at is None:
+                continue
+            if checked_at > any_reference.get(car_number, datetime.min):
+                any_reference[car_number] = checked_at
+            if total is not None and total > 0 and checked_at > debt_reference.get(car_number, datetime.min):
+                debt_reference[car_number] = checked_at
         seeds: dict[tuple[str, str], dict] = {}
         rows = self._conn.execute(
             "SELECT monitoring_task_id, external_fine_id, amount, first_detected_at, last_seen_at "
             "FROM detected_fines WHERE external_fine_id IS NOT NULL AND external_fine_id != ''"
         ).fetchall()
         for task_id, protocol_no, amount, first_detected_at, last_seen_at in rows:
-            if task_id not in tasks:
-                continue
-            car_number, snapshot_at = tasks[task_id]
-            if is_fine_output_suppressed(car_number):
+            car_number = task_plates.get(task_id)
+            if car_number is None or is_fine_output_suppressed(car_number):
                 continue
             seen_at = _parse_ts(last_seen_at)
             first_at = _parse_ts(first_detected_at)
-            listed = snapshot_at is None or seen_at >= snapshot_at - timedelta(seconds=1)
             seed = seeds.setdefault((car_number, protocol_no), {
-                "amount": amount, "first_at": first_at, "seen_at": seen_at, "listed": False,
+                "amount": amount, "first_at": first_at, "seen_at": seen_at,
             })
             if seed["amount"] is None:
                 seed["amount"] = amount
             seed["first_at"] = min(seed["first_at"], first_at)
             seed["seen_at"] = max(seed["seen_at"], seen_at)
-            if listed:
-                seed["listed"] = True
         created = 0
         with self._conn:
             for (car_number, protocol_no), seed in seeds.items():
-                presence = PRESENCE_LISTED if seed["listed"] else PRESENCE_UNVERIFIED
+                reference = debt_reference.get(car_number) or any_reference.get(car_number)
+                listed = reference is not None and seed["seen_at"] >= reference - SNAPSHOT_TOLERANCE
+                presence = PRESENCE_LISTED if listed else PRESENCE_UNVERIFIED
                 cursor = self._conn.execute(
                     "INSERT OR IGNORE INTO georgia_fine_status "
                     "(car_number, protocol_no, amount, presence, first_listed_at, last_listed_at) "
@@ -618,7 +647,7 @@ class FineStatusRepository:
                 )
                 if cursor.rowcount:
                     created += 1
-                    self._log(cursor.lastrowid, "seeded" if seed["listed"] else "seeded_unverified",
+                    self._log(cursor.lastrowid, "seeded" if listed else "seeded_unverified",
                               SOURCE_CHECK, None, None, at)
         return created
 

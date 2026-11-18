@@ -28,6 +28,7 @@ from reader.fines.payment_status import (
     PRESENCE_MISSING,
     PRESENCE_UNVERIFIED,
     SOURCE_PAYMENT_PAGE,
+    FineStatus,
     FineStatusRepository,
     FineStatusTracker,
     PaymentPageMarkers,
@@ -381,22 +382,36 @@ def test_classifier_priority_and_normalization():
     assert classify_payment_page_text(None, markers) is PaymentPageVerdict.UNRECOGNIZED
 
 
+class _S:
+    """Только поля, от которых зависит display_status (логика — настоящая)."""
+
+    display_status = FineStatus.display_status
+
+    def __init__(self, payment_status, presence, amount):
+        self.payment_status = payment_status
+        self.presence = presence
+        self.amount = amount
+
+
 def test_breakdown_ignores_gone():
-    class _S:
-        def __init__(self, payment_status, presence, amount):
-            self.payment_status = payment_status
-            self.presence = presence
-            self.amount = amount
-
-        @property
-        def counts_as_listed(self):
-            return self.presence != PRESENCE_GONE
-
     breakdown = breakdown_of([
         _S(PAYMENT_UNPAID, PRESENCE_LISTED, 10), _S(PAYMENT_PAID, PRESENCE_MISSING, 20),
         _S(PAYMENT_NEEDS_REVIEW, PRESENCE_LISTED, 30), _S(PAYMENT_UNPAID, PRESENCE_GONE, 1000),
     ])
     assert (breakdown.unpaid_amount, breakdown.paid_amount, breakdown.needs_review_amount) == (10, 20, 30)
+
+
+def test_breakdown_counts_marked_unverified_receipts_by_their_mark():
+    """⏳ — только неоплаченная история; 🟡 на квитанции ⏳ — долг, 🟢 — оплачено."""
+    breakdown = breakdown_of([
+        _S(PAYMENT_UNPAID, PRESENCE_UNVERIFIED, 5),
+        _S(PAYMENT_NEEDS_REVIEW, PRESENCE_UNVERIFIED, 40),
+        _S(PAYMENT_PAID, PRESENCE_UNVERIFIED, 7),
+    ])
+    assert (breakdown.unverified_amount, breakdown.unverified_count) == (5, 1)
+    assert (breakdown.needs_review_amount, breakdown.needs_review_count) == (40, 1)
+    assert (breakdown.paid_amount, breakdown.paid_count) == (7, 1)
+    assert breakdown.unpaid_amount == 0
 
 
 def test_source_updated_on_round_trip(tracker):

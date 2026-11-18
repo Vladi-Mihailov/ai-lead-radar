@@ -95,7 +95,7 @@ import logging
 import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 from reader.fines.models import OneOffCheckResult
@@ -105,6 +105,7 @@ from reader.fines.payment_status import (
     PAYMENT_NEEDS_REVIEW,
     PAYMENT_PAID,
     PAYMENT_UNPAID,
+    SNAPSHOT_TOLERANCE,
     SOURCE_PAYMENT_PAGE,
     DebtBreakdown,
     FineStatus,
@@ -284,8 +285,9 @@ _DEBT_LIST_PAGE_CHAR_BUDGET_WITH_STATUSES = 2600
 
 
 def _statuses_are_current(observed_at: datetime | None, snapshot_at: datetime | None) -> bool:
-    """Статусы машины сверены с police.ge не раньше её снимка суммы (с
-    запасом в минуту: снимок пишется до обработки штрафов, статусы — после)."""
+    """Статусы машины сверены с police.ge не раньше её снимка суммы — с
+    тем же допуском, что и у первичного заполнения статусов (см.
+    payment_status.SNAPSHOT_TOLERANCE)."""
     if observed_at is None:
         return False
     if snapshot_at is None:
@@ -294,7 +296,7 @@ def _statuses_are_current(observed_at: datetime | None, snapshot_at: datetime | 
     snapshot = (
         snapshot_at.astimezone(timezone.utc).replace(tzinfo=None) if snapshot_at.tzinfo else snapshot_at
     )
-    return observed >= snapshot - timedelta(minutes=1)
+    return observed >= snapshot - SNAPSHOT_TOLERANCE
 
 
 def _paginate_debt_blocks(blocks: list[str], *, char_budget: int = _DEBT_LIST_PAGE_CHAR_BUDGET) -> list[list[str]]:
@@ -1388,25 +1390,27 @@ class ConversationController:
         for car_number in car_numbers:
             breakdown = breakdowns.get(car_number) or DebtBreakdown()
             snapshot = snapshot_totals.get(car_number, 0.0)
-            if breakdown.listed_count == 0:
-                if snapshot <= 0 or _statuses_are_current(observed.get(car_number), snapshot_times.get(car_number)):
-                    # Ни долга, ни оплаченного в базе полиции по статусам,
-                    # сверенным не раньше снимка: старый снимок долгом не
-                    # считается. Квитанции ⏳ (ждут повторной проверки) —
-                    # только в итоговой строке, без строки машины.
-                    totals = totals.add(DebtBreakdown(
-                        unverified_amount=breakdown.unverified_amount,
-                        unverified_count=breakdown.unverified_count,
-                    ))
-                    continue
-                # Снимок долга есть, а статусов нет вовсе или они старше
-                # снимка (проверка прошла без статусов: операторский процесс,
-                # сбой записи статусов) — сумма снимка остаётся
-                # неоплаченной, как и раньше; число штрафов неизвестно.
-                breakdown = DebtBreakdown(
-                    unpaid_amount=snapshot, unpaid_count=1,
-                    unverified_amount=breakdown.unverified_amount, unverified_count=breakdown.unverified_count,
-                )
+            explained = breakdown.unpaid_amount + breakdown.needs_review_amount + breakdown.paid_amount
+            if snapshot > explained + 0.005 and not _statuses_are_current(
+                observed.get(car_number), snapshot_times.get(car_number),
+            ):
+                # Снимок долга новее статусов машины и больше того, что они
+                # объясняют (статусов нет вовсе или проверка прошла без них:
+                # операторский процесс, сбой записи статусов) — сумма снимка
+                # остаётся неоплаченной, как и раньше; число штрафов
+                # неизвестно. Квитанции ⏳ этой машины не добавляются: более
+                # новый снимок уже включает всё, что police.ge тогда показал.
+                breakdown = DebtBreakdown(unpaid_amount=snapshot, unpaid_count=1)
+            elif breakdown.listed_count == 0:
+                # Ни долга, ни оплаченного в базе полиции по статусам,
+                # сверенным не раньше снимка: старый снимок долгом не
+                # считается. Квитанции ⏳ (ждут повторной проверки) —
+                # только в итоговой строке, без строки машины.
+                totals = totals.add(DebtBreakdown(
+                    unverified_amount=breakdown.unverified_amount,
+                    unverified_count=breakdown.unverified_count,
+                ))
+                continue
             rows.append((car_number, snapshot, breakdown))
             totals = totals.add(breakdown)
         rows.sort(key=lambda row: (

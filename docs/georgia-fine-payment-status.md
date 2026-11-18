@@ -119,14 +119,24 @@ Rules:
 On its first start the bot creates statuses from the existing
 `detected_fines` (`seed_from_detected_fines`, idempotent, once):
 
-- A receipt that police.ge returned in the last successful check of any task
-  of the plate, or that the public feed found later, becomes 🔴 `listed`.
-- A receipt that was absent from that last check becomes ⏳ `unverified`.
+- Each plate gets one reference check across all its tasks. If the plate
+  has a task with a positive saved total, the reference is the check that
+  the old debt statistics already use (the freshest such task), so no car
+  loses its debt. Otherwise it is the latest successful check of any task
+  of the plate.
+- A receipt that police.ge returned in the reference check, or that the
+  public feed found later, becomes 🔴 `listed`.
+- A receipt that was absent from the reference check becomes ⏳
+  `unverified`. So does every receipt of a plate none of whose tasks has a
+  recorded successful check (tasks older than that field): there is nothing
+  to compare with, and the old statistics did not count them as debt.
   That answer came before the empty-answer protection and may have been
   falsely empty, so it confirms nothing:
   - not ⚪ and not confirmed debt; shown as a separate line in statistics
     («⏳ Ждут повторной проверки police.ge: … ₾ (N шт.)») and with ⏳ on the
     manager screen;
+  - a manager mark wins: a ⏳ receipt marked 🟡 is counted as 🟡 debt, and
+    one marked 🟢 as paid;
   - ⚪ only after two *new* successful complete checks without it, at least
     12 h apart;
   - one new check that finds it turns it 🔴 again;
@@ -154,6 +164,11 @@ Where statuses are shown:
   - per-car lines: «💰 Задолженность» is 🔴 plus 🟡, then «🟡 Из них…» and
     «🟢 Оплачено» lines. A car whose receipts are all ⚪ is not shown, even if
     an old task still has a positive total;
+  - a saved total newer than the car's statuses and larger than they
+    explain is shown as before, as unpaid debt. This happens when a check
+    ran without statuses (the operator process) or writing statuses failed;
+    errors must not hide debt. The car's ⏳ receipts are then not added on
+    top, because the newer total already includes them;
   - «База police.ge обновлена»;
   - the last evening re-check.
 - «🧾 Статусы оплаты» (trusted managers): enter a plate → list → a receipt →
@@ -243,9 +258,10 @@ requests HTTP 200 (no 403/429/5xx):
 | **total today** | **~430–550** |
 | daily re-check: plates with known fines today | 34 |
 | plus plates with ⏳ history, during the first ~5 days after enabling | +91 |
-| re-check requests, first ~5 days | ≈ 125 `searchByAuto` + zero confirmations + 1 page GET ≈ **130–140 (+25–30 %)** |
+| re-check requests, nights 1–2 | ≈ 125 `searchByAuto` + ≈ 91 zero confirmations (an empty answer for a plate with ⏳ receipts is always asked twice) + 1 page GET ≈ **215–220 (+40–50 %)** |
+| re-check requests, nights 3–5 | ≈ 125 `searchByAuto` + 1 page GET ≈ **130 (+25–30 %)**: the ⏳ receipts are ⚪ by then, and their plates stay in the re-check for 3 days without a second request |
 | re-check requests afterwards | ≈ **35–40 (+7–9 %)** |
-| pass duration | ≈ 8 minutes steady state; ≈ 30 minutes in the first nights (fits the 45-minute window) |
+| pass duration | ≈ 8 minutes steady state; ≈ 38 minutes on nights 1–2 (125 × 8 s + 12 × 60 s + 91 × 5 s), still inside the 45-minute window; a plate not reached by 23:45 goes first the next night |
 
 The collector process uses 33 MB of RAM, and the server has 565 MB available
 (1 vCPU, load 0.10). Each plate is one HTTPS request handled by the existing
@@ -257,8 +273,8 @@ Found while measuring, not changed here: the collector's public-list poll
 never completes a cycle (`last_successful_poll_at` is empty, last error
 "safety cap reached before an empty page"). Every cycle therefore runs as a
 first run of 100 pages, about 400 requests a day instead of a few dozen. Its
-seen-receipts table is never cleaned (148 k rows). Fixing it would cut the
-largest share of police.ge traffic and needs a separate decision.
+seen-receipts table is never cleaned (148 k rows). The fix is a separate
+pull request (branch `fix/georgia-collector-feed-horizon`).
 
 ### Blocking risks
 

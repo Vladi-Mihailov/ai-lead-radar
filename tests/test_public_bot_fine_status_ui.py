@@ -43,9 +43,9 @@ from reader.public_bot.subscription_service import SubscriptionService
 from reader.users.repository import UserRepository
 
 _TBILISI = ZoneInfo("Asia/Tbilisi")
-_TRUSTED = 5712994689
-_OTHER_TRUSTED = 5712994690
-_OWNER = 685137235
+_TRUSTED = 900000001
+_OTHER_TRUSTED = 900000002
+_OWNER = 900000101
 _CHAT = 424242
 _CAR = "AA111BB"
 
@@ -278,6 +278,77 @@ async def test_snapshot_newer_than_statuses_is_still_shown_as_debt(fx):
 
     assert "🔴 Подтверждённая задолженность: 90 ₾" in reply.text
     assert "💰 Задолженность: 90 ₾" in reply.text
+
+
+async def test_stale_statuses_with_listed_receipts_do_not_hide_a_newer_debt(fx):
+    """Статусы есть (🔴 50), но более новая проверка без статусов нашла ещё
+    один штраф — в статистике сумма снимка, а не устаревшие статусы."""
+    task, _ = fx.car(_CAR, [("GE1", 50)])
+    two_hours_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2)
+    fx.tracker.record_full_check(_CAR, [_record(_CAR, "GE1", 50)], complete=True, at=two_hours_ago)
+    fx.provider.records[_CAR] = [_record(_CAR, "GE1", 50), _record(_CAR, "GE5", 30)]
+    untracked = FineCheckService(fx.provider, fx.tasks, fx.fines, sleep=_instant)  # без статусов
+    await untracked.check_task(fx.tasks.get(task.id))
+
+    stats = fx.controller._format_statistics_reply().text
+
+    assert "💰 Задолженность: 80 ₾" in stats
+    assert "🔴 Подтверждённая задолженность: 80 ₾" in stats
+
+
+async def test_paid_receipt_explains_a_newer_untracked_snapshot(fx):
+    """Более новый снимок, который статусы объясняют полностью (🟢 100 из
+    100), отметку «оплачено» не отменяет."""
+    task, _ = fx.car(_CAR, [("GE1", 100)])
+    two_hours_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2)
+    fx.tracker.record_full_check(_CAR, [_record(_CAR, "GE1", 100)], complete=True, at=two_hours_ago)
+    fx.tracker.mark_paid(fx.status(_CAR, "GE1").id, actor_user_id=_TRUSTED, note="TBC 1")
+    untracked = FineCheckService(fx.provider, fx.tasks, fx.fines, sleep=_instant)
+    await untracked.check_task(fx.tasks.get(task.id))
+
+    stats = fx.controller._format_statistics_reply().text
+
+    assert "🔴 Подтверждённая задолженность: 0 ₾ (0 шт.)" in stats
+    assert "🟢 Оплачено, ещё в базе полиции: 100 ₾ (1 шт.)" in stats
+
+
+def _make_unverified(fx, protocol_no, amount):
+    status = fx.tracker._repository.insert_listed(
+        car_number=_CAR, protocol_no=protocol_no, amount=amount, at=datetime(2026, 10, 1, 10, 0), source="check",
+    )
+    fx.tracker._repository._conn.execute(
+        "UPDATE georgia_fine_status SET presence = 'unverified' WHERE id = ?", (status.id,),
+    )
+    fx.tracker._repository._conn.commit()
+    return status
+
+
+async def test_fallback_row_does_not_count_history_twice(fx):
+    """Квитанция ⏳, которую потом нашла проверка без статусов: сумма снимка —
+    в долге машины, а в строке ⏳ эта квитанция второй раз не считается."""
+    task, _ = fx.car(_CAR, [("OLD1", 30)])
+    _make_unverified(fx, "OLD1", 30)
+    untracked = FineCheckService(fx.provider, fx.tasks, fx.fines, sleep=_instant)
+    await untracked.check_task(fx.tasks.get(task.id))
+
+    stats = fx.controller._format_statistics_reply().text
+
+    assert "🔴 Подтверждённая задолженность: 30 ₾ (1 шт.)" in stats
+    assert "⏳ Ждут повторной проверки" not in stats
+
+
+async def test_unverified_receipt_marked_failed_payment_stays_in_debt(fx):
+    """Квитанция из истории (⏳), по которой сайт МВД отказал в оплате, —
+    🟡 и в долге, как любая 🟡; машина видна в списке даже без снимка долга."""
+    fx.car(_CAR, [])  # ни одной успешной проверки — снимка долга нет
+    status = _make_unverified(fx, "OLD1", 40)
+    fx.tracker.mark_needs_review(status.id, actor_user_id=_TRUSTED, note="ჯარიმის გადახდა ვერ მოხერხდა!")
+
+    stats = fx.controller._format_statistics_reply().text
+
+    assert "🟡 Неопределённый статус оплаты: 40 ₾ (1 шт.)" in stats
+    assert "💰 Задолженность: 40 ₾" in stats and "🟡 Из них требует проверки: 40 ₾" in stats
+    assert "⏳ Ждут повторной проверки" not in stats
 
 
 async def test_statistics_without_statuses_is_unchanged(tmp_path):

@@ -8,7 +8,10 @@
   отсутствовавшие в старом ответе — ⏳ 'unverified', ни одной ⚪;
 - старые таблицы (detected_fines, задачи, доставки) не меняются;
 - в статистике ни одна машина с долгом по старой логике не пропадает и не
-  теряет сумму; история не превращается в подтверждённый долг;
+  теряет сумму; история не превращается в подтверждённый долг — в том
+  числе строки старых задач без записанной проверки, строки, записанные
+  за секунды до снимка, и номер, где более новая нулевая проверка другой
+  задачи спорит со старым долгом;
 - клиентская доставка после перехода не отправляет ничего, чего не
   отправила бы старая логика;
 - ⚪ — только после двух НОВЫХ успешных полных проверок с интервалом;
@@ -50,7 +53,7 @@ from reader.public_bot.subscription_service import SubscriptionService
 from reader.users.repository import UserRepository
 
 _TBILISI = ZoneInfo("Asia/Tbilisi")
-_TRUSTED = 5712994689
+_TRUSTED = 900000001
 
 
 async def _instant(_seconds):
@@ -225,9 +228,13 @@ async def test_statistics_keep_every_old_debt_and_show_history_separately(legacy
     controller = _controller(legacy, tracker)
 
     text = controller._format_statistics_reply().text
+    rows, _ = controller._debt_rows_with_statuses(legacy.tasks.list_debt_car_groups())
+    by_car = {car: breakdown for car, _, breakdown in rows}
 
     # каждая машина с долгом по старой логике — в списке, с той же суммой
     for car, total in old_groups.items():
+        assert car in by_car, car
+        assert by_car[car].unpaid_amount + by_car[car].needs_review_amount == total, (car, total)
         assert f"💰 Задолженность: {total:g} ₾" in text, (car, total)
     assert "🔴 Подтверждённая задолженность: 340 ₾ (5 шт.)" in text  # 150 + 40 + 60 + 90 (feed)
     # история — не долг и не ⚪, но видна отдельной строкой
@@ -338,6 +345,86 @@ async def test_cached_read_during_outage_changes_nothing(legacy):
     assert result.from_cache
     assert {key: (s.presence, s.payment_status) for key, s in _statuses(tracker).items()} == before
     repository.close()
+
+
+def _seed_and_rows(db):
+    """Первичное заполнение + строки статистики (машина -> разбивка)."""
+    repository = FineStatusRepository(db.db_path)
+    tracker = FineStatusTracker(repository)
+    tracker.seed_from_detected_fines()
+    rows, totals = _controller(db, tracker)._debt_rows_with_statuses(db.tasks.list_debt_car_groups())
+    return repository, tracker, {car: breakdown for car, _, breakdown in rows}, totals
+
+
+def test_receipt_of_a_task_without_recorded_check_is_history_when_a_newer_check_missed_it(tmp_path):
+    """Старая задача без записанной успешной проверки (поле появилось
+    позже) хранит квитанцию, которую более свежая проверка другой задачи
+    номера уже не нашла: это история (⏳), а не подтверждённый долг."""
+    db = _LegacyDb(tmp_path)
+    old_task = db.task("GG777HH", status="completed")  # last_successful_checked_at пуст
+    db.fine(old_task, "GE9", 80, last_seen="2025-03-01 10:00:00")
+    db.task("GG777HH", snapshot=0, checked_at="2026-11-16 10:00:00")
+    assert db.tasks.list_debt_car_groups() == []  # старая статистика долга его не показывала
+
+    repository, tracker, rows, totals = _seed_and_rows(db)
+
+    assert tracker.statuses_by_protocol("GG777HH")["GE9"].presence == PRESENCE_UNVERIFIED
+    assert "GG777HH" not in rows
+    assert (totals.unpaid_amount, totals.unverified_amount) == (0, 80)
+    repository.close()
+    db.close()
+
+
+def test_old_debt_reference_wins_over_a_newer_zero_check_of_another_task(tmp_path):
+    """Прежняя статистика брала самую свежую задачу с положительным
+    снимком; более новая нулевая проверка другой задачи номера (возможно,
+    ложный ноль) долг не прячет — квитанция остаётся 🔴 до новой проверки."""
+    db = _LegacyDb(tmp_path)
+    debt_task = db.task("HH888II", snapshot=100, checked_at="2026-10-01 10:00:00")
+    db.fine(debt_task, "GE10", 100, last_seen="2026-10-01 10:00:00")
+    db.task("HH888II", snapshot=0, checked_at="2026-11-16 10:00:00")
+    assert {g.car_number: g.total_amount for g in db.tasks.list_debt_car_groups()} == {"HH888II": 100}
+
+    repository, tracker, rows, _ = _seed_and_rows(db)
+
+    assert tracker.statuses_by_protocol("HH888II")["GE10"].presence == PRESENCE_LISTED
+    assert rows["HH888II"].unpaid_amount == 100
+    repository.close()
+    db.close()
+
+
+def test_plate_without_any_recorded_check_is_history_only(tmp_path):
+    db = _LegacyDb(tmp_path)
+    task = db.task("II999JJ")  # ни одной записанной успешной проверки
+    db.fine(task, "GE11", 20, last_seen="2026-08-01 10:00:00")
+    db.fine(task, "GE12", 30, last_seen="2026-08-01 10:00:00")
+
+    repository, tracker, rows, totals = _seed_and_rows(db)
+
+    assert {s.presence for s in tracker.statuses_for_car("II999JJ")} == {PRESENCE_UNVERIFIED}
+    assert "II999JJ" not in rows
+    assert (totals.unpaid_amount, totals.unverified_amount) == (0, 50)
+    repository.close()
+    db.close()
+
+
+@pytest.mark.parametrize("last_seen", ["2026-11-16 09:59:40", "2026-11-16 09:57:00"])
+def test_rows_written_before_the_snapshot_never_drop_the_car_from_debt(tmp_path, last_seen):
+    """Старые версии писали снимок ПОСЛЕ строк detected_fines. Строки за
+    секунды до снимка — квитанции того же ответа (🔴); строки сильно
+    раньше — ⏳, но тогда статусы старше снимка, и машина остаётся в списке
+    с суммой снимка. Пропасть из списка или посчитаться дважды она не может."""
+    db = _LegacyDb(tmp_path)
+    task = db.task("JJ000KK", snapshot=100, checked_at="2026-11-16 10:00:00")
+    db.fine(task, "GE13", 40, last_seen=last_seen)
+    db.fine(task, "GE14", 60, last_seen=last_seen)
+
+    repository, _, rows, totals = _seed_and_rows(db)
+
+    assert rows["JJ000KK"].unpaid_amount + rows["JJ000KK"].needs_review_amount == 100
+    assert totals.unpaid_amount + totals.unverified_amount == 100
+    repository.close()
+    db.close()
 
 
 def _controller(legacy, tracker):
