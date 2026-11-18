@@ -12,10 +12,12 @@ from datetime import date, datetime
 from reader.fines.models import FineMonitoringTask, NewFineEvent
 from reader.fines.payment_status import (
     DISPLAY_GONE,
+    DISPLAY_UNVERIFIED,
     PAYMENT_NEEDS_REVIEW,
     PAYMENT_PAID,
     PAYMENT_UNPAID,
     PRESENCE_MISSING,
+    PRESENCE_UNVERIFIED,
     SOURCE_PAYMENT_PAGE,
     SOURCE_RECEIPT,
     DebtBreakdown,
@@ -262,6 +264,7 @@ FINE_STATUS_LABELS = {
     PAYMENT_PAID: "🟢 Оплачен",
     PAYMENT_NEEDS_REVIEW: "🟡 Оплата требует проверки",
     DISPLAY_GONE: "⚪ Больше не отображается в базе полиции",
+    DISPLAY_UNVERIFIED: "⏳ Ждёт повторной проверки police.ge",
 }
 
 
@@ -915,6 +918,8 @@ def format_debt_row(
             lines.append(f"🟡 Из них требует проверки: {_format_search_amount(breakdown.needs_review_amount)}")
         if breakdown.paid_count:
             lines.append(f"🟢 Оплачено: {_format_search_amount(breakdown.paid_amount)}")
+        if breakdown.unverified_count:
+            lines.append(f"⏳ Ждут повторной проверки: {_format_search_amount(breakdown.unverified_amount)}")
     if not owners:
         lines.append(DEBT_OWNER_NOT_LINKED_LINE)
     for owner in owners:
@@ -958,6 +963,14 @@ def format_debt_status_summary_block(
         f"🟢 Оплачено, ещё в базе полиции: {_format_search_amount(totals.paid_amount)}"
         f" ({totals.paid_count} шт.)",
     ]
+    if totals.unverified_count:
+        # Квитанции из истории, которых не было в последнем ответе police.ge
+        # до перехода на статусы: не долг и не ⚪, пока две новые проверки не
+        # решат (см. reader/fines/payment_status.py, 'unverified').
+        lines.append(
+            f"⏳ Ждут повторной проверки police.ge: {_format_search_amount(totals.unverified_amount)}"
+            f" ({totals.unverified_count} шт.)"
+        )
     if source_updated_on is not None:
         lines.append(f"🗓 База police.ge обновлена: {_fmt_date(source_updated_on)}")
     if recheck_line:
@@ -1047,7 +1060,9 @@ def format_fine_status_car(*, car_number: str, statuses: list[FineStatus], sourc
         return "\n".join(lines)
     for index, status in enumerate(statuses, start=1):
         line = f"{index}. №{status.protocol_no} — {_fine_status_amount(status)} — {fine_status_label(status.display_status)}"
-        if status.presence == PRESENCE_MISSING:
+        if status.presence == PRESENCE_MISSING or (
+            status.presence == PRESENCE_UNVERIFIED and status.missing_since is not None
+        ):
             line += " · не найден в последней проверке"
         lines.append(line)
     if any(status.display_status != DISPLAY_GONE for status in statuses):
@@ -1067,6 +1082,11 @@ def format_fine_status_detail(status: FineStatus, *, notice: str | None = None) 
     ])
     if status.presence == PRESENCE_MISSING:
         lines.append("⏳ Не найден в последней проверке police.ge — ждём подтверждения следующей проверкой.")
+    elif status.presence == PRESENCE_UNVERIFIED:
+        lines.append(
+            "⏳ Квитанция из истории: police.ge не показал её в последней проверке до перехода на статусы. "
+            "Исчезновение засчитается только после двух новых проверок."
+        )
     if status.payment_status != PAYMENT_UNPAID and status.payment_note:
         source = _PAYMENT_SOURCE_TEXT.get(status.payment_source or "", "менеджер")
         lines.append(f"Основание ({source}): {escape_telethon_markdown(status.payment_note)}")

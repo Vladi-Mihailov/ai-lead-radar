@@ -463,6 +463,24 @@ async def test_selection_includes_feed_found_cars_and_skips_suppressed(fx, monke
     assert set(plates) == {"AA111BB", "FF777GG"}
 
 
+async def test_selection_includes_plates_with_unverified_history(fx):
+    task = fx.tasks.create(
+        car_number="GG888HH", label=None, start_date=date(2026, 11, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=-1, created_by_user_id=1,
+    )
+    fine = fx.fines.create(
+        monitoring_task_id=task.id, car_number="GG888HH", external_fine_id="OLD9", fingerprint="fp-old9",
+        penalty_date=None, due_date=None, delivered_status=None, raw_data="{}", amount=20,
+    )
+    fx.tasks.record_successful_check(task.id, total_amount=0)
+    fx.fines._conn.execute("UPDATE detected_fines SET last_seen_at = '2026-10-01 10:00:00' WHERE id = ?", (fine.id,))
+    fx.fines._conn.commit()
+    fx.tracker.seed_from_detected_fines()
+    assert fx.tracker.statuses_by_protocol("GG888HH")["OLD9"].presence == "unverified"
+
+    assert "GG888HH" in fx.service.select_plates()
+
+
 async def test_max_plates_cap(tmp_path):
     fixture = _Fixture(tmp_path, max_plates=2)
     for index, car in enumerate(["AA111BB", "BB222CC", "CC333DD"]):

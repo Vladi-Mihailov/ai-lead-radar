@@ -6,7 +6,7 @@
 
 import logging
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -193,6 +193,23 @@ async def test_feed_found_receipt_forces_confirmation_even_with_zero_snapshot(fx
 
     assert len(fx.provider.refresh_flags) == 2
     assert fx.statuses()["GE1"].presence == PRESENCE_LISTED
+
+
+async def test_unverified_history_also_forces_confirmation(fx):
+    task = fx.task()
+    fx.provider.results = [ProviderSearchResult(records=[])]
+    await fx.service.check_task(task)  # снимок 0
+    row = fx.status_repository.insert_listed(
+        car_number=_CAR, protocol_no="OLD1", amount=30, at=datetime(2026, 10, 1, 10, 0), source="check",
+    )
+    fx.status_repository._conn.execute("UPDATE georgia_fine_status SET presence = 'unverified' WHERE id = ?", (row.id,))
+    fx.status_repository._conn.commit()
+    fx.provider.refresh_flags.clear()
+
+    fx.provider.results = [ProviderSearchResult(records=[]), ProviderSearchResult(records=[])]
+    await fx.service.check_task(fx.tasks.get(task.id))
+
+    assert len(fx.provider.refresh_flags) == 2
 
 
 async def test_second_empty_answer_is_still_double_checked(tmp_path):

@@ -241,6 +241,26 @@ async def test_car_with_only_gone_receipts_leaves_statistics_despite_old_snapsho
     assert "🔴 Подтверждённая задолженность: 0 ₾ (0 шт.)" in reply.text
 
 
+async def test_unverified_history_is_shown_separately_not_as_debt(fx):
+    task, _ = fx.car(_CAR, [("GE1", 50)])
+    await fx.check(task)
+    old = fx.tracker._repository.insert_listed(
+        car_number=_CAR, protocol_no="OLD1", amount=30, at=datetime(2026, 10, 1, 10, 0), source="check",
+    )
+    fx.tracker._repository._conn.execute(
+        "UPDATE georgia_fine_status SET presence = 'unverified' WHERE id = ?", (old.id,),
+    )
+    fx.tracker._repository._conn.commit()
+
+    stats = fx.controller._format_statistics_reply().text
+    screen = await _open_car(fx)
+
+    assert "🔴 Подтверждённая задолженность: 50 ₾ (1 шт.)" in stats
+    assert "⏳ Ждут повторной проверки police.ge: 30 ₾ (1 шт.)" in stats
+    assert "⏳ Ждут повторной проверки: 30 ₾" in stats  # строка в блоке машины
+    assert "№OLD1 — 30 ₾ — ⏳ Ждёт повторной проверки police.ge" in screen.text
+
+
 async def test_snapshot_newer_than_statuses_is_still_shown_as_debt(fx):
     """Квитанция давно ⚪, а потом проверка БЕЗ статусов (операторский
     процесс, сбой записи статусов) нашла настоящий долг — он не прячется."""

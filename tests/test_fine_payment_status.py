@@ -18,6 +18,7 @@ from reader.fines.detected_fine_repository import DetectedFineRepository
 from reader.fines.models import ParsedFineRecord
 from reader.fines.payment_status import (
     DISPLAY_GONE,
+    DISPLAY_UNVERIFIED,
     MIA_PAYMENT_FAILED_MESSAGE,
     PAYMENT_NEEDS_REVIEW,
     PAYMENT_PAID,
@@ -25,6 +26,7 @@ from reader.fines.payment_status import (
     PRESENCE_GONE,
     PRESENCE_LISTED,
     PRESENCE_MISSING,
+    PRESENCE_UNVERIFIED,
     SOURCE_PAYMENT_PAGE,
     FineStatusRepository,
     FineStatusTracker,
@@ -197,6 +199,54 @@ def test_records_without_receipt_number_are_ignored(tracker):
     assert tracker.statuses_for_car(_CAR) == []
 
 
+def _seed_unverified(tracker, tmp_path_db=None):
+    """Статус 'unverified' — как после первичного заполнения истории."""
+    status = tracker._repository.insert_listed(
+        car_number=_CAR, protocol_no="OLD1", amount=30, at=_T0 - timedelta(days=40), source="check",
+    )
+    tracker._repository._conn.execute(
+        "UPDATE georgia_fine_status SET presence = ? WHERE id = ?", (PRESENCE_UNVERIFIED, status.id),
+    )
+    tracker._repository._conn.commit()
+    return status.id
+
+
+def test_unverified_needs_two_new_absences_and_returns_when_found(tracker):
+    status_id = _seed_unverified(tracker)
+    assert tracker.has_listed_receipts(_CAR)  # свидетельство долга для false-zero guard
+    assert tracker.breakdown_for_cars([_CAR])[_CAR].unpaid_count == 0  # не подтверждённый долг
+
+    tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=_T0)
+    first = tracker.get(status_id)
+    assert first.presence == PRESENCE_UNVERIFIED and first.missing_since == _T0
+    tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=_T0 + timedelta(hours=11))
+    assert tracker.get(status_id).presence == PRESENCE_UNVERIFIED
+
+    tracker.record_full_check(_CAR, [_record("OLD1", 30)], complete=True, at=_T0 + timedelta(hours=20))
+
+    found = tracker.get(status_id)
+    assert found.presence == PRESENCE_LISTED and found.missing_since is None
+    assert tracker.breakdown_for_cars([_CAR])[_CAR].unpaid_amount == 30
+
+
+def test_unverified_becomes_gone_after_second_new_absence(tracker):
+    status_id = _seed_unverified(tracker)
+    tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=_T0)
+    tracker.record_full_check(_CAR, [], complete=True, empty_confirmed=True, at=_T0 + timedelta(hours=12))
+
+    assert tracker.get(status_id).presence == PRESENCE_GONE
+    assert [e["event"] for e in tracker.events(status_id)][-2:] == ["unverified_missing", "gone"]
+
+
+def test_unverified_ignores_errors_unconfirmed_and_incomplete_answers(tracker):
+    status_id = _seed_unverified(tracker)
+    tracker.record_full_check(_CAR, [], complete=True, at=_T0)  # пустой, не подтверждён
+    tracker.record_full_check(_CAR, [_record("OTHER")], complete=False, at=_T0 + timedelta(hours=13))
+
+    status = tracker.get(status_id)
+    assert status.presence == PRESENCE_UNVERIFIED and status.missing_since is None
+
+
 # ---- отметки менеджера ----
 
 
@@ -362,7 +412,7 @@ def test_source_updated_on_round_trip(tracker):
 # ---- первичное заполнение из detected_fines ----
 
 
-def test_seed_marks_historical_receipts_gone_and_keys_by_task_plate(tmp_path):
+def test_seed_marks_historical_receipts_unverified_and_keys_by_task_plate(tmp_path):
     db_path = tmp_path / "users.db"
     tasks = FineMonitoringTaskRepository(db_path)
     fines = DetectedFineRepository(db_path)
@@ -391,8 +441,12 @@ def test_seed_marks_historical_receipts_gone_and_keys_by_task_plate(tmp_path):
     assert set(statuses) == {"OLD1", "CUR1", "CUR2"}
     assert statuses["CUR1"].presence == PRESENCE_LISTED and statuses["CUR1"].amount == 60
     assert statuses["CUR2"].presence == PRESENCE_LISTED
-    assert statuses["OLD1"].presence == PRESENCE_GONE  # на последней проверке его уже не было
-    assert tracker.gone_protocols(_CAR) == {"OLD1"}
+    # на последней (старой) проверке его не было — но это не подтверждение ⚪
+    assert statuses["OLD1"].presence == PRESENCE_UNVERIFIED
+    assert statuses["OLD1"].display_status == DISPLAY_UNVERIFIED
+    assert tracker.gone_protocols(_CAR) == set()
+    breakdown = tracker.breakdown_for_cars([_CAR])[_CAR]
+    assert (breakdown.unpaid_amount, breakdown.unverified_amount) == (65, 10)
     repository.close()
     fines.close()
     tasks.close()

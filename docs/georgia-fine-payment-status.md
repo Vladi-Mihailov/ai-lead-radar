@@ -95,6 +95,7 @@ receipt number (not by monitoring task). It has two independent dimensions:
 | `presence = listed` | in the last successful full check |
 | `presence = missing` | absent once, waiting for confirmation (keeps its status and stays in debt) |
 | `presence = gone` | ⚪ Больше не отображается в базе полиции — absent in two successful full checks at least `fine_disappearance_min_gap_hours` apart |
+| `presence = unverified` | ⏳ Ждёт повторной проверки police.ge — a receipt from history that was absent from police.ge's last answer *before* this change; see "First start" |
 
 Rules:
 
@@ -112,6 +113,32 @@ Rules:
   "new fine" message.
 - Every change is written to `georgia_fine_status_events`: what changed, the
   source, the manager's Telegram id and the reason.
+
+## First start
+
+On its first start the bot creates statuses from the existing
+`detected_fines` (`seed_from_detected_fines`, idempotent, once):
+
+- A receipt that police.ge returned in the last successful check of any task
+  of the plate, or that the public feed found later, becomes 🔴 `listed`.
+- A receipt that was absent from that last check becomes ⏳ `unverified`.
+  That answer came before the empty-answer protection and may have been
+  falsely empty, so it confirms nothing:
+  - not ⚪ and not confirmed debt; shown as a separate line in statistics
+    («⏳ Ждут повторной проверки police.ge: … ₾ (N шт.)») and with ⏳ on the
+    manager screen;
+  - ⚪ only after two *new* successful complete checks without it, at least
+    12 h apart;
+  - one new check that finds it turns it 🔴 again;
+  - errors, unconfirmed empty answers, incomplete answers and cached reads
+    change nothing;
+  - clients are notified about it exactly as before (it is not ⚪).
+- In production on 2026-11-18 this was 74 receipts → 🔴 (34 cars) and 289
+  receipts → ⏳ (91 cars, 14 400 ₾; most last seen 30–89 days ago). No
+  receipt becomes ⚪ at first start.
+- Old tables (`detected_fines`, tasks, subscriptions, deliveries) are not
+  changed. New tables are created with `CREATE TABLE IF NOT EXISTS`, and no
+  existing table is altered.
 
 Where statuses are shown:
 
@@ -150,9 +177,8 @@ Client delivery:
   this, a receipt stored under two tasks of a plate reached the same
   subscription twice (5 cases in production).
 - No such message for a ⚪ receipt (2 cases in production).
-  - At first start, receipts already absent at their task's last successful
-    check are seeded as ⚪.
-  - A receipt missing only once is still delivered.
+  - A receipt missing only once, or ⏳ from history, is still delivered, as
+    before.
 - In the Georgian bot only, if the operator was already notified about a
   receipt through another task, the new task's row is created as already
   notified. The operator process (`reader/main.py`) keeps its old behaviour.
@@ -168,8 +194,8 @@ The re-check, once a day:
 - **Window:** 23:00–23:45 Asia/Tbilisi, between the collector's 21:00 and
   23:55 cycles and after the Turkey batch (22:00 Tbilisi).
 - **Plates:** those with a positive debt snapshot, those with non-⚪
-  statuses (feed-found and paid-but-listed included), and those with a
-  receipt that went ⚪ in the last 3 days.
+  statuses (feed-found, paid-but-listed and ⏳ history included), and those
+  with a receipt that went ⚪ in the last 3 days.
   - Order: least recently checked first; plates the previous pass failed on
     go last, so two always-failing plates cannot stop every pass.
   - At most `daily_recheck_max_plates`.
@@ -215,9 +241,11 @@ requests HTTP 200 (no 403/429/5xx):
 | page GETs (CSRF) | 6–12 |
 | `searchByAuto` (manual checks, refresh, check-all) | 16–133 |
 | **total today** | **~430–550** |
-| daily re-check: plates selected today | 34 |
-| re-check requests | 34 `searchByAuto` + 1 page GET + a few zero confirmations ≈ **35–40 (+7–9 %)** |
-| pass duration | ≈ 34 × (0.5 s + 8 s) + 3 × 60 s ≈ **8 minutes** |
+| daily re-check: plates with known fines today | 34 |
+| plus plates with ⏳ history, during the first ~5 days after enabling | +91 |
+| re-check requests, first ~5 days | ≈ 125 `searchByAuto` + zero confirmations + 1 page GET ≈ **130–140 (+25–30 %)** |
+| re-check requests afterwards | ≈ **35–40 (+7–9 %)** |
+| pass duration | ≈ 8 minutes steady state; ≈ 30 minutes in the first nights (fits the 45-minute window) |
 
 The collector process uses 33 MB of RAM, and the server has 565 MB available
 (1 vCPU, load 0.10). Each plate is one HTTPS request handled by the existing

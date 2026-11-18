@@ -1386,18 +1386,27 @@ class ConversationController:
         rows: list[tuple[str, float, DebtBreakdown | None]] = []
         totals = DebtBreakdown()
         for car_number in car_numbers:
-            breakdown = breakdowns.get(car_number)
+            breakdown = breakdowns.get(car_number) or DebtBreakdown()
             snapshot = snapshot_totals.get(car_number, 0.0)
-            if breakdown is None or breakdown.listed_count == 0:
+            if breakdown.listed_count == 0:
                 if snapshot <= 0 or _statuses_are_current(observed.get(car_number), snapshot_times.get(car_number)):
-                    # Все квитанции машины ⚪ по статусам, сверенным не раньше
-                    # снимка, — старый снимок долгом не считается.
+                    # Ни долга, ни оплаченного в базе полиции по статусам,
+                    # сверенным не раньше снимка: старый снимок долгом не
+                    # считается. Квитанции ⏳ (ждут повторной проверки) —
+                    # только в итоговой строке, без строки машины.
+                    totals = totals.add(DebtBreakdown(
+                        unverified_amount=breakdown.unverified_amount,
+                        unverified_count=breakdown.unverified_count,
+                    ))
                     continue
                 # Снимок долга есть, а статусов нет вовсе или они старше
                 # снимка (проверка прошла без статусов: операторский процесс,
                 # сбой записи статусов) — сумма снимка остаётся
                 # неоплаченной, как и раньше; число штрафов неизвестно.
-                breakdown = DebtBreakdown(unpaid_amount=snapshot, unpaid_count=1)
+                breakdown = DebtBreakdown(
+                    unpaid_amount=snapshot, unpaid_count=1,
+                    unverified_amount=breakdown.unverified_amount, unverified_count=breakdown.unverified_count,
+                )
             rows.append((car_number, snapshot, breakdown))
             totals = totals.add(breakdown)
         rows.sort(key=lambda row: (

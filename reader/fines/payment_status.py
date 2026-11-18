@@ -14,7 +14,12 @@ police.ge публикует квитанции ("Receipts of fines published") 
 - presence — что показывает police.ge:
   'listed' (есть в последней успешной полной проверке), 'missing' (не найден
   один раз — ждём подтверждения), 'gone' (⚪ — не найден в двух успешных
-  полных проверках с интервалом не меньше disappearance_min_gap).
+  полных проверках с интервалом не меньше disappearance_min_gap),
+  'unverified' (⏳ — квитанция из истории detected_fines, которой не было в
+  последнем ответе police.ge ДО появления этих статусов: тот ответ мог быть
+  ложно пустым, поэтому ни ⚪, ни подтверждённым долгом она не считается,
+  пока две НОВЫЕ полные проверки с тем же интервалом её не подтвердят —
+  отсутствие -> ⚪, присутствие -> снова 'listed').
 
 Пока штраф не 'gone', он остаётся в своём статусе и, если не 'paid', — в
 задолженности: одна проверка без штрафа не доказывает, что он исчез. Ошибки
@@ -61,10 +66,13 @@ PAYMENT_NEEDS_REVIEW = "needs_review"
 PRESENCE_LISTED = "listed"
 PRESENCE_MISSING = "missing"
 PRESENCE_GONE = "gone"
+PRESENCE_UNVERIFIED = "unverified"
 
 # Что показывать (см. FineStatus.display_status): статус оплаты, пока штраф
 # в базе полиции, и ⚪ — когда исчезновение подтверждено.
 DISPLAY_GONE = "gone"
+# ⏳ — неоплаченная квитанция в состоянии 'unverified' (см. модульный докстрок).
+DISPLAY_UNVERIFIED = "unverified"
 
 # Источник записи в журнале/последнего изменения статуса оплаты.
 SOURCE_CHECK = "check"
@@ -176,15 +184,22 @@ class FineStatus:
     @property
     def display_status(self) -> str:
         """'unpaid'/'paid'/'needs_review', пока штраф в базе полиции
-        (включая 'missing' — исчезновение ещё не подтверждено), и
-        DISPLAY_GONE (⚪) после подтверждения."""
+        (включая 'missing' — исчезновение ещё не подтверждено),
+        DISPLAY_GONE (⚪) после подтверждения и DISPLAY_UNVERIFIED (⏳) —
+        неоплаченная квитанция, чьё присутствие ещё не перепроверено после
+        перехода на статусы."""
         if self.presence == PRESENCE_GONE:
             return DISPLAY_GONE
+        if self.presence == PRESENCE_UNVERIFIED and self.payment_status == PAYMENT_UNPAID:
+            return DISPLAY_UNVERIFIED
         return self.payment_status
 
     @property
     def counts_as_listed(self) -> bool:
-        return self.presence != PRESENCE_GONE
+        """В задолженности/оплаченном: есть в базе полиции или не найден
+        только один раз. 'unverified' — отдельная категория (см.
+        DebtBreakdown), 'gone' — нигде."""
+        return self.presence in (PRESENCE_LISTED, PRESENCE_MISSING)
 
 
 def _row_to_status(row) -> FineStatus:
@@ -217,6 +232,9 @@ class DebtBreakdown:
     paid_count: int = 0
     needs_review_amount: float = 0.0
     needs_review_count: int = 0
+    # ⏳ 'unverified' — ни долг, ни оплачено: присутствие ещё не перепроверено.
+    unverified_amount: float = 0.0
+    unverified_count: int = 0
 
     @property
     def listed_count(self) -> int:
@@ -230,16 +248,22 @@ class DebtBreakdown:
             paid_count=self.paid_count + other.paid_count,
             needs_review_amount=self.needs_review_amount + other.needs_review_amount,
             needs_review_count=self.needs_review_count + other.needs_review_count,
+            unverified_amount=self.unverified_amount + other.unverified_amount,
+            unverified_count=self.unverified_count + other.unverified_count,
         )
 
 
 def breakdown_of(statuses: Iterable[FineStatus]) -> DebtBreakdown:
-    unpaid_amount = paid_amount = review_amount = 0.0
-    unpaid_count = paid_count = review_count = 0
+    unpaid_amount = paid_amount = review_amount = unverified_amount = 0.0
+    unpaid_count = paid_count = review_count = unverified_count = 0
     for status in statuses:
+        amount = status.amount or 0.0
+        if status.presence == PRESENCE_UNVERIFIED:
+            unverified_amount += amount
+            unverified_count += 1
+            continue
         if not status.counts_as_listed:
             continue
-        amount = status.amount or 0.0
         if status.payment_status == PAYMENT_PAID:
             paid_amount += amount
             paid_count += 1
@@ -253,6 +277,7 @@ def breakdown_of(statuses: Iterable[FineStatus]) -> DebtBreakdown:
         unpaid_amount=unpaid_amount, unpaid_count=unpaid_count,
         paid_amount=paid_amount, paid_count=paid_count,
         needs_review_amount=review_amount, needs_review_count=review_count,
+        unverified_amount=unverified_amount, unverified_count=unverified_count,
     )
 
 
@@ -484,7 +509,9 @@ class FineStatusRepository:
                 "amount = COALESCE(?, amount)"
             )
             params: tuple = (presence, _fmt(at), amount, status_id)
-        elif presence == PRESENCE_MISSING:
+        elif presence in (PRESENCE_MISSING, PRESENCE_UNVERIFIED):
+            # 'unverified' остаётся 'unverified', но запоминает первое НОВОЕ
+            # отсутствие (см. FineStatusTracker.record_full_check).
             assignments = "presence = ?, missing_since = ?"
             params = (presence, _fmt(at), status_id)
         else:
@@ -542,9 +569,11 @@ class FineStatusRepository:
         там. Ключ — номер ЗАДАЧИ (тот же, что передают проверки и
         подписки), а не protocolAuto строки. Квитанция, которую police.ge
         показал на последней успешной проверке хотя бы одной задачи номера
-        (или нашёл позже feed), — 'listed'; остальные — 'gone' (⚪): их уже
-        не было в базе полиции, и "новым штрафом" для новой подписки они
-        быть не должны. Сравнение дат — в Python, а не в SQL:
+        (или нашёл позже feed), — 'listed'; остальные — 'unverified' (⏳):
+        их не было в старом ответе, полученном ещё без нынешней защиты от
+        ложно пустых ответов, поэтому исчезновение не считается
+        подтверждённым — ⚪ только после двух НОВЫХ полных проверок (см.
+        record_full_check). Сравнение дат — в Python, а не в SQL:
         last_seen_at и last_successful_checked_at пишутся разными путями.
         Возвращает число созданных строк."""
         tasks = {
@@ -568,7 +597,7 @@ class FineStatusRepository:
             first_at = _parse_ts(first_detected_at)
             listed = snapshot_at is None or seen_at >= snapshot_at - timedelta(seconds=1)
             seed = seeds.setdefault((car_number, protocol_no), {
-                "amount": amount, "first_at": first_at, "seen_at": seen_at, "listed": False, "gone_at": None,
+                "amount": amount, "first_at": first_at, "seen_at": seen_at, "listed": False,
             })
             if seed["amount"] is None:
                 seed["amount"] = amount
@@ -576,24 +605,21 @@ class FineStatusRepository:
             seed["seen_at"] = max(seed["seen_at"], seen_at)
             if listed:
                 seed["listed"] = True
-            elif snapshot_at is not None:
-                seed["gone_at"] = max(seed["gone_at"] or snapshot_at, snapshot_at)
         created = 0
         with self._conn:
             for (car_number, protocol_no), seed in seeds.items():
-                presence = PRESENCE_LISTED if seed["listed"] else PRESENCE_GONE
-                gone_at = None if seed["listed"] else _fmt(seed["gone_at"] or seed["seen_at"])
+                presence = PRESENCE_LISTED if seed["listed"] else PRESENCE_UNVERIFIED
                 cursor = self._conn.execute(
                     "INSERT OR IGNORE INTO georgia_fine_status "
-                    "(car_number, protocol_no, amount, presence, first_listed_at, last_listed_at, gone_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "(car_number, protocol_no, amount, presence, first_listed_at, last_listed_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
                     (car_number, protocol_no, seed["amount"], presence, _fmt(seed["first_at"]),
-                     _fmt(seed["seen_at"]), gone_at),
+                     _fmt(seed["seen_at"])),
                 )
                 if cursor.rowcount:
                     created += 1
-                    self._log(cursor.lastrowid, "seeded" if seed["listed"] else "seeded_gone", SOURCE_CHECK,
-                              None, None, at)
+                    self._log(cursor.lastrowid, "seeded" if seed["listed"] else "seeded_unverified",
+                              SOURCE_CHECK, None, None, at)
         return created
 
 
@@ -685,7 +711,14 @@ class FineStatusTracker:
                     status.id, presence=PRESENCE_MISSING, at=now, event="missing", source=source,
                 )
                 summary.missing += 1
-            elif status.presence == PRESENCE_MISSING:
+            elif status.presence == PRESENCE_UNVERIFIED and status.missing_since is None:
+                # Первое НОВОЕ отсутствие квитанции из истории — запоминаем,
+                # но ни в долг, ни в ⚪ она пока не переходит.
+                self._repository.update_presence(
+                    status.id, presence=PRESENCE_UNVERIFIED, at=now, event="unverified_missing", source=source,
+                )
+                summary.missing += 1
+            elif status.presence in (PRESENCE_MISSING, PRESENCE_UNVERIFIED):
                 missing_since = status.missing_since or now
                 if now - missing_since >= self._min_gap:
                     self._repository.update_presence(
@@ -715,7 +748,7 @@ class FineStatusTracker:
                 existing.id, presence=PRESENCE_LISTED, at=at, event="reappeared", source=source, amount=amount,
             )
             return "reappeared"
-        if existing.presence == PRESENCE_MISSING:
+        if existing.presence in (PRESENCE_MISSING, PRESENCE_UNVERIFIED):
             self._repository.update_presence(
                 existing.id, presence=PRESENCE_LISTED, at=at, event="found_again", source=source, amount=amount,
             )
