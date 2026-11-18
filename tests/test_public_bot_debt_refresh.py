@@ -1099,9 +1099,10 @@ async def test_resold_car_shows_current_subscriber_not_former_one(fx):
     assert "former_owner" not in reply.text
 
 
-async def test_user_with_notifications_off_is_shown_when_nobody_is_active(fx):
+async def test_user_with_notifications_off_is_shown_marked_when_nobody_is_active(fx):
     """Уведомления выключены, но машина по-прежнему в "Мои авто"
-    пользователя — он привязан, это не "не привязан"."""
+    пользователя — он привязан, это не "не привязан"; при этом явно
+    помечен, что уведомлений он не получает."""
     task = fx.make_task("KK440KK")
     await fx.seed_debt(task, amount=25)
     stopped = _create_subscription(fx, task, telegram_user_id=23)
@@ -1111,7 +1112,7 @@ async def test_user_with_notifications_off_is_shown_when_nobody_is_active(fx):
     reply = await _open_statistics(fx)
 
     assert _block_of(reply.text, "KK440KK") == _debt_block(
-        "KK440KK", "25 ₾", "👤 Пользователь: Пауза", "🔗 Telegram: @paused_owner",
+        "KK440KK", "25 ₾", "👤 Пользователь: Пауза (уведомления выключены)", "🔗 Telegram: @paused_owner",
     )
 
 
@@ -1133,7 +1134,7 @@ async def test_expired_subscriber_is_shown_only_when_nobody_is_active(fx):
         "KK450KK", "65 ₾", "👤 Пользователь: Имя не указано", "🔗 Telegram: @active_owner",
     )
     assert _block_of(reply.text, "KK460KK") == _debt_block(
-        "KK460KK", "55 ₾", "👤 Пользователь: Имя не указано", "🔗 Telegram: @expired_owner",
+        "KK460KK", "55 ₾", "👤 Пользователь: Имя не указано (уведомления выключены)", "🔗 Telegram: @expired_owner",
     )
 
 
@@ -1223,8 +1224,32 @@ async def test_active_status_with_past_end_date_counts_as_inactive(fx):
         "KK470KK", "45 ₾", "👤 Пользователь: Имя не указано", "🔗 Telegram: @current_owner",
     )
     assert _block_of(reply.text, "KK480KK") == _debt_block(
-        "KK480KK", "40 ₾", "👤 Пользователь: Имя не указано", "🔗 Telegram: @lapsed_owner",
+        "KK480KK", "40 ₾", "👤 Пользователь: Имя не указано (уведомления выключены)", "🔗 Telegram: @lapsed_owner",
     )
+
+
+async def test_notifications_off_mark_applies_per_car_not_per_user(fx):
+    """Один и тот же пользователь: на одной машине подписка действует (без
+    пометки), на другой — выключена и других пользователей нет (с
+    пометкой)."""
+    car_on = fx.make_task("KK490KK")
+    car_off = fx.make_task("KK491KK")
+    await fx.seed_debt(car_on, amount=35, fingerprint="fp-a")
+    await fx.seed_debt(car_off, amount=30, fingerprint="fp-b")
+    _create_subscription(fx, car_on, telegram_user_id=28)
+    paused = _create_subscription(fx, car_off, telegram_user_id=28)
+    assert fx.subscription_repository.stop_by_owner_or_creator(paused.id, telegram_user_id=28)
+    fx.record_known(telegram_user_id=28, username="two_cars", first_name="Тамар")
+
+    reply = await _open_statistics(fx)
+
+    assert _block_of(reply.text, "KK490KK") == _debt_block(
+        "KK490KK", "35 ₾", "👤 Пользователь: Тамар", "🔗 Telegram: @two_cars",
+    )
+    assert _block_of(reply.text, "KK491KK") == _debt_block(
+        "KK491KK", "30 ₾", "👤 Пользователь: Тамар (уведомления выключены)", "🔗 Telegram: @two_cars",
+    )
+    assert reply.text.count("(уведомления выключены)") == 1
 
 
 async def test_out_of_range_debt_page_is_clamped_with_length_based_pages(fx):

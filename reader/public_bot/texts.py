@@ -775,6 +775,7 @@ def format_debt_refresh_summary(outcome: RefreshOutcome) -> str:
 DEBT_OWNER_NOT_LINKED_LINE = "👤 Пользователь не привязан"
 _DEBT_OWNER_NAME_MISSING_TEXT = "Имя не указано"
 _DEBT_OWNER_USERNAME_MISSING_TEXT = "Логин не указан"
+_DEBT_OWNER_NOTIFICATIONS_OFF_MARK = " (уведомления выключены)"
 
 
 @dataclass(frozen=True)
@@ -786,10 +787,14 @@ class DebtOwner:
     first_name + last_name (см. debt_owner_name), username — Telegram
     username как он есть (без "@"), НИКОГДА не собранный из имени. None —
     значение неизвестно (format_debt_row покажет "Имя не указано"/"Логин
-    не указан")."""
+    не указан"). notifications_off — у пользователя нет действующей
+    подписки на машину (уведомления выключены или срок истёк): такой
+    пользователь показывается, только если действующих нет, и помечается
+    явно — чтобы менеджер не принял его за получающего уведомления."""
 
     name: str | None
     username: str | None
+    notifications_off: bool = False
 
 
 def debt_owner_name(first_name: str | None, last_name: str | None) -> str | None:
@@ -806,7 +811,8 @@ def _format_debt_owner_lines(owner: DebtOwner) -> list[str]:
     username = safe_telegram_username(owner.username)
     name_text = escape_telethon_markdown(owner.name) if owner.name else _DEBT_OWNER_NAME_MISSING_TEXT
     username_text = f"@{username}" if username else _DEBT_OWNER_USERNAME_MISSING_TEXT
-    return [f"👤 Пользователь: {name_text}", f"🔗 Telegram: {username_text}"]
+    mark = _DEBT_OWNER_NOTIFICATIONS_OFF_MARK if owner.notifications_off else ""
+    return [f"👤 Пользователь: {name_text}{mark}", f"🔗 Telegram: {username_text}"]
 
 
 def format_debt_row(*, car_number: str, owners: list[DebtOwner], total_amount: float) -> str:

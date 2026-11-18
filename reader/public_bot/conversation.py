@@ -93,7 +93,7 @@ is_trusted() перепроверяется на КАЖДОМ шаге обои�
 
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -1305,8 +1305,9 @@ class ConversationController:
         (см. SubscriptionService.list_subscriptions_for_car). Показываются
         пользователи с действующей подпиской (is_effectively_active); если
         таких нет — остальные (stopped/expired: машина по-прежнему в их "Мои
-        авто"), чтобы бывший владелец перепроданной машины не стоял рядом с
-        нынешним. pending_claim без telegram_user_id (клиент ещё не принял
+        авто") с пометкой "уведомления выключены" (DebtOwner.
+        notifications_off), чтобы бывший владелец перепроданной машины не
+        стоял рядом с нынешним. pending_claim без telegram_user_id (клиент ещё не принял
         приглашение) — ещё не привязан. Один и тот же пользователь на
         нескольких подписках/задачах номера — один раз (дедуп по
         telegram_user_id).
@@ -1355,10 +1356,15 @@ class ConversationController:
             username = (known.telegram_username if known else None) or (profile.username if profile else None)
             owners_by_user_id[user_id] = texts.DebtOwner(name=name, username=username)
 
-        return {
-            car_number: [owners_by_user_id[user_id] for user_id in user_ids]
-            for car_number, user_ids in user_ids_by_car.items()
-        }
+        owners_by_car: dict[str, list[texts.DebtOwner]] = {}
+        for car_number, user_ids in user_ids_by_car.items():
+            # Действующих пользователей у машины нет — показаны остальные,
+            # и в строке видно, что уведомления у них выключены.
+            notifications_off = not active_user_ids[car_number]
+            owners_by_car[car_number] = [
+                replace(owners_by_user_id[user_id], notifications_off=notifications_off) for user_id in user_ids
+            ]
+        return owners_by_car
 
     # ---- "🔄 Обновить задолженности" (см. задачу "OPTIONAL DEBT REFRESH") —
     # trusted-manager-only, is_trusted() перепроверяется ЗАНОВО на каждом
