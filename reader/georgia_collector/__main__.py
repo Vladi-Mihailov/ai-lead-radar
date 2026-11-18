@@ -107,6 +107,29 @@ def load_timeouts(env: dict[str, str] | None = None) -> tuple[float, float]:
 _DEFAULT_CHECKNOW_HOST = "127.0.0.1"
 _DEFAULT_CHECKNOW_PORT = 8766
 
+# Лимиты страниц общего списка за цикл (см. collector_job.py, DEEP-горизонт).
+# 300 страниц = 9 000 строк ≈ полтора дня публикаций (~5–6,3 тыс. в сутки):
+# самый загруженный цикл (21:00 Тбилиси, ~3–3,5 тыс. новых строк ≈ 100–117
+# страниц) доходит до уже просмотренных строк, а первый запуск читает только
+# сегодняшние публикации (≤ ~210 страниц). Прежние неявные 30/100 были
+# рассчитаны на ~670 публикаций в сутки.
+_DEFAULT_MAX_PAGES_PER_CYCLE = 300
+_DEFAULT_FIRST_RUN_MAX_PAGES = 300
+
+
+def load_page_limits(env: dict[str, str] | None = None) -> tuple[int, int]:
+    """(max_pages_per_cycle, first_run_max_pages) из
+    GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE / GEORGIA_COLLECTOR_FIRST_RUN_MAX_PAGES
+    (тот же приём, что и load_timeouts() выше). Не целое число или < 1 —
+    ValueError при старте, а не молчаливый откат к умолчанию."""
+    if env is None:
+        env = os.environ
+    max_pages = int(env.get("GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE", str(_DEFAULT_MAX_PAGES_PER_CYCLE)))
+    first_run = int(env.get("GEORGIA_COLLECTOR_FIRST_RUN_MAX_PAGES", str(_DEFAULT_FIRST_RUN_MAX_PAGES)))
+    if max_pages < 1 or first_run < 1:
+        raise ValueError("GEORGIA_COLLECTOR_*_MAX_PAGES must be >= 1")
+    return max_pages, first_run
+
 
 def load_checknow_server_config(env: dict[str, str] | None = None) -> tuple[str, int]:
     """(host, port) для run_check_now_server_forever() — та же тестируемая-
@@ -191,16 +214,19 @@ async def main() -> None:
         production_http_client, hmac_secret=hmac_secret, submission_timeout=submission_timeout,
     )
 
+    max_pages_per_cycle, first_run_max_pages = load_page_limits()
     job = GeorgiaCollectorJob(
         session, production_client, feed_state_repository, seen_repository, outbox_repository,
         run_times=run_times, tz=tz,
+        max_pages_per_cycle=max_pages_per_cycle, first_run_max_pages=first_run_max_pages,
     )
 
     logger.info(
         "Georgia collector starting: production=%s, run_times=%s, tz=%s, db=%s, "
-        "request_timeout=%ss, submission_timeout=%ss, checknow=%s:%d",
+        "request_timeout=%ss, submission_timeout=%ss, checknow=%s:%d, max_pages=%d/%d",
         production_base_url, [t.strftime("%H:%M") for t in run_times], tz, db_path,
         request_timeout, submission_timeout, checknow_host, checknow_port,
+        max_pages_per_cycle, first_run_max_pages,
     )
 
     # Та же SAME session (= тот же circuit breaker), что и у polling job'а

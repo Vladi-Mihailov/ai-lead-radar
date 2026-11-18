@@ -887,7 +887,11 @@ async def test_missed_slot_does_not_trigger_per_car_fallback_next_scheduled_run_
     seen_repo = _make_seen_repo(tmp_path)
     try:
         _create_active_task(task_repo, "AA001AA")
-        session = _FakeFeedSession({0: _page([_entry(plate="AA001AA")]), 30: _empty_page()})
+        # Запись опубликована в день запуска (23.10 по Тбилиси): более старая
+        # страница завершила бы DEEP первого запуска сразу (DEEP-горизонт).
+        session = _FakeFeedSession({
+            0: _page([_entry(plate="AA001AA", publish_date="2026-10-23")]), 30: _empty_page(),
+        })
         job, provider = _make_job(session, task_repo, fine_repo, feed_state_repo, seen_repo)
 
         # 21:00 слот "пропущен" — should_run() для него никогда не
@@ -898,6 +902,383 @@ async def test_missed_slot_does_not_trigger_per_car_fallback_next_scheduled_run_
 
         assert provider.search_by_plate_calls == []
         assert session.requested_offsets == [0, 30]
+    finally:
+        task_repo.close()
+        fine_repo.close()
+        feed_state_repo.close()
+        seen_repo.close()
+
+
+# ==== DEEP-горизонт: первый запуск и восстановление завершаются без пустой страницы ====
+
+
+def _rows(prefix: str, count: int, *, publish_date: str) -> list[dict]:
+    return [
+        _entry(protocol_no=f"{prefix}{i:03d}", plate=f"ZZ{i:03d}ZZ", publish_date=publish_date)
+        for i in range(count)
+    ]
+
+
+def _mark_seen_at(seen_repo, rows: list[dict], *, seen_at: datetime) -> None:
+    for row in rows:
+        seen_repo.mark_seen(
+            row["protocolNo"], publish_date=date.fromisoformat(row["publishDate"]), seen_at=seen_at,
+        )
+
+
+def _spy_persisted(job) -> list[str]:
+    """external_fine_id каждой записи, переданной в persist_feed_match —
+    "обработана ровно один раз" нельзя проверить по detected_fines, их
+    fingerprint dedup скрыл бы повторную обработку."""
+    persisted: list[str] = []
+    original = job._check_service.persist_feed_match
+
+    async def spy(task, record):
+        persisted.append(record.external_fine_id)
+        return await original(task, record)
+
+    job._check_service.persist_feed_match = spy
+    return persisted
+
+
+async def test_first_run_completes_at_first_page_older_than_today_then_fast(tmp_path):
+    """До пустой страницы реального feed'а не дойти (~10 тыс. страниц) —
+    первый запуск читает только сегодняшние публикации и завершается на
+    первой странице, целиком опубликованной раньше сегодняшнего дня."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    feed_state_repo = _make_feed_state_repo(tmp_path)
+    seen_repo = _make_seen_repo(tmp_path)
+    try:
+        _create_active_task(task_repo, "AA001AA")
+        today_rows = _rows("T0_", 29, publish_date="2026-10-22")
+        session = _FakeFeedSession({
+            0: _page(today_rows + [_entry(protocol_no="MATCH001", plate="AA001AA", publish_date="2026-10-22")]),
+            30: _page(_rows("T1_", 30, publish_date="2026-10-22")),
+            60: _page(_rows("Y0_", 30, publish_date="2026-10-21")),
+            90: _page(_rows("Y1_", 30, publish_date="2026-10-21")),
+        })
+        job, _provider = _make_job(
+            session, task_repo, fine_repo, feed_state_repo, seen_repo, first_run_max_pages=10,
+        )
+
+        await job.run(_utc(21))
+
+        assert session.requested_offsets == [0, 30, 60]
+        assert len(fine_repo.list_by_car_number("AA001AA")) == 1
+        state = feed_state_repo.get()
+        assert state.last_successful_poll_at == _utc(21)
+        assert state.last_error is None
+
+        # Следующий цикл — FAST: граница на page0 + ровно одна overlap-страница.
+        new_row = _entry(protocol_no="NEW001", plate="ZZ999ZZ", publish_date="2026-10-22")
+        session2 = _FakeFeedSession({0: _page([new_row] + today_rows)})
+        job2, _p2 = _make_job(session2, task_repo, fine_repo, feed_state_repo, seen_repo)
+        await job2.run(_utc(23, 55))
+
+        assert session2.requested_offsets == [0, 30]
+    finally:
+        task_repo.close()
+        fine_repo.close()
+        feed_state_repo.close()
+        seen_repo.close()
+
+
+async def test_first_run_cap_on_todays_rows_is_an_error_and_next_cycle_stays_deep(tmp_path):
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    feed_state_repo = _make_feed_state_repo(tmp_path)
+    seen_repo = _make_seen_repo(tmp_path)
+    try:
+        pages = {
+            0: _page(_rows("T0_", 30, publish_date="2026-10-22")),
+            30: _page(_rows("T1_", 30, publish_date="2026-10-22")),
+            60: _page(_rows("Y0_", 30, publish_date="2026-10-21")),
+        }
+        session = _FakeFeedSession(pages)
+        job, _provider = _make_job(
+            session, task_repo, fine_repo, feed_state_repo, seen_repo, first_run_max_pages=2,
+        )
+
+        await job.run(_utc(21))
+
+        assert session.requested_offsets == [0, 30]
+        state = feed_state_repo.get()
+        assert state.last_successful_poll_at is None
+        assert "safety cap" in state.last_error
+
+        # Следующий цикл всё ещё DEEP: уже виденные сегодняшние строки его не
+        # останавливают (FAST остановился бы на [0, 30]) — доходит до
+        # вчерашней страницы и только тогда завершается.
+        session2 = _FakeFeedSession(pages)
+        job2, _p2 = _make_job(
+            session2, task_repo, fine_repo, feed_state_repo, seen_repo, first_run_max_pages=3,
+        )
+        await job2.run(_utc(23, 55))
+
+        assert session2.requested_offsets == [0, 30, 60]
+        assert feed_state_repo.get().last_error is None
+    finally:
+        task_repo.close()
+        fine_repo.close()
+        feed_state_repo.close()
+        seen_repo.close()
+
+
+async def test_recovery_stops_at_rows_seen_before_last_success_of_the_same_day(tmp_path):
+    """Строки того же дня, что и последний успех, перечитывать целиком не
+    нужно: увиденные ДО него уже обработаны (first_seen_at)."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    feed_state_repo = _make_feed_state_repo(tmp_path)
+    seen_repo = _make_seen_repo(tmp_path)
+    try:
+        feed_state_repo.record_successful_cycle(
+            newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15),
+        )
+        earlier = _rows("E0_", 30, publish_date="2026-10-22")
+        _mark_seen_at(seen_repo, earlier, seen_at=_utc(9))
+        feed_state_repo.record_error("ConnectTimeout", at=_utc(21))
+        session = _FakeFeedSession({
+            0: _page(_rows("N0_", 30, publish_date="2026-10-22")),
+            30: _page(earlier),
+            60: _page(_rows("E1_", 30, publish_date="2026-10-22")),
+        })
+        job, _provider = _make_job(session, task_repo, fine_repo, feed_state_repo, seen_repo)
+
+        await job.run(_utc(23, 55))
+
+        assert session.requested_offsets == [0, 30]
+        assert feed_state_repo.get().last_error is None
+    finally:
+        task_repo.close()
+        fine_repo.close()
+        feed_state_repo.close()
+        seen_repo.close()
+
+
+async def test_recovery_reads_through_rows_marked_after_last_success_and_fills_the_gap(tmp_path):
+    """Сбойная попытка после успеха отметила верхние строки и упала, не
+    дойдя до более старых ("дыра"). Восстановление не считает отмеченные
+    ею строки обработанными, дочитывает дыру (совпавшая запись обработана
+    ровно один раз) и останавливается на строках, увиденных до успеха."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    feed_state_repo = _make_feed_state_repo(tmp_path)
+    seen_repo = _make_seen_repo(tmp_path)
+    try:
+        _create_active_task(task_repo, "AA001AA")
+        feed_state_repo.record_successful_cycle(
+            newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15),
+        )
+        base = _rows("B0_", 30, publish_date="2026-10-22")
+        _mark_seen_at(seen_repo, base, seen_at=_utc(9))
+        top = _rows("T0_", 30, publish_date="2026-10-22")
+        gap = _rows("G0_", 29, publish_date="2026-10-22") + [
+            _entry(protocol_no="GAP_MATCH", plate="AA001AA", publish_date="2026-10-22"),
+        ]
+
+        failing = _FakeFeedSession({0: _page(top)}, errors={30: FineProviderError("ConnectTimeout")})
+        job1, _p1 = _make_job(failing, task_repo, fine_repo, feed_state_repo, seen_repo)
+        await job1.run(_utc(21))
+        assert feed_state_repo.get().last_error is not None
+        assert fine_repo.list_by_car_number("AA001AA") == []
+
+        session = _FakeFeedSession({
+            0: _page(_rows("N0_", 30, publish_date="2026-10-22")),
+            30: _page(top),
+            60: _page(gap),
+            90: _page(base),
+            120: _page(_rows("O0_", 30, publish_date="2026-10-21")),
+        })
+        job2, _p2 = _make_job(session, task_repo, fine_repo, feed_state_repo, seen_repo)
+        persisted = _spy_persisted(job2)
+        await job2.run(_utc(23, 55))
+
+        assert session.requested_offsets == [0, 30, 60, 90]
+        assert persisted == ["GAP_MATCH"]
+        assert len(fine_repo.list_by_car_number("AA001AA")) == 1
+        assert feed_state_repo.get().last_error is None
+    finally:
+        task_repo.close()
+        fine_repo.close()
+        feed_state_repo.close()
+        seen_repo.close()
+
+
+async def test_recovery_stops_at_page_older_than_last_success_date_without_seen_rows(tmp_path):
+    """Строки старше даты последнего успеха уже обработаны, даже если
+    retention успел удалить их из georgia_public_feed_seen."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    feed_state_repo = _make_feed_state_repo(tmp_path)
+    seen_repo = _make_seen_repo(tmp_path)
+    try:
+        feed_state_repo.record_successful_cycle(
+            newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(23, 55),
+        )
+        feed_state_repo.record_error("ConnectTimeout", at=_utc(9, day=23))
+        session = _FakeFeedSession({
+            0: _page(_rows("N0_", 30, publish_date="2026-10-23")),
+            30: _page(_rows("OLD0_", 30, publish_date="2026-10-21")),
+            60: _page(_rows("OLD1_", 30, publish_date="2026-10-21")),
+        })
+        job, _provider = _make_job(session, task_repo, fine_repo, feed_state_repo, seen_repo)
+
+        await job.run(_utc(15, day=23))
+
+        assert session.requested_offsets == [0, 30]
+        assert feed_state_repo.get().last_error is None
+    finally:
+        task_repo.close()
+        fine_repo.close()
+        feed_state_repo.close()
+        seen_repo.close()
+
+
+async def test_row_without_publish_date_does_not_complete_deep_by_date(tmp_path):
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    feed_state_repo = _make_feed_state_repo(tmp_path)
+    seen_repo = _make_seen_repo(tmp_path)
+    try:
+        undated = _entry(protocol_no="NODATE1", plate="ZZ998ZZ", publish_date=None)
+        session = _FakeFeedSession({
+            0: _page(_rows("Y0_", 29, publish_date="2026-10-21") + [undated]),
+            30: _page(_rows("Y1_", 30, publish_date="2026-10-21")),
+        })
+        job, _provider = _make_job(
+            session, task_repo, fine_repo, feed_state_repo, seen_repo, first_run_max_pages=10,
+        )
+
+        await job.run(_utc(21))
+
+        assert session.requested_offsets == [0, 30]
+        assert feed_state_repo.get().last_error is None
+    finally:
+        task_repo.close()
+        fine_repo.close()
+        feed_state_repo.close()
+        seen_repo.close()
+
+
+async def test_busy_fast_cycle_reaches_the_frontier_under_a_300_page_cap(tmp_path):
+    """Самый загруженный цикл (~3,5 тыс. новых строк ≈ 120 страниц): FAST-
+    логика не менялась, при лимите 300 граница достигается, цикл успешен."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    feed_state_repo = _make_feed_state_repo(tmp_path)
+    seen_repo = _make_seen_repo(tmp_path)
+    try:
+        _establish_fast_mode(feed_state_repo, at=_utc(15))
+        frontier = _rows("SEEN_", 30, publish_date="2026-10-22")
+        _seed_seen(seen_repo, [row["protocolNo"] for row in frontier])
+        pages = {i * 30: _page(_rows(f"P{i:03d}_", 30, publish_date="2026-10-22")) for i in range(120)}
+        pages[120 * 30] = _page(frontier)
+        pages[121 * 30] = _page(_rows("AFTER_", 30, publish_date="2026-10-22"))
+        session = _FakeFeedSession(pages)
+        job, _provider = _make_job(
+            session, task_repo, fine_repo, feed_state_repo, seen_repo, max_pages_per_cycle=300,
+        )
+
+        await job.run(_utc(21))
+
+        assert len(session.requested_offsets) == 122
+        assert feed_state_repo.get().last_error is None
+    finally:
+        task_repo.close()
+        fine_repo.close()
+        feed_state_repo.close()
+        seen_repo.close()
+
+
+async def test_recovery_after_two_failed_cycles_fits_the_page_cap(tmp_path):
+    """Регрессия "застревания": последний успех поздно вечером 21.10, два
+    сбоя 22.10. Только date-горизонт (дата 21.10) требовал бы перечитать
+    ВСЕ строки 21.10: 6 + 8 + 1 = 15 страниц > лимита 10 — и так на каждом
+    следующем цикле. Строки, увиденные до успеха, завершают восстановление
+    на 7-й странице."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    feed_state_repo = _make_feed_state_repo(tmp_path)
+    seen_repo = _make_seen_repo(tmp_path)
+    try:
+        feed_state_repo.record_successful_cycle(
+            newest_seen_publish_date=date(2026, 10, 21), polled_at=_utc(23, 55, day=21),
+        )
+        yesterday_pages = [_rows(f"Y{i}_", 30, publish_date="2026-10-21") for i in range(8)]
+        for rows in yesterday_pages:
+            _mark_seen_at(seen_repo, rows, seen_at=_utc(21, day=21))
+
+        for hour in (9, 15):
+            failing = _FakeFeedSession(errors={0: FineProviderError("ConnectTimeout")})
+            job_failed, _pf = _make_job(
+                failing, task_repo, fine_repo, feed_state_repo, seen_repo, max_pages_per_cycle=10,
+            )
+            await job_failed.run(_utc(hour))
+        assert feed_state_repo.get().last_error is not None
+
+        pages = {i * 30: _page(_rows(f"N{i}_", 30, publish_date="2026-10-22")) for i in range(6)}
+        for i, rows in enumerate(yesterday_pages):
+            pages[(6 + i) * 30] = _page(rows)
+        pages[14 * 30] = _page(_rows("D20_", 30, publish_date="2026-10-20"))
+        session = _FakeFeedSession(pages)
+        job, _provider = _make_job(
+            session, task_repo, fine_repo, feed_state_repo, seen_repo, max_pages_per_cycle=10,
+        )
+
+        await job.run(_utc(21))
+
+        assert len(session.requested_offsets) == 7
+        state = feed_state_repo.get()
+        assert state.last_error is None
+        assert state.last_successful_poll_at == _utc(21)
+    finally:
+        task_repo.close()
+        fine_repo.close()
+        feed_state_repo.close()
+        seen_repo.close()
+
+
+async def test_rows_marked_by_an_earlier_successful_cycle_complete_a_later_recovery(tmp_path):
+    """Сквозная проверка first_seen_at = run_at: строки, отмеченные первым
+    успешным циклом, завершают последующее восстановление; строки самого
+    последнего успешного цикла (first_seen_at == его run_at) — нет."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    feed_state_repo = _make_feed_state_repo(tmp_path)
+    seen_repo = _make_seen_repo(tmp_path)
+    try:
+        rows_a = _rows("A0_", 30, publish_date="2026-10-22")
+        rows_b = _rows("B0_", 30, publish_date="2026-10-22")
+        yesterday = _rows("Y0_", 30, publish_date="2026-10-21")
+
+        first = _FakeFeedSession({0: _page(rows_a), 30: _page(yesterday)})
+        job1, _p1 = _make_job(first, task_repo, fine_repo, feed_state_repo, seen_repo)
+        await job1.run(_utc(15))
+        assert first.requested_offsets == [0, 30]
+
+        second = _FakeFeedSession({0: _page(rows_b), 30: _page(rows_a), 60: _page(yesterday)})
+        job2, _p2 = _make_job(second, task_repo, fine_repo, feed_state_repo, seen_repo)
+        await job2.run(_utc(21))
+        assert second.requested_offsets == [0, 30, 60]  # FAST: граница + overlap
+
+        failing = _FakeFeedSession(errors={0: FineProviderError("ConnectTimeout")})
+        job3, _p3 = _make_job(failing, task_repo, fine_repo, feed_state_repo, seen_repo)
+        await job3.run(_utc(23, 55))
+        assert feed_state_repo.get().last_error is not None
+
+        recovery = _FakeFeedSession({
+            0: _page(_rows("C0_", 30, publish_date="2026-10-23")),
+            30: _page(rows_b),
+            60: _page(rows_a),
+            90: _page(yesterday),
+        })
+        job4, _p4 = _make_job(recovery, task_repo, fine_repo, feed_state_repo, seen_repo)
+        await job4.run(_utc(9, day=23))
+
+        assert recovery.requested_offsets == [0, 30, 60]
+        assert feed_state_repo.get().last_error is None
     finally:
         task_repo.close()
         fine_repo.close()

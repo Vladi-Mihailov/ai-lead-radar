@@ -12,12 +12,18 @@ protocolAuto/plate, ни сумма, ни место, ни статья, ни о
 это НЕ detected_fines и не должно использоваться как источник каких-либо
 деталей штрафа, только как "видели ли мы уже эту запись feed'а".
 
+first_seen_at — когда запись встретилась впервые (UTC, формат
+CURRENT_TIMESTAMP). DEEP-восстановление (см. seen_before) по нему отличает
+строки, обработанные ДО последнего успешного цикла, от строк, отмеченных
+позже (в том числе сбойными попытками над ещё не дочитанной "дырой").
+
 Ограничено по времени (см. retention_days в GeorgiaPublicFineFeedJob) —
-при наблюдаемой скорости публикации (~670/день, см. audit report) даже
-7 дней хранения — это ~4700 строк, тривиально для SQLite."""
+при наблюдаемой скорости публикации (~5–6,3 тыс./день в ноябре 2026, а
+не ~670/день из исходного audit report) 7 дней хранения — это ~40–45 тыс.
+строк, всё ещё тривиально для SQLite."""
 
 import sqlite3
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 _SCHEMA = """
@@ -40,6 +46,15 @@ _MARK_SEEN = (
     "VALUES (:protocol_no, :publish_date)"
 )
 
+_MARK_SEEN_AT = (
+    "INSERT OR IGNORE INTO georgia_public_feed_seen (protocol_no, publish_date, first_seen_at) "
+    "VALUES (:protocol_no, :publish_date, :first_seen_at)"
+)
+
+_SELECT_SEEN_BEFORE = (
+    "SELECT 1 FROM georgia_public_feed_seen WHERE protocol_no = ? AND first_seen_at < ?"
+)
+
 _DELETE_OLDER_THAN = "DELETE FROM georgia_public_feed_seen WHERE publish_date < ?"
 
 _COUNT = "SELECT COUNT(*) FROM georgia_public_feed_seen"
@@ -56,17 +71,31 @@ class GeorgiaPublicFeedSeenRepository:
     def is_seen(self, protocol_no: str) -> bool:
         return self._conn.execute(_SELECT_IS_SEEN, (protocol_no,)).fetchone() is not None
 
-    def mark_seen(self, protocol_no: str, *, publish_date: date) -> None:
+    def mark_seen(self, protocol_no: str, *, publish_date: date, seen_at: datetime | None = None) -> None:
         """Идемпотентно (INSERT OR IGNORE) — вызывается для КАЖДОЙ строки
         feed'а, встреченной впервые (см. GeorgiaPublicFineFeedJob), вне
         зависимости от того, совпала она с отслеживаемым номером или нет —
         это единственное, что делает "frontier"-детектирование вообще
         возможным (если бы отмечались только совпавшие строки, почти
-        каждая страница выглядела бы "полностью новой" навсегда)."""
-        self._conn.execute(
-            _MARK_SEEN, {"protocol_no": protocol_no, "publish_date": publish_date.isoformat()},
-        )
+        каждая страница выглядела бы "полностью новой" навсегда).
+
+        seen_at — момент цикла, в котором запись встретилась (jobs передают
+        run_at); без него first_seen_at = CURRENT_TIMESTAMP, как раньше.
+        Повторный вызов first_seen_at не меняет."""
+        params = {"protocol_no": protocol_no, "publish_date": publish_date.isoformat()}
+        if seen_at is None:
+            self._conn.execute(_MARK_SEEN, params)
+        else:
+            self._conn.execute(_MARK_SEEN_AT, {**params, "first_seen_at": _sqlite_utc(seen_at)})
         self._conn.commit()
+
+    def seen_before(self, protocol_no: str, at: datetime) -> bool:
+        """Запись впервые отмечена СТРОГО раньше at (только чтение) — см.
+        DEEP-горизонт восстановления в GeorgiaPublicFineFeedJob/
+        GeorgiaCollectorJob: строки, увиденные до последнего успешного
+        цикла, уже обработаны."""
+        row = self._conn.execute(_SELECT_SEEN_BEFORE, (protocol_no, _sqlite_utc(at))).fetchone()
+        return row is not None
 
     def cleanup_older_than(self, cutoff: date) -> int:
         """Retention (см. задачу) — удаляет строки СТРОГО старше cutoff.
@@ -84,3 +113,12 @@ class GeorgiaPublicFeedSeenRepository:
 
     def close(self) -> None:
         self._conn.close()
+
+
+def _sqlite_utc(value: datetime) -> str:
+    """Тот же формат, что пишет DEFAULT CURRENT_TIMESTAMP (UTC,
+    'YYYY-MM-DD HH:MM:SS') — иначе строковое сравнение с first_seen_at уже
+    существующих строк было бы неверным. Naive datetime считается UTC."""
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value.strftime("%Y-%m-%d %H:%M:%S")

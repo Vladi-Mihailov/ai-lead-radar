@@ -80,9 +80,17 @@ baseline ≈ 4 цикла × 2 запроса ≈ 8 запросов/день �
   что именно она отражает после сбоя/никогда не запускалась), жёстко
   ограничен max_pages (first_run_max_pages для истинного первого запуска,
   max_pages_per_cycle для восстановления после сбоя — обычно меньше).
-  Завершается успешно ТОЛЬКО на пустой странице; упёрся в max_pages —
-  остаётся в DEEP-режиме и на следующем цикле (см. задачу: "Do not
-  silently declare catch-up complete").
+  Завершается успешно на пустой странице ИЛИ на странице, ВСЕ строки
+  которой уже обработаны (DEEP-горизонт, см. _page_already_processed):
+  при истинном первом запуске — опубликованы раньше сегодняшнего дня; при
+  восстановлении — опубликованы раньше даты самой новой строки последнего
+  успешного цикла ЛИБО впервые увидены раньше этого цикла (first_seen_at;
+  строки, отмеченные сбойными попытками после него, не считаются — "дыра"
+  под ними будет дочитана). Дойти до пустой страницы реального feed'а
+  (~10 тыс. страниц, ~5–6,3 тыс. публикаций в сутки) невозможно — без
+  горизонта DEEP не завершался никогда. Упёрся в max_pages раньше
+  горизонта — по-прежнему остаётся в DEEP-режиме и на следующем цикле
+  (см. задачу: "Do not silently declare catch-up complete").
 - "FAST" (обычный установившийся режим, после хотя бы одного успешного
   DEEP-прохода И без свежей ошибки) — останавливается через ОДНУ
   дополнительную (overlap) страницу ПОСЛЕ первой страницы, содержащей уже
@@ -93,7 +101,7 @@ failure does not cause data loss"): ЛЮБОЕ исключение в сере�
 выставляет last_error (см. GeorgiaPublicFeedStateRepository) — пока он не
 сброшен, СЛЕДУЮЩИЙ цикл автоматически работает в DEEP-режиме (не доверяя
 FAST-границе, которая могла не покрыть то, что сбойный цикл не успел
-обработать), пока не пройдёт полностью до пустой страницы. Строки,
+обработать), пока не дойдёт до пустой страницы или DEEP-горизонта. Строки,
 реально обработанные ДО сбоя (mark_seen/persist_feed_match — обе
 операции идемпотентны и коммитятся по одной), не теряются и не
 переобрабатываются как ошибка — detected_fines fingerprint dedup и
@@ -101,7 +109,8 @@ georgia_public_feed_seen PRIMARY KEY делают повторную обраб�
 
 protocolNo НЕ считается глобально монотонным (см. audit report, риск №5)
 — обход никогда не полагается на его порядок, только на seen/unseen per
-protocolNo и на пустоту страницы."""
+protocolNo, на пустоту страницы и на DEEP-горизонт (даты публикации и
+first_seen_at)."""
 
 import logging
 from dataclasses import dataclass
@@ -236,6 +245,28 @@ class GeorgiaPublicFineFeedJob(Job):
         in_recovery = feed_state.last_error is not None
         deep_mode = is_true_first_run or in_recovery
         max_pages = self._first_run_max_pages if is_true_first_run else self._max_pages_per_cycle
+        # DEEP-горизонт (см. _page_already_processed): DEEP завершается на
+        # странице, ВСЕ строки которой уже обработаны, — ниже по feed'у
+        # (newest-first) лежат только такие. До пустой страницы не дойти:
+        # в feed'е ~10 тыс. страниц (~5–6,3 тыс. публикаций в сутки), без
+        # горизонта DEEP не завершался никогда и каждый цикл перечитывал
+        # max_pages страниц заново.
+        # - Истинный первый запуск — только сегодняшние публикации: более
+        #   ранние штрафы отслеживаемых номеров находит bootstrap-поиск при
+        #   добавлении номера.
+        # - Восстановление — строки, опубликованные раньше даты самой новой
+        #   строки последнего успешного цикла, ЛИБО впервые увиденные раньше
+        #   него (first_seen_at). Отмеченные во время/после него (в т.ч.
+        #   сбойной попыткой над недочитанной "дырой") не считаются — дыра
+        #   будет дочитана. Весь последний день заново не перечитывается,
+        #   иначе восстановление после двух сбоев подряд не помещалось бы в
+        #   лимит страниц.
+        if is_true_first_run:
+            processed_before_date = run_at.astimezone(self._tz).date()
+            processed_before_time = None
+        else:
+            processed_before_date = feed_state.newest_seen_publish_date
+            processed_before_time = feed_state.last_successful_poll_at
 
         matched_count = 0
         pages_fetched = 0
@@ -296,9 +327,18 @@ class GeorgiaPublicFineFeedJob(Job):
                     # handled normally") — отмечаем ДО попытки сопоставления,
                     # см. GeorgiaPublicFeedSeenRepository докстрок.
                     self._seen.mark_seen(
-                        protocol_no, publish_date=entry_date or run_at.date(),
+                        protocol_no, publish_date=entry_date or run_at.date(), seen_at=run_at,
                     )
                     matched_count += await self._maybe_process_entry(entry, monitored)
+
+                if deep_mode and _page_already_processed(
+                    raw_results, self._seen,
+                    published_before=processed_before_date, seen_before=processed_before_time,
+                ):
+                    # DEEP дошёл до уже обработанных строк (см. DEEP-горизонт) —
+                    # цикл завершён честно, а не упором в лимит страниц.
+                    completed = True
+                    break
 
                 if pending_overlap:
                     # Это и была единственная overlap-страница — хватит,
@@ -328,13 +368,15 @@ class GeorgiaPublicFineFeedJob(Job):
         if not completed:
             logger.warning(
                 "GeorgiaPublicFineFeedJob: reached safety cap (%d pages, deep_mode=%s) before "
-                "reaching an empty page — %s scan INCOMPLETE, will retry in deep mode next cycle "
+                "reaching an empty page, the frontier or already-processed rows — %s scan "
+                "INCOMPLETE, will retry in deep mode next cycle "
                 "(matched=%d this attempt)",
                 max_pages, deep_mode, "first-run catch-up" if is_true_first_run else "recovery",
                 matched_count,
             )
             self._record_error(
-                "safety cap reached before an empty page (see WARNING log)", at=run_at,
+                "safety cap reached before an empty page, the frontier or already-processed rows "
+                "(see WARNING log)", at=run_at,
             )
             return
 
@@ -429,3 +471,27 @@ def _parse_publish_date(value) -> date | None:
         return date.fromisoformat(value)
     except ValueError:
         return None
+
+
+def _page_already_processed(
+    entries: list[dict],
+    seen: GeorgiaPublicFeedSeenRepository,
+    *,
+    published_before: date | None,
+    seen_before: datetime | None,
+) -> bool:
+    """DEEP-горизонт (см. run()): КАЖДАЯ строка страницы опубликована
+    раньше published_before ЛИБО впервые увидена раньше seen_before (до
+    последнего успешного цикла). Строка без даты публикации и без такой
+    отметки — не обработанная: обход продолжается."""
+    if not entries:
+        return False
+    for entry in entries:
+        entry_date = _parse_publish_date(entry.get("publishDate"))
+        if published_before is not None and entry_date is not None and entry_date < published_before:
+            continue
+        protocol_no = entry.get("protocolNo")
+        if seen_before is not None and protocol_no and seen.seen_before(protocol_no, seen_before):
+            continue
+        return False
+    return True

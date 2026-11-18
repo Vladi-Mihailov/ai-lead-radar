@@ -10,6 +10,16 @@ the production client's own bounded retries) queues the payload in the
 local outbox (outbox_repository.py) instead of aborting the cycle, so a
 production-side outage never loses an already-fetched match.
 
+DEEP mode (true first run, or recovery after a failed cycle) completes at an
+empty page OR at a page whose rows are all already processed (see
+_page_already_processed): on the true first run, rows published before
+today; in recovery, rows published before the newest publish date of the
+last successful cycle OR first seen before that cycle (first_seen_at; rows
+marked by failed attempts after it don't count, so a gap below them is still
+read). The real feed has ~10k pages (~5–6.3k publications a day), so an
+empty page is unreachable — without this horizon DEEP never completed and
+re-read max_pages pages every cycle. FAST mode is unchanged.
+
 should_run()/run_times/_last_run_slot is the SAME exact-wall-clock pattern
 as reader/jobs/fine_job.py::FineJob.should_run()/reader/jobs/
 georgia_public_feed_job.py::GeorgiaPublicFineFeedJob.should_run() — an
@@ -180,6 +190,28 @@ class GeorgiaCollectorJob:
         in_recovery = feed_state.last_error is not None
         deep_mode = is_true_first_run or in_recovery
         max_pages = self._first_run_max_pages if is_true_first_run else self._max_pages_per_cycle
+        # DEEP-горизонт (см. _page_already_processed): DEEP завершается на
+        # странице, ВСЕ строки которой уже обработаны, — ниже по feed'у
+        # (newest-first) лежат только такие. До пустой страницы не дойти:
+        # в feed'е ~10 тыс. страниц (~5–6,3 тыс. публикаций в сутки), без
+        # горизонта DEEP не завершался никогда и каждый цикл перечитывал
+        # max_pages страниц заново.
+        # - Истинный первый запуск — только сегодняшние публикации: более
+        #   ранние штрафы отслеживаемых номеров находит bootstrap-поиск при
+        #   добавлении номера.
+        # - Восстановление — строки, опубликованные раньше даты самой новой
+        #   строки последнего успешного цикла, ЛИБО впервые увиденные раньше
+        #   него (first_seen_at). Отмеченные во время/после него (в т.ч.
+        #   сбойной попыткой над недочитанной "дырой") не считаются — дыра
+        #   будет дочитана. Весь последний день заново не перечитывается,
+        #   иначе восстановление после двух сбоев подряд не помещалось бы в
+        #   лимит страниц.
+        if is_true_first_run:
+            processed_before_date = run_at.astimezone(self._tz).date()
+            processed_before_time = None
+        else:
+            processed_before_date = feed_state.newest_seen_publish_date
+            processed_before_time = feed_state.last_successful_poll_at
 
         pages_fetched = 0
         newest_seen_this_cycle: date | None = None
@@ -218,8 +250,17 @@ class GeorgiaCollectorJob:
                         page_has_seen_row = True
                         continue
 
-                    self._seen.mark_seen(protocol_no, publish_date=entry_date or run_at.date())
+                    self._seen.mark_seen(protocol_no, publish_date=entry_date or run_at.date(), seen_at=run_at)
                     await self._maybe_submit_entry(entry, monitored)
+
+                if deep_mode and _page_already_processed(
+                    raw_results, self._seen,
+                    published_before=processed_before_date, seen_before=processed_before_time,
+                ):
+                    # DEEP дошёл до уже обработанных строк — цикл завершён
+                    # честно, а не упором в лимит страниц.
+                    completed = True
+                    break
 
                 if pending_overlap:
                     completed = True
@@ -239,7 +280,10 @@ class GeorgiaCollectorJob:
             return
 
         if not completed:
-            self._record_error("safety cap reached before an empty page", at=run_at)
+            self._record_error(
+                "safety cap reached before an empty page, the frontier or already-processed rows",
+                at=run_at,
+            )
             return
 
         if newest_seen_this_cycle is not None:
@@ -366,3 +410,28 @@ def _parse_publish_date(value) -> date | None:
         return date.fromisoformat(value)
     except ValueError:
         return None
+
+
+def _page_already_processed(
+    entries: list[dict],
+    seen: GeorgiaPublicFeedSeenRepository,
+    *,
+    published_before: date | None,
+    seen_before: datetime | None,
+) -> bool:
+    """DEEP-горизонт (см. _poll_feed()): КАЖДАЯ строка страницы опубликована
+    раньше published_before ЛИБО впервые увидена раньше seen_before (до
+    последнего успешного цикла). Строка без даты публикации и без такой
+    отметки — не обработанная: обход продолжается."""
+    if not entries:
+        return False
+    for entry in entries:
+        entry_date = _parse_publish_date(entry.get("publishDate"))
+        if published_before is not None and entry_date is not None and entry_date < published_before:
+            continue
+        protocol_no = entry.get("protocolNo")
+        if seen_before is not None and protocol_no and seen.seen_before(protocol_no, seen_before):
+            continue
+        return False
+    return True
+
