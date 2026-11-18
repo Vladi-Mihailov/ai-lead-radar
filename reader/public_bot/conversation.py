@@ -288,6 +288,22 @@ def _naive_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
 
 
+def _snapshot_has_unexplained_debt(
+    breakdown: DebtBreakdown, snapshot: float, snapshot_at: datetime | None, last_full_check_at: datetime | None,
+) -> bool:
+    """Снимок суммы задачи больше долга по статусам машины (🔴 + 🟡), а
+    полной проверки со статусами после него не было: проверка прошла без
+    статусов (операторский процесс, сбой записи статусов) или статусы только
+    что заполнены из истории. Ошибка не должна скрывать долг — тогда
+    показывается снимок. Отметки 🟢 такой снимок не объясняют: оплаченная
+    квитанция могла уже исчезнуть из ответа, а на её месте оказаться новый
+    штраф; до следующей полной проверки машина показывает снимок, как раньше."""
+    debt = breakdown.unpaid_amount + breakdown.needs_review_amount
+    if snapshot <= debt + 0.005:
+        return False
+    return not _statuses_are_current(last_full_check_at, snapshot_at)
+
+
 def _statuses_are_current(last_full_check_at: datetime | None, snapshot_at: datetime | None) -> bool:
     """Номер прошёл полную проверку со статусами не раньше снимка суммы
     задачи (с допуском payment_status.SNAPSHOT_TOLERANCE). Совпадения
@@ -1390,8 +1406,8 @@ class ConversationController:
         for car_number in car_numbers:
             breakdown = breakdowns.get(car_number) or DebtBreakdown()
             snapshot = snapshot_totals.get(car_number, 0.0)
-            if self._snapshot_has_unexplained_debt(
-                car_number, breakdown, snapshot, snapshot_times.get(car_number), last_full_checks.get(car_number),
+            if _snapshot_has_unexplained_debt(
+                breakdown, snapshot, snapshot_times.get(car_number), last_full_checks.get(car_number),
             ):
                 # Сумма снимка остаётся неоплаченной, как и раньше; число
                 # штрафов неизвестно. Квитанции ⏳ этой машины не
@@ -1414,29 +1430,6 @@ class ConversationController:
             -(row[2].unpaid_amount + row[2].needs_review_amount), -row[2].paid_amount, row[0],
         ))
         return rows, totals
-
-    def _snapshot_has_unexplained_debt(
-        self, car_number: str, breakdown: DebtBreakdown, snapshot: float,
-        snapshot_at: datetime | None, last_full_check_at: datetime | None,
-    ) -> bool:
-        """Снимок суммы задачи больше долга по статусам машины (🔴 + 🟡), а
-        полной проверки со статусами после него не было: проверка прошла без
-        статусов (операторский процесс, сбой записи статусов) или статусы
-        только что заполнены из истории. Ошибка не должна скрывать долг —
-        тогда показывается снимок. Отметка 🟢 объясняет снимок, только если
-        поставлена после него: более ранняя оплаченная квитанция могла уже
-        исчезнуть из ответа, а на её месте оказаться новый штраф."""
-        debt = breakdown.unpaid_amount + breakdown.needs_review_amount
-        if snapshot <= debt + 0.005 or _statuses_are_current(last_full_check_at, snapshot_at):
-            return False
-        marked_since = _naive_utc(snapshot_at) - SNAPSHOT_TOLERANCE if snapshot_at else None
-        paid_after_snapshot = sum(
-            status.amount or 0.0
-            for status in self._fine_status.statuses_for_car(car_number, include_gone=False)
-            if status.payment_status == PAYMENT_PAID and marked_since is not None
-            and status.payment_updated_at is not None and status.payment_updated_at >= marked_since
-        )
-        return snapshot > debt + paid_after_snapshot + 0.005
 
     def _debt_owners_by_car(self, car_numbers: list[str]) -> dict[str, list[texts.DebtOwner]]:
         """Пользователи, привязанные к каждой машине debt-списка (см.

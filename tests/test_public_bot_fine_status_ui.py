@@ -296,9 +296,9 @@ async def test_stale_statuses_with_listed_receipts_do_not_hide_a_newer_debt(fx):
     assert "🔴 Подтверждённая задолженность: 80 ₾" in stats
 
 
-async def test_paid_mark_set_after_a_newer_snapshot_explains_it(fx):
-    """Проверка без статусов, а затем отметка 🟢: снимок включал эту
-    квитанцию ещё неоплаченной — отметка его объясняет и не отменяется."""
+async def test_paid_mark_set_after_a_newer_snapshot_explains_it_after_the_next_full_check(fx):
+    """Проверка без статусов, затем отметка 🟢: до следующей полной проверки
+    машина показывает снимок, как раньше; после неё — 🟢 и ноль долга."""
     task, _ = fx.car(_CAR, [("GE1", 100)])
     two_hours_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2)
     fx.tracker.record_full_check(_CAR, [_record(_CAR, "GE1", 100)], complete=True, at=two_hours_ago)
@@ -306,10 +306,30 @@ async def test_paid_mark_set_after_a_newer_snapshot_explains_it(fx):
     await untracked.check_task(fx.tasks.get(task.id))
     fx.tracker.mark_paid(fx.status(_CAR, "GE1").id, actor_user_id=_TRUSTED, note="TBC 1")
 
+    assert "💰 Задолженность: 100 ₾" in fx.controller._format_statistics_reply().text
+
+    await fx.check(task)  # полная проверка со статусами
     stats = fx.controller._format_statistics_reply().text
 
     assert "🔴 Подтверждённая задолженность: 0 ₾ (0 шт.)" in stats
     assert "🟢 Оплачено, ещё в базе полиции: 100 ₾ (1 шт.)" in stats
+
+
+async def test_paid_mark_on_history_does_not_hide_a_newer_snapshot(fx):
+    """Проверка без статусов нашла ещё один штраф, а менеджер затем отметил
+    🟢 старую квитанцию ⏳ на ту же сумму — новый долг не прячется."""
+    task, _ = fx.car(_CAR, [("GE1", 50)])
+    two_hours_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2)
+    fx.tracker.record_full_check(_CAR, [_record(_CAR, "GE1", 50)], complete=True, at=two_hours_ago)
+    history = _make_unverified(fx, "OLD1", 30)
+    fx.provider.records[_CAR] = [_record(_CAR, "GE1", 50), _record(_CAR, "GE5", 30)]
+    untracked = FineCheckService(fx.provider, fx.tasks, fx.fines, sleep=_instant)
+    await untracked.check_task(fx.tasks.get(task.id))
+    fx.tracker.mark_paid(history.id, actor_user_id=_TRUSTED, note="TBC 2")
+
+    stats = fx.controller._format_statistics_reply().text
+
+    assert "💰 Задолженность: 80 ₾" in stats
 
 
 async def test_paid_mark_older_than_a_newer_snapshot_does_not_hide_new_debt(fx):

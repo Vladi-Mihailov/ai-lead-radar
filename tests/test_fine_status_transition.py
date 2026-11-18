@@ -471,6 +471,33 @@ def test_receipt_missed_by_a_newer_check_of_its_own_task_stays_history(tmp_path)
     db.close()
 
 
+def test_feed_find_missed_by_a_newer_check_does_not_raise_the_old_total(tmp_path):
+    """Feed нашёл квитанцию (строки у активной задачи и у задачи без
+    проверки), а более новая нулевая проверка её уже не показала: она ⏳, и
+    прежний долг машины не растёт — ни через строку задачи без проверки, ни
+    через строку самой опорной задачи."""
+    db = _LegacyDb(tmp_path)
+    reference = db.task("NN444OO", snapshot=100, checked_at="2026-09-01 10:00:00")
+    db.fine(reference, "GE22", 100, last_seen="2026-09-01 10:00:00")
+    db.fine(reference, "GE23", 40, last_seen="2026-11-10 10:00:00", notified=False)  # feed, после снимка
+    newer = db.task("NN444OO", snapshot=0, checked_at="2026-11-16 10:00:00")
+    db.fine(newer, "GE23", 40, last_seen="2026-11-10 10:00:00", notified=False)
+    db.fine(newer, "GE24", 70, last_seen="2026-10-01 10:00:00")
+    never_checked = db.task("NN444OO")
+    db.fine(never_checked, "GE23", 40, last_seen="2026-11-10 10:00:00", notified=False)
+    assert {g.car_number: g.total_amount for g in db.tasks.list_debt_car_groups()} == {"NN444OO": 100}
+
+    repository, tracker, rows, totals = _seed_and_rows(db)
+
+    statuses = tracker.statuses_by_protocol("NN444OO")
+    assert statuses["GE22"].presence == PRESENCE_LISTED
+    assert statuses["GE23"].presence == PRESENCE_UNVERIFIED
+    assert statuses["GE24"].presence == PRESENCE_UNVERIFIED
+    assert rows["NN444OO"].unpaid_amount + rows["NN444OO"].needs_review_amount == 100
+    repository.close()
+    db.close()
+
+
 def test_feed_find_under_a_task_without_recorded_check_counts_after_the_plate_check(tmp_path):
     """У задачи нет записанной проверки, но у номера есть успешная проверка
     другой задачи: строка, увиденная после неё (её нашёл feed), — 🔴."""

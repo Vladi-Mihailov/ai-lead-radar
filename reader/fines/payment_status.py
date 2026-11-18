@@ -82,6 +82,11 @@ DISPLAY_UNVERIFIED = "unverified"
 # статистике (полная проверка со статусами не раньше снимка, см.
 # conversation._statuses_are_current).
 SNAPSHOT_TOLERANCE = timedelta(minutes=1)
+# Сколько после снимка суммы проверка может ещё создавать строки новых
+# штрафов: перевод каждого нового штрафа идёт до записи его строки, поэтому
+# у проверки с несколькими новыми штрафами последняя строка появляется через
+# минуты после снимка (см. seed_from_detected_fines).
+_SAME_CHECK_WINDOW = timedelta(minutes=10)
 
 # Источник записи в журнале/последнего изменения статуса оплаты.
 SOURCE_CHECK = "check"
@@ -600,56 +605,66 @@ class FineStatusRepository:
         там. Ключ — номер ЗАДАЧИ (тот же, что передают проверки и
         подписки), а не protocolAuto строки.
 
-        Квитанция — 'listed', если хотя бы одна её строка не старше обеих
-        проверок: проверки своей задачи и опорной проверки номера (то есть
-        police.ge показал её в ответе, новее которого для этой строки нет,
-        или feed нашёл её позже). Иначе — 'unverified' (⏳): её не было в
-        старом ответе, полученном ещё без нынешней защиты от ложно пустых
-        ответов, поэтому исчезновение не считается подтверждённым — ⚪
-        только после двух НОВЫХ полных проверок (см. record_full_check).
-        Опорная проверка номера — та же, что у прежней статистики долга
-        (list_debt_car_groups — самая свежая задача номера с положительным
-        снимком), чтобы ни одна машина не потеряла и не изменила долг; у
-        номера без такого снимка — самая свежая успешная проверка любой его
-        задачи. Проверка своей задачи не даёт засчитать строку, которую
-        более новая (в том числе нулевая) проверка той же задачи уже не
-        нашла. Номер, у которого ни одна задача не записала успешной
-        проверки (задачи старше поля last_successful_checked_at), — только
-        ⏳: опоры нет, а прежняя статистика долгом его не считала.
+        Квитанция — 'listed', если police.ge показал её на самой свежей
+        успешной проверке номера (любой его задачи) или feed нашёл её позже,
+        а также если она входит в снимок, по которому прежняя статистика
+        считает долг машины (list_debt_car_groups — самая свежая задача
+        номера с положительным снимком): её строка была в последнем ответе
+        этой задачи. Так ни одна машина не теряет и не меняет прежний долг,
+        а квитанцию, которую более новая (в том числе нулевая) проверка уже
+        не нашла, ничто другое в долг не возвращает. Остальные —
+        'unverified' (⏳): их не было в старом ответе, полученном ещё без
+        нынешней защиты от ложно пустых ответов, поэтому исчезновение не
+        считается подтверждённым — ⚪ только после двух НОВЫХ полных
+        проверок (см. record_full_check). Номер, у которого ни одна задача
+        не записала успешной проверки (задачи старше поля
+        last_successful_checked_at или только bootstrap REDNET и feed), —
+        только ⏳: опоры нет, а прежняя статистика долгом его не считала.
         Сравнение дат — в Python, а не в SQL: last_seen_at и
         last_successful_checked_at пишутся разными путями. Возвращает число
         созданных строк."""
-        task_plates: dict[int, tuple[str, datetime | None]] = {}
-        debt_reference: dict[str, datetime] = {}
-        any_reference: dict[str, datetime] = {}
+        task_plates: dict[int, str] = {}
+        latest_check: dict[str, datetime] = {}
+        # номер -> (время, id) самой свежей задачи с положительным снимком —
+        # тот же выбор (и tie-break по id), что у list_debt_car_groups
+        debt_reference: dict[str, tuple[datetime, int]] = {}
         for task_id, car_number, total, checked_raw in self._conn.execute(
             "SELECT id, car_number, last_successful_total_amount, last_successful_checked_at "
             "FROM fine_monitoring_tasks"
         ):
+            task_plates[task_id] = car_number
             checked_at = _parse_ts(checked_raw)
-            task_plates[task_id] = (car_number, checked_at)
             if checked_at is None:
                 continue
-            if checked_at > any_reference.get(car_number, datetime.min):
-                any_reference[car_number] = checked_at
-            if total is not None and total > 0 and checked_at > debt_reference.get(car_number, datetime.min):
-                debt_reference[car_number] = checked_at
+            if checked_at > latest_check.get(car_number, datetime.min):
+                latest_check[car_number] = checked_at
+            if total is not None and total > 0 and (checked_at, task_id) > debt_reference.get(
+                car_number, (datetime.min, -1),
+            ):
+                debt_reference[car_number] = (checked_at, task_id)
         seeds: dict[tuple[str, str], dict] = {}
         rows = self._conn.execute(
             "SELECT monitoring_task_id, external_fine_id, amount, first_detected_at, last_seen_at "
             "FROM detected_fines WHERE external_fine_id IS NOT NULL AND external_fine_id != ''"
         ).fetchall()
         for task_id, protocol_no, amount, first_detected_at, last_seen_at in rows:
-            if task_id not in task_plates:
-                continue
-            car_number, task_checked_at = task_plates[task_id]
-            if is_fine_output_suppressed(car_number):
+            car_number = task_plates.get(task_id)
+            if car_number is None or is_fine_output_suppressed(car_number):
                 continue
             seen_at = _parse_ts(last_seen_at)
             first_at = _parse_ts(first_detected_at)
-            plate_reference = debt_reference.get(car_number) or any_reference.get(car_number)
-            references = [value for value in (task_checked_at, plate_reference) if value is not None]
-            listed = bool(references) and seen_at >= max(references) - SNAPSHOT_TOLERANCE
+            latest = latest_check.get(car_number)
+            listed = latest is not None and seen_at >= latest - SNAPSHOT_TOLERANCE
+            reference = debt_reference.get(car_number)
+            if not listed and reference is not None and reference[1] == task_id:
+                # Строка из последнего ответа задачи, на снимке которой стоит
+                # прежняя статистика долга (была до этой проверки или создана
+                # ею самой, а не найдена feed'ом позже).
+                reference_at = reference[0]
+                listed = (
+                    seen_at >= reference_at - SNAPSHOT_TOLERANCE
+                    and first_at <= reference_at + _SAME_CHECK_WINDOW
+                )
             seed = seeds.setdefault((car_number, protocol_no), {
                 "amount": amount, "first_at": first_at, "seen_at": seen_at, "listed": False,
             })

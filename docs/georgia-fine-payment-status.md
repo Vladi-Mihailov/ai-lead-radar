@@ -124,15 +124,17 @@ On its first start the bot creates statuses from the existing
   the old debt statistics already use (the freshest such task), so no car
   loses or changes its debt. Otherwise it is the latest successful check of
   any task of the plate.
-- A receipt becomes 🔴 `listed` if one of its rows is not older than both
-  its own task's last check and the plate's reference check: police.ge
-  returned it in the newest answer that applies to that row, or the public
-  feed found it later. A newer check of the same task, even one with total
-  0, that no longer showed the receipt keeps it from being listed.
+- A receipt becomes 🔴 `listed` if police.ge returned it in the plate's
+  latest successful check (any task) or the public feed found it later, or
+  if it is part of the saved total the old statistics show: its row was in
+  the last answer of the reference task. Nothing else brings back a receipt
+  that a newer check, even one with total 0, no longer showed.
 - Any other receipt becomes ⏳ `unverified`. So does every receipt of a
   plate none of whose tasks has a recorded successful check (tasks older
-  than that field): there is nothing to compare with, and the old
-  statistics did not count them as debt.
+  than that field, or tasks that so far only had the REDNET bootstrap and
+  public-feed matches): there is nothing to compare with, and the old
+  statistics did not count them as debt. Their first full check turns
+  them 🔴 or starts the way to ⚪.
   That answer came before the empty-answer protection and may have been
   falsely empty, so it confirms nothing:
   - not ⚪ and not confirmed debt; shown as a separate line in statistics
@@ -150,7 +152,9 @@ On its first start the bot creates statuses from the existing
   gave 67 receipts → 🔴 (33 cars) and 296 receipts → ⏳ (92 cars, 87 of
   them with ⏳ only; 14 800 ₾). No receipt becomes ⚪ at first start.
   All 29 cars of the old debt list keep their totals. 4 cars are added:
-  receipts the public feed found after their plate's last check.
+  receipts the public feed found after their plate's last check. 7 plates
+  have no recorded check at all; their 7 receipts (400 ₾, all seen in the
+  last 60 days) start as ⏳.
 - Old tables (`detected_fines`, tasks, subscriptions, deliveries) are not
   changed. New tables are created with `CREATE TABLE IF NOT EXISTS`, and no
   existing table is altered.
@@ -170,13 +174,15 @@ Where statuses are shown:
     «🟢 Оплачено» lines. A car whose receipts are all ⚪ is not shown, even if
     an old task still has a positive total;
   - a saved total that is newer than the plate's last full check with
-    statuses and larger than the statuses explain (🔴 + 🟡, plus 🟢 marks
-    set after that total) is shown as before, as unpaid debt. This happens
-    when a check ran without statuses (the operator process), writing
-    statuses failed, or statuses were just seeded from history; errors must
-    not hide debt. A public-feed match does not count as a full check. The
-    car's ⏳ receipts are then not added on top, because the newer total
-    already includes them;
+    statuses and larger than the statuses' 🔴 + 🟡 is shown as before, as
+    unpaid debt. This happens when a check ran without statuses (the
+    operator process), writing statuses failed, or statuses were just seeded
+    from history; errors must not hide debt. A public-feed match does not
+    count as a full check, and 🟢 marks do not explain such a total (the
+    paid receipt may already be gone and a new fine in its place), so until
+    the next full check the car shows its saved total. The car's ⏳
+    receipts are then not added on top, because the newer total already
+    includes them;
   - «База police.ge обновлена»;
   - the last evening re-check.
 - «🧾 Статусы оплаты» (trusted managers): enter a plate → list → a receipt →
