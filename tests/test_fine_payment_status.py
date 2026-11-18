@@ -414,6 +414,20 @@ def test_breakdown_counts_marked_unverified_receipts_by_their_mark():
     assert breakdown.unpaid_amount == 0
 
 
+def test_last_full_check_time_is_set_by_full_checks_only(tracker):
+    """Время последней полной проверки номера: его ставит любая успешная
+    полная проверка (и неполный ответ), но не совпадение feed'а; более
+    ранний ответ, записанный позже, его не откатывает."""
+    tracker.record_listed(_CAR, _record("GE1"), at=_T0)
+    assert tracker.last_full_check_by_car([_CAR]) == {}
+    tracker.record_full_check(_CAR, [_record("GE1")], complete=False, at=_T0 + timedelta(hours=1))
+    assert tracker.last_full_check_by_car([_CAR]) == {_CAR: _T0 + timedelta(hours=1)}
+    tracker.record_full_check(_CAR, [_record("GE1")], complete=True, at=_T0 + timedelta(hours=3))
+    tracker.record_full_check(_CAR, [_record("GE1")], complete=True, at=_T0 + timedelta(hours=2))
+    tracker.record_listed(_CAR, _record("GE1"), at=_T0 + timedelta(hours=5))
+    assert tracker.last_full_check_by_car([_CAR]) == {_CAR: _T0 + timedelta(hours=3)}
+
+
 def test_source_updated_on_round_trip(tracker):
     assert tracker.source_updated_on() is None
     tracker.record_source_updated_on(date(2026, 11, 12), at=_T0)

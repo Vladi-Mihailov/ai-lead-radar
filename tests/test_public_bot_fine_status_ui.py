@@ -296,20 +296,57 @@ async def test_stale_statuses_with_listed_receipts_do_not_hide_a_newer_debt(fx):
     assert "🔴 Подтверждённая задолженность: 80 ₾" in stats
 
 
-async def test_paid_receipt_explains_a_newer_untracked_snapshot(fx):
-    """Более новый снимок, который статусы объясняют полностью (🟢 100 из
-    100), отметку «оплачено» не отменяет."""
+async def test_paid_mark_set_after_a_newer_snapshot_explains_it(fx):
+    """Проверка без статусов, а затем отметка 🟢: снимок включал эту
+    квитанцию ещё неоплаченной — отметка его объясняет и не отменяется."""
     task, _ = fx.car(_CAR, [("GE1", 100)])
     two_hours_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2)
     fx.tracker.record_full_check(_CAR, [_record(_CAR, "GE1", 100)], complete=True, at=two_hours_ago)
-    fx.tracker.mark_paid(fx.status(_CAR, "GE1").id, actor_user_id=_TRUSTED, note="TBC 1")
     untracked = FineCheckService(fx.provider, fx.tasks, fx.fines, sleep=_instant)
     await untracked.check_task(fx.tasks.get(task.id))
+    fx.tracker.mark_paid(fx.status(_CAR, "GE1").id, actor_user_id=_TRUSTED, note="TBC 1")
 
     stats = fx.controller._format_statistics_reply().text
 
     assert "🔴 Подтверждённая задолженность: 0 ₾ (0 шт.)" in stats
     assert "🟢 Оплачено, ещё в базе полиции: 100 ₾ (1 шт.)" in stats
+
+
+async def test_paid_mark_older_than_a_newer_snapshot_does_not_hide_new_debt(fx):
+    """🟢 поставлен до проверки без статусов, которая нашла новый штраф
+    (оплаченный к тому времени исчез из ответа): та же сумма снимка не
+    выдаётся за «оплачено» — показывается снимок."""
+    task, _ = fx.car(_CAR, [("GE1", 50), ("GE2", 50)])
+    two_hours_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2)
+    fx.tracker.record_full_check(
+        _CAR, [_record(_CAR, "GE1", 50), _record(_CAR, "GE2", 50)], complete=True, at=two_hours_ago,
+    )
+    fx.tracker.mark_paid(fx.status(_CAR, "GE2").id, actor_user_id=_TRUSTED, note="TBC 1",
+                         at=two_hours_ago + timedelta(minutes=5))
+    fx.provider.records[_CAR] = [_record(_CAR, "GE1", 50), _record(_CAR, "GE3", 50)]
+    untracked = FineCheckService(fx.provider, fx.tasks, fx.fines, sleep=_instant)
+    await untracked.check_task(fx.tasks.get(task.id))
+
+    stats = fx.controller._format_statistics_reply().text
+
+    assert "💰 Задолженность: 100 ₾" in stats
+    assert "🔴 Подтверждённая задолженность: 100 ₾" in stats
+
+
+async def test_feed_match_does_not_make_outdated_statuses_current(fx):
+    """Feed снова увидел уже известную квитанцию — это не полная проверка:
+    более новый снимок с ещё одним штрафом по-прежнему не прячется."""
+    task, _ = fx.car(_CAR, [("GE1", 50)])
+    two_hours_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2)
+    fx.tracker.record_full_check(_CAR, [_record(_CAR, "GE1", 50)], complete=True, at=two_hours_ago)
+    fx.provider.records[_CAR] = [_record(_CAR, "GE1", 50), _record(_CAR, "GE5", 70)]
+    untracked = FineCheckService(fx.provider, fx.tasks, fx.fines, sleep=_instant)
+    await untracked.check_task(fx.tasks.get(task.id))
+    fx.tracker.record_listed(_CAR, _record(_CAR, "GE1", 50))  # совпадение feed'а — сейчас
+
+    stats = fx.controller._format_statistics_reply().text
+
+    assert "💰 Задолженность: 120 ₾" in stats
 
 
 def _make_unverified(fx, protocol_no, amount):

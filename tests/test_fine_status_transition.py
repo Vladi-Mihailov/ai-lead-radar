@@ -408,8 +408,10 @@ def test_plate_without_any_recorded_check_is_history_only(tmp_path):
     db.close()
 
 
-@pytest.mark.parametrize("last_seen", ["2026-11-16 09:59:40", "2026-11-16 09:57:00"])
-def test_rows_written_before_the_snapshot_never_drop_the_car_from_debt(tmp_path, last_seen):
+@pytest.mark.parametrize(("last_seen", "presence"), [
+    ("2026-11-16 09:59:40", PRESENCE_LISTED), ("2026-11-16 09:57:00", PRESENCE_UNVERIFIED),
+])
+def test_rows_written_before_the_snapshot_never_drop_the_car_from_debt(tmp_path, last_seen, presence):
     """Старые версии писали снимок ПОСЛЕ строк detected_fines. Строки за
     секунды до снимка — квитанции того же ответа (🔴); строки сильно
     раньше — ⏳, но тогда статусы старше снимка, и машина остаётся в списке
@@ -419,10 +421,68 @@ def test_rows_written_before_the_snapshot_never_drop_the_car_from_debt(tmp_path,
     db.fine(task, "GE13", 40, last_seen=last_seen)
     db.fine(task, "GE14", 60, last_seen=last_seen)
 
-    repository, _, rows, totals = _seed_and_rows(db)
+    repository, tracker, rows, totals = _seed_and_rows(db)
 
+    assert {s.presence for s in tracker.statuses_for_car("JJ000KK")} == {presence}
     assert rows["JJ000KK"].unpaid_amount + rows["JJ000KK"].needs_review_amount == 100
     assert totals.unpaid_amount + totals.unverified_amount == 100
+    repository.close()
+    db.close()
+
+
+def test_rows_on_both_sides_of_the_tolerance_keep_the_old_total(tmp_path):
+    """Один старый ответ, строки которого записаны за 20 с и за 90 с до
+    снимка: первая — 🔴, вторая — ⏳, а машина показывает прежнюю сумму
+    снимка целиком (полной проверки со статусами ещё не было), без двойного
+    счёта."""
+    db = _LegacyDb(tmp_path)
+    task = db.task("MM333NN", snapshot=100, checked_at="2026-11-16 10:00:00")
+    db.fine(task, "GE20", 40, last_seen="2026-11-16 09:59:40")
+    db.fine(task, "GE21", 60, last_seen="2026-11-16 09:58:30")
+
+    repository, tracker, rows, totals = _seed_and_rows(db)
+
+    statuses = tracker.statuses_by_protocol("MM333NN")
+    assert (statuses["GE20"].presence, statuses["GE21"].presence) == (PRESENCE_LISTED, PRESENCE_UNVERIFIED)
+    assert rows["MM333NN"].unpaid_amount == 100
+    assert (totals.unpaid_amount, totals.unverified_amount) == (100, 0)
+    repository.close()
+    db.close()
+
+
+def test_receipt_missed_by_a_newer_check_of_its_own_task_stays_history(tmp_path):
+    """Старая задача с положительным снимком держит долг прежней статистики
+    (GE17), а строка GE18 активной задачи старше её собственной более новой
+    (нулевой) проверки — GE18 остаётся ⏳, сумма машины не меняется."""
+    db = _LegacyDb(tmp_path)
+    old_task = db.task("KK111LL", status="completed", snapshot=100, checked_at="2026-09-01 10:00:00")
+    db.fine(old_task, "GE17", 100, last_seen="2026-09-01 10:00:00")
+    active = db.task("KK111LL", snapshot=0, checked_at="2026-11-16 10:00:00")
+    db.fine(active, "GE18", 70, last_seen="2026-10-01 10:00:00")
+    assert {g.car_number: g.total_amount for g in db.tasks.list_debt_car_groups()} == {"KK111LL": 100}
+
+    repository, tracker, rows, totals = _seed_and_rows(db)
+
+    statuses = tracker.statuses_by_protocol("KK111LL")
+    assert (statuses["GE17"].presence, statuses["GE18"].presence) == (PRESENCE_LISTED, PRESENCE_UNVERIFIED)
+    assert rows["KK111LL"].unpaid_amount + rows["KK111LL"].needs_review_amount == 100
+    assert totals.unverified_amount == 70
+    repository.close()
+    db.close()
+
+
+def test_feed_find_under_a_task_without_recorded_check_counts_after_the_plate_check(tmp_path):
+    """У задачи нет записанной проверки, но у номера есть успешная проверка
+    другой задачи: строка, увиденная после неё (её нашёл feed), — 🔴."""
+    db = _LegacyDb(tmp_path)
+    db.task("LL222MM", snapshot=0, checked_at="2026-11-01 10:00:00")
+    legacy_task = db.task("LL222MM")  # без записанной проверки
+    db.fine(legacy_task, "GE19", 90, last_seen="2026-11-10 10:00:00", notified=False)
+
+    repository, tracker, rows, _ = _seed_and_rows(db)
+
+    assert tracker.statuses_by_protocol("LL222MM")["GE19"].presence == PRESENCE_LISTED
+    assert rows["LL222MM"].unpaid_amount == 90
     repository.close()
     db.close()
 

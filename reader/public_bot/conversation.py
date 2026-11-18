@@ -284,19 +284,19 @@ _DEBT_LIST_PAGE_CHAR_BUDGET = 3000
 _DEBT_LIST_PAGE_CHAR_BUDGET_WITH_STATUSES = 2600
 
 
-def _statuses_are_current(observed_at: datetime | None, snapshot_at: datetime | None) -> bool:
-    """Статусы машины сверены с police.ge не раньше её снимка суммы — с
-    тем же допуском, что и у первичного заполнения статусов (см.
-    payment_status.SNAPSHOT_TOLERANCE)."""
-    if observed_at is None:
+def _naive_utc(value: datetime) -> datetime:
+    return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
+
+
+def _statuses_are_current(last_full_check_at: datetime | None, snapshot_at: datetime | None) -> bool:
+    """Номер прошёл полную проверку со статусами не раньше снимка суммы
+    задачи (с допуском payment_status.SNAPSHOT_TOLERANCE). Совпадения
+    feed'а не в счёт: они подтверждают одну квитанцию, а не весь ответ."""
+    if last_full_check_at is None:
         return False
     if snapshot_at is None:
         return True
-    observed = observed_at.replace(tzinfo=None) if observed_at.tzinfo else observed_at
-    snapshot = (
-        snapshot_at.astimezone(timezone.utc).replace(tzinfo=None) if snapshot_at.tzinfo else snapshot_at
-    )
-    return observed >= snapshot - SNAPSHOT_TOLERANCE
+    return _naive_utc(last_full_check_at) >= _naive_utc(snapshot_at) - SNAPSHOT_TOLERANCE
 
 
 def _paginate_debt_blocks(blocks: list[str], *, char_budget: int = _DEBT_LIST_PAGE_CHAR_BUDGET) -> list[list[str]]:
@@ -1384,22 +1384,19 @@ class ConversationController:
             [group.car_number for group in debt_groups] + self._fine_status.listed_car_numbers()
         ))
         breakdowns = self._fine_status.breakdown_for_cars(car_numbers)
-        observed = self._fine_status.latest_observation_by_car(car_numbers)
+        last_full_checks = self._fine_status.last_full_check_by_car(car_numbers)
         rows: list[tuple[str, float, DebtBreakdown | None]] = []
         totals = DebtBreakdown()
         for car_number in car_numbers:
             breakdown = breakdowns.get(car_number) or DebtBreakdown()
             snapshot = snapshot_totals.get(car_number, 0.0)
-            explained = breakdown.unpaid_amount + breakdown.needs_review_amount + breakdown.paid_amount
-            if snapshot > explained + 0.005 and not _statuses_are_current(
-                observed.get(car_number), snapshot_times.get(car_number),
+            if self._snapshot_has_unexplained_debt(
+                car_number, breakdown, snapshot, snapshot_times.get(car_number), last_full_checks.get(car_number),
             ):
-                # Снимок долга новее статусов машины и больше того, что они
-                # объясняют (статусов нет вовсе или проверка прошла без них:
-                # операторский процесс, сбой записи статусов) — сумма снимка
-                # остаётся неоплаченной, как и раньше; число штрафов
-                # неизвестно. Квитанции ⏳ этой машины не добавляются: более
-                # новый снимок уже включает всё, что police.ge тогда показал.
+                # Сумма снимка остаётся неоплаченной, как и раньше; число
+                # штрафов неизвестно. Квитанции ⏳ этой машины не
+                # добавляются: более новый снимок уже включает всё, что
+                # police.ge тогда показал.
                 breakdown = DebtBreakdown(unpaid_amount=snapshot, unpaid_count=1)
             elif breakdown.listed_count == 0:
                 # Ни долга, ни оплаченного в базе полиции по статусам,
@@ -1417,6 +1414,29 @@ class ConversationController:
             -(row[2].unpaid_amount + row[2].needs_review_amount), -row[2].paid_amount, row[0],
         ))
         return rows, totals
+
+    def _snapshot_has_unexplained_debt(
+        self, car_number: str, breakdown: DebtBreakdown, snapshot: float,
+        snapshot_at: datetime | None, last_full_check_at: datetime | None,
+    ) -> bool:
+        """Снимок суммы задачи больше долга по статусам машины (🔴 + 🟡), а
+        полной проверки со статусами после него не было: проверка прошла без
+        статусов (операторский процесс, сбой записи статусов) или статусы
+        только что заполнены из истории. Ошибка не должна скрывать долг —
+        тогда показывается снимок. Отметка 🟢 объясняет снимок, только если
+        поставлена после него: более ранняя оплаченная квитанция могла уже
+        исчезнуть из ответа, а на её месте оказаться новый штраф."""
+        debt = breakdown.unpaid_amount + breakdown.needs_review_amount
+        if snapshot <= debt + 0.005 or _statuses_are_current(last_full_check_at, snapshot_at):
+            return False
+        marked_since = _naive_utc(snapshot_at) - SNAPSHOT_TOLERANCE if snapshot_at else None
+        paid_after_snapshot = sum(
+            status.amount or 0.0
+            for status in self._fine_status.statuses_for_car(car_number, include_gone=False)
+            if status.payment_status == PAYMENT_PAID and marked_since is not None
+            and status.payment_updated_at is not None and status.payment_updated_at >= marked_since
+        )
+        return snapshot > debt + paid_after_snapshot + 0.005
 
     def _debt_owners_by_car(self, car_numbers: list[str]) -> dict[str, list[texts.DebtOwner]]:
         """Пользователи, привязанные к каждой машине debt-списка (см.

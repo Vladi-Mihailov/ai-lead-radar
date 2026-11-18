@@ -77,11 +77,10 @@ DISPLAY_UNVERIFIED = "unverified"
 # Допуск при сверке времени ответа police.ge со снимком суммы задачи
 # (last_successful_checked_at): сейчас снимок пишется до обработки штрафов,
 # а в старых версиях писался после неё — на секунды позже строк
-# detected_fines. Один и тот же допуск у первичного заполнения (квитанция
-# была в ответе, по которому сделан снимок, см. seed_from_detected_fines) и
-# у статистики (статусы машины не старше её снимка, см.
-# conversation._statuses_are_current): при разных допусках машина с долгом
-# выпадала бы из списка — строки уже ⏳, а статусы ещё считаются свежими.
+# detected_fines. Используется при первичном заполнении (квитанция была в
+# ответе, по которому сделан снимок, см. seed_from_detected_fines) и в
+# статистике (полная проверка со статусами не раньше снимка, см.
+# conversation._statuses_are_current).
 SNAPSHOT_TOLERANCE = timedelta(minutes=1)
 
 # Источник записи в журнале/последнего изменения статуса оплаты.
@@ -141,6 +140,14 @@ _SCHEMA = (
         id                 INTEGER PRIMARY KEY CHECK (id = 1),
         source_updated_on  TEXT,
         observed_at        TIMESTAMP
+    )
+    """,
+    # Последняя успешная полная проверка номера со статусами (record_full_check)
+    # — по ней статистика решает, не новее ли снимок суммы задачи, чем статусы.
+    """
+    CREATE TABLE IF NOT EXISTS georgia_fine_plate_checks (
+        car_number          TEXT PRIMARY KEY,
+        last_full_check_at  TIMESTAMP NOT NULL
     )
     """,
 )
@@ -456,19 +463,28 @@ class FineStatusRepository:
         ).fetchall()
         return {row[0] for row in rows}
 
-    def latest_observation_by_car(self, car_numbers: list[str]) -> dict[str, datetime]:
-        """Когда статусы машины последний раз сверялись с ответом police.ge
-        (максимум из last_listed_at/missing_since/gone_at по её квитанциям)."""
+    def record_full_check_time(self, car_number: str, at: datetime) -> None:
+        self._conn.execute(
+            "INSERT INTO georgia_fine_plate_checks (car_number, last_full_check_at) VALUES (?, ?) "
+            "ON CONFLICT(car_number) DO UPDATE SET "
+            "last_full_check_at = MAX(last_full_check_at, excluded.last_full_check_at)",
+            (car_number, _fmt(at)),
+        )
+        self._conn.commit()
+
+    def last_full_check_by_car(self, car_numbers: list[str]) -> dict[str, datetime]:
+        """Когда номер последний раз прошёл успешную полную проверку со
+        статусами. Совпадения feed'а сюда не входят: они подтверждают одну
+        квитанцию, а не весь ответ police.ge."""
         if not car_numbers:
             return {}
         placeholders = ",".join("?" for _ in car_numbers)
         rows = self._conn.execute(
-            "SELECT car_number, MAX(MAX(last_listed_at, COALESCE(missing_since, last_listed_at), "
-            "COALESCE(gone_at, last_listed_at))) FROM georgia_fine_status "
-            f"WHERE car_number IN ({placeholders}) GROUP BY car_number",
+            "SELECT car_number, last_full_check_at FROM georgia_fine_plate_checks "
+            f"WHERE car_number IN ({placeholders})",
             list(car_numbers),
         ).fetchall()
-        return {row[0]: _parse_ts(row[1]) for row in rows if row[1]}
+        return {row[0]: _parse_ts(row[1]) for row in rows}
 
     def list_recently_gone_car_numbers(self, *, since: datetime) -> list[str]:
         rows = self._conn.execute(
@@ -584,30 +600,34 @@ class FineStatusRepository:
         там. Ключ — номер ЗАДАЧИ (тот же, что передают проверки и
         подписки), а не protocolAuto строки.
 
-        Квитанция — 'listed', если police.ge показал её на опорной проверке
-        номера (или feed нашёл её позже), иначе — 'unverified' (⏳): её не
-        было в старом ответе, полученном ещё без нынешней защиты от ложно
-        пустых ответов, поэтому исчезновение не считается подтверждённым —
-        ⚪ только после двух НОВЫХ полных проверок (см. record_full_check).
-        Опорная проверка — одна на номер, по всем его задачам: та же, что у
-        прежней статистики долга (list_debt_car_groups — самая свежая
-        задача номера с положительным снимком), чтобы ни одна машина не
-        потеряла долг; у номера без такого снимка — самая свежая успешная
-        проверка любой его задачи. Номер, у которого ни одна задача не
-        записала успешной проверки (задачи старше поля
-        last_successful_checked_at), — только ⏳: опоры нет, а прежняя
-        статистика долгом его не считала. Сравнение дат — в Python, а не в
-        SQL: last_seen_at и last_successful_checked_at пишутся разными
-        путями. Возвращает число созданных строк."""
-        task_plates: dict[int, str] = {}
+        Квитанция — 'listed', если хотя бы одна её строка не старше обеих
+        проверок: проверки своей задачи и опорной проверки номера (то есть
+        police.ge показал её в ответе, новее которого для этой строки нет,
+        или feed нашёл её позже). Иначе — 'unverified' (⏳): её не было в
+        старом ответе, полученном ещё без нынешней защиты от ложно пустых
+        ответов, поэтому исчезновение не считается подтверждённым — ⚪
+        только после двух НОВЫХ полных проверок (см. record_full_check).
+        Опорная проверка номера — та же, что у прежней статистики долга
+        (list_debt_car_groups — самая свежая задача номера с положительным
+        снимком), чтобы ни одна машина не потеряла и не изменила долг; у
+        номера без такого снимка — самая свежая успешная проверка любой его
+        задачи. Проверка своей задачи не даёт засчитать строку, которую
+        более новая (в том числе нулевая) проверка той же задачи уже не
+        нашла. Номер, у которого ни одна задача не записала успешной
+        проверки (задачи старше поля last_successful_checked_at), — только
+        ⏳: опоры нет, а прежняя статистика долгом его не считала.
+        Сравнение дат — в Python, а не в SQL: last_seen_at и
+        last_successful_checked_at пишутся разными путями. Возвращает число
+        созданных строк."""
+        task_plates: dict[int, tuple[str, datetime | None]] = {}
         debt_reference: dict[str, datetime] = {}
         any_reference: dict[str, datetime] = {}
         for task_id, car_number, total, checked_raw in self._conn.execute(
             "SELECT id, car_number, last_successful_total_amount, last_successful_checked_at "
             "FROM fine_monitoring_tasks"
         ):
-            task_plates[task_id] = car_number
             checked_at = _parse_ts(checked_raw)
+            task_plates[task_id] = (car_number, checked_at)
             if checked_at is None:
                 continue
             if checked_at > any_reference.get(car_number, datetime.min):
@@ -620,23 +640,29 @@ class FineStatusRepository:
             "FROM detected_fines WHERE external_fine_id IS NOT NULL AND external_fine_id != ''"
         ).fetchall()
         for task_id, protocol_no, amount, first_detected_at, last_seen_at in rows:
-            car_number = task_plates.get(task_id)
-            if car_number is None or is_fine_output_suppressed(car_number):
+            if task_id not in task_plates:
+                continue
+            car_number, task_checked_at = task_plates[task_id]
+            if is_fine_output_suppressed(car_number):
                 continue
             seen_at = _parse_ts(last_seen_at)
             first_at = _parse_ts(first_detected_at)
+            plate_reference = debt_reference.get(car_number) or any_reference.get(car_number)
+            references = [value for value in (task_checked_at, plate_reference) if value is not None]
+            listed = bool(references) and seen_at >= max(references) - SNAPSHOT_TOLERANCE
             seed = seeds.setdefault((car_number, protocol_no), {
-                "amount": amount, "first_at": first_at, "seen_at": seen_at,
+                "amount": amount, "first_at": first_at, "seen_at": seen_at, "listed": False,
             })
             if seed["amount"] is None:
                 seed["amount"] = amount
             seed["first_at"] = min(seed["first_at"], first_at)
             seed["seen_at"] = max(seed["seen_at"], seen_at)
+            if listed:
+                seed["listed"] = True
         created = 0
         with self._conn:
             for (car_number, protocol_no), seed in seeds.items():
-                reference = debt_reference.get(car_number) or any_reference.get(car_number)
-                listed = reference is not None and seed["seen_at"] >= reference - SNAPSHOT_TOLERANCE
+                listed = seed["listed"]
                 presence = PRESENCE_LISTED if listed else PRESENCE_UNVERIFIED
                 cursor = self._conn.execute(
                     "INSERT OR IGNORE INTO georgia_fine_status "
@@ -730,6 +756,7 @@ class FineStatusTracker:
                 summary.reappeared += 1
         if not complete:
             summary.skipped_incomplete = True
+            self._repository.record_full_check_time(car_number, now)
             return summary
 
         for status in self._repository.list_for_car(car_number, include_gone=False):
@@ -755,6 +782,7 @@ class FineStatusTracker:
                     )
                     summary.gone += 1
                     summary.gone_protocols.append(status.protocol_no)
+        self._repository.record_full_check_time(car_number, now)
         return summary
 
     def record_listed(
@@ -892,8 +920,8 @@ class FineStatusTracker:
     def car_numbers_with_statuses(self, car_numbers: list[str]) -> set[str]:
         return self._repository.list_car_numbers_with_statuses(car_numbers)
 
-    def latest_observation_by_car(self, car_numbers: list[str]) -> dict[str, datetime]:
-        return self._repository.latest_observation_by_car(car_numbers)
+    def last_full_check_by_car(self, car_numbers: list[str]) -> dict[str, datetime]:
+        return self._repository.last_full_check_by_car(car_numbers)
 
     def breakdown_for_cars(self, car_numbers: list[str]) -> dict[str, DebtBreakdown]:
         by_car: dict[str, list[FineStatus]] = {}

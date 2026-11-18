@@ -122,14 +122,17 @@ On its first start the bot creates statuses from the existing
 - Each plate gets one reference check across all its tasks. If the plate
   has a task with a positive saved total, the reference is the check that
   the old debt statistics already use (the freshest such task), so no car
-  loses its debt. Otherwise it is the latest successful check of any task
-  of the plate.
-- A receipt that police.ge returned in the reference check, or that the
-  public feed found later, becomes 🔴 `listed`.
-- A receipt that was absent from the reference check becomes ⏳
-  `unverified`. So does every receipt of a plate none of whose tasks has a
-  recorded successful check (tasks older than that field): there is nothing
-  to compare with, and the old statistics did not count them as debt.
+  loses or changes its debt. Otherwise it is the latest successful check of
+  any task of the plate.
+- A receipt becomes 🔴 `listed` if one of its rows is not older than both
+  its own task's last check and the plate's reference check: police.ge
+  returned it in the newest answer that applies to that row, or the public
+  feed found it later. A newer check of the same task, even one with total
+  0, that no longer showed the receipt keeps it from being listed.
+- Any other receipt becomes ⏳ `unverified`. So does every receipt of a
+  plate none of whose tasks has a recorded successful check (tasks older
+  than that field): there is nothing to compare with, and the old
+  statistics did not count them as debt.
   That answer came before the empty-answer protection and may have been
   falsely empty, so it confirms nothing:
   - not ⚪ and not confirmed debt; shown as a separate line in statistics
@@ -143,9 +146,11 @@ On its first start the bot creates statuses from the existing
   - errors, unconfirmed empty answers, incomplete answers and cached reads
     change nothing;
   - clients are notified about it exactly as before (it is not ⚪).
-- In production on 2026-11-18 this was 74 receipts → 🔴 (34 cars) and 289
-  receipts → ⏳ (91 cars, 14 400 ₾; most last seen 30–89 days ago). No
-  receipt becomes ⚪ at first start.
+- A read-only dry run on a copy of the production database (2026-11-18)
+  gave 67 receipts → 🔴 (33 cars) and 296 receipts → ⏳ (92 cars, 87 of
+  them with ⏳ only; 14 800 ₾). No receipt becomes ⚪ at first start.
+  All 29 cars of the old debt list keep their totals. 4 cars are added:
+  receipts the public feed found after their plate's last check.
 - Old tables (`detected_fines`, tasks, subscriptions, deliveries) are not
   changed. New tables are created with `CREATE TABLE IF NOT EXISTS`, and no
   existing table is altered.
@@ -164,11 +169,14 @@ Where statuses are shown:
   - per-car lines: «💰 Задолженность» is 🔴 plus 🟡, then «🟡 Из них…» and
     «🟢 Оплачено» lines. A car whose receipts are all ⚪ is not shown, even if
     an old task still has a positive total;
-  - a saved total newer than the car's statuses and larger than they
-    explain is shown as before, as unpaid debt. This happens when a check
-    ran without statuses (the operator process) or writing statuses failed;
-    errors must not hide debt. The car's ⏳ receipts are then not added on
-    top, because the newer total already includes them;
+  - a saved total that is newer than the plate's last full check with
+    statuses and larger than the statuses explain (🔴 + 🟡, plus 🟢 marks
+    set after that total) is shown as before, as unpaid debt. This happens
+    when a check ran without statuses (the operator process), writing
+    statuses failed, or statuses were just seeded from history; errors must
+    not hide debt. A public-feed match does not count as a full check. The
+    car's ⏳ receipts are then not added on top, because the newer total
+    already includes them;
   - «База police.ge обновлена»;
   - the last evening re-check.
 - «🧾 Статусы оплаты» (trusted managers): enter a plate → list → a receipt →
@@ -256,12 +264,12 @@ requests HTTP 200 (no 403/429/5xx):
 | page GETs (CSRF) | 6–12 |
 | `searchByAuto` (manual checks, refresh, check-all) | 16–133 |
 | **total today** | **~430–550** |
-| daily re-check: plates with known fines today | 34 |
-| plus plates with ⏳ history, during the first ~5 days after enabling | +91 |
-| re-check requests, nights 1–2 | ≈ 125 `searchByAuto` + ≈ 91 zero confirmations (an empty answer for a plate with ⏳ receipts is always asked twice) + 1 page GET ≈ **215–220 (+40–50 %)** |
-| re-check requests, nights 3–5 | ≈ 125 `searchByAuto` + 1 page GET ≈ **130 (+25–30 %)**: the ⏳ receipts are ⚪ by then, and their plates stay in the re-check for 3 days without a second request |
+| daily re-check: plates with known fines today | 33 |
+| plus plates with ⏳ history only, during the first ~5 days after enabling | +87 |
+| re-check requests, nights 1–2 | ≈ 120 `searchByAuto` + ≈ 87 zero confirmations (an empty answer for a plate with ⏳ receipts is always asked twice) + 1 page GET ≈ **205–215 (+40–50 %)** |
+| re-check requests, nights 3–5 | ≈ 120 `searchByAuto` + 1 page GET ≈ **120–125 (+22–29 %)**: the ⏳ receipts are ⚪ by then, and their plates stay in the re-check for 3 days without a second request |
 | re-check requests afterwards | ≈ **35–40 (+7–9 %)** |
-| pass duration | ≈ 8 minutes steady state; ≈ 38 minutes on nights 1–2 (125 × 8 s + 12 × 60 s + 91 × 5 s), still inside the 45-minute window; a plate not reached by 23:45 goes first the next night |
+| pass duration | ≈ 8 minutes steady state; ≈ 36 minutes on nights 1–2 (120 × 8 s + 11 × 60 s + 87 × 5 s), still inside the 45-minute window; a plate not reached by 23:45 goes first the next night |
 
 The collector process uses 33 MB of RAM, and the server has 565 MB available
 (1 vCPU, load 0.10). Each plate is one HTTPS request handled by the existing
