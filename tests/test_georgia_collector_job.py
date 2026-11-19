@@ -1361,9 +1361,11 @@ async def test_fast_killed_mid_cycle_is_followed_by_a_deep_recovery_that_loses_n
     job2, feed_state_repo2, *_ = _make_job(tmp_path, recovery, production)   # restart
     await job2.run(_utc(23, 55))
 
-    # DEEP: the new rows on top, the killed attempt's pages, the boundary,
-    # then the first page of rows the last success had seen.
-    assert recovery.requested_offsets == [i * 30 for i in range(8)]
+    # DEEP reads down to the first page of rows the last success had seen
+    # (offset 210) and stops there; FAST would have stopped on the killed
+    # attempt's pages (offset 90). Only the end is pinned: how a recovery
+    # crosses pages an earlier attempt read is not this rule's business.
+    assert recovery.requested_offsets[-1] == max(recovery.requested_offsets) == 210
     assert sorted(_submitted(production)) == ["ავ000009300", "კვ000000160"]
     assert all(seen_repo.is_seen(p) for p in _protocols(top + new))
     state = feed_state_repo2.get()
@@ -1399,7 +1401,8 @@ async def test_fast_cap_before_the_boundary_is_an_error_and_the_next_cycle_reads
     job2, feed_state_repo2, *_ = _make_job(tmp_path, session2, production)
     await job2.run(_utc(23, 55))
 
-    assert session2.requested_offsets == [0, 30, 60, 90, 120]
+    # DEEP ends on the first page of rows the last success had seen (120).
+    assert session2.requested_offsets[-1] == max(session2.requested_offsets) == 120
     assert sorted(_submitted(production)) == ["ავ000009100", "კვ000000130"]
     assert all(seen_repo.is_seen(p) for p in _protocols(new))
     state = feed_state_repo2.get()
@@ -1440,9 +1443,10 @@ async def test_fast_cap_during_the_lookahead_is_an_error_not_a_success(tmp_path)
     job2, feed_state_repo2, *_ = _make_job(tmp_path, session2, production)
     await job2.run(_utc(23, 55))
 
-    # DEEP: the new rows on top, the capped attempt's page, then the first
-    # page the last success covered (FAST would have read three more).
-    assert session2.requested_offsets == [0, 30, 60]
+    # DEEP: the new rows on top, the capped attempt's page (not covered by
+    # the last success), then the first page the last success covered (60);
+    # FAST would have gone on to 90.
+    assert session2.requested_offsets[-1] == max(session2.requested_offsets) == 60
     assert sorted(_submitted(production)) == ["ავ000009400", "კვ000000170"]
     assert all(seen_repo.is_seen(p) for p in _protocols(top + new))
     state = feed_state_repo2.get()

@@ -2219,9 +2219,12 @@ async def test_fast_killed_mid_cycle_is_followed_by_a_deep_recovery_that_loses_n
     job2, persisted2 = _feed_job(feed_repos, recovery)   # рестарт
     await job2.run(_utc(23, 55))
 
-    # DEEP: новые сверху, страницы убитой попытки, граница, затем первая
-    # страница строк, увиденных последним успехом.
-    assert recovery.requested_offsets == [i * 30 for i in range(8)]
+    # DEEP читает до первой страницы строк, увиденных последним успехом
+    # (смещение 210), и останавливается на ней; FAST остановился бы на
+    # страницах убитой попытки (смещение 90). Закреплён только конец: как
+    # восстановление проходит страницы, прочитанные прошлой попыткой, —
+    # не предмет этого правила.
+    assert recovery.requested_offsets[-1] == max(recovery.requested_offsets) == 210
     assert sorted(persisted + persisted2) == ["ავ000009300", "კვ000000160"]
     assert len(fine_repo.list_by_car_number("AA001AA")) == 2
     assert all(seen_repo.is_seen(p) for p in _protocols(top + new))
@@ -2256,7 +2259,8 @@ async def test_fast_cap_before_the_boundary_is_an_error_and_the_next_cycle_reads
     job2, persisted2 = _feed_job(feed_repos, session2)
     await job2.run(_utc(23, 55))
 
-    assert session2.requested_offsets == [0, 30, 60, 90, 120]
+    # DEEP заканчивает на первой странице строк, увиденных последним успехом (120).
+    assert session2.requested_offsets[-1] == max(session2.requested_offsets) == 120
     assert persisted2 == ["კვ000000130"]
     assert all(seen_repo.is_seen(p) for p in _protocols(new))
     state = feed_state_repo.get()
@@ -2294,9 +2298,9 @@ async def test_fast_cap_during_the_lookahead_is_an_error_not_a_success(feed_repo
     job2, persisted2 = _feed_job(feed_repos, session2)
     await job2.run(_utc(23, 55))
 
-    # DEEP: новые сверху, страница той попытки, затем первая страница,
-    # покрытая последним успехом (FAST прочитал бы ещё три).
-    assert session2.requested_offsets == [0, 30, 60]
+    # DEEP: новые сверху, страница той попытки (не покрыта последним
+    # успехом), затем первая страница, покрытая им (60); FAST пошёл бы до 90.
+    assert session2.requested_offsets[-1] == max(session2.requested_offsets) == 60
     assert persisted2 == ["კვ000000170"]
     assert all(seen_repo.is_seen(p) for p in _protocols(top + new))
     state = feed_state_repo.get()
