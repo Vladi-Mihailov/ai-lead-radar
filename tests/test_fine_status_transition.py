@@ -593,3 +593,27 @@ def test_restart_does_not_take_a_newer_snapshot_from_a_check_without_statuses_as
     by_car = {car: breakdown for car, _, breakdown in rows}
     assert by_car["HH888JJ"].unpaid_amount == 80  # страховка: снимок, а не 0 ₾
     repository.close()
+
+
+def test_seeding_compares_the_snapshot_with_the_amounts_statistics_use(legacy):
+    """Обзор 359daec: квитанция с изменившейся карточкой — строки 50 и 70,
+    снимок 70, а сумма статуса взята из первой строки (50). Снимок статусами
+    не объяснён: время проверки не записывается, статистика показывает 70."""
+    task = legacy.task("JJ999KK", snapshot=70)
+    legacy.fine(task, "GE20", 50, last_seen="2026-11-16 10:00:00")
+    changed = legacy.fines.create(
+        monitoring_task_id=task.id, car_number="JJ999KK", external_fine_id="GE20", fingerprint="fp-JJ999KK-GE20-new",
+        penalty_date=None, due_date=None, delivered_status=None, raw_data="{}", amount=70,
+    )
+    legacy._sql("UPDATE detected_fines SET last_seen_at = '2026-11-16 10:00:00', first_detected_at = "
+                "'2026-11-16 10:00:00' WHERE id = ?", changed.id)
+    repository = FineStatusRepository(legacy.db_path)
+    tracker = FineStatusTracker(repository)
+
+    tracker.seed_from_detected_fines()
+
+    assert tracker.statuses_by_protocol("JJ999KK")["GE20"].amount == 50
+    assert "JJ999KK" not in tracker.last_full_check_by_car(["JJ999KK"])
+    rows, _ = _controller(legacy, tracker)._debt_rows_with_statuses(legacy.tasks.list_debt_car_groups())
+    assert {car: breakdown for car, _, breakdown in rows}["JJ999KK"].unpaid_amount == 70
+    repository.close()

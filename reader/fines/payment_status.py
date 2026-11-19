@@ -647,7 +647,7 @@ class FineStatusRepository:
         seeds: dict[tuple[str, str], dict] = {}
         # номер -> {protocolNo: сумма} — последний ответ задачи-опоры (тот,
         # из которого сложилась сумма снимка прежней статистики)
-        reference_answer: dict[str, dict[str, float | None]] = {}
+        reference_answer: dict[str, set[str]] = {}
         rows = self._conn.execute(
             "SELECT monitoring_task_id, external_fine_id, amount, first_detected_at, last_seen_at "
             "FROM detected_fines WHERE external_fine_id IS NOT NULL AND external_fine_id != ''"
@@ -671,7 +671,7 @@ class FineStatusRepository:
             )
             if in_reference_answer:
                 listed = True
-                reference_answer.setdefault(car_number, {})[protocol_no] = amount
+                reference_answer.setdefault(car_number, set()).add(protocol_no)
             seed = seeds.setdefault((car_number, protocol_no), {
                 "amount": amount, "first_at": first_at, "seen_at": seen_at, "listed": False,
             })
@@ -713,15 +713,21 @@ class FineStatusRepository:
                 answer = reference_answer.get(car_number)
                 if not answer or is_fine_output_suppressed(car_number):
                     continue
-                if sum(amount or 0.0 for amount in answer.values()) + 0.005 < reference_total[car_number]:
-                    continue
-                presence_by_protocol = dict(self._conn.execute(
-                    "SELECT protocol_no, presence FROM georgia_fine_status WHERE car_number = ?", (car_number,),
-                ).fetchall())
+                # Суммы — статусов, как их считает статистика (у квитанции с
+                # изменившейся карточкой сумма статуса может быть меньше суммы
+                # в ответе: тогда снимок не объяснён и страховка остаётся).
+                status_by_protocol = {
+                    protocol_no: (presence, amount)
+                    for protocol_no, presence, amount in self._conn.execute(
+                        "SELECT protocol_no, presence, amount FROM georgia_fine_status WHERE car_number = ?",
+                        (car_number,),
+                    )
+                }
+                answer_statuses = [status_by_protocol.get(protocol_no) for protocol_no in answer]
                 if all(
-                    presence_by_protocol.get(protocol_no) in (PRESENCE_LISTED, PRESENCE_MISSING)
-                    for protocol_no in answer
-                ):
+                    status is not None and status[0] in (PRESENCE_LISTED, PRESENCE_MISSING)
+                    for status in answer_statuses
+                ) and sum(status[1] or 0.0 for status in answer_statuses) + 0.005 >= reference_total[car_number]:
                     self._conn.execute(
                         "INSERT OR IGNORE INTO georgia_fine_plate_checks (car_number, last_full_check_at) "
                         "VALUES (?, ?)",
