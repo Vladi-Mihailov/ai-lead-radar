@@ -380,13 +380,14 @@ async def test_statistics_separates_confirmed_paid_and_uncertain(tmp_path):
     assert "🗓 База police.ge обновлена: 12.11.2026" in reply.text
     assert "🌙 Вечерняя перепроверка 18.11: завершена — проверено 3 из 3, ошибок 0" in reply.text
     assert reply.fine_status_available
-    # подтверждённый долг — первым, оплаченная машина — с нулём и строкой 🟢
+    # подтверждённый долг — первым, оплаченная машина — только строкой 🟢
     position = {car: reply.text.index(format_plate_for_telegram(car)) for car in ("AA111BB", "BB222CC", "CC333DD")}
     assert position["AA111BB"] < position["CC333DD"] < position["BB222CC"]
     paid_block = reply.text[position["BB222CC"]:]
-    assert "💰 Задолженность: 0 ₾" in paid_block and "🟢 Оплачено: 30 ₾" in paid_block
+    assert "🟢 Оплачено: 1 штраф — 30 ₾" in paid_block and "🔴" not in paid_block
     review_block = reply.text[position["CC333DD"]:position["BB222CC"]]
-    assert "💰 Задолженность: 70 ₾" in review_block and "🟡 Из них требует проверки: 70 ₾" in review_block
+    assert "🔴 Неоплачено: 1 штраф — 70 ₾" in review_block
+    assert "🟡 Из них требуют проверки: 1 штраф — 70 ₾" in review_block
     fixture.close()
 
 
@@ -400,7 +401,7 @@ def test_summary_without_uncertain_fines_has_no_needs_review_line():
     """🟡 = 0 — строки нет вовсе, и пустой строки на её месте тоже нет."""
     assert _summary_lines(unpaid_amount=150, unpaid_count=2, paid_amount=30, paid_count=1) == [
         "🚨 Штрафы по последней проверке",
-        "Автомобилей: 2",
+        "Автомобили со штрафами: 2",
         "🔴 Подтверждённая задолженность: 150 ₾ (2 шт.)",
         "🟢 Оплачено, ещё в базе полиции: 30 ₾ (1 шт.)",
         "",
@@ -455,7 +456,8 @@ async def test_statistics_counts_uncertain_fines_of_all_cars_and_keeps_their_amo
 
     assert "🟡 Требуют проверки: 3 штрафа" in stats.splitlines()
     assert "🔴 Подтверждённая задолженность: 40 ₾ (1 шт.)" in stats
-    assert "🟡 Из них требует проверки: 150 ₾" in stats and "🟡 Из них требует проверки: 30 ₾" in stats
+    assert "🟡 Из них требуют проверки: 2 штрафа — 150 ₾" in stats
+    assert "🟡 Из них требуют проверки: 1 штраф — 30 ₾" in stats
     assert "№GE1 — 50 ₾ — 🟡 Оплата требует проверки" in screen.text
     assert "№GE2 — 100 ₾ — 🟡 Оплата требует проверки" in screen.text
 
@@ -469,7 +471,7 @@ async def test_car_with_only_gone_receipts_leaves_statistics_despite_old_snapsho
 
     reply = fx.controller._format_statistics_reply()
 
-    assert "Автомобилей: 0" in reply.text
+    assert "Автомобили со штрафами: 0" in reply.text
     assert "🔴 Подтверждённая задолженность: 0 ₾ (0 шт.)" in reply.text
 
 
@@ -489,7 +491,7 @@ async def test_unverified_history_is_shown_separately_not_as_debt(fx):
 
     assert "🔴 Подтверждённая задолженность: 50 ₾ (1 шт.)" in stats
     assert "⏳ Ждут повторной проверки police.ge: 30 ₾ (1 шт.)" in stats
-    assert "⏳ Ждут повторной проверки: 30 ₾" in stats  # строка в блоке машины
+    assert "⏳ Ждут повторной проверки: 1 штраф — 30 ₾" in stats  # строка в блоке машины
     assert "№OLD1 — 30 ₾ — ⏳ Ждёт повторной проверки police.ge" in screen.text
 
 
@@ -509,7 +511,7 @@ async def test_snapshot_newer_than_statuses_is_still_shown_as_debt(fx):
     reply = fx.controller._format_statistics_reply()
 
     assert "🔴 Подтверждённая задолженность: 90 ₾" in reply.text
-    assert "💰 Задолженность: 90 ₾" in reply.text
+    assert "🔴 Неоплачено: 90 ₾ (количество уточнится при следующей проверке)" in reply.text
 
 
 async def test_stale_statuses_with_listed_receipts_do_not_hide_a_newer_debt(fx):
@@ -524,7 +526,7 @@ async def test_stale_statuses_with_listed_receipts_do_not_hide_a_newer_debt(fx):
 
     stats = fx.controller._format_statistics_reply().text
 
-    assert "💰 Задолженность: 80 ₾" in stats
+    assert "🔴 Неоплачено: 80 ₾ (количество уточнится при следующей проверке)" in stats
     assert "🔴 Подтверждённая задолженность: 80 ₾" in stats
 
 
@@ -538,13 +540,16 @@ async def test_paid_mark_set_after_a_newer_snapshot_explains_it_after_the_next_f
     await untracked.check_task(fx.tasks.get(task.id))
     fx.tracker.mark_paid(fx.status(_CAR, "GE1").id, actor_user_id=_TRUSTED, note="TBC 1")
 
-    assert "💰 Задолженность: 100 ₾" in fx.controller._format_statistics_reply().text
+    assert "🔴 Неоплачено: 100 ₾ (количество уточнится при следующей проверке)" in (
+        fx.controller._format_statistics_reply().text
+    )
 
     await fx.check(task)  # полная проверка со статусами
     stats = fx.controller._format_statistics_reply().text
 
     assert "🔴 Подтверждённая задолженность: 0 ₾ (0 шт.)" in stats
     assert "🟢 Оплачено, ещё в базе полиции: 100 ₾ (1 шт.)" in stats
+    assert "🟢 Оплачено: 1 штраф — 100 ₾" in stats and "🔴 Неоплачено" not in stats
 
 
 async def test_paid_mark_on_history_does_not_hide_a_newer_snapshot(fx):
@@ -561,7 +566,7 @@ async def test_paid_mark_on_history_does_not_hide_a_newer_snapshot(fx):
 
     stats = fx.controller._format_statistics_reply().text
 
-    assert "💰 Задолженность: 80 ₾" in stats
+    assert "🔴 Неоплачено: 80 ₾ (количество уточнится при следующей проверке)" in stats
 
 
 async def test_paid_mark_older_than_a_newer_snapshot_does_not_hide_new_debt(fx):
@@ -581,7 +586,7 @@ async def test_paid_mark_older_than_a_newer_snapshot_does_not_hide_new_debt(fx):
 
     stats = fx.controller._format_statistics_reply().text
 
-    assert "💰 Задолженность: 100 ₾" in stats
+    assert "🔴 Неоплачено: 100 ₾ (количество уточнится при следующей проверке)" in stats
     assert "🔴 Подтверждённая задолженность: 100 ₾" in stats
 
 
@@ -598,7 +603,7 @@ async def test_feed_match_does_not_make_outdated_statuses_current(fx):
 
     stats = fx.controller._format_statistics_reply().text
 
-    assert "💰 Задолженность: 120 ₾" in stats
+    assert "🔴 Неоплачено: 120 ₾ (количество уточнится при следующей проверке)" in stats
 
 
 def _make_unverified(fx, protocol_no, amount):
@@ -636,7 +641,7 @@ async def test_unverified_receipt_marked_failed_payment_stays_in_debt(fx):
     stats = fx.controller._format_statistics_reply().text
 
     assert "🟡 Требуют проверки: 1 штраф" in stats.splitlines()
-    assert "💰 Задолженность: 40 ₾" in stats and "🟡 Из них требует проверки: 40 ₾" in stats
+    assert "🔴 Неоплачено: 1 штраф — 40 ₾" in stats and "🟡 Из них требуют проверки: 1 штраф — 40 ₾" in stats
     assert "⏳ Ждут повторной проверки" not in stats
 
 
@@ -1004,3 +1009,242 @@ async def test_trusted_one_off_check_leaves_out_a_paid_receipt_back_after_gone(f
     reply = fx.controller._format_one_off_reply(result)
 
     assert "💰 Штрафы: 50 ₾ (🟢 оплачено: 100 ₾)" in reply.text
+
+
+# ---- 📊 Статистика: число и сумма штрафов по каждой машине (задача
+# "показывать по каждой машине количество и сумму отдельно") ----
+
+_PLATE_LINE = f"🚗 Госномер: {format_plate_for_telegram('AA111BB')}"
+
+
+def _debt_row_lines(breakdown, *, owners=(), total_amount=0.0):
+    return texts.format_debt_row(
+        car_number="AA111BB", owners=list(owners), total_amount=total_amount, breakdown=breakdown,
+    ).splitlines()
+
+
+def _car_block(text, car):
+    """Блок одной машины из ответа 📊 Статистика — до пустой строки."""
+    start = text.index(f"🚗 Госномер: {format_plate_for_telegram(car)}")
+    end = text.find("\n\n", start)
+    return text[start:] if end == -1 else text[start:end]
+
+
+def _unverified_receipt(fx, car, protocol_no, amount):
+    status = fx.tracker._repository.insert_listed(
+        car_number=car, protocol_no=protocol_no, amount=amount, at=datetime(2026, 10, 1, 10, 0), source="check",
+    )
+    fx.tracker._repository._conn.execute(
+        "UPDATE georgia_fine_status SET presence = 'unverified' WHERE id = ?", (status.id,),
+    )
+    fx.tracker._repository._conn.commit()
+    return status
+
+
+def test_debt_row_unpaid_only_shows_count_and_amount():
+    assert _debt_row_lines(DebtBreakdown(unpaid_amount=150, unpaid_count=2)) == [
+        _PLATE_LINE, "🔴 Неоплачено: 2 штрафа — 150 ₾", texts.DEBT_OWNER_NOT_LINKED_LINE,
+    ]
+
+
+def test_debt_row_paid_only_has_no_unpaid_line():
+    assert _debt_row_lines(DebtBreakdown(paid_amount=30, paid_count=1)) == [
+        _PLATE_LINE, "🟢 Оплачено: 1 штраф — 30 ₾", texts.DEBT_OWNER_NOT_LINKED_LINE,
+    ]
+
+
+def test_debt_row_needs_review_stays_in_unpaid_and_is_shown_apart():
+    assert _debt_row_lines(DebtBreakdown(
+        unpaid_amount=50, unpaid_count=1, needs_review_amount=100, needs_review_count=2,
+    )) == [
+        _PLATE_LINE,
+        "🔴 Неоплачено: 3 штрафа — 150 ₾",
+        "🟡 Из них требуют проверки: 2 штрафа — 100 ₾",
+        texts.DEBT_OWNER_NOT_LINKED_LINE,
+    ]
+
+
+def test_debt_row_never_mixes_paid_and_unpaid_sums():
+    lines = _debt_row_lines(DebtBreakdown(unpaid_amount=50, unpaid_count=1, paid_amount=30, paid_count=2))
+
+    assert lines[1:3] == ["🔴 Неоплачено: 1 штраф — 50 ₾", "🟢 Оплачено: 2 штрафа — 30 ₾"]
+    assert not any("80 ₾" in line for line in lines)
+
+
+def test_debt_row_unverified_history_is_not_unpaid():
+    lines = _debt_row_lines(DebtBreakdown(unpaid_amount=50, unpaid_count=1, unverified_amount=30, unverified_count=1))
+
+    assert lines[1:3] == ["🔴 Неоплачено: 1 штраф — 50 ₾", "⏳ Ждут повторной проверки: 1 штраф — 30 ₾"]
+
+
+def test_debt_row_lines_keep_their_order_and_owners_stay_last():
+    owners = [
+        texts.DebtOwner(name="Иван", username="ivan_p"),
+        texts.DebtOwner(name=None, username=None, notifications_off=True),
+    ]
+    lines = _debt_row_lines(DebtBreakdown(
+        unpaid_amount=50, unpaid_count=1, needs_review_amount=40, needs_review_count=1,
+        paid_amount=30, paid_count=1, unverified_amount=20, unverified_count=1,
+    ), owners=owners)
+
+    assert lines == [
+        _PLATE_LINE,
+        "🔴 Неоплачено: 2 штрафа — 90 ₾",
+        "🟡 Из них требуют проверки: 1 штраф — 40 ₾",
+        "🟢 Оплачено: 1 штраф — 30 ₾",
+        "⏳ Ждут повторной проверки: 1 штраф — 20 ₾",
+        "👤 Пользователь: Иван",
+        "🔗 Telegram: @ivan_p",
+        "👤 Пользователь: Имя не указано (уведомления выключены)",
+        "🔗 Telegram: Логин не указан",
+    ]
+
+
+def test_debt_row_with_unknown_count_shows_the_amount_without_a_count():
+    """Снимок суммы, который статусы не объясняют: число штрафов неизвестно,
+    нижняя граница 1 из итогов в строке машины не печатается."""
+    assert _debt_row_lines(texts.SnapshotDebt(unpaid_amount=90, unpaid_count=1)) == [
+        _PLATE_LINE,
+        "🔴 Неоплачено: 90 ₾ (количество уточнится при следующей проверке)",
+        texts.DEBT_OWNER_NOT_LINKED_LINE,
+    ]
+
+
+def test_debt_row_single_fine_explained_by_statuses_is_counted():
+    """Неизвестное число — явный тип, а не догадка по unpaid_count == 1."""
+    assert _debt_row_lines(DebtBreakdown(unpaid_amount=90, unpaid_count=1))[1] == "🔴 Неоплачено: 1 штраф — 90 ₾"
+
+
+def test_debt_row_without_statuses_keeps_the_amount_only_line():
+    assert _debt_row_lines(None, total_amount=250) == [
+        _PLATE_LINE, "💰 Задолженность: 250 ₾", texts.DEBT_OWNER_NOT_LINKED_LINE,
+    ]
+
+
+@pytest.mark.parametrize("count, word", [
+    (1, "штраф"), (2, "штрафа"), (4, "штрафа"), (5, "штрафов"), (11, "штрафов"), (12, "штрафов"),
+    (14, "штрафов"), (20, "штрафов"), (21, "штраф"), (22, "штрафа"), (25, "штрафов"), (101, "штраф"),
+    (111, "штрафов"), (112, "штрафов"), (122, "штрафа"),
+])
+def test_debt_row_uses_the_russian_plural_on_every_line(count, word):
+    lines = _debt_row_lines(DebtBreakdown(
+        unpaid_amount=10, unpaid_count=count, paid_amount=20, paid_count=count,
+        unverified_amount=30, unverified_count=count,
+    ))
+    review_lines = _debt_row_lines(DebtBreakdown(needs_review_amount=40, needs_review_count=count))
+
+    assert lines[1:4] == [
+        f"🔴 Неоплачено: {count} {word} — 10 ₾",
+        f"🟢 Оплачено: {count} {word} — 20 ₾",
+        f"⏳ Ждут повторной проверки: {count} {word} — 30 ₾",
+    ]
+    assert review_lines[1:3] == [
+        f"🔴 Неоплачено: {count} {word} — 40 ₾", f"🟡 Из них требуют проверки: {count} {word} — 40 ₾",
+    ]
+
+
+async def test_paid_only_car_is_listed_but_never_counted_as_debt(fx):
+    """Машина только с 🟢 — в списке и в «Автомобили со штрафами», но её
+    сумма не входит ни в «🔴 Подтверждённая задолженность», ни в чью-либо
+    строку «🔴 Неоплачено»."""
+    debt_task, _ = fx.car("AA111BB", [("GE1", 50)])
+    paid_task, _ = fx.car("BB222CC", [("GE2", 30), ("GE3", 70)])
+    for task in (debt_task, paid_task):
+        await fx.check(task)
+    for protocol in ("GE2", "GE3"):
+        fx.tracker.mark_paid(fx.status("BB222CC", protocol).id, actor_user_id=_TRUSTED, note="TBC 1")
+
+    text = fx.controller._format_statistics_reply().text
+
+    assert "Автомобили со штрафами: 2" in text.splitlines()
+    assert "Автомобилей:" not in text
+    assert "🔴 Подтверждённая задолженность: 50 ₾ (1 шт.)" in text
+    assert "🟢 Оплачено, ещё в базе полиции: 100 ₾ (2 шт.)" in text
+    assert _car_block(text, "AA111BB").splitlines()[1:] == [
+        "🔴 Неоплачено: 1 штраф — 50 ₾", texts.DEBT_OWNER_NOT_LINKED_LINE,
+    ]
+    assert _car_block(text, "BB222CC").splitlines()[1:] == [
+        "🟢 Оплачено: 2 штрафа — 100 ₾", texts.DEBT_OWNER_NOT_LINKED_LINE,
+    ]
+    assert "150 ₾" not in text
+
+
+async def test_unverified_only_and_gone_only_cars_stay_out_of_the_list(fx):
+    debt_task, _ = fx.car("AA111BB", [("GE1", 50)])
+    gone_task, _ = fx.car("CC333DD", [("GE5", 70)])
+    fx.car("BB222CC", [])  # ни одной успешной проверки — только квитанция из истории
+    for task in (debt_task, gone_task):
+        await fx.check(task)
+    _unverified_receipt(fx, "BB222CC", "OLD1", 40)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    fx.tracker.record_full_check("CC333DD", [], complete=True, empty_confirmed=True, at=now - timedelta(hours=13))
+    fx.tracker.record_full_check("CC333DD", [], complete=True, empty_confirmed=True, at=now + timedelta(seconds=5))
+
+    text = fx.controller._format_statistics_reply().text
+
+    assert format_plate_for_telegram("BB222CC") not in text
+    assert format_plate_for_telegram("CC333DD") not in text
+    assert "Автомобили со штрафами: 1" in text.splitlines()
+    assert "🔴 Подтверждённая задолженность: 50 ₾ (1 шт.)" in text
+    assert "⏳ Ждут повторной проверки police.ge: 40 ₾ (1 шт.)" in text
+
+
+async def test_unknown_count_car_keeps_exact_amounts_and_sorting(fx):
+    """Снимок новее статусов: в строке машины — сумма без числа; в итогах
+    сумма точная, а число — нижняя граница (1 за такую машину)."""
+    known_task, _ = fx.car("AA111BB", [("GE1", 50), ("GE2", 100)])
+    await fx.check(known_task)
+    task, _ = fx.car("BB222CC", [("GE5", 50)])
+    two_hours_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2)
+    fx.tracker.record_full_check("BB222CC", [_record("BB222CC", "GE5", 50)], complete=True, at=two_hours_ago)
+    fx.provider.records["BB222CC"] = [_record("BB222CC", "GE5", 50), _record("BB222CC", "GE6", 30)]
+    untracked = FineCheckService(fx.provider, fx.tasks, fx.fines, sleep=_instant)  # без статусов
+    await untracked.check_task(fx.tasks.get(task.id))
+
+    text = fx.controller._format_statistics_reply().text
+
+    assert "Автомобили со штрафами: 2" in text.splitlines()
+    assert "🔴 Подтверждённая задолженность: 230 ₾ (3 шт.)" in text
+    assert _car_block(text, "AA111BB").splitlines()[1] == "🔴 Неоплачено: 2 штрафа — 150 ₾"
+    unknown_block = _car_block(text, "BB222CC")
+    assert unknown_block.splitlines()[1] == "🔴 Неоплачено: 80 ₾ (количество уточнится при следующей проверке)"
+    assert "штраф" not in unknown_block
+    assert text.index(format_plate_for_telegram("AA111BB")) < text.index(format_plate_for_telegram("BB222CC"))
+
+
+async def test_debt_list_sorting_owners_and_pagination_are_unchanged(fx):
+    """Сортировка прежняя: долг (🔴 + 🟡) по убыванию, затем оплаченное, затем
+    номер; владельцы — после строк статусов; страницы — по 10 машин."""
+    tie_paid, _ = fx.car("AA111BB", [("GE1", 50), ("GE2", 30)], owner=_OWNER)
+    tie_plain, _ = fx.car("BB222CC", [("GE3", 50)])
+    paid_late, _ = fx.car("DD444EE", [("GE4", 70)])
+    paid_early, _ = fx.car("CC333DD", [("GE5", 70)])
+    small = [fx.car(f"EE{100 + index}FF", [(f"GE{10 + index}", 5)])[0] for index in range(8)]
+    for task in (tie_paid, tie_plain, paid_late, paid_early, *small):
+        await fx.check(task)
+    for car, protocol in (("AA111BB", "GE2"), ("DD444EE", "GE4"), ("CC333DD", "GE5")):
+        fx.tracker.mark_paid(fx.status(car, protocol).id, actor_user_id=_TRUSTED, note="TBC 1")
+    fx.known.record_seen(
+        telegram_user_id=_OWNER, telegram_chat_id=_OWNER, telegram_username="owner_test", first_name="Анна",
+    )
+
+    first = fx.controller._format_statistics_reply()
+    second = fx.controller._format_statistics_reply(debt_page=1)
+
+    assert (first.debt_list_page, first.debt_list_total_pages) == (0, 2)
+    order = ["AA111BB", "BB222CC", *(f"EE{100 + index}FF" for index in range(8))]
+    positions = [first.text.index(format_plate_for_telegram(car)) for car in order]
+    assert positions == sorted(positions)
+    assert second.text.index(format_plate_for_telegram("CC333DD")) < second.text.index(
+        format_plate_for_telegram("DD444EE"),
+    )
+    assert format_plate_for_telegram("CC333DD") not in first.text
+    assert _car_block(first.text, "AA111BB").splitlines()[1:] == [
+        "🔴 Неоплачено: 1 штраф — 50 ₾",
+        "🟢 Оплачено: 1 штраф — 30 ₾",
+        "👤 Пользователь: Анна",
+        "🔗 Telegram: @owner_test",
+    ]
+    assert "Автомобили со штрафами: 12" in second.text.splitlines()
+    assert "🔴 Подтверждённая задолженность: 140 ₾ (10 шт.)" in second.text
+    assert "🟢 Оплачено, ещё в базе полиции: 170 ₾ (3 шт.)" in second.text

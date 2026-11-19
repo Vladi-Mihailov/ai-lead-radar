@@ -172,9 +172,17 @@ Where statuses are shown:
   - confirmed debt (🔴) and paid but still listed (🟢), with counts; uncertain
     (🟡) as a count only («🟡 Требуют проверки: 3 штрафа»), and no 🟡 line at
     all when nothing needs review;
-  - per-car lines: «💰 Задолженность» is 🔴 plus 🟡, then «🟡 Из них…» and
-    «🟢 Оплачено» lines. A car whose receipts are all ⚪ is not shown, even if
-    an old task still has a positive total;
+  - «Автомобили со штрафами» counts every car in the list, cars with only 🟢
+    fines included. 🟢 sums are never added to «🔴 Неоплачено» or «🔴
+    Подтверждённая задолженность» (see the saved-total exception below);
+  - per-car lines give the number of fines and their sum, each line only when
+    its number is above zero: «🔴 Неоплачено» is 🔴 plus 🟡, then «🟡 Из них
+    требуют проверки», «🟢 Оплачено» (not part of the unpaid sum) and «⏳ Ждут
+    повторной проверки» (not debt), for example «🔴 Неоплачено: 3 штрафа —
+    150 ₾». A car with only 🟢 has just its 🟢 line. A car whose receipts are
+    all ⚪ is not shown, even if an old task still has a positive total, and a
+    car with only ⏳ receipts has no line (they count in the summary's ⏳
+    line);
   - a saved total that is newer than the plate's last full check with
     statuses and larger than the statuses' 🔴 + 🟡 is shown as before, as
     unpaid debt. This happens when a check ran without statuses (the
@@ -184,7 +192,10 @@ Where statuses are shown:
     paid receipt may already be gone and a new fine in its place), so until
     the next full check the car shows its saved total. The car's ⏳
     receipts are then not added on top, because the newer total already
-    includes them;
+    includes them. The number of fines behind such a total is unknown: the
+    car's line shows the sum only, «🔴 Неоплачено: 80 ₾ (количество
+    уточнится при следующей проверке)», and the summary counts the car as
+    one fine (a lower bound);
   - «База police.ge обновлена»;
   - the last evening re-check.
 - «🧾 Статусы оплаты» (trusted managers): enter a plate → list → a receipt →
@@ -257,7 +268,7 @@ Client delivery:
 - Statistics at first start: seeding records the snapshot's time as the
   plate's last full check when every receipt of the snapshot check's answer
   is among the statuses still in the police base (with any payment mark)
-  and they add up to the snapshot, so a 🟢 mark leaves «Задолженность» at
+  and they add up to the snapshot, so a 🟢 mark leaves «Неоплачено» at
   once even on plates not checked since the transition. The match is by
   receipt, not by sum: on a later start, a newer snapshot from a check
   without statuses (its receipts ⏳ or without a status) or other receipts
