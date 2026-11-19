@@ -284,10 +284,12 @@ Client delivery:
   total that is newer than the statuses (a check without statuses) or not
   explained by them is still shown whole, possibly including a 🟢 receipt,
   until the next full check — so that a new fine that took the paid one's
-  place is never hidden. Known limitation (issue #62): the operator
-  process's checks (its scheduled runs and `fine check` / `fine update-all`)
-  write such totals, so a 🟢-only car can show as unpaid with an unknown
-  count until the bot's next full check.
+  place is never hidden. Known limitation (issue #62): such a total comes
+  from a manual operator `fine check` / `fine update-all` (the operator
+  process checks without statuses; its scheduled check jobs are off in
+  remote-collector mode, and collector ingest writes no totals), a failed
+  status write, or a saved total seeding could not explain. Until the bot's
+  next full check, a 🟢-only car then shows as unpaid with an unknown count.
 
 ## Daily evening re-check
 

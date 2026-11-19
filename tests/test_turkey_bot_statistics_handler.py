@@ -444,3 +444,19 @@ async def test_debt_list_counts_gib_and_kgm_records_and_never_shows_paid():
     assert "Общая сумма: 2 740 ₺" in full_text
     assert "🟢" not in full_text
     assert "оплачено" not in full_text.lower()
+
+
+async def test_debt_list_skips_records_whose_amount_did_not_parse():
+    """Ревью: GİB has_debt без разобранных сумм (итог 0, debt_count 2) и KGM
+    615 ₺ в 3 строках — сумма 615 ₺, и за ней только 3 проезда KGM."""
+    manager = 900000001
+    fx = _Fixture(trusted_operator_user_ids=frozenset({manager}))
+    fx.add_car(telegram_user_id=1, car_number="34ABC123")
+    fx.save_run(telegram_user_id=1, plate="34ABC123", providers=(
+        _counted("gib", Decimal(0), 2), _provider(ProviderStatus.NO_DEBT, Decimal(0), provider="avrasya"),
+        _counted("kgm", Decimal(615), 3),
+    ))
+
+    full_text = await _statistics_text(fx, telegram_user_id=manager)
+
+    assert "🔴 Неоплаченные записи: 615 ₺ — 3 неоплаченных проезда KGM" in full_text.splitlines()

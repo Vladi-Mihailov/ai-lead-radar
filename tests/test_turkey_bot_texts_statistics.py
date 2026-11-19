@@ -600,6 +600,23 @@ def test_debt_row_count_uses_the_russian_plural(count, gib_text, kgm_text):
     assert text.splitlines()[1] == f"🔴 Неоплаченные записи: 300 ₺ — {gib_text} GİB, {kgm_text} KGM"
 
 
+def test_debt_row_does_not_count_records_of_a_provider_whose_amount_is_not_in_the_sum():
+    """Ревью: штрафы GİB без разобранной суммы (amount 0) за суммой строки не
+    стоят — считаются только проезды KGM, чья сумма в ней."""
+    states = (
+        _state("gib", TurkeyProviderFreshness.CURRENT, Decimal(0), last_success_at=_NOV_11,
+               last_attempt_at=_NOV_11, debt_count=2),
+        _state("kgm", TurkeyProviderFreshness.CURRENT, Decimal(615), last_success_at=_NOV_11,
+               last_attempt_at=_NOV_11, debt_count=3),
+    )
+
+    line = texts.format_debt_row(
+        car_number="34ABC123", owners=[], total_amount=Decimal(615), provider_states=states,
+    ).splitlines()[1]
+
+    assert line == "🔴 Неоплаченные записи: 615 ₺ — 3 неоплаченных проезда KGM"
+
+
 def test_debt_row_kgm_only_never_calls_passages_fines():
     states = (
         _state("gib", TurkeyProviderFreshness.CURRENT, last_success_at=_NOV_11, last_attempt_at=_NOV_11),

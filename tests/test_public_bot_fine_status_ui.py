@@ -1213,16 +1213,18 @@ async def test_unknown_count_car_keeps_exact_amounts_and_sorting(fx):
 
 
 async def test_debt_list_sorting_owners_and_pagination_are_unchanged(fx):
-    """Сортировка прежняя: долг (🔴 + 🟡) по убыванию, затем оплаченное, затем
-    номер; владельцы — после строк статусов; страницы — по 10 машин."""
-    tie_paid, _ = fx.car("AA111BB", [("GE1", 50), ("GE2", 30)], owner=_OWNER)
-    tie_plain, _ = fx.car("BB222CC", [("GE3", 50)])
-    paid_late, _ = fx.car("DD444EE", [("GE4", 70)])
-    paid_early, _ = fx.car("CC333DD", [("GE5", 70)])
+    """Сортировка прежняя: долг (🔴 + 🟡) по убыванию, затем оплаченное по
+    убыванию, затем номер; владельцы — после строк статусов; страницы — по 10
+    машин. У машин с большим оплаченным номер нарочно идёт ПОЗЖЕ пары —
+    иначе порядок по оплаченному не отличить от порядка по номеру."""
+    tie_paid, _ = fx.car("BB222CC", [("GE1", 50), ("GE2", 30)], owner=_OWNER)
+    tie_plain, _ = fx.car("AA111BB", [("GE3", 50)])
+    paid_more, _ = fx.car("DD444EE", [("GE4", 80)])
+    paid_less, _ = fx.car("CC333DD", [("GE5", 70)])
     small = [fx.car(f"EE{100 + index}FF", [(f"GE{10 + index}", 5)])[0] for index in range(8)]
-    for task in (tie_paid, tie_plain, paid_late, paid_early, *small):
+    for task in (tie_paid, tie_plain, paid_more, paid_less, *small):
         await fx.check(task)
-    for car, protocol in (("AA111BB", "GE2"), ("DD444EE", "GE4"), ("CC333DD", "GE5")):
+    for car, protocol in (("BB222CC", "GE2"), ("DD444EE", "GE4"), ("CC333DD", "GE5")):
         fx.tracker.mark_paid(fx.status(car, protocol).id, actor_user_id=_TRUSTED, note="TBC 1")
     fx.known.record_seen(
         telegram_user_id=_OWNER, telegram_chat_id=_OWNER, telegram_username="owner_test", first_name="Анна",
@@ -1232,14 +1234,14 @@ async def test_debt_list_sorting_owners_and_pagination_are_unchanged(fx):
     second = fx.controller._format_statistics_reply(debt_page=1)
 
     assert (first.debt_list_page, first.debt_list_total_pages) == (0, 2)
-    order = ["AA111BB", "BB222CC", *(f"EE{100 + index}FF" for index in range(8))]
+    order = ["BB222CC", "AA111BB", *(f"EE{100 + index}FF" for index in range(8))]
     positions = [first.text.index(format_plate_for_telegram(car)) for car in order]
     assert positions == sorted(positions)
-    assert second.text.index(format_plate_for_telegram("CC333DD")) < second.text.index(
-        format_plate_for_telegram("DD444EE"),
+    assert second.text.index(format_plate_for_telegram("DD444EE")) < second.text.index(
+        format_plate_for_telegram("CC333DD"),
     )
     assert format_plate_for_telegram("CC333DD") not in first.text
-    assert _car_block(first.text, "AA111BB").splitlines()[1:] == [
+    assert _car_block(first.text, "BB222CC").splitlines()[1:] == [
         "🔴 Неоплачено: 1 штраф — 50 ₾",
         "🟢 Оплачено: 1 штраф — 30 ₾",
         "👤 Пользователь: Анна",
@@ -1247,7 +1249,7 @@ async def test_debt_list_sorting_owners_and_pagination_are_unchanged(fx):
     ]
     assert "Автомобили со штрафами: 12" in second.text.splitlines()
     assert "🔴 Неоплачено: 10 штрафов — 140 ₾" in second.text.splitlines()
-    assert "🟢 Оплачено, ещё в базе полиции: 170 ₾ (3 шт.)" in second.text
+    assert "🟢 Оплачено, ещё в базе полиции: 180 ₾ (3 шт.)" in second.text
 
 
 _DEBT_LINE = re.compile(r"🔴 Неоплачено: (?:не менее )?(\d+) штраф\w* — (\d+(?:\.\d+)?) ₾")
@@ -1361,3 +1363,71 @@ async def test_long_status_pages_stay_single_messages(tmp_path):
         fixture.controller.handle_debt_list_page(page, telegram_user_id=_TRUSTED).text for page in range(total_pages)
     )
     fixture.close()
+
+
+def test_debt_row_lines_are_decided_by_count_not_amount():
+    """Квитанция без суммы (police.ge не дал amount — в статусах 0) всё равно
+    штраф: каждая строка показывается по числу, а не по сумме."""
+    assert _debt_row_lines(DebtBreakdown(
+        unpaid_count=1, needs_review_count=1, paid_count=1, unverified_count=1,
+    )) == [
+        _PLATE_LINE,
+        "🔴 Неоплачено: 2 штрафа — 0 ₾",
+        "🟡 Из них требуют проверки: 1 штраф — 0 ₾",
+        "🟢 Оплачено: 1 штраф — 0 ₾",
+        "⏳ Ждут повторной проверки: 1 штраф — 0 ₾",
+        texts.DEBT_OWNER_NOT_LINKED_LINE,
+    ]
+
+
+async def test_receipt_without_amount_is_listed_and_counted(fx):
+    task, _ = fx.car("AA111BB", [("GE1", None)])
+    await fx.check(task)
+
+    text = fx.controller._format_statistics_reply().text
+
+    assert "Автомобили со штрафами: 1" in text.splitlines()
+    assert text.splitlines().count("🔴 Неоплачено: 1 штраф — 0 ₾") == 2  # заголовок и машина
+
+
+async def test_unknown_count_header_counts_one_fine_per_car(fx):
+    """Ревью: за снимком 4 штрафа, статусы знают 3 — но они могли уже уйти из
+    ответа, поэтому надёжная нижняя граница — один штраф на машину."""
+    task, _ = fx.car("AA111BB", [("GE1", 50), ("GE2", 60), ("GE3", 70)])
+    two_hours_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2)
+    fx.tracker.record_full_check(
+        "AA111BB", [_record("AA111BB", protocol, amount) for protocol, amount in (("GE1", 50), ("GE2", 60), ("GE3", 70))],
+        complete=True, at=two_hours_ago,
+    )
+    fx.provider.records["AA111BB"].append(_record("AA111BB", "GE4", 80))
+    untracked = FineCheckService(fx.provider, fx.tasks, fx.fines, sleep=_instant)  # без статусов
+    await untracked.check_task(fx.tasks.get(task.id))
+
+    text = fx.controller._format_statistics_reply().text
+
+    assert "🔴 Неоплачено: не менее 1 штрафа — 260 ₾" in text.splitlines()
+    assert _car_block(text, "AA111BB").splitlines()[1] == (
+        "🔴 Неоплачено: 260 ₾ (количество уточнится при следующей проверке)"
+    )
+
+
+async def test_known_limitation_issue_62_saved_total_shows_a_paid_car_as_unpaid(fx):
+    """Известное ограничение (issue #62), поведение не меняется: после
+    проверки без статусов (ручная операторская `fine check`) снимок новее
+    статусов, и машина только с 🟢 до следующей полной проверки показана
+    неоплаченной с неизвестным числом. Её 🟢 при этом не показывается и не
+    считается второй раз: строки 🟢 у машины нет, в 🟢 заголовка её нет."""
+    task, _ = fx.car("BB222CC", [("GE9", 100)])
+    two_hours_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2)
+    fx.tracker.record_full_check("BB222CC", [_record("BB222CC", "GE9", 100)], complete=True, at=two_hours_ago)
+    untracked = FineCheckService(fx.provider, fx.tasks, fx.fines, sleep=_instant)  # без статусов
+    await untracked.check_task(fx.tasks.get(task.id))
+    fx.tracker.mark_paid(fx.status("BB222CC", "GE9").id, actor_user_id=_TRUSTED, note="TBC 1")
+
+    text = fx.controller._format_statistics_reply().text
+
+    assert _car_block(text, "BB222CC").splitlines()[1:] == [
+        "🔴 Неоплачено: 100 ₾ (количество уточнится при следующей проверке)", texts.DEBT_OWNER_NOT_LINKED_LINE,
+    ]
+    assert "🔴 Неоплачено: не менее 1 штрафа — 100 ₾" in text.splitlines()
+    assert "🟢 Оплачено, ещё в базе полиции: 0 ₾ (0 шт.)" in text.splitlines()

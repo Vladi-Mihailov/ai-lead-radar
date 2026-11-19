@@ -887,19 +887,19 @@ _DEBT_RECORD_FALLBACK_FORMS = ("запись", "записи", "записей")
 
 def _format_debt_record_counts(provider_states: tuple[TurkeyProviderDebtState, ...]) -> str | None:
     """"3 штрафа GİB, 4 неоплаченных проезда KGM" — записи долга за суммой
-    строки по провайдерам (только провайдеры с записями). None — число
-    ненадёжно: состояний нет, записей нет, или у провайдера с суммой нет
-    числа записей."""
-    if not any(state.debt_count > 0 for state in provider_states):
-        return None
-    if any(state.amount > 0 and state.debt_count <= 0 for state in provider_states):
+    строки, по провайдерам, чья сумма в неё вошла (amount > 0): записи
+    провайдера без суммы (например, штрафы GİB, у которых сумма не
+    разобралась) за суммой строки не стоят и не считаются. None — число
+    ненадёжно: ни у одного провайдера нет суммы или у провайдера с суммой
+    нет числа записей."""
+    with_amount = [state for state in provider_states if state.amount > 0]
+    if not with_amount or any(state.debt_count <= 0 for state in with_amount):
         return None
     parts = []
-    for state in provider_states:
-        if state.debt_count > 0:
-            forms = _DEBT_RECORD_FORMS.get(state.provider, _DEBT_RECORD_FALLBACK_FORMS)
-            name = _DEBT_PROVIDER_DISPLAY.get(state.provider, state.provider)
-            parts.append(f"{state.debt_count} {_russian_plural(state.debt_count, *forms)} {name}")
+    for state in with_amount:
+        forms = _DEBT_RECORD_FORMS.get(state.provider, _DEBT_RECORD_FALLBACK_FORMS)
+        name = _DEBT_PROVIDER_DISPLAY.get(state.provider, state.provider)
+        parts.append(f"{state.debt_count} {_russian_plural(state.debt_count, *forms)} {name}")
     return ", ".join(parts)
 
 
@@ -935,10 +935,10 @@ def format_debt_row(
     (_format_debt_record_counts): debt_count тех же состояний GİB и KGM, из
     которых сложена сумма (см. TurkeyProviderDebtState; Avrasya не
     прибавляется — её долг уже внутри KGM, как и в сумме). GİB — штрафы,
-    KGM — неоплаченные проезды. Число показывается, только если оно есть у
-    каждого провайдера с долгом; иначе — только сумма, число не
-    выдумывается. Строки "оплачено" у Turkey нет: источники не сообщают об
-    оплате."""
+    KGM — неоплаченные проезды. Считаются только провайдеры, чья сумма вошла
+    в строку; число показывается, только если оно есть у каждого из них;
+    иначе — только сумма, число не выдумывается. Строки "оплачено" у Turkey
+    нет: источники не сообщают об оплате."""
     debt_text = _format_try_amount(total_amount)
     record_counts = _format_debt_record_counts(provider_states)
     if record_counts:
