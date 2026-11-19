@@ -2292,6 +2292,38 @@ async def test_repeated_start_number_at_a_page_end_is_not_confirmed_by_seen_rows
         repos.close()
 
 
+async def test_re_shown_start_number_right_above_a_read_region_is_not_taken_for_the_region(tmp_path):
+    """Второе ревью (dup_probe4): старая квитанция с номером начала участка R
+    (G005) снова показана прямо над уже прочитанным участком S, а между S и R —
+    200 непрочитанных строк (с совпадением). За G005 идут увиденные строки S,
+    поэтому отменить ложное принятие нечему: только проверка соседства
+    (следующая строка должна быть G006) не даёт принять R и перескочить 200
+    строк."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_rows("G", 2000, publish_date="2026-10-22"))
+        await repos.cycle(feed, _utc(15), cap=50)
+        feed.publish(_with_matches(_rows("H", 200, publish_date="2026-10-22"), {120: "M_GAP"}))
+        feed.publish(_rows("S", 300, publish_date="2026-10-22"))
+        await repos.cycle(feed, _utc(21), cap=10)
+        upper, lower = repos.feed_state_repo.get().recovery_regions
+        assert (upper.top[0], upper.length, lower.top[0], lower.length) == ("S000", 300, "G000", 1500)
+        feed.publish([_entry(protocol_no="G005", plate="ZZ005ZZ", publish_date="2026-10-22")])
+        feed.publish(_rows("N", 60, publish_date="2026-10-22"))
+        present = [row["protocolNo"] for row in feed.rows]
+
+        offsets = await repos.cycle(feed, _utc(23, 55), cap=300)
+
+        assert offsets[:3] == [0, 30, 60]
+        assert repos.feed_state_repo.get().last_error is None
+        assert [p for p in present if not repos.seen_repo.is_seen(p)] == []
+        assert repos.persisted == ["M_GAP"]
+    finally:
+        repos.close()
+
+
 async def test_repeated_number_mid_page_does_not_poison_the_saved_region(tmp_path):
     """Второе ревью, сценарий B: новая строка посреди страницы повторяет
     G005, цикл упирается в лимит среди новых строк. Записанный участок —

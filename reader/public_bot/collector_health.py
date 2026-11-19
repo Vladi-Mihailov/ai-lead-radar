@@ -108,6 +108,11 @@ _SCHEMA = (
 )
 
 
+_ADDED_HEALTH_COLUMNS = (
+    ("problem_kind", "TEXT"),
+)
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -235,6 +240,17 @@ class CollectorHealthStore:
         self._conn = sqlite3.connect(db_path)
         for statement in _SCHEMA:
             self._conn.execute(statement)
+        # Колонки, добавленные после первого варианта таблицы (24be82a): на
+        # уже созданной таблице их добавляет открытие хранилища.
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(georgia_collector_health)")}
+        for name, column_type in _ADDED_HEALTH_COLUMNS:
+            if name not in existing:
+                try:
+                    self._conn.execute(f"ALTER TABLE georgia_collector_health ADD COLUMN {name} {column_type}")
+                except sqlite3.OperationalError as exc:
+                    # Другой процесс добавил её между PRAGMA и ALTER.
+                    if "duplicate column name" not in str(exc).lower():
+                        raise
         self._conn.execute("INSERT OR IGNORE INTO georgia_collector_health (id) VALUES (1)")
         self._conn.commit()
 

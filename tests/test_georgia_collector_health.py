@@ -525,6 +525,36 @@ def test_streak_delivery_and_queue_survive_a_restart(tmp_path):
     assert _deliver(fourth, telegram)[0].startswith("✅ ")
 
 
+def test_health_table_created_by_an_earlier_version_gets_the_new_column_and_keeps_its_state(tmp_path):
+    """Таблица первого варианта (24be82a, без problem_kind): открытие
+    хранилища добавляет колонку, состояние сохраняется, observe и сторож
+    работают."""
+    db_path = tmp_path / "users.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE georgia_collector_health (id INTEGER PRIMARY KEY CHECK (id = 1), last_report_at TIMESTAMP, "
+        "last_status TEXT, last_cycle_at TEXT, non_ok_streak INTEGER NOT NULL DEFAULT 0, "
+        "problem_alerted_at TIMESTAMP, silence_alerted_at TIMESTAMP)"
+    )
+    conn.execute("INSERT INTO georgia_collector_health (id, last_report_at, last_status, non_ok_streak) "
+                 "VALUES (1, '2026-11-20T05:03:00+00:00', 'error', 1)")
+    conn.commit()
+    conn.close()
+
+    clock, telegram = _Clock(), _Telegram()
+    monitor = _monitor(clock, db_path)
+    assert monitor.store.load().non_ok_streak == 1
+    monitor.observe(_error(cycle_at="c2"))  # второй неудачный подряд
+    clock.advance(hours=14)
+    monitor.check_silence()
+    problem, silence = _deliver(monitor, telegram)
+    assert problem.startswith(f"⚠️ {_TITLE}: цикл обхода не завершён.")
+    assert silence.startswith(f"⚠️ {_TITLE}: нет отчётов 14 ч")
+    columns = [row[1] for row in sqlite3.connect(db_path).execute("PRAGMA table_info(georgia_collector_health)")]
+    assert columns.count("problem_kind") == 1
+    CollectorHealthStore(db_path).close()  # повторное открытие колонку не дублирует
+
+
 def test_store_tables_are_created_next_to_existing_data(tmp_path):
     db_path = tmp_path / "users.db"
     conn = sqlite3.connect(db_path)

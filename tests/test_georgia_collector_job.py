@@ -1567,6 +1567,35 @@ async def test_repeated_start_number_at_a_page_end_is_not_confirmed_by_seen_rows
     assert _submitted(production) == ["M_NEW"]
 
 
+async def test_re_shown_start_number_right_above_a_read_region_is_not_taken_for_the_region(tmp_path):
+    """Second review (dup_probe4): an old receipt with a start number of region
+    R (G005) is shown again directly above the already-read region S, with 200
+    unread rows (one match) between S and R. The rows after G005 are S's, all
+    seen, so no unread row would undo a false acceptance: only the adjacency
+    check (the next row must be G006) keeps R from being accepted there and
+    the 200 rows from being jumped over."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
+    feed_state_repo, seen_repo = await _first_run_before_the_outage(tmp_path, production, feed)
+    feed.publish(_rows("G", 2000, publish_date="2026-10-22"))
+    await _cycle(tmp_path, feed, production, _utc(15), cap=50)  # region R = G000..G1499
+    feed.publish(_with_matches(_rows("H", 200, publish_date="2026-10-22"), {120: "M_GAP"}))
+    feed.publish(_rows("S", 300, publish_date="2026-10-22"))
+    await _cycle(tmp_path, feed, production, _utc(21), cap=10)  # region S = S000..S299, stops before H
+    upper, lower = feed_state_repo.get().recovery_regions
+    assert (upper.top[0], upper.length, lower.top[0], lower.length) == ("S000", 300, "G000", 1500)
+    feed.publish([_entry(protocol_no="G005", plate="ZZ005ZZ", publish_date="2026-10-22")])
+    feed.publish(_rows("N", 60, publish_date="2026-10-22"))
+    present = [row["protocolNo"] for row in feed.rows]
+
+    offsets = await _cycle(tmp_path, feed, production, _utc(23, 55), cap=300)
+
+    assert offsets[:3] == [0, 30, 60]
+    assert feed_state_repo.get().last_error is None
+    assert [p for p in present if not seen_repo.is_seen(p)] == []
+    assert _submitted(production) == ["M_GAP"]
+
+
 async def test_repeated_number_mid_page_does_not_poison_the_saved_region(tmp_path):
     """Second review, scenario B: a new row in the middle of a page re-uses
     G005 and the cycle stops at its cap among the new rows. The saved
