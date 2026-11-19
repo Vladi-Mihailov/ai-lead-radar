@@ -21,8 +21,11 @@ read). The real feed has ~10k pages (~5–6.3k publications a day), so an
 empty page is unreachable — without this horizon DEEP never completed and
 re-read max_pages pages every cycle. Each cycle first records "cycle in
 progress" as last_error, so a cycle killed midway (SIGTERM, OOM,
-CancelledError) is followed by DEEP recovery, not FAST. FAST mode is
-unchanged.
+CancelledError) is followed by DEEP recovery, not FAST. FAST mode stops one
+overlap page after the first page with a row seen BEFORE this cycle: rows
+this cycle already marked reappear when new publications shift the pages
+during the traversal (production: bursts of 70–360 rows), and stopping on
+them would leave the new rows below unread.
 
 should_run()/run_times/_last_run_slot is the SAME exact-wall-clock pattern
 as reader/jobs/fine_job.py::FineJob.should_run()/reader/jobs/
@@ -247,6 +250,13 @@ class GeorgiaCollectorJob:
         newest_seen_this_cycle: date | None = None
         completed = False
         pending_overlap = False
+        # Отмеченные этим циклом: пока идёт обход, наверху feed'а появляются
+        # новые публикации, страницы сдвигаются вниз, и следующая страница
+        # снова показывает уже прочитанные строки (в production — пачки по
+        # 70–360 строк в циклы 15:00/21:00). Это не граница FAST — граница
+        # только строка, увиденная до этого цикла, иначе FAST остановился бы
+        # на повторе и не дочитал бы новые строки под ним.
+        marked_this_cycle: set[str] = set()
 
         # Отметка "цикл идёт": если процесс остановят посреди цикла (SIGTERM,
         # OOM, CancelledError — их не ловит ни один except ниже), last_error
@@ -284,10 +294,12 @@ class GeorgiaCollectorJob:
                         continue
 
                     if self._seen.is_seen(protocol_no):
-                        page_has_seen_row = True
+                        if protocol_no not in marked_this_cycle:
+                            page_has_seen_row = True
                         continue
 
                     self._seen.mark_seen(protocol_no, publish_date=entry_date or run_at.date(), seen_at=run_at)
+                    marked_this_cycle.add(protocol_no)
                     await self._maybe_submit_entry(entry, monitored)
 
                 if deep_mode and _page_already_processed(

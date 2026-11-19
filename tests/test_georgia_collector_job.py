@@ -812,3 +812,118 @@ async def test_first_run_horizon_uses_the_tbilisi_date_not_utc(tmp_path):
     await job.run(_utc(1, day=23))
 
     assert session.requested_offsets == [0, 30]
+
+
+# ==== live feed: publications between cycles and DURING a traversal
+# (mirrors tests/test_georgia_public_feed_job.py) ====
+
+
+class _LiveFeed:
+    """A newest-first feed that changes like the real one: publish() puts
+    rows on top; rows published while a cycle is still reading shift every
+    later page down, so the next page repeats rows this cycle already read
+    (production: bursts of 70–360 rows in the 15:00/21:00 cycles)."""
+
+    def __init__(self, rows: list[dict] | None = None):
+        self.rows: list[dict] = list(rows or [])
+        self.requested_offsets: list[int] = []
+        self._served = 0
+        self._published_after: dict[int, list[dict]] = {}
+        self._fail_at: dict[int, BaseException] = {}
+
+    def publish(self, rows: list[dict]) -> None:
+        self.rows[:0] = rows
+
+    def publish_after_requests(self, count: int, rows: list[dict]) -> None:
+        """rows appear on top right after the next `count` requests."""
+        self._published_after[self._served + count - 1] = rows
+
+    def fail_after_requests(self, count: int, exc: BaseException) -> None:
+        """The request after the next `count` ones raises exc."""
+        self._fail_at[self._served + count] = exc
+
+    def is_available(self) -> bool:
+        return True
+
+    async def fetch_published_protocols(self, *, first_result: int) -> dict:
+        number = self._served
+        self._served += 1
+        self.requested_offsets.append(first_result)
+        if number in self._fail_at:
+            raise self._fail_at.pop(number)
+        entries = self.rows[first_result:first_result + 30]
+        if number in self._published_after:
+            self.publish(self._published_after.pop(number))
+        return _page(entries) if entries else _empty_page()
+
+    async def search_by_plate(self, plate: str) -> dict:
+        return {"success": True, "data": {"count": 0, "results": []}}
+
+
+async def test_fast_reads_new_rows_below_a_page_it_already_read_when_publications_shift_the_pages(tmp_path):
+    """60 rows published after the 2nd page shift the list by two pages: pages
+    3–4 repeat rows this cycle already marked. They are not the frontier —
+    FAST goes on, reads the remaining new rows (and their match) and stops one
+    page after rows seen BEFORE this cycle."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    feed = _LiveFeed(_rows("OLD", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
+    job1, feed_state_repo, seen_repo, _outbox = _make_job(tmp_path, feed, production, first_run_max_pages=10)
+    await job1.run(_utc(15))
+    assert feed_state_repo.get().last_error is None
+
+    feed.publish(_rows("NEW", 119, publish_date="2026-10-22") + [
+        _entry(protocol_no="DEEP_MATCH", plate="AA001AA", publish_date="2026-10-22"),
+    ])
+    feed.publish_after_requests(2, _rows("BURST", 60, publish_date="2026-10-22"))
+    feed.requested_offsets.clear()
+    job2, *_ = _make_job(tmp_path, feed, production)
+    await job2.run(_utc(21))
+
+    assert feed.requested_offsets == [0, 30, 60, 90, 120, 150, 180, 210]
+    assert _submitted(production) == ["DEEP_MATCH"]
+    assert feed_state_repo.get().last_error is None
+
+    feed.requested_offsets.clear()
+    job3, *_ = _make_job(tmp_path, feed, production)
+    await job3.run(_utc(23, 55))
+
+    assert feed.requested_offsets == [0, 30, 60, 90]
+    assert all(seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
+    assert _submitted(production) == ["DEEP_MATCH"]
+
+
+async def test_interrupted_cycle_then_recovery_with_shifting_pages_reads_every_row_once(tmp_path):
+    """End to end: a first run, a cycle killed after two pages, a recovery
+    during which 45 rows are published on top, then FAST. Every published
+    row ends up seen and every match is submitted exactly once."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    feed = _LiveFeed(_rows("Y0_", 30, publish_date="2026-10-21"))
+    feed.publish(_rows("A", 45, publish_date="2026-10-22"))
+    job1, feed_state_repo, seen_repo, _outbox = _make_job(tmp_path, feed, production)
+    await job1.run(_utc(9))
+    assert feed_state_repo.get().last_error is None
+
+    feed.publish(_rows("B", 89, publish_date="2026-10-22") + [
+        _entry(protocol_no="MATCH_BELOW_KILL", plate="AA001AA", publish_date="2026-10-22"),
+    ])
+    feed.fail_after_requests(2, asyncio.CancelledError())
+    job2, *_ = _make_job(tmp_path, feed, production)
+    with pytest.raises(asyncio.CancelledError):
+        await job2.run(_utc(15))
+    assert feed_state_repo.get().last_error is not None
+
+    feed.publish(_rows("C", 60, publish_date="2026-10-22"))
+    feed.publish_after_requests(1, [_entry(protocol_no="MATCH_IN_BURST_TOP", plate="AA001AA")]
+                                + _rows("D", 43, publish_date="2026-10-22")
+                                + [_entry(protocol_no="MATCH_IN_BURST_BOTTOM", plate="AA001AA")])
+    job3, *_ = _make_job(tmp_path, feed, production)
+    await job3.run(_utc(21))
+    assert feed_state_repo.get().last_error is None
+    assert sorted(_submitted(production)) == ["MATCH_BELOW_KILL", "MATCH_IN_BURST_BOTTOM"]
+
+    job4, *_ = _make_job(tmp_path, feed, production)
+    await job4.run(_utc(23, 55))
+
+    assert feed_state_repo.get().last_error is None
+    assert all(seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
+    assert sorted(_submitted(production)) == ["MATCH_BELOW_KILL", "MATCH_IN_BURST_BOTTOM", "MATCH_IN_BURST_TOP"]

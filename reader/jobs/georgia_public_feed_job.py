@@ -95,7 +95,11 @@ baseline ≈ 4 цикла × 2 запроса ≈ 8 запросов/день �
 - "FAST" (обычный установившийся режим, после хотя бы одного успешного
   DEEP-прохода И без свежей ошибки) — останавливается через ОДНУ
   дополнительную (overlap) страницу ПОСЛЕ первой страницы, содержащей уже
-  известную (seen) запись (см. выше про защиту от сдвига страниц).
+  известную (seen) запись, увиденную ДО этого цикла (см. выше про защиту от
+  сдвига страниц): строки, уже отмеченные этим же циклом, появляются снова,
+  когда новые публикации сдвигают страницы во время обхода (в production —
+  пачки по 70–360 строк), и граница на них оставила бы новые строки под
+  ними непрочитанными.
 
 ВОССТАНОВЛЕНИЕ ПОСЛЕ СБОЯ (см. задачу "ATOMICITY": "mid-pagination
 failure does not cause data loss"): ЛЮБОЕ исключение в середине цикла
@@ -311,6 +315,13 @@ class GeorgiaPublicFineFeedJob(Job):
         # после неё цикл останавливается — без цепочки дальнейших overlap'ов
         # и без повторной проверки page_has_seen_row на ней самой.
         pending_overlap = False
+        # Отмеченные этим циклом: пока идёт обход, наверху feed'а появляются
+        # новые публикации, страницы сдвигаются вниз, и следующая страница
+        # снова показывает уже прочитанные строки (в production — пачки по
+        # 70–360 строк в циклы 15:00/21:00). Это не граница FAST — граница
+        # только строка, увиденная до этого цикла, иначе FAST остановился бы
+        # на повторе и не дочитал бы новые строки под ним.
+        marked_this_cycle: set[str] = set()
 
         # Отметка "цикл идёт": если процесс остановят посреди цикла (SIGTERM,
         # OOM, CancelledError — их не ловит ни один except ниже), last_error
@@ -353,7 +364,8 @@ class GeorgiaPublicFineFeedJob(Job):
                         continue
 
                     if self._seen.is_seen(protocol_no):
-                        page_has_seen_row = True
+                        if protocol_no not in marked_this_cycle:
+                            page_has_seen_row = True
                         continue
 
                     # Впервые видим эту конкретную запись feed'а (неважно,
@@ -365,6 +377,7 @@ class GeorgiaPublicFineFeedJob(Job):
                     self._seen.mark_seen(
                         protocol_no, publish_date=entry_date or run_at.date(), seen_at=run_at,
                     )
+                    marked_this_cycle.add(protocol_no)
                     matched_count += await self._maybe_process_entry(entry, monitored)
 
                 if deep_mode and _page_already_processed(

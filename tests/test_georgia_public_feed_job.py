@@ -1596,3 +1596,151 @@ async def test_first_run_horizon_uses_the_tbilisi_date_not_utc(tmp_path):
         fine_repo.close()
         feed_state_repo.close()
         seen_repo.close()
+
+
+# ==== живой feed: публикации между циклами и ВО ВРЕМЯ обхода (зеркало
+# tests/test_georgia_collector_job.py) ====
+
+
+class _LiveFeed:
+    """Feed newest-first, меняющийся как настоящий: publish() кладёт строки
+    наверх; строки, опубликованные, пока цикл ещё читает, сдвигают все
+    следующие страницы вниз, и следующая страница повторяет строки, уже
+    прочитанные этим циклом (в production — пачки по 70–360 строк в циклы
+    15:00/21:00)."""
+
+    def __init__(self, rows: list[dict] | None = None):
+        self.rows: list[dict] = list(rows or [])
+        self.requested_offsets: list[int] = []
+        self._served = 0
+        self._published_after: dict[int, list[dict]] = {}
+        self._fail_at: dict[int, BaseException] = {}
+
+    def publish(self, rows: list[dict]) -> None:
+        self.rows[:0] = rows
+
+    def publish_after_requests(self, count: int, rows: list[dict]) -> None:
+        """rows появятся наверху сразу после следующих count запросов."""
+        self._published_after[self._served + count - 1] = rows
+
+    def fail_after_requests(self, count: int, exc: BaseException) -> None:
+        """Запрос после следующих count запросов бросит exc."""
+        self._fail_at[self._served + count] = exc
+
+    async def fetch_published_protocols(self, *, first_result: int) -> dict:
+        number = self._served
+        self._served += 1
+        self.requested_offsets.append(first_result)
+        if number in self._fail_at:
+            raise self._fail_at.pop(number)
+        entries = self.rows[first_result:first_result + 30]
+        if number in self._published_after:
+            self.publish(self._published_after.pop(number))
+        return _page(entries) if entries else _empty_page()
+
+
+async def test_fast_reads_new_rows_below_a_page_it_already_read_when_publications_shift_the_pages(tmp_path):
+    """60 строк, опубликованных после 2-й страницы, сдвигают список на две
+    страницы: страницы 3–4 повторяют строки, уже отмеченные этим циклом. Это
+    не граница — FAST идёт дальше, дочитывает новые строки (и их совпадение)
+    и останавливается через страницу после строк, увиденных ДО этого цикла."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    feed_state_repo = _make_feed_state_repo(tmp_path)
+    seen_repo = _make_seen_repo(tmp_path)
+    try:
+        _create_active_task(task_repo, "AA001AA")
+        feed = _LiveFeed(
+            _rows("OLD", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"),
+        )
+        job1, _p1 = _make_job(feed, task_repo, fine_repo, feed_state_repo, seen_repo, first_run_max_pages=10)
+        await job1.run(_utc(15))
+        assert feed_state_repo.get().last_error is None
+
+        feed.publish(_rows("NEW", 119, publish_date="2026-10-22") + [
+            _entry(protocol_no="DEEP_MATCH", plate="AA001AA", publish_date="2026-10-22"),
+        ])
+        feed.publish_after_requests(2, _rows("BURST", 60, publish_date="2026-10-22"))
+        feed.requested_offsets.clear()
+        job2, _p2 = _make_job(feed, task_repo, fine_repo, feed_state_repo, seen_repo)
+        persisted = _spy_persisted(job2)
+        await job2.run(_utc(21))
+
+        assert feed.requested_offsets == [0, 30, 60, 90, 120, 150, 180, 210]
+        assert persisted == ["DEEP_MATCH"]
+        assert feed_state_repo.get().last_error is None
+
+        feed.requested_offsets.clear()
+        job3, _p3 = _make_job(feed, task_repo, fine_repo, feed_state_repo, seen_repo)
+        persisted3 = _spy_persisted(job3)
+        await job3.run(_utc(23, 55))
+
+        assert feed.requested_offsets == [0, 30, 60, 90]
+        assert all(seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
+        assert persisted3 == []
+    finally:
+        task_repo.close()
+        fine_repo.close()
+        feed_state_repo.close()
+        seen_repo.close()
+
+
+async def test_interrupted_cycle_then_recovery_with_shifting_pages_reads_every_row_once(tmp_path):
+    """Сквозной сценарий: первый запуск, цикл, убитый после двух страниц,
+    восстановление, во время которого наверху публикуются 45 строк, затем
+    FAST. Каждая опубликованная строка увидена, каждое совпадение обработано
+    ровно один раз."""
+    task_repo = _make_task_repo(tmp_path)
+    fine_repo = _make_fine_repo(tmp_path)
+    feed_state_repo = _make_feed_state_repo(tmp_path)
+    seen_repo = _make_seen_repo(tmp_path)
+    try:
+        _create_active_task(task_repo, "AA001AA")
+        persisted: list[str] = []
+        feed = _LiveFeed(_rows("Y0_", 30, publish_date="2026-10-21"))
+        feed.publish(_rows("A", 45, publish_date="2026-10-22"))
+        job1, _p1 = _make_job(feed, task_repo, fine_repo, feed_state_repo, seen_repo)
+        spy1 = _spy_persisted(job1)
+        await job1.run(_utc(9))
+        persisted += spy1
+        assert feed_state_repo.get().last_error is None
+
+        feed.publish(_rows("B", 89, publish_date="2026-10-22") + [
+            _entry(protocol_no="MATCH_BELOW_KILL", plate="AA001AA", publish_date="2026-10-22"),
+        ])
+        feed.fail_after_requests(2, asyncio.CancelledError())
+        job2, _p2 = _make_job(feed, task_repo, fine_repo, feed_state_repo, seen_repo)
+        spy2 = _spy_persisted(job2)
+        with pytest.raises(asyncio.CancelledError):
+            await job2.run(_utc(15))
+        persisted += spy2
+        assert feed_state_repo.get().last_error is not None
+
+        feed.publish(_rows("C", 60, publish_date="2026-10-22"))
+        feed.publish_after_requests(
+            1,
+            [_entry(protocol_no="MATCH_IN_BURST_TOP", plate="AA001AA")]
+            + _rows("D", 43, publish_date="2026-10-22")
+            + [_entry(protocol_no="MATCH_IN_BURST_BOTTOM", plate="AA001AA")],
+        )
+        job3, _p3 = _make_job(feed, task_repo, fine_repo, feed_state_repo, seen_repo)
+        spy3 = _spy_persisted(job3)
+        await job3.run(_utc(21))
+        persisted += spy3
+        assert feed_state_repo.get().last_error is None
+        assert sorted(persisted) == ["MATCH_BELOW_KILL", "MATCH_IN_BURST_BOTTOM"]
+
+        job4, _p4 = _make_job(feed, task_repo, fine_repo, feed_state_repo, seen_repo)
+        spy4 = _spy_persisted(job4)
+        await job4.run(_utc(23, 55))
+        persisted += spy4
+
+        assert feed_state_repo.get().last_error is None
+        assert all(seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
+        assert sorted(persisted) == ["MATCH_BELOW_KILL", "MATCH_IN_BURST_BOTTOM", "MATCH_IN_BURST_TOP"]
+        assert len(fine_repo.list_by_car_number("AA001AA")) == 3
+    finally:
+        task_repo.close()
+        fine_repo.close()
+        feed_state_repo.close()
+        seen_repo.close()
