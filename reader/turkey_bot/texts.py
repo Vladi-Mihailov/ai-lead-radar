@@ -860,6 +860,20 @@ def _format_debt_owner_lines(owner: DebtOwner) -> list[str]:
     return [f"👤 Пользователь: {name_text}", f"🔗 Telegram: {username_text}"]
 
 
+def _russian_plural(count: int, one: str, few: str, many: str) -> str:
+    """Форма существительного после числа: 1, 21, 101 -> one ("штраф");
+    2–4, 22–24 -> few ("штрафа"); 0, 5–20, 25–30, 111–114 -> many ("штрафов").
+    Тот же алгоритм, что и в reader/public_bot/texts.py (боты не
+    импортируют друг друга)."""
+    last_two = abs(count) % 100
+    last = last_two % 10
+    if last == 1 and last_two != 11:
+        return one
+    if 2 <= last <= 4 and not 12 <= last_two <= 14:
+        return few
+    return many
+
+
 def format_debt_row(
     *, car_number: str, owners: list[DebtOwner], total_amount: Decimal,
     provider_states: tuple[TurkeyProviderDebtState, ...] = (),
@@ -867,7 +881,7 @@ def format_debt_row(
     """Блок одной машины debt-списка (см. задачу "дополнить статистику
     штрафов информацией о пользователях"):
         🚗 Госномер: <номер>
-        💰 Задолженность: <сумма> ₺
+        🔴 Неоплачено: <N штрафов> — <сумма> ₺
         👤 Пользователь: <имя>
         🔗 Telegram: @<username>
     БЕЗ даты/checked_at/"сегодня"/"вчера"/"N дней назад" и БЕЗ "≥"/"·
@@ -886,13 +900,22 @@ def format_debt_row(
     под ней по одной строке на GİB и KGM — что подтверждено последней
     проверкой, что известно только по более ранней успешной проверке (с
     её датой и датой неответа), по какому провайдеру достоверных данных
-    нет."""
-    amount_text = _format_try_amount(total_amount)
+    нет.
+
+    Число штрафов — сумма debt_count тех же состояний GİB и KGM, из которых
+    сложена сумма (см. TurkeyProviderDebtState; Avrasya не прибавляется —
+    её долг уже внутри KGM, как и в сумме). Нет состояний или в них нет
+    числа — только сумма, число не выдумывается. Строки "оплачено" у
+    Turkey нет: источники не сообщают об оплате."""
+    debt_text = _format_try_amount(total_amount)
+    fine_count = sum(state.debt_count for state in provider_states)
+    if fine_count > 0:
+        debt_text = f"{fine_count} {_russian_plural(fine_count, 'штраф', 'штрафа', 'штрафов')} — {debt_text}"
     lines = [f"🚗 Госномер: {format_plate_for_telegram(car_number)}"]
     if all(state.freshness == TurkeyProviderFreshness.CURRENT for state in provider_states):
-        lines.append(f"💰 Задолженность: {amount_text}")
+        lines.append(f"🔴 Неоплачено: {debt_text}")
     else:
-        lines.append(f"💰 Задолженность: ⚠️ {amount_text}")
+        lines.append(f"🔴 Неоплачено: ⚠️ {debt_text}")
         lines.extend(f"   {_format_debt_provider_state(state)}" for state in provider_states)
     if not owners:
         lines.append(DEBT_OWNER_NOT_LINKED_LINE)

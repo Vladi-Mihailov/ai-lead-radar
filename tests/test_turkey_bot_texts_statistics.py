@@ -2,7 +2,7 @@
 Тесты reader/turkey_bot/texts.py::format_statistics/format_debt_row/
 format_debt_list_messages (см. задачи "manager Statistics / refresh для
 обоих ботов" и "дополнить статистику штрафов информацией о
-пользователях") — блок машины "🚗 Госномер / 💰 Задолженность / 👤
+пользователях") — блок машины "🚗 Госномер / 🔴 Неоплачено / 👤
 Пользователь / 🔗 Telegram", БЕЗ даты/checked_at/"сегодня"/"вчера"/"≥"-
 пометки PARTIAL."""
 
@@ -10,6 +10,8 @@ import sys
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -105,7 +107,7 @@ def test_debt_row_is_plate_debt_user_telegram_block():
 
     assert block == (
         f"🚗 Госномер: {format_plate_for_telegram('M295YB196')}\n"
-        "💰 Задолженность: 2 740 ₺\n"
+        "🔴 Неоплачено: 2 740 ₺\n"
         "👤 Пользователь: Иван Петров\n"
         "🔗 Telegram: @ivan_petrov"
     )
@@ -118,7 +120,7 @@ def test_debt_row_has_no_partial_marker_or_recency():
 
     assert block.splitlines()[:2] == [
         f"🚗 Госномер: {format_plate_for_telegram('34ABC123')}",
-        "💰 Задолженность: 1 250 ₺",
+        "🔴 Неоплачено: 1 250 ₺",
     ]
     assert "≥" not in block
     assert "частично" not in block
@@ -143,7 +145,7 @@ def test_debt_row_lists_every_owner_and_amount_once():
 
     assert block.splitlines() == [
         f"🚗 Госномер: {format_plate_for_telegram('H401HH95')}",
-        "💰 Задолженность: 32 664,50 ₺",
+        "🔴 Неоплачено: 32 664,50 ₺",
         "👤 Пользователь: Иван Петров",
         "🔗 Telegram: @ivan_petrov",
         "👤 Пользователь: Анна",
@@ -260,10 +262,14 @@ _NOV_04 = datetime(2026, 11, 4, 12, 0, tzinfo=timezone.utc)
 _NOV_11 = datetime(2026, 11, 11, 12, 0, tzinfo=timezone.utc)
 
 
-def _state(provider, freshness, amount=Decimal(0), *, last_success_at=None, last_attempt_at=None, error_type=None):
+def _state(
+    provider, freshness, amount=Decimal(0), *, last_success_at=None, last_attempt_at=None, error_type=None,
+    debt_count=0,
+):
     return TurkeyProviderDebtState(
         provider=provider, freshness=freshness, amount=amount,
         last_success_at=last_success_at, last_attempt_at=last_attempt_at, last_attempt_error_type=error_type,
+        debt_count=debt_count,
     )
 
 
@@ -322,7 +328,7 @@ def test_debt_row_with_all_providers_current_has_no_provider_lines():
 
     assert block.splitlines() == [
         f"🚗 Госномер: {format_plate_for_telegram('M295YB196')}",
-        "💰 Задолженность: 2 740 ₺",
+        "🔴 Неоплачено: 2 740 ₺",
         "👤 Пользователь: Иван Петров",
         "🔗 Telegram: @ivan_petrov",
     ]
@@ -344,7 +350,7 @@ def test_debt_row_stale_kgm_reads_as_last_known_with_dates():
     # Детализация по провайдерам — сразу под суммой, владельцы — после неё.
     assert text.splitlines() == [
         f"🚗 Госномер: {format_plate_for_telegram('34ABC123')}",
-        "💰 Задолженность: ⚠️ 33 528,50 ₺",
+        "🔴 Неоплачено: ⚠️ 33 528,50 ₺",
         "   ✅ GİB: 13 336 ₺ — проверка 11.11.2026",
         "   ⚠️ KGM: 20 192,50 ₺ — последняя известная (успешная проверка 04.11.2026), не ответил 11.11.2026",
         "👤 Пользователь: Иван Петров",
@@ -369,7 +375,7 @@ def test_debt_row_provider_without_reliable_data():
         car_number="34ABC123", owners=[], total_amount=Decimal(18000), provider_states=never_checked,
     )
 
-    assert attempted_text.splitlines()[1] == "💰 Задолженность: ⚠️ 18 000 ₺"
+    assert attempted_text.splitlines()[1] == "🔴 Неоплачено: ⚠️ 18 000 ₺"
     assert attempted_text.splitlines()[-2] == "   ❔ KGM: нет достоверных данных (не ответил 11.11.2026)"
     assert never_text.splitlines()[-2] == "   ❔ KGM: нет достоверных данных (не проверялся)"
     assert never_text.splitlines()[-1] == "👤 Пользователь не привязан"
@@ -478,6 +484,118 @@ def test_refresh_summary_without_failed_providers_lists_plates_only():
     summary = texts.format_debt_refresh_summary(outcome)
 
     assert f"Частично: {format_plate_for_telegram('34ABC123')}" in summary.splitlines()
+
+
+# ---- число неоплаченных штрафов в строке машины (задача "показывать по
+# каждой машине количество и сумму отдельно"): сумма debt_count тех же
+# состояний GİB и KGM, из которых сложена сумма; строки "оплачено" нет ----
+
+
+def test_debt_row_shows_count_of_gib_and_kgm_records_behind_the_amount():
+    states = (
+        _state("gib", TurkeyProviderFreshness.CURRENT, Decimal(80), last_success_at=_NOV_11, last_attempt_at=_NOV_11,
+               debt_count=2),
+        _state("kgm", TurkeyProviderFreshness.CURRENT, Decimal(2660), last_success_at=_NOV_11,
+               last_attempt_at=_NOV_11, debt_count=3),
+    )
+
+    block = texts.format_debt_row(
+        car_number="34ABC123", owners=[_OWNER], total_amount=Decimal(2740), provider_states=states,
+    )
+
+    assert block.splitlines() == [
+        f"🚗 Госномер: {format_plate_for_telegram('34ABC123')}",
+        "🔴 Неоплачено: 5 штрафов — 2 740 ₺",
+        "👤 Пользователь: Иван Петров",
+        "🔗 Telegram: @ivan_petrov",
+    ]
+
+
+def test_debt_row_count_keeps_the_warning_mark_and_provider_lines():
+    states = (
+        _state("gib", TurkeyProviderFreshness.CURRENT, Decimal(13336), last_success_at=_NOV_11,
+               last_attempt_at=_NOV_11, debt_count=1),
+        _state(
+            "kgm", TurkeyProviderFreshness.STALE, Decimal("20192.50"),
+            last_success_at=_NOV_04, last_attempt_at=_NOV_11, error_type="unexpected", debt_count=3,
+        ),
+    )
+
+    text = texts.format_debt_row(
+        car_number="34ABC123", owners=[], total_amount=Decimal("33528.50"), provider_states=states,
+    )
+
+    assert text.splitlines() == [
+        f"🚗 Госномер: {format_plate_for_telegram('34ABC123')}",
+        "🔴 Неоплачено: ⚠️ 4 штрафа — 33 528,50 ₺",
+        "   ✅ GİB: 13 336 ₺ — проверка 11.11.2026",
+        "   ⚠️ KGM: 20 192,50 ₺ — последняя известная (успешная проверка 04.11.2026), не ответил 11.11.2026",
+        "👤 Пользователь не привязан",
+    ]
+
+
+def test_debt_row_count_skips_a_provider_without_reliable_data():
+    states = (
+        _state("gib", TurkeyProviderFreshness.CURRENT, Decimal(18000), last_success_at=_NOV_11,
+               last_attempt_at=_NOV_11, debt_count=1),
+        _state("kgm", TurkeyProviderFreshness.NO_DATA, last_attempt_at=_NOV_11, error_type="transport_error"),
+    )
+
+    text = texts.format_debt_row(car_number="34ABC123", owners=[], total_amount=Decimal(18000), provider_states=states)
+
+    assert text.splitlines()[1] == "🔴 Неоплачено: ⚠️ 1 штраф — 18 000 ₺"
+
+
+def test_debt_row_without_a_known_count_shows_the_amount_only():
+    """Состояния без числа (или без состояний вовсе) — только сумма: число
+    не выдумывается."""
+    states = (
+        _state("gib", TurkeyProviderFreshness.CURRENT, Decimal(500), last_success_at=_NOV_11, last_attempt_at=_NOV_11),
+        _state("kgm", TurkeyProviderFreshness.CURRENT, last_success_at=_NOV_11, last_attempt_at=_NOV_11),
+    )
+
+    with_states = texts.format_debt_row(
+        car_number="34ABC123", owners=[], total_amount=Decimal(500), provider_states=states,
+    )
+    without_states = texts.format_debt_row(car_number="34ABC123", owners=[], total_amount=Decimal(500))
+
+    assert with_states.splitlines()[1] == "🔴 Неоплачено: 500 ₺"
+    assert without_states.splitlines()[1] == "🔴 Неоплачено: 500 ₺"
+
+
+@pytest.mark.parametrize("gib_count, kgm_count, expected", [
+    (1, 0, "1 штраф"), (1, 1, "2 штрафа"), (2, 2, "4 штрафа"), (2, 3, "5 штрафов"), (10, 1, "11 штрафов"),
+    (20, 1, "21 штраф"), (20, 2, "22 штрафа"), (100, 11, "111 штрафов"), (100, 22, "122 штрафа"),
+])
+def test_debt_row_count_uses_the_russian_plural(gib_count, kgm_count, expected):
+    states = (
+        _state("gib", TurkeyProviderFreshness.CURRENT, Decimal(100), last_success_at=_NOV_11,
+               last_attempt_at=_NOV_11, debt_count=gib_count),
+        _state("kgm", TurkeyProviderFreshness.CURRENT, Decimal(200) if kgm_count else Decimal(0),
+               last_success_at=_NOV_11, last_attempt_at=_NOV_11, debt_count=kgm_count),
+    )
+
+    text = texts.format_debt_row(car_number="34ABC123", owners=[], total_amount=Decimal(300), provider_states=states)
+
+    assert text.splitlines()[1] == f"🔴 Неоплачено: {expected} — 300 ₺"
+
+
+@pytest.mark.parametrize("kgm_freshness", list(TurkeyProviderFreshness))
+def test_debt_row_never_has_a_paid_line(kgm_freshness):
+    """Turkey: источники не сообщают об оплате — строки 🟢/"оплачено" нет ни
+    при каких состояниях провайдеров."""
+    states = (
+        _state("gib", TurkeyProviderFreshness.CURRENT, Decimal(100), last_success_at=_NOV_11,
+               last_attempt_at=_NOV_11, debt_count=1),
+        _state("kgm", kgm_freshness, Decimal(50) if kgm_freshness != TurkeyProviderFreshness.NO_DATA else Decimal(0),
+               last_success_at=_NOV_04 if kgm_freshness != TurkeyProviderFreshness.NO_DATA else None,
+               last_attempt_at=_NOV_11, debt_count=2 if kgm_freshness != TurkeyProviderFreshness.NO_DATA else 0),
+    )
+
+    text = texts.format_debt_row(car_number="34ABC123", owners=[], total_amount=Decimal(150), provider_states=states)
+
+    assert "🟢" not in text
+    assert "плачено" not in text.replace("Неоплачено", "")
 
 
 # ---- owner display name sanitization (задача п.2) ----

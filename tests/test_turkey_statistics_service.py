@@ -821,3 +821,76 @@ def test_debt_rows_sorted_by_total_including_last_known_amounts():
     rows = service.get_debt_rows([current, stale])
 
     assert [row.car_number for row in rows] == ["BBB222", "AAA111"]
+
+
+# ---- число записей долга по провайдеру (задача "показывать по каждой
+# машине количество и сумму отдельно") — из того же последнего успешного
+# результата, что и сумма ----
+
+
+def _counted(provider: str, amount: Decimal, debt_count: int) -> ProviderCheckResult:
+    return ProviderCheckResult(
+        provider=provider, status=ProviderStatus.HAS_DEBT, debt_count=debt_count,
+        principal_amount=amount, penalty_amount=Decimal(0), total_amount=amount,
+        items=(), error_type=None, checked_at=_NOW,
+    )
+
+
+def test_debt_count_comes_from_the_same_successful_result_as_the_amount():
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car = garage.add_car(telegram_user_id=1, car_number="34ABC123")
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123",
+        providers=(_counted("gib", Decimal(80), 2), _counted("avrasya", Decimal(330), 4),
+                   _counted("kgm", Decimal(615), 3)),
+        days_ago=0,
+    )
+
+    rows = service.get_debt_rows([car])
+
+    states = _states(rows[0])
+    assert set(states) == {"gib", "kgm"}  # Avrasya — ни в сумме, ни в числе (она уже внутри KGM)
+    assert (states["gib"].amount, states["gib"].debt_count) == (Decimal(80), 2)
+    assert (states["kgm"].amount, states["kgm"].debt_count) == (Decimal(615), 3)
+    assert rows[0].total_amount == Decimal(695)
+
+
+def test_failed_or_partial_attempt_keeps_the_last_known_count():
+    """KGM ответил частично (ERROR с разобранными строками) после полной
+    проверки: и сумма, и число — последнего УСПЕШНОГО результата."""
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car = garage.add_car(telegram_user_id=1, car_number="34ABC123")
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123",
+        providers=(_ok("gib"), _ok("avrasya"), _counted("kgm", Decimal(3788), 5)), days_ago=3,
+    )
+    partial = ProviderCheckResult(
+        provider="kgm", status=ProviderStatus.ERROR, debt_count=2, principal_amount=None, penalty_amount=None,
+        total_amount=Decimal(100), items=(), error_type="partial_unchecked:otoyol", checked_at=_NOW,
+    )
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123", providers=(_ok("gib"), _ok("avrasya"), partial), days_ago=0,
+    )
+
+    kgm = _states(service.get_debt_rows([car])[0])["kgm"]
+
+    assert kgm.freshness == TurkeyProviderFreshness.STALE
+    assert (kgm.amount, kgm.debt_count) == (Decimal(3788), 5)
+
+
+def test_success_without_debt_resets_the_provider_count():
+    service, _known, runs, _subs, garage = _service_with_garage()
+    car = garage.add_car(telegram_user_id=1, car_number="34ABC123")
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123",
+        providers=(_counted("gib", Decimal(500), 2), _ok("avrasya"), _counted("kgm", Decimal(300), 4)), days_ago=2,
+    )
+    _save_debt_run(
+        runs, telegram_user_id=1, plate="34ABC123",
+        providers=(_counted("gib", Decimal(500), 2), _ok("avrasya"), _ok("kgm")), days_ago=0,
+    )
+
+    states = _states(service.get_debt_rows([car])[0])
+
+    assert (states["kgm"].amount, states["kgm"].debt_count) == (Decimal(0), 0)
+    assert (states["gib"].amount, states["gib"].debt_count) == (Decimal(500), 2)
