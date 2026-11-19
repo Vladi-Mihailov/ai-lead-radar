@@ -21,18 +21,33 @@ py docstring) — persist_feed_match()'s fingerprint dedup and mark_completed()'
 idempotent re-check already make a retried/duplicate POST safe; adding a
 second "have we seen this request" layer here would be exactly the parallel
 dedupe system the architecture explicitly avoids.
+
+/health: the collector reports every cycle's outcome there (status, mode,
+counts, dates and last_success_at only, see reader/fines/
+public_feed_traversal.py::TraversalOutcome). reader/public_bot/
+collector_health.py turns problem reports and a silent collector into short
+alerts for the managers' group (settings.public_bot.support_chat_id, passed
+in as alert_chat_id; None — alerts are only logged), keeping its state and
+the alert queue in the production DB (health_db_path). The handler queues
+and starts delivering right away, but answers after at most a few seconds
+(well under the collector client's 30 s timeout, so it does not re-send the
+report) while delivery goes on in the background; the watchdog task
+re-checks the silence and retries undelivered alerts every minute. Delivery
+never fails the request.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 
 from aiohttp import web
 from telethon import TelegramClient
 
 from reader.fines.collector_http_auth import build_hmac_middleware
 from reader.fines.collector_payload import payload_to_record
+from reader.public_bot.collector_health import CollectorHealthMonitor, CollectorHealthStore
 from reader.public_bot.collector_ingest_service import (
     BOOTSTRAP_MODE,
     VALID_INGEST_MODES,
@@ -53,10 +68,58 @@ logger = logging.getLogger(__name__)
 # payload, and no handler/business logic ever sees it either.
 _MAX_REQUEST_BODY_SIZE = 64 * 1024
 
+# Как часто сторож проверяет, не замолчал ли коллектор (порог 13 ч, см.
+# CollectorHealthMonitor.check_silence), и повторяет недоставленные
+# предупреждения (пауза между попытками — от минуты до 30 мин).
+_WATCHDOG_INTERVAL_SECONDS = 60
+# Сколько /health ждёт отправки предупреждения, прежде чем ответить:
+# заметно меньше таймаута клиента коллектора (30 с, иначе он повторит
+# отчёт); отправка при этом продолжается в фоне.
+_HEALTH_DELIVERY_WAIT_SECONDS = 5
+
+
+async def send_collector_alert(telegram_client: TelegramClient, chat_id: int | None, text: str) -> None:
+    """Исключение — Telegram предупреждение не принял (монитор повторит
+    позже). chat_id None — предупреждения только пишутся в журнал и
+    считаются доставленными."""
+    if chat_id is None:
+        logger.warning("Georgia collector alert (support_chat_id not configured): %s", text.splitlines()[0])
+        return
+    await telegram_client.send_message(chat_id, text)
+
+
+async def watch_collector_health(
+    monitor: CollectorHealthMonitor, send, *, sleep=asyncio.sleep,
+    interval_seconds: float = _WATCHDOG_INTERVAL_SECONDS,
+) -> None:
+    """Сторож (см. CollectorHealthMonitor.check_silence) и повтор
+    недоставленных предупреждений: send — async callable(text), бросающий
+    исключение, если не доставлено. Работает, пока его не отменят."""
+    while True:
+        await sleep(interval_seconds)
+        try:
+            monitor.check_silence()
+            await monitor.deliver(send)
+        except Exception:
+            logger.exception("Georgia collector API: сторож коллектора — непредвиденная ошибка")
+
 
 def build_collector_api_app(
     ingest_service: CollectorIngestService, *, hmac_secret: str, telegram_client: TelegramClient,
+    health_monitor: CollectorHealthMonitor | None = None, alert_chat_id: int | None = None,
 ) -> web.Application:
+    monitor = health_monitor or CollectorHealthMonitor()
+    deliveries: set[asyncio.Task] = set()
+
+    async def send_alert(text: str) -> None:
+        await send_collector_alert(telegram_client, alert_chat_id, text)
+
+    async def deliver_alerts() -> None:
+        try:
+            await monitor.deliver(send_alert)
+        except Exception:
+            logger.exception("Georgia collector API: не удалось отправить предупреждения о коллекторе")
+
     app = web.Application(
         middlewares=[build_hmac_middleware(hmac_secret)], client_max_size=_MAX_REQUEST_BODY_SIZE,
     )
@@ -124,11 +187,27 @@ def build_collector_api_app(
             payload = await request.json()
         except ValueError:
             payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
         status = payload.get("status", "unknown")
         if status == "ok":
             logger.info("Georgia collector health: ok (%s)", payload.get("detail", ""))
         else:
             logger.warning("Georgia collector health: %s (%s)", status, payload.get("detail", ""))
+        try:
+            monitor.observe(payload)
+        except Exception:
+            # Отчёт коллектора принят в любом случае: предупреждения — забота
+            # бота, повторять отчёт коллектору незачем.
+            logger.exception("Georgia collector API: не удалось обработать отчёт коллектора для предупреждений")
+            return web.json_response({"status": "ack"})
+        delivery = asyncio.ensure_future(deliver_alerts())
+        deliveries.add(delivery)
+        delivery.add_done_callback(deliveries.discard)
+        try:
+            await asyncio.wait_for(asyncio.shield(delivery), timeout=_HEALTH_DELIVERY_WAIT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning("Georgia collector API: предупреждение ещё отправляется — отчёт подтверждён, не дожидаясь")
         return web.json_response({"status": "ack"})
 
     app.router.add_get("/internal/georgia/plates", get_plates)
@@ -142,21 +221,30 @@ def build_collector_api_app(
 
 async def run_collector_api_forever(
     ingest_service: CollectorIngestService, *, hmac_secret: str, telegram_client: TelegramClient,
-    host: str, port: int,
+    host: str, port: int, alert_chat_id: int | None = None, health_db_path: Path | None = None,
 ) -> None:
     """Одна из корутин reader/public_bot/main.py's _run_concurrently([...])
     (ТОТ ЖЕ приём, что и client.run_until_disconnected()/
     _run_delivery_poller() там же) — awaited forever, как и
-    scheduler.run_forever() в reader/main.py."""
+    scheduler.run_forever() в reader/main.py. health_db_path — production-БД
+    для состояния предупреждений о коллекторе (None — только в памяти)."""
+    if health_db_path is None:
+        logger.warning("Georgia collector API: health alert state is kept in memory only (no health_db_path)")
+    monitor = CollectorHealthMonitor(CollectorHealthStore(health_db_path) if health_db_path else None)
     app = build_collector_api_app(
         ingest_service, hmac_secret=hmac_secret, telegram_client=telegram_client,
+        health_monitor=monitor, alert_chat_id=alert_chat_id,
     )
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)
     await site.start()
     logger.info("Georgia collector API listening on %s:%d", host, port)
+    watchdog = asyncio.create_task(watch_collector_health(
+        monitor, lambda text: send_collector_alert(telegram_client, alert_chat_id, text),
+    ))
     try:
         await asyncio.Event().wait()
     finally:
+        watchdog.cancel()
         await runner.cleanup()

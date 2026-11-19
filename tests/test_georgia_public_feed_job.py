@@ -1436,7 +1436,7 @@ async def test_future_dated_row_does_not_move_the_recovery_date_horizon_past_the
         seen_repo.close()
 
 
-async def test_capped_recovery_says_it_cannot_reach_the_last_success_and_names_the_setting(tmp_path, caplog):
+async def test_capped_recovery_keeps_what_it_read_as_a_region_and_names_the_setting(tmp_path, caplog):
     task_repo = _make_task_repo(tmp_path)
     fine_repo = _make_fine_repo(tmp_path)
     feed_state_repo = _make_feed_state_repo(tmp_path)
@@ -1454,10 +1454,16 @@ async def test_capped_recovery_says_it_cannot_reach_the_last_success_and_names_t
             await job.run(_utc(23, 55))
 
         assert session.requested_offsets == [0, 30, 60]
-        error = feed_state_repo.get().last_error
-        assert "recovery could not reach rows covered by the last successful cycle within 3 pages" in error
+        state = feed_state_repo.get()
+        error = state.last_error
+        assert "recovery reached the page cap of 3 pages before rows covered by the last successful cycle" in error
+        assert "90 rows read so far in 1 region(s) are kept" in error
         assert "fine_monitor.public_feed_max_pages_per_cycle" in error
         assert any(r.levelno == logging.WARNING and error in r.getMessage() for r in caplog.records)
+        [region] = state.recovery_regions
+        assert region.length == 90
+        assert region.top == tuple(f"N0_{i:03d}" for i in range(30))
+        assert region.bottom == tuple(f"N{p}_{i:03d}" for p in range(3) for i in range(30))
     finally:
         task_repo.close()
         fine_repo.close()
@@ -1483,7 +1489,8 @@ async def test_first_run_cap_has_its_own_message(tmp_path):
         error = feed_state_repo.get().last_error
         assert error.startswith("first-run catch-up: safety cap of 2 pages")
         assert "fine_monitor.public_feed_first_run_max_pages" in error
-        assert "recovery could not reach" not in error
+        assert feed_state_repo.get().recovery_regions == ()
+        assert "recovery reached the page cap" not in error
     finally:
         task_repo.close()
         fine_repo.close()
@@ -1620,6 +1627,9 @@ class _LiveFeed:
 
     def publish(self, rows: list[dict]) -> None:
         self.rows[:0] = rows
+
+    def remove(self, protocol_nos: set[str]) -> None:
+        self.rows = [row for row in self.rows if row["protocolNo"] not in protocol_nos]
 
     def publish_after_requests(self, count: int, rows: list[dict]) -> None:
         """rows появятся наверху сразу после следующих count запросов."""
@@ -1820,3 +1830,777 @@ async def test_one_job_instance_runs_consecutive_cycles_like_production(tmp_path
         fine_repo.close()
         feed_state_repo.close()
         seen_repo.close()
+
+
+# ==== восстановление в несколько циклов: простой дольше лимита одного цикла
+# (reader/fines/public_feed_traversal.py; зеркало
+# tests/test_georgia_collector_job.py) ====
+
+
+def _with_matches(rows: list[dict], matches: dict[int, str]) -> list[dict]:
+    """rows с отслеживаемым номером на указанных позициях (protocolNo — как указан)."""
+    rows = list(rows)
+    for index, protocol_no in matches.items():
+        rows[index] = _entry(protocol_no=protocol_no, plate="AA001AA", publish_date=rows[index]["publishDate"])
+    return rows
+
+
+class _Repos:
+    """Репозитории одного теста и совпадения, обработанные всеми его циклами."""
+
+    def __init__(self, tmp_path):
+        self.task_repo = _make_task_repo(tmp_path)
+        self.fine_repo = _make_fine_repo(tmp_path)
+        self.feed_state_repo = _make_feed_state_repo(tmp_path)
+        self.seen_repo = _make_seen_repo(tmp_path)
+        self.persisted: list[str] = []
+        _create_active_task(self.task_repo, "AA001AA")
+
+    async def cycle(self, feed, at, *, cap=30, first_run_max_pages=100) -> list[int]:
+        feed.requested_offsets.clear()
+        job, _provider = _make_job(
+            feed, self.task_repo, self.fine_repo, self.feed_state_repo, self.seen_repo,
+            max_pages_per_cycle=cap, first_run_max_pages=first_run_max_pages,
+        )
+        spy = _spy_persisted(job)
+        try:
+            await job.run(at)
+        finally:
+            self.persisted += spy
+        return list(feed.requested_offsets)
+
+    async def first_run_before_the_outage(self, feed) -> None:
+        """Успешный первый запуск в 09:00 22.10 по сегодняшним E и вчерашним
+        Y: последний успех, от которого восстанавливаются тесты ниже."""
+        await self.cycle(feed, _utc(9), first_run_max_pages=10)
+        assert self.feed_state_repo.get().last_error is None
+
+    def unseen(self, feed) -> list[str]:
+        return [row["protocolNo"] for row in feed.rows if not self.seen_repo.is_seen(row["protocolNo"])]
+
+    async def cycles_until_success(self, feed, *, cap) -> int:
+        """Циклы до первого успешного; по пути — ни один не читает больше
+        лимита страниц и успех не оставляет непрочитанных строк."""
+        slots = [_utc(h, m, day=d) for d in (23, 24, 25) for h, m in ((9, 0), (15, 0), (21, 0), (23, 55))]
+        for number, at in enumerate(slots, start=1):
+            present = [row["protocolNo"] for row in feed.rows]
+            offsets = await self.cycle(feed, at, cap=cap)
+            assert len(offsets) <= cap
+            if self.feed_state_repo.get().last_error is None:
+                assert [p for p in present if not self.seen_repo.is_seen(p)] == []
+                return number
+        raise AssertionError("восстановление не завершилось")
+
+    def close(self) -> None:
+        for repo in (self.task_repo, self.fine_repo, self.feed_state_repo, self.seen_repo):
+            repo.close()
+
+
+def _feed_before_the_outage() -> _LiveFeed:
+    return _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
+
+
+async def test_outage_longer_than_the_cap_is_caught_up_over_several_cycles(tmp_path):
+    """300 строк (10 страниц) с последнего успеха. FAST упирается в лимит и
+    сохраняет прочитанное участком; каждое восстановление дочитывает новое
+    сверху, находит начало участка по номерам, перескакивает в его последние
+    строки, затем к самой последней и читает дальше. Каждое совпадение
+    обработано один раз, успех очищает участки."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_with_matches(
+            _rows("G", 300, publish_date="2026-10-22"), {0: "M_TOP", 150: "M_MIDDLE", 299: "M_BOTTOM"},
+        ))
+
+        assert await repos.cycle(feed, _utc(15), cap=4) == [0, 30, 60, 90]
+        [region] = repos.feed_state_repo.get().recovery_regions
+        assert (region.length, region.top[0], region.bottom[0], region.bottom[-1]) == (120, "M_TOP", "M_TOP", "G119")
+
+        feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+        assert await repos.cycle(feed, _utc(21), cap=6) == [0, 30, 120, 150, 180, 210]
+        [region] = repos.feed_state_repo.get().recovery_regions
+        assert (region.length, region.top[0], region.bottom[-1]) == (240, "N000", "G209")
+        assert await repos.cycle(feed, _utc(23, 55), cap=6) == [0, 120, 210, 240, 270, 300]
+        assert await repos.cycle(feed, _utc(9, day=23), cap=6) == [0, 180, 300, 330]
+
+        state = repos.feed_state_repo.get()
+        assert state.last_error is None
+        assert state.recovery_regions == ()
+        assert repos.unseen(feed) == []
+        assert sorted(repos.persisted) == ["M_BOTTOM", "M_MIDDLE", "M_TOP"]
+    finally:
+        repos.close()
+
+
+async def test_burst_during_the_step_after_a_jump_does_not_skip_rows(tmp_path):
+    """Repro ревью (61df2c5 здесь терял строки): 75 строк опубликованы во
+    время упёршейся попытки, ещё 20 — сразу после страницы перескока
+    следующей. Перескоку верят, только найдя последние строки участка по
+    номерам; нет их на странице — восстановление читает дальше по порядку."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_with_matches(_rows("G", 300, publish_date="2026-10-22"), {120: "M_LOST"}))
+        feed.publish_after_requests(2, _rows("B", 75, publish_date="2026-10-22"))
+        assert await repos.cycle(feed, _utc(15), cap=6) == [0, 30, 60, 90, 120, 150]
+        assert len(repos.feed_state_repo.get().recovery_regions) == 1
+        feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+        present = [row["protocolNo"] for row in feed.rows]
+        feed.publish_after_requests(5, _rows("B2_", 20, publish_date="2026-10-22"))
+
+        await repos.cycle(feed, _utc(21), cap=30)
+        assert repos.feed_state_repo.get().last_error is None
+        assert [p for p in present if not repos.seen_repo.is_seen(p)] == []
+        assert "M_LOST" in repos.persisted
+
+        await repos.cycle(feed, _utc(23, 55), cap=30)
+        assert repos.unseen(feed) == []
+        assert repos.persisted == ["M_LOST"]
+    finally:
+        repos.close()
+
+
+async def test_older_attempt_rows_below_an_unread_gap_are_not_taken_for_the_region(tmp_path):
+    """Repro ревью (61df2c5 здесь терял строки): T1 читает G[0:120) и
+    упирается в лимит; до T2 появляются 90 строк (одно совпадение), верх
+    которых сам съедает лимит T2 (во время неё — ещё 70 строк). T3 обязана
+    прочитать 30 строк H между участком T2 и участком T1, а не перескочить их
+    потому, что ниже есть строки, прочитанные какой-то попыткой."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_rows("G", 300, publish_date="2026-10-22"))
+        assert await repos.cycle(feed, _utc(15), cap=4) == [0, 30, 60, 90]
+        feed.publish(_with_matches(_rows("H", 90, publish_date="2026-10-22"), {60: "M_LOST"}))
+        feed.publish_after_requests(2, _rows("B", 70, publish_date="2026-10-22"))
+        assert await repos.cycle(feed, _utc(21), cap=4) == [0, 30, 60, 90]
+        upper, lower = repos.feed_state_repo.get().recovery_regions
+        assert (upper.top[0], lower.top[0], lower.length) == ("H000", "G000", 120)
+        feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+
+        await repos.cycle(feed, _utc(23, 55), cap=30)
+
+        state = repos.feed_state_repo.get()
+        assert state.last_error is None
+        assert state.recovery_regions == ()
+        assert repos.unseen(feed) == []
+        assert repos.persisted == ["M_LOST"]
+    finally:
+        repos.close()
+
+
+async def test_killed_attempt_keeps_the_pages_it_read_and_the_next_one_goes_on_from_there(tmp_path):
+    """Участки записываются после каждой страницы: попытка, остановленная
+    посреди восстановления (SIGTERM, OOM), оставляет прочитанное, и следующая
+    продолжает после него, а не начинает заново; совпадения — по разу."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_with_matches(_rows("G", 300, publish_date="2026-10-22"), {140: "M_KILLED", 200: "M_AFTER"}))
+        assert await repos.cycle(feed, _utc(15), cap=4) == [0, 30, 60, 90]
+        feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+
+        feed.fail_after_requests(4, asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            await repos.cycle(feed, _utc(21), cap=6)
+        assert feed.requested_offsets == [0, 30, 120, 150, 180]
+        state = repos.feed_state_repo.get()
+        assert state.last_error.startswith("cycle in progress")
+        [region] = state.recovery_regions
+        assert (region.length, region.top[0], region.bottom[-1]) == (180, "N000", "G149")
+        assert repos.persisted == ["M_KILLED"]
+
+        feed.publish(_rows("N2_", 30, publish_date="2026-10-22"))
+        assert await repos.cycle(feed, _utc(23, 55), cap=6) == [0, 30, 120, 180, 210, 240]
+        assert await repos.cycle(feed, _utc(9, day=23), cap=6) == [0, 150, 240, 270, 300, 330]
+        assert await repos.cycle(feed, _utc(15, day=23), cap=6) == [0, 210, 330, 360]
+
+        assert repos.feed_state_repo.get().last_error is None
+        assert repos.unseen(feed) == []
+        assert sorted(repos.persisted) == ["M_AFTER", "M_KILLED"]
+    finally:
+        repos.close()
+
+
+async def test_error_mid_recovery_keeps_the_progress(tmp_path):
+    """Ошибка police.ge посреди восстановления: прочитанное до неё остаётся в
+    участке, следующий цикл продолжает после него."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_with_matches(_rows("G", 300, publish_date="2026-10-22"), {200: "M_AFTER_ERROR"}))
+        assert await repos.cycle(feed, _utc(15), cap=4) == [0, 30, 60, 90]
+
+        feed.fail_after_requests(4, FineProviderError("ConnectTimeout"))
+        assert await repos.cycle(feed, _utc(21), cap=10) == [0, 90, 120, 150, 180]
+        state = repos.feed_state_repo.get()
+        assert state.last_error == "ConnectTimeout"
+        [region] = state.recovery_regions
+        assert (region.length, region.bottom[-1]) == (180, "G179")
+        assert repos.persisted == []
+
+        assert await repos.cycles_until_success(feed, cap=10) == 1
+        assert repos.unseen(feed) == []
+        assert repos.persisted == ["M_AFTER_ERROR"]
+    finally:
+        repos.close()
+
+
+async def test_cap_hit_while_looking_for_the_region_end_keeps_the_regions_valid(tmp_path, monkeypatch):
+    """Лимит кончился во время поиска последних строк участка: записано
+    прочитанное подряд плюс сам участок (прочитанный целиком), следующий цикл
+    просто ищет снова."""
+    from reader.fines import public_feed_traversal
+
+    monkeypatch.setattr(public_feed_traversal, "BOTTOM_ANCHOR_ROWS", 30)
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_with_matches(_rows("G", 360, publish_date="2026-10-22"), {250: "M_BELOW"}))
+        assert await repos.cycle(feed, _utc(15), cap=8) == [0, 30, 60, 90, 120, 150, 180, 210]
+        feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+        feed.publish_after_requests(2, _rows("B", 45, publish_date="2026-10-22"))
+
+        assert await repos.cycle(feed, _utc(21), cap=3) == [0, 30, 240]
+        [region] = repos.feed_state_repo.get().recovery_regions
+        assert (region.length, region.top[0], region.bottom[-1]) == (270, "N000", "G239")
+
+        assert await repos.cycles_until_success(feed, cap=8) == 1
+        assert repos.unseen(feed) == []
+        assert repos.persisted == ["M_BELOW"]
+    finally:
+        repos.close()
+
+
+async def test_long_region_with_short_anchor_lists_jumps_twice_and_corrects_its_length(tmp_path, monkeypatch):
+    """При коротком списке последних строк (BOTTOM_ANCHOR_ROWS=60) длинный
+    участок проходится двумя перескоками. Строки, посчитанные прошлым циклом
+    лишний раз (пачка показала строки выше прочитанных), удлинили участок:
+    перескок перелетает конец, шаг назад находит последние строки, и
+    измеренная длина заменяет завышенную."""
+    from reader.fines import public_feed_traversal
+
+    monkeypatch.setattr(public_feed_traversal, "BOTTOM_ANCHOR_ROWS", 60)
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_with_matches(_rows("G", 600, publish_date="2026-10-22"), {500: "M_DEEP"}))
+        feed.publish_after_requests(1, _rows("B", 80, publish_date="2026-10-22"))
+        assert await repos.cycle(feed, _utc(15), cap=12) == [i * 30 for i in range(12)]
+        [region] = repos.feed_state_repo.get().recovery_regions
+        assert region.length == 330
+        assert region.bottom == tuple(f"G{i:03d}" for i in range(220, 280))
+
+        assert await repos.cycle(feed, _utc(21), cap=12) == [
+            0, 30, 60, 360, 330, 360, 390, 420, 450, 480, 510, 540,
+        ]
+        [region] = repos.feed_state_repo.get().recovery_regions
+        assert region.length == 80 + 490
+        assert await repos.cycles_until_success(feed, cap=12) == 1
+        assert repos.unseen(feed) == []
+        assert repos.persisted == ["M_DEEP"]
+    finally:
+        repos.close()
+
+
+async def test_region_whose_last_rows_vanished_is_read_in_order_and_still_makes_progress(tmp_path, monkeypatch):
+    """Последние 30 строк участка (все его конечные номера) пропали:
+    подтвердить перескок нечем, участок читается по порядку от своей первой
+    страницы — и считается заново, так что упёршийся цикл всё равно
+    сохраняет продвижение, — и восстановление завершается."""
+    from reader.fines import public_feed_traversal
+
+    monkeypatch.setattr(public_feed_traversal, "BOTTOM_ANCHOR_ROWS", 30)
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        rows = _with_matches(_rows("G", 300, publish_date="2026-10-22"), {200: "M_AFTER"})
+        feed.publish(rows)
+        assert await repos.cycle(feed, _utc(15), cap=6) == [0, 30, 60, 90, 120, 150]
+        feed.remove({row["protocolNo"] for row in rows[150:180]})
+
+        assert await repos.cycles_until_success(feed, cap=8) <= 3
+        assert repos.unseen(feed) == []
+        assert repos.persisted == ["M_AFTER"]
+    finally:
+        repos.close()
+
+
+async def test_rows_vanished_inside_the_region_never_hide_rows_below_it(tmp_path):
+    """40 строк внутри участка пропали до следующего цикла — участок короче,
+    чем говорит его длина: на странице после перескока к его последней
+    строке его строк нет, восстановление читает дальше по порядку от места,
+    где нашло его конец, и ничего ниже не пропускает."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        gap = _with_matches(_rows("G", 300, publish_date="2026-10-22"), {125: "M_AFTER_GAP"})
+        feed.publish(gap)
+        assert await repos.cycle(feed, _utc(15), cap=4) == [0, 30, 60, 90]
+        feed.remove({row["protocolNo"] for row in gap[40:80]})
+        feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+
+        assert await repos.cycle(feed, _utc(21), cap=6) == [0, 30, 120, 60, 90, 120]
+        assert await repos.cycles_until_success(feed, cap=6) <= 3
+        assert repos.unseen(feed) == []
+        assert repos.persisted == ["M_AFTER_GAP"]
+    finally:
+        repos.close()
+
+
+async def test_jump_past_the_end_of_the_feed_still_reads_the_rows_between(tmp_path):
+    """90 из 120 строк участка пропали, перескок в его последние строки
+    улетает за конец списка. Пустая страница — признак перелёта, а не конец
+    цикла: восстановление возвращается выше и читает 30 строк между ними (с
+    совпадением)."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _LiveFeed(_rows("Y0_", 30, publish_date="2026-10-21"))
+        await repos.cycle(feed, _utc(9), first_run_max_pages=10)
+        gap = _with_matches(_rows("G", 150, publish_date="2026-10-22"), {135: "M_HIDDEN"})
+        feed.publish(gap)
+        assert await repos.cycle(feed, _utc(15), cap=4) == [0, 30, 60, 90]
+        feed.remove({row["protocolNo"] for row in gap[30:120]})
+
+        assert await repos.cycles_until_success(feed, cap=6) == 1
+        assert repos.persisted == ["M_HIDDEN"]
+        assert repos.unseen(feed) == []
+    finally:
+        repos.close()
+
+
+async def test_a_burst_during_the_cycle_does_not_inflate_the_region_length(tmp_path, monkeypatch):
+    """45 строк, опубликованных между началом участка и его концом, делают
+    измеренное расстояние на 45 строк длиннее. Число строк заменяет только
+    меньшее измерение, так что записанный участок по-прежнему ровно
+    N000..G164 (пачка выше него, её прочитает следующий цикл)."""
+    from reader.fines import public_feed_traversal
+
+    monkeypatch.setattr(public_feed_traversal, "BOTTOM_ANCHOR_ROWS", 30)
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_rows("G", 300, publish_date="2026-10-22"))
+        assert await repos.cycle(feed, _utc(15), cap=4) == [0, 30, 60, 90]
+        feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+        feed.publish_after_requests(2, _rows("B", 45, publish_date="2026-10-22"))
+
+        assert await repos.cycle(feed, _utc(21), cap=6) == [0, 30, 120, 150, 180, 210]
+        [region] = repos.feed_state_repo.get().recovery_regions
+        assert (region.length, region.top[0], region.bottom[-1]) == (30 + 120 + 45, "N000", "G164")
+
+        assert await repos.cycles_until_success(feed, cap=10) == 1
+        assert repos.unseen(feed) == []
+    finally:
+        repos.close()
+
+
+async def test_rows_reshown_above_the_region_end_by_a_burst_are_not_counted_again(tmp_path, monkeypatch):
+    """90 строк опубликованы сразу после страницы, где нашлись последние
+    строки участка: следующая страница снова показывает строки из его
+    середины. Они узнаются как перечитывание (увиденные, выше последних
+    строк), а не принимаются за строки под участком, — участок сохраняет
+    настоящую длину, и перескок к его последней строке всё равно делается."""
+    from reader.fines import public_feed_traversal
+
+    monkeypatch.setattr(public_feed_traversal, "BOTTOM_ANCHOR_ROWS", 60)
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_rows("G", 600, publish_date="2026-10-22"))
+        assert await repos.cycle(feed, _utc(15), cap=8) == [i * 30 for i in range(8)]
+        feed.publish(_rows("N", 59, publish_date="2026-10-22"))
+        feed.publish_after_requests(4, _rows("B", 90, publish_date="2026-10-22"))
+
+        assert await repos.cycle(feed, _utc(21), cap=10) == [0, 30, 60, 240, 270, 300, 360, 390, 420, 450]
+        [region] = repos.feed_state_repo.get().recovery_regions
+        assert (region.length, region.bottom[-1]) == (59 + 240 + 91, "G330")
+
+        assert await repos.cycles_until_success(feed, cap=20) <= 2
+        assert repos.unseen(feed) == []
+    finally:
+        repos.close()
+
+
+async def _region_of_600_then_new_rows(repos, feed, new_rows):
+    """Восстановление с лимитом 20 страниц оставляет участок G000..G599,
+    затем сверху публикуются новые строки. Возвращает строки, бывшие в
+    списке до следующего цикла."""
+    await repos.first_run_before_the_outage(feed)
+    feed.publish(_rows("G", 900, publish_date="2026-10-22"))
+    await repos.cycle(feed, _utc(15), cap=20)
+    [region] = repos.feed_state_repo.get().recovery_regions
+    assert (region.length, region.top[5]) == (600, "G005")
+    feed.publish(new_rows)
+    return [row["protocolNo"] for row in feed.rows]
+
+
+async def test_repeated_number_of_a_region_start_at_a_page_end_is_not_taken_for_the_region(tmp_path):
+    """Второе ревью, сценарий A: последняя строка страницы 0 повторяет G005 —
+    номер из начала участка. Участок принимается только по двум соседним
+    номерам начала, а с конца страницы — лишь после подтверждения следующей:
+    N030..N089 (и совпадение) читаются, а не перескакиваются."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        new = _with_matches(_rows("N", 90, publish_date="2026-10-22"), {50: "M_NEW"})
+        new[29] = _entry(protocol_no="G005", plate="ZZ005ZZ", publish_date="2026-10-22")
+        present = await _region_of_600_then_new_rows(repos, feed, new)
+
+        offsets = await repos.cycle(feed, _utc(21), cap=300)
+
+        assert offsets[:4] == [0, 30, 60, 90]
+        assert repos.feed_state_repo.get().last_error is None
+        assert [p for p in present if not repos.seen_repo.is_seen(p)] == []
+        assert repos.persisted == ["M_NEW"]
+    finally:
+        repos.close()
+
+
+async def test_repeated_start_number_at_a_page_end_is_not_confirmed_by_seen_rows_after_it(tmp_path):
+    """G005 повторён последней строкой страницы 0, а страница 1 — строки
+    прежней попытки (увиденные, но не участка). Участок подтверждает только
+    следующий номер начала (G006): увиденные строки ничего не подтверждают,
+    непрочитанные строки под ними (с совпадением) читаются."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        new = _with_matches(_rows("N", 90, publish_date="2026-10-22"), {70: "M_NEW"})
+        new[29] = _entry(protocol_no="G005", plate="ZZ005ZZ", publish_date="2026-10-22")
+        present = await _region_of_600_then_new_rows(repos, feed, new)
+        _mark_seen_at(repos.seen_repo, new[30:60], seen_at=_utc(15))
+
+        offsets = await repos.cycle(feed, _utc(21), cap=300)
+
+        assert offsets[:4] == [0, 30, 60, 90]
+        assert repos.feed_state_repo.get().last_error is None
+        assert [p for p in present if not repos.seen_repo.is_seen(p)] == []
+        assert repos.persisted == ["M_NEW"]
+    finally:
+        repos.close()
+
+
+async def test_re_shown_start_number_right_above_a_read_region_is_not_taken_for_the_region(tmp_path):
+    """Второе ревью (dup_probe4): старая квитанция с номером начала участка R
+    (G005) снова показана прямо над уже прочитанным участком S, а между S и R —
+    200 непрочитанных строк (с совпадением). За G005 идут увиденные строки S,
+    поэтому отменить ложное принятие нечему: только проверка соседства
+    (следующая строка должна быть G006) не даёт принять R и перескочить 200
+    строк."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_rows("G", 2000, publish_date="2026-10-22"))
+        await repos.cycle(feed, _utc(15), cap=50)
+        feed.publish(_with_matches(_rows("H", 200, publish_date="2026-10-22"), {120: "M_GAP"}))
+        feed.publish(_rows("S", 300, publish_date="2026-10-22"))
+        await repos.cycle(feed, _utc(21), cap=10)
+        upper, lower = repos.feed_state_repo.get().recovery_regions
+        assert (upper.top[0], upper.length, lower.top[0], lower.length) == ("S000", 300, "G000", 1500)
+        feed.publish([_entry(protocol_no="G005", plate="ZZ005ZZ", publish_date="2026-10-22")])
+        feed.publish(_rows("N", 60, publish_date="2026-10-22"))
+        present = [row["protocolNo"] for row in feed.rows]
+
+        offsets = await repos.cycle(feed, _utc(23, 55), cap=300)
+
+        assert offsets[:3] == [0, 30, 60]
+        assert repos.feed_state_repo.get().last_error is None
+        assert [p for p in present if not repos.seen_repo.is_seen(p)] == []
+        assert repos.persisted == ["M_GAP"]
+    finally:
+        repos.close()
+
+
+async def test_repeated_number_mid_page_does_not_poison_the_saved_region(tmp_path):
+    """Второе ревью, сценарий B: новая строка посреди страницы повторяет
+    G005, цикл упирается в лимит среди новых строк. Записанный участок —
+    ровно 180 прочитанных новых строк (а не 180 + 600 старого участка с его
+    номерами конца), и следующий цикл читает все 400 новых строк."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        new = _with_matches(_rows("N", 400, publish_date="2026-10-22"), {300: "M_NEW"})
+        new[100] = _entry(protocol_no="G005", plate="ZZ005ZZ", publish_date="2026-10-22")
+        present = await _region_of_600_then_new_rows(repos, feed, new)
+
+        assert await repos.cycle(feed, _utc(21), cap=6) == [0, 30, 60, 90, 120, 150]
+        upper, lower = repos.feed_state_repo.get().recovery_regions
+        assert (upper.length, upper.bottom[0], upper.bottom[-1]) == (180, "N000", "N179")
+        assert (lower.length, lower.top[0]) == (600, "G000")
+        feed.publish(_rows("K", 30, publish_date="2026-10-22"))
+
+        await repos.cycle(feed, _utc(23, 55), cap=300)
+
+        assert repos.feed_state_repo.get().last_error is None
+        assert [p for p in present if not repos.seen_repo.is_seen(p)] == []
+        assert repos.persisted == ["M_NEW"]
+    finally:
+        repos.close()
+
+
+async def test_end_jump_is_confirmed_only_by_the_region_end_numbers_after_rows_vanished(tmp_path):
+    """40 строк внутри участка пропали, перескок к его последней строке
+    улетает за конец: на 20 непрочитанных строк, а за ними — строки,
+    прочитанные прежней попыткой (увиденные, но не его). Увиденные строки
+    ничего не подтверждают: чтение идёт по порядку от места, где нашёлся
+    конец участка, непрочитанные строки (с совпадением) не перескакиваются."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        rows = _with_matches(_rows("G", 300, publish_date="2026-10-22"), {135: "M_GAP"})
+        rows[140] = _entry(protocol_no="G100", plate="ZZ100ZZ", publish_date="2026-10-22")  # repeats an end number
+        feed.publish(rows)
+        assert await repos.cycle(feed, _utc(15), cap=4) == [0, 30, 60, 90]
+        _mark_seen_at(repos.seen_repo, rows[150:], seen_at=_utc(15))
+        feed.remove({row["protocolNo"] for row in rows[40:80]})
+        feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+
+        assert (await repos.cycle(feed, _utc(21), cap=12))[:5] == [0, 30, 120, 60, 90]
+        assert repos.feed_state_repo.get().last_error is None
+        assert repos.unseen(feed) == []
+        assert repos.persisted == ["M_GAP"]
+    finally:
+        repos.close()
+
+
+async def test_foreign_seen_row_on_the_landing_page_does_not_confirm_the_end_jump(tmp_path):
+    """Список конца участка кончается номерами строк, стоящих в другом
+    месте, и перескок к его "последней строке" улетает на 30 строк дальше:
+    на 10 непрочитанных строк, затем строки прежней попытки. Увиденные
+    строки ничего не подтверждают, 10 строк и совпадение читаются."""
+    from reader.fines.public_feed_state_repository import ReadRegion
+
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        rows = _with_matches(_rows("G", 300, publish_date="2026-10-22"), {65: "M_GAP"})
+        feed.publish(rows)
+        _mark_seen_at(repos.seen_repo, rows[:60] + rows[70:], seen_at=_utc(15))
+        names = [row["protocolNo"] for row in rows]
+        elsewhere = tuple(f"X{i:03d}" for i in range(30))
+        repos.feed_state_repo.record_recovery_regions([
+            ReadRegion(top=tuple(names[:30]), bottom=(*names[:60], *elsewhere), length=90,
+                       updated_at=_utc(15).isoformat()),
+        ])
+        repos.feed_state_repo.record_error("cycle in progress", at=_utc(15))
+        feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+
+        assert (await repos.cycle(feed, _utc(21), cap=20))[:4] == [0, 30, 90, 60]
+        assert repos.feed_state_repo.get().last_error is None
+        assert repos.unseen(feed) == []
+        assert repos.persisted == ["M_GAP"]
+    finally:
+        repos.close()
+
+
+async def test_unread_row_inside_an_accepted_region_undoes_the_acceptance(tmp_path):
+    """Участок, принятый по первым строкам (G000, G001), показывает
+    непрочитанную строку там, где должны идти его строки: принятие
+    отменяется. Его строки считаются обычными, прочитанными подряд, он
+    остаётся в списке, а записанное продвижение — ровно прочитанное."""
+    from reader.fines.public_feed_state_repository import ReadRegion
+
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        tops = _rows("G", 30, publish_date="2026-10-22")
+        feed.publish(tops + _with_matches(_rows("H", 90, publish_date="2026-10-22"), {50: "M_AFTER"}))
+        _mark_seen_at(repos.seen_repo, tops, seen_at=_utc(15))
+        repos.feed_state_repo.record_recovery_regions([
+            ReadRegion(top=tuple(row["protocolNo"] for row in tops),
+                       bottom=tuple(f"G{i:03d}" for i in range(30, 60)), length=60,
+                       updated_at=_utc(15).isoformat()),
+        ])
+        repos.feed_state_repo.record_error("cycle in progress", at=_utc(15))
+
+        assert await repos.cycle(feed, _utc(21), cap=2) == [0, 30]
+        upper, lower = repos.feed_state_repo.get().recovery_regions
+        assert (upper.length, upper.bottom[0], upper.bottom[-1]) == (60, "G000", "H029")
+        assert (lower.length, lower.top[0]) == (60, "G000")
+
+        assert await repos.cycles_until_success(feed, cap=10) == 1
+        assert repos.unseen(feed) == []
+        assert repos.persisted == ["M_AFTER"]
+    finally:
+        repos.close()
+
+
+async def test_cycle_killed_while_persisting_a_match_leaves_the_row_unread_and_the_match_is_not_lost(tmp_path):
+    """Строка отмечается увиденной ПОСЛЕ записи совпадения: процесс,
+    остановленный посреди записи, оставляет строку непрочитанной, и
+    следующий цикл записывает совпадение (повтор отсеял бы fingerprint)."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_with_matches(_rows("G", 40, publish_date="2026-10-22"), {10: "M_KILLED"}))
+        job, _provider = _make_job(feed, repos.task_repo, repos.fine_repo, repos.feed_state_repo, repos.seen_repo)
+        original = job._check_service.persist_feed_match
+
+        async def killed(task, record):
+            raise asyncio.CancelledError
+
+        job._check_service.persist_feed_match = killed
+        with pytest.raises(asyncio.CancelledError):
+            await job.run(_utc(15))
+        assert not repos.seen_repo.is_seen("M_KILLED")
+        job._check_service.persist_feed_match = original
+
+        await repos.cycle(feed, _utc(21))
+        assert repos.persisted == ["M_KILLED"]
+        assert repos.unseen(feed) == []
+    finally:
+        repos.close()
+
+
+async def test_persist_error_keeps_the_old_semantics_row_marked_and_cycle_failed(tmp_path):
+    """Ошибка (не остановка) записи совпадения — как и раньше: строка
+    отмечена увиденной, цикл завершён с ошибкой."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_with_matches(_rows("G", 40, publish_date="2026-10-22"), {10: "M_ERROR"}))
+        job, _provider = _make_job(feed, repos.task_repo, repos.fine_repo, repos.feed_state_repo, repos.seen_repo)
+
+        async def broken(task, record):
+            raise RuntimeError("database is locked")
+
+        job._check_service.persist_feed_match = broken
+        await job.run(_utc(15))
+        assert repos.feed_state_repo.get().last_error == "database is locked"
+        assert repos.seen_repo.is_seen("M_ERROR")
+    finally:
+        repos.close()
+
+
+async def test_regions_written_before_the_last_success_are_ignored(tmp_path):
+    """Участки, оставленные откатом на код без участков (записанные раньше
+    последнего успеха), не используются: восстановление читает по порядку."""
+    from reader.fines.public_feed_state_repository import ReadRegion
+
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        rows = _with_matches(_rows("G", 120, publish_date="2026-10-22"), {60: "M_IN_ORDER"})
+        feed.publish(rows)
+        names = [row["protocolNo"] for row in rows]
+        repos.feed_state_repo.record_recovery_regions([
+            ReadRegion(top=tuple(names[:30]), bottom=tuple(names), length=120, updated_at=_utc(8).isoformat()),
+        ])
+        repos.feed_state_repo.record_error("cycle in progress", at=_utc(15))
+
+        assert await repos.cycle(feed, _utc(21), cap=10) == [0, 30, 60, 90, 120]
+        assert repos.feed_state_repo.get().last_error is None
+        assert repos.persisted == ["M_IN_ORDER"]
+    finally:
+        repos.close()
+
+
+async def test_horizon_page_met_while_searching_is_an_overshoot_not_the_end(tmp_path):
+    """Участок с сильно завышенным числом строк отправляет поиск на
+    вчерашние строки (страницу горизонта). Это значит только "перелетели":
+    180 непрочитанных строк между участком и горизонтом не объявляются
+    прочитанными. Восстановление возвращается выше, в итоге читает участок
+    по порядку (пересчитывая его), сохраняет продвижение и завершается
+    следующим циклом."""
+    from reader.fines.public_feed_state_repository import ReadRegion
+
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        rows = _with_matches(_rows("G", 300, publish_date="2026-10-22"), {250: "M_BETWEEN"})
+        feed.publish(rows)
+        _mark_seen_at(repos.seen_repo, rows[:120], seen_at=_utc(15))
+        names = [row["protocolNo"] for row in rows]
+        repos.feed_state_repo.record_recovery_regions([
+            ReadRegion(top=tuple(names[:30]), bottom=tuple(names[90:120]), length=380, updated_at="x"),
+        ])
+        repos.feed_state_repo.record_error("cycle in progress", at=_utc(15))
+
+        assert await repos.cycle(feed, _utc(21), cap=10) == [0, 360, 330, 270, 150, 0, 30, 60, 90, 120]
+        state = repos.feed_state_repo.get()
+        assert state.last_error is not None
+        [region] = state.recovery_regions
+        assert (region.length, region.top[0], region.bottom[-1]) == (150, "G000", "G149")
+        # Страницы поиска только читаются: их строки остаются непрочитанными
+        # до чтения подряд — непрочитанная строка по-прежнему значит "за концом".
+        assert not repos.seen_repo.is_seen("G150") and not repos.seen_repo.is_seen("G270")
+
+        assert await repos.cycles_until_success(feed, cap=10) == 1
+        assert repos.unseen(feed) == []
+        assert repos.persisted == ["M_BETWEEN"]
+    finally:
+        repos.close()
+
+
+async def test_next_region_right_below_is_recognised_although_the_last_end_anchor_sits_elsewhere(tmp_path):
+    """Последний номер конца участка может быть строкой, стоящей в другом
+    месте (строки, выдвинутые пачкой, считаются последними), — конец не
+    отмечен. Следующий участок, начинающийся сразу под ним, всё равно
+    узнаётся по своим первым строкам — не принимается за перечитывание — и
+    перескакивается."""
+    from reader.fines.public_feed_state_repository import ReadRegion
+
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        rows = _rows("G", 300, publish_date="2026-10-22")
+        feed.publish(rows)
+        _mark_seen_at(repos.seen_repo, rows, seen_at=_utc(15))
+        names = [row["protocolNo"] for row in rows]
+        repos.feed_state_repo.record_recovery_regions([
+            ReadRegion(top=tuple(names[:30]), bottom=(*names[:60], "ELSEWHERE"), length=61, updated_at="x"),
+            ReadRegion(top=tuple(names[60:90]), bottom=tuple(names[240:]), length=240, updated_at="x"),
+        ])
+        repos.feed_state_repo.record_error("ConnectTimeout", at=_utc(15))
+
+        assert await repos.cycle(feed, _utc(21), cap=10) == [0, 60, 30, 60, 270, 300]
+        assert repos.feed_state_repo.get().last_error is None
+    finally:
+        repos.close()
+
+
+async def test_regions_whose_rows_are_gone_are_harmless(tmp_path):
+    """Участки с номерами, которых нет в списке (от старой версии или все их
+    строки пропали): восстановление читает по порядку до горизонта, как без
+    участков, успех их очищает."""
+    from reader.fines.public_feed_state_repository import ReadRegion
+
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_with_matches(_rows("G", 120, publish_date="2026-10-22"), {45: "M_IN_ORDER"}))
+        repos.feed_state_repo.record_recovery_regions([
+            ReadRegion(top=("GONE_TOP",), bottom=("GONE_BOTTOM",), length=5000,
+                       updated_at="2026-10-22T08:00:00+00:00"),
+        ])
+        repos.feed_state_repo.record_error("ConnectTimeout", at=_utc(15))
+
+        assert await repos.cycle(feed, _utc(21), cap=10) == [0, 30, 60, 90, 120]
+        state = repos.feed_state_repo.get()
+        assert state.last_error is None
+        assert state.recovery_regions == ()
+        assert repos.persisted == ["M_IN_ORDER"]
+    finally:
+        repos.close()

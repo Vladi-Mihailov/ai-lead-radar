@@ -24,8 +24,18 @@ safety cap до того, как окно было покрыто — иначе
 нетронутым, и следующий цикл просто повторяет то же (или более широкое)
 окно заново, что безопасно благодаря fingerprint dedup (см. задачу
 "FEED CURSOR": "If poll fails halfway: do not advance cursor beyond
-unprocessed data")."""
+unprocessed data").
 
+recovery_regions — прогресс восстановления, которое не уложилось в лимит
+страниц одного цикла (простой дольше ~1,5 суток): JSON-список уже
+прочитанных подряд участков списка (ReadRegion, сверху вниз), каждый с
+номерами протоколов своих первых и последних строк и числом строк. См.
+reader/fines/public_feed_traversal.py. Успешный цикл список очищает.
+Колонка добавляется в уже существующую таблицу при открытии репозитория
+(ALTER TABLE ADD COLUMN, данные не меняются; одновременное открытие
+несколькими процессами не падает)."""
+
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -38,15 +48,23 @@ CREATE TABLE IF NOT EXISTS georgia_public_feed_state (
     last_successful_poll_at  TIMESTAMP,
     last_completed_at        TIMESTAMP,
     last_error               TEXT,
-    last_error_at            TIMESTAMP
+    last_error_at            TIMESTAMP,
+    recovery_regions         TEXT
 )
 """
+
+# Колонки, добавленные после первого выпуска таблицы: на уже существующей
+# базе (REDNET, production) их добавляет __init__.
+_ADDED_COLUMNS = (
+    ("recovery_regions", "TEXT"),
+)
 
 _ENSURE_ROW = "INSERT OR IGNORE INTO georgia_public_feed_state (id) VALUES (1)"
 
 _SELECT = (
     "SELECT newest_seen_publish_date, last_successful_poll_at, last_completed_at, "
-    "last_error, last_error_at FROM georgia_public_feed_state WHERE id = 1"
+    "last_error, last_error_at, recovery_regions "
+    "FROM georgia_public_feed_state WHERE id = 1"
 )
 
 _RECORD_SUCCESS = """
@@ -55,13 +73,46 @@ SET newest_seen_publish_date = :newest_seen_publish_date,
     last_successful_poll_at = :polled_at,
     last_completed_at = :polled_at,
     last_error = NULL,
-    last_error_at = NULL
+    last_error_at = NULL,
+    recovery_regions = NULL
 WHERE id = 1
 """
 
 _RECORD_ERROR = """
 UPDATE georgia_public_feed_state SET last_error = :message, last_error_at = :at WHERE id = 1
 """
+
+_RECORD_REGIONS = """
+UPDATE georgia_public_feed_state SET recovery_regions = :regions WHERE id = 1
+"""
+
+
+@dataclass(frozen=True)
+class ReadRegion:
+    """Участок общего списка, прочитанный подряд (без пропусков) прошлыми
+    циклами восстановления: top — номера протоколов его первых строк, bottom
+    — последних (в порядке списка), length — сколько в нём разных строк,
+    updated_at — когда участок последний раз рос (только для журналов).
+    Участок узнаётся только по этим номерам — никогда по тому, что строка
+    "уже увидена" (её могла прочитать и другая попытка)."""
+
+    top: tuple[str, ...]
+    bottom: tuple[str, ...]
+    length: int
+    updated_at: str
+
+    def to_json(self) -> dict:
+        return {"top": list(self.top), "bottom": list(self.bottom), "length": self.length,
+                "updated_at": self.updated_at}
+
+    @staticmethod
+    def from_json(data: dict) -> "ReadRegion":
+        return ReadRegion(
+            top=tuple(str(p) for p in data.get("top", [])),
+            bottom=tuple(str(p) for p in data.get("bottom", [])),
+            length=int(data.get("length", 0)),
+            updated_at=str(data.get("updated_at", "")),
+        )
 
 
 @dataclass(frozen=True)
@@ -71,24 +122,57 @@ class PublicFeedState:
     last_completed_at: datetime | None
     last_error: str | None
     last_error_at: datetime | None
+    recovery_regions: tuple[ReadRegion, ...] = ()
+
+
+def _parse_regions(raw: str | None) -> tuple[ReadRegion, ...]:
+    if not raw:
+        return ()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return ()
+    if not isinstance(data, list):
+        return ()
+    regions = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        region = ReadRegion.from_json(item)
+        if region.top and region.bottom and region.length > 0:
+            regions.append(region)
+    return tuple(regions)
 
 
 def _row_to_state(row) -> PublicFeedState:
-    newest, polled_at, completed_at, error, error_at = row
+    newest, polled_at, completed_at, error, error_at, regions = row
     return PublicFeedState(
         newest_seen_publish_date=date.fromisoformat(newest) if newest else None,
         last_successful_poll_at=datetime.fromisoformat(polled_at) if polled_at else None,
         last_completed_at=datetime.fromisoformat(completed_at) if completed_at else None,
         last_error=error,
         last_error_at=datetime.fromisoformat(error_at) if error_at else None,
+        recovery_regions=_parse_regions(regions),
     )
 
 
 class GeorgiaPublicFeedStateRepository:
     def __init__(self, db_path: Path):
-        self._conn = sqlite3.connect(db_path)
+        # Дольше стандартных 5 с ждать блокировку записи: добавление колонки
+        # при первом открытии не должно ронять старт, пока другой процесс
+        # (ручной запуск, check-now) пишет в ту же базу.
+        self._conn = sqlite3.connect(db_path, timeout=30)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute(_SCHEMA)
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(georgia_public_feed_state)")}
+        for name, column_type in _ADDED_COLUMNS:
+            if name not in existing:
+                try:
+                    self._conn.execute(f"ALTER TABLE georgia_public_feed_state ADD COLUMN {name} {column_type}")
+                except sqlite3.OperationalError as exc:
+                    # Другой процесс добавил её между PRAGMA и ALTER.
+                    if "duplicate column name" not in str(exc).lower():
+                        raise
         self._conn.execute(_ENSURE_ROW)
         self._conn.commit()
 
@@ -105,6 +189,14 @@ class GeorgiaPublicFeedStateRepository:
 
     def record_error(self, message: str, *, at: datetime) -> None:
         self._conn.execute(_RECORD_ERROR, {"message": message, "at": at.isoformat()})
+        self._conn.commit()
+
+    def record_recovery_regions(self, regions: list[ReadRegion] | tuple[ReadRegion, ...]) -> None:
+        """Прогресс восстановления, не уложившегося в лимит страниц (см.
+        докстрок модуля): прочитанные подряд участки, сверху вниз. Пустой
+        список — прогресса нет. last_error не трогает."""
+        payload = json.dumps([region.to_json() for region in regions]) if regions else None
+        self._conn.execute(_RECORD_REGIONS, {"regions": payload})
         self._conn.commit()
 
     def close(self) -> None:
