@@ -48,7 +48,8 @@ before merge": защита от сдвига страниц/порядка — 
 проверено вживую, но НЕ доказана идеальная долгосрочная стабильность
 порядка/backfill), полностью её обрабатывает (её новые строки — НЕ
 отбрасываются) и только затем останавливается — без цепочки дальнейших
-overlap'ов. Поэтому стоимость цикла — O(число НОВЫХ записей с прошлого
+overlap'ов, если только overlap-страница не оказалась целиком новой (см.
+"FAST" ниже). Поэтому стоимость цикла — O(число НОВЫХ записей с прошлого
 раза) + 1 страница, а НЕ O(глубина backlog'а за день). Примеры (см.
 задачу):
   - граница на странице 1 (ничего нового с прошлого раза) -> 2 запроса
@@ -80,20 +81,36 @@ baseline ≈ 4 цикла × 2 запроса ≈ 8 запросов/день �
   что именно она отражает после сбоя/никогда не запускалась), жёстко
   ограничен max_pages (first_run_max_pages для истинного первого запуска,
   max_pages_per_cycle для восстановления после сбоя — обычно меньше).
-  Завершается успешно ТОЛЬКО на пустой странице; упёрся в max_pages —
-  остаётся в DEEP-режиме и на следующем цикле (см. задачу: "Do not
-  silently declare catch-up complete").
+  Завершается успешно на пустой странице ИЛИ на странице, ВСЕ строки
+  которой уже обработаны (DEEP-горизонт, см. _page_already_processed):
+  при истинном первом запуске — опубликованы раньше сегодняшнего дня; при
+  восстановлении — опубликованы раньше даты самой новой строки последнего
+  успешного цикла (но не позже его собственного дня) ЛИБО впервые увидены
+  этим циклом или раньше (first_seen_at <= его run_at; строки, отмеченные
+  сбойными или прерванными попытками после него, не считаются — "дыра"
+  под ними будет дочитана). Дойти до пустой страницы реального feed'а
+  (~10 тыс. страниц, ~5–6,3 тыс. публикаций в сутки) невозможно — без
+  горизонта DEEP не завершался никогда. Упёрся в max_pages раньше
+  горизонта — по-прежнему остаётся в DEEP-режиме и на следующем цикле
+  (см. задачу: "Do not silently declare catch-up complete").
 - "FAST" (обычный установившийся режим, после хотя бы одного успешного
-  DEEP-прохода И без свежей ошибки) — останавливается через ОДНУ
-  дополнительную (overlap) страницу ПОСЛЕ первой страницы, содержащей уже
-  известную (seen) запись (см. выше про защиту от сдвига страниц).
+  DEEP-прохода И без свежей ошибки) — останавливается на ВТОРОЙ странице,
+  содержащей уже известную (seen) запись, увиденную ДО этого цикла (обычно
+  это сразу следующая, overlap-страница; см. выше про защиту от сдвига
+  страниц). Строки, уже отмеченные этим же циклом, границей не считаются:
+  они появляются снова, когда новые публикации сдвигают страницы во время
+  обхода (в production — пачки по 70–360 строк), и граница на них — как и
+  страница, целиком занятая такой пачкой сразу после границы, — оставила бы
+  новые строки под ними непрочитанными навсегда.
 
 ВОССТАНОВЛЕНИЕ ПОСЛЕ СБОЯ (см. задачу "ATOMICITY": "mid-pagination
 failure does not cause data loss"): ЛЮБОЕ исключение в середине цикла
-выставляет last_error (см. GeorgiaPublicFeedStateRepository) — пока он не
-сброшен, СЛЕДУЮЩИЙ цикл автоматически работает в DEEP-режиме (не доверяя
+выставляет last_error (см. GeorgiaPublicFeedStateRepository); прерванный
+цикл (SIGTERM, OOM, CancelledError) оставляет отметку "цикл идёт",
+записанную перед первой страницей, — пока last_error не сброшен,
+СЛЕДУЮЩИЙ цикл автоматически работает в DEEP-режиме (не доверяя
 FAST-границе, которая могла не покрыть то, что сбойный цикл не успел
-обработать), пока не пройдёт полностью до пустой страницы. Строки,
+обработать), пока не дойдёт до пустой страницы или DEEP-горизонта. Строки,
 реально обработанные ДО сбоя (mark_seen/persist_feed_match — обе
 операции идемпотентны и коммитятся по одной), не теряются и не
 переобрабатываются как ошибка — detected_fines fingerprint dedup и
@@ -101,7 +118,8 @@ georgia_public_feed_seen PRIMARY KEY делают повторную обраб�
 
 protocolNo НЕ считается глобально монотонным (см. audit report, риск №5)
 — обход никогда не полагается на его порядок, только на seen/unseen per
-protocolNo и на пустоту страницы."""
+protocolNo, на пустоту страницы и на DEEP-горизонт (даты публикации и
+first_seen_at)."""
 
 import logging
 from dataclasses import dataclass
@@ -127,6 +145,18 @@ from reader.jobs.base import Job
 logger = logging.getLogger(__name__)
 
 _PAGE_SIZE = 30
+
+# Отметка "цикл идёт" в georgia_public_feed_state.last_error (см. отметку
+# перед циклом страниц): если она осталась, цикл был прерван.
+_CYCLE_IN_PROGRESS = (
+    "cycle in progress (if this stays, the cycle was interrupted "
+    "and the next one runs deep recovery)"
+)
+
+# Настройки лимита страниц, которые называет _safety_cap_message() —
+# ключи config.yaml (см. reader/settings.py).
+_FIRST_RUN_PAGES_SETTING = "fine_monitor.public_feed_first_run_max_pages"
+_PAGES_PER_CYCLE_SETTING = "fine_monitor.public_feed_max_pages_per_cycle"
 
 
 @dataclass
@@ -236,6 +266,42 @@ class GeorgiaPublicFineFeedJob(Job):
         in_recovery = feed_state.last_error is not None
         deep_mode = is_true_first_run or in_recovery
         max_pages = self._first_run_max_pages if is_true_first_run else self._max_pages_per_cycle
+        # DEEP-горизонт (см. _page_already_processed): DEEP завершается на
+        # странице, ВСЕ строки которой уже обработаны, — ниже по feed'у
+        # (newest-first) лежат только такие. До пустой страницы не дойти:
+        # в feed'е ~10 тыс. страниц (~5–6,3 тыс. публикаций в сутки), без
+        # горизонта DEEP не завершался никогда и каждый цикл перечитывал
+        # max_pages страниц заново.
+        # - Истинный первый запуск — только сегодняшние публикации: более
+        #   ранние штрафы отслеживаемых номеров находит bootstrap-поиск при
+        #   добавлении номера.
+        # - Восстановление — строки, опубликованные раньше даты самой новой
+        #   строки последнего успешного цикла (но не позже дня самого цикла:
+        #   строка, датированная будущим, горизонт не сдвигает), ЛИБО впервые
+        #   увиденные этим циклом или раньше (first_seen_at <= его run_at —
+        #   всё, что он отметил, обработано). Отмеченные позже (в т.ч.
+        #   сбойной или прерванной попыткой над недочитанной "дырой") не
+        #   считаются — дыра будет дочитана. Весь последний день заново не
+        #   перечитывается, иначе восстановление после двух сбоев подряд не
+        #   помещалось бы в лимит страниц.
+        if is_true_first_run:
+            processed_before_date = run_at.astimezone(self._tz).date()
+            processed_before_time = None
+        else:
+            last_success = _as_utc(feed_state.last_successful_poll_at)
+            success_day = last_success.astimezone(self._tz).date()
+            newest = feed_state.newest_seen_publish_date
+            processed_before_date = success_day if newest is None else min(newest, success_day)
+            processed_before_time = last_success
+            if deep_mode and last_success.replace(microsecond=0) >= _as_utc(run_at).replace(microsecond=0):
+                # Успех записан с часами "впереди": по first_seen_at строки
+                # этого и прошлых сбойных циклов сошли бы за обработанные.
+                logger.warning(
+                    "GeorgiaPublicFineFeedJob: last successful cycle %s is not earlier than this "
+                    "cycle %s (clock skew?) — recovery ignores first-seen times this cycle",
+                    last_success.isoformat(), run_at.isoformat(),
+                )
+                processed_before_time = None
 
         matched_count = 0
         pages_fetched = 0
@@ -244,13 +310,28 @@ class GeorgiaPublicFineFeedJob(Job):
         # "One page of overlap after frontier" (см. корректирующую задачу
         # "One final safety adjustment before merge") — после страницы, на
         # которой НАЙДЕНА установленная граница (page_has_seen_row), FAST-
-        # режим не останавливается немедленно: сначала запрашивается РОВНО
-        # ОДНА дополнительная страница (на случай небольшого сдвига
-        # порядка/страницы, см. докстрок класса), она тоже полностью
-        # обрабатывается (её новые строки — НЕ отбрасываются), и ТОЛЬКО
-        # после неё цикл останавливается — без цепочки дальнейших overlap'ов
-        # и без повторной проверки page_has_seen_row на ней самой.
+        # режим не останавливается немедленно: следующие страницы тоже
+        # полностью обрабатываются (их новые строки — НЕ отбрасываются), и
+        # цикл останавливается на ВТОРОЙ странице со строкой, увиденной до
+        # этого цикла, — обычно это сразу следующая (overlap) страница. Если
+        # пачка публикаций сдвинула список сразу после границы и следующая
+        # страница целиком новая, обход продолжается, иначе самые старые
+        # строки пачки остались бы непрочитанными навсегда.
         pending_overlap = False
+        # Отмеченные этим циклом: пока идёт обход, наверху feed'а появляются
+        # новые публикации, страницы сдвигаются вниз, и следующая страница
+        # снова показывает уже прочитанные строки (в production — пачки по
+        # 70–360 строк в циклы 15:00/21:00). Это не граница FAST — граница
+        # только строка, увиденная до этого цикла, иначе FAST остановился бы
+        # на повторе и не дочитал бы новые строки под ним.
+        marked_this_cycle: set[str] = set()
+
+        # Отметка "цикл идёт": если процесс остановят посреди цикла (SIGTERM,
+        # OOM, CancelledError — их не ловит ни один except ниже), last_error
+        # останется, и следующий цикл пойдёт DEEP-восстановлением, а не FAST
+        # (FAST остановился бы на строках прерванного цикла и не вернулся бы
+        # к недочитанным под ними). Успех её снимает, ошибка перезаписывает.
+        self._feed_state.record_error(_CYCLE_IN_PROGRESS, at=run_at)
 
         try:
             for page_index in range(max_pages):
@@ -286,7 +367,8 @@ class GeorgiaPublicFineFeedJob(Job):
                         continue
 
                     if self._seen.is_seen(protocol_no):
-                        page_has_seen_row = True
+                        if protocol_no not in marked_this_cycle:
+                            page_has_seen_row = True
                         continue
 
                     # Впервые видим эту конкретную запись feed'а (неважно,
@@ -296,22 +378,31 @@ class GeorgiaPublicFineFeedJob(Job):
                     # handled normally") — отмечаем ДО попытки сопоставления,
                     # см. GeorgiaPublicFeedSeenRepository докстрок.
                     self._seen.mark_seen(
-                        protocol_no, publish_date=entry_date or run_at.date(),
+                        protocol_no, publish_date=entry_date or run_at.date(), seen_at=run_at,
                     )
+                    marked_this_cycle.add(protocol_no)
                     matched_count += await self._maybe_process_entry(entry, monitored)
 
-                if pending_overlap:
-                    # Это и была единственная overlap-страница — хватит,
-                    # независимо от того, что на ней нашлось (см. задачу:
-                    # никакой цепочки дальнейших overlap'ов).
+                if deep_mode and _page_already_processed(
+                    raw_results, self._seen,
+                    published_before=processed_before_date, seen_at_or_before=processed_before_time,
+                ):
+                    # DEEP дошёл до уже обработанных строк (см. DEEP-горизонт) —
+                    # цикл завершён честно, а не упором в лимит страниц.
                     completed = True
                     break
 
                 if not deep_mode and page_has_seen_row:
+                    if pending_overlap:
+                        # Вторая страница со строками, увиденными до этого
+                        # цикла: ниже — только уже обработанное. Страница
+                        # без них (пачка публикаций сдвинула список сразу
+                        # после границы) обход не завершает.
+                        completed = True
+                        break
                     # Установленная граница с прошлого цикла найдена — не
                     # останавливаемся немедленно (см. задачу про защиту от
-                    # сдвига страниц/порядка), а запрашиваем ровно ОДНУ
-                    # дополнительную страницу на следующей итерации.
+                    # сдвига страниц/порядка), а запрашиваем ещё страницу.
                     pending_overlap = True
                     continue
             else:
@@ -326,16 +417,13 @@ class GeorgiaPublicFineFeedJob(Job):
             return
 
         if not completed:
+            message = _safety_cap_message(
+                max_pages, is_true_first_run=is_true_first_run, deep_mode=deep_mode,
+            )
             logger.warning(
-                "GeorgiaPublicFineFeedJob: reached safety cap (%d pages, deep_mode=%s) before "
-                "reaching an empty page — %s scan INCOMPLETE, will retry in deep mode next cycle "
-                "(matched=%d this attempt)",
-                max_pages, deep_mode, "first-run catch-up" if is_true_first_run else "recovery",
-                matched_count,
+                "GeorgiaPublicFineFeedJob: %s (matched=%d this attempt)", message, matched_count,
             )
-            self._record_error(
-                "safety cap reached before an empty page (see WARNING log)", at=run_at,
-            )
+            self._record_error(message, at=run_at)
             return
 
         if newest_seen_this_cycle is not None:
@@ -429,3 +517,59 @@ def _parse_publish_date(value) -> date | None:
         return date.fromisoformat(value)
     except ValueError:
         return None
+
+
+def _page_already_processed(
+    entries: list[dict],
+    seen: GeorgiaPublicFeedSeenRepository,
+    *,
+    published_before: date | None,
+    seen_at_or_before: datetime | None,
+) -> bool:
+    """DEEP-горизонт (см. run()): КАЖДАЯ строка страницы опубликована
+    раньше published_before ЛИБО впервые увидена не позже seen_at_or_before
+    (последним успешным циклом или раньше). Строка без даты публикации и
+    без такой отметки — не обработанная: обход продолжается."""
+    if not entries:
+        return False
+    for entry in entries:
+        entry_date = _parse_publish_date(entry.get("publishDate"))
+        if published_before is not None and entry_date is not None and entry_date < published_before:
+            continue
+        protocol_no = entry.get("protocolNo")
+        if (
+            seen_at_or_before is not None
+            and protocol_no
+            and seen.seen_at_or_before(protocol_no, seen_at_or_before)
+        ):
+            continue
+        return False
+    return True
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Naive datetime считается UTC (как и first_seen_at в
+    GeorgiaPublicFeedSeenRepository)."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _safety_cap_message(max_pages: int, *, is_true_first_run: bool, deep_mode: bool) -> str:
+    """Свой текст для каждого режима, с именем настройки лимита.
+    Восстановление, не дошедшее до строк последнего успеха за max_pages
+    страниц, само уже не завершится: новые строки только отодвигают их."""
+    if is_true_first_run:
+        return (
+            f"first-run catch-up: safety cap of {max_pages} pages reached before rows published "
+            f"before today; retrying in deep mode next cycle (raise {_FIRST_RUN_PAGES_SETTING} "
+            "if this repeats)"
+        )
+    if deep_mode:
+        return (
+            "recovery could not reach rows covered by the last successful cycle within "
+            f"{max_pages} pages; it keeps failing until {_PAGES_PER_CYCLE_SETTING} is raised"
+        )
+    return (
+        f"safety cap of {max_pages} pages reached before the frontier (already-seen rows); "
+        "the next cycle runs deep recovery, which needs even more pages — raise "
+        f"{_PAGES_PER_CYCLE_SETTING}"
+    )

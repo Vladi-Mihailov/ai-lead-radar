@@ -180,34 +180,35 @@ class FineMonitorSettings(BaseModel):
     )
     # Safety cap страниц (по 30 строк) на ОДИН ОБЫЧНЫЙ (FAST-режим, см.
     # reader/jobs/georgia_public_feed_job.py докстрок) ЛИБО
-    # восстановительный (после сбоя предыдущего цикла) проход — см. audit
-    # report про реально измеренную скорость публикации (~670 штрафов/
-    # сутки ≈ 2-3 строки за 5-минутный цикл в среднем): FAST-режим
-    # останавливается НАМНОГО раньше этого предела почти всегда (как
-    # только страница содержит хотя бы одну уже известную запись, см.
-    # "IMPORTANT CORRECTION BEFORE COMMIT / PR" про исправление
-    # первоначальной версии, пересматривавшей целый день на каждом
-    # цикле) — это именно safety net на случай всплеска/восстановления,
-    # а не ожидаемый типичный объём за цикл.
-    public_feed_max_pages_per_cycle: int = 30
+    # восстановительный (после сбоя или прерывания предыдущего цикла)
+    # проход. FAST останавливается на первой странице с уже известной
+    # записью + одна overlap-страница; восстановление — на странице, все
+    # строки которой уже обработаны последним успешным циклом (DEEP-
+    # горизонт). При ~5–6,3 тыс. публикаций в сутки (ноябрь 2026, а не ~670
+    # из исходного audit report) самый загруженный цикл (21:00 Тбилиси)
+    # приносит ~3–3,5 тыс. строк ≈ 100–117 страниц, поэтому 300 — тот же
+    # лимит, что и у REDNET-коллектора (GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE).
+    # Восстановление, не уложившееся в лимит, само не завершится — лимит
+    # нужно поднять (см. текст ошибки в georgia_public_feed_state).
+    public_feed_max_pages_per_cycle: int = 300
     # Safety cap ТОЛЬКО для истинного первого запуска (cutover catch-up,
     # когда georgia_public_feed_state.last_successful_poll_at ещё ни разу
-    # не был установлен) — заметно больше обычного: нужно перекрыть разрыв
-    # между последней успешной per-car проверкой и моментом включения
-    # feed'а (см. audit report: 520/523 активных машин проверялись в
-    # последние 48 часов — 100 страниц (3000 строк) с запасом покрывает
-    # это окно при наблюдаемой скорости публикации). ОДНОразовая операция
+    # не был установлен). Первый запуск читает только сегодняшние
+    # публикации (до первой страницы, целиком опубликованной раньше
+    # сегодняшнего дня; более ранние штрафы находит bootstrap-поиск номера)
+    # — до ~6,3 тыс. строк ≈ 210 страниц к концу дня; пустой страницы в
+    # реальном feed'е (~10 тыс. страниц) не бывает. ОДНОразовая операция
     # (см. задачу: "That is a ONE-TIME operation. It must not become the
-    # normal polling strategy") — после первого успешного завершения
-    # (пустая страница в пределах этого лимита) больше никогда не
-    # используется, все последующие циклы работают в FAST-режиме.
-    public_feed_first_run_max_pages: int = 100
+    # normal polling strategy") — после первого успешного завершения больше
+    # никогда не используется. 300 — как у REDNET-коллектора
+    # (GEORGIA_COLLECTOR_FIRST_RUN_MAX_PAGES).
+    public_feed_first_run_max_pages: int = 300
     # Retention для georgia_public_feed_seen (см.
     # reader/fines/public_feed_seen_repository.py) — "видели ли мы уже
     # этот protocolNo" нужно знать только для недавних записей (текущая
     # FAST-граница всегда среди самых свежих publishDate); при
-    # наблюдаемой скорости публикации (~670/сутки) даже 7 дней хранения —
-    # это ~4700 строк, тривиально для SQLite.
+    # наблюдаемой скорости публикации (~5–6,3 тыс./сутки) 7 дней хранения —
+    # это ~40–45 тыс. строк, всё ещё тривиально для SQLite.
     public_feed_seen_retention_days: int = 7
 
     # Внутренний collector API (см. задачу "Georgia remote collector
@@ -753,10 +754,10 @@ def load_settings(config_path: Path) -> Settings:
                     )
                 ],
                 public_feed_max_pages_per_cycle=int(
-                    fine_monitor_raw.get("public_feed_max_pages_per_cycle", 30)
+                    fine_monitor_raw.get("public_feed_max_pages_per_cycle", 300)
                 ),
                 public_feed_first_run_max_pages=int(
-                    fine_monitor_raw.get("public_feed_first_run_max_pages", 100)
+                    fine_monitor_raw.get("public_feed_first_run_max_pages", 300)
                 ),
                 public_feed_seen_retention_days=int(
                     fine_monitor_raw.get("public_feed_seen_retention_days", 7)
