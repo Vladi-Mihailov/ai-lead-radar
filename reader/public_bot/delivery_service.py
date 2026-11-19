@@ -113,6 +113,13 @@ def _applicable_roles(subscription: FineMonitoringSubscription) -> list[Recipien
     return roles
 
 
+class FineStatusLookupLike(Protocol):
+    """Ровно то, что нужно отсюда от FineStatusTracker (см.
+    reader/fines/payment_status.py)."""
+
+    def undeliverable_protocols(self, car_number: str) -> set[str]: ...
+
+
 class ClientDeliveryService:
     def __init__(
         self,
@@ -123,7 +130,11 @@ class ClientDeliveryService:
         *,
         tz: ZoneInfo,
         payment_help_contact_username: str = "tplgee",
+        status_lookup: FineStatusLookupLike | None = None,
     ):
+        # None — статусы оплаты не ведутся: дедуп по квитанции работает,
+        # пропуска исчезнувших из базы полиции квитанций нет.
+        self._status_lookup = status_lookup
         self._detected_fine_repository = detected_fine_repository
         self._subscription_repository = subscription_repository
         self._delivery_repository = delivery_repository
@@ -158,10 +169,20 @@ class ClientDeliveryService:
                 # check_service.py), этот поллер — единственный путь
                 # клиентской доставки, независимый от notification_sent_at.
                 continue
-            fines = self._detected_fine_repository.list_by_car_number(subscription.car_number)
+            fines = self._deliverable_fines(subscription)
+            delivered_protocols = (
+                self._delivery_repository.delivered_protocols(subscription.id) if fines else {}
+            )
             for fine in fines:
                 for role in _applicable_roles(subscription):
+                    if fine.external_fine_id and fine.external_fine_id in delivered_protocols.get(role, set()):
+                        # Эта квитанция уже доставлена этому получателю по
+                        # другой строке (другая задача того же номера) —
+                        # второй "🚨 Обнаружен новый штраф" не нужен.
+                        continue
                     outcome = await self._attempt_delivery(fine, subscription, role, now=now)
+                    if outcome == "delivered" and fine.external_fine_id:
+                        delivered_protocols.setdefault(role, set()).add(fine.external_fine_id)
                     if outcome == "delivered":
                         delivered += 1
                     elif outcome == "failed":
@@ -181,6 +202,36 @@ class ClientDeliveryService:
                     # "not_due" — ничего не считаем, это не попытка.
 
         return DeliveryTickResult(delivered=delivered, failed=failed, flood_wait_hit=False)
+
+    def _deliverable_fines(self, subscription: FineMonitoringSubscription) -> list[DetectedFine]:
+        """Строки detected_fines номера подписки, по одной на квитанцию
+        (самая ранняя строка — каноническая), без квитанций, которых police.ge
+        больше не показывает (⚪), и без ⏳ — квитанций из истории, чьё
+        присутствие новая проверка ещё не подтвердила: "новый штраф" о них
+        был бы ложным (см. задачу — подписку могли создать уже после того,
+        как штраф оплатили и он исчез). ⏳ подписчик видит отдельной строкой
+        (итог добавления машины, "Проверить сейчас"); подтверждённая
+        проверкой или feed'ом квитанция уйдёт на следующем тике, ⚪ — никогда.
+        Не найденные один раз ('missing') доставляются как обычно — это ещё
+        не доказательство. Строки без номера квитанции (старые записи) — как
+        раньше, каждая отдельно."""
+        fines = sorted(
+            self._detected_fine_repository.list_by_car_number(subscription.car_number), key=lambda fine: fine.id,
+        )
+        undeliverable = (
+            self._status_lookup.undeliverable_protocols(subscription.car_number)
+            if self._status_lookup is not None and fines else set()
+        )
+        result: list[DetectedFine] = []
+        seen_protocols: set[str] = set()
+        for fine in fines:
+            protocol_no = fine.external_fine_id
+            if protocol_no:
+                if protocol_no in seen_protocols or protocol_no in undeliverable:
+                    continue
+                seen_protocols.add(protocol_no)
+            result.append(fine)
+        return result
 
     async def _attempt_delivery(
         self,

@@ -42,6 +42,7 @@ from reader.public_bot.texts import (
     CHECK_NOW_LABEL,
     DEBT_REFRESH_BUTTON_LABEL,
     DEBT_REFRESH_CONFIRM_BUTTON_LABEL,
+    FINE_STATUS_BUTTON_LABEL,
     DELETE_CAR_BUTTON_LABEL,
     DELETE_CAR_CONFIRM_BUTTON_LABEL,
     HELP_LABEL,
@@ -624,7 +625,9 @@ def decode_debt_list_page_callback(data: bytes | None) -> int | None:
     return _decode_id(data, _DEBT_LIST_PAGE_PREFIX)
 
 
-def debt_statistics_keyboard(*, page: int | None, total_pages: int | None) -> list[list[Button]]:
+def debt_statistics_keyboard(
+    *, page: int | None, total_pages: int | None, fine_status_button: bool = False,
+) -> list[list[Button]]:
     """Клавиатура ПОД сообщением 📊 Статистика, когда debt_refresh
     доступен (см. BotReply.debt_refresh_available) — пагинация itemized-
     списка (только если он не пуст И страниц больше одной, см.
@@ -642,7 +645,85 @@ def debt_statistics_keyboard(*, page: int | None, total_pages: int | None) -> li
             Button.inline("Вперёд ▶️", encode_debt_list_page_callback(next_page)),
         ])
     rows.append([Button.inline(DEBT_REFRESH_BUTTON_LABEL, _DEBT_REFRESH_PICK)])
+    if fine_status_button:
+        rows.append([Button.inline(FINE_STATUS_BUTTON_LABEL, _FINE_STATUS_ASK)])
     return rows
+
+
+# ==== "🧾 Статусы оплаты" (см. reader/fines/payment_status.py) — trusted-
+# manager-only; id статуса в callback_data публичен и НЕ доказывает
+# авторизацию: is_trusted() перепроверяется в каждом handle_fine_status_*
+# (см. ConversationController). ====
+_FINE_STATUS_ASK = b"fstask"
+_FINE_STATUS_OPEN_PREFIX = b"fsto:"
+_FINE_STATUS_ACTION_PREFIX = b"fsta:"
+_FINE_STATUS_CONFIRM_PREFIX = b"fsty:"
+_FINE_STATUS_CANCEL_PREFIX = b"fstn:"
+_FINE_STATUS_BACK_PREFIX = b"fstb:"
+FINE_STATUS_ACTIONS = ("paid", "failed", "text", "unpaid")
+
+
+def is_fine_status_ask_callback(data: bytes | None) -> bool:
+    return data == _FINE_STATUS_ASK
+
+
+def encode_fine_status_open_callback(status_id: int) -> bytes:
+    return _FINE_STATUS_OPEN_PREFIX + str(status_id).encode("ascii")
+
+
+def decode_fine_status_open_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _FINE_STATUS_OPEN_PREFIX)
+
+
+def encode_fine_status_action_callback(status_id: int, action: str) -> bytes:
+    return _FINE_STATUS_ACTION_PREFIX + f"{status_id}:{action}".encode("ascii")
+
+
+def decode_fine_status_action_callback(data: bytes | None) -> tuple[int, str] | None:
+    if not data or not data.startswith(_FINE_STATUS_ACTION_PREFIX):
+        return None
+    raw_id, _, action = data[len(_FINE_STATUS_ACTION_PREFIX):].decode("ascii", "replace").partition(":")
+    if action not in FINE_STATUS_ACTIONS:
+        return None
+    try:
+        return int(raw_id), action
+    except ValueError:
+        return None
+
+
+def encode_fine_status_confirm_callback(status_id: int, token: str) -> bytes:
+    """token — одноразовый код экрана подтверждения (см.
+    ConversationController._fine_status_confirm_reply): кнопка со старого
+    экрана не применит действие, показанное на другом экране."""
+    return _FINE_STATUS_CONFIRM_PREFIX + f"{status_id}:{token}".encode("ascii")
+
+
+def decode_fine_status_confirm_callback(data: bytes | None) -> tuple[int, str] | None:
+    if not data or not data.startswith(_FINE_STATUS_CONFIRM_PREFIX):
+        return None
+    raw_id, _, token = data[len(_FINE_STATUS_CONFIRM_PREFIX):].decode("ascii", "replace").partition(":")
+    if not token or not token.isalnum():
+        return None
+    try:
+        return int(raw_id), token
+    except ValueError:
+        return None
+
+
+def encode_fine_status_cancel_callback(status_id: int) -> bytes:
+    return _FINE_STATUS_CANCEL_PREFIX + str(status_id).encode("ascii")
+
+
+def decode_fine_status_cancel_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _FINE_STATUS_CANCEL_PREFIX)
+
+
+def encode_fine_status_back_callback(status_id: int) -> bytes:
+    return _FINE_STATUS_BACK_PREFIX + str(status_id).encode("ascii")
+
+
+def decode_fine_status_back_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _FINE_STATUS_BACK_PREFIX)
 
 
 def debt_refresh_confirm_keyboard() -> list[list[Button]]:

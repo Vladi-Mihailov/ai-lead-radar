@@ -195,5 +195,22 @@ class ClientFineDeliveryRepository:
         delivery = self.get(detected_fine_id, subscription_id, recipient_role)
         return delivery is not None and delivery.delivered_at is not None
 
+    def delivered_protocols(self, subscription_id: int) -> dict[str, set[str]]:
+        """{recipient_role: {protocolNo}} — какие квитанции этой подписке уже
+        доставлены (по ЛЮБОЙ строке detected_fines: одна и та же квитанция
+        одного номера может лежать под несколькими задачами). См.
+        ClientDeliveryService — дедуп "нового штрафа" по квитанции."""
+        rows = self._conn.execute(
+            "SELECT d.recipient_role, df.external_fine_id FROM client_fine_deliveries d "
+            "JOIN detected_fines df ON df.id = d.detected_fine_id "
+            "WHERE d.subscription_id = ? AND d.delivered_at IS NOT NULL "
+            "AND df.external_fine_id IS NOT NULL AND df.external_fine_id != ''",
+            (subscription_id,),
+        ).fetchall()
+        result: dict[str, set[str]] = {}
+        for role, protocol_no in rows:
+            result.setdefault(role, set()).add(protocol_no)
+        return result
+
     def close(self) -> None:
         self._conn.close()

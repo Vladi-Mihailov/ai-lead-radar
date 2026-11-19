@@ -32,9 +32,9 @@ from aiohttp import web
 
 from reader.fines.collector_http_auth import build_hmac_middleware
 from reader.fines.collector_payload import record_to_payload
-from reader.fines.parser import FineParseError, parse_search_response
+from reader.fines.parser import FineParseError, extract_reported_count, parse_search_response
 from reader.fines.police_ge_session import PoliceGeSession
-from reader.fines.provider import FineProviderError, PoliceGeUnavailableError
+from reader.fines.provider import FineProviderError, PoliceGeBlockedError, PoliceGeUnavailableError
 from reader.fines.validation import FineValidationError, normalize_car_number
 
 logger = logging.getLogger(__name__)
@@ -59,8 +59,15 @@ def build_check_now_app(session: PoliceGeSession, *, hmac_secret: str) -> web.Ap
             return web.json_response({"error": "malformed payload"}, status=400)
         except FineValidationError:
             return web.json_response({"error": "invalid plate"}, status=400)
+        # Необязательный флаг вечерней перепроверки (см. reader/public_bot/
+        # daily_recheck.py): перед поиском заново загрузить страницу
+        # police.ge, чтобы source_updated_on в ответе была свежей. Старый
+        # production его не присылает — поведение прежнее.
+        refresh_page = isinstance(payload, dict) and payload.get("refresh_page") is True
 
         try:
+            if refresh_page:
+                await session.refresh_page()
             raw = await session.search_by_plate(plate)
             records = parse_search_response(raw, car_number=plate)
         except PoliceGeUnavailableError:
@@ -74,11 +81,27 @@ def build_check_now_app(session: PoliceGeSession, *, hmac_secret: str) -> web.Ap
         except FineParseError as exc:
             logger.warning("check-now: police.ge response did not parse (%s)", type(exc).__name__)
             return web.json_response({"error": "parse_error"}, status=502)
+        except PoliceGeBlockedError as exc:
+            # 403/429 от police.ge — тот же HTTP 502, что и у любой ошибки
+            # источника (старый production так и разберёт его как обычную
+            # FineProviderError), но с кодом в теле: новый production
+            # останавливает массовую перепроверку сразу.
+            logger.warning("check-now: police.ge refused the request (HTTP %s)", exc.status_code)
+            return web.json_response({"error": "blocked", "http_status": exc.status_code}, status=502)
         except FineProviderError as exc:
             logger.warning("check-now: provider error (%s)", type(exc).__name__)
             return web.json_response({"error": "provider_error"}, status=502)
 
-        return web.json_response({"records": [record_to_payload(r) for r in records]})
+        # count/source_updated_on — дополнительные поля (см. reader/fines/
+        # provider.py::ProviderSearchResult): старый production их
+        # игнорирует, новый — не считает неполный ответ доказательством
+        # исчезновения штрафа и показывает дату обновления базы police.ge.
+        updated_on = getattr(session, "source_updated_on", None)
+        return web.json_response({
+            "records": [record_to_payload(r) for r in records],
+            "count": extract_reported_count(raw),
+            "source_updated_on": updated_on.isoformat() if updated_on else None,
+        })
 
     app.router.add_post(_CHECK_NOW_PATH, post_check_now)
     return app

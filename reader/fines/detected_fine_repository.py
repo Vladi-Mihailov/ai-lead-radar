@@ -282,6 +282,21 @@ class DetectedFineRepository:
         ).fetchall()
         return [_row_to_fine(row) for row in rows]
 
+    def has_notified_protocol_for_car(self, car_number: str, external_fine_id: str, *, exclude_task_id: int) -> bool:
+        """Уведомлён ли оператор об этой квитанции этого номера через
+        ДРУГУЮ задачу — см. FineCheckService._finalize: строка для ещё одной
+        задачи номера тогда рождается "уведомлённой", чтобы уже известный
+        штраф не пришёл оператору повторно (idx_detected_fines_car_number —
+        без полного скана). Квитанция, новая для всех задач сразу, сюда не
+        попадает: у каждой задачи своя строка, ждущая уведомления, как и
+        раньше."""
+        row = self._conn.execute(
+            "SELECT 1 FROM detected_fines WHERE car_number = ? AND external_fine_id = ? "
+            "AND monitoring_task_id != ? AND notification_sent_at IS NOT NULL LIMIT 1",
+            (car_number, external_fine_id, exclude_task_id),
+        ).fetchone()
+        return row is not None
+
     def list_by_car_number(self, car_number: str) -> list[DetectedFine]:
         """Все обнаруженные штрафы конкретного номера — используется client
         delivery poller'ом (см. reader/public_bot/delivery_service.py) для
@@ -351,15 +366,15 @@ class DetectedFineRepository:
         notification_sent_at: datetime | None = None,
     ) -> DetectedFine:
         """notification_sent_at — по умолчанию None (NULL): "новый штраф
-        ждёт уведомления" (см. list_pending_notifications()). Все
-        вызывающие коды в проекте (FineCheckService._finalize(), см. задачу
-        "Fix Georgia fine notifications") используют именно это значение по
-        умолчанию — передача НЕ-None значения создаёт строку, с рождения
-        невидимую для list_pending_notifications() (WHERE
-        notification_sent_at IS NULL), без единого изменения в
-        FineNotificationCoordinator/NotificationFlushJob; это низкоуровневая
-        возможность repository, которой текущий код сознательно не
-        пользуется ни в одном вызывающем месте."""
+        ждёт уведомления" (см. list_pending_notifications()). НЕ-None
+        значение создаёт строку, с рождения невидимую для
+        list_pending_notifications() (WHERE notification_sent_at IS NULL),
+        без единого изменения в FineNotificationCoordinator/
+        NotificationFlushJob. FineCheckService._finalize() передаёт его
+        ТОЛЬКО когда оператор уже уведомлён о той же квитанции того же номера
+        через другую задачу (см. has_notified_protocol_for_car) — новый для
+        номера штраф по-прежнему рождается с NULL и уведомляет оператора как
+        обычно."""
         try:
             cursor = self._conn.execute(
                 _INSERT,

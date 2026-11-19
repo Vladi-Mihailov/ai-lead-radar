@@ -288,3 +288,22 @@ def test_no_special_suppression_wording_left_in_bot_texts():
     fine_source = (PROJECT_ROOT / "reader" / "commands" / "fine.py").read_text(encoding="utf-8")
     assert "Проверка штрафов для этого автомобиля недоступна" not in fine_source
     assert "проверка недоступна" not in fine_source
+
+
+async def test_suppressed_plate_does_not_leak_through_the_cached_check_now(fx):
+    """police.ge недоступен — «Проверить сейчас» читает последнее состояние
+    из БД (check_task_or_read_cached): denylist действует и там, строки,
+    сохранённые до него, не показываются. Обычный номер в той же ситуации
+    по-прежнему видит свои штрафы."""
+    suppressed, normal = fx.make_task(_SUPPRESSED), fx.make_task(_NORMAL)
+    for task in (suppressed, normal):
+        fx.seed_snapshot(task, _CANARY)
+        fx.add_history(task)
+    fx.provider.is_available = lambda: False
+
+    suppressed_text = await _check_now_text(fx, _SUPPRESSED)
+    normal_text = await _check_now_text(fx, _NORMAL)
+
+    assert fx.provider.requested_plates == []
+    assert "98765" not in suppressed_text and suppressed_text == texts.format_no_fines_found(_SUPPRESSED)
+    assert normal_text != texts.format_no_fines_found(_NORMAL)
