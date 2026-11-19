@@ -16,8 +16,7 @@ first_seen_at — когда запись встретилась впервые 
 CURRENT_TIMESTAMP). DEEP-восстановление (см. seen_at_or_before) по нему
 отличает строки, обработанные последним успешным циклом или раньше, от
 строк, отмеченных позже (в том числе сбойными или прерванными попытками
-над ещё не дочитанной "дырой"); восстановление в несколько циклов (см.
-seen_between) — строки, уже прочитанные им самим.
+над ещё не дочитанной "дырой").
 
 Ограничено по времени (см. retention_days в GeorgiaPublicFineFeedJob) —
 при наблюдаемой скорости публикации (~5–6,3 тыс./день в ноябре 2026, а
@@ -55,10 +54,6 @@ _MARK_SEEN_AT = (
 
 _SELECT_SEEN_AT_OR_BEFORE = (
     "SELECT 1 FROM georgia_public_feed_seen WHERE protocol_no = ? AND first_seen_at <= ?"
-)
-
-_SELECT_SEEN_BETWEEN = (
-    "SELECT 1 FROM georgia_public_feed_seen WHERE protocol_no = ? AND first_seen_at > ? AND first_seen_at <= ?"
 )
 
 _DELETE_OLDER_THAN = "DELETE FROM georgia_public_feed_seen WHERE publish_date < ?"
@@ -102,17 +97,6 @@ class GeorgiaPublicFeedSeenRepository:
         последний успешный цикл (first_seen_at = его run_at) или более
         ранние, уже обработано."""
         row = self._conn.execute(_SELECT_SEEN_AT_OR_BEFORE, (protocol_no, _sqlite_utc(at))).fetchone()
-        return row is not None
-
-    def seen_between(self, protocol_no: str, *, after: datetime, until: datetime) -> bool:
-        """Запись впервые отмечена позже after и не позже until, с точностью
-        до секунды (только чтение) — восстановление в несколько циклов (см.
-        GeorgiaPublicFineFeedJob/GeorgiaCollectorJob): after — последний
-        успешный цикл, until — цикл, упёршийся в лимит страниц; такие строки
-        уже прочитаны этим восстановлением."""
-        row = self._conn.execute(
-            _SELECT_SEEN_BETWEEN, (protocol_no, _sqlite_utc(after), _sqlite_utc(until)),
-        ).fetchone()
         return row is not None
 
     def cleanup_older_than(self, cutoff: date) -> int:

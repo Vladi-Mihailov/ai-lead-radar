@@ -730,7 +730,7 @@ async def test_future_dated_row_does_not_move_the_recovery_date_horizon_past_the
     assert feed_state_repo3.get().last_error is None
 
 
-async def test_capped_recovery_records_where_it_stopped_and_names_the_setting(tmp_path, caplog):
+async def test_capped_recovery_keeps_what_it_read_as_a_region_and_names_the_setting(tmp_path, caplog):
     import logging
 
     production = _FakeProductionClient(active_plates=["AA001AA"])
@@ -746,11 +746,13 @@ async def test_capped_recovery_records_where_it_stopped_and_names_the_setting(tm
     state = feed_state_repo.get()
     error = state.last_error
     assert "recovery reached the page cap of 3 pages before rows covered by the last successful cycle" in error
-    assert "continues from where this one stopped (offset 90)" in error
+    assert "90 rows read so far in 1 region(s) are kept" in error
     assert "GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE" in error
     assert any(r.levelno == logging.WARNING and error in r.getMessage() for r in caplog.records)
-    assert state.recovery_resume_offset == 90
-    assert state.recovery_resume_at == _utc(23, 55)
+    [region] = state.recovery_regions
+    assert region.length == 90
+    assert region.top == tuple(f"N0_{i:03d}" for i in range(30))
+    assert region.bottom == tuple(f"N{p}_{i:03d}" for p in range(3) for i in range(30))
 
 
 async def test_first_run_cap_has_its_own_message(tmp_path):
@@ -767,7 +769,7 @@ async def test_first_run_cap_has_its_own_message(tmp_path):
     assert error.startswith("first-run catch-up: safety cap of 2 pages")
     assert "GEORGIA_COLLECTOR_FIRST_RUN_MAX_PAGES" in error
     assert "recovery reached the page cap" not in error
-    assert feed_state_repo.get().recovery_resume_offset is None
+    assert feed_state_repo.get().recovery_regions == ()
 
 
 async def test_fast_cap_has_its_own_message(tmp_path):
@@ -1094,8 +1096,9 @@ async def test_a_recurring_unexpected_submit_error_never_stops_the_feed_poll(tmp
     assert all(seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
 
 
-# ==== resumable recovery: an outage longer than one cycle's page cap
-# (mirrors tests/test_georgia_public_feed_job.py) ====
+# ==== recovery over several cycles: an outage longer than one cycle's page
+# cap (reader/fines/public_feed_traversal.py; mirrors
+# tests/test_georgia_public_feed_job.py) ====
 
 
 def _with_matches(rows: list[dict], matches: dict[int, str]) -> list[dict]:
@@ -1122,12 +1125,32 @@ async def _cycle(tmp_path, feed, production, at, *, cap):
     return list(feed.requested_offsets)
 
 
-async def test_outage_longer_than_the_cap_is_caught_up_over_several_cycles_without_rereading(tmp_path):
-    """300 rows (10 pages) since the last success, cap 4 pages. FAST hits the
-    cap and records where it stopped; each recovery reads the new rows on
-    top, jumps past what the previous attempt read (minus a page), lands on
-    that attempt's rows and goes on. Five cycles read everything, each match
-    is submitted once, and the progress mark is cleared by the success."""
+def _unseen(feed, seen_repo) -> list[str]:
+    return [row["protocolNo"] for row in feed.rows if not seen_repo.is_seen(row["protocolNo"])]
+
+
+_LATER_SLOTS = [_utc(h, m, day=d) for d in (23, 24, 25) for h, m in ((9, 0), (15, 0), (21, 0), (23, 55))]
+
+
+async def _cycles_until_success(tmp_path, feed, production, feed_state_repo, seen_repo, *, cap, slots=_LATER_SLOTS):
+    """Runs cycles until one succeeds; checks on the way that none reads
+    more pages than the cap and that a success never leaves a row unread."""
+    for number, at in enumerate(slots, start=1):
+        present = [row["protocolNo"] for row in feed.rows]
+        offsets = await _cycle(tmp_path, feed, production, at, cap=cap)
+        assert len(offsets) <= cap
+        if feed_state_repo.get().last_error is None:
+            assert [p for p in present if not seen_repo.is_seen(p)] == []
+            return number
+    raise AssertionError("recovery did not complete")
+
+
+async def test_outage_longer_than_the_cap_is_caught_up_over_several_cycles(tmp_path):
+    """300 rows (10 pages) since the last success. FAST hits its cap and keeps
+    what it read as a region; each recovery reads the new rows on top, finds
+    the region's first rows by their numbers, jumps into its last rows, then
+    to its very last row, and reads on from there. Each match is submitted
+    once and the success clears the regions."""
     production = _FakeProductionClient(active_plates=["AA001AA"])
     feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
     feed_state_repo, seen_repo = await _first_run_before_the_outage(tmp_path, production, feed)
@@ -1136,161 +1159,315 @@ async def test_outage_longer_than_the_cap_is_caught_up_over_several_cycles_witho
     ))
 
     assert await _cycle(tmp_path, feed, production, _utc(15), cap=4) == [0, 30, 60, 90]
-    state = feed_state_repo.get()
-    assert (state.recovery_resume_offset, state.recovery_resume_at) == (120, _utc(15))
-    assert state.last_error is not None
+    [region] = feed_state_repo.get().recovery_regions
+    assert (region.length, region.top[0], region.bottom[0], region.bottom[-1]) == (120, "M_TOP", "M_TOP", "G119")
 
     feed.publish(_rows("N", 30, publish_date="2026-10-22"))
-    assert await _cycle(tmp_path, feed, production, _utc(21), cap=4) == [0, 30, 120, 150]
-    assert await _cycle(tmp_path, feed, production, _utc(23, 55), cap=4) == [0, 150, 180, 210]
-    assert await _cycle(tmp_path, feed, production, _utc(9, day=23), cap=4) == [0, 210, 240, 270]
-    assert feed_state_repo.get().recovery_resume_offset == 300
-    assert await _cycle(tmp_path, feed, production, _utc(15, day=23), cap=4) == [0, 270, 300, 330]
+    # N on top; G000 found on page 30 — its last rows are on the page too, so
+    # straight to the region's last row (page 120) and on.
+    assert await _cycle(tmp_path, feed, production, _utc(21), cap=6) == [0, 30, 120, 150, 180, 210]
+    [region] = feed_state_repo.get().recovery_regions
+    assert (region.length, region.top[0], region.bottom[-1]) == (240, "N000", "G209")
+    # N000 on page 0; a jump into the region's last rows (page 120), then to its last row (210).
+    assert await _cycle(tmp_path, feed, production, _utc(23, 55), cap=6) == [0, 120, 210, 240, 270, 300]
+    assert await _cycle(tmp_path, feed, production, _utc(9, day=23), cap=6) == [0, 180, 300, 330]
 
     state = feed_state_repo.get()
     assert state.last_error is None
-    assert state.last_successful_poll_at == _utc(15, day=23)
-    assert (state.recovery_resume_offset, state.recovery_resume_at) == (None, None)
-    assert all(seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
+    assert state.last_successful_poll_at == _utc(9, day=23)
+    assert state.recovery_regions == ()
+    assert _unseen(feed, seen_repo) == []
     assert sorted(_submitted(production)) == ["M_BOTTOM", "M_MIDDLE", "M_TOP"]
-    assert [r["status"] for r in production.health_reports] == [
-        "ok", "recovering", "recovering", "recovering", "recovering", "ok",
-    ]
+    assert [r["status"] for r in production.health_reports] == ["ok", "recovering", "recovering", "recovering", "ok"]
     capped = production.health_reports[2]
     assert capped["mode"] == "recovery"
-    assert capped["pages"] == 4
-    assert capped["resume_offset"] == 180
+    assert capped["pages"] == 6
+    assert (capped["regions"], capped["backlog_rows_read"]) == (1, 240)
     assert capped["last_success_at"] == _utc(9).isoformat()
     assert capped["oldest_publish_date"] == "2026-10-22"
     assert capped["horizon_date"] == "2026-10-22"
     assert production.health_reports[1]["mode"] == "fast"
 
 
-async def test_resumed_recovery_steps_back_when_publications_shifted_the_previous_attempt(tmp_path):
-    """45 rows published during the capped attempt shift its later pages: it
-    read less than its offset says. The jump lands one page past its rows —
-    no row of that attempt there — so the recovery steps back a page, finds
-    them, and continues after the jump page; the rows on the overshot page
-    are processed, nothing is skipped."""
+async def test_burst_during_the_step_after_a_jump_does_not_skip_rows(tmp_path):
+    """Review repro (61df2c5 lost rows here): 75 rows published during the
+    capped attempt, 20 more right after the resumed attempt's jump page.
+    The jump is only trusted once the region's last rows are found by their
+    numbers; when the landing page has none, the recovery reads on in order."""
     production = _FakeProductionClient(active_plates=["AA001AA"])
     feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
     feed_state_repo, seen_repo = await _first_run_before_the_outage(tmp_path, production, feed)
-    feed.publish(_with_matches(
-        _rows("G", 300, publish_date="2026-10-22"), {10: "M_A", 150: "M_OVERSHOT_PAGE", 290: "M_LAST"},
-    ))
-    feed.publish_after_requests(2, _with_matches(_rows("BURST", 45, publish_date="2026-10-22"), {40: "M_BURST"}))
-
+    feed.publish(_with_matches(_rows("G", 300, publish_date="2026-10-22"), {120: "M_LOST"}))
+    feed.publish_after_requests(2, _rows("B", 75, publish_date="2026-10-22"))
     assert await _cycle(tmp_path, feed, production, _utc(15), cap=6) == [0, 30, 60, 90, 120, 150]
-    assert feed_state_repo.get().recovery_resume_offset == 180
-
+    assert len(feed_state_repo.get().recovery_regions) == 1
     feed.publish(_rows("N", 30, publish_date="2026-10-22"))
-    assert await _cycle(tmp_path, feed, production, _utc(21), cap=6) == [0, 30, 60, 210, 180, 240]
-    assert feed_state_repo.get().recovery_resume_offset == 270
-    assert await _cycle(tmp_path, feed, production, _utc(23, 55), cap=6) == [0, 240, 270, 300, 330, 360]
-    assert await _cycle(tmp_path, feed, production, _utc(9, day=23), cap=6) == [0, 360, 390]
+    present = [row["protocolNo"] for row in feed.rows]
+    feed.publish_after_requests(5, _rows("B2_", 20, publish_date="2026-10-22"))
+
+    await _cycle(tmp_path, feed, production, _utc(21), cap=30)
+    state = feed_state_repo.get()
+    assert state.last_error is None
+    assert [p for p in present if not seen_repo.is_seen(p)] == []
+    assert "M_LOST" in _submitted(production)
+
+    await _cycle(tmp_path, feed, production, _utc(23, 55), cap=30)
+    assert _unseen(feed, seen_repo) == []
+    assert _submitted(production) == ["M_LOST"]
+
+
+async def test_older_attempt_rows_below_an_unread_gap_are_not_taken_for_the_region(tmp_path):
+    """Review repro (61df2c5 lost rows here): T1 reads G[0:120) and stops at
+    the cap; 90 rows (one match) come before T2, whose top part alone uses
+    its cap (70 more rows published meanwhile). T3 must read the 30 H rows
+    between T2's region and T1's — not jump over them because rows below
+    were read by some attempt."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
+    feed_state_repo, seen_repo = await _first_run_before_the_outage(tmp_path, production, feed)
+    feed.publish(_rows("G", 300, publish_date="2026-10-22"))
+    assert await _cycle(tmp_path, feed, production, _utc(15), cap=4) == [0, 30, 60, 90]
+    feed.publish(_with_matches(_rows("H", 90, publish_date="2026-10-22"), {60: "M_LOST"}))
+    feed.publish_after_requests(2, _rows("B", 70, publish_date="2026-10-22"))
+    assert await _cycle(tmp_path, feed, production, _utc(21), cap=4) == [0, 30, 60, 90]
+    upper, lower = feed_state_repo.get().recovery_regions
+    assert (upper.top[0], lower.top[0], lower.length) == ("H000", "G000", 120)
+    feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+
+    await _cycle(tmp_path, feed, production, _utc(23, 55), cap=30)
+
+    state = feed_state_repo.get()
+    assert state.last_error is None
+    assert state.recovery_regions == ()
+    assert _unseen(feed, seen_repo) == []
+    assert _submitted(production) == ["M_LOST"]
+
+
+async def test_killed_attempt_keeps_the_pages_it_read_and_the_next_one_goes_on_from_there(tmp_path):
+    """Regions are written after every page: an attempt killed mid-recovery
+    (SIGTERM, OOM) leaves what it read, and the next attempt continues after
+    it instead of starting over; matches are submitted once."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
+    feed_state_repo, seen_repo = await _first_run_before_the_outage(tmp_path, production, feed)
+    feed.publish(_with_matches(_rows("G", 300, publish_date="2026-10-22"), {140: "M_KILLED", 200: "M_AFTER"}))
+    assert await _cycle(tmp_path, feed, production, _utc(15), cap=4) == [0, 30, 60, 90]
+    feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+
+    feed.fail_after_requests(4, asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await _cycle(tmp_path, feed, production, _utc(21), cap=6)
+    assert feed.requested_offsets == [0, 30, 120, 150, 180]
+    state = feed_state_repo.get()
+    assert state.last_error.startswith("cycle in progress")
+    [region] = state.recovery_regions
+    assert (region.length, region.top[0], region.bottom[-1]) == (180, "N000", "G149")
+    assert _submitted(production) == ["M_KILLED"]
+
+    feed.publish(_rows("N2_", 30, publish_date="2026-10-22"))
+    assert await _cycle(tmp_path, feed, production, _utc(23, 55), cap=6) == [0, 30, 120, 180, 210, 240]
+    assert await _cycle(tmp_path, feed, production, _utc(9, day=23), cap=6) == [0, 150, 240, 270, 300, 330]
+    assert await _cycle(tmp_path, feed, production, _utc(15, day=23), cap=6) == [0, 210, 330, 360]
 
     assert feed_state_repo.get().last_error is None
-    assert all(seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
-    assert sorted(_submitted(production)) == ["M_A", "M_BURST", "M_LAST", "M_OVERSHOT_PAGE"]
+    assert _unseen(feed, seen_repo) == []
+    assert sorted(_submitted(production)) == ["M_AFTER", "M_KILLED"]
 
 
-async def test_resumed_recovery_steps_back_when_rows_vanished_above(tmp_path):
-    """40 rows of the capped attempt's region disappear before the next
-    cycle, so its offset now points 40 rows too deep: the jump page has
-    none of its rows, one step back finds them, nothing below is skipped."""
+async def test_error_mid_recovery_keeps_the_progress(tmp_path):
+    """A police.ge error in the middle of a recovery: the rows read before it
+    stay in the region, the next cycle goes on after them."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
+    feed_state_repo, seen_repo = await _first_run_before_the_outage(tmp_path, production, feed)
+    feed.publish(_with_matches(_rows("G", 300, publish_date="2026-10-22"), {200: "M_AFTER_ERROR"}))
+    assert await _cycle(tmp_path, feed, production, _utc(15), cap=4) == [0, 30, 60, 90]
+
+    feed.fail_after_requests(4, FineProviderError("ConnectTimeout"))
+    # G000 on page 0 with the region's last rows: straight to its last row (90), on to 150, error at 180.
+    assert await _cycle(tmp_path, feed, production, _utc(21), cap=10) == [0, 90, 120, 150, 180]
+    state = feed_state_repo.get()
+    assert state.last_error == "ConnectTimeout"
+    [region] = state.recovery_regions
+    assert (region.length, region.bottom[-1]) == (180, "G179")
+    assert production.health_reports[-1]["status"] == "error"
+    assert production.health_reports[-1]["backlog_rows_read"] == 180
+    assert _submitted(production) == []
+
+    assert await _cycles_until_success(tmp_path, feed, production, feed_state_repo, seen_repo, cap=10) == 1
+    assert _unseen(feed, seen_repo) == []
+    assert _submitted(production) == ["M_AFTER_ERROR"]
+
+
+async def test_cap_hit_while_looking_for_the_region_end_keeps_the_regions_valid(tmp_path, monkeypatch):
+    """The cap ends the cycle during the search for the region's last rows:
+    what is written is the rows read in order plus the region (all read), so
+    the next cycle simply searches again."""
+    from reader.fines import public_feed_traversal
+
+    monkeypatch.setattr(public_feed_traversal, "BOTTOM_ANCHOR_ROWS", 30)
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
+    feed_state_repo, seen_repo = await _first_run_before_the_outage(tmp_path, production, feed)
+    feed.publish(_with_matches(_rows("G", 360, publish_date="2026-10-22"), {250: "M_BELOW"}))
+    assert await _cycle(tmp_path, feed, production, _utc(15), cap=8) == [0, 30, 60, 90, 120, 150, 180, 210]
+    feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+    # 45 rows published right after the region's first rows were found: the
+    # search page (240) now shows rows above its last ones — the cap ends the
+    # cycle before they are found.
+    feed.publish_after_requests(2, _rows("B", 45, publish_date="2026-10-22"))
+
+    assert await _cycle(tmp_path, feed, production, _utc(21), cap=3) == [0, 30, 240]
+    state = feed_state_repo.get()
+    [region] = state.recovery_regions
+    assert (region.length, region.top[0], region.bottom[-1]) == (270, "N000", "G239")
+    assert production.health_reports[-1]["status"] == "recovering"
+
+    assert await _cycles_until_success(tmp_path, feed, production, feed_state_repo, seen_repo, cap=8) == 1
+    assert _unseen(feed, seen_repo) == []
+    assert _submitted(production) == ["M_BELOW"]
+
+
+async def test_long_region_with_short_anchor_lists_jumps_twice_and_corrects_its_length(tmp_path, monkeypatch):
+    """With few end-anchor rows (BOTTOM_ANCHOR_ROWS=60) a long region is
+    crossed in two jumps: into its last rows, then to its very last row.
+    Rows counted twice by the previous cycle (a burst re-showed rows above
+    the ones it had read) made the region look longer; the jump lands short
+    of the end, reads on, and the measured length replaces the inflated one."""
+    from reader.fines import public_feed_traversal
+
+    monkeypatch.setattr(public_feed_traversal, "BOTTOM_ANCHOR_ROWS", 60)
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
+    feed_state_repo, seen_repo = await _first_run_before_the_outage(tmp_path, production, feed)
+    feed.publish(_with_matches(_rows("G", 600, publish_date="2026-10-22"), {500: "M_DEEP"}))
+    # 80 rows published while the first attempt reads: 20 of them land below
+    # its position and are counted although they sit above its first rows.
+    feed.publish_after_requests(1, _rows("B", 80, publish_date="2026-10-22"))
+    assert await _cycle(tmp_path, feed, production, _utc(15), cap=12) == [i * 30 for i in range(12)]
+    [region] = feed_state_repo.get().recovery_regions
+    assert region.length == 330  # G000..G279 + 50 burst rows that sit above G000
+    assert region.bottom == tuple(f"G{i:03d}" for i in range(220, 280))
+
+    # B on top, G000 on page 60; the jump overshoots the end (unseen rows on
+    # page 360), one step back finds the last rows (330), then on in order.
+    assert await _cycle(tmp_path, feed, production, _utc(21), cap=12) == [
+        0, 30, 60, 360, 330, 360, 390, 420, 450, 480, 510, 540,
+    ]
+    [region] = feed_state_repo.get().recovery_regions
+    assert region.length == 80 + 490  # B000..B079 + G000..G489: no inflated rows left
+    assert await _cycles_until_success(tmp_path, feed, production, feed_state_repo, seen_repo, cap=12) == 1
+    assert _unseen(feed, seen_repo) == []
+    assert _submitted(production) == ["M_DEEP"]
+
+
+async def test_region_whose_last_rows_vanished_is_read_in_order_and_still_makes_progress(tmp_path, monkeypatch):
+    """The region's last 30 rows (all its end anchors) disappear: no jump
+    can be confirmed, so the region is read in order from its first page —
+    counted again, so the capped cycle still saves progress — and the
+    recovery completes."""
+    from reader.fines import public_feed_traversal
+
+    monkeypatch.setattr(public_feed_traversal, "BOTTOM_ANCHOR_ROWS", 30)
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
+    feed_state_repo, seen_repo = await _first_run_before_the_outage(tmp_path, production, feed)
+    rows = _with_matches(_rows("G", 300, publish_date="2026-10-22"), {200: "M_AFTER"})
+    feed.publish(rows)
+    assert await _cycle(tmp_path, feed, production, _utc(15), cap=6) == [0, 30, 60, 90, 120, 150]
+    feed.remove({row["protocolNo"] for row in rows[150:180]})
+
+    assert await _cycles_until_success(tmp_path, feed, production, feed_state_repo, seen_repo, cap=8) <= 3
+    assert _unseen(feed, seen_repo) == []
+    assert _submitted(production) == ["M_AFTER"]
+
+
+async def test_rows_vanished_inside_the_region_never_hide_rows_below_it(tmp_path):
+    """40 rows inside the capped attempt's region disappear before the next
+    cycle, so the region is shorter than its length says: the landing page
+    after the jump to its last row has none of its rows, the recovery reads
+    on in order from where it found the region's last rows, and nothing
+    below is skipped."""
     production = _FakeProductionClient(active_plates=["AA001AA"])
     feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
     feed_state_repo, seen_repo = await _first_run_before_the_outage(tmp_path, production, feed)
     gap = _with_matches(_rows("G", 300, publish_date="2026-10-22"), {125: "M_AFTER_GAP"})
     feed.publish(gap)
-
     assert await _cycle(tmp_path, feed, production, _utc(15), cap=4) == [0, 30, 60, 90]
     feed.remove({row["protocolNo"] for row in gap[40:80]})
     feed.publish(_rows("N", 30, publish_date="2026-10-22"))
 
-    assert await _cycle(tmp_path, feed, production, _utc(21), cap=6) == [0, 30, 120, 90, 150, 180]
-    assert await _cycle(tmp_path, feed, production, _utc(23, 55), cap=6) == [0, 180, 210, 240, 270, 300]
-
-    assert feed_state_repo.get().last_error is None
-    assert all(seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
+    assert await _cycle(tmp_path, feed, production, _utc(21), cap=6) == [0, 30, 120, 60, 90, 120]
+    assert await _cycles_until_success(tmp_path, feed, production, feed_state_repo, seen_repo, cap=6) <= 3
+    assert _unseen(feed, seen_repo) == []
     assert _submitted(production) == ["M_AFTER_GAP"]
 
 
-async def test_attempt_killed_in_the_middle_of_a_resumed_recovery_loses_nothing(tmp_path):
-    """The resumed attempt is killed after its jump: its progress is not
-    recorded, the next attempt reads through its rows (seen — not submitted
-    again), jumps from the older mark and finishes the job."""
-    production = _FakeProductionClient(active_plates=["AA001AA"])
-    feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
-    feed_state_repo, seen_repo = await _first_run_before_the_outage(tmp_path, production, feed)
-    feed.publish(_with_matches(_rows("G", 300, publish_date="2026-10-22"), {140: "M_KILLED", 200: "M_AFTER"}))
-
-    assert await _cycle(tmp_path, feed, production, _utc(15), cap=4) == [0, 30, 60, 90]
-    feed.publish(_rows("N", 30, publish_date="2026-10-22"))
-    feed.fail_after_requests(4, asyncio.CancelledError())
-    with pytest.raises(asyncio.CancelledError):
-        await _cycle(tmp_path, feed, production, _utc(21), cap=6)
-    state = feed_state_repo.get()
-    assert (state.recovery_resume_offset, state.recovery_resume_at) == (120, _utc(15))
-    assert _submitted(production) == ["M_KILLED"]
-
-    feed.publish(_rows("N2_", 30, publish_date="2026-10-22"))
-    assert await _cycle(tmp_path, feed, production, _utc(23, 55), cap=6) == [0, 30, 60, 150, 180, 210]
-    assert await _cycle(tmp_path, feed, production, _utc(9, day=23), cap=6) == [0, 210, 240, 270, 300, 330]
-    assert await _cycle(tmp_path, feed, production, _utc(15, day=23), cap=6) == [0, 330, 360]
-
-    assert feed_state_repo.get().last_error is None
-    assert all(seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
-    assert sorted(_submitted(production)) == ["M_AFTER", "M_KILLED"]
-
-
-async def test_jump_past_the_previous_rows_onto_processed_or_empty_pages_still_reads_the_rows_between(tmp_path):
-    """90 of the capped attempt's 120 rows vanish, so the jump lands past the
-    end of the feed. An empty page and a page of rows the last success
-    processed do not prove there is no unread row between them and the
-    previous attempt: the recovery steps back until it meets pages it
-    already read this cycle, reading the 30 rows in between (with a match)."""
+async def test_jump_past_the_end_of_the_feed_still_reads_the_rows_between(tmp_path):
+    """90 of the region's 120 rows vanish, so the jump into its last rows
+    lands past the end of the feed. An empty page is a sign of overshooting,
+    not the end of the cycle: the recovery jumps back and reads the 30 rows
+    in between (with a match)."""
     production = _FakeProductionClient(active_plates=["AA001AA"])
     feed = _LiveFeed(_rows("Y0_", 30, publish_date="2026-10-21"))
     job0, feed_state_repo, seen_repo, _outbox = _make_job(tmp_path, feed, production, first_run_max_pages=10)
     await job0.run(_utc(9))
     gap = _with_matches(_rows("G", 150, publish_date="2026-10-22"), {135: "M_HIDDEN"})
     feed.publish(gap)
-
     assert await _cycle(tmp_path, feed, production, _utc(15), cap=4) == [0, 30, 60, 90]
     feed.remove({row["protocolNo"] for row in gap[30:120]})
 
-    assert await _cycle(tmp_path, feed, production, _utc(21), cap=6) == [0, 90, 60, 30]
-
-    state = feed_state_repo.get()
-    assert state.last_error is None
-    assert state.recovery_resume_offset is None
+    assert await _cycles_until_success(tmp_path, feed, production, feed_state_repo, seen_repo, cap=6) == 1
     assert _submitted(production) == ["M_HIDDEN"]
-    assert all(seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
+    assert _unseen(feed, seen_repo) == []
 
 
-async def test_cap_hit_before_the_previous_rows_are_found_keeps_the_old_mark(tmp_path):
-    """Pages run out while stepping back: nothing proves this attempt's reads
-    are contiguous, so the previous attempt's mark stays and the message says
-    so; the next cycle, with more pages, aligns and moves the mark on."""
+async def test_next_region_right_below_is_recognised_although_the_last_end_anchor_sits_elsewhere(tmp_path):
+    """The last end-anchor of a region can be a row that sits elsewhere
+    (rows a burst pushed into view are counted last), so its end is not
+    marked. The next region, starting right below it, is still recognised by
+    its first rows — not taken for rows re-shown by a burst — and skipped."""
+    from reader.fines.public_feed_state_repository import ReadRegion
+
     production = _FakeProductionClient(active_plates=["AA001AA"])
     feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
-    feed_state_repo, _seen = await _first_run_before_the_outage(tmp_path, production, feed)
-    feed.publish(_rows("G", 300, publish_date="2026-10-22"))
-    feed.publish_after_requests(2, _rows("BURST", 45, publish_date="2026-10-22"))
-    assert await _cycle(tmp_path, feed, production, _utc(15), cap=6) == [0, 30, 60, 90, 120, 150]
-    feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+    feed_state_repo, seen_repo = await _first_run_before_the_outage(tmp_path, production, feed)
+    rows = _rows("G", 300, publish_date="2026-10-22")
+    feed.publish(rows)
+    _mark_seen_at(seen_repo, rows, seen_at=_utc(15))  # read by earlier, capped attempts
+    names = [row["protocolNo"] for row in rows]
+    feed_state_repo.record_recovery_regions([
+        ReadRegion(top=tuple(names[:30]), bottom=(*names[:60], "ELSEWHERE"), length=61, updated_at="x"),
+        ReadRegion(top=tuple(names[60:90]), bottom=tuple(names[240:]), length=240, updated_at="x"),
+    ])
+    feed_state_repo.record_error("ConnectTimeout", at=_utc(15))
 
-    assert await _cycle(tmp_path, feed, production, _utc(21), cap=4) == [0, 30, 60, 210]
+    # page 60 has no row of the first region's end: back to 30, on to 60 —
+    # G060 starts the second region: a jump into its last rows (270), done.
+    assert await _cycle(tmp_path, feed, production, _utc(21), cap=10) == [0, 60, 30, 60, 270, 300]
+    assert feed_state_repo.get().last_error is None
 
+
+async def test_regions_whose_rows_are_gone_are_harmless(tmp_path):
+    """Regions naming rows that are not on the feed (left by an old version,
+    or every row of them vanished): the recovery reads in order to the
+    horizon, as without regions, and the success clears them."""
+    from reader.fines.public_feed_state_repository import ReadRegion
+
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
+    feed_state_repo, seen_repo = await _first_run_before_the_outage(tmp_path, production, feed)
+    feed.publish(_with_matches(_rows("G", 120, publish_date="2026-10-22"), {45: "M_IN_ORDER"}))
+    feed_state_repo.record_recovery_regions([
+        ReadRegion(top=("GONE_TOP",), bottom=("GONE_BOTTOM",), length=5000, updated_at="2026-10-22T08:00:00+00:00"),
+    ])
+    feed_state_repo.record_error("ConnectTimeout", at=_utc(15))
+
+    assert await _cycle(tmp_path, feed, production, _utc(21), cap=10) == [0, 30, 60, 90, 120]
     state = feed_state_repo.get()
-    assert (state.recovery_resume_offset, state.recovery_resume_at) == (180, _utc(15))
-    assert "while looking for where the previous attempt stopped" in state.last_error
-    assert production.health_reports[-1]["status"] == "recovering"
-    assert production.health_reports[-1]["resume_offset"] == 180
-
-    assert await _cycle(tmp_path, feed, production, _utc(23, 55), cap=8) == [0, 30, 60, 210, 180, 240, 270, 300]
-    assert feed_state_repo.get().recovery_resume_offset == 330
+    assert state.last_error is None
+    assert state.recovery_regions == ()
+    assert _submitted(production) == ["M_IN_ORDER"]
 
 
 # ==== health report to production ====
@@ -1312,8 +1489,11 @@ async def test_health_report_failure_never_affects_the_cycle(tmp_path):
         assert session.search_calls == ["BB002BB"]
 
 
-async def test_health_reports_say_error_for_a_failed_or_skipped_cycle(tmp_path):
+async def test_health_reports_say_error_for_a_failed_or_skipped_cycle_with_the_last_success(tmp_path):
     production = _FakeProductionClient(active_plates=["AA001AA"])
+    first_run = _FakeSession({0: _page(_rows("Y0_", 30, publish_date="2026-10-21"))})
+    job0, *_ = _make_job(tmp_path, first_run, production)
+    await job0.run(_utc(15))
     failing = _FakeSession(errors={0: FineProviderError("ConnectTimeout")})
     job, *_ = _make_job(tmp_path, failing, production)
     await job.run(_utc(21))
@@ -1321,36 +1501,45 @@ async def test_health_reports_say_error_for_a_failed_or_skipped_cycle(tmp_path):
     job2, *_ = _make_job(tmp_path, unavailable, production)
     await job2.run(_utc(23, 55))
 
-    first, second = production.health_reports
-    assert (first["status"], first["mode"], first["detail"]) == ("error", "first_run", "ConnectTimeout")
-    assert first["last_success_at"] is None
-    assert second["status"] == "error"
-    assert "circuit breaker" in second["detail"]
+    _ok, failed, skipped = production.health_reports
+    assert (failed["status"], failed["mode"], failed["detail"]) == ("error", "fast", "ConnectTimeout")
+    assert failed["last_success_at"] == _utc(15).isoformat()
+    assert failed["cycle_at"] == _utc(21).isoformat()
+    assert (skipped["status"], skipped["mode"]) == ("error", "skipped")
+    assert "circuit breaker" in skipped["detail"]
+    assert skipped["last_success_at"] == _utc(15).isoformat()
+    assert skipped["cycle_at"] == _utc(23, 55).isoformat()
 
 
-async def test_first_run_cap_is_reported_as_an_error_without_a_resume_mark(tmp_path):
+async def test_first_run_reports_are_errors_without_regions_or_a_last_success(tmp_path):
     production = _FakeProductionClient(active_plates=["AA001AA"])
     session = _FakeSession({i * 30: _page(_rows(f"T{i}_", 30, publish_date="2026-10-22")) for i in range(3)})
     job, feed_state_repo, *_ = _make_job(tmp_path, session, production, first_run_max_pages=2)
-
     await job.run(_utc(21))
+    unavailable = _FakeSession(available=False)
+    job2, *_ = _make_job(tmp_path, unavailable, production)
+    await job2.run(_utc(23, 55))
 
-    report = production.health_reports[-1]
-    assert (report["status"], report["mode"], report["resume_offset"]) == ("error", "first_run", None)
-    assert feed_state_repo.get().recovery_resume_offset is None
+    capped, skipped = production.health_reports
+    assert (capped["status"], capped["mode"], capped["regions"]) == ("error", "first_run", 0)
+    assert capped["last_success_at"] is None
+    assert skipped["last_success_at"] is None
+    assert feed_state_repo.get().recovery_regions == ()
 
 
-async def test_resume_mark_from_the_future_is_ignored(tmp_path):
-    """A mark written with the clock ahead would make this cycle's own rows
-    look already read and jump over unread ones: it is ignored, and the
-    recovery reads in order."""
+async def test_health_reports_never_carry_plates_or_protocol_numbers(tmp_path):
+    import json
+    import re
+
     production = _FakeProductionClient(active_plates=["AA001AA"])
     feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
-    feed_state_repo, _seen = await _first_run_before_the_outage(tmp_path, production, feed)
-    feed.publish(_with_matches(_rows("G", 120, publish_date="2026-10-22"), {45: "M_SKIPPABLE"}))
-    feed_state_repo.record_recovery_progress(offset=120, at=_utc(9, day=23))
-    feed_state_repo.record_error("ConnectTimeout", at=_utc(15))
+    await _first_run_before_the_outage(tmp_path, production, feed)
+    feed.publish(_with_matches(_rows("G", 300, publish_date="2026-10-22"), {10: "M_ROW"}))
+    await _cycle(tmp_path, feed, production, _utc(15), cap=4)
+    feed.fail_after_requests(2, FineProviderError("ConnectTimeout"))
+    await _cycle(tmp_path, feed, production, _utc(21), cap=6)
 
-    assert await _cycle(tmp_path, feed, production, _utc(21), cap=10) == [0, 30, 60, 90, 120]
-    assert feed_state_repo.get().last_error is None
-    assert _submitted(production) == ["M_SKIPPABLE"]
+    assert len(production.health_reports) == 3
+    for report in production.health_reports:
+        text = json.dumps(report)
+        assert not re.search(r"AA001AA|ZZ\d{3}ZZ|M_ROW|\bG\d{3}\b|\bE\d{3}\b", text), text
