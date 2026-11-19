@@ -159,18 +159,21 @@ FAST_LOOKAHEAD_PAGES (the collector's GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES
 overrides it there; this job has no setting for it).
 
 Data behind K = 2 (production, 2026-11-19):
-- the only clean FAST observation (17:00 UTC: 40 pages read, 1197 new
-  rows, so 1–3 old ones) had its out-of-place old row directly above the
-  boundary: the old "second page with a seen row" stop ended one page
-  above the boundary and missed nothing only by luck;
+- both FAST cycles that day had one old row re-shown above new rows
+  (17:00 UTC: 1197 of the 1200 rows read were new, the old row directly
+  above the boundary page; 19:55 UTC: 238 of 240). The old "second page
+  with a seen row" stop happened to end on the real boundary both times;
+  a second such row on another page above it would have ended the
+  traversal early;
 - new rows numbered below numbers already seen (1–7 rows in 10 of 32
   cycles, 63 once): the shallow number-space overlaps are <= 5 rows;
 - a page-0 probe showed the feed ordered by publication, not by protocol
-  number (the series interleave), with today's rows as one contiguous
-  block on top; the anomaly seen is an old row re-shown above new rows.
-  Deep insertion of new rows below the boundary was not observed; if the
-  data.count delta ever exceeds the new rows read, revisit (a DEEP trigger
-  or a daily sweep, ~190–210 pages a day).
+  number (the series interleave), with the day's rows as one contiguous
+  block on top; at 19:55 every new number was above every old one, so the
+  re-shown row is a re-published or updated receipt, not a number-ordering
+  effect. Deep insertion of new rows below the boundary was not observed;
+  if the data.count delta ever exceeds the new rows read, revisit (a DEEP
+  trigger or a daily sweep, ~190–210 pages a day).
 K = 2 covers ~60 rows beyond the first quiet page for at most +2 page
 requests per ordinary FAST cycle (~+8 a day at four cycles), well inside
 the 300-page cap."""
