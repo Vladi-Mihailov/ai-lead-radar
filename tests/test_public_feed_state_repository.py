@@ -232,8 +232,8 @@ def test_column_added_by_another_process_between_the_check_and_the_alter_is_not_
         """PRAGMA table_info видит старую схему; перед ALTER колонку
         добавляет "другой процесс"."""
 
-        def __init__(self, path):
-            self._conn = real_connect(path)
+        def __init__(self, path, **kwargs):
+            self._conn = real_connect(path, **kwargs)
 
         def execute(self, sql, *args):
             if sql.startswith("ALTER TABLE"):

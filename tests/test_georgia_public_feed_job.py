@@ -2269,6 +2269,29 @@ async def test_repeated_number_of_a_region_start_at_a_page_end_is_not_taken_for_
         repos.close()
 
 
+async def test_repeated_start_number_at_a_page_end_is_not_confirmed_by_seen_rows_after_it(tmp_path):
+    """G005 повторён последней строкой страницы 0, а страница 1 — строки
+    прежней попытки (увиденные, но не участка). Участок подтверждает только
+    следующий номер начала (G006): увиденные строки ничего не подтверждают,
+    непрочитанные строки под ними (с совпадением) читаются."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        new = _with_matches(_rows("N", 90, publish_date="2026-10-22"), {70: "M_NEW"})
+        new[29] = _entry(protocol_no="G005", plate="ZZ005ZZ", publish_date="2026-10-22")
+        present = await _region_of_600_then_new_rows(repos, feed, new)
+        _mark_seen_at(repos.seen_repo, new[30:60], seen_at=_utc(15))
+
+        offsets = await repos.cycle(feed, _utc(21), cap=300)
+
+        assert offsets[:4] == [0, 30, 60, 90]
+        assert repos.feed_state_repo.get().last_error is None
+        assert [p for p in present if not repos.seen_repo.is_seen(p)] == []
+        assert repos.persisted == ["M_NEW"]
+    finally:
+        repos.close()
+
+
 async def test_repeated_number_mid_page_does_not_poison_the_saved_region(tmp_path):
     """Второе ревью, сценарий B: новая строка посреди страницы повторяет
     G005, цикл упирается в лимит среди новых строк. Записанный участок —
@@ -2410,6 +2433,27 @@ async def test_cycle_killed_while_persisting_a_match_leaves_the_row_unread_and_t
         await repos.cycle(feed, _utc(21))
         assert repos.persisted == ["M_KILLED"]
         assert repos.unseen(feed) == []
+    finally:
+        repos.close()
+
+
+async def test_persist_error_keeps_the_old_semantics_row_marked_and_cycle_failed(tmp_path):
+    """Ошибка (не остановка) записи совпадения — как и раньше: строка
+    отмечена увиденной, цикл завершён с ошибкой."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_with_matches(_rows("G", 40, publish_date="2026-10-22"), {10: "M_ERROR"}))
+        job, _provider = _make_job(feed, repos.task_repo, repos.fine_repo, repos.feed_state_repo, repos.seen_repo)
+
+        async def broken(task, record):
+            raise RuntimeError("database is locked")
+
+        job._check_service.persist_feed_match = broken
+        await job.run(_utc(15))
+        assert repos.feed_state_repo.get().last_error == "database is locked"
+        assert repos.seen_repo.is_seen("M_ERROR")
     finally:
         repos.close()
 

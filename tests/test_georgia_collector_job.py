@@ -1547,6 +1547,26 @@ async def test_repeated_number_of_a_region_start_at_a_page_end_is_not_taken_for_
     assert _submitted(production) == ["M_NEW"]
 
 
+async def test_repeated_start_number_at_a_page_end_is_not_confirmed_by_seen_rows_after_it(tmp_path):
+    """G005 is repeated as the last row of page 0, and page 1 holds rows an
+    earlier attempt read (seen, but not the region's). Only the next start
+    number (G006) confirms a region, so those seen rows confirm nothing; the
+    unread rows below them (with a match) are read, not jumped over."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
+    new = _with_matches(_rows("N", 90, publish_date="2026-10-22"), {70: "M_NEW"})
+    new[29] = _entry(protocol_no="G005", plate="ZZ005ZZ", publish_date="2026-10-22")
+    feed_state_repo, seen_repo, present = await _region_of_600_then_new_rows(tmp_path, production, feed, new)
+    _mark_seen_at(seen_repo, new[30:60], seen_at=_utc(15))
+
+    offsets = await _cycle(tmp_path, feed, production, _utc(21), cap=300)
+
+    assert offsets[:4] == [0, 30, 60, 90]
+    assert feed_state_repo.get().last_error is None
+    assert [p for p in present if not seen_repo.is_seen(p)] == []
+    assert _submitted(production) == ["M_NEW"]
+
+
 async def test_repeated_number_mid_page_does_not_poison_the_saved_region(tmp_path):
     """Second review, scenario B: a new row in the middle of a page re-uses
     G005 and the cycle stops at its cap among the new rows. The saved

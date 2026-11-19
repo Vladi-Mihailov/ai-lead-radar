@@ -250,7 +250,8 @@ class _Walk:
         self.search_start = 0
         self.search_pages = 0
         self.backoff = 0
-        self.searched: set[str] = set()
+        # строки неудачных проходов поиска: номер -> следующий номер прохода
+        self.searched: dict[str, str] = {}
         self._pass_rows: list[str] = []
         # перескок к последней строке участка, ещё не подтверждённый
         self.verifying = False
@@ -273,15 +274,17 @@ class _Walk:
         return self.regions[self.next_index:]
 
     def _rebuild(self) -> None:
+        # _lower: номер из начала или конца участка ниже -> следующий номер
+        # того же списка (признак перелёта — только пара соседних строк).
         self._tops = {}
-        lower: set[str] = set()
+        self._lower = {}
         for index in range(self.next_index, len(self.regions)):
             region = self.regions[index]
             for position, protocol_no in enumerate(region.top):
                 self._tops.setdefault(protocol_no, (index, position))
-            lower.update(region.top)
-            lower.update(region.bottom)
-        self._lower = frozenset(lower)
+            for anchors in (region.top, region.bottom):
+                for protocol_no, following in zip(anchors, anchors[1:]):
+                    self._lower.setdefault(protocol_no, following)
 
     def begin_page(self, offset: int, numbers: list[str | None]) -> None:
         self.page_offset = offset
@@ -316,7 +319,12 @@ class _Walk:
                 return True
             if self.searching:
                 self._pass_rows.append(protocol_no)
-                if not was_seen or protocol_no in self._lower or protocol_no in self.searched:
+                # Перелёт: непросмотренная строка — или ДВЕ соседние строки
+                # из участка ниже либо из неудачного прохода (одиночная
+                # увиденная строка ничего не доказывает: номер мог повториться).
+                following = self._next[row_index]
+                if not was_seen or (following is not None and following in (
+                        self._lower.get(protocol_no), self.searched.get(protocol_no))):
                     self.page_overshoot = True
             return False
         if self.state == _IN_REGION:
@@ -484,7 +492,7 @@ class _Walk:
             self.search_start = target
             self.search_pages = 0
             self.backoff = 0
-            self.searched = set()
+            self.searched = {}
             self._pass_rows = []
             return target
         return None
@@ -506,7 +514,8 @@ class _Walk:
         if not (self.page_overshoot or terminal):
             return offset + PAGE_SIZE
         # Этот проход целиком за концом участка: выше и снова вперёд.
-        self.searched.update(self._pass_rows)
+        for protocol_no, following in zip(self._pass_rows, self._pass_rows[1:]):
+            self.searched.setdefault(protocol_no, following)
         self._pass_rows = []
         step = max(len(self.region.bottom) - 2 * PAGE_SIZE, PAGE_SIZE) * 2 ** self.backoff
         self.backoff += 1
@@ -524,7 +533,7 @@ class _Walk:
         self.searching = False
         self.verifying = False
         self._pass_rows = []
-        self.searched = set()
+        self.searched = {}
         self.segment = self._before_absorb if self._before_absorb is not None else _Segment()
         self.dirty = True
         self._leave_region()
