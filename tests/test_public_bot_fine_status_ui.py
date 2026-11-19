@@ -879,9 +879,11 @@ def test_search_money_line_leaves_paid_fines_out_of_the_total():
     assert texts.format_search_money_line(
         check_ok=True, fines=fines, statuses={"GE1": "paid", "GE2": "paid"},
     ) == "💰 Штрафы: 0 ₾ (🟢 оплачено: 150 ₾)"
+    # живая проверка: police.ge эти штрафы только что вернул — устаревший ⚪/⏳
+    # в статусах (не записался) сумму не занижает, 🟡 — долг
     assert texts.format_search_money_line(
         check_ok=True, fines=fines, statuses={"GE1": "needs_review", "GE2": "gone"},
-    ) == "💰 Штрафы: 50 ₾"
+    ) == "💰 Штрафы: 150 ₾"
 
 
 async def test_manager_search_block_leaves_paid_fines_out_of_the_total(fx):
@@ -898,3 +900,18 @@ async def test_manager_search_block_leaves_paid_fines_out_of_the_total(fx):
     )
 
     assert "💰 Штрафы: 50 ₾ (🟢 оплачено: 100 ₾)" in block
+
+
+async def test_trusted_one_off_check_leaves_paid_fines_out_of_the_total(fx):
+    """Разовая проверка менеджера (номер без активной задачи) — та же сумма,
+    что в поиске: 🟢 не входит, показывается рядом."""
+    task, _ = fx.car(_CAR, [("GE1", 50), ("GE2", 100)])
+    await fx.check(task)
+    fx.tracker.mark_paid(fx.status(_CAR, "GE2").id, actor_user_id=_TRUSTED, note="TBC 1")
+    fx.tasks._conn.execute("UPDATE fine_monitoring_tasks SET status = 'stopped' WHERE id = ?", (task.id,))
+    fx.tasks._conn.commit()
+
+    result = await fx.check_service.check_plate_readonly(_CAR)
+    reply = fx.controller._format_one_off_reply(result)
+
+    assert "💰 Штрафы: 50 ₾ (🟢 оплачено: 100 ₾)" in reply.text

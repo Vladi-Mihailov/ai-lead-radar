@@ -698,7 +698,9 @@ def format_trusted_plate_choice_prompt(car_number: str) -> str:
     )
 
 
-def format_one_off_check_result(result, *, inactive_task: FineMonitoringTask | None = None) -> str:
+def format_one_off_check_result(
+    result, *, inactive_task: FineMonitoringTask | None = None, statuses: dict[str, str] | None = None,
+) -> str:
     """result: reader.fines.models.OneOffCheckResult (см. FineCheckService.
     check_plate_readonly). ВСЕ штрафы из ответа police.ge/REDNET тем же
     блоком, что и у "🔎 Проверить сейчас" (delivery_texts.
@@ -710,7 +712,8 @@ def format_one_off_check_result(result, *, inactive_task: FineMonitoringTask | N
 
     inactive_task — историческая (completed/stopped) задача номера, если
     она есть: хвост MONITORING_STILL_OFF_LINE подтверждает, что разовая
-    проверка мониторинг НЕ включила."""
+    проверка мониторинг НЕ включила. statuses — см. format_search_money_line
+    (🟢 в сумму не входит)."""
     plate = format_plate_for_telegram(result.car_number)
     if not result.shows_as_ok:
         if result.provider_unavailable:
@@ -725,7 +728,7 @@ def format_one_off_check_result(result, *, inactive_task: FineMonitoringTask | N
     else:
         parts = [
             f"🔎 {plate}: найдено штрафов — {len(result.fines)}\n"
-            + format_search_money_line(check_ok=True, fines=result.fines),
+            + format_search_money_line(check_ok=True, fines=result.fines, statuses=statuses),
             format_check_now_fines_message(car_number=result.car_number, fines=result.fines),
             ONE_OFF_CHECK_NOT_SAVED_LINE,
         ]
@@ -1243,9 +1246,10 @@ def format_search_money_line(
     превращать в 0 ₾").
 
     statuses — {protocolNo: display_status} (см. FineStatus.display_status),
-    если статусы оплаты ведутся: в сумму входят только 🔴 и 🟡 (как в
-    "Задолженности" статистики); 🟢 — оплачено, ещё в базе police.ge — не
-    входит и показывается рядом, ⚪ и ⏳ не входят."""
+    если статусы оплаты ведутся: 🟢 — оплачено, ещё в базе police.ge — в
+    сумму не входит и показывается рядом. Остальное входит: проверка живая,
+    police.ge эти штрафы только что вернул, так что ⚪/⏳ в статусах значит
+    лишь, что запись статуса не удалась, — сумма не занижается."""
     if not check_ok:
         return "💰 Штрафы: неизвестно"
     if not fines:
@@ -1255,7 +1259,7 @@ def format_search_money_line(
     def status_of(fine) -> str:
         return statuses.get(fine.external_fine_id or "", PAYMENT_UNPAID)
 
-    owed = [fine for fine in fines if status_of(fine) in (PAYMENT_UNPAID, PAYMENT_NEEDS_REVIEW)]
+    owed = [fine for fine in fines if status_of(fine) != PAYMENT_PAID]
     paid = [fine for fine in fines if status_of(fine) == PAYMENT_PAID]
     if any(fine.amount is None for fine in owed):
         return "💰 Штрафы: неизвестно"

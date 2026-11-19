@@ -286,3 +286,19 @@ async def test_paid_receipt_found_again_under_another_row_is_not_announced(fx):
     await fx.service.run_once()
 
     assert fx.sender.sent == []
+
+
+
+async def test_a_new_receipt_on_a_plate_with_a_paid_one_is_still_announced(fx):
+    """🟢 касается только своей квитанции: новый штраф того же номера
+    приходит как обычно."""
+    task = fx.task()
+    fx.fine(task, "GE1")
+    fx.fine(task, "GE2")
+    fx.tracker.record_full_check(_CAR, [_record("GE1"), _record("GE2")], complete=True, at=_T0)
+    fx.tracker.mark_paid(fx.tracker.statuses_by_protocol(_CAR)["GE1"].id, actor_user_id=1, note="TBC 1")
+    fx.subscribe(task)
+
+    await fx.service.run_once()
+
+    assert len(fx.sender.sent) == 1 and "GE2" in fx.sender.sent[0][1]

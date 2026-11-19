@@ -628,6 +628,7 @@ class FineStatusRepository:
         # номер -> (время, id) самой свежей задачи с положительным снимком —
         # тот же выбор (и tie-break по id), что у list_debt_car_groups
         debt_reference: dict[str, tuple[datetime, int]] = {}
+        reference_total: dict[str, float] = {}
         for task_id, car_number, total, checked_raw in self._conn.execute(
             "SELECT id, car_number, last_successful_total_amount, last_successful_checked_at "
             "FROM fine_monitoring_tasks"
@@ -642,6 +643,7 @@ class FineStatusRepository:
                 car_number, (datetime.min, -1),
             ):
                 debt_reference[car_number] = (checked_at, task_id)
+                reference_total[car_number] = total
         seeds: dict[tuple[str, str], dict] = {}
         rows = self._conn.execute(
             "SELECT monitoring_task_id, external_fine_id, amount, first_detected_at, last_seen_at "
@@ -690,6 +692,28 @@ class FineStatusRepository:
                     created += 1
                     self._log(cursor.lastrowid, "seeded" if listed else "seeded_unverified",
                               SOURCE_CHECK, None, None, at)
+            # Снимок, на котором стоит прежняя статистика долга, — та же
+            # проверка, из которой выросли статусы номера. Если её квитанции в
+            # базе полиции (с любой отметкой оплаты) объясняют сумму снимка,
+            # статусы актуальны на её время: иначе отметка 🟢 у номера, не
+            # проверенного после перехода, в статистике не действовала бы
+            # (страховка "снимок новее статусов", см. conversation.
+            # _snapshot_has_unexplained_debt). Не объясняют — страховка
+            # остаётся; настоящее время полной проверки не перезаписывается.
+            for car_number, (reference_at, _task_id) in debt_reference.items():
+                if is_fine_output_suppressed(car_number):
+                    continue
+                listed_sum = self._conn.execute(
+                    "SELECT COALESCE(SUM(amount), 0) FROM georgia_fine_status "
+                    "WHERE car_number = ? AND presence IN (?, ?)",
+                    (car_number, PRESENCE_LISTED, PRESENCE_MISSING),
+                ).fetchone()[0]
+                if listed_sum + 0.005 >= reference_total[car_number]:
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO georgia_fine_plate_checks (car_number, last_full_check_at) "
+                        "VALUES (?, ?)",
+                        (car_number, _fmt(reference_at)),
+                    )
         return created
 
 

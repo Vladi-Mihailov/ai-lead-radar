@@ -535,3 +535,34 @@ def _controller(legacy, tracker):
         debt_refresh_service=DebtRefreshService(legacy.tasks, check_service, sleep=_instant),
         fine_status_tracker=tracker,
     )
+
+
+
+def test_seeding_makes_statuses_current_only_where_they_explain_the_snapshot(legacy):
+    """Если квитанции номера, выросшие из снимка прежней статистики, дают
+    его сумму, статусы актуальны на время снимка: отметка 🟢 сразу убирает
+    квитанцию из долга. Не дают — страховка "снимок новее статусов"
+    остаётся. Настоящее время полной проверки не перезаписывается."""
+    short_task = legacy.task("GG777HH", snapshot=150)
+    legacy.fine(short_task, "GE9", 50, last_seen="2026-11-16 10:00:00")  # снимок 150 объясняют только 50
+    repository = FineStatusRepository(legacy.db_path)
+    real_check = datetime(2026, 11, 18, 9, 0)
+    repository.record_full_check_time("CC333DD", real_check)
+    tracker = FineStatusTracker(repository)
+
+    tracker.seed_from_detected_fines()
+    tracker.seed_from_detected_fines()  # повторный старт ничего не меняет
+
+    checks = tracker.last_full_check_by_car(["AA111BB", "DD444EE", "CC333DD", "GG777HH", "BB222CC"])
+    assert checks["AA111BB"] == datetime(2026, 11, 16, 10, 0)
+    assert checks["DD444EE"] == datetime(2026, 11, 16, 10, 0)
+    assert checks["CC333DD"] == real_check
+    assert "GG777HH" not in checks and "BB222CC" not in checks  # не объяснён / снимок 0
+
+    tracker.mark_paid(tracker.statuses_by_protocol("AA111BB")["GE2"].id, actor_user_id=_TRUSTED, note="TBC 1")
+    rows, _ = _controller(legacy, tracker)._debt_rows_with_statuses(legacy.tasks.list_debt_car_groups())
+    by_car = {car: breakdown for car, _, breakdown in rows}
+
+    assert by_car["AA111BB"].unpaid_amount == 50 and by_car["AA111BB"].paid_amount == 100
+    assert by_car["GG777HH"].unpaid_amount == 150  # страховка: показан снимок
+    repository.close()

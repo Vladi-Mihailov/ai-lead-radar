@@ -233,20 +233,35 @@ Client delivery:
   evening re-check keeps its plate until it is ⚪), and a check, the feed,
   a changed card on police.ge (a new row of the same receipt) or its return
   after ⚪ never make it a new fine: in the Georgian bot such a row is
-  created as already notified, so the operator chat is not told either, and
-  it does not count in «найдено новых» of the add-car summary. «🔴 Снять
+  created as already notified, so the operator chat is not told about it,
+  and it does not count in «найдено новых» of the add-car summary. «🔴 Снять
   отметку» makes it an ordinary receipt again (sent if the subscriber never
   got it). A status that cannot be read counts as unpaid: a fine is never
-  lost because of it.
+  lost because of it. Another receipt of the same plate is unaffected.
+  - Not covered: a row created before the 🟢 mark and not yet sent to the
+    operator chat (the operator process flushes pending rows without
+    looking at statuses) still goes there; checks run by the operator
+    process itself have no statuses. Managers' counters «🚨 Новых штрафов
+    найдено сегодня» and the check-all «С задолженностью» still count such
+    rows and plates. The trusted «🔎 Проверить сейчас» of a plate with an
+    active task shows fines without status labels (it has no sum and no
+    payment buttons).
 - In the Georgian bot only, if the operator was already notified about a
   receipt through another task, the new task's row is created as already
   notified. The operator process (`reader/main.py`) keeps its old behaviour.
-- Managers' «🔎 Поиск»: «💰 Штрафы» is 🔴 + 🟡 (as «Задолженность» in
-  statistics); 🟢 is left out and shown next to it, «(🟢 оплачено: N ₾)».
-- Deliberate exception: in statistics, a saved total newer than the plate's
-  statuses (see above) is still shown whole, possibly including a 🟢
-  receipt, until the next full check — so that a new fine that took the
-  paid one's place is never hidden.
+- Managers' «🔎 Поиск» and the trusted one-off check: «💰 Штрафы» leaves 🟢
+  out and shows it next to it, «(🟢 оплачено: N ₾)». Both are live checks,
+  so every other fine police.ge just returned counts (a ⚪ or ⏳ status there
+  only means its write failed).
+- Statistics at first start: seeding records the snapshot's time as the
+  plate's last full check when the seeded receipts (with any payment mark)
+  add up to the snapshot, so a 🟢 mark leaves «Задолженность» at once even
+  on plates not checked since the transition. In production all 29 cars of
+  the old debt list are explained this way. Deliberate exception: a saved
+  total that is newer than the statuses (a check without statuses) or not
+  explained by them is still shown whole, possibly including a 🟢 receipt,
+  until the next full check — so that a new fine that took the paid one's
+  place is never hidden.
 
 ## Daily evening re-check
 

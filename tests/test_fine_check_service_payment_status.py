@@ -440,3 +440,17 @@ async def test_unreadable_payment_status_still_announces_a_new_receipt(fx, caplo
 
     assert [fine.external_fine_id for fine in result.new_fines] == ["GE2"]
     assert all(_CAR not in r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+
+
+async def test_a_new_receipt_next_to_a_paid_one_is_a_new_fine(fx):
+    """Номер с 🟢 квитанцией: новая квитанция — по-прежнему новый штраф
+    (ждёт уведомления), а 🟢 с изменившейся карточкой — нет."""
+    task = await _listed_and_paid(fx)
+    fx.provider.results = [ProviderSearchResult(records=[_changed_card("GE1"), _record("GE2")])]
+
+    result = await fx.service.check_task(task)
+
+    assert [fine.external_fine_id for fine in result.new_fines] == ["GE2"]
+    new_row = [row for row in fx.fines.list_by_car_number(_CAR) if row.external_fine_id == "GE2"]
+    assert len(new_row) == 1 and new_row[0].notification_sent_at is None
+    assert all(row.notification_sent_at is not None for row in _changed_rows(fx))

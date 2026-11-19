@@ -662,13 +662,14 @@ class FineCheckService:
         except Exception:
             logger.exception("Georgia fine status: не удалось обновить статусы после проверки")
 
-    def _is_paid_receipt(self, record: ParsedFineRecord) -> bool:
-        """🟢 по статусам (только там, где они ведутся). Сбой чтения статуса —
-        как раньше: штраф считается неоплаченным, уведомление не теряется."""
+    def _is_paid_receipt(self, car_number: str, record: ParsedFineRecord) -> bool:
+        """🟢 по статусам (только там, где они ведутся; ключ — номер задачи,
+        как у record_full_check). Сбой чтения статуса — как раньше: штраф
+        считается неоплаченным, уведомление не теряется."""
         if self._status_tracker is None or not record.external_fine_id:
             return False
         try:
-            return self._status_tracker.is_paid(record.car_number, record.external_fine_id)
+            return self._status_tracker.is_paid(car_number, record.external_fine_id)
         except Exception:
             logger.exception("Georgia fine status: не удалось прочитать статус оплаты квитанции")
             return False
@@ -788,7 +789,7 @@ class FineCheckService:
             # строка той же квитанции (карточка на police.ge изменилась,
             # другая задача номера, feed, возврат после ⚪) рождается
             # "уведомлённой" и в new_fines не попадает.
-            paid = self._is_paid_receipt(record)
+            paid = self._is_paid_receipt(task.car_number, record)
             already_known = paid or (
                 self._dedupe_known_receipts
                 and bool(record.external_fine_id)
