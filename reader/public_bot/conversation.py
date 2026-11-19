@@ -3359,10 +3359,18 @@ class ConversationController:
             username=known.telegram_username if known else None,
         )
 
+        # Менеджерский вид, как в статистике: 🟢 не входит в сумму штрафов.
+        statuses = (
+            {
+                protocol_no: status.display_status
+                for protocol_no, status in self._fine_status.statuses_by_protocol(hit.car_number).items()
+            }
+            if self._fine_status is not None and check_ok and fines else None
+        )
         lines = [
             f"👤 {owner_display}",
             f"🚗 {format_plate_for_telegram(hit.car_number)}",
-            texts.format_search_money_line(check_ok=check_ok, fines=fines),
+            texts.format_search_money_line(check_ok=check_ok, fines=fines, statuses=statuses),
             texts.format_search_monitoring_line(monitoring_active=monitoring_active),
             texts.format_search_checked_at_line(checked_at),
         ]

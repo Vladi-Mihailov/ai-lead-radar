@@ -325,3 +325,63 @@ async def test_collector_bootstrap_completion_is_idempotent_against_already_comp
     assert len(fine_repo.list_current_for_task(task.id, since=_EPOCH_UTC)) == 1
     state = bootstrap_repo.get("AA001AA")
     assert state.bootstrap_completed_by_user_id == 777  # менеджерская audit-запись не перезаписана
+
+
+async def test_feed_match_of_a_paid_receipt_is_not_a_new_fine_for_anyone(tmp_path):
+    """REDNET снова нашёл в общем списке квитанцию, оплата которой
+    подтверждена (🟢), с изменившейся суммой (новый fingerprint): новая
+    строка рождается уведомлённой (оператору не уйдёт), статус остаётся 🟢,
+    и подписчик, ещё не получавший эту квитанцию, ничего не получает."""
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+
+    from reader.fines.models import UNLIMITED_END_DATE
+    from reader.fines.payment_status import PAYMENT_PAID, FineStatusRepository, FineStatusTracker
+    from reader.public_bot.delivery_repository import ClientFineDeliveryRepository
+    from reader.public_bot.delivery_service import ClientDeliveryService
+    from reader.public_bot.subscription_repository import FineSubscriptionRepository
+
+    db_path = tmp_path / "users.db"
+    task_repo = FineMonitoringTaskRepository(db_path)
+    fine_repo = DetectedFineRepository(db_path)
+    bootstrap_repo = GeorgiaPlateBootstrapRepository(db_path)
+    status_repo = FineStatusRepository(db_path)
+    subscriptions = FineSubscriptionRepository(db_path)
+    deliveries = ClientFineDeliveryRepository(db_path)
+    try:
+        tracker = FineStatusTracker(status_repo, disappearance_min_gap=timedelta(hours=12))
+        check_service = FineCheckService(
+            _AlwaysAvailableProvider(), task_repo, fine_repo, status_tracker=tracker, dedupe_known_receipts=True,
+        )
+        manual_bootstrap = ManualBootstrapService(bootstrap_repo, task_repo, fine_repo, check_service)
+        service = CollectorIngestService(task_repo, fine_repo, check_service, bootstrap_repo, manual_bootstrap)
+        task = _create_task(task_repo, "AA001AA")
+        await service.ingest_feed_match("AA001AA", _record(amount=50))
+        tracker.mark_paid(tracker.statuses_by_protocol("AA001AA")["P-0001"].id, actor_user_id=1, note="TBC 1")
+
+        await service.ingest_feed_match("AA001AA", _record(amount=100))
+
+        changed = [row for row in fine_repo.list_by_car_number("AA001AA") if row.amount == 100.0]
+        assert len(changed) == 1 and changed[0].notification_sent_at is not None
+        assert tracker.statuses_by_protocol("AA001AA")["P-0001"].payment_status == PAYMENT_PAID
+
+        subscriptions.create(
+            monitoring_task_id=task.id, car_number="AA001AA", telegram_user_id=900000101,
+            telegram_chat_id=900000101, telegram_username=None, start_date=date(2026, 10, 1),
+            end_date=UNLIMITED_END_DATE,
+        )
+        sent = []
+
+        class _Sender:
+            async def send_message(self, chat_id, text, *, buttons=None):
+                sent.append(chat_id)
+
+        delivery = ClientDeliveryService(
+            fine_repo, subscriptions, deliveries, _Sender(), tz=ZoneInfo("Asia/Tbilisi"), status_lookup=tracker,
+        )
+        await delivery.run_once(now=datetime(2026, 10, 15, 10, 0, tzinfo=timezone.utc))
+
+        assert sent == []
+    finally:
+        for repository in (deliveries, subscriptions, status_repo, bootstrap_repo, fine_repo, task_repo):
+            repository.close()

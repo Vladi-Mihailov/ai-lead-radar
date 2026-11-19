@@ -917,16 +917,25 @@ class FineStatusTracker:
 
     def undeliverable_protocols(self, car_number: str) -> set[str]:
         """Квитанции, о которых клиенту НЕ отправляется "новый штраф" (см.
-        ClientDeliveryService): ⚪ и 'unverified' — квитанции из истории, чьё
-        присутствие новая полная проверка ещё не подтвердила (с любой
-        отметкой менеджера). Подписчик видит их отдельной строкой ⏳; как
-        только проверка или feed найдут квитанцию, она снова 'listed' и
-        уходит как обычно. 'missing' сюда не входит (см. gone_protocols)."""
+        ClientDeliveryService): ⚪, 🟢 и 'unverified' — квитанции из истории,
+        чьё присутствие новая полная проверка ещё не подтвердила (с любой
+        отметкой менеджера). Подписчик видит 'unverified' отдельной строкой
+        ⏳; как только проверка или feed найдут такую квитанцию, она снова
+        'listed' и уходит как обычно. 🟢 не уходит, пока отметка стоит
+        (повторной оплаты не предлагаем; после «Снять отметку» — как
+        обычно), но остаётся в истории и проверяется до ⚪. 'missing' сюда
+        не входит (см. gone_protocols)."""
         return {
             status.protocol_no
             for status in self._repository.list_for_car(car_number, include_gone=True)
-            if status.presence in (PRESENCE_GONE, PRESENCE_UNVERIFIED)
+            if status.presence in (PRESENCE_GONE, PRESENCE_UNVERIFIED) or status.payment_status == PAYMENT_PAID
         }
+
+    def is_paid(self, car_number: str, protocol_no: str) -> bool:
+        """🟢 — оплата квитанции подтверждена (см. FineCheckService._finalize:
+        её повторное обнаружение не уведомляет как о новом штрафе)."""
+        status = self._repository.get_by_protocol(car_number, protocol_no)
+        return status is not None and status.payment_status == PAYMENT_PAID
 
     def has_listed_receipts(self, car_number: str) -> bool:
         """Есть ли у номера квитанции, ещё не признанные исчезнувшими — это

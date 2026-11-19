@@ -1228,7 +1228,9 @@ def _format_search_amount(value: float) -> str:
     return f"{text} ₾"
 
 
-def format_search_money_line(*, check_ok: bool, fines: list[NewFineEvent]) -> str:
+def format_search_money_line(
+    *, check_ok: bool, fines: list[NewFineEvent], statuses: dict[str, str] | None = None,
+) -> str:
     """КРИТИЧНО (см. задачу): "0 ₾" — ТОЛЬКО если live-проверка реально
     подтвердила отсутствие штрафов (check_ok=True И fines пуст) — тот же
     CheckNowOutcome/CheckResult.current_fines, что и у "🔎 Проверить
@@ -1238,15 +1240,29 @@ def format_search_money_line(*, check_ok: bool, fines: list[NewFineEvent]) -> st
     хотя бы у одного найденного штрафа amount не определён (police.ge не
     отдал распознаваемую сумму) — сумма НИКОГДА не занижается молчаливым
     пропуском такого штрафа (задача явно запрещает "ERROR/UNKNOWN
-    превращать в 0 ₾")."""
+    превращать в 0 ₾").
+
+    statuses — {protocolNo: display_status} (см. FineStatus.display_status),
+    если статусы оплаты ведутся: в сумму входят только 🔴 и 🟡 (как в
+    "Задолженности" статистики); 🟢 — оплачено, ещё в базе police.ge — не
+    входит и показывается рядом, ⚪ и ⏳ не входят."""
     if not check_ok:
         return "💰 Штрафы: неизвестно"
     if not fines:
         return "💰 Штрафы: 0 ₾"
-    if any(fine.amount is None for fine in fines):
+    statuses = statuses or {}
+
+    def status_of(fine) -> str:
+        return statuses.get(fine.external_fine_id or "", PAYMENT_UNPAID)
+
+    owed = [fine for fine in fines if status_of(fine) in (PAYMENT_UNPAID, PAYMENT_NEEDS_REVIEW)]
+    paid = [fine for fine in fines if status_of(fine) == PAYMENT_PAID]
+    if any(fine.amount is None for fine in owed):
         return "💰 Штрафы: неизвестно"
-    total = sum(fine.amount for fine in fines)
-    return f"💰 Штрафы: {_format_search_amount(total)}"
+    line = f"💰 Штрафы: {_format_search_amount(sum(fine.amount for fine in owed))}"
+    if paid:
+        line += f" (🟢 оплачено: {_format_search_amount(sum(fine.amount or 0.0 for fine in paid))})"
+    return line
 
 
 def format_search_monitoring_line(*, monitoring_active: bool) -> str:

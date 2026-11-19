@@ -825,3 +825,76 @@ def test_statistics_keyboard_has_payment_status_button_only_when_enabled():
     without = keyboards.debt_statistics_keyboard(page=None, total_pages=None)
     assert any(button.text == texts.FINE_STATUS_BUTTON_LABEL for row in with_button for button in row)
     assert not any(button.text == texts.FINE_STATUS_BUTTON_LABEL for row in without for button in row)
+
+
+# ---- 🟢: не новый штраф, не в сумме, без кнопок оплаты ----
+
+
+def _changed_card(car, protocol_no, amount):
+    """Та же квитанция с изменившейся карточкой на police.ge (новый fingerprint)."""
+    return ParsedFineRecord(
+        car_number=car, external_fine_id=protocol_no, penalty_date=date(2026, 11, 1), due_date=date(2026, 12, 31),
+        delivered_status="Вручено", fingerprint=f"fp-{car}-{protocol_no}-changed",
+        raw_data={"protocolNo": protocol_no}, amount=amount,
+    )
+
+
+async def test_add_car_does_not_count_a_paid_receipt_found_again_as_new(fx):
+    task, _ = fx.car(_CAR, [("GE1", 50)])
+    await fx.check(task)
+    fx.tracker.mark_paid(fx.status(_CAR, "GE1").id, actor_user_id=_TRUSTED, note="TBC 1")
+    fx.provider.records[_CAR] = [_changed_card(_CAR, "GE1", 50)]
+
+    reply = await fx.controller._complete_self_add_car(
+        car_number=_CAR, username=None, today=date(2026, 11, 19), chat_id=_OWNER, telegram_user_id=_OWNER,
+        first_name=None, last_name=None,
+    )
+
+    assert "🔎 Штрафы проверены: новых штрафов нет" in reply.text
+
+
+async def test_check_now_shows_a_paid_receipt_without_payment_and_out_of_the_amount(fx):
+    task, subscription = fx.car(_CAR, [("GE1", 50)], owner=_OWNER)
+    await fx.check(task)
+    fx.tracker.mark_paid(fx.status(_CAR, "GE1").id, actor_user_id=_TRUSTED, note="TBC 1")
+    fx.provider.records[_CAR] = [_changed_card(_CAR, "GE1", 50)]  # police.ge показал её снова
+
+    reply = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=_OWNER)
+
+    assert "Статус: 🟢 Оплачен" in reply.text
+    assert "💰 К оплате: 0 ₾" in reply.text
+    assert reply.cta_buttons is None
+    assert fx.status(_CAR, "GE1").payment_status == "paid"
+
+
+def test_search_money_line_leaves_paid_fines_out_of_the_total():
+    from types import SimpleNamespace
+
+    fines = [SimpleNamespace(external_fine_id="GE1", amount=50.0), SimpleNamespace(external_fine_id="GE2", amount=100.0)]
+
+    assert texts.format_search_money_line(check_ok=True, fines=fines) == "💰 Штрафы: 150 ₾"
+    assert texts.format_search_money_line(
+        check_ok=True, fines=fines, statuses={"GE2": "paid"},
+    ) == "💰 Штрафы: 50 ₾ (🟢 оплачено: 100 ₾)"
+    assert texts.format_search_money_line(
+        check_ok=True, fines=fines, statuses={"GE1": "paid", "GE2": "paid"},
+    ) == "💰 Штрафы: 0 ₾ (🟢 оплачено: 150 ₾)"
+    assert texts.format_search_money_line(
+        check_ok=True, fines=fines, statuses={"GE1": "needs_review", "GE2": "gone"},
+    ) == "💰 Штрафы: 50 ₾"
+
+
+async def test_manager_search_block_leaves_paid_fines_out_of_the_total(fx):
+    from reader.public_bot.conversation import _SearchHit
+
+    task, subscription = fx.car(_CAR, [("GE1", 50), ("GE2", 100)], owner=_OWNER)
+    await fx.check(task)
+    fx.tracker.mark_paid(fx.status(_CAR, "GE2").id, actor_user_id=_TRUSTED, note="TBC 1")
+    outcome = await fx.subscription_service.check_now(subscription.id, telegram_user_id=_OWNER)
+
+    block = fx.controller._format_search_block(
+        _SearchHit(task_id=task.id, owner_telegram_user_id=_OWNER, car_number=_CAR),
+        monitoring_active=True, check_ok=True, fines=outcome.fines, checked_at=datetime(2026, 11, 19, 10, 0),
+    )
+
+    assert "💰 Штрафы: 50 ₾ (🟢 оплачено: 100 ₾)" in block
