@@ -38,6 +38,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
+from reader.fines.batch_gate import BatchCheckGate
 from reader.fines.check_service import FineCheckService
 from reader.fines.models import FineCarDebtGroup, FineTaskDebtSnapshot
 from reader.fines.task_repository import FineMonitoringTaskRepository
@@ -87,10 +88,14 @@ class DebtRefreshService:
         *,
         inter_car_delay_seconds: float = _INTER_CAR_DELAY_SECONDS,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        gate: BatchCheckGate | None = None,
     ):
         self._task_repository = task_repository
         self._check_service = check_service
         self._in_progress = False
+        # Общий с вечерней перепроверкой и "fine check-all" (см.
+        # reader/fines/batch_gate.py) — None сохраняет прежнее поведение.
+        self._gate = gate
         self._inter_car_delay_seconds = inter_car_delay_seconds
         self._sleep = sleep
 
@@ -144,6 +149,10 @@ class DebtRefreshService:
         "Проверено: N" разошлось бы с "Будет проверено автомобилей: N"."""
         if self._in_progress:
             raise RefreshAlreadyInProgressError()
+        if self._gate is not None and not self._gate.try_acquire("debt_refresh"):
+            # Идёт другой массовый проход (вечерняя перепроверка или "fine
+            # check-all") — для менеджера это то же "проверка уже идёт".
+            raise RefreshAlreadyInProgressError()
 
         self._in_progress = True
         try:
@@ -190,3 +199,5 @@ class DebtRefreshService:
             )
         finally:
             self._in_progress = False
+            if self._gate is not None:
+                self._gate.release("debt_refresh")

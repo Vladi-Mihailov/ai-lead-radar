@@ -10,13 +10,21 @@ POST подряд, но иногда сервер начинает отвеча�
 """
 
 import re
+from datetime import date
 
 import httpx
 
+from reader.fines.parser import parse_source_updated_on
 from reader.fines.police_ge_circuit_breaker import PoliceGeCircuitBreaker
-from reader.fines.provider import FineProviderError, PoliceGeUnavailableError
+from reader.fines.provider import FineProviderError, PoliceGeBlockedError, PoliceGeUnavailableError
 
 _CSRF_RE = re.compile(r'name="csrf_token"\s+value="([^"]*)"')
+
+# Ответы, которые означают отказ/ограничение со стороны police.ge, а не
+# сетевой сбой — см. PoliceGeBlockedError (массовые проходы на них
+# останавливаются сразу). Для circuit breaker они по-прежнему считаются
+# transport-сбоем, как и раньше.
+_BLOCKING_STATUS_CODES = frozenset({403, 429})
 
 _SEARCH_URL_PATH = "index.php?url=protocols/searchByAuto"
 # Публичный feed "Receipts of fines published" (см. задачу "Georgia fines
@@ -45,6 +53,10 @@ class PoliceGeSession:
         # передающие circuit_breaker, продолжают работать без изменений
         # (is_available()/allow_request() просто не проверяются вовсе).
         self._circuit_breaker = circuit_breaker
+        # "Date of update of information" со страницы, загруженной при
+        # последнем обновлении csrf_token (см. parse_source_updated_on) —
+        # None, пока страница ни разу не загружалась или блока на ней нет.
+        self.source_updated_on: date | None = None
 
     def is_available(self) -> bool:
         """См. FineProvider.is_available() — используется scheduled-
@@ -141,6 +153,19 @@ class PoliceGeSession:
             f"(firstResult={first_result}) даже после обновления сессии (csrf_token)"
         )
 
+    async def refresh_page(self) -> None:
+        """Принудительно загрузить страницу police.ge заново — ОДИН GET:
+        новый csrf_token и свежая source_updated_on. Нужен вечерней
+        перепроверке ровно один раз за проход (см. check_now_server.py,
+        refresh_page): сам по себе токен живёт долго, и без этого дата
+        обновления базы оставалась бы той, что была при старте процесса.
+        Circuit breaker — та же первая проверка, что и в search_by_plate()."""
+        if self._circuit_breaker is not None and not self._circuit_breaker.allow_request():
+            raise PoliceGeUnavailableError(
+                "police.ge временно недоступен (circuit breaker открыт после повторных сбоев соединения)"
+            )
+        await self._refresh_csrf_token()
+
     async def _refresh_csrf_token(self) -> None:
         # Production bug (O127PX62, 2026-10-21): необёрнутый httpx.ConnectTimeout
         # (police.ge временно недоступен) проходил мимо check_task()'s
@@ -155,6 +180,11 @@ class PoliceGeSession:
         try:
             response = await self._client.get(self._page_url, timeout=self._timeout)
             response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if self._circuit_breaker is not None:
+                self._circuit_breaker.record_transport_failure()
+            _raise_for_blocking_status(exc, "Не удалось загрузить страницу police.ge")
+            raise FineProviderError(f"Не удалось загрузить страницу police.ge: {exc}") from exc
         except httpx.HTTPError as exc:
             # Именно TRANSPORT-сбой (см. задачу п.2: "Only network/
             # connectivity failures should affect circuit state") —
@@ -166,6 +196,10 @@ class PoliceGeSession:
 
         if self._circuit_breaker is not None:
             self._circuit_breaker.record_success()
+
+        updated_on = parse_source_updated_on(response.text)
+        if updated_on is not None:
+            self.source_updated_on = updated_on
 
         match = _CSRF_RE.search(response.text)
         if match is None:
@@ -195,6 +229,11 @@ class PoliceGeSession:
                 timeout=self._timeout,
             )
             response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if self._circuit_breaker is not None:
+                self._circuit_breaker.record_transport_failure()
+            _raise_for_blocking_status(exc, "police.ge отклонил запрос")
+            raise FineProviderError(f"Не удалось выполнить запрос к police.ge: {exc}") from exc
         except httpx.HTTPError as exc:
             if self._circuit_breaker is not None:
                 self._circuit_breaker.record_transport_failure()
@@ -214,3 +253,12 @@ class PoliceGeSession:
             return None
 
         return data
+
+
+def _raise_for_blocking_status(exc: httpx.HTTPStatusError, prefix: str) -> None:
+    """HTTP 403/429 -> PoliceGeBlockedError (см. _BLOCKING_STATUS_CODES);
+    на любом другом коде просто возвращает управление — вызывающий код
+    бросает обычную FineProviderError."""
+    status_code = exc.response.status_code
+    if status_code in _BLOCKING_STATUS_CODES:
+        raise PoliceGeBlockedError(f"{prefix}: HTTP {status_code}", status_code=status_code) from exc

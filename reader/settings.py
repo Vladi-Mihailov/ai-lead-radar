@@ -275,6 +275,30 @@ class FineMonitorSettings(BaseModel):
     # uses, so "breaker already open -> immediate REDNET fallback" is
     # unaffected either way.
     georgia_checknow_local_timeout: float = 3.0
+    # Ежедневная вечерняя перепроверка известных штрафов через REDNET (см.
+    # reader/public_bot/daily_recheck.py). Выключена по умолчанию: включение
+    # добавляет запросы к police.ge (~1 searchByAuto на номер с известными
+    # штрафами в день + 1 GET страницы) и делается отдельным решением.
+    # Окно — по fine_monitor.timezone, между циклами коллектора 21:00/23:55.
+    daily_recheck_enabled: bool = False
+    daily_recheck_time: time = time(23, 0)
+    daily_recheck_cutoff_time: time = time(23, 45)
+    daily_recheck_inter_car_delay_seconds: float = 8.0
+    daily_recheck_batch_size: int = 10
+    daily_recheck_batch_pause_seconds: float = 60.0
+    daily_recheck_max_plates: int = 200
+    daily_recheck_max_consecutive_errors: int = 2
+    # Штраф считается исчезнувшим из базы полиции (⚪), если его нет в двух
+    # успешных полных проверках, между которыми прошло не меньше этого
+    # интервала (см. reader/fines/payment_status.py).
+    fine_disappearance_min_gap_hours: float = 12.0
+    # Фрагменты текста страницы оплаты (см. PaymentPageMarkers):
+    # already_paid пуст, пока реальный ответ "уже оплачено" не наблюдался;
+    # None у payment_failed — встроенный список (общий отказ МВД
+    # "ჯარიმის გადახდა ვერ მოხერხდა!").
+    payment_page_already_paid_markers: list[str] = Field(default_factory=list)
+    payment_page_failed_markers: list[str] | None = None
+    payment_page_technical_error_markers: list[str] = Field(default_factory=list)
 
 
 class InviterWorkerSettings(BaseModel):
@@ -747,6 +771,32 @@ def load_settings(config_path: Path) -> Settings:
                 georgia_checknow_local_timeout=float(
                     fine_monitor_raw.get("georgia_checknow_local_timeout", 3.0)
                 ),
+                daily_recheck_enabled=bool(fine_monitor_raw.get("daily_recheck_enabled", False)),
+                daily_recheck_time=_parse_check_time(fine_monitor_raw.get("daily_recheck_time", "23:00")),
+                daily_recheck_cutoff_time=_parse_check_time(
+                    fine_monitor_raw.get("daily_recheck_cutoff_time", "23:45")
+                ),
+                daily_recheck_inter_car_delay_seconds=float(
+                    fine_monitor_raw.get("daily_recheck_inter_car_delay_seconds", 8.0)
+                ),
+                daily_recheck_batch_size=int(fine_monitor_raw.get("daily_recheck_batch_size", 10)),
+                daily_recheck_batch_pause_seconds=float(
+                    fine_monitor_raw.get("daily_recheck_batch_pause_seconds", 60.0)
+                ),
+                daily_recheck_max_plates=int(fine_monitor_raw.get("daily_recheck_max_plates", 200)),
+                daily_recheck_max_consecutive_errors=int(
+                    fine_monitor_raw.get("daily_recheck_max_consecutive_errors", 2)
+                ),
+                fine_disappearance_min_gap_hours=float(
+                    fine_monitor_raw.get("fine_disappearance_min_gap_hours", 12.0)
+                ),
+                payment_page_already_paid_markers=_parse_marker_list(
+                    fine_monitor_raw, "payment_page_already_paid_markers",
+                ) or [],
+                payment_page_failed_markers=_parse_marker_list(fine_monitor_raw, "payment_page_failed_markers"),
+                payment_page_technical_error_markers=_parse_marker_list(
+                    fine_monitor_raw, "payment_page_technical_error_markers",
+                ) or [],
             ),
             inviter=InviterSettings(
                 worker=InviterWorkerSettings(
@@ -825,6 +875,19 @@ def _parse_forward_targets(raw: str) -> list[int | str]:
             targets.append(token)
 
     return targets
+
+
+def _parse_marker_list(raw: dict, key: str) -> list[str] | None:
+    """fine_monitor.payment_page_*_markers — ТОЛЬКО список строк. Строка
+    вместо списка — ConfigError: перебор строки дал бы маркеры из одной
+    буквы, совпадающие с любым текстом (и общий отказ МВД стал бы
+    "уже оплачено"). None/отсутствует — None (значение по умолчанию)."""
+    value = raw.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ConfigError(f"fine_monitor.{key} должен быть списком строк")
+    return [item.strip() for item in value if item.strip()]
 
 
 def _parse_check_time(value: str) -> time:

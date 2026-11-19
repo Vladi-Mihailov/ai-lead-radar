@@ -6,10 +6,19 @@ parse_published_protocols_response ниже) в ParsedFineRecord. Никакой
 """
 
 import hashlib
+import re
 from datetime import date
 from typing import Any
 
 from reader.fines.models import ParsedFineRecord
+
+# "Date of update of information 22.10.2026" — английская версия страницы
+# police.ge/protocol (settings.fine_monitor.source_url, ?lang=en); на
+# странице результата оплаты (fail.php) тот же блок встречается с
+# двоеточием: "Date of update of information: 12.11.2026".
+_SOURCE_UPDATED_ON_RE = re.compile(
+    r"Date of update of information\s*:?\s*(\d{1,2})\.(\d{1,2})\.(\d{4})"
+)
 
 
 class FineParseError(ValueError):
@@ -45,6 +54,37 @@ def compute_fingerprint(
         ]
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def parse_source_updated_on(html: str | None) -> date | None:
+    """Дата последнего обновления опубликованных квитанций ("Date of update
+    of information") со страницы police.ge — той самой, которую сессия и так
+    загружает ради csrf_token (см. PoliceGeSession._refresh_csrf_token), то
+    есть без отдельного запроса. None — блока нет или дата некорректна
+    (разметка страницы могла измениться): это не ошибка проверки."""
+    match = _SOURCE_UPDATED_ON_RE.search(html or "")
+    if match is None:
+        return None
+    day, month, year = (int(part) for part in match.groups())
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def extract_reported_count(raw: Any) -> int | None:
+    """data.count из конверта police.ge ({success, data: {count, results}})
+    — сколько записей источник сообщил всего. None — поля нет или это не
+    целое число (bool не считается)."""
+    if not isinstance(raw, dict):
+        return None
+    data = raw.get("data")
+    if not isinstance(data, dict):
+        return None
+    count = data.get("count")
+    if isinstance(count, bool) or not isinstance(count, int):
+        return None
+    return count
 
 
 def _parse_amount(value: Any) -> float | None:

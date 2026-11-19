@@ -47,7 +47,9 @@ def format_trusted_operator_fine_message(
     return "\n".join(lines)
 
 
-def format_check_now_fines_message(*, car_number: str, fines: list[NewFineEvent]) -> str:
+def format_check_now_fines_message(
+    *, car_number: str, fines: list[NewFineEvent], status_labels: dict[str, str] | None = None,
+) -> str:
     """Manual "🔎 Проверить сейчас" (см. design report про UX manual
     check) — показывает ВСЕ штрафы, которые police.ge вернул на этой
     проверке (CheckNowOutcome.fines = CheckResult.current_fines), а не
@@ -59,7 +61,11 @@ def format_check_now_fines_message(*, car_number: str, fines: list[NewFineEvent]
     формат штрафа используется везде в проекте (фоновые уведомления и
     manual check неотличимы по виду одного штрафа). Пустой fines сюда не
     передаётся — вызывающий код (texts.format_check_now_result) обрабатывает
-    "штрафов не найдено" отдельно, до вызова этой функции."""
+    "штрафов не найдено" отдельно, до вызова этой функции.
+
+    status_labels — {protocolNo: "🔴 Не оплачен"/...} (см. статусы оплаты,
+    reader/fines/payment_status.py): строка "Статус: ..." под блоком
+    штрафа; None — статусы не ведутся, формат прежний."""
     formatted_car_number = format_plate_for_telegram(car_number)
     blocks = []
     for fine in fines:
@@ -69,5 +75,9 @@ def format_check_now_fines_message(*, car_number: str, fines: list[NewFineEvent]
             f"🚗 Автомобиль: {formatted_car_number}",
             format_fine_block(fine),
         ]
+        if status_labels is not None:
+            label = status_labels.get(fine.external_fine_id or "")
+            if label:
+                lines.append(f"Статус: {label}")
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)

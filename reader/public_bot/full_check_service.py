@@ -30,6 +30,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from reader.fines.batch_gate import BatchCheckGate
 from reader.fines.check_service import FineCheckService
 from reader.fines.task_repository import FineMonitoringTaskRepository
 
@@ -82,7 +83,9 @@ class FullCheckService:
         inter_car_delay_seconds: float = _INTER_CAR_DELAY_SECONDS,
         progress_every: int = _PROGRESS_EVERY,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        gate: BatchCheckGate | None = None,
     ):
+        self._gate = gate
         self._task_repository = task_repository
         self._check_service = check_service
         self._progress_sender = progress_sender
@@ -114,6 +117,9 @@ class FullCheckService:
         НИКОГДА не chat_id клиента: этот скан не привязан ни к какому
         конкретному владельцу машины."""
         if self._in_progress:
+            raise FullCheckAlreadyInProgressError()
+        if self._gate is not None and not self._gate.try_acquire("full_check"):
+            # Идёт другой массовый проход (см. reader/fines/batch_gate.py).
             raise FullCheckAlreadyInProgressError()
 
         self._in_progress = True
@@ -189,6 +195,8 @@ class FullCheckService:
             )
         finally:
             self._in_progress = False
+            if self._gate is not None:
+                self._gate.release("full_check")
 
 
 def _format_progress(*, done: int, total: int, ok: int, failed: int) -> str:

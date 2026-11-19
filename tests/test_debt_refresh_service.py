@@ -390,10 +390,12 @@ def test_debt_refresh_service_has_no_notification_dependency():
     конструктора ни для NotificationService, ни для
     FineNotificationCoordinator. inter_car_delay_seconds/sleep (см. задачу
     "guard Georgia debt against false zero results" п.5) — технический
-    throttle между машинами, не notification-механизм."""
+    throttle между машинами, gate (reader/fines/batch_gate.py) — замок от
+    параллельных массовых проходов; ни то, ни другое не notification-
+    механизм."""
     params = list(inspect.signature(DebtRefreshService.__init__).parameters)
     assert params == [
-        "self", "task_repository", "check_service", "inter_car_delay_seconds", "sleep",
+        "self", "task_repository", "check_service", "inter_car_delay_seconds", "sleep", "gate",
     ]
 
     import reader.public_bot.debt_refresh_service as module
