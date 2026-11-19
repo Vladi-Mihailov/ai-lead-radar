@@ -21,12 +21,19 @@ read). The real feed has ~10k pages (~5–6.3k publications a day), so an
 empty page is unreachable — without this horizon DEEP never completed and
 re-read max_pages pages every cycle. Each cycle first records "cycle in
 progress" as last_error, so a cycle killed midway (SIGTERM, OOM,
-CancelledError) is followed by DEEP recovery, not FAST. FAST mode stops on
-the SECOND page with a row seen BEFORE this cycle (normally the overlap page
-right after the frontier). Rows this cycle already marked reappear when new
-publications shift the pages during the traversal (production: bursts of
-70–360 rows); stopping on them, or on an overlap page such a burst filled
-right after the frontier, would leave new rows below unread for good.
+CancelledError) is followed by DEEP recovery, not FAST. FAST mode stops
+only on a QUIET page (no unseen row, at least one row seen before this
+cycle that this cycle had not read yet) followed by FAST_LOOKAHEAD_PAGES
+more quiet pages; a page with an unseen row resets the count, so an old
+row re-shown above new rows (a re-published receipt — production,
+2026-11-19) no longer ends the traversal early. Rows this cycle already
+marked, and rows seen before it that a burst re-shows on a later page,
+reappear when new publications shift the pages during the traversal
+(production: bursts of 70–360 rows); they neither make a page quiet nor
+reset the count — stopping on them would leave new rows below unread for
+good. Per-cycle counters (seen_among_new, quiet_pages, lookahead_new) and
+the page-0 data.count with its delta since the previous cycle go to the
+"feed poll finished" line, without protocol numbers.
 
 A matched row's payload goes to the local outbox BEFORE it is submitted and
 leaves it after production accepted it, so a cycle killed mid-submit loses
@@ -43,9 +50,9 @@ collector restart.
 
 KNOWN TECHNICAL DEBT (see architecture review, task "PR #34 integration
 sequence"): _poll_feed() below duplicates GeorgiaPublicFineFeedJob.run()'s
-DEEP/FAST frontier+one-overlap-page state machine almost line-for-line
-(same deep_mode/is_true_first_run/in_recovery computation, same pending_
-overlap/page_has_seen_row tracking, same error/retry/retention handling).
+DEEP/FAST frontier+look-ahead state machine almost line-for-line
+(same deep_mode/is_true_first_run/in_recovery computation, same quiet-page/
+look-ahead tracking, same error/retry/retention handling).
 This was reviewed deliberately for extraction into a shared module and
 rejected: GeorgiaPublicFineFeedJob is already-merged, production-tested
 code living in reader/jobs/, which this package is architecturally
@@ -82,6 +89,7 @@ from reader.fines.collector_payload import record_to_payload
 from reader.fines.parser import (
     FineParseError,
     extract_published_protocols_results,
+    extract_reported_count,
     parse_published_protocol_entry,
     parse_search_response,
 )
@@ -103,6 +111,31 @@ from reader.georgia_collector.production_client import (
 logger = logging.getLogger(__name__)
 
 _PAGE_SIZE = 30
+
+FAST_LOOKAHEAD_PAGES = 2
+"""K: how many more quiet pages FAST reads after the first quiet page (a
+page without unseen rows that shows at least one row seen before this
+cycle and not yet read by it) before it stops; a page with unseen rows
+among them resets the count. Overridden by GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES (see
+__main__.load_fast_lookahead_pages); mirrored in
+reader/jobs/georgia_public_feed_job.py.
+
+Data behind K = 2 (production, 2026-11-19):
+- the only clean FAST observation (17:00 UTC: 40 pages read, 1197 new
+  rows, so 1–3 old ones) had its out-of-place old row directly above the
+  boundary: the old "second page with a seen row" stop ended one page
+  above the boundary and missed nothing only by luck;
+- new rows numbered below numbers already seen (1–7 rows in 10 of 32
+  cycles, 63 once): the shallow number-space overlaps are <= 5 rows;
+- a page-0 probe showed the feed ordered by publication, not by protocol
+  number (the series interleave), with today's rows as one contiguous
+  block on top; the anomaly seen is an old row re-shown above new rows.
+  Deep insertion of new rows below the boundary was not observed; if the
+  data.count delta ever exceeds the new rows read, revisit (a DEEP trigger
+  or a daily sweep, ~190–210 pages a day).
+K = 2 covers ~60 rows beyond the first quiet page for at most +2 page
+requests per ordinary FAST cycle (~+8 a day at four cycles), well inside
+the 300-page cap."""
 
 # Отметка "цикл идёт" в georgia_public_feed_state.last_error (см. отметку
 # перед циклом страниц): если она осталась, цикл был прерван.
@@ -140,6 +173,42 @@ class CollectorJobStatus:
     last_error_at: datetime | None = None
 
 
+@dataclass
+class _FeedCycleCounters:
+    """Per-cycle feed diagnostics for the log, never protocol numbers or
+    plates (mirrored in reader/jobs/georgia_public_feed_job.py):
+    - new_rows: rows this cycle saw for the first time;
+    - seen_among_new: rows seen before this cycle standing above a new row
+      on the same page (an old row re-shown among new ones). The old rows
+      under the last new row of the boundary page are not counted — every
+      cycle has them;
+    - quiet_pages: pages with no new row and at least one row seen before
+      this cycle that it had not read yet;
+    - lookahead_new: FAST only — new rows on pages after a quiet page,
+      i.e. rows inserted below a boundary that the look-ahead found;
+    - reported_count: data.count of page 0 (the feed total), and
+      reported_count_delta: its change since the previous cycle's page 0 in
+      this process (n/a after a restart). A delta above new_rows hints at
+      rows added out of reach; a single cycle can also differ by rows a
+      burst pushed into the previous cycle's pages."""
+
+    new_rows: int = 0
+    seen_among_new: int = 0
+    quiet_pages: int = 0
+    lookahead_new: int = 0
+    reported_count: int | None = None
+    reported_count_delta: int | None = None
+
+    def describe(self) -> str:
+        reported = "n/a" if self.reported_count is None else str(self.reported_count)
+        delta = "n/a" if self.reported_count_delta is None else f"{self.reported_count_delta:+d}"
+        return (
+            f"new_rows={self.new_rows}, seen_among_new={self.seen_among_new}, "
+            f"quiet_pages={self.quiet_pages}, lookahead_new={self.lookahead_new}, "
+            f"reported_count={reported}, reported_count_delta={delta}"
+        )
+
+
 class GeorgiaCollectorJob:
     def __init__(
         self,
@@ -154,7 +223,10 @@ class GeorgiaCollectorJob:
         max_pages_per_cycle: int = 30,
         first_run_max_pages: int = 100,
         retention_days: int = 7,
+        fast_lookahead_pages: int = FAST_LOOKAHEAD_PAGES,
     ):
+        if fast_lookahead_pages < 1:
+            raise ValueError("fast_lookahead_pages must be >= 1")
         self._session = session
         self._production = production_client
         self._feed_state = feed_state_repository
@@ -165,7 +237,11 @@ class GeorgiaCollectorJob:
         self._max_pages_per_cycle = max_pages_per_cycle
         self._first_run_max_pages = first_run_max_pages
         self._retention_days = retention_days
+        self._fast_lookahead_pages = fast_lookahead_pages
         self._last_run_slot: tuple[date, dt_time] | None = None
+        # data.count первой страницы прошлого цикла этого процесса — только
+        # для журнала (см. _poll_feed), в БД не хранится.
+        self._previous_reported_count: int | None = None
         self.status = CollectorJobStatus()
 
     async def should_run(self, now: datetime) -> bool:
@@ -255,7 +331,6 @@ class GeorgiaCollectorJob:
         pages_fetched = 0
         newest_seen_this_cycle: date | None = None
         completed = False
-        pending_overlap = False
         # Отмеченные этим циклом: пока идёт обход, наверху feed'а появляются
         # новые публикации, страницы сдвигаются вниз, и следующая страница
         # снова показывает уже прочитанные строки (в production — пачки по
@@ -263,6 +338,18 @@ class GeorgiaCollectorJob:
         # только строка, увиденная до этого цикла, иначе FAST остановился бы
         # на повторе и не дочитал бы новые строки под ним.
         marked_this_cycle: set[str] = set()
+        # Строки, увиденные до этого цикла, которые он уже прочитал: такая
+        # строка, снова показанная ниже после сдвига пачкой, страницу "тихой"
+        # не делает — иначе пачка во время look-ahead израсходовала бы его на
+        # уже прочитанные строки, не заглянув под тихую страницу.
+        seen_before_read: set[str] = set()
+        # FAST-граница (см. FAST_LOOKAHEAD_PAGES): тихих страниц подряд с
+        # последней страницы с новыми строками; обход завершается, когда их
+        # 1 + K. Все страницы, включая look-ahead, обрабатываются целиком (их
+        # новые строки — НЕ отбрасываются). Отдельная старая строка над
+        # новыми (переопубликованная квитанция) обход больше не завершает.
+        quiet_run = 0
+        counters = _FeedCycleCounters()
 
         # Отметка "цикл идёт": если процесс остановят посреди цикла (SIGTERM,
         # OOM, CancelledError — их не ловит ни один except ниже), last_error
@@ -283,11 +370,22 @@ class GeorgiaCollectorJob:
                     self._record_error(str(exc), at=run_at)
                     return
 
+                if page_index == 0:
+                    # Только для журнала: data.count — всего строк в списке
+                    # (проба 19.11: 298 570), разница с прошлым циклом —
+                    # сколько добавилось с его первой страницы.
+                    counters.reported_count = extract_reported_count(raw)
+                    if counters.reported_count is not None and self._previous_reported_count is not None:
+                        counters.reported_count_delta = counters.reported_count - self._previous_reported_count
+                    self._previous_reported_count = counters.reported_count
+
                 if not raw_results:
                     completed = True
                     break
 
-                page_has_seen_row = False
+                page_new = 0
+                page_quiet_rows = 0
+                seen_above_new = 0
                 for entry in raw_results:
                     entry_date = _parse_publish_date(entry.get("publishDate"))
                     if entry_date is not None and (
@@ -300,13 +398,30 @@ class GeorgiaCollectorJob:
                         continue
 
                     if self._seen.is_seen(protocol_no):
-                        if protocol_no not in marked_this_cycle:
-                            page_has_seen_row = True
+                        if protocol_no not in marked_this_cycle and protocol_no not in seen_before_read:
+                            seen_before_read.add(protocol_no)
+                            page_quiet_rows += 1
+                            seen_above_new += 1
                         continue
 
                     self._seen.mark_seen(protocol_no, publish_date=entry_date or run_at.date(), seen_at=run_at)
                     marked_this_cycle.add(protocol_no)
+                    page_new += 1
+                    # Старые строки над новой на этой странице (не хвост
+                    # страницы-границы под последней новой строкой).
+                    counters.seen_among_new += seen_above_new
+                    seen_above_new = 0
                     await self._maybe_submit_entry(entry, monitored)
+
+                if page_new:
+                    if not deep_mode and counters.quiet_pages:
+                        # Новые строки ниже тихой страницы — вставка под
+                        # границей: без look-ahead их бы не прочитали.
+                        counters.lookahead_new += page_new
+                    quiet_run = 0
+                elif page_quiet_rows:
+                    counters.quiet_pages += 1
+                    quiet_run += 1
 
                 if deep_mode and _page_already_processed(
                     raw_results, self._seen,
@@ -317,16 +432,12 @@ class GeorgiaCollectorJob:
                     completed = True
                     break
 
-                if not deep_mode and page_has_seen_row:
-                    if pending_overlap:
-                        # Вторая страница со строками, увиденными до этого
-                        # цикла: ниже — только уже обработанное. Страница
-                        # без них (пачка публикаций сдвинула список сразу
-                        # после границы) обход не завершает.
-                        completed = True
-                        break
-                    pending_overlap = True
-                    continue
+                if not deep_mode and quiet_run > self._fast_lookahead_pages:
+                    # Тихая страница и K тихих за ней: ниже — только уже
+                    # обработанное. Страница из одних повторов (пачка
+                    # сдвинула список) счёт не меняет.
+                    completed = True
+                    break
             else:
                 completed = False
         except FineProviderError as exc:
@@ -337,11 +448,14 @@ class GeorgiaCollectorJob:
             logger.exception("GeorgiaCollectorJob: unexpected error during feed poll")
             return
 
+        counters.new_rows = len(marked_this_cycle)
         if not completed:
             message = _safety_cap_message(
                 max_pages, is_true_first_run=is_true_first_run, deep_mode=deep_mode,
+                lookahead_pages_read=quiet_run - 1 if not deep_mode and quiet_run else None,
+                lookahead_pages=self._fast_lookahead_pages,
             )
-            logger.warning("GeorgiaCollectorJob: %s", message)
+            logger.warning("GeorgiaCollectorJob: %s (pages=%d, %s)", message, pages_fetched, counters.describe())
             self._record_error(message, at=run_at)
             return
 
@@ -357,7 +471,8 @@ class GeorgiaCollectorJob:
         self._seen.cleanup_older_than(run_at.date() - timedelta(days=self._retention_days))
         self.status.last_success_at = run_at
         logger.info(
-            "GeorgiaCollectorJob feed poll finished: pages=%d, deep_mode=%s", pages_fetched, deep_mode,
+            "GeorgiaCollectorJob feed poll finished: pages=%d, deep_mode=%s, %s",
+            pages_fetched, deep_mode, counters.describe(),
         )
 
     async def _maybe_submit_entry(self, entry: dict, monitored: set[str]) -> None:
@@ -522,10 +637,19 @@ def _as_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
-def _safety_cap_message(max_pages: int, *, is_true_first_run: bool, deep_mode: bool) -> str:
+def _safety_cap_message(
+    max_pages: int,
+    *,
+    is_true_first_run: bool,
+    deep_mode: bool,
+    lookahead_pages_read: int | None = None,
+    lookahead_pages: int = FAST_LOOKAHEAD_PAGES,
+) -> str:
     """Свой текст для каждого режима, с именем настройки лимита.
     Восстановление, не дошедшее до строк последнего успеха за max_pages
-    страниц, само уже не завершится: новые строки только отодвигают их."""
+    страниц, само уже не завершится: новые строки только отодвигают их.
+    lookahead_pages_read — FAST упёрся в лимит после тихой страницы, до
+    конца look-ahead: граница не подтверждена, это тоже не успех."""
     if is_true_first_run:
         return (
             f"first-run catch-up: safety cap of {max_pages} pages reached before rows published "
@@ -536,6 +660,13 @@ def _safety_cap_message(max_pages: int, *, is_true_first_run: bool, deep_mode: b
         return (
             "recovery could not reach rows covered by the last successful cycle within "
             f"{max_pages} pages; it keeps failing until {_PAGES_PER_CYCLE_SETTING} is raised"
+        )
+    if lookahead_pages_read is not None:
+        return (
+            f"safety cap of {max_pages} pages reached before the frontier was confirmed "
+            f"(look-ahead: {lookahead_pages_read} of {lookahead_pages} pages read after a page "
+            "without new rows); the next cycle runs deep recovery, which needs even more pages "
+            f"— raise {_PAGES_PER_CYCLE_SETTING}"
         )
     return (
         f"safety cap of {max_pages} pages reached before the frontier (already-seen rows); "

@@ -12,7 +12,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import pytest
 
-from reader.georgia_collector.__main__ import load_page_limits, load_timeouts
+from reader.georgia_collector.__main__ import load_fast_lookahead_pages, load_page_limits, load_timeouts
+from reader.georgia_collector.collector_job import FAST_LOOKAHEAD_PAGES
 
 
 def test_load_timeouts_defaults_when_env_unset():
@@ -70,3 +71,25 @@ def test_load_page_limits_falls_back_to_os_environ_when_env_omitted(monkeypatch)
     monkeypatch.setenv("GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE", "200")
     monkeypatch.delenv("GEORGIA_COLLECTOR_FIRST_RUN_MAX_PAGES", raising=False)
     assert load_page_limits() == (200, 300)
+
+
+def test_load_fast_lookahead_pages_defaults_to_the_collector_constant():
+    assert load_fast_lookahead_pages(env={}) == FAST_LOOKAHEAD_PAGES == 2
+
+
+@pytest.mark.parametrize("value, expected", [("1", 1), ("3", 3), ("10", 10)])
+def test_load_fast_lookahead_pages_reads_overrides_from_given_env(value, expected):
+    assert load_fast_lookahead_pages(env={"GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES": value}) == expected
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "abc", "2.5", ""])
+def test_load_fast_lookahead_pages_rejects_invalid_values(value):
+    with pytest.raises(ValueError):
+        load_fast_lookahead_pages(env={"GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES": value})
+
+
+def test_load_fast_lookahead_pages_falls_back_to_os_environ_when_env_omitted(monkeypatch):
+    monkeypatch.setenv("GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES", "4")
+    assert load_fast_lookahead_pages() == 4
+    monkeypatch.delenv("GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES")
+    assert load_fast_lookahead_pages() == FAST_LOOKAHEAD_PAGES
