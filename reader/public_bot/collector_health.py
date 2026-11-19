@@ -55,6 +55,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_REMINDER_INTERVAL = timedelta(hours=12)
 DEFAULT_SILENCE_THRESHOLD = timedelta(hours=13)
+# Сколько ждать ответа Telegram на одно предупреждение: зависший вызов не
+# держит очередь (и её блокировку) вечно — это просто неудачная попытка.
+DEFAULT_SEND_TIMEOUT = timedelta(seconds=60)
 # Пауза перед повтором недоставленного предупреждения: 1, 2, 4, ... мин, не больше 30.
 RETRY_BASE_DELAY = timedelta(minutes=1)
 RETRY_MAX_DELAY = timedelta(minutes=30)
@@ -73,6 +76,10 @@ _PROBLEM = "problem"
 _PROBLEM_RESOLVED = "problem_resolved"
 _SILENCE = "silence"
 _SILENCE_RESOLVED = "silence_resolved"
+_RESOLVED_TEXT = {
+    _PROBLEM: f"✅ {_TITLE}: обход снова завершается успешно.",
+    _SILENCE: f"✅ {_TITLE}: снова на связи.",
+}
 
 _SCHEMA = (
     """
@@ -82,6 +89,7 @@ _SCHEMA = (
         last_status        TEXT,
         last_cycle_at      TEXT,
         non_ok_streak      INTEGER NOT NULL DEFAULT 0,
+        problem_kind       TEXT,
         problem_alerted_at TIMESTAMP,
         silence_alerted_at TIMESTAMP
     )
@@ -201,6 +209,9 @@ class HealthState:
     # cycle_at последнего учтённого отчёта (время цикла коллектора).
     last_cycle_at: str | None = None
     non_ok_streak: int = 0
+    # Вид проблемы последнего предупреждения ("recovering", "error", "skipped"):
+    # другой вид — новое предупреждение сразу, а не напоминание через 12 ч.
+    problem_kind: str | None = None
     # Когда ДОСТАВЛЕНО (последнее) предупреждение по теме; None — не было или тема закрыта.
     problem_alerted_at: datetime | None = None
     silence_alerted_at: datetime | None = None
@@ -232,22 +243,22 @@ class CollectorHealthStore:
 
     def load(self) -> HealthState:
         row = self._conn.execute(
-            "SELECT last_report_at, last_status, last_cycle_at, non_ok_streak, problem_alerted_at, "
+            "SELECT last_report_at, last_status, last_cycle_at, non_ok_streak, problem_kind, problem_alerted_at, "
             "silence_alerted_at FROM georgia_collector_health WHERE id = 1"
         ).fetchone()
-        last_report_at, last_status, last_cycle_at, streak, problem_at, silence_at = row
+        last_report_at, last_status, last_cycle_at, streak, problem_kind, problem_at, silence_at = row
         return HealthState(
             last_report_at=_parse_datetime(last_report_at), last_status=last_status, last_cycle_at=last_cycle_at,
-            non_ok_streak=streak or 0, problem_alerted_at=_parse_datetime(problem_at),
+            non_ok_streak=streak or 0, problem_kind=problem_kind, problem_alerted_at=_parse_datetime(problem_at),
             silence_alerted_at=_parse_datetime(silence_at),
         )
 
     def save(self, state: HealthState) -> None:
         self._conn.execute(
             "UPDATE georgia_collector_health SET last_report_at = ?, last_status = ?, last_cycle_at = ?, "
-            "non_ok_streak = ?, problem_alerted_at = ?, silence_alerted_at = ? WHERE id = 1",
+            "non_ok_streak = ?, problem_kind = ?, problem_alerted_at = ?, silence_alerted_at = ? WHERE id = 1",
             (_iso(state.last_report_at), state.last_status, state.last_cycle_at, state.non_ok_streak,
-             _iso(state.problem_alerted_at), _iso(state.silence_alerted_at)),
+             state.problem_kind, _iso(state.problem_alerted_at), _iso(state.silence_alerted_at)),
         )
 
     def queued(self) -> list[QueuedAlert]:
@@ -273,15 +284,17 @@ class CollectorHealthStore:
     def cancel(self, kind: str) -> None:
         self._conn.execute("DELETE FROM georgia_collector_alert_outbox WHERE kind = ? AND sent_at IS NULL", (kind,))
 
-    def mark_sent(self, alert_id: int, *, at: datetime) -> None:
-        self._conn.execute(
+    def mark_sent(self, alert_id: int, *, at: datetime) -> bool:
+        """False — записи уже нет: её отменили, пока она отправлялась."""
+        updated = self._conn.execute(
             "UPDATE georgia_collector_alert_outbox SET sent_at = ?, attempts = attempts + 1 WHERE id = ?",
             (at.isoformat(), alert_id),
-        )
+        ).rowcount
         self._conn.execute(
             "DELETE FROM georgia_collector_alert_outbox WHERE sent_at IS NOT NULL AND sent_at < ?",
             ((at - _SENT_RETENTION).isoformat(),),
         )
+        return updated == 1
 
     def mark_failed(self, alert_id: int, *, next_attempt_at: datetime) -> None:
         self._conn.execute(
@@ -306,12 +319,14 @@ class CollectorHealthMonitor:
         clock: Callable[[], datetime] = _utc_now,
         reminder_interval: timedelta = DEFAULT_REMINDER_INTERVAL,
         silence_threshold: timedelta = DEFAULT_SILENCE_THRESHOLD,
+        send_timeout: timedelta = DEFAULT_SEND_TIMEOUT,
     ):
         # Без хранилища — только в памяти процесса (тесты, отладка).
         self._store = store or CollectorHealthStore(":memory:")
         self._clock = clock
         self._reminder_interval = reminder_interval
         self._silence_threshold = silence_threshold
+        self._send_timeout = send_timeout
         self._delivery_lock = asyncio.Lock()
 
     @property
@@ -331,24 +346,29 @@ class CollectorHealthMonitor:
                 # Тот же отчёт ещё раз (клиент коллектора повторил POST после
                 # таймаута) — уже учтён, вторым неудачным циклом не считается.
                 return
-            state = self._close_topic(replace(state, last_cycle_at=cycle_at), _SILENCE,
-                                      f"✅ {_TITLE}: снова на связи.", now)
+            state = self._close_topic(replace(state, last_cycle_at=cycle_at), _SILENCE, _RESOLVED_TEXT[_SILENCE], now)
             status = payload.get("status")
             if status == "ok":
                 line = _last_success_line(payload)
-                text = f"✅ {_TITLE}: обход снова завершается успешно." + (f"\n{line}" if line else "")
+                text = _RESOLVED_TEXT[_PROBLEM] + (f"\n{line}" if line else "")
                 state = self._close_topic(replace(state, non_ok_streak=0), _PROBLEM, text, now)
             else:
                 streak = state.non_ok_streak + 1
                 state = replace(state, non_ok_streak=streak)
                 if status == "recovering" or streak >= 2:
+                    kind = "skipped" if payload.get("mode") == "skipped" else str(status)
                     queued = store.queued_of(_PROBLEM)
-                    reminder = state.problem_alerted_at is not None
+                    # Другой вид проблемы ("догоняет" -> "цикл не завершён") —
+                    # новое предупреждение сразу, а не напоминание через 12 ч.
+                    changed = state.problem_kind is not None and kind != state.problem_kind
+                    reminder = state.problem_alerted_at is not None and not changed
                     text = format_problem_alert(payload, reminder=reminder, failures_in_a_row=streak)
                     if queued is not None:
                         store.update_text(queued.id, text)
+                        state = replace(state, problem_kind=kind)
                     elif not reminder or now - state.problem_alerted_at >= self._reminder_interval:
                         store.enqueue(_PROBLEM, text, at=now)
+                        state = replace(state, problem_kind=kind)
             store.save(replace(state, last_report_at=now, last_status=status))
 
     def check_silence(self) -> None:
@@ -372,6 +392,8 @@ class CollectorHealthMonitor:
         """Проблема прошла: недоставленное предупреждение отменяется, а если
         оно было доставлено — в очередь "✅"."""
         self._store.cancel(topic)
+        if topic == _PROBLEM:
+            state = replace(state, problem_kind=None)
         alerted_field = f"{topic}_alerted_at"
         if getattr(state, alerted_field) is None:
             return state
@@ -389,8 +411,8 @@ class CollectorHealthMonitor:
                 if alert.next_attempt_at is not None and alert.next_attempt_at > now:
                     break
                 try:
-                    await send(alert.text)
-                except Exception as exc:  # noqa: BLE001 — любой сбой отправки = повтор позже
+                    await asyncio.wait_for(send(alert.text), timeout=self._send_timeout.total_seconds())
+                except Exception as exc:  # noqa: BLE001 — любой сбой отправки (и таймаут) = повтор позже
                     delay = retry_delay(alert.attempts + 1)
                     logger.warning(
                         "Georgia collector alert not delivered (attempt %d, %s), next try in %d s",
@@ -401,9 +423,14 @@ class CollectorHealthMonitor:
                     break
                 sent_at = self._clock()
                 with self._store.transaction():
-                    self._store.mark_sent(alert.id, at=sent_at)
-                    if alert.kind in (_PROBLEM, _SILENCE):
-                        state = self._store.load()
-                        self._store.save(replace(state, **{f"{alert.kind}_alerted_at": sent_at}))
+                    if self._store.mark_sent(alert.id, at=sent_at):
+                        if alert.kind in (_PROBLEM, _SILENCE):
+                            state = self._store.load()
+                            self._store.save(replace(state, **{f"{alert.kind}_alerted_at": sent_at}))
+                    elif alert.kind in (_PROBLEM, _SILENCE):
+                        # Отменено, пока отправлялось (проблема уже прошла), а
+                        # Telegram сообщение принял: сразу и "✅", доставленным
+                        # предупреждение не считается.
+                        self._store.enqueue(f"{alert.kind}_resolved", _RESOLVED_TEXT[alert.kind], at=sent_at)
                 delivered += 1
         return delivered

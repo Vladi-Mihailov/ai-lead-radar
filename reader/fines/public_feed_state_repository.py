@@ -158,7 +158,10 @@ def _row_to_state(row) -> PublicFeedState:
 
 class GeorgiaPublicFeedStateRepository:
     def __init__(self, db_path: Path):
-        self._conn = sqlite3.connect(db_path)
+        # Дольше стандартных 5 с ждать блокировку записи: добавление колонки
+        # при первом открытии не должно ронять старт, пока другой процесс
+        # (ручной запуск, check-now) пишет в ту же базу.
+        self._conn = sqlite3.connect(db_path, timeout=30)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute(_SCHEMA)
         existing = {row[1] for row in self._conn.execute("PRAGMA table_info(georgia_public_feed_state)")}

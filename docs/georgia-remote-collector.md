@@ -147,7 +147,21 @@ its row count. No plates, no other fields. Each following cycle:
 
 A jump is trusted only after the region's last rows are found by their
 numbers, so nothing is skipped, even when publications arrive during the
-cycle. Every cycle stays within the cap. Until the gap is closed the cycle
+cycle.
+
+Protocol numbers are assumed unique. As in every mode before regions, a new
+row that re-uses a number already seen counts as processed. So that a
+repeated number cannot stand in for a region, the traversal requires two
+adjacent numbers:
+- a region is accepted only when two adjacent rows match two consecutive
+  numbers of its start; a match on the last row of a page waits for the next
+  page;
+- its end is accepted the same way during the search and after the jump.
+
+An unread row inside an accepted region cancels the acceptance: its rows
+are counted again and the region goes back on the list. A FAST cycle logs a
+warning, without the number, when a new row sits below a row seen before
+the cycle on the same page. Every cycle stays within the cap. Until the gap is closed the cycle
 ends as "recovering". A cycle that is stopped mid-way (restart, OOM) keeps
 the regions saved after its last page. A successful cycle clears them. The
 column is added to the existing state database automatically when the
@@ -191,3 +205,10 @@ Set `collector_api_enabled: false` on production and/or stop
 manual-manager-bootstrap fallback both continue to work completely
 independently of the collector; nothing about this architecture removes or
 weakens either existing path.
+
+Rolling the collector back to a version without regions (section 8)
+leaves the `recovery_regions` column, and possibly saved regions, in
+`collector.db`. Old code never reads them. If the new code is deployed
+again later, it ignores regions written before the last successful cycle
+and clears the column on its first success. The bot's two alert tables are
+likewise ignored by old code.

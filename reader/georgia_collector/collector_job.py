@@ -125,6 +125,7 @@ class GeorgiaCollectorJob:
             tz=tz, max_pages_per_cycle=max_pages_per_cycle, first_run_max_pages=first_run_max_pages,
             retention_days=retention_days, pages_per_cycle_setting=_PAGES_PER_CYCLE_SETTING,
             first_run_pages_setting=_FIRST_RUN_PAGES_SETTING, log=logger, log_name="GeorgiaCollectorJob",
+            mark_after_processing=True,
         )
         self._last_run_slot: tuple[date, dt_time] | None = None
         self.status = CollectorJobStatus()
@@ -219,11 +220,13 @@ class GeorgiaCollectorJob:
             return
 
         payload = record_to_payload(record)
-        # В outbox ДО отправки: строка уже отмечена увиденной, и если цикл
-        # убьют посреди отправки (до трёх попыток по 180 с, когда production
+        # В outbox ДО отправки и до отметки строки увиденной (обход отмечает
+        # её после этого вызова, mark_after_processing): если цикл убьют
+        # посреди отправки (до трёх попыток по 180 с, когда production
         # медленная) или она упадёт непредвиденной ошибкой, совпадение не
-        # потеряется — следующий цикл сначала разбирает outbox (повтор
-        # production отсеет по fingerprint).
+        # потеряется — следующий цикл сначала разбирает outbox, а
+        # неотмеченную строку прочитает снова (повтор production отсеет по
+        # fingerprint).
         outbox_id = self._outbox.enqueue(KIND_FEED_MATCH, payload)
         try:
             await self._production.submit_feed_match(payload)

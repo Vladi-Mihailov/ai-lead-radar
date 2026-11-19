@@ -162,14 +162,13 @@ def test_reminders_at_most_every_12_hours_after_delivery_then_recovery_message()
     clock.advance(hours=6)
     monitor.observe(_recovering())
     clock.advance(hours=5, minutes=59)
-    monitor.observe(_error())
+    monitor.observe(_recovering())
     assert _deliver(monitor, telegram) == []
 
     clock.advance(minutes=1)
-    monitor.observe(_error())
+    monitor.observe(_recovering())
     [reminder] = _deliver(monitor, telegram)
-    assert reminder.startswith(f"⏰ Напоминание. ⚠️ {_TITLE}: цикл обхода не завершён.")
-    assert "Неудачных циклов подряд: 4." in reminder
+    assert reminder.startswith(f"⏰ Напоминание. ⚠️ {_TITLE} догоняет список после перерыва.")
 
     clock.advance(hours=1)
     monitor.observe({"status": "ok", "last_success_at": "2026-11-21T06:03:00+00:00"})
@@ -178,6 +177,109 @@ def test_reminders_at_most_every_12_hours_after_delivery_then_recovery_message()
     ]
     monitor.observe({"status": "ok"})
     assert _deliver(monitor, telegram) == []
+
+
+def test_a_new_kind_of_problem_alerts_at_once_instead_of_waiting_for_the_reminder():
+    clock, telegram = _Clock(), _Telegram()
+    monitor = _monitor(clock)
+    monitor.observe(_recovering())
+    assert len(_deliver(monitor, telegram)) == 1
+    clock.advance(hours=1)
+    monitor.observe(_error("police.ge HTTP 502"))  # "догоняет" -> "цикл не завершён"
+    [alert] = _deliver(monitor, telegram)
+    assert alert.startswith(f"⚠️ {_TITLE}: цикл обхода не завершён.")
+    clock.advance(hours=1)
+    monitor.observe(_error())  # тот же вид — до напоминания тихо
+    assert _deliver(monitor, telegram) == []
+    clock.advance(hours=1)
+    monitor.observe(_error("police.ge circuit breaker open — cycle skipped", mode="skipped"))
+    [skipped] = _deliver(monitor, telegram)
+    assert skipped.startswith(f"⚠️ {_TITLE}: police.ge недоступен")
+
+
+def _slow_telegram():
+    gate = asyncio.Event()
+    sent: list[str] = []
+
+    async def send(text: str) -> None:
+        await gate.wait()  # Telegram отвечает не сразу
+        sent.append(text)
+
+    return gate, sent, send
+
+
+def test_problem_alert_cancelled_while_it_was_being_sent_is_not_counted_as_delivered():
+    """Ревью: проблема прошла, пока предупреждение о ней отправлялось. Telegram
+    его принял, но доставленным оно не считается: сразу уходит "✅", и новая
+    проблема через 6 ч предупреждается, а не глушится как "напоминание"."""
+
+    async def scenario():
+        clock = _Clock()
+        monitor = _monitor(clock)
+        gate, sent, send = _slow_telegram()
+        monitor.observe(_error(cycle_at="c1"))
+        monitor.observe(_error(cycle_at="c2"))
+        delivery = asyncio.create_task(monitor.deliver(send))
+        await asyncio.sleep(0)
+        clock.advance(seconds=20)
+        monitor.observe({"status": "ok", "cycle_at": "c3"})
+        gate.set()
+        await delivery
+        assert monitor.store.load().problem_alerted_at is None
+        await monitor.deliver(send)
+        assert [text.splitlines()[0] for text in sent] == [
+            f"⚠️ {_TITLE}: цикл обхода не завершён.", f"✅ {_TITLE}: обход снова завершается успешно.",
+        ]
+        clock.advance(hours=3)
+        monitor.observe(_error(cycle_at="c4"))
+        clock.advance(hours=3)
+        monitor.observe(_error(cycle_at="c5"))
+        await monitor.deliver(send)
+        assert sent[-1].startswith(f"⚠️ {_TITLE}: цикл обхода не завершён.")
+
+    asyncio.run(scenario())
+
+
+def test_silence_alert_cancelled_while_it_was_being_sent_is_followed_by_back_online():
+    async def scenario():
+        clock = _Clock()
+        monitor = _monitor(clock)
+        gate, sent, send = _slow_telegram()
+        monitor.observe({"status": "ok", "cycle_at": "c0"})
+        clock.advance(hours=14)
+        monitor.check_silence()
+        delivery = asyncio.create_task(monitor.deliver(send))
+        await asyncio.sleep(0)
+        clock.advance(seconds=20)
+        monitor.observe({"status": "ok", "cycle_at": "c1"})
+        gate.set()
+        await delivery
+        assert monitor.store.load().silence_alerted_at is None
+        await monitor.deliver(send)
+        assert sent[0].startswith(f"⚠️ {_TITLE}: нет отчётов 14 ч")
+        assert sent[1:] == [f"✅ {_TITLE}: снова на связи."]
+
+    asyncio.run(scenario())
+
+
+def test_hung_telegram_call_times_out_and_the_queue_is_retried():
+    async def scenario():
+        clock = _Clock()
+        monitor = CollectorHealthMonitor(clock=clock, send_timeout=timedelta(milliseconds=50))
+
+        async def hung(text: str) -> None:
+            await asyncio.Event().wait()
+
+        monitor.observe(_recovering())
+        assert await monitor.deliver(hung) == 0
+        [queued] = monitor.store.queued()
+        assert queued.attempts == 1
+        clock.advance(minutes=1)
+        telegram = _Telegram()
+        assert await monitor.deliver(telegram.send) == 1  # блокировка очереди отпущена
+        assert monitor.store.load().problem_alerted_at == clock.now
+
+    asyncio.run(scenario())
 
 
 def test_unknown_or_missing_status_counts_as_a_problem():

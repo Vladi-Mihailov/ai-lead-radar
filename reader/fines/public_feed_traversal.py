@@ -68,6 +68,17 @@ georgia_public_feed_state.recovery_regions): каждый — кусок спи�
 сверху (в production за 24 дня иначе не бывало); пропажа строк во время
 обхода не обрабатывается ни одним режимом.
 
+Номер протокола считается уникальным. Новая строка с номером, который уже
+встречался, во всех режимах считается обработанной (как и до участков).
+Чтобы такой повтор не подменил участок, участок принимается только по ДВУМ
+соседним номерам его начала (повтор, за которым идёт не следующий номер
+начала, — обычная строка), а его конец при поиске и после перескока — только
+по двум соседним номерам конца. Непросмотренная строка внутри принятого
+участка отменяет принятие: прочитанное от его начала считается заново, а сам
+участок возвращается в список. FAST пишет WARNING (без номера), если на
+странице новая строка стоит ниже строки, увиденной до этого цикла, — так
+повторы номеров видны заранее.
+
 Только police.ge-сессия и SQLite-репозитории — ни Telegram, ни production-
 БД (модуль импортирует и REDNET-коллектор, см. тест графа импорта)."""
 
@@ -202,6 +213,15 @@ class _Walk:
         self.bottom_index: dict[str, int] = {}
         self.segment = _Segment()
         self._before_absorb: _Segment | None = None
+        self._before_absorb_index = 0
+        # строки, прочитанные подряд от начала поглощённого участка (для отмены поглощения)
+        self._region_rows: list[str] = []
+        # совпадение с началом участка в последней строке страницы ждёт
+        # подтверждения следующей страницей: (индекс участка, место в top, номер, состояние)
+        self._pending: tuple[int, int, str, str] | None = None
+        # соседние номера строк текущей страницы (строки без номера пропускаются)
+        self._prev: list[str | None] = []
+        self._next: list[str | None] = []
         self._tops: dict[str, tuple[int, int]] = {}
         self._lower: frozenset[str] = frozenset()
         self._rebuild()
@@ -254,19 +274,31 @@ class _Walk:
             lower.update(region.bottom)
         self._lower = frozenset(lower)
 
-    def begin_page(self, offset: int) -> None:
+    def begin_page(self, offset: int, numbers: list[str | None]) -> None:
         self.page_offset = offset
         self.top_match = None
         self.page_bottom_seen = False
         self.page_found_bottom = False
         self.page_overshoot = False
         self.page_last_anchor = None
+        self._prev = [None] * len(numbers)
+        self._next = [None] * len(numbers)
+        last: str | None = None
+        for index, protocol_no in enumerate(numbers):
+            self._prev[index] = last
+            last = protocol_no or last
+        last = None
+        for index in range(len(numbers) - 1, -1, -1):
+            self._next[index] = last
+            last = numbers[index] or last
 
     def on_row(self, row_index: int, protocol_no: str, *, was_seen: bool) -> bool:
         """True — строка в прочитанной подряд части списка: обработать её
         (если новая). False — строка поиска: до неё ещё дойдёт чтение подряд."""
+        if self._pending is not None and self._resolve_pending(row_index, protocol_no):
+            return True
         if not self.contiguous:
-            if protocol_no in self.bottom_index:
+            if protocol_no in self.bottom_index and self._end_pair(row_index, protocol_no):
                 # Конец участка на месте: перескок подтверждён, дальше — подряд.
                 self.page_found_bottom = self.searching
                 self.searching = False
@@ -283,14 +315,16 @@ class _Walk:
                 self._at_bottom(row_index, protocol_no)
                 return True
             hit = self._tops.get(protocol_no)
-            if hit is not None:
+            if hit is not None and self._candidate(hit, row_index, protocol_no):
                 # Последних строк участка нет (пропали) — уже следующий участок.
-                self._absorb(hit[0], row_index, hit[1])
                 return True
             if was_seen:
+                self._region_rows.append(protocol_no)
                 return True
-            # Последних строк участка нет, а эта строка не просмотрена — она уже за ним.
-            self._leave_region()
+            # Непросмотренная строка внутри поглощённого участка: его
+            # последних строк нет (пропали) или поглощение было ложным
+            # (повторный номер) — прочитанное от его начала считается заново.
+            self._undo_absorb()
         elif self.state == _IN_BOTTOM:
             if protocol_no in self.bottom_index:
                 self._at_bottom(row_index, protocol_no)
@@ -303,18 +337,65 @@ class _Walk:
                 return True
             self._leave_region()
         hit = self._tops.get(protocol_no)
-        if hit is not None:
-            self._absorb(hit[0], row_index, hit[1])
+        if hit is not None and self._candidate(hit, row_index, protocol_no):
             return True
         if self.segment.count(protocol_no):
             self.dirty = True
         return True
 
-    def _absorb(self, index: int, row_index: int, position: int) -> None:
+    def _candidate(self, hit: tuple[int, int], row_index: int, protocol_no: str) -> bool:
+        """Строка совпала с номером из начала участка: участок принимается,
+        только если следующая строка — следующий номер его начала (одиночный
+        повторный номер его не подменит). False — строка обычная."""
+        index, position = hit
+        region = self.regions[index]
+        if position + 1 >= len(region.top):
+            return False
+        following = self._next[row_index]
+        if following is None:
+            # Последняя строка страницы: подтвердит следующая, прочитанная подряд.
+            self._pending = (index, position, protocol_no, self.state)
+            return True
+        if following != region.top[position + 1]:
+            return False
+        self._absorb(index, row_index, position, [protocol_no])
+        return True
+
+    def _resolve_pending(self, row_index: int, protocol_no: str) -> bool:
+        """Первые строки следующей страницы решают отложенное совпадение.
+        True — строка учтена здесь."""
+        index, position, matched, state = self._pending
+        region = self.regions[index]
+        if protocol_no == region.top[position + 1]:
+            self._pending = None
+            self._absorb(index, row_index, position + 1, [matched, protocol_no])
+            return True
+        if protocol_no == matched or protocol_no in self.segment.counted:
+            # Показаны снова (пачка публикаций сдвинула страницы) — ждём дальше.
+            return True
+        # Не подтвердилось: совпадение — повторный номер, строка обычная.
+        self._pending = None
+        if state == _IN_REGION:
+            self._region_rows.append(matched)
+        elif self.segment.count(matched):
+            self.dirty = True
+        return False
+
+    def _end_pair(self, row_index: int, protocol_no: str) -> bool:
+        """Конец участка при поиске и после перескока признаётся только по
+        двум соседним номерам его конца (одиночный повтор — не признак)."""
+        position = self.bottom_index[protocol_no]
+        bottom = self.region.bottom
+        return (position > 0 and self._prev[row_index] == bottom[position - 1]) or (
+            position + 1 < len(bottom) and self._next[row_index] == bottom[position + 1]
+        )
+
+    def _absorb(self, index: int, row_index: int, position: int, rows: list[str]) -> None:
         # Участки между прошлым и найденным пройдены подряд (их строки
         # посчитаны как прочитанные), сам он поглощается.
         region = self.regions[index]
         self._before_absorb = self.segment.copy()
+        self._before_absorb_index = self.next_index
         self.segment.absorb(region)
         self.dirty = True
         self.next_index = index + 1
@@ -323,10 +404,23 @@ class _Walk:
         self.bottom_index = {protocol_no: i for i, protocol_no in enumerate(region.bottom)}
         self.state = _IN_REGION
         self.region_first = self.page_offset + row_index - position
+        self._region_rows = list(rows)
         self.measured = False
         self.passed_end = False
         self.no_end_jump = False
         self.top_match = (row_index, position)
+
+    def _undo_absorb(self) -> None:
+        # Участок не подтвердился чтением: он возвращается в список, а
+        # строки, прочитанные подряд от его начала, считаются как обычные.
+        self.segment = self._before_absorb if self._before_absorb is not None else _Segment()
+        self.next_index = self._before_absorb_index
+        self._rebuild()
+        for protocol_no in self._region_rows:
+            self.segment.count(protocol_no)
+        self._region_rows = []
+        self.dirty = True
+        self._leave_region()
 
     def _at_bottom(self, row_index: int, protocol_no: str) -> None:
         position = self.bottom_index[protocol_no]
@@ -471,9 +565,27 @@ def as_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
+def _written_by_then(region: ReadRegion, last_success: datetime | None) -> bool:
+    """Участок записан не позже последнего успеха (неразборчивое время — нет)."""
+    if last_success is None:
+        return False
+    try:
+        written = datetime.fromisoformat(region.updated_at)
+    except ValueError:
+        return False
+    return as_utc(written) <= as_utc(last_success)
+
+
 class PublicFeedTraversal:
     """log/log_name — журнал и префикс задачи, которая обходит список: записи
-    остаются под её именем, как до выделения обхода в этот модуль."""
+    остаются под её именем, как до выделения обхода в этот модуль.
+
+    mark_after_processing — новую строку сначала обработать (коллектор кладёт
+    совпадение в outbox), потом отметить увиденной: остановка процесса или
+    ошибка между ними не теряет совпадение — строка не отмечена и будет
+    прочитана снова (production отсеет повтор по fingerprint). Ошибка
+    обработки тогда не записывает участки этой страницы. Встроенная задача
+    оставляет прежний порядок (отметка до обработки)."""
 
     def __init__(
         self,
@@ -489,7 +601,9 @@ class PublicFeedTraversal:
         first_run_pages_setting: str,
         log: logging.Logger,
         log_name: str,
+        mark_after_processing: bool = False,
     ):
+        self._mark_after_processing = mark_after_processing
         self._session = session
         self._feed_state = feed_state_repository
         self._seen = seen_repository
@@ -528,8 +642,13 @@ class PublicFeedTraversal:
                 processed_before_time = None
         mode = "first_run" if is_true_first_run else "recovery" if deep_mode else "fast"
         # Участки прошлых попыток — только у восстановления (FAST бывает лишь
-        # после успеха, который их очищает).
-        walk = _Walk(feed_state.recovery_regions if mode == "recovery" else ())
+        # после успеха, который их очищает). Участки, записанные не позже
+        # последнего успеха (оставленные откатом на код без участков), не
+        # используются: их строки ниже горизонта.
+        regions = feed_state.recovery_regions if mode == "recovery" else ()
+        if regions:
+            regions = tuple(region for region in regions if not _written_by_then(region, feed_state.last_successful_poll_at))
+        walk = _Walk(regions)
         if walk.regions:
             self._log.info(
                 "%s: recovery continues over %d read region(s), %d rows read so far",
@@ -565,6 +684,13 @@ class PublicFeedTraversal:
             self._feed_state.record_recovery_regions(regions)
             return regions
 
+        def progress_after_failure() -> list[ReadRegion]:
+            if processing_row and self._mark_after_processing:
+                # Строка не обработана и не отмечена: участки этой страницы не
+                # пишутся, записанные после прошлой страницы остаются верными.
+                return list(self._feed_state.get().recovery_regions)
+            return save_progress()
+
         # Отметка "цикл идёт": если процесс остановят посреди цикла (SIGTERM,
         # OOM, CancelledError — их не ловит ни один except ниже), last_error
         # останется и следующий цикл пойдёт DEEP-восстановлением от участков,
@@ -572,14 +698,17 @@ class PublicFeedTraversal:
         self._feed_state.record_error(CYCLE_IN_PROGRESS, at=run_at)
 
         completed = False
+        processing_row = False
+        warned_repeat = False
         try:
             while pages_fetched < max_pages:
                 raw = await self._session.fetch_published_protocols(first_result=offset)
                 pages_fetched += 1
                 raw_results = extract_published_protocols_results(raw)
 
-                walk.begin_page(offset)
+                walk.begin_page(offset, [entry.get("protocolNo") or None for entry in raw_results])
                 page_has_seen_row = False
+                seen_before_on_page = False
                 for row_index, entry in enumerate(raw_results):
                     protocol_no = entry.get("protocolNo")
                     was_seen = bool(protocol_no) and self._seen.is_seen(protocol_no)
@@ -601,11 +730,27 @@ class PublicFeedTraversal:
                     if was_seen:
                         if protocol_no not in marked_this_cycle:
                             page_has_seen_row = True
+                            seen_before_on_page = True
+                        continue
+                    if not deep_mode and seen_before_on_page and not warned_repeat:
+                        # На одной странице порядок точен: новая строка ниже
+                        # увиденной до цикла — повторный номер (или дыра).
+                        warned_repeat = True
+                        self._log.warning(
+                            "%s: a new row below a row seen before this cycle at offset %d "
+                            "(a repeated protocol number?)", self._log_name, offset,
+                        )
+                    publish_date = entry_date or run_at.date()
+                    processing_row = True
+                    if self._mark_after_processing:
+                        await on_new_row(entry)
+                        self._seen.mark_seen(protocol_no, publish_date=publish_date, seen_at=run_at)
                     else:
                         # Отмечается ДО обработки (см. GeorgiaPublicFeedSeenRepository).
-                        self._seen.mark_seen(protocol_no, publish_date=entry_date or run_at.date(), seen_at=run_at)
-                        marked_this_cycle.add(protocol_no)
+                        self._seen.mark_seen(protocol_no, publish_date=publish_date, seen_at=run_at)
                         await on_new_row(entry)
+                    processing_row = False
+                    marked_this_cycle.add(protocol_no)
                 if walk.dirty:
                     save_progress()
 
@@ -648,12 +793,12 @@ class PublicFeedTraversal:
                     continue
                 offset += PAGE_SIZE
         except (FineProviderError, FineParseError) as exc:
-            regions = save_progress()
+            regions = progress_after_failure()
             self._feed_state.record_error(str(exc), at=run_at)
             self._log.exception("%s: feed poll failed (police.ge request or response format)", self._log_name)
             return outcome("error", str(exc), regions)
         except Exception as exc:
-            regions = save_progress()
+            regions = progress_after_failure()
             self._feed_state.record_error(str(exc), at=run_at)
             self._log.exception("%s: unexpected error during feed poll", self._log_name)
             return outcome("error", str(exc), regions)
