@@ -874,6 +874,35 @@ def _russian_plural(count: int, one: str, few: str, many: str) -> str:
     return many
 
 
+# Как называть записи долга провайдера рядом с числом (см. format_debt_row):
+# у GİB — штрафы, у KGM — неоплаченные проезды (штраф за проезд начисляется
+# только после срока «Без штрафа до», см. HELP_TERMS_TEXT), поэтому KGM
+# штрафами не называется.
+_DEBT_RECORD_FORMS = {
+    "gib": ("штраф", "штрафа", "штрафов"),
+    "kgm": ("неоплаченный проезд", "неоплаченных проезда", "неоплаченных проездов"),
+}
+_DEBT_RECORD_FALLBACK_FORMS = ("запись", "записи", "записей")
+
+
+def _format_debt_record_counts(provider_states: tuple[TurkeyProviderDebtState, ...]) -> str | None:
+    """"3 штрафа GİB, 4 неоплаченных проезда KGM" — записи долга за суммой
+    строки по провайдерам (только провайдеры с записями). None — число
+    ненадёжно: состояний нет, записей нет, или у провайдера с суммой нет
+    числа записей."""
+    if not any(state.debt_count > 0 for state in provider_states):
+        return None
+    if any(state.amount > 0 and state.debt_count <= 0 for state in provider_states):
+        return None
+    parts = []
+    for state in provider_states:
+        if state.debt_count > 0:
+            forms = _DEBT_RECORD_FORMS.get(state.provider, _DEBT_RECORD_FALLBACK_FORMS)
+            name = _DEBT_PROVIDER_DISPLAY.get(state.provider, state.provider)
+            parts.append(f"{state.debt_count} {_russian_plural(state.debt_count, *forms)} {name}")
+    return ", ".join(parts)
+
+
 def format_debt_row(
     *, car_number: str, owners: list[DebtOwner], total_amount: Decimal,
     provider_states: tuple[TurkeyProviderDebtState, ...] = (),
@@ -881,7 +910,7 @@ def format_debt_row(
     """Блок одной машины debt-списка (см. задачу "дополнить статистику
     штрафов информацией о пользователях"):
         🚗 Госномер: <номер>
-        🔴 Неоплачено: <N штрафов> — <сумма> ₺
+        🔴 Неоплаченные записи: <сумма> ₺ — <N штрафов GİB>, <M неоплаченных проездов KGM>
         👤 Пользователь: <имя>
         🔗 Telegram: @<username>
     БЕЗ даты/checked_at/"сегодня"/"вчера"/"N дней назад" и БЕЗ "≥"/"·
@@ -902,21 +931,23 @@ def format_debt_row(
     её датой и датой неответа), по какому провайдеру достоверных данных
     нет.
 
-    Число штрафов — сумма debt_count тех же состояний GİB и KGM, из которых
-    сложена сумма (см. TurkeyProviderDebtState; Avrasya не прибавляется —
-    её долг уже внутри KGM, как и в сумме). Число показывается, только если
-    оно есть у каждого провайдера с долгом; нет состояний или у провайдера
-    с суммой нет числа — только сумма, число не выдумывается. Строки
-    "оплачено" у Turkey нет: источники не сообщают об оплате."""
+    После суммы — сколько за ней записей, отдельно по провайдерам
+    (_format_debt_record_counts): debt_count тех же состояний GİB и KGM, из
+    которых сложена сумма (см. TurkeyProviderDebtState; Avrasya не
+    прибавляется — её долг уже внутри KGM, как и в сумме). GİB — штрафы,
+    KGM — неоплаченные проезды. Число показывается, только если оно есть у
+    каждого провайдера с долгом; иначе — только сумма, число не
+    выдумывается. Строки "оплачено" у Turkey нет: источники не сообщают об
+    оплате."""
     debt_text = _format_try_amount(total_amount)
-    fine_count = sum(state.debt_count for state in provider_states)
-    if fine_count > 0 and all(state.debt_count > 0 for state in provider_states if state.amount > 0):
-        debt_text = f"{fine_count} {_russian_plural(fine_count, 'штраф', 'штрафа', 'штрафов')} — {debt_text}"
+    record_counts = _format_debt_record_counts(provider_states)
+    if record_counts:
+        debt_text = f"{debt_text} — {record_counts}"
     lines = [f"🚗 Госномер: {format_plate_for_telegram(car_number)}"]
     if all(state.freshness == TurkeyProviderFreshness.CURRENT for state in provider_states):
-        lines.append(f"🔴 Неоплачено: {debt_text}")
+        lines.append(f"🔴 Неоплаченные записи: {debt_text}")
     else:
-        lines.append(f"🔴 Неоплачено: ⚠️ {debt_text}")
+        lines.append(f"🔴 Неоплаченные записи: ⚠️ {debt_text}")
         lines.extend(f"   {_format_debt_provider_state(state)}" for state in provider_states)
     if not owners:
         lines.append(DEBT_OWNER_NOT_LINKED_LINE)

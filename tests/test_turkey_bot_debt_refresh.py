@@ -336,7 +336,7 @@ async def test_confirm_row_format_is_plate_debt_user_telegram_block():
     full_text = "\n".join((reply.text, *reply.extra_texts))
     assert "\n".join([
         f"🚗 Госномер: {format_plate_for_telegram('BB002BB')}",
-        "🔴 Неоплачено: 1 штраф — 1 800 ₺",
+        "🔴 Неоплаченные записи: 1 800 ₺ — 1 штраф GİB",
         *_NO_PROFILE_OWNER_LINES,
     ]) in full_text
 
@@ -362,7 +362,7 @@ async def test_confirm_display_aggregates_duplicate_plate_one_row_one_amount():
     # сумма один раз.
     assert "\n".join([
         f"🚗 Госномер: {format_plate_for_telegram('BB002BB')}",
-        "🔴 Неоплачено: 1 штраф — 1 800 ₺",
+        "🔴 Неоплаченные записи: 1 800 ₺ — 1 штраф GİB",
         *_NO_PROFILE_OWNER_LINES,
         *_NO_PROFILE_OWNER_LINES,
     ]) in full_text

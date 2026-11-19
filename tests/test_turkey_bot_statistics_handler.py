@@ -197,7 +197,7 @@ def _debt_block(car_number: str, amount: str, *owner_lines: str) -> str:
     один штраф GİB (debt_count=1), KGM без долга."""
     return "\n".join([
         f"🚗 Госномер: {format_plate_for_telegram(car_number)}",
-        f"🔴 Неоплачено: 1 штраф — {amount}",
+        f"🔴 Неоплаченные записи: {amount} — 1 штраф GİB",
         *owner_lines,
     ])
 
@@ -285,7 +285,7 @@ async def test_sums_order_and_totals_unchanged_with_owner_lines(fx):
     assert "Общая сумма: 1 500,50 ₺" in reply.text
     # Сортировка прежняя — по сумме по убыванию.
     assert debt_list.index(format_plate_for_telegram("34BBB222")) < debt_list.index(format_plate_for_telegram("34AAA111"))
-    assert debt_list.count("🔴 Неоплачено:") == 2
+    assert debt_list.count("🔴 Неоплаченные записи:") == 2
 
 
 async def test_owner_text_from_profile_cannot_inject_telegram_markdown(fx):
@@ -436,11 +436,11 @@ async def test_debt_list_counts_gib_and_kgm_records_and_never_shows_paid():
 
     assert "\n".join([
         f"🚗 Госномер: {format_plate_for_telegram('34ABC123')}",
-        "🔴 Неоплачено: 5 штрафов — 2 740 ₺",
+        "🔴 Неоплаченные записи: 2 740 ₺ — 2 штрафа GİB, 3 неоплаченных проезда KGM",
         "👤 Пользователь: Имя не указано",
         "🔗 Telegram: Логин не указан",
     ]) in full_text
     assert "Автомобилей: 1" in full_text
     assert "Общая сумма: 2 740 ₺" in full_text
     assert "🟢" not in full_text
-    assert "Оплачено" not in full_text
+    assert "оплачено" not in full_text.lower()

@@ -2,7 +2,7 @@
 Тесты reader/turkey_bot/texts.py::format_statistics/format_debt_row/
 format_debt_list_messages (см. задачи "manager Statistics / refresh для
 обоих ботов" и "дополнить статистику штрафов информацией о
-пользователях") — блок машины "🚗 Госномер / 🔴 Неоплачено / 👤
+пользователях") — блок машины "🚗 Госномер / 🔴 Неоплаченные записи / 👤
 Пользователь / 🔗 Telegram", БЕЗ даты/checked_at/"сегодня"/"вчера"/"≥"-
 пометки PARTIAL."""
 
@@ -107,7 +107,7 @@ def test_debt_row_is_plate_debt_user_telegram_block():
 
     assert block == (
         f"🚗 Госномер: {format_plate_for_telegram('M295YB196')}\n"
-        "🔴 Неоплачено: 2 740 ₺\n"
+        "🔴 Неоплаченные записи: 2 740 ₺\n"
         "👤 Пользователь: Иван Петров\n"
         "🔗 Telegram: @ivan_petrov"
     )
@@ -120,7 +120,7 @@ def test_debt_row_has_no_partial_marker_or_recency():
 
     assert block.splitlines()[:2] == [
         f"🚗 Госномер: {format_plate_for_telegram('34ABC123')}",
-        "🔴 Неоплачено: 1 250 ₺",
+        "🔴 Неоплаченные записи: 1 250 ₺",
     ]
     assert "≥" not in block
     assert "частично" not in block
@@ -145,7 +145,7 @@ def test_debt_row_lists_every_owner_and_amount_once():
 
     assert block.splitlines() == [
         f"🚗 Госномер: {format_plate_for_telegram('H401HH95')}",
-        "🔴 Неоплачено: 32 664,50 ₺",
+        "🔴 Неоплаченные записи: 32 664,50 ₺",
         "👤 Пользователь: Иван Петров",
         "🔗 Telegram: @ivan_petrov",
         "👤 Пользователь: Анна",
@@ -328,7 +328,7 @@ def test_debt_row_with_all_providers_current_has_no_provider_lines():
 
     assert block.splitlines() == [
         f"🚗 Госномер: {format_plate_for_telegram('M295YB196')}",
-        "🔴 Неоплачено: 2 740 ₺",
+        "🔴 Неоплаченные записи: 2 740 ₺",
         "👤 Пользователь: Иван Петров",
         "🔗 Telegram: @ivan_petrov",
     ]
@@ -350,7 +350,7 @@ def test_debt_row_stale_kgm_reads_as_last_known_with_dates():
     # Детализация по провайдерам — сразу под суммой, владельцы — после неё.
     assert text.splitlines() == [
         f"🚗 Госномер: {format_plate_for_telegram('34ABC123')}",
-        "🔴 Неоплачено: ⚠️ 33 528,50 ₺",
+        "🔴 Неоплаченные записи: ⚠️ 33 528,50 ₺",
         "   ✅ GİB: 13 336 ₺ — проверка 11.11.2026",
         "   ⚠️ KGM: 20 192,50 ₺ — последняя известная (успешная проверка 04.11.2026), не ответил 11.11.2026",
         "👤 Пользователь: Иван Петров",
@@ -375,7 +375,7 @@ def test_debt_row_provider_without_reliable_data():
         car_number="34ABC123", owners=[], total_amount=Decimal(18000), provider_states=never_checked,
     )
 
-    assert attempted_text.splitlines()[1] == "🔴 Неоплачено: ⚠️ 18 000 ₺"
+    assert attempted_text.splitlines()[1] == "🔴 Неоплаченные записи: ⚠️ 18 000 ₺"
     assert attempted_text.splitlines()[-2] == "   ❔ KGM: нет достоверных данных (не ответил 11.11.2026)"
     assert never_text.splitlines()[-2] == "   ❔ KGM: нет достоверных данных (не проверялся)"
     assert never_text.splitlines()[-1] == "👤 Пользователь не привязан"
@@ -505,7 +505,7 @@ def test_debt_row_shows_count_of_gib_and_kgm_records_behind_the_amount():
 
     assert block.splitlines() == [
         f"🚗 Госномер: {format_plate_for_telegram('34ABC123')}",
-        "🔴 Неоплачено: 5 штрафов — 2 740 ₺",
+        "🔴 Неоплаченные записи: 2 740 ₺ — 2 штрафа GİB, 3 неоплаченных проезда KGM",
         "👤 Пользователь: Иван Петров",
         "🔗 Telegram: @ivan_petrov",
     ]
@@ -527,7 +527,7 @@ def test_debt_row_count_keeps_the_warning_mark_and_provider_lines():
 
     assert text.splitlines() == [
         f"🚗 Госномер: {format_plate_for_telegram('34ABC123')}",
-        "🔴 Неоплачено: ⚠️ 4 штрафа — 33 528,50 ₺",
+        "🔴 Неоплаченные записи: ⚠️ 33 528,50 ₺ — 1 штраф GİB, 3 неоплаченных проезда KGM",
         "   ✅ GİB: 13 336 ₺ — проверка 11.11.2026",
         "   ⚠️ KGM: 20 192,50 ₺ — последняя известная (успешная проверка 04.11.2026), не ответил 11.11.2026",
         "👤 Пользователь не привязан",
@@ -543,7 +543,7 @@ def test_debt_row_count_skips_a_provider_without_reliable_data():
 
     text = texts.format_debt_row(car_number="34ABC123", owners=[], total_amount=Decimal(18000), provider_states=states)
 
-    assert text.splitlines()[1] == "🔴 Неоплачено: ⚠️ 1 штраф — 18 000 ₺"
+    assert text.splitlines()[1] == "🔴 Неоплаченные записи: ⚠️ 18 000 ₺ — 1 штраф GİB"
 
 
 def test_debt_row_without_a_known_count_shows_the_amount_only():
@@ -559,8 +559,8 @@ def test_debt_row_without_a_known_count_shows_the_amount_only():
     )
     without_states = texts.format_debt_row(car_number="34ABC123", owners=[], total_amount=Decimal(500))
 
-    assert with_states.splitlines()[1] == "🔴 Неоплачено: 500 ₺"
-    assert without_states.splitlines()[1] == "🔴 Неоплачено: 500 ₺"
+    assert with_states.splitlines()[1] == "🔴 Неоплаченные записи: 500 ₺"
+    assert without_states.splitlines()[1] == "🔴 Неоплаченные записи: 500 ₺"
 
 
 def test_debt_row_shows_no_count_when_a_provider_with_debt_has_none():
@@ -574,25 +574,60 @@ def test_debt_row_shows_no_count_when_a_provider_with_debt_has_none():
 
     text = texts.format_debt_row(car_number="34ABC123", owners=[], total_amount=Decimal(150), provider_states=states)
 
-    assert text.splitlines()[1] == "🔴 Неоплачено: 150 ₺"
+    assert text.splitlines()[1] == "🔴 Неоплаченные записи: 150 ₺"
 
 
-@pytest.mark.parametrize("gib_count, kgm_count, expected", [
-    (1, 0, "1 штраф"), (1, 1, "2 штрафа"), (2, 2, "4 штрафа"), (2, 3, "5 штрафов"), (10, 1, "11 штрафов"),
-    (10, 2, "12 штрафов"), (7, 7, "14 штрафов"), (20, 1, "21 штраф"), (20, 2, "22 штрафа"),
-    (100, 11, "111 штрафов"), (100, 12, "112 штрафов"), (100, 22, "122 штрафа"),
+@pytest.mark.parametrize("count, gib_text, kgm_text", [
+    (1, "1 штраф", "1 неоплаченный проезд"), (2, "2 штрафа", "2 неоплаченных проезда"),
+    (4, "4 штрафа", "4 неоплаченных проезда"), (5, "5 штрафов", "5 неоплаченных проездов"),
+    (11, "11 штрафов", "11 неоплаченных проездов"), (12, "12 штрафов", "12 неоплаченных проездов"),
+    (14, "14 штрафов", "14 неоплаченных проездов"), (21, "21 штраф", "21 неоплаченный проезд"),
+    (22, "22 штрафа", "22 неоплаченных проезда"), (111, "111 штрафов", "111 неоплаченных проездов"),
+    (112, "112 штрафов", "112 неоплаченных проездов"), (122, "122 штрафа", "122 неоплаченных проезда"),
 ])
-def test_debt_row_count_uses_the_russian_plural(gib_count, kgm_count, expected):
+def test_debt_row_count_uses_the_russian_plural(count, gib_text, kgm_text):
+    """GİB — штрафы, KGM — неоплаченные проезды: у каждого провайдера своё
+    слово с нужной формой."""
     states = (
         _state("gib", TurkeyProviderFreshness.CURRENT, Decimal(100), last_success_at=_NOV_11,
-               last_attempt_at=_NOV_11, debt_count=gib_count),
-        _state("kgm", TurkeyProviderFreshness.CURRENT, Decimal(200) if kgm_count else Decimal(0),
-               last_success_at=_NOV_11, last_attempt_at=_NOV_11, debt_count=kgm_count),
+               last_attempt_at=_NOV_11, debt_count=count),
+        _state("kgm", TurkeyProviderFreshness.CURRENT, Decimal(200), last_success_at=_NOV_11,
+               last_attempt_at=_NOV_11, debt_count=count),
     )
 
     text = texts.format_debt_row(car_number="34ABC123", owners=[], total_amount=Decimal(300), provider_states=states)
 
-    assert text.splitlines()[1] == f"🔴 Неоплачено: {expected} — 300 ₺"
+    assert text.splitlines()[1] == f"🔴 Неоплаченные записи: 300 ₺ — {gib_text} GİB, {kgm_text} KGM"
+
+
+def test_debt_row_kgm_only_never_calls_passages_fines():
+    states = (
+        _state("gib", TurkeyProviderFreshness.CURRENT, last_success_at=_NOV_11, last_attempt_at=_NOV_11),
+        _state("kgm", TurkeyProviderFreshness.CURRENT, Decimal(60), last_success_at=_NOV_11,
+               last_attempt_at=_NOV_11, debt_count=1),
+    )
+
+    line = texts.format_debt_row(
+        car_number="34ABC123", owners=[], total_amount=Decimal(60), provider_states=states,
+    ).splitlines()[1]
+
+    assert line == "🔴 Неоплаченные записи: 60 ₺ — 1 неоплаченный проезд KGM"
+    assert "штраф" not in line
+
+
+@pytest.mark.parametrize("count, expected", [(1, "1 запись"), (2, "2 записи"), (5, "5 записей")])
+def test_debt_row_unknown_provider_records_are_called_records(count, expected):
+    """Провайдер без своего слова (сейчас таких нет) — нейтральное «записи»."""
+    states = (
+        _state("other", TurkeyProviderFreshness.CURRENT, Decimal(30), last_success_at=_NOV_11,
+               last_attempt_at=_NOV_11, debt_count=count),
+    )
+
+    line = texts.format_debt_row(
+        car_number="34ABC123", owners=[], total_amount=Decimal(30), provider_states=states,
+    ).splitlines()[1]
+
+    assert line == f"🔴 Неоплаченные записи: 30 ₺ — {expected} other"
 
 
 @pytest.mark.parametrize("kgm_freshness", list(TurkeyProviderFreshness))
@@ -610,7 +645,7 @@ def test_debt_row_never_has_a_paid_line(kgm_freshness):
     text = texts.format_debt_row(car_number="34ABC123", owners=[], total_amount=Decimal(150), provider_states=states)
 
     assert "🟢" not in text
-    assert "плачено" not in text.replace("Неоплачено", "")
+    assert "оплачено" not in text.lower()  # «Неоплаченные записи» — не «оплачено»
 
 
 # ---- owner display name sanitization (задача п.2) ----
