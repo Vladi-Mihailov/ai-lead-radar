@@ -1408,6 +1408,9 @@ class ConversationController:
                 car_count=len(rows), totals=totals,
                 source_updated_on=source[0] if source else None,
                 recheck_line=texts.format_daily_recheck_line(run),
+                debt_count_is_lower_bound=any(
+                    isinstance(breakdown, texts.SnapshotDebt) for _, _, breakdown in rows
+                ),
             )
 
         page: int | None = None

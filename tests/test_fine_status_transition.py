@@ -233,7 +233,7 @@ async def test_statistics_keep_every_old_debt_and_show_history_separately(legacy
     by_car = {car: breakdown for car, _, breakdown in rows}
 
     # каждая машина с долгом по старой логике — в списке, с той же суммой
-    debt_lines = [line for line in text.splitlines() if line.startswith("🔴 Неоплачено: ")]
+    header_line, *debt_lines = [line for line in text.splitlines() if line.startswith("🔴 Неоплачено: ")]
     for car, total in old_groups.items():
         assert car in by_car, car
         assert by_car[car].unpaid_amount + by_car[car].needs_review_amount == total, (car, total)
@@ -241,7 +241,7 @@ async def test_statistics_keep_every_old_debt_and_show_history_separately(legacy
             line.endswith(f" — {total:g} ₾") or line.startswith(f"🔴 Неоплачено: {total:g} ₾ (")
             for line in debt_lines
         ), (car, total)
-    assert "🔴 Подтверждённая задолженность: 340 ₾ (5 шт.)" in text  # 150 + 40 + 60 + 90 (feed)
+    assert header_line == "🔴 Неоплачено: 5 штрафов — 340 ₾"  # 150 + 40 + 60 + 90 (feed)
     # история — не долг и не ⚪, но видна отдельной строкой
     assert "⏳ Ждут повторной проверки police.ge: 125 ₾ (3 шт.)" in text
     assert "BB" + "222" not in text.replace("*", "")  # машина только с историей — без строки долга

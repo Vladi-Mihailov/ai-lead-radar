@@ -290,8 +290,11 @@ async def test_full_check_skips_suppressed_plate_without_calling_provider(tmp_pa
     # только unrelated_task вносит вклад в checked_ok/with_debt.
     assert "Всего: 2" in reply.text
     assert "Проверено успешно: 1" in reply.text
-    assert "С задолженностью: 1" in reply.text
-    assert "Без задолженности: 0" in reply.text
+    # Сумма в police.ge — не подтверждённый долг (police.ge показывает и
+    # оплаченные штрафы), поэтому счётчики так и называются.
+    assert "С суммой в police.ge: 1" in reply.text
+    assert "Без суммы в police.ge: 0" in reply.text
+    assert "задолженност" not in reply.text
     assert "Не удалось проверить: 0" in reply.text
 
     updated_suppressed = fx.task_repository.get(suppressed_task.id)

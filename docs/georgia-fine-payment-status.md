@@ -169,14 +169,18 @@ Where statuses are shown:
   - the «💳 Оплатить в рублях» button disappears when no fine is left in «К
     оплате».
 - «📊 Статистика»:
-  - confirmed debt (🔴) and paid but still listed (🟢), with counts; uncertain
-    (🟡) as a count only («🟡 Требуют проверки: 3 штрафа»), and no 🟡 line at
-    all when nothing needs review;
+  - «🔴 Неоплачено: 6 штрафов — 295 ₾» is 🔴 plus 🟡 (payment not
+    confirmed), the same rule as the per-car «🔴 Неоплачено» lines, so those
+    add up to it. When some cars' counts are unknown (saved totals, below),
+    the number is a lower bound and reads «не менее 3 штрафов». Under it,
+    «🟡 Из них требуют проверки: 3 штрафа» is a count only (its sum is already
+    in 🔴), with no line at all when nothing needs review. Paid but still
+    listed (🟢) and ⏳ have their own lines and are not part of 🔴;
   - «Автомобили со штрафами» counts every car in the list, cars with only 🟢
-    fines included. No 🟢 status is added to «🔴 Неоплачено» or «🔴
-    Подтверждённая задолженность». The one exception is a saved total the
-    statuses do not explain (next bullet but one): it is shown whole, and it
-    may include a receipt marked 🟢, until the next full check;
+    fines included. No 🟢 status is added to «🔴 Неоплачено». The one
+    exception is a saved total the statuses do not explain (next bullet but
+    one): it is shown whole, and it may include a receipt marked 🟢, until
+    the next full check (known limitation, issue #62);
   - per-car lines give the number of fines and their sum, each line only when
     its number is above zero: «🔴 Неоплачено» is 🔴 plus 🟡, then «🟡 Из них
     требуют проверки», «🟢 Оплачено» (not part of the unpaid sum) and «⏳ Ждут
@@ -197,7 +201,7 @@ Where statuses are shown:
     includes them. The number of fines behind such a total is unknown: the
     car's line shows the sum only, «🔴 Неоплачено: 80 ₾ (количество
     уточнится при следующей проверке)», and the summary counts the car as
-    one fine (a lower bound);
+    one fine and says «не менее N штрафов»;
   - «База police.ge обновлена»;
   - the last evening re-check.
 - «🧾 Статусы оплаты» (trusted managers): enter a plate → list → a receipt →
@@ -256,8 +260,9 @@ Client delivery:
     operator chat (the operator process flushes pending rows without
     looking at statuses) still goes there; checks run by the operator
     process itself have no statuses. Managers' counters «🚨 Новых штрафов
-    найдено сегодня» and the check-all «С задолженностью» still count such
-    rows and plates. The trusted «🔎 Проверить сейчас» of a plate with an
+    найдено сегодня» and the check-all «С суммой в police.ge» (a police.ge
+    total, not confirmed debt) still count such rows and plates. The trusted
+    «🔎 Проверить сейчас» of a plate with an
     active task shows fines without status labels (it has no sum and no
     payment buttons).
 - In the Georgian bot only, if the operator was already notified about a
@@ -279,7 +284,10 @@ Client delivery:
   total that is newer than the statuses (a check without statuses) or not
   explained by them is still shown whole, possibly including a 🟢 receipt,
   until the next full check — so that a new fine that took the paid one's
-  place is never hidden.
+  place is never hidden. Known limitation (issue #62): the operator
+  process's checks (its scheduled runs and `fine check` / `fine update-all`)
+  write such totals, so a 🟢-only car can show as unpaid with an unknown
+  count until the bot's next full check.
 
 ## Daily evening re-check
 
