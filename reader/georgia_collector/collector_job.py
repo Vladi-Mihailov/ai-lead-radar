@@ -21,11 +21,17 @@ read). The real feed has ~10k pages (~5–6.3k publications a day), so an
 empty page is unreachable — without this horizon DEEP never completed and
 re-read max_pages pages every cycle. Each cycle first records "cycle in
 progress" as last_error, so a cycle killed midway (SIGTERM, OOM,
-CancelledError) is followed by DEEP recovery, not FAST. FAST mode stops one
-overlap page after the first page with a row seen BEFORE this cycle: rows
-this cycle already marked reappear when new publications shift the pages
-during the traversal (production: bursts of 70–360 rows), and stopping on
-them would leave the new rows below unread.
+CancelledError) is followed by DEEP recovery, not FAST. FAST mode stops on
+the SECOND page with a row seen BEFORE this cycle (normally the overlap page
+right after the frontier). Rows this cycle already marked reappear when new
+publications shift the pages during the traversal (production: bursts of
+70–360 rows); stopping on them, or on an overlap page such a burst filled
+right after the frontier, would leave new rows below unread for good.
+
+A matched row's payload goes to the local outbox BEFORE it is submitted and
+leaves it after production accepted it, so a cycle killed mid-submit loses
+nothing: the next cycle flushes the outbox first (production dedups by
+fingerprint).
 
 should_run()/run_times/_last_run_slot is the SAME exact-wall-clock pattern
 as reader/jobs/fine_job.py::FineJob.should_run()/reader/jobs/
@@ -311,11 +317,14 @@ class GeorgiaCollectorJob:
                     completed = True
                     break
 
-                if pending_overlap:
-                    completed = True
-                    break
-
                 if not deep_mode and page_has_seen_row:
+                    if pending_overlap:
+                        # Вторая страница со строками, увиденными до этого
+                        # цикла: ниже — только уже обработанное. Страница
+                        # без них (пачка публикаций сдвинула список сразу
+                        # после границы) обход не завершает.
+                        completed = True
+                        break
                     pending_overlap = True
                     continue
             else:
@@ -373,14 +382,18 @@ class GeorgiaCollectorJob:
             return
 
         payload = record_to_payload(record)
+        # В outbox ДО отправки: строка уже отмечена увиденной, и если цикл
+        # убьют посреди отправки (до трёх попыток по 180 с, когда production
+        # медленная) или она упадёт непредвиденной ошибкой, совпадение не
+        # потеряется — следующий цикл сначала разбирает outbox (повтор
+        # production отсеет по fingerprint).
+        outbox_id = self._outbox.enqueue(KIND_FEED_MATCH, payload)
         try:
             await self._production.submit_feed_match(payload)
         except ProductionApiError:
-            logger.warning(
-                "GeorgiaCollectorJob: production недоступна, feed-match для %s уходит в outbox",
-                normalized_plate,
-            )
-            self._outbox.enqueue(KIND_FEED_MATCH, payload)
+            logger.warning("GeorgiaCollectorJob: production недоступна, feed-match остаётся в outbox")
+            return
+        self._outbox.remove(outbox_id)
 
     async def _run_bootstrap(self, run_at: datetime) -> None:
         """Один one-time historical searchByAuto на КАЖДУЮ pending-плиту,

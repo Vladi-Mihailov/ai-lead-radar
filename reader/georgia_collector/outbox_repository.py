@@ -54,8 +54,8 @@ class CollectorOutboxRepository:
         self._conn.execute(_SCHEMA)
         self._conn.commit()
 
-    def enqueue(self, kind: str, payload: dict) -> None:
-        self._conn.execute(
+    def enqueue(self, kind: str, payload: dict) -> int:
+        cursor = self._conn.execute(
             "INSERT INTO collector_outbox (kind, payload, created_at, attempts) "
             "VALUES (:kind, :payload, :created_at, 0)",
             {
@@ -65,6 +65,7 @@ class CollectorOutboxRepository:
             },
         )
         self._conn.commit()
+        return cursor.lastrowid
 
     def list_all(self) -> list[OutboxEntry]:
         rows = self._conn.execute(

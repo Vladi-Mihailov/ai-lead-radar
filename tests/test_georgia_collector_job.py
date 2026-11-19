@@ -514,15 +514,16 @@ async def test_busy_fast_cycle_reaches_the_frontier_under_the_default_cap(tmp_pa
     max_pages_per_cycle, _first_run = load_page_limits(env={})
     frontier = _rows("SEEN_", 30, publish_date="2026-10-22")
     pages = {i * 30: _page(_rows(f"P{i:03d}_", 30, publish_date="2026-10-22")) for i in range(120)}
+    after = _rows("AFTER_", 30, publish_date="2026-10-22")
     pages[120 * 30] = _page(frontier)
-    pages[121 * 30] = _page(_rows("AFTER_", 30, publish_date="2026-10-22"))
+    pages[121 * 30] = _page(after)
     session = _FakeSession(pages)
     production = _FakeProductionClient(active_plates=["AA001AA"])
     job, feed_state_repo, seen_repo, _outbox = _make_job(
         tmp_path, session, production, max_pages_per_cycle=max_pages_per_cycle,
     )
     feed_state_repo.record_successful_cycle(newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15))
-    _mark_seen_at(seen_repo, frontier, seen_at=_utc(15))
+    _mark_seen_at(seen_repo, frontier + after, seen_at=_utc(15))
 
     await job.run(_utc(21))
 
@@ -772,10 +773,11 @@ async def test_fast_page_of_rows_seen_before_last_success_still_gets_its_overlap
     last success is an ordinary frontier, followed by one overlap page."""
     production = _FakeProductionClient(active_plates=["AA001AA"])
     old = _rows("OLD_", 30, publish_date="2026-10-22")
-    session = _FakeSession({0: _page(old), 30: _page(_rows("OLDER_", 30, publish_date="2026-10-22"))})
+    older = _rows("OLDER_", 30, publish_date="2026-10-22")
+    session = _FakeSession({0: _page(old), 30: _page(older)})
     job, feed_state_repo, seen_repo, _outbox = _make_job(tmp_path, session, production)
     feed_state_repo.record_successful_cycle(newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15))
-    _mark_seen_at(seen_repo, old, seen_at=_utc(9))
+    _mark_seen_at(seen_repo, old + older, seen_at=_utc(9))
 
     await job.run(_utc(21))
 
@@ -927,3 +929,104 @@ async def test_interrupted_cycle_then_recovery_with_shifting_pages_reads_every_r
     assert feed_state_repo.get().last_error is None
     assert all(seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
     assert sorted(_submitted(production)) == ["MATCH_BELOW_KILL", "MATCH_IN_BURST_BOTTOM", "MATCH_IN_BURST_TOP"]
+
+
+async def test_fast_keeps_reading_when_a_burst_fills_the_overlap_page_right_after_the_frontier(tmp_path):
+    """The frontier is on page 0 and 150 rows are published right after it:
+    the next page holds only new rows. FAST does not stop there — it ends on
+    the second page with rows seen before this cycle, so the oldest rows of
+    the burst (and their match) are read now, not lost for good."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    feed = _LiveFeed(_rows("OLD", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
+    job1, feed_state_repo, seen_repo, _outbox = _make_job(tmp_path, feed, production, first_run_max_pages=10)
+    await job1.run(_utc(15))
+
+    feed.publish(_rows("NEW", 10, publish_date="2026-10-22"))
+    burst = _rows("B", 150, publish_date="2026-10-22")
+    burst[115] = _entry(protocol_no="BURST_MATCH", plate="AA001AA", publish_date="2026-10-22")
+    feed.publish_after_requests(1, burst)
+    feed.requested_offsets.clear()
+    job2, *_ = _make_job(tmp_path, feed, production)
+    await job2.run(_utc(21))
+
+    assert feed.requested_offsets == [0, 30, 60, 90, 120, 150]
+    assert _submitted(production) == ["BURST_MATCH"]
+
+    job3, *_ = _make_job(tmp_path, feed, production)
+    await job3.run(_utc(23, 55))
+
+    assert all(seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
+    assert _submitted(production) == ["BURST_MATCH"]
+    assert feed_state_repo.get().last_error is None
+
+
+async def test_one_job_instance_runs_consecutive_cycles_like_production(tmp_path):
+    """Production keeps one job object for every cycle: nothing from one
+    cycle (rows it marked) may change how the next one stops."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    feed = _LiveFeed(_rows("OLD", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
+    job, feed_state_repo, seen_repo, _outbox = _make_job(tmp_path, feed, production, first_run_max_pages=10)
+    await job.run(_utc(9))
+
+    for cycle, run_at in enumerate((_utc(15), _utc(21), _utc(23, 55))):
+        feed.publish(_rows(f"C{cycle}_", 45, publish_date="2026-10-22"))
+        feed.requested_offsets.clear()
+        await job.run(run_at)
+        assert feed.requested_offsets == [0, 30, 60], cycle
+        assert feed_state_repo.get().last_error is None
+
+    assert all(seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
+
+
+class _SubmitFails(_FakeProductionClient):
+    """Production whose first feed-match submit dies with `exc` (a kill —
+    CancelledError — or an unexpected error)."""
+
+    def __init__(self, exc: BaseException, **kwargs):
+        super().__init__(**kwargs)
+        self._exc = exc
+
+    async def submit_feed_match(self, payload: dict) -> dict:
+        if self._exc is not None:
+            exc, self._exc = self._exc, None
+            raise exc
+        return await super().submit_feed_match(payload)
+
+
+@pytest.mark.parametrize("exc", [asyncio.CancelledError(), ValueError("unexpected response")])
+async def test_match_is_not_lost_when_the_cycle_dies_during_its_submit(tmp_path, exc):
+    """The payload is queued BEFORE the submit: a kill (or an unexpected
+    error) mid-submit leaves the row seen but the match in the outbox, and
+    the next cycle delivers it first — exactly once."""
+    production = _SubmitFails(exc, active_plates=["AA001AA"])
+    match = _entry(protocol_no="MATCH_IN_FLIGHT", plate="AA001AA", publish_date="2026-10-22")
+    session = _FakeSession({0: _page(_rows("T0_", 29, publish_date="2026-10-22") + [match]),
+                            30: _page(_rows("Y0_", 30, publish_date="2026-10-21"))})
+    job, feed_state_repo, seen_repo, outbox_repo = _make_job(tmp_path, session, production, first_run_max_pages=10)
+
+    if isinstance(exc, asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError):
+            await job.run(_utc(21))
+    else:
+        await job.run(_utc(21))
+    assert seen_repo.is_seen("MATCH_IN_FLIGHT")
+    assert [entry.payload["external_fine_id"] for entry in outbox_repo.list_all()] == ["MATCH_IN_FLIGHT"]
+    assert feed_state_repo.get().last_error is not None
+
+    job2, *_ = _make_job(tmp_path, session, production, first_run_max_pages=10)
+    await job2.run(_utc(23, 55))
+
+    assert _submitted(production) == ["MATCH_IN_FLIGHT"]
+    assert outbox_repo.list_all() == []
+
+
+async def test_submitted_match_leaves_nothing_in_the_outbox(tmp_path):
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    match = _entry(protocol_no="MATCH_OK", plate="AA001AA", publish_date="2026-10-22")
+    session = _FakeSession({0: _page([match]), 30: _page(_rows("Y0_", 30, publish_date="2026-10-21"))})
+    job, _feed_state, _seen, outbox_repo = _make_job(tmp_path, session, production, first_run_max_pages=10)
+
+    await job.run(_utc(21))
+
+    assert _submitted(production) == ["MATCH_OK"]
+    assert outbox_repo.list_all() == []
