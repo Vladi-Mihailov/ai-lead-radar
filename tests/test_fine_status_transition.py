@@ -535,3 +535,85 @@ def _controller(legacy, tracker):
         debt_refresh_service=DebtRefreshService(legacy.tasks, check_service, sleep=_instant),
         fine_status_tracker=tracker,
     )
+
+
+
+def test_seeding_makes_statuses_current_only_where_they_explain_the_snapshot(legacy):
+    """Если квитанции номера, выросшие из снимка прежней статистики, дают
+    его сумму, статусы актуальны на время снимка: отметка 🟢 сразу убирает
+    квитанцию из долга. Не дают — страховка "снимок новее статусов"
+    остаётся. Настоящее время полной проверки не перезаписывается."""
+    short_task = legacy.task("GG777HH", snapshot=150)
+    legacy.fine(short_task, "GE9", 50, last_seen="2026-11-16 10:00:00")  # снимок 150 объясняют только 50
+    repository = FineStatusRepository(legacy.db_path)
+    real_check = datetime(2026, 11, 18, 9, 0)
+    repository.record_full_check_time("CC333DD", real_check)
+    tracker = FineStatusTracker(repository)
+
+    tracker.seed_from_detected_fines()
+    tracker.seed_from_detected_fines()  # повторный старт ничего не меняет
+
+    checks = tracker.last_full_check_by_car(["AA111BB", "DD444EE", "CC333DD", "GG777HH", "BB222CC"])
+    assert checks["AA111BB"] == datetime(2026, 11, 16, 10, 0)
+    assert checks["DD444EE"] == datetime(2026, 11, 16, 10, 0)
+    assert checks["CC333DD"] == real_check
+    assert "GG777HH" not in checks and "BB222CC" not in checks  # не объяснён / снимок 0
+
+    tracker.mark_paid(tracker.statuses_by_protocol("AA111BB")["GE2"].id, actor_user_id=_TRUSTED, note="TBC 1")
+    rows, _ = _controller(legacy, tracker)._debt_rows_with_statuses(legacy.tasks.list_debt_car_groups())
+    by_car = {car: breakdown for car, _, breakdown in rows}
+
+    assert by_car["AA111BB"].unpaid_amount == 50 and by_car["AA111BB"].paid_amount == 100
+    assert by_car["GG777HH"].unpaid_amount == 150  # страховка: показан снимок
+    repository.close()
+
+
+def test_restart_does_not_take_a_newer_snapshot_from_a_check_without_statuses_as_explained(legacy):
+    """Обзор f2dc7c6: при перезапуске устаревшая 🟢 'listed' не должна
+    "объяснить" снимок более новой проверки без статусов, чьи квитанции в
+    статусах ⏳ — иначе их долг пропал бы из «Задолженности»."""
+    task = legacy.task("HH888JJ", snapshot=0, checked_at="2026-11-16 10:00:00")
+    legacy.fine(task, "GE10", 100, last_seen="2026-11-17 10:00:00")  # найдена feed'ом после нулевой проверки
+    old = legacy.fine(task, "GE11", 80, last_seen="2026-11-01 10:00:00")  # история — ⏳
+    repository = FineStatusRepository(legacy.db_path)
+    tracker = FineStatusTracker(repository)
+    tracker.seed_from_detected_fines()
+    statuses = tracker.statuses_by_protocol("HH888JJ")
+    assert statuses["GE10"].presence == PRESENCE_LISTED and statuses["GE11"].presence == PRESENCE_UNVERIFIED
+    tracker.mark_paid(statuses["GE10"].id, actor_user_id=_TRUSTED, note="TBC 1")
+    # проверка без статусов (сбой записи статусов / операторский процесс) нашла GE11
+    legacy._sql("UPDATE fine_monitoring_tasks SET last_successful_total_amount = 80, "
+                "last_successful_checked_at = '2026-11-18 10:00:00' WHERE id = ?", task.id)
+    legacy._sql("UPDATE detected_fines SET last_seen_at = '2026-11-18 10:00:00' WHERE id = ?", old.id)
+
+    tracker.seed_from_detected_fines()  # перезапуск
+
+    assert "HH888JJ" not in tracker.last_full_check_by_car(["HH888JJ"])
+    rows, _ = _controller(legacy, tracker)._debt_rows_with_statuses(legacy.tasks.list_debt_car_groups())
+    by_car = {car: breakdown for car, _, breakdown in rows}
+    assert by_car["HH888JJ"].unpaid_amount == 80  # страховка: снимок, а не 0 ₾
+    repository.close()
+
+
+def test_seeding_compares_the_snapshot_with_the_amounts_statistics_use(legacy):
+    """Обзор 359daec: квитанция с изменившейся карточкой — строки 50 и 70,
+    снимок 70, а сумма статуса взята из первой строки (50). Снимок статусами
+    не объяснён: время проверки не записывается, статистика показывает 70."""
+    task = legacy.task("JJ999KK", snapshot=70)
+    legacy.fine(task, "GE20", 50, last_seen="2026-11-16 10:00:00")
+    changed = legacy.fines.create(
+        monitoring_task_id=task.id, car_number="JJ999KK", external_fine_id="GE20", fingerprint="fp-JJ999KK-GE20-new",
+        penalty_date=None, due_date=None, delivered_status=None, raw_data="{}", amount=70,
+    )
+    legacy._sql("UPDATE detected_fines SET last_seen_at = '2026-11-16 10:00:00', first_detected_at = "
+                "'2026-11-16 10:00:00' WHERE id = ?", changed.id)
+    repository = FineStatusRepository(legacy.db_path)
+    tracker = FineStatusTracker(repository)
+
+    tracker.seed_from_detected_fines()
+
+    assert tracker.statuses_by_protocol("JJ999KK")["GE20"].amount == 50
+    assert "JJ999KK" not in tracker.last_full_check_by_car(["JJ999KK"])
+    rows, _ = _controller(legacy, tracker)._debt_rows_with_statuses(legacy.tasks.list_debt_car_groups())
+    assert {car: breakdown for car, _, breakdown in rows}["JJ999KK"].unpaid_amount == 70
+    repository.close()

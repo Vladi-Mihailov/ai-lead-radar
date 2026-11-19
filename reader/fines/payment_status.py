@@ -628,6 +628,7 @@ class FineStatusRepository:
         # номер -> (время, id) самой свежей задачи с положительным снимком —
         # тот же выбор (и tie-break по id), что у list_debt_car_groups
         debt_reference: dict[str, tuple[datetime, int]] = {}
+        reference_total: dict[str, float] = {}
         for task_id, car_number, total, checked_raw in self._conn.execute(
             "SELECT id, car_number, last_successful_total_amount, last_successful_checked_at "
             "FROM fine_monitoring_tasks"
@@ -642,7 +643,11 @@ class FineStatusRepository:
                 car_number, (datetime.min, -1),
             ):
                 debt_reference[car_number] = (checked_at, task_id)
+                reference_total[car_number] = total
         seeds: dict[tuple[str, str], dict] = {}
+        # номер -> {protocolNo: сумма} — последний ответ задачи-опоры (тот,
+        # из которого сложилась сумма снимка прежней статистики)
+        reference_answer: dict[str, set[str]] = {}
         rows = self._conn.execute(
             "SELECT monitoring_task_id, external_fine_id, amount, first_detected_at, last_seen_at "
             "FROM detected_fines WHERE external_fine_id IS NOT NULL AND external_fine_id != ''"
@@ -656,15 +661,17 @@ class FineStatusRepository:
             latest = latest_check.get(car_number)
             listed = latest is not None and seen_at >= latest - SNAPSHOT_TOLERANCE
             reference = debt_reference.get(car_number)
-            if not listed and reference is not None and reference[1] == task_id:
-                # Строка из последнего ответа задачи, на снимке которой стоит
-                # прежняя статистика долга (была до этой проверки или создана
-                # ею самой, а не найдена feed'ом позже).
-                reference_at = reference[0]
-                listed = (
-                    seen_at >= reference_at - SNAPSHOT_TOLERANCE
-                    and first_at <= reference_at + _SAME_CHECK_WINDOW
-                )
+            # Строка из последнего ответа задачи, на снимке которой стоит
+            # прежняя статистика долга (была до этой проверки или создана ею
+            # самой, а не найдена feed'ом позже).
+            in_reference_answer = (
+                reference is not None and reference[1] == task_id
+                and seen_at >= reference[0] - SNAPSHOT_TOLERANCE
+                and first_at <= reference[0] + _SAME_CHECK_WINDOW
+            )
+            if in_reference_answer:
+                listed = True
+                reference_answer.setdefault(car_number, set()).add(protocol_no)
             seed = seeds.setdefault((car_number, protocol_no), {
                 "amount": amount, "first_at": first_at, "seen_at": seen_at, "listed": False,
             })
@@ -690,6 +697,42 @@ class FineStatusRepository:
                     created += 1
                     self._log(cursor.lastrowid, "seeded" if listed else "seeded_unverified",
                               SOURCE_CHECK, None, None, at)
+            # Снимок, на котором стоит прежняя статистика долга, — проверка,
+            # из ответа которой выросли статусы номера. Если КАЖДАЯ квитанция
+            # этого ответа есть среди статусов в базе полиции (с любой
+            # отметкой оплаты) и они дают сумму снимка, статусы актуальны на
+            # его время: иначе отметка 🟢 у номера, не проверенного после
+            # перехода, в статистике не действовала бы (страховка "снимок
+            # новее статусов", см. conversation._snapshot_has_unexplained_debt).
+            # Сверка по квитанциям, а не по суммам: снимок более новой
+            # проверки без статусов (её квитанции — ⏳ или вовсе без статуса)
+            # и чужие квитанции (feed, 🟢) страховку не снимают. Не сошлось —
+            # страховка остаётся; настоящее время полной проверки не
+            # перезаписывается.
+            for car_number, (reference_at, _task_id) in debt_reference.items():
+                answer = reference_answer.get(car_number)
+                if not answer or is_fine_output_suppressed(car_number):
+                    continue
+                # Суммы — статусов, как их считает статистика (у квитанции с
+                # изменившейся карточкой сумма статуса может быть меньше суммы
+                # в ответе: тогда снимок не объяснён и страховка остаётся).
+                status_by_protocol = {
+                    protocol_no: (presence, amount)
+                    for protocol_no, presence, amount in self._conn.execute(
+                        "SELECT protocol_no, presence, amount FROM georgia_fine_status WHERE car_number = ?",
+                        (car_number,),
+                    )
+                }
+                answer_statuses = [status_by_protocol.get(protocol_no) for protocol_no in answer]
+                if all(
+                    status is not None and status[0] in (PRESENCE_LISTED, PRESENCE_MISSING)
+                    for status in answer_statuses
+                ) and sum(status[1] or 0.0 for status in answer_statuses) + 0.005 >= reference_total[car_number]:
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO georgia_fine_plate_checks (car_number, last_full_check_at) "
+                        "VALUES (?, ?)",
+                        (car_number, _fmt(reference_at)),
+                    )
         return created
 
 
@@ -917,16 +960,25 @@ class FineStatusTracker:
 
     def undeliverable_protocols(self, car_number: str) -> set[str]:
         """Квитанции, о которых клиенту НЕ отправляется "новый штраф" (см.
-        ClientDeliveryService): ⚪ и 'unverified' — квитанции из истории, чьё
-        присутствие новая полная проверка ещё не подтвердила (с любой
-        отметкой менеджера). Подписчик видит их отдельной строкой ⏳; как
-        только проверка или feed найдут квитанцию, она снова 'listed' и
-        уходит как обычно. 'missing' сюда не входит (см. gone_protocols)."""
+        ClientDeliveryService): ⚪, 🟢 и 'unverified' — квитанции из истории,
+        чьё присутствие новая полная проверка ещё не подтвердила (с любой
+        отметкой менеджера). Подписчик видит 'unverified' отдельной строкой
+        ⏳; как только проверка или feed найдут такую квитанцию, она снова
+        'listed' и уходит как обычно. 🟢 не уходит, пока отметка стоит
+        (повторной оплаты не предлагаем; после «Снять отметку» — как
+        обычно), но остаётся в истории и проверяется до ⚪. 'missing' сюда
+        не входит (см. gone_protocols)."""
         return {
             status.protocol_no
             for status in self._repository.list_for_car(car_number, include_gone=True)
-            if status.presence in (PRESENCE_GONE, PRESENCE_UNVERIFIED)
+            if status.presence in (PRESENCE_GONE, PRESENCE_UNVERIFIED) or status.payment_status == PAYMENT_PAID
         }
+
+    def is_paid(self, car_number: str, protocol_no: str) -> bool:
+        """🟢 — оплата квитанции подтверждена (см. FineCheckService._finalize:
+        её повторное обнаружение не уведомляет как о новом штрафе)."""
+        status = self._repository.get_by_protocol(car_number, protocol_no)
+        return status is not None and status.payment_status == PAYMENT_PAID
 
     def has_listed_receipts(self, car_number: str) -> bool:
         """Есть ли у номера квитанции, ещё не признанные исчезнувшими — это

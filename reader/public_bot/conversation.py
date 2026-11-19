@@ -296,11 +296,13 @@ def _snapshot_has_unexplained_debt(
 ) -> bool:
     """Снимок суммы задачи больше долга по статусам машины (🔴 + 🟡), а
     полной проверки со статусами после него не было: проверка прошла без
-    статусов (операторский процесс, сбой записи статусов) или статусы только
-    что заполнены из истории. Ошибка не должна скрывать долг — тогда
-    показывается снимок. Отметки 🟢 такой снимок не объясняют: оплаченная
-    квитанция могла уже исчезнуть из ответа, а на её месте оказаться новый
-    штраф; до следующей полной проверки машина показывает снимок, как раньше."""
+    статусов (операторский процесс, сбой записи статусов) или статусы,
+    заполненные из истории, снимок не объяснили (объяснили — время снимка
+    записано как полная проверка, см. seed_from_detected_fines). Ошибка не
+    должна скрывать долг — тогда показывается снимок. Отметки 🟢 такой
+    снимок не объясняют: оплаченная квитанция могла уже исчезнуть из ответа,
+    а на её месте оказаться новый штраф; до следующей полной проверки машина
+    показывает снимок, как раньше."""
     debt = breakdown.unpaid_amount + breakdown.needs_review_amount
     if snapshot <= debt + 0.005:
         return False
@@ -688,6 +690,20 @@ class ConversationController:
     def _owner_cta_buttons(self) -> list[list[tuple[str, str]]]:
         url = f"https://t.me/{self._payment_help_contact_username}"
         return [[("💳 Оплатить в рублях", url), ("🚗 ОСАГО Грузии", url)]]
+
+    def _manager_statuses(self, car_number: str) -> dict[str, str] | None:
+        """{protocolNo: payment_status} для экранов менеджера с суммой
+        штрафов из живой проверки ("🔎 Поиск", разовая проверка): 🟢 в сумму
+        не входит (см. texts.format_search_money_line). Отметка оплаты, а не
+        отображаемый статус: разовая проверка статусы не пишет, и 🟢,
+        вернувшийся после ⚪, иначе остался бы 'gone' и попал в сумму. None —
+        статусы не ведутся."""
+        if self._fine_status is None:
+            return None
+        return {
+            protocol_no: status.payment_status
+            for protocol_no, status in self._fine_status.statuses_by_protocol(car_number).items()
+        }
 
     def _unverified_totals(self, car_number: str) -> dict:
         """⏳ номера для подписчика ({unverified_count, unverified_amount} —
@@ -2414,13 +2430,16 @@ class ConversationController:
         задач нет — "➕ Добавить на мониторинг" (существующий Add Car, см.
         handle_trusted_one_off_add). CTA нет."""
         another = (texts.TRUSTED_ONE_OFF_ANOTHER_LABEL, _mb_kb().encode_trusted_one_off_another_callback())
+        statuses = self._manager_statuses(result.car_number) if result.fines else None
         tasks = self._subscriptions.list_tasks_for_car(result.car_number)
         if any(task.status == "active" for task in tasks):
-            return BotReply(text=texts.format_one_off_check_result(result), inline_buttons=[[another]])
+            return BotReply(
+                text=texts.format_one_off_check_result(result, statuses=statuses), inline_buttons=[[another]],
+            )
         if tasks:
             representative = self._subscriptions.find_representative_task_for_inactive_car(result.car_number)
             return BotReply(
-                text=texts.format_one_off_check_result(result, inactive_task=representative),
+                text=texts.format_one_off_check_result(result, inactive_task=representative, statuses=statuses),
                 inline_buttons=[
                     [(
                         texts.TRUSTED_RESUME_MONITORING_LABEL,
@@ -2430,7 +2449,7 @@ class ConversationController:
                 ],
             )
         return BotReply(
-            text=texts.format_one_off_check_result(result),
+            text=texts.format_one_off_check_result(result, statuses=statuses),
             inline_buttons=[
                 [another],
                 [(texts.TRUSTED_ONE_OFF_ADD_LABEL, _mb_kb().encode_trusted_one_off_add_callback(result.car_number))],
@@ -3359,10 +3378,11 @@ class ConversationController:
             username=known.telegram_username if known else None,
         )
 
+        statuses = self._manager_statuses(hit.car_number) if check_ok and fines else None
         lines = [
             f"👤 {owner_display}",
             f"🚗 {format_plate_for_telegram(hit.car_number)}",
-            texts.format_search_money_line(check_ok=check_ok, fines=fines),
+            texts.format_search_money_line(check_ok=check_ok, fines=fines, statuses=statuses),
             texts.format_search_monitoring_line(monitoring_active=monitoring_active),
             texts.format_search_checked_at_line(checked_at),
         ]

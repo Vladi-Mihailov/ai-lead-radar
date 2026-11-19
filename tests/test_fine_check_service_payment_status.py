@@ -18,6 +18,8 @@ from reader.fines.check_service import FineCheckService
 from reader.fines.detected_fine_repository import DetectedFineRepository
 from reader.fines.models import ParsedFineRecord
 from reader.fines.payment_status import (
+    PAYMENT_PAID,
+    PRESENCE_GONE,
     PRESENCE_LISTED,
     PRESENCE_MISSING,
     FineStatusRepository,
@@ -351,3 +353,104 @@ async def test_recheck_of_known_receipts_creates_no_new_notifications(fx):
         assert result.new_fines == []
 
     assert fx.fines.list_pending_notifications() == []
+
+
+# ---- 🟢 оплачено: повторное обнаружение — не новый штраф, проверки идут до ⚪ ----
+
+
+def _changed_card(protocol_no: str, amount: float = 50.0) -> ParsedFineRecord:
+    """Та же квитанция, но её карточка на police.ge изменилась — другой fingerprint."""
+    return ParsedFineRecord(
+        car_number=_CAR, external_fine_id=protocol_no, penalty_date=date(2026, 11, 1),
+        due_date=date(2026, 12, 31), delivered_status="Вручено", fingerprint=f"fp-{protocol_no}-changed",
+        raw_data={"protocolNo": protocol_no}, amount=amount,
+    )
+
+
+async def _listed_and_paid(fx):
+    task = fx.task()
+    fx.provider.results = [ProviderSearchResult(records=[_record("GE1")])]
+    await fx.service.check_task(task)
+    fx.tracker.mark_paid(fx.statuses()["GE1"].id, actor_user_id=1, note="TBC 1")
+    return fx.tasks.get(task.id)
+
+
+def _changed_rows(fx):
+    return [row for row in fx.fines.list_by_car_number(_CAR) if row.fingerprint == "fp-GE1-changed"]
+
+
+async def test_paid_receipt_found_again_with_a_changed_card_is_not_a_new_fine(fx):
+    task = await _listed_and_paid(fx)
+    fx.provider.results = [ProviderSearchResult(records=[_changed_card("GE1")])]
+
+    result = await fx.service.check_task(task)
+
+    assert result.new_fines == []
+    assert [fine.external_fine_id for fine in result.current_fines] == ["GE1"]
+    rows = _changed_rows(fx)
+    assert len(rows) == 1 and rows[0].notification_sent_at is not None  # оператору не уйдёт
+    assert fx.statuses()["GE1"].payment_status == PAYMENT_PAID
+
+
+async def test_feed_match_of_a_paid_receipt_is_not_a_new_fine(fx):
+    task = await _listed_and_paid(fx)
+
+    result = await fx.service.persist_feed_match(task, _changed_card("GE1"))
+
+    assert result.new_fines == []
+    rows = _changed_rows(fx)
+    assert len(rows) == 1 and rows[0].notification_sent_at is not None
+    assert fx.statuses()["GE1"].payment_status == PAYMENT_PAID
+
+
+async def test_paid_receipt_keeps_being_checked_until_gone_and_stays_paid_when_back(fx):
+    """🟢 остаётся в истории и в перепроверке, пока police.ge его показывает;
+    исчез дважды — ⚪ (и ещё 3 дня в follow-up); вернулся — снова в базе,
+    по-прежнему 🟢 и не новый штраф."""
+    task = await _listed_and_paid(fx)
+    assert _CAR in fx.tracker.listed_car_numbers()
+
+    fx.provider.results = [ProviderSearchResult(records=[])]
+    await fx.service.check_task(task)
+    assert fx.statuses()["GE1"].presence == PRESENCE_MISSING
+    assert _CAR in fx.tracker.listed_car_numbers()
+    await fx.service.check_task(fx.tasks.get(task.id))
+    assert fx.statuses()["GE1"].presence == PRESENCE_GONE
+    assert _CAR not in fx.tracker.listed_car_numbers() and _CAR in fx.tracker.recently_gone_car_numbers()
+
+    fx.provider.results = [ProviderSearchResult(records=[_changed_card("GE1")])]
+    result = await fx.service.check_task(fx.tasks.get(task.id))
+
+    status = fx.statuses()["GE1"]
+    assert status.presence == PRESENCE_LISTED and status.payment_status == PAYMENT_PAID
+    assert result.new_fines == []
+    assert all(row.notification_sent_at is not None for row in _changed_rows(fx))
+
+
+async def test_unreadable_payment_status_still_announces_a_new_receipt(fx, caplog):
+    task = await _listed_and_paid(fx)
+
+    def unreadable(*_args):
+        raise RuntimeError("db locked")
+
+    fx.tracker.is_paid = unreadable
+    fx.provider.results = [ProviderSearchResult(records=[_record("GE1"), _record("GE2")])]
+
+    result = await fx.service.check_task(task)
+
+    assert [fine.external_fine_id for fine in result.new_fines] == ["GE2"]
+    assert all(_CAR not in r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+
+
+async def test_a_new_receipt_next_to_a_paid_one_is_a_new_fine(fx):
+    """Номер с 🟢 квитанцией: новая квитанция — по-прежнему новый штраф
+    (ждёт уведомления), а 🟢 с изменившейся карточкой — нет."""
+    task = await _listed_and_paid(fx)
+    fx.provider.results = [ProviderSearchResult(records=[_changed_card("GE1"), _record("GE2")])]
+
+    result = await fx.service.check_task(task)
+
+    assert [fine.external_fine_id for fine in result.new_fines] == ["GE2"]
+    new_row = [row for row in fx.fines.list_by_car_number(_CAR) if row.external_fine_id == "GE2"]
+    assert len(new_row) == 1 and new_row[0].notification_sent_at is None
+    assert all(row.notification_sent_at is not None for row in _changed_rows(fx))

@@ -111,6 +111,8 @@ class FineStatusTrackerLike(Protocol):
 
     def has_listed_receipts(self, car_number: str) -> bool: ...
 
+    def is_paid(self, car_number: str, protocol_no: str) -> bool: ...
+
 
 class FineTranslatorLike(Protocol):
     """Ровно то, что нужно отсюда от FineTranslationService (см.
@@ -660,6 +662,18 @@ class FineCheckService:
         except Exception:
             logger.exception("Georgia fine status: не удалось обновить статусы после проверки")
 
+    def _is_paid_receipt(self, car_number: str, record: ParsedFineRecord) -> bool:
+        """🟢 по статусам (только там, где они ведутся; ключ — номер задачи,
+        как у record_full_check). Сбой чтения статуса — как раньше: штраф
+        считается неоплаченным, уведомление не теряется."""
+        if self._status_tracker is None or not record.external_fine_id:
+            return False
+        try:
+            return self._status_tracker.is_paid(car_number, record.external_fine_id)
+        except Exception:
+            logger.exception("Georgia fine status: не удалось прочитать статус оплаты квитанции")
+            return False
+
     def _track_listed(self, car_number: str, record: ParsedFineRecord) -> None:
         if self._status_tracker is None:
             return
@@ -771,7 +785,12 @@ class FineCheckService:
             # Новая для всех задач квитанция уведомляется как и раньше — по
             # строке на задачу. Клиентам — дедуп по квитанции в
             # ClientDeliveryService.
-            already_known = (
+            # 🟢 (оплата подтверждена) — не новый штраф ни для кого: новая
+            # строка той же квитанции (карточка на police.ge изменилась,
+            # другая задача номера, feed, возврат после ⚪) рождается
+            # "уведомлённой" и в new_fines не попадает.
+            paid = self._is_paid_receipt(task.car_number, record)
+            already_known = paid or (
                 self._dedupe_known_receipts
                 and bool(record.external_fine_id)
                 and self._detected_fine_repository.has_notified_protocol_for_car(
@@ -832,7 +851,8 @@ class FineCheckService:
                 continue
 
             event = NewFineEvent.from_detected_fine(created, label=task.label)
-            new_fines.append(event)
+            if not paid:
+                new_fines.append(event)
             current_fines.append(event)
 
         # Snapshot (record_check_result/record_successful_check) уже сохранён

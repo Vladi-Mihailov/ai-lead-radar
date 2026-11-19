@@ -250,3 +250,55 @@ async def test_unconfirmed_paid_history_is_not_announced(fx):
     await fx.service.run_once()
 
     assert fx.sender.sent == []
+
+
+
+async def test_paid_receipt_is_not_announced_until_the_mark_is_removed(fx):
+    """🟢 — оплата подтверждена: новому подписчику "новым штрафом" (и с
+    кнопками оплаты) не уходит; менеджер снял отметку — уходит как обычно."""
+    task = fx.task()
+    fx.fine(task, "GE1")
+    fx.tracker.record_full_check(_CAR, [_record("GE1")], complete=True, at=_T0)
+    status = fx.tracker.statuses_by_protocol(_CAR)["GE1"]
+    fx.tracker.mark_paid(status.id, actor_user_id=1, note="TBC 1")
+    fx.subscribe(task)
+
+    await fx.service.run_once()
+    assert fx.sender.sent == []
+
+    fx.tracker.mark_unpaid(status.id, actor_user_id=1, note="ошибка отметки")
+    await fx.service.run_once()
+    assert len(fx.sender.sent) == 1
+
+
+async def test_paid_receipt_found_again_under_another_row_is_not_announced(fx):
+    """Квитанция 🟢 нашлась ещё раз — feed, другая задача номера или
+    изменившаяся карточка (новая строка) — ни один подписчик не получает её
+    как неоплаченный новый штраф."""
+    first, second = fx.task(), fx.task()
+    fx.fine(first, "GE1")
+    fx.tracker.record_full_check(_CAR, [_record("GE1")], complete=True, at=_T0)
+    fx.tracker.mark_paid(fx.tracker.statuses_by_protocol(_CAR)["GE1"].id, actor_user_id=1, note="TBC 1")
+    fx.fine(second, "GE1", fingerprint="fp-changed")
+    fx.subscribe(first)
+    fx.subscribe(second, user_id=_OWNER + 1)
+
+    await fx.service.run_once()
+
+    assert fx.sender.sent == []
+
+
+
+async def test_a_new_receipt_on_a_plate_with_a_paid_one_is_still_announced(fx):
+    """🟢 касается только своей квитанции: новый штраф того же номера
+    приходит как обычно."""
+    task = fx.task()
+    fx.fine(task, "GE1")
+    fx.fine(task, "GE2")
+    fx.tracker.record_full_check(_CAR, [_record("GE1"), _record("GE2")], complete=True, at=_T0)
+    fx.tracker.mark_paid(fx.tracker.statuses_by_protocol(_CAR)["GE1"].id, actor_user_id=1, note="TBC 1")
+    fx.subscribe(task)
+
+    await fx.service.run_once()
+
+    assert len(fx.sender.sent) == 1 and "GE2" in fx.sender.sent[0][1]
