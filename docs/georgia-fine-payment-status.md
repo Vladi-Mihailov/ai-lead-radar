@@ -163,10 +163,11 @@ Where statuses are shown:
 
 - «🔎 Проверить сейчас»:
   - a «Статус: …» line under each fine;
-  - a summary: «💰 К оплате» covers everything not confirmed as paid. 🟡 is
-    still debt («🟡 Из них оплата требует проверки»), and 🟢 is shown
-    separately;
-  - the «💳 Оплатить в рублях» button disappears only when every fine is 🟢.
+  - a summary: «💰 К оплате» covers every fine that is neither 🟢, ⚪ nor
+    ⏳ (see "Client delivery" below for ⏳). 🟡 is still debt («🟡 Из них
+    оплата требует проверки»), and 🟢 is shown separately;
+  - the «💳 Оплатить в рублях» button disappears when no fine is left in «К
+    оплате».
 - «📊 Статистика»:
   - confirmed debt (🔴), uncertain (🟡) and paid but still listed (🟢), with
     counts;
@@ -219,8 +220,12 @@ Client delivery:
   - For subscribers such a receipt is ⏳ even with a 🟡 mark: a refused
     payment is no proof of debt, and for a receipt police.ge did not even
     show it more likely means "already paid". Managers' statistics keep
-    counting 🟡 as debt. A 🟢-marked one is paid: neither sent nor on the ⏳
-    line.
+    counting 🟡 as debt. A 🟢-marked one is paid and not on the ⏳ line; it
+    is held back like any unconfirmed receipt, but once a check finds it
+    (police.ge keeps paid receipts until its base updates) it is 'listed'
+    and, like every listed 🟢 receipt since before this change, is sent as
+    «🚨 Обнаружен новый штраф» with the payment buttons. Possible follow-up:
+    never announce 🟢 receipts as new.
   - Not covered: a check that bypasses the statuses (the operator process,
     a failed status write) leaves the receipt ⏳ for subscribers until the
     next check with statuses, while statistics already show the saved total.

@@ -2799,15 +2799,16 @@ class ConversationController:
         # штраф, НЕ подтверждённый оплаченным (см. design report: "CTA —
         # только owner", не trusted-оператору, управляющему чужой
         # delegated-подпиской; и задачу "не предлагать повторную оплату
-        # подтверждённо оплаченного штрафа": только 🟢 кнопку убирает, 🟡 —
-        # нет).
+        # подтверждённо оплаченного штрафа": 🟢 (а также ⚪ и ⏳, см. ниже)
+        # кнопку убирает, 🟡 — нет).
         statuses = None
         if self._fine_status is not None and outcome.check_ok and outcome.fines:
             statuses = {
                 protocol_no: _subscriber_display_status(status)
                 for protocol_no, status in self._fine_status.statuses_by_protocol(outcome.car_number).items()
             }
-        # ⏳ (из кэша) к оплате не предлагается, как 🟢 и ⚪.
+        # К оплате не предлагаются 🟢, ⚪ и ⏳ (по правилу подписчика, см.
+        # _subscriber_display_status: ⏳ попадает сюда только из кэша).
         has_payable = statuses is None or any(
             statuses.get(fine.external_fine_id or "", PAYMENT_UNPAID)
             not in (PAYMENT_PAID, DISPLAY_GONE, DISPLAY_UNVERIFIED)

@@ -231,6 +231,11 @@ class FineCheckService:
         уже было запущено, когда эти штрафы были обнаружены по-настоящему,
         см. FineNotificationCoordinator)."""
         fresh_task = self._task_repository.get(task.id) or task
+        if is_fine_output_suppressed(fresh_task.car_number):
+            # Denylist и здесь (см. reader/fines/suppression.py): строки,
+            # сохранённые до него, не показываются и из кэша — тот же ответ,
+            # что у check_task() для такого номера.
+            return self._suppressed_result()
         if fresh_task.last_successful_checked_at is None:
             rows = []
         else:

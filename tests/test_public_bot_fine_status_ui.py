@@ -273,6 +273,25 @@ async def test_cached_unconfirmed_receipt_with_a_failed_payment_mark_is_not_offe
     assert reply.cta_buttons is None
 
 
+async def test_cached_receipt_missing_once_is_still_debt_for_the_subscriber(fx):
+    """Не найдена один раз ('missing') — ещё не доказательство: подписчику
+    это обычный 🔴, в «К оплате» и с кнопками, не ⏳."""
+    task, subscription = fx.car(_CAR, [("GE1", 50)], owner=_OWNER)
+    outcome = await fx.subscription_service.check_now(subscription.id, telegram_user_id=_OWNER)
+    fx.tracker._repository._conn.execute(
+        "UPDATE georgia_fine_status SET presence = 'missing', missing_since = '2026-11-19 10:00:00' WHERE id = ?",
+        (fx.status(_CAR, "GE1").id,),
+    )
+    fx.tracker._repository._conn.commit()
+
+    reply = fx.controller._format_check_now_outcome_reply(outcome)
+
+    assert "Статус: 🔴 Не оплачен" in reply.text
+    assert "💰 К оплате: 50 ₾" in reply.text
+    assert "повторной проверки" not in reply.text  # ни метки ⏳, ни строки ⏳
+    assert reply.cta_buttons
+
+
 async def test_owner_add_car_summary_shows_unverified_history(fx):
     fx.provider.records[_CAR] = [_record(_CAR, "GE1", 50)]
     _make_unverified(fx, "OLD1", 30)
