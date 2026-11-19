@@ -1,7 +1,8 @@
 """ClientDeliveryService: одна квитанция — одно "🚨 Обнаружен новый штраф"
 на получателя подписки, даже если квитанция лежит под несколькими задачами
-номера; квитанции, которых police.ge больше не показывает (⚪) или не
-показал на последней полной проверке, клиенту как "новые" не уходят.
+номера; квитанции, которых police.ge больше не показывает (⚪), и ⏳ —
+история, чьё присутствие новая проверка ещё не подтвердила, — клиенту как
+"новые" не уходят.
 Repository — настоящие (SQLite, tmp_path); номера синтетические."""
 
 import sys
@@ -185,3 +186,55 @@ async def test_legacy_rows_without_receipt_number_are_each_delivered(fx):
     await fx.service.run_once()
 
     assert len(fx.sender.sent) == 2
+
+
+def _make_unverified(fx, protocol_no):
+    """⏳ — квитанция из истории, которой не было в последнем ответе police.ge
+    до перехода на статусы (см. FineStatusRepository.seed_from_detected_fines)."""
+    status = fx.status_repository.insert_listed(
+        car_number=_CAR, protocol_no=protocol_no, amount=50, at=_T0 - timedelta(days=30), source="check",
+    )
+    fx.status_repository._conn.execute(
+        "UPDATE georgia_fine_status SET presence = 'unverified' WHERE id = ?", (status.id,),
+    )
+    fx.status_repository._conn.commit()
+    return status
+
+
+async def test_unverified_history_is_announced_only_after_a_new_check_confirms_it(fx):
+    """Новому подписчику ⏳ "новым штрафом" не уходит. Новая проверка её
+    подтвердила — уходит на следующем тике; две новые проверки с интервалом
+    её не нашли (⚪) — не уходит никогда."""
+    task = fx.task()
+    for protocol_no in ("GE1", "GE2", "GE3"):
+        fx.fine(task, protocol_no)
+    fx.tracker.record_full_check(_CAR, [_record("GE1")], complete=True, at=_T0)
+    _make_unverified(fx, "GE2")
+    _make_unverified(fx, "GE3")
+    fx.subscribe(task)
+
+    await fx.service.run_once()
+    assert [text for _, text in fx.sender.sent if "GE1" in text] and len(fx.sender.sent) == 1
+
+    fx.tracker.record_full_check(_CAR, [_record("GE1"), _record("GE2")], complete=True, at=_T0 + timedelta(hours=1))
+    await fx.service.run_once()
+    assert len(fx.sender.sent) == 2 and "GE2" in fx.sender.sent[-1][1]
+
+    fx.tracker.record_full_check(_CAR, [_record("GE1"), _record("GE2")], complete=True, at=_T0 + timedelta(hours=14))
+    await fx.service.run_once()
+    assert len(fx.sender.sent) == 2
+    assert not any("GE3" in text for _, text in fx.sender.sent)
+
+
+async def test_unverified_history_with_a_manager_mark_is_not_announced_either(fx):
+    """Отметка менеджера (🟡 — оплата не прошла) не подтверждает, что
+    police.ge квитанцию ещё показывает: "новым штрафом" она тоже не уходит."""
+    task = fx.task()
+    fx.fine(task, "GE1")
+    status = _make_unverified(fx, "GE1")
+    fx.tracker.mark_needs_review(status.id, actor_user_id=1, note="ჯარიმის გადახდა ვერ მოხერხდა!")
+    fx.subscribe(task)
+
+    await fx.service.run_once()
+
+    assert fx.sender.sent == []

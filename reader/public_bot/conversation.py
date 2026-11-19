@@ -101,6 +101,7 @@ from zoneinfo import ZoneInfo
 from reader.fines.models import OneOffCheckResult
 from reader.fines.payment_status import (
     DISPLAY_GONE,
+    DISPLAY_UNVERIFIED,
     MIA_PAYMENT_FAILED_MESSAGE,
     PAYMENT_NEEDS_REVIEW,
     PAYMENT_PAID,
@@ -111,10 +112,12 @@ from reader.fines.payment_status import (
     FineStatus,
     FineStatusTracker,
     PaymentPageVerdict,
+    breakdown_of,
     classify_payment_page_text,
     clean_note,
     payment_status_for_verdict,
 )
+from reader.fines.suppression import is_fine_output_suppressed
 from reader.fines.validation import FineValidationError, looks_like_car_number, normalize_car_number
 from reader.plate_display import format_plate_for_telegram
 from reader.public_bot import manager_alerts, texts
@@ -673,6 +676,19 @@ class ConversationController:
     def _owner_cta_buttons(self) -> list[list[tuple[str, str]]]:
         url = f"https://t.me/{self._payment_help_contact_username}"
         return [[("💳 Оплатить в рублях", url), ("🚗 ОСАГО Грузии", url)]]
+
+    def _unverified_totals(self, car_number: str) -> dict:
+        """⏳ номера для подписчика ({unverified_count, unverified_amount} —
+        kwargs текстов): квитанции из истории, чьё присутствие police.ge ещё
+        не подтвердил; новыми штрафами они не приходят (см.
+        ClientDeliveryService), поэтому показываются отдельной строкой.
+        Пусто без статусов и для скрытых номеров (suppression)."""
+        if self._fine_status is None or is_fine_output_suppressed(car_number):
+            return {}
+        breakdown = breakdown_of(self._fine_status.statuses_for_car(car_number, include_gone=False))
+        if not breakdown.unverified_count:
+            return {}
+        return {"unverified_count": breakdown.unverified_count, "unverified_amount": breakdown.unverified_amount}
 
     def _today(self) -> date:
         return datetime.now(timezone.utc).astimezone(self._tz).date()
@@ -2669,6 +2685,7 @@ class ConversationController:
                 check_ok=outcome.check_ok,
                 new_fines_count=outcome.new_fines_count,
                 provider_unavailable=outcome.provider_unavailable,
+                **(self._unverified_totals(car_number) if outcome.check_ok else {}),
             ),
             manager_alert_text=manager_alert_text,
             manager_alert_buttons=manager_alert_buttons,
@@ -2707,6 +2724,7 @@ class ConversationController:
                 new_fines_count=outcome.new_fines_count,
                 pending_claim=outcome.pending_claim,
                 claim_link=outcome.claim_link,
+                **(self._unverified_totals(car_number) if outcome.check_ok else {}),
             )
         )
 
@@ -2725,6 +2743,7 @@ class ConversationController:
                 car_number=car_number,
                 check_ok=outcome.check_ok,
                 new_fines_count=outcome.new_fines_count,
+                **(self._unverified_totals(car_number) if outcome.check_ok else {}),
             )
         )
 
@@ -2769,12 +2788,17 @@ class ConversationController:
                 protocol_no: status.display_status
                 for protocol_no, status in self._fine_status.statuses_by_protocol(outcome.car_number).items()
             }
+        # ⏳ (из кэша) к оплате не предлагается, как 🟢 и ⚪.
         has_payable = statuses is None or any(
-            statuses.get(fine.external_fine_id or "", PAYMENT_UNPAID) not in (PAYMENT_PAID, DISPLAY_GONE)
+            statuses.get(fine.external_fine_id or "", PAYMENT_UNPAID)
+            not in (PAYMENT_PAID, DISPLAY_GONE, DISPLAY_UNVERIFIED)
             for fine in outcome.fines
         )
         cta = self._owner_cta_buttons() if outcome.is_owner and outcome.fines and has_payable else None
-        return BotReply(text=texts.format_check_now_result(outcome, statuses=statuses), cta_buttons=cta)
+        unverified = self._unverified_totals(outcome.car_number) if outcome.check_ok else {}
+        return BotReply(
+            text=texts.format_check_now_result(outcome, statuses=statuses, **unverified), cta_buttons=cta,
+        )
 
     async def handle_my_car_check_now_once(
         self, subscription_id: int, *, telegram_user_id: int,

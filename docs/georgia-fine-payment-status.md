@@ -206,8 +206,17 @@ Client delivery:
   this, a receipt stored under two tasks of a plate reached the same
   subscription twice (5 cases in production).
 - No such message for a ⚪ receipt (2 cases in production).
-  - A receipt missing only once, or ⏳ from history, is still delivered, as
-    before.
+- No such message for a ⏳ receipt either (history whose presence no new
+  check has confirmed, whatever its manager mark). It goes out on the next
+  tick after a check or the feed finds it again; after ⚪, never. The
+  subscriber sees ⏳ on its own line instead: «⏳ Ждут повторной проверки
+  police.ge: N ₾ (K шт.) — в сумму к оплате не входят», at the bottom of
+  the add-car summary (owner and trusted variants) and of «🔎 Проверить
+  сейчас», also under «штрафов не найдено». A ⏳ receipt that reaches
+  «Проверить сейчас» from the cache gets its ⏳ label, stays out of «К
+  оплате» and alone brings no payment buttons. Suppressed plates show no ⏳
+  line.
+  - A receipt missing only once is still delivered, as before.
 - In the Georgian bot only, if the operator was already notified about a
   receipt through another task, the new task's row is created as already
   notified. The operator process (`reader/main.py`) keeps its old behaviour.

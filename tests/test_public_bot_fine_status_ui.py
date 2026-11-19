@@ -180,6 +180,77 @@ async def test_check_now_uncertain_payment_stays_in_amount_to_pay(fx):
     assert reply.cta_buttons
 
 
+async def test_check_now_shows_unverified_history_separately_not_in_amount_to_pay(fx):
+    """⏳ (история, присутствие police.ge ещё не подтвердил) новым штрафом
+    подписчику не приходит — в "Проверить сейчас" она отдельной строкой и в
+    "К оплате" не входит."""
+    task, subscription = fx.car(_CAR, [("GE1", 50)], owner=_OWNER)
+    _make_unverified(fx, "OLD1", 30)
+    _make_unverified(fx, "OLD2", 20)
+
+    reply = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=_OWNER)
+
+    assert "💰 К оплате: 50 ₾" in reply.text
+    assert "⏳ Ждут повторной проверки police.ge: 50 ₾ (2 шт.) — в сумму к оплате не входят" in reply.text
+    assert reply.text.rstrip().endswith("в сумму к оплате не входят")
+
+
+async def test_check_now_without_fines_still_shows_unverified_history(fx):
+    task, subscription = fx.car(_CAR, [], owner=_OWNER)
+    _make_unverified(fx, "OLD1", 30)
+
+    reply = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=_OWNER)
+
+    assert reply.text.startswith(texts.format_no_fines_found(_CAR))
+    assert "⏳ Ждут повторной проверки police.ge: 30 ₾ (1 шт.)" in reply.text
+    assert fx.status(_CAR, "OLD1").presence == "unverified"  # одна проверка — ещё не ⚪
+
+
+async def test_cached_unverified_receipt_is_labelled_and_not_offered_for_payment(fx):
+    """Из кэша (police.ge недоступен) в список может попасть ⏳: у неё своя
+    метка, в "К оплате" она не входит, и кнопок оплаты только из-за неё нет."""
+    task, subscription = fx.car(_CAR, [("OLD1", 30)], owner=_OWNER)
+    outcome = await fx.subscription_service.check_now(subscription.id, telegram_user_id=_OWNER)
+    fx.tracker._repository._conn.execute(
+        "UPDATE georgia_fine_status SET presence = 'unverified' WHERE id = ?", (fx.status(_CAR, "OLD1").id,),
+    )
+    fx.tracker._repository._conn.commit()
+
+    reply = fx.controller._format_check_now_outcome_reply(outcome)
+
+    assert "Статус: ⏳ Ждёт повторной проверки police.ge" in reply.text
+    assert "💰 К оплате: 0 ₾" in reply.text
+    assert "⏳ Ждут повторной проверки police.ge: 30 ₾ (1 шт.)" in reply.text
+    assert reply.cta_buttons is None
+
+
+async def test_unverified_line_is_hidden_for_suppressed_plates_and_without_statuses(fx, tmp_path, monkeypatch):
+    fx.car(_CAR, [])
+    _make_unverified(fx, "OLD1", 30)
+    assert fx.controller._unverified_totals(_CAR) == {"unverified_count": 1, "unverified_amount": 30}
+
+    monkeypatch.setattr("reader.public_bot.conversation.is_fine_output_suppressed", lambda car: car == _CAR)
+    assert fx.controller._unverified_totals(_CAR) == {}
+
+    fixture = _Fixture(tmp_path / "plain", with_statuses=False)
+    assert fixture.controller._unverified_totals(_CAR) == {}
+    fixture.close()
+
+
+def test_add_car_summaries_show_unverified_history_on_its_own_line():
+    common = {"car_number": _CAR, "check_ok": True, "new_fines_count": 1}
+    line = "⏳ Ждут повторной проверки police.ge: 30 ₾ (1 шт.) — в сумму к оплате не входят"
+    unverified = {"unverified_count": 1, "unverified_amount": 30.0}
+
+    assert texts.format_add_car_summary(**common, **unverified).endswith(line)
+    assert texts.format_delegated_add_car_without_client_summary(**common, **unverified).endswith(line)
+    delegated = texts.format_delegated_add_car_summary(
+        **common, owner_username="client", pending_claim=False, claim_link=None, **unverified,
+    )
+    assert delegated.endswith(line)
+    assert "⏳" not in texts.format_add_car_summary(**common)
+
+
 async def test_check_now_without_statuses_keeps_old_format(tmp_path):
     fixture = _Fixture(tmp_path, with_statuses=False)
     task, subscription = fixture.car(_CAR, [("GE1", 50)], owner=_OWNER)

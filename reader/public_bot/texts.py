@@ -216,7 +216,9 @@ _TRUSTED_STOP_CONFIRM_BUTTON_NO_CLIENTS = "⛔ Остановить"
 _TRUSTED_STOP_CONFIRM_BUTTON_WITH_CLIENTS = "⛔ Остановить для всех"
 
 
-def format_check_now_result(outcome, *, statuses: dict[str, str] | None = None) -> str:
+def format_check_now_result(
+    outcome, *, statuses: dict[str, str] | None = None, unverified_count: int = 0, unverified_amount: float = 0.0,
+) -> str:
     """outcome: reader.public_bot.subscription_service.CheckNowOutcome.
     Без технической детали ошибки в тексте клиенту (см. design: та же
     осторожность, что и в format_add_car_summary/
@@ -241,8 +243,13 @@ def format_check_now_result(outcome, *, statuses: dict[str, str] | None = None) 
             f"⚠️ Проверить штрафы для {format_plate_for_telegram(outcome.car_number)} "
             "сейчас не удалось. Попробуйте позже."
         )
+    # ⏳ машины (см. ClientDeliveryService: как новые штрафы они не
+    # приходят) — отдельной строкой в самом низу, в "К оплате" не входят.
+    unverified_line = (
+        f"\n\n{format_unverified_line(unverified_count, unverified_amount)}" if unverified_count else ""
+    )
     if not outcome.fines:
-        return format_no_fines_found(outcome.car_number)
+        return format_no_fines_found(outcome.car_number) + unverified_line
     if statuses is None:
         return format_check_now_fines_message(car_number=outcome.car_number, fines=outcome.fines)
     # statuses — {protocolNo: display_status} (см. FineStatus.display_status):
@@ -254,7 +261,7 @@ def format_check_now_result(outcome, *, statuses: dict[str, str] | None = None) 
         if fine.external_fine_id
     }
     blocks = format_check_now_fines_message(car_number=outcome.car_number, fines=outcome.fines, status_labels=labels)
-    return f"{blocks}\n\n{format_check_now_status_summary(outcome.fines, statuses)}"
+    return f"{blocks}\n\n{format_check_now_status_summary(outcome.fines, statuses)}{unverified_line}"
 
 
 # ==== Статусы оплаты (см. reader/fines/payment_status.py) ====
@@ -272,12 +279,23 @@ def fine_status_label(display_status: str) -> str:
     return FINE_STATUS_LABELS.get(display_status, FINE_STATUS_LABELS[PAYMENT_UNPAID])
 
 
+def format_unverified_line(count: int, amount: float) -> str:
+    """⏳ подписчику — квитанции из истории, чьё присутствие police.ge ещё не
+    подтвердил: новыми штрафами они не приходят (см. ClientDeliveryService),
+    поэтому показываются отдельно и в сумму к оплате не входят."""
+    return (
+        f"⏳ Ждут повторной проверки police.ge: {_format_search_amount(amount)} ({count} шт.) — "
+        "в сумму к оплате не входят"
+    )
+
+
 def format_check_now_status_summary(fines: list[NewFineEvent], statuses: dict[str, str]) -> str:
     """Итог под результатом "🔎 Проверить сейчас": из суммы к оплате
-    исключены только подтверждённо оплаченные (🟢) — 🟡 (оплата не прошла
-    по неизвестной причине) остаётся долгом и показывается отдельной
-    строкой "из них"; ⚪ (может попасть сюда только из кэша при
-    недоступности police.ge) в сумму не входит."""
+    исключены подтверждённо оплаченные (🟢) — 🟡 (оплата не прошла по
+    неизвестной причине) остаётся долгом и показывается отдельной строкой
+    "из них"; ⚪ и ⏳ (могут попасть сюда только из кэша при недоступности
+    police.ge) в сумму не входят — ⏳ показывается отдельной строкой ниже
+    (см. format_check_now_result)."""
     to_pay = paid = review = 0.0
     paid_count = review_count = 0
     for fine in fines:
@@ -286,7 +304,7 @@ def format_check_now_status_summary(fines: list[NewFineEvent], statuses: dict[st
         if status == PAYMENT_PAID:
             paid += amount
             paid_count += 1
-        elif status == DISPLAY_GONE:
+        elif status in (DISPLAY_GONE, DISPLAY_UNVERIFIED):
             continue
         else:
             to_pay += amount
@@ -335,6 +353,8 @@ def format_add_car_summary(
     check_ok: bool,
     new_fines_count: int,
     provider_unavailable: bool = False,
+    unverified_count: int = 0,
+    unverified_amount: float = 0.0,
 ) -> str:
     """Итог Add Car flow, показываемый клиенту — не путать с операторским
     reader/commands/fine.py::_format_add_summary (другой текст/аудитория,
@@ -383,7 +403,14 @@ def format_add_car_summary(
         "",
         f"🚗 {formatted_car_number}",
         _format_add_car_check_line(new_fines_count),
+        *_unverified_lines(unverified_count, unverified_amount),
     ])
+
+
+def _unverified_lines(count: int, amount: float) -> list[str]:
+    """⏳ номера в итоге добавления машины: новыми штрафами эти квитанции
+    подписчику не приходят (см. ClientDeliveryService)."""
+    return [format_unverified_line(count, amount)] if count else []
 
 
 def _format_add_car_check_line(new_fines_count: int) -> str:
@@ -400,6 +427,8 @@ def format_delegated_add_car_summary(
     new_fines_count: int,
     pending_claim: bool,
     claim_link: str | None,
+    unverified_count: int = 0,
+    unverified_amount: float = 0.0,
 ) -> str:
     """Итог trusted-operator delegated Add Car flow — показывается
     ТОЛЬКО trusted-оператору (владельцу это же событие ничего не
@@ -422,6 +451,7 @@ def format_delegated_add_car_summary(
             f"🚗 {formatted_car_number}",
             f"👤 Владелец: @{owner_username}",
             _format_add_car_check_line(new_fines_count),
+            *_unverified_lines(unverified_count, unverified_amount),
         ]
 
     if pending_claim and claim_link:
@@ -443,6 +473,8 @@ def format_delegated_add_car_without_client_summary(
     car_number: str,
     check_ok: bool,
     new_fines_count: int,
+    unverified_count: int = 0,
+    unverified_amount: float = 0.0,
 ) -> str:
     """Итог trusted-operator delegated Add Car БЕЗ клиента ("Отмена" на
     ADD_CLIENT_DECISION_PROMPT) — как format_delegated_add_car_summary, но
@@ -463,6 +495,7 @@ def format_delegated_add_car_without_client_summary(
         "",
         f"🚗 {formatted_car_number}",
         _format_add_car_check_line(new_fines_count),
+        *_unverified_lines(unverified_count, unverified_amount),
     ])
 
 
