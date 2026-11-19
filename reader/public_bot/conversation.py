@@ -692,14 +692,16 @@ class ConversationController:
         return [[("💳 Оплатить в рублях", url), ("🚗 ОСАГО Грузии", url)]]
 
     def _manager_statuses(self, car_number: str) -> dict[str, str] | None:
-        """{protocolNo: display_status} для экранов менеджера с суммой
+        """{protocolNo: payment_status} для экранов менеджера с суммой
         штрафов из живой проверки ("🔎 Поиск", разовая проверка): 🟢 в сумму
-        не входит (см. texts.format_search_money_line). None — статусы не
-        ведутся."""
+        не входит (см. texts.format_search_money_line). Отметка оплаты, а не
+        отображаемый статус: разовая проверка статусы не пишет, и 🟢,
+        вернувшийся после ⚪, иначе остался бы 'gone' и попал в сумму. None —
+        статусы не ведутся."""
         if self._fine_status is None:
             return None
         return {
-            protocol_no: status.display_status
+            protocol_no: status.payment_status
             for protocol_no, status in self._fine_status.statuses_by_protocol(car_number).items()
         }
 

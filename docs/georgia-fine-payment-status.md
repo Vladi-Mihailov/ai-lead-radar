@@ -254,10 +254,14 @@ Client delivery:
   so every other fine police.ge just returned counts (a ⚪ or ⏳ status there
   only means its write failed).
 - Statistics at first start: seeding records the snapshot's time as the
-  plate's last full check when the seeded receipts (with any payment mark)
-  add up to the snapshot, so a 🟢 mark leaves «Задолженность» at once even
-  on plates not checked since the transition. In production all 29 cars of
-  the old debt list are explained this way. Deliberate exception: a saved
+  plate's last full check when every receipt of the snapshot check's answer
+  is among the statuses still in the police base (with any payment mark)
+  and they add up to the snapshot, so a 🟢 mark leaves «Задолженность» at
+  once even on plates not checked since the transition. The match is by
+  receipt, not by sum: on a later start, a newer snapshot from a check
+  without statuses (its receipts ⏳ or without a status) or other receipts
+  (feed finds, 🟢) never pass for it. In production all 29 cars of the old
+  debt list are explained this way. Deliberate exception: a saved
   total that is newer than the statuses (a check without statuses) or not
   explained by them is still shown whole, possibly including a 🟢 receipt,
   until the next full check — so that a new fine that took the paid one's

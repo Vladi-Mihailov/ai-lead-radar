@@ -566,3 +566,30 @@ def test_seeding_makes_statuses_current_only_where_they_explain_the_snapshot(leg
     assert by_car["AA111BB"].unpaid_amount == 50 and by_car["AA111BB"].paid_amount == 100
     assert by_car["GG777HH"].unpaid_amount == 150  # страховка: показан снимок
     repository.close()
+
+
+def test_restart_does_not_take_a_newer_snapshot_from_a_check_without_statuses_as_explained(legacy):
+    """Обзор f2dc7c6: при перезапуске устаревшая 🟢 'listed' не должна
+    "объяснить" снимок более новой проверки без статусов, чьи квитанции в
+    статусах ⏳ — иначе их долг пропал бы из «Задолженности»."""
+    task = legacy.task("HH888JJ", snapshot=0, checked_at="2026-11-16 10:00:00")
+    legacy.fine(task, "GE10", 100, last_seen="2026-11-17 10:00:00")  # найдена feed'ом после нулевой проверки
+    old = legacy.fine(task, "GE11", 80, last_seen="2026-11-01 10:00:00")  # история — ⏳
+    repository = FineStatusRepository(legacy.db_path)
+    tracker = FineStatusTracker(repository)
+    tracker.seed_from_detected_fines()
+    statuses = tracker.statuses_by_protocol("HH888JJ")
+    assert statuses["GE10"].presence == PRESENCE_LISTED and statuses["GE11"].presence == PRESENCE_UNVERIFIED
+    tracker.mark_paid(statuses["GE10"].id, actor_user_id=_TRUSTED, note="TBC 1")
+    # проверка без статусов (сбой записи статусов / операторский процесс) нашла GE11
+    legacy._sql("UPDATE fine_monitoring_tasks SET last_successful_total_amount = 80, "
+                "last_successful_checked_at = '2026-11-18 10:00:00' WHERE id = ?", task.id)
+    legacy._sql("UPDATE detected_fines SET last_seen_at = '2026-11-18 10:00:00' WHERE id = ?", old.id)
+
+    tracker.seed_from_detected_fines()  # перезапуск
+
+    assert "HH888JJ" not in tracker.last_full_check_by_car(["HH888JJ"])
+    rows, _ = _controller(legacy, tracker)._debt_rows_with_statuses(legacy.tasks.list_debt_car_groups())
+    by_car = {car: breakdown for car, _, breakdown in rows}
+    assert by_car["HH888JJ"].unpaid_amount == 80  # страховка: снимок, а не 0 ₾
+    repository.close()

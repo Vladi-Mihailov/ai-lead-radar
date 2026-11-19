@@ -915,3 +915,21 @@ async def test_trusted_one_off_check_leaves_paid_fines_out_of_the_total(fx):
     reply = fx.controller._format_one_off_reply(result)
 
     assert "💰 Штрафы: 50 ₾ (🟢 оплачено: 100 ₾)" in reply.text
+
+
+async def test_trusted_one_off_check_leaves_out_a_paid_receipt_back_after_gone(fx):
+    """Разовая проверка статусы не пишет: 🟢, ушедший в ⚪ и снова показанный
+    police.ge, остаётся 'gone' в статусах, но в сумму всё равно не входит."""
+    task, _ = fx.car(_CAR, [("GE1", 50), ("GE2", 100)])
+    await fx.check(task)
+    paid = fx.status(_CAR, "GE2")
+    fx.tracker.mark_paid(paid.id, actor_user_id=_TRUSTED, note="TBC 1")
+    fx.tracker._repository._conn.execute("UPDATE georgia_fine_status SET presence = 'gone' WHERE id = ?", (paid.id,))
+    fx.tracker._repository._conn.commit()
+    fx.tasks._conn.execute("UPDATE fine_monitoring_tasks SET status = 'stopped' WHERE id = ?", (task.id,))
+    fx.tasks._conn.commit()
+
+    result = await fx.check_service.check_plate_readonly(_CAR)
+    reply = fx.controller._format_one_off_reply(result)
+
+    assert "💰 Штрафы: 50 ₾ (🟢 оплачено: 100 ₾)" in reply.text

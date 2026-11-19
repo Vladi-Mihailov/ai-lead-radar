@@ -645,6 +645,9 @@ class FineStatusRepository:
                 debt_reference[car_number] = (checked_at, task_id)
                 reference_total[car_number] = total
         seeds: dict[tuple[str, str], dict] = {}
+        # номер -> {protocolNo: сумма} — последний ответ задачи-опоры (тот,
+        # из которого сложилась сумма снимка прежней статистики)
+        reference_answer: dict[str, dict[str, float | None]] = {}
         rows = self._conn.execute(
             "SELECT monitoring_task_id, external_fine_id, amount, first_detected_at, last_seen_at "
             "FROM detected_fines WHERE external_fine_id IS NOT NULL AND external_fine_id != ''"
@@ -658,15 +661,17 @@ class FineStatusRepository:
             latest = latest_check.get(car_number)
             listed = latest is not None and seen_at >= latest - SNAPSHOT_TOLERANCE
             reference = debt_reference.get(car_number)
-            if not listed and reference is not None and reference[1] == task_id:
-                # Строка из последнего ответа задачи, на снимке которой стоит
-                # прежняя статистика долга (была до этой проверки или создана
-                # ею самой, а не найдена feed'ом позже).
-                reference_at = reference[0]
-                listed = (
-                    seen_at >= reference_at - SNAPSHOT_TOLERANCE
-                    and first_at <= reference_at + _SAME_CHECK_WINDOW
-                )
+            # Строка из последнего ответа задачи, на снимке которой стоит
+            # прежняя статистика долга (была до этой проверки или создана ею
+            # самой, а не найдена feed'ом позже).
+            in_reference_answer = (
+                reference is not None and reference[1] == task_id
+                and seen_at >= reference[0] - SNAPSHOT_TOLERANCE
+                and first_at <= reference[0] + _SAME_CHECK_WINDOW
+            )
+            if in_reference_answer:
+                listed = True
+                reference_answer.setdefault(car_number, {})[protocol_no] = amount
             seed = seeds.setdefault((car_number, protocol_no), {
                 "amount": amount, "first_at": first_at, "seen_at": seen_at, "listed": False,
             })
@@ -692,23 +697,31 @@ class FineStatusRepository:
                     created += 1
                     self._log(cursor.lastrowid, "seeded" if listed else "seeded_unverified",
                               SOURCE_CHECK, None, None, at)
-            # Снимок, на котором стоит прежняя статистика долга, — та же
-            # проверка, из которой выросли статусы номера. Если её квитанции в
-            # базе полиции (с любой отметкой оплаты) объясняют сумму снимка,
-            # статусы актуальны на её время: иначе отметка 🟢 у номера, не
-            # проверенного после перехода, в статистике не действовала бы
-            # (страховка "снимок новее статусов", см. conversation.
-            # _snapshot_has_unexplained_debt). Не объясняют — страховка
-            # остаётся; настоящее время полной проверки не перезаписывается.
+            # Снимок, на котором стоит прежняя статистика долга, — проверка,
+            # из ответа которой выросли статусы номера. Если КАЖДАЯ квитанция
+            # этого ответа есть среди статусов в базе полиции (с любой
+            # отметкой оплаты) и они дают сумму снимка, статусы актуальны на
+            # его время: иначе отметка 🟢 у номера, не проверенного после
+            # перехода, в статистике не действовала бы (страховка "снимок
+            # новее статусов", см. conversation._snapshot_has_unexplained_debt).
+            # Сверка по квитанциям, а не по суммам: снимок более новой
+            # проверки без статусов (её квитанции — ⏳ или вовсе без статуса)
+            # и чужие квитанции (feed, 🟢) страховку не снимают. Не сошлось —
+            # страховка остаётся; настоящее время полной проверки не
+            # перезаписывается.
             for car_number, (reference_at, _task_id) in debt_reference.items():
-                if is_fine_output_suppressed(car_number):
+                answer = reference_answer.get(car_number)
+                if not answer or is_fine_output_suppressed(car_number):
                     continue
-                listed_sum = self._conn.execute(
-                    "SELECT COALESCE(SUM(amount), 0) FROM georgia_fine_status "
-                    "WHERE car_number = ? AND presence IN (?, ?)",
-                    (car_number, PRESENCE_LISTED, PRESENCE_MISSING),
-                ).fetchone()[0]
-                if listed_sum + 0.005 >= reference_total[car_number]:
+                if sum(amount or 0.0 for amount in answer.values()) + 0.005 < reference_total[car_number]:
+                    continue
+                presence_by_protocol = dict(self._conn.execute(
+                    "SELECT protocol_no, presence FROM georgia_fine_status WHERE car_number = ?", (car_number,),
+                ).fetchall())
+                if all(
+                    presence_by_protocol.get(protocol_no) in (PRESENCE_LISTED, PRESENCE_MISSING)
+                    for protocol_no in answer
+                ):
                     self._conn.execute(
                         "INSERT OR IGNORE INTO georgia_fine_plate_checks (car_number, last_full_check_at) "
                         "VALUES (?, ?)",
