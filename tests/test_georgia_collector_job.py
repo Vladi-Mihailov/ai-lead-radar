@@ -1422,6 +1422,40 @@ async def test_jump_past_the_end_of_the_feed_still_reads_the_rows_between(tmp_pa
     assert _unseen(feed, seen_repo) == []
 
 
+async def test_horizon_page_met_while_searching_is_an_overshoot_not_the_end(tmp_path):
+    """A region whose row count is far too high sends the search onto
+    yesterday's rows (a horizon page). That only says the jump went too far:
+    the 180 unread rows between the region and the horizon must not be
+    declared done. The recovery jumps back, finally reads the region in
+    order (counting it), keeps the progress and completes next cycle."""
+    from reader.fines.public_feed_state_repository import ReadRegion
+
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
+    feed_state_repo, seen_repo = await _first_run_before_the_outage(tmp_path, production, feed)
+    rows = _with_matches(_rows("G", 300, publish_date="2026-10-22"), {250: "M_BETWEEN"})
+    feed.publish(rows)
+    _mark_seen_at(seen_repo, rows[:120], seen_at=_utc(15))
+    names = [row["protocolNo"] for row in rows]
+    feed_state_repo.record_recovery_regions([
+        ReadRegion(top=tuple(names[:30]), bottom=tuple(names[90:120]), length=380, updated_at="x"),
+    ])
+    feed_state_repo.record_error("cycle in progress", at=_utc(15))
+
+    # 360: yesterday's rows (horizon) — too far; 330: rows of the last success
+    # — too far; 270, 150: unread rows — too far; back at the region's first
+    # page: read it in order from 0.
+    assert await _cycle(tmp_path, feed, production, _utc(21), cap=10) == [0, 360, 330, 270, 150, 0, 30, 60, 90, 120]
+    state = feed_state_repo.get()
+    assert state.last_error is not None
+    [region] = state.recovery_regions
+    assert (region.length, region.top[0], region.bottom[-1]) == (150, "G000", "G149")
+
+    assert await _cycles_until_success(tmp_path, feed, production, feed_state_repo, seen_repo, cap=10) == 1
+    assert _unseen(feed, seen_repo) == []
+    assert _submitted(production) == ["M_BETWEEN"]
+
+
 async def test_next_region_right_below_is_recognised_although_the_last_end_anchor_sits_elsewhere(tmp_path):
     """The last end-anchor of a region can be a row that sits elsewhere
     (rows a burst pushed into view are counted last), so its end is not

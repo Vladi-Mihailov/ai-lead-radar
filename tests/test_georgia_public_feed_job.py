@@ -2179,6 +2179,41 @@ async def test_jump_past_the_end_of_the_feed_still_reads_the_rows_between(tmp_pa
         repos.close()
 
 
+async def test_horizon_page_met_while_searching_is_an_overshoot_not_the_end(tmp_path):
+    """Участок с сильно завышенным числом строк отправляет поиск на
+    вчерашние строки (страницу горизонта). Это значит только "перелетели":
+    180 непрочитанных строк между участком и горизонтом не объявляются
+    прочитанными. Восстановление возвращается выше, в итоге читает участок
+    по порядку (пересчитывая его), сохраняет продвижение и завершается
+    следующим циклом."""
+    from reader.fines.public_feed_state_repository import ReadRegion
+
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        rows = _with_matches(_rows("G", 300, publish_date="2026-10-22"), {250: "M_BETWEEN"})
+        feed.publish(rows)
+        _mark_seen_at(repos.seen_repo, rows[:120], seen_at=_utc(15))
+        names = [row["protocolNo"] for row in rows]
+        repos.feed_state_repo.record_recovery_regions([
+            ReadRegion(top=tuple(names[:30]), bottom=tuple(names[90:120]), length=380, updated_at="x"),
+        ])
+        repos.feed_state_repo.record_error("cycle in progress", at=_utc(15))
+
+        assert await repos.cycle(feed, _utc(21), cap=10) == [0, 360, 330, 270, 150, 0, 30, 60, 90, 120]
+        state = repos.feed_state_repo.get()
+        assert state.last_error is not None
+        [region] = state.recovery_regions
+        assert (region.length, region.top[0], region.bottom[-1]) == (150, "G000", "G149")
+
+        assert await repos.cycles_until_success(feed, cap=10) == 1
+        assert repos.unseen(feed) == []
+        assert repos.persisted == ["M_BETWEEN"]
+    finally:
+        repos.close()
+
+
 async def test_next_region_right_below_is_recognised_although_the_last_end_anchor_sits_elsewhere(tmp_path):
     """Последний номер конца участка может быть строкой, стоящей в другом
     месте (строки, выдвинутые пачкой, считаются последними), — конец не
