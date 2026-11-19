@@ -2307,6 +2307,7 @@ async def test_end_jump_is_confirmed_only_by_the_region_end_numbers_after_rows_v
         feed = _feed_before_the_outage()
         await repos.first_run_before_the_outage(feed)
         rows = _with_matches(_rows("G", 300, publish_date="2026-10-22"), {135: "M_GAP"})
+        rows[140] = _entry(protocol_no="G100", plate="ZZ100ZZ", publish_date="2026-10-22")  # repeats an end number
         feed.publish(rows)
         assert await repos.cycle(feed, _utc(15), cap=4) == [0, 30, 60, 90]
         _mark_seen_at(repos.seen_repo, rows[150:], seen_at=_utc(15))
@@ -2348,6 +2349,67 @@ async def test_foreign_seen_row_on_the_landing_page_does_not_confirm_the_end_jum
         assert repos.feed_state_repo.get().last_error is None
         assert repos.unseen(feed) == []
         assert repos.persisted == ["M_GAP"]
+    finally:
+        repos.close()
+
+
+async def test_unread_row_inside_an_accepted_region_undoes_the_acceptance(tmp_path):
+    """Участок, принятый по первым строкам (G000, G001), показывает
+    непрочитанную строку там, где должны идти его строки: принятие
+    отменяется. Его строки считаются обычными, прочитанными подряд, он
+    остаётся в списке, а записанное продвижение — ровно прочитанное."""
+    from reader.fines.public_feed_state_repository import ReadRegion
+
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        tops = _rows("G", 30, publish_date="2026-10-22")
+        feed.publish(tops + _with_matches(_rows("H", 90, publish_date="2026-10-22"), {50: "M_AFTER"}))
+        _mark_seen_at(repos.seen_repo, tops, seen_at=_utc(15))
+        repos.feed_state_repo.record_recovery_regions([
+            ReadRegion(top=tuple(row["protocolNo"] for row in tops),
+                       bottom=tuple(f"G{i:03d}" for i in range(30, 60)), length=60,
+                       updated_at=_utc(15).isoformat()),
+        ])
+        repos.feed_state_repo.record_error("cycle in progress", at=_utc(15))
+
+        assert await repos.cycle(feed, _utc(21), cap=2) == [0, 30]
+        upper, lower = repos.feed_state_repo.get().recovery_regions
+        assert (upper.length, upper.bottom[0], upper.bottom[-1]) == (60, "G000", "H029")
+        assert (lower.length, lower.top[0]) == (60, "G000")
+
+        assert await repos.cycles_until_success(feed, cap=10) == 1
+        assert repos.unseen(feed) == []
+        assert repos.persisted == ["M_AFTER"]
+    finally:
+        repos.close()
+
+
+async def test_cycle_killed_while_persisting_a_match_leaves_the_row_unread_and_the_match_is_not_lost(tmp_path):
+    """Строка отмечается увиденной ПОСЛЕ записи совпадения: процесс,
+    остановленный посреди записи, оставляет строку непрочитанной, и
+    следующий цикл записывает совпадение (повтор отсеял бы fingerprint)."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_with_matches(_rows("G", 40, publish_date="2026-10-22"), {10: "M_KILLED"}))
+        job, _provider = _make_job(feed, repos.task_repo, repos.fine_repo, repos.feed_state_repo, repos.seen_repo)
+        original = job._check_service.persist_feed_match
+
+        async def killed(task, record):
+            raise asyncio.CancelledError
+
+        job._check_service.persist_feed_match = killed
+        with pytest.raises(asyncio.CancelledError):
+            await job.run(_utc(15))
+        assert not repos.seen_repo.is_seen("M_KILLED")
+        job._check_service.persist_feed_match = original
+
+        await repos.cycle(feed, _utc(21))
+        assert repos.persisted == ["M_KILLED"]
+        assert repos.unseen(feed) == []
     finally:
         repos.close()
 

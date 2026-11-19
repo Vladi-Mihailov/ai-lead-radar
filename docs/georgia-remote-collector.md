@@ -149,8 +149,16 @@ A jump is trusted only after the region's last rows are found by their
 numbers, so nothing is skipped, even when publications arrive during the
 cycle.
 
-Protocol numbers are assumed unique. As in every mode before regions, a new
-row that re-uses a number already seen counts as processed. So that a
+Assumption, the same one FAST and the DEEP horizon rely on (not a fact):
+new rows are never inserted inside a region already read, so skipping the
+region skips no new row. Production shows the order is not strictly by
+publication time: in the 19.11 17:00 FAST cycle, a row seen earlier stood
+above new rows; old receipts seem to be shown again near the top. That is
+why a single seen row never counts as proof here; only an unread row means
+"past the region's end". New rows inserted inside a region would be missed.
+
+Protocol numbers are also assumed unique. As in every mode before regions,
+a new row that re-uses a number already seen counts as processed. So that a
 repeated number cannot stand in for a region, the traversal requires two
 adjacent numbers:
 - a region is accepted only when two adjacent rows match two consecutive

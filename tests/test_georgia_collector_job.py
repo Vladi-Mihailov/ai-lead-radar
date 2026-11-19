@@ -1573,14 +1573,16 @@ async def test_repeated_number_mid_page_does_not_poison_the_saved_region(tmp_pat
 
 async def test_end_jump_is_confirmed_only_by_the_region_end_numbers_after_rows_vanished(tmp_path):
     """40 rows inside the region vanished, so the jump to its last row lands
-    past its end, on 20 unread rows followed by rows an earlier attempt read
-    (seen, but not the region's). Seen rows confirm nothing: the recovery
+    past its end, on 20 unread rows (one re-uses an end number of the region)
+    followed by rows an earlier attempt read. Neither a seen row nor a
+    single end number confirms anything: the recovery
     reads on in order from where it found the region's end, and the unread
     rows (with a match) are not jumped over."""
     production = _FakeProductionClient(active_plates=["AA001AA"])
     feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
     feed_state_repo, seen_repo = await _first_run_before_the_outage(tmp_path, production, feed)
     rows = _with_matches(_rows("G", 300, publish_date="2026-10-22"), {135: "M_GAP"})
+    rows[140] = _entry(protocol_no="G100", plate="ZZ100ZZ", publish_date="2026-10-22")  # repeats an end number
     feed.publish(rows)
     assert await _cycle(tmp_path, feed, production, _utc(15), cap=4) == [0, 30, 60, 90]
     _mark_seen_at(seen_repo, rows[150:], seen_at=_utc(15))  # read by an earlier attempt
@@ -1622,6 +1624,36 @@ async def test_foreign_seen_row_on_the_landing_page_does_not_confirm_the_end_jum
     assert feed_state_repo.get().last_error is None
     assert _unseen(feed, seen_repo) == []
     assert _submitted(production) == ["M_GAP"]
+
+
+async def test_unread_row_inside_an_accepted_region_undoes_the_acceptance(tmp_path):
+    """A region accepted on its first rows (G000, G001) shows an unread row
+    where its rows should go on: acceptance is undone. Its rows are counted
+    as ordinary rows read in order, it stays on the list, and the saved
+    progress is exactly what was read (not the region's 60 rows + the new
+    ones)."""
+    from reader.fines.public_feed_state_repository import ReadRegion
+
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
+    feed_state_repo, seen_repo = await _first_run_before_the_outage(tmp_path, production, feed)
+    tops = _rows("G", 30, publish_date="2026-10-22")
+    feed.publish(tops + _with_matches(_rows("H", 90, publish_date="2026-10-22"), {50: "M_AFTER"}))
+    _mark_seen_at(seen_repo, tops, seen_at=_utc(15))
+    feed_state_repo.record_recovery_regions([
+        ReadRegion(top=tuple(row["protocolNo"] for row in tops), bottom=tuple(f"G{i:03d}" for i in range(30, 60)),
+                   length=60, updated_at=_utc(15).isoformat()),
+    ])
+    feed_state_repo.record_error("cycle in progress", at=_utc(15))
+
+    assert await _cycle(tmp_path, feed, production, _utc(21), cap=2) == [0, 30]
+    upper, lower = feed_state_repo.get().recovery_regions
+    assert (upper.length, upper.bottom[0], upper.bottom[-1]) == (60, "G000", "H029")
+    assert (lower.length, lower.top[0]) == (60, "G000")
+
+    assert await _cycles_until_success(tmp_path, feed, production, feed_state_repo, seen_repo, cap=10) == 1
+    assert _unseen(feed, seen_repo) == []
+    assert _submitted(production) == ["M_AFTER"]
 
 
 async def test_regions_written_before_the_last_success_are_ignored(tmp_path):
