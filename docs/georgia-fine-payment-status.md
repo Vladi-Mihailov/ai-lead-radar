@@ -280,8 +280,11 @@ The re-check, once a day:
 - **Plates:** those with a positive debt snapshot, those with non-⚪
   statuses (feed-found, paid-but-listed and ⏳ history included), and those
   with a receipt that went ⚪ in the last 3 days.
-  - Order: least recently checked first; plates the previous pass failed on
-    go last, so two always-failing plates cannot stop every pass.
+  - Order: least recently checked or attempted first. A failed attempt also
+    sends the plate to the back of the queue, so with a cap smaller than the
+    number of plates an always-failing plate does not return to the front
+    every other night. Plates whose last attempt failed go at the end of
+    their pass, so two always-failing plates cannot stop it before the others.
   - At most `daily_recheck_max_plates`.
   - Fine rows and notifications are created only for the plate's active
     tasks; with no active task, only for its freshest task with a positive
@@ -301,7 +304,11 @@ The re-check, once a day:
   - `daily_recheck_max_consecutive_errors` errors in a row (default 2).
 - **Postponed:** when the window ends, or when a manual bulk check is still
   running at 23:45. One bulk pass per process (`BatchCheckGate`) is shared
-  with «🔄 Проверить авто» and `fine check-all`.
+  with «🔄 Проверить авто» and `fine check-all`. Known limitation: the plates
+  are chosen when the day's run is created. A pass that had to wait for a
+  manual bulk check re-checks the plates that check has just covered. Those
+  checks are less than 12 h apart, so they move nothing toward ⚪. Avoid manual
+  bulk checks in the window.
 - **Progress:** stored in `georgia_daily_recheck_runs` and
   `georgia_daily_recheck_items`.
   - After a restart, the same day resumes with the plates not yet checked.
@@ -382,14 +389,28 @@ fine_monitor:
   payment_page_technical_error_markers: []
 ```
 
-`daily_recheck_scope: debt` limits the selection to plates with known debt: a
-positive saved total, or a receipt still in the police base (any payment mark).
-Plates whose only receipts are ⏳ history are left out; plates with a receipt
-that went ⚪ in the last 3 days stay in, for the follow-up. With
-`daily_recheck_max_plates` (e.g. 15) this gives a pilot on a limited group:
-the least recently checked known-debt plates first. With the default `all` and
-the same cap, the first plates would be ⏳-history plates (they are the least
-recently checked). Any other value stops the bot at start-up.
+`daily_recheck_scope: debt` limits the selection to the plates the managers'
+debt list shows: a positive saved total, or a 🔴/🟡/🟢 status (a receipt still
+in the police base with any payment mark, or a ⏳ receipt a manager marked 🟡
+or 🟢). Plates whose only receipts are unmarked ⏳ history are left out;
+plates with a receipt that went ⚪ in the last 3 days stay in, for the
+follow-up.
+
+With a small `daily_recheck_max_plates` (e.g. 15) this is a pilot, but not a
+fixed group: each night takes the least recently checked plates of that set,
+so the set is covered in rotation. With about 35 plates, each one is checked
+every 2–3 nights, and a paid receipt reaches ⚪ about 3–6 days after police.ge
+drops it (two checks at least 12 h apart, one per round). A cap at least as
+large as the set (about 40, about 8 minutes a night) checks every plate each
+night. With the default `all` and a small cap, the first plates would be
+⏳-history plates (they are the least recently checked).
+
+Any other value is a configuration error, and every process that loads
+`config/config.yaml` refuses to start, even with the re-check disabled. That
+includes the Georgian bot, ai-lead-radar and the Turkey bot, so check the
+edited file with `load_settings` before restarting anything. Code without
+this key ignores it. A changed scope or cap applies from the next day's run:
+a run already created that day keeps its plates.
 
 Markers must be YAML lists of at least 6 characters. A marker that is part of
 the generic MIA failure message is rejected at start-up, so that message can
