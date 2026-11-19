@@ -59,7 +59,7 @@ class _FakeTelegramClient:
         self.sent_messages.append((chat_id, text))
 
 
-def _make_app(tmp_path, *, secret=_SECRET):
+def _make_ingest_service(tmp_path):
     db_path = tmp_path / "users.db"
     task_repo = FineMonitoringTaskRepository(db_path)
     fine_repo = DetectedFineRepository(db_path)
@@ -67,9 +67,14 @@ def _make_app(tmp_path, *, secret=_SECRET):
     check_service = FineCheckService(_AlwaysAvailableProvider(), task_repo, fine_repo)
     manual_bootstrap = ManualBootstrapService(bootstrap_repo, task_repo, fine_repo, check_service)
     ingest_service = CollectorIngestService(task_repo, fine_repo, check_service, bootstrap_repo, manual_bootstrap)
-    telegram_client = _FakeTelegramClient()
+    return ingest_service, task_repo, fine_repo, bootstrap_repo
 
-    app = build_collector_api_app(ingest_service, hmac_secret=secret, telegram_client=telegram_client)
+
+def _make_app(tmp_path, *, secret=_SECRET, telegram_client=None, **app_kwargs):
+    ingest_service, task_repo, fine_repo, bootstrap_repo = _make_ingest_service(tmp_path)
+    telegram_client = telegram_client or _FakeTelegramClient()
+
+    app = build_collector_api_app(ingest_service, hmac_secret=secret, telegram_client=telegram_client, **app_kwargs)
     return app, task_repo, fine_repo, bootstrap_repo, telegram_client
 
 
@@ -379,3 +384,118 @@ async def test_health_endpoint_acknowledges(tmp_path):
         assert resp.status == 200
         data = await resp.json()
         assert data == {"status": "ack"}
+
+
+# ==== /health -> alerts for the managers' group (reader/public_bot/
+# collector_health.py) ====
+
+
+async def _post_health(client, payload) -> int:
+    body = json.dumps(payload).encode("utf-8")
+    headers = _signed_headers("POST", "/internal/georgia/health", body)
+    headers["Content-Type"] = "application/json"
+    resp = await client.post("/internal/georgia/health", data=body, headers=headers)
+    assert await resp.json() == {"status": "ack"}
+    return resp.status
+
+
+async def test_health_problem_alerts_the_support_chat_once_and_says_when_it_is_over(tmp_path):
+    app, *_rest, telegram_client = _make_app(tmp_path, alert_chat_id=-100555)
+    async with TestClient(TestServer(app)) as client:
+        assert await _post_health(client, {"status": "ok"}) == 200
+        assert await _post_health(client, {"status": "recovering", "detail": "cap", "pages": 300}) == 200
+        assert await _post_health(client, {"status": "recovering", "detail": "cap", "pages": 300}) == 200
+        assert await _post_health(client, {"status": "ok"}) == 200
+
+    assert [chat for chat, _text in telegram_client.sent_messages] == [-100555, -100555]
+    assert telegram_client.sent_messages[0][1].startswith("⚠️ ")
+    assert telegram_client.sent_messages[1][1].startswith("✅ ")
+
+
+async def test_health_alert_without_a_support_chat_is_only_logged(tmp_path):
+    app, *_rest, telegram_client = _make_app(tmp_path)
+    async with TestClient(TestServer(app)) as client:
+        assert await _post_health(client, {"status": "error", "detail": "ConnectTimeout"}) == 200
+
+    assert telegram_client.sent_messages == []
+
+
+async def test_health_alert_that_cannot_be_sent_still_acknowledges(tmp_path):
+    class _FailingTelegramClient:
+        async def send_message(self, chat_id: int, text: str) -> None:
+            raise RuntimeError("telegram unavailable")
+
+    app, *_rest = _make_app(tmp_path, telegram_client=_FailingTelegramClient(), alert_chat_id=-100555)
+    async with TestClient(TestServer(app)) as client:
+        assert await _post_health(client, {"status": "error", "detail": "ConnectTimeout"}) == 200
+
+
+async def test_health_with_a_non_object_json_body_is_acknowledged(tmp_path):
+    app, *_rest, telegram_client = _make_app(tmp_path, alert_chat_id=-100555)
+    async with TestClient(TestServer(app)) as client:
+        assert await _post_health(client, ["not", "an", "object"]) == 200
+
+    assert len(telegram_client.sent_messages) == 1
+    assert telegram_client.sent_messages[0][1].startswith("⚠️ ")
+
+
+async def test_watch_collector_silence_sends_one_alert_after_13_silent_hours():
+    import asyncio
+    from datetime import timedelta
+
+    from reader.public_bot.collector_api import watch_collector_silence
+    from reader.public_bot.collector_health import CollectorHealthMonitor
+
+    now = [datetime(2026, 11, 20, 5, 0, tzinfo=timezone.utc)]
+    monitor = CollectorHealthMonitor(clock=lambda: now[0])
+    monitor.observe({"status": "ok"})
+    sent: list[str] = []
+    sleeps: list[float] = []
+
+    async def send(text: str) -> None:
+        sent.append(text)
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) > 3:
+            raise asyncio.CancelledError
+        now[0] += timedelta(hours=7)
+
+    with pytest.raises(asyncio.CancelledError):
+        await watch_collector_silence(monitor, send, sleep=fake_sleep)
+
+    assert len(sent) == 1
+    assert "нет отчётов 14 ч" in sent[0]
+    assert sleeps == [600, 600, 600, 600]
+
+
+async def test_run_collector_api_forever_hands_the_alert_chat_to_the_app_and_stops_the_watchdog(tmp_path, monkeypatch):
+    import asyncio
+
+    from reader.public_bot import collector_api
+    from reader.public_bot.collector_health import CollectorHealthMonitor
+
+    ingest_service, *_repos = _make_ingest_service(tmp_path)
+    captured: dict = {}
+    real_build = collector_api.build_collector_api_app
+
+    def spy_build(*args, **kwargs):
+        captured.update(kwargs)
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(collector_api, "build_collector_api_app", spy_build)
+    task = asyncio.create_task(collector_api.run_collector_api_forever(
+        ingest_service, hmac_secret=_SECRET, telegram_client=_FakeTelegramClient(),
+        host="127.0.0.1", port=0, alert_chat_id=-100777,
+    ))
+    for _ in range(50):
+        if captured:
+            break
+        await asyncio.sleep(0.02)
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert captured["alert_chat_id"] == -100777
+    assert isinstance(captured["health_monitor"], CollectorHealthMonitor)

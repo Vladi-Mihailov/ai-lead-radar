@@ -167,3 +167,22 @@ def test_rows_with_default_current_timestamp_compare_correctly(tmp_path):
         assert repo.seen_at_or_before("AB123456", now - timedelta(minutes=5)) is False
     finally:
         repo.close()
+
+
+def test_seen_between_is_after_exclusive_until_inclusive_to_the_second(tmp_path):
+    """Восстановление в несколько циклов: строки, отмеченные после последнего
+    успеха (after) и не позже цикла, упёршегося в лимит (until)."""
+    repo = GeorgiaPublicFeedSeenRepository(tmp_path / "users.db")
+    try:
+        success = datetime(2026, 10, 22, 5, 0, 0, 400000, tzinfo=timezone.utc)
+        capped = datetime(2026, 10, 22, 11, 0, 0, 900000, tzinfo=timezone.utc)
+        repo.mark_seen("BY_SUCCESS", publish_date=date(2026, 10, 22), seen_at=success)
+        repo.mark_seen("BY_CAPPED", publish_date=date(2026, 10, 22), seen_at=capped)
+        repo.mark_seen("LATER", publish_date=date(2026, 10, 22), seen_at=capped + timedelta(seconds=1))
+
+        assert repo.seen_between("BY_SUCCESS", after=success, until=capped) is False
+        assert repo.seen_between("BY_CAPPED", after=success, until=capped) is True
+        assert repo.seen_between("LATER", after=success, until=capped) is False
+        assert repo.seen_between("UNKNOWN1", after=success, until=capped) is False
+    finally:
+        repo.close()

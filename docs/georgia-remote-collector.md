@@ -122,6 +122,40 @@ A successful run prints `OK: HTTP 200, {"plates": [...]}`. Then watch
 (09:00/15:00/21:00/23:55 Asia/Tbilisi, or whatever `GEORGIA_COLLECTOR_RUN_TIMES`
 is set to) for a successful poll cycle.
 
+## 8. Long outages: resumed recovery and alerts
+
+A cycle reads at most `GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE` pages (300 by
+default, about 1.5 days of publications). After a longer outage the cycle
+that hits the cap records where it stopped
+(`georgia_public_feed_state.recovery_resume_offset` / `recovery_resume_at`).
+Each following cycle:
+
+1. reads the new rows on top as usual;
+2. at the rows the previous attempt already read, jumps to just before where
+   that attempt stopped;
+3. checks that it landed among that attempt's rows, stepping back page by
+   page if not;
+4. goes on, until it reaches the rows of the last successful cycle.
+
+Nothing is skipped and every cycle stays within the cap. Until the gap is
+closed the cycle ends as "recovering". The two columns are added to the
+existing state database automatically when the collector starts
+(`ALTER TABLE ... ADD COLUMN`); no existing value changes.
+
+After every feed poll the collector POSTs its outcome to production's
+`/internal/georgia/health`: status, mode, page count and dates only, no
+plates. The production bot (`ai-lead-radar-geshtrafbot.service`) alerts the
+managers' group (`public_bot.support_chat_id`):
+
+- the first "recovering" or "error" report;
+- a reminder at most every 12 h while it lasts;
+- ✅ when cycles complete again;
+- one alert if no report arrives for more than 13 h, and ✅ when reports
+  resume. This watch starts with the first report after the bot starts, so
+  deploying the bot before the collector never raises a false alarm.
+
+A report that fails is logged on REDNET and never affects the cycle.
+
 ## Rollback
 
 Set `collector_api_enabled: false` on production and/or stop

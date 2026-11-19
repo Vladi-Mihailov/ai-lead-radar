@@ -539,6 +539,7 @@ async def run() -> None:
                 telegram_client=client,
                 host=settings.fine_monitor.collector_api_host,
                 port=settings.fine_monitor.collector_api_port,
+                alert_chat_id=settings.public_bot.support_chat_id,
             )
 
         controller = ConversationController(

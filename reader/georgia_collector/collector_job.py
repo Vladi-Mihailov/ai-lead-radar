@@ -33,6 +33,20 @@ leaves it after production accepted it, so a cycle killed mid-submit loses
 nothing: the next cycle flushes the outbox first (production dedups by
 fingerprint).
 
+Resumable recovery (an outage longer than one cycle's page cap, ~1.5 days
+at 300 pages): a recovery or FAST cycle that hits the cap records where it
+stopped (georgia_public_feed_state.recovery_resume_offset/_at, see
+_ResumePoint). The next recovery reads the new rows on top as usual until
+it reaches rows that attempt already read, jumps to just before where it
+stopped, confirms it landed among that attempt's rows (stepping back page
+by page if not — a horizon page alone proves nothing) and goes on. So the
+gap is caught up over several cycles within the same per-cycle cap,
+nothing skipped; until then every cycle ends "recovering". After every
+feed poll the collector reports the outcome to production's
+/internal/georgia/health (FeedPollOutcome: status, mode, counts, dates —
+no plates), which alerts the managers' group (reader/public_bot/
+collector_health.py); a report that fails never affects the cycle.
+
 should_run()/run_times/_last_run_slot is the SAME exact-wall-clock pattern
 as reader/jobs/fine_job.py::FineJob.should_run()/reader/jobs/
 georgia_public_feed_job.py::GeorgiaPublicFineFeedJob.should_run() — an
@@ -88,7 +102,10 @@ from reader.fines.parser import (
 from reader.fines.police_ge_session import PoliceGeSession
 from reader.fines.provider import FineProviderError
 from reader.fines.public_feed_seen_repository import GeorgiaPublicFeedSeenRepository
-from reader.fines.public_feed_state_repository import GeorgiaPublicFeedStateRepository
+from reader.fines.public_feed_state_repository import (
+    GeorgiaPublicFeedStateRepository,
+    PublicFeedState,
+)
 from reader.fines.validation import FineValidationError, normalize_car_number
 from reader.georgia_collector.outbox_repository import (
     KIND_BOOTSTRAP_RESULT,
@@ -138,6 +155,35 @@ class CollectorJobStatus:
     error_count: int = 0
     last_error: str | None = None
     last_error_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class FeedPollOutcome:
+    """Итог обхода feed'а одного цикла для отчёта production (см. run(),
+    ProductionApiClient.report_health) — только режим, счётчики и даты, без
+    номеров и квитанций. status: "ok" — цикл завершён; "recovering" — упёрся
+    в лимит страниц, следующий цикл продолжит с того же места; "error"."""
+
+    status: str
+    detail: str
+    mode: str
+    pages: int
+    last_success_at: datetime | None
+    resume_offset: int | None = None
+    oldest_publish_date: date | None = None
+    horizon_date: date | None = None
+
+    def to_payload(self) -> dict:
+        return {
+            "status": self.status,
+            "detail": self.detail,
+            "mode": self.mode,
+            "pages": self.pages,
+            "last_success_at": self.last_success_at.isoformat() if self.last_success_at else None,
+            "resume_offset": self.resume_offset,
+            "oldest_publish_date": self.oldest_publish_date.isoformat() if self.oldest_publish_date else None,
+            "horizon_date": self.horizon_date.isoformat() if self.horizon_date else None,
+        }
 
 
 class GeorgiaCollectorJob:
@@ -198,6 +244,7 @@ class GeorgiaCollectorJob:
 
         if not self._session.is_available():
             logger.info("GeorgiaCollectorJob: circuit breaker open — skipping this cycle")
+            await self._report_health({"status": "error", "detail": "police.ge circuit breaker open — cycle skipped"})
             return
 
         try:
@@ -206,10 +253,20 @@ class GeorgiaCollectorJob:
             logger.warning("GeorgiaCollectorJob: production API unavailable (get_active_plates)")
             return
 
-        await self._poll_feed(monitored, run_at)
+        outcome = await self._poll_feed(monitored, run_at)
+        await self._report_health(outcome.to_payload())
         await self._run_bootstrap(run_at)
 
-    async def _poll_feed(self, monitored: set[str], run_at: datetime) -> None:
+    async def _report_health(self, payload: dict) -> None:
+        """Итог цикла — production (см. reader/public_bot/collector_health.py),
+        чтобы о простое или отставании узнал человек. На цикл не влияет
+        никак: сбой отправки только пишется в журнал."""
+        try:
+            await self._production.report_health(payload)
+        except Exception as exc:  # noqa: BLE001 — сбой отчёта не должен ломать цикл
+            logger.warning("GeorgiaCollectorJob: health report not delivered to production (%s)", exc)
+
+    async def _poll_feed(self, monitored: set[str], run_at: datetime) -> FeedPollOutcome:
         feed_state = self._feed_state.get()
         is_true_first_run = feed_state.last_successful_poll_at is None
         in_recovery = feed_state.last_error is not None
@@ -252,8 +309,20 @@ class GeorgiaCollectorJob:
                 )
                 processed_before_time = None
 
+        mode = "first_run" if is_true_first_run else "recovery" if deep_mode else "fast"
+        # Продолжение восстановления, которое прошлый цикл не уложил в лимит
+        # страниц (простой дольше ~1,5 суток: отставание больше лимита одного
+        # цикла): без него каждая попытка начинала бы с первой страницы и,
+        # пока сверху прибавляются новые публикации, не дошла бы до горизонта
+        # никогда. См. _ResumePoint.
+        resume = (
+            _resume_point(feed_state, last_success=processed_before_time, run_at=run_at)
+            if deep_mode and processed_before_time is not None else None
+        )
+
         pages_fetched = 0
         newest_seen_this_cycle: date | None = None
+        oldest_seen_this_cycle: date | None = None
         completed = False
         pending_overlap = False
         # Отмеченные этим циклом: пока идёт обход, наверху feed'а появляются
@@ -263,6 +332,26 @@ class GeorgiaCollectorJob:
         # только строка, увиденная до этого цикла, иначе FAST остановился бы
         # на повторе и не дочитал бы новые строки под ним.
         marked_this_cycle: set[str] = set()
+        next_offset = 0
+        deepest_offset = 0
+        # Перескок (см. _ResumePoint): jump_offset — страница, к которой
+        # перескочили; top_last_offset — последняя страница перед перескоком;
+        # aligning — место, где остановилась прошлая попытка, ещё не найдено;
+        # jump_page_terminal — страница перескока пустая или целиком
+        # обработанная (после выравнивания цикл на ней и завершается).
+        resume_handled = False
+        jump_offset = 0
+        top_last_offset = 0
+        aligning = False
+        jump_page_terminal = False
+
+        def outcome(status: str, detail: str, *, resume_offset: int | None = None) -> FeedPollOutcome:
+            return FeedPollOutcome(
+                status=status, detail=detail, mode=mode, pages=pages_fetched,
+                last_success_at=run_at if status == "ok" else feed_state.last_successful_poll_at,
+                resume_offset=resume_offset, oldest_publish_date=oldest_seen_this_cycle,
+                horizon_date=processed_before_date,
+            )
 
         # Отметка "цикл идёт": если процесс остановят посреди цикла (SIGTERM,
         # OOM, CancelledError — их не ловит ни один except ниже), last_error
@@ -272,28 +361,30 @@ class GeorgiaCollectorJob:
         self._feed_state.record_error(_CYCLE_IN_PROGRESS, at=run_at)
 
         try:
-            for page_index in range(max_pages):
-                first_result = page_index * _PAGE_SIZE
+            while pages_fetched < max_pages:
+                first_result = next_offset
                 raw = await self._session.fetch_published_protocols(first_result=first_result)
                 pages_fetched += 1
+                deepest_offset = max(deepest_offset, first_result)
 
                 try:
                     raw_results = extract_published_protocols_results(raw)
                 except FineParseError as exc:
                     self._record_error(str(exc), at=run_at)
-                    return
+                    return outcome("error", str(exc))
 
-                if not raw_results:
+                if not raw_results and not aligning:
                     completed = True
                     break
 
                 page_has_seen_row = False
                 for entry in raw_results:
                     entry_date = _parse_publish_date(entry.get("publishDate"))
-                    if entry_date is not None and (
-                        newest_seen_this_cycle is None or entry_date > newest_seen_this_cycle
-                    ):
-                        newest_seen_this_cycle = entry_date
+                    if entry_date is not None:
+                        if newest_seen_this_cycle is None or entry_date > newest_seen_this_cycle:
+                            newest_seen_this_cycle = entry_date
+                        if oldest_seen_this_cycle is None or entry_date < oldest_seen_this_cycle:
+                            oldest_seen_this_cycle = entry_date
 
                     protocol_no = entry.get("protocolNo")
                     if not protocol_no:
@@ -307,6 +398,37 @@ class GeorgiaCollectorJob:
                     self._seen.mark_seen(protocol_no, publish_date=entry_date or run_at.date(), seen_at=run_at)
                     marked_this_cycle.add(protocol_no)
                     await self._maybe_submit_entry(entry, monitored)
+
+                if aligning:
+                    # После перескока страница должна содержать строку,
+                    # прочитанную прошлой попыткой: иначе перескочили дальше,
+                    # чем она дошла (пачка публикаций во время неё сдвинула её
+                    # страницы, строки исчезли сверху) — шаг назад, пока такая
+                    # строка не найдётся или пока между перескоком и
+                    # страницами до него не останется непрочитанного. Страница
+                    # строк, обработанных горизонтом, сама по себе этого не
+                    # доказывает: между ними и прошлой попыткой может быть дыра.
+                    if first_result == jump_offset:
+                        jump_page_terminal = not raw_results or _page_already_processed(
+                            raw_results, self._seen,
+                            published_before=processed_before_date, seen_at_or_before=processed_before_time,
+                        )
+                    if (
+                        _first_row_read_by(raw_results, self._seen, resume) is not None
+                        or first_result - _PAGE_SIZE <= top_last_offset
+                    ):
+                        aligning = False
+                        logger.info(
+                            "GeorgiaCollectorJob: recovery aligned at offset %d after jumping to %d",
+                            first_result, jump_offset,
+                        )
+                        if jump_page_terminal:
+                            completed = True
+                            break
+                        next_offset = jump_offset + _PAGE_SIZE
+                    else:
+                        next_offset = first_result - _PAGE_SIZE
+                    continue
 
                 if deep_mode and _page_already_processed(
                     raw_results, self._seen,
@@ -326,24 +448,54 @@ class GeorgiaCollectorJob:
                         completed = True
                         break
                     pending_overlap = True
-                    continue
-            else:
-                completed = False
+
+                if resume is not None and not resume_handled:
+                    row_index = _first_row_read_by(raw_results, self._seen, resume)
+                    if row_index is not None:
+                        # Дошли сверху до строк прошлой попытки: дальше подряд
+                        # лежит прочитанное ею — перескок к её концу минус
+                        # страница (с выравниванием выше).
+                        resume_handled = True
+                        target = (first_result + row_index + resume.offset - _PAGE_SIZE) // _PAGE_SIZE * _PAGE_SIZE
+                        if target > first_result + _PAGE_SIZE:
+                            logger.info(
+                                "GeorgiaCollectorJob: recovery resumes — jump from offset %d to %d "
+                                "(the previous attempt read %d rows from the top)",
+                                first_result, target, resume.offset,
+                            )
+                            jump_offset = target
+                            top_last_offset = first_result
+                            aligning = True
+                            next_offset = target
+                            continue
+
+                next_offset = first_result + _PAGE_SIZE
         except FineProviderError as exc:
             self._record_error(str(exc), at=run_at)
-            return
+            return outcome("error", str(exc))
         except Exception as exc:
             self._record_error(str(exc), at=run_at)
             logger.exception("GeorgiaCollectorJob: unexpected error during feed poll")
-            return
+            return outcome("error", str(exc))
 
         if not completed:
+            # Лимит страниц: от верха feed'а до deepest_offset всё прочитано
+            # подряд (с перескоком — только после выравнивания), поэтому
+            # следующее восстановление продолжит отсюда, а не с первой
+            # страницы. Не выровнялись — прежняя отметка остаётся.
+            resume_offset = None
+            if not is_true_first_run and not aligning:
+                resume_offset = deepest_offset + _PAGE_SIZE
+                self._feed_state.record_recovery_progress(offset=resume_offset, at=run_at)
             message = _safety_cap_message(
-                max_pages, is_true_first_run=is_true_first_run, deep_mode=deep_mode,
+                max_pages, is_true_first_run=is_true_first_run, deep_mode=deep_mode, resume_offset=resume_offset,
             )
             logger.warning("GeorgiaCollectorJob: %s", message)
             self._record_error(message, at=run_at)
-            return
+            return outcome(
+                "error" if is_true_first_run else "recovering", message,
+                resume_offset=resume_offset if resume_offset is not None else feed_state.recovery_resume_offset,
+            )
 
         if newest_seen_this_cycle is not None:
             self._feed_state.record_successful_cycle(
@@ -359,6 +511,7 @@ class GeorgiaCollectorJob:
         logger.info(
             "GeorgiaCollectorJob feed poll finished: pages=%d, deep_mode=%s", pages_fetched, deep_mode,
         )
+        return outcome("ok", f"feed poll finished: pages={pages_fetched}, mode={mode}")
 
     async def _maybe_submit_entry(self, entry: dict, monitored: set[str]) -> None:
         """См. "DATA MINIMIZATION" в reader/jobs/georgia_public_feed_job.py —
@@ -522,24 +675,82 @@ def _as_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
-def _safety_cap_message(max_pages: int, *, is_true_first_run: bool, deep_mode: bool) -> str:
-    """Свой текст для каждого режима, с именем настройки лимита.
-    Восстановление, не дошедшее до строк последнего успеха за max_pages
-    страниц, само уже не завершится: новые строки только отодвигают их."""
+@dataclass(frozen=True)
+class _ResumePoint:
+    """Где остановилась попытка (восстановление или FAST), упёршаяся в лимит
+    страниц, — см. GeorgiaPublicFeedStateRepository: offset — first_result
+    сразу за последней прочитанной ею страницей, until — её run_at, after —
+    последний успешный цикл. Строки, впервые отмеченные в (after, until],
+    прочитаны продолжаемым восстановлением, и от верха feed'а в момент той
+    попытки до offset всё прочитано подряд (страницы сдвигаются только
+    публикациями сверху, см. marked_this_cycle). Поэтому следующая попытка,
+    дойдя сверху до первой такой строки (позиция Z), перескакивает к
+    Z + offset минус страница и выравнивается (см. aligning в обходе), а
+    упёршись в лимит снова, записывает свою отметку."""
+
+    offset: int
+    after: datetime
+    until: datetime
+
+
+def _resume_point(feed_state: PublicFeedState, *, last_success: datetime, run_at: datetime) -> _ResumePoint | None:
+    """None — продолжать нечего: отметки нет, она не от этого восстановления
+    (не позже последнего успеха) или из будущего (часы) — обход идёт подряд
+    с первой страницы, как раньше."""
+    offset, until = feed_state.recovery_resume_offset, feed_state.recovery_resume_at
+    if not offset or until is None:
+        return None
+    until = _as_utc(until)
+    if not (
+        last_success.replace(microsecond=0) < until.replace(microsecond=0)
+        < _as_utc(run_at).replace(microsecond=0)
+    ):
+        return None
+    return _ResumePoint(offset=offset, after=last_success, until=until)
+
+
+def _first_row_read_by(
+    entries: list[dict], seen: GeorgiaPublicFeedSeenRepository, resume: _ResumePoint | None,
+) -> int | None:
+    """Индекс первой строки страницы, уже прочитанной продолжаемым
+    восстановлением (см. _ResumePoint); None — таких нет."""
+    if resume is None:
+        return None
+    for index, entry in enumerate(entries):
+        protocol_no = entry.get("protocolNo")
+        if protocol_no and seen.seen_between(protocol_no, after=resume.after, until=resume.until):
+            return index
+    return None
+
+
+def _safety_cap_message(
+    max_pages: int, *, is_true_first_run: bool, deep_mode: bool, resume_offset: int | None,
+) -> str:
+    """Свой текст для каждого режима, с именем настройки лимита. Упёршиеся
+    в лимит восстановление и FAST следующий цикл продолжает с resume_offset
+    (см. _ResumePoint); None — место, где остановилась прошлая попытка, в
+    этом цикле не нашлось, и её отметка остаётся."""
     if is_true_first_run:
         return (
             f"first-run catch-up: safety cap of {max_pages} pages reached before rows published "
             f"before today; retrying in deep mode next cycle (raise {_FIRST_RUN_PAGES_SETTING} "
             "if this repeats)"
         )
+    if resume_offset is None:
+        return (
+            f"recovery reached the page cap of {max_pages} pages while looking for where the previous "
+            "attempt stopped; the next cycle continues from that attempt's position (raise "
+            f"{_PAGES_PER_CYCLE_SETTING} if this repeats)"
+        )
     if deep_mode:
         return (
-            "recovery could not reach rows covered by the last successful cycle within "
-            f"{max_pages} pages; it keeps failing until {_PAGES_PER_CYCLE_SETTING} is raised"
+            f"recovery reached the page cap of {max_pages} pages before rows covered by the last "
+            f"successful cycle; the next cycle continues from where this one stopped (offset "
+            f"{resume_offset}), nothing is skipped (raise {_PAGES_PER_CYCLE_SETTING} to catch up "
+            "in fewer cycles)"
         )
     return (
-        f"safety cap of {max_pages} pages reached before the frontier (already-seen rows); "
-        "the next cycle runs deep recovery, which needs even more pages — raise "
-        f"{_PAGES_PER_CYCLE_SETTING}"
+        f"safety cap of {max_pages} pages reached before the frontier (already-seen rows); the next "
+        f"cycle runs deep recovery and continues from where this one stopped (offset {resume_offset}) "
+        f"(raise {_PAGES_PER_CYCLE_SETTING} to catch up in fewer cycles)"
     )
-

@@ -1436,7 +1436,7 @@ async def test_future_dated_row_does_not_move_the_recovery_date_horizon_past_the
         seen_repo.close()
 
 
-async def test_capped_recovery_says_it_cannot_reach_the_last_success_and_names_the_setting(tmp_path, caplog):
+async def test_capped_recovery_records_where_it_stopped_and_names_the_setting(tmp_path, caplog):
     task_repo = _make_task_repo(tmp_path)
     fine_repo = _make_fine_repo(tmp_path)
     feed_state_repo = _make_feed_state_repo(tmp_path)
@@ -1454,10 +1454,14 @@ async def test_capped_recovery_says_it_cannot_reach_the_last_success_and_names_t
             await job.run(_utc(23, 55))
 
         assert session.requested_offsets == [0, 30, 60]
-        error = feed_state_repo.get().last_error
-        assert "recovery could not reach rows covered by the last successful cycle within 3 pages" in error
+        state = feed_state_repo.get()
+        error = state.last_error
+        assert "recovery reached the page cap of 3 pages before rows covered by the last successful cycle" in error
+        assert "continues from where this one stopped (offset 90)" in error
         assert "fine_monitor.public_feed_max_pages_per_cycle" in error
         assert any(r.levelno == logging.WARNING and error in r.getMessage() for r in caplog.records)
+        assert state.recovery_resume_offset == 90
+        assert state.recovery_resume_at == _utc(23, 55)
     finally:
         task_repo.close()
         fine_repo.close()
@@ -1483,7 +1487,8 @@ async def test_first_run_cap_has_its_own_message(tmp_path):
         error = feed_state_repo.get().last_error
         assert error.startswith("first-run catch-up: safety cap of 2 pages")
         assert "fine_monitor.public_feed_first_run_max_pages" in error
-        assert "recovery could not reach" not in error
+        assert feed_state_repo.get().recovery_resume_offset is None
+        assert "recovery reached the page cap" not in error
     finally:
         task_repo.close()
         fine_repo.close()
@@ -1620,6 +1625,9 @@ class _LiveFeed:
 
     def publish(self, rows: list[dict]) -> None:
         self.rows[:0] = rows
+
+    def remove(self, protocol_nos: set[str]) -> None:
+        self.rows = [row for row in self.rows if row["protocolNo"] not in protocol_nos]
 
     def publish_after_requests(self, count: int, rows: list[dict]) -> None:
         """rows появятся наверху сразу после следующих count запросов."""
@@ -1820,3 +1828,240 @@ async def test_one_job_instance_runs_consecutive_cycles_like_production(tmp_path
         fine_repo.close()
         feed_state_repo.close()
         seen_repo.close()
+
+
+# ==== продолжение восстановления: простой дольше лимита одного цикла
+# (зеркало tests/test_georgia_collector_job.py) ====
+
+
+def _with_matches(rows: list[dict], matches: dict[int, str]) -> list[dict]:
+    """rows с отслеживаемым номером на указанных позициях (protocolNo — как указан)."""
+    rows = list(rows)
+    for index, protocol_no in matches.items():
+        rows[index] = _entry(protocol_no=protocol_no, plate="AA001AA", publish_date=rows[index]["publishDate"])
+    return rows
+
+
+class _Repos:
+    """Репозитории одного теста и совпадения, обработанные всеми его циклами."""
+
+    def __init__(self, tmp_path):
+        self.task_repo = _make_task_repo(tmp_path)
+        self.fine_repo = _make_fine_repo(tmp_path)
+        self.feed_state_repo = _make_feed_state_repo(tmp_path)
+        self.seen_repo = _make_seen_repo(tmp_path)
+        self.persisted: list[str] = []
+        _create_active_task(self.task_repo, "AA001AA")
+
+    async def cycle(self, feed, at, *, cap=30, first_run_max_pages=100) -> list[int]:
+        feed.requested_offsets.clear()
+        job, _provider = _make_job(
+            feed, self.task_repo, self.fine_repo, self.feed_state_repo, self.seen_repo,
+            max_pages_per_cycle=cap, first_run_max_pages=first_run_max_pages,
+        )
+        spy = _spy_persisted(job)
+        try:
+            await job.run(at)
+        finally:
+            self.persisted += spy
+        return list(feed.requested_offsets)
+
+    async def first_run_before_the_outage(self, feed) -> None:
+        """Успешный первый запуск в 09:00 22.10 по сегодняшним E и вчерашним
+        Y: последний успех, от которого восстанавливаются тесты ниже."""
+        await self.cycle(feed, _utc(9), first_run_max_pages=10)
+        assert self.feed_state_repo.get().last_error is None
+
+    def close(self) -> None:
+        for repo in (self.task_repo, self.fine_repo, self.feed_state_repo, self.seen_repo):
+            repo.close()
+
+
+def _feed_before_the_outage() -> _LiveFeed:
+    return _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
+
+
+async def test_outage_longer_than_the_cap_is_caught_up_over_several_cycles_without_rereading(tmp_path):
+    """300 строк (10 страниц) с последнего успеха при лимите 4 страницы. FAST
+    упирается в лимит и записывает, где остановился; каждое восстановление
+    дочитывает новое сверху, перескакивает прочитанное прошлой попыткой
+    (минус страница), попадает в её строки и идёт дальше. За пять циклов
+    прочитано всё, каждое совпадение обработано один раз, отметку снимает
+    успех."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_with_matches(
+            _rows("G", 300, publish_date="2026-10-22"), {0: "M_TOP", 150: "M_MIDDLE", 299: "M_BOTTOM"},
+        ))
+
+        assert await repos.cycle(feed, _utc(15), cap=4) == [0, 30, 60, 90]
+        state = repos.feed_state_repo.get()
+        assert (state.recovery_resume_offset, state.recovery_resume_at) == (120, _utc(15))
+
+        feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+        assert await repos.cycle(feed, _utc(21), cap=4) == [0, 30, 120, 150]
+        assert await repos.cycle(feed, _utc(23, 55), cap=4) == [0, 150, 180, 210]
+        assert await repos.cycle(feed, _utc(9, day=23), cap=4) == [0, 210, 240, 270]
+        assert await repos.cycle(feed, _utc(15, day=23), cap=4) == [0, 270, 300, 330]
+
+        state = repos.feed_state_repo.get()
+        assert state.last_error is None
+        assert (state.recovery_resume_offset, state.recovery_resume_at) == (None, None)
+        assert all(repos.seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
+        assert sorted(repos.persisted) == ["M_BOTTOM", "M_MIDDLE", "M_TOP"]
+    finally:
+        repos.close()
+
+
+async def test_resumed_recovery_steps_back_when_publications_shifted_the_previous_attempt(tmp_path):
+    """45 строк, опубликованных во время упёршейся попытки, сдвинули её
+    страницы: она прочитала меньше, чем говорит её отметка. Перескок
+    попадает на страницу за её строками — шаг назад находит их, строки
+    перелётной страницы обработаны, ничего не пропущено."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_with_matches(
+            _rows("G", 300, publish_date="2026-10-22"), {10: "M_A", 150: "M_OVERSHOT_PAGE", 290: "M_LAST"},
+        ))
+        feed.publish_after_requests(
+            2, _with_matches(_rows("BURST", 45, publish_date="2026-10-22"), {40: "M_BURST"}),
+        )
+
+        assert await repos.cycle(feed, _utc(15), cap=6) == [0, 30, 60, 90, 120, 150]
+        feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+        assert await repos.cycle(feed, _utc(21), cap=6) == [0, 30, 60, 210, 180, 240]
+        assert repos.feed_state_repo.get().recovery_resume_offset == 270
+        assert await repos.cycle(feed, _utc(23, 55), cap=6) == [0, 240, 270, 300, 330, 360]
+        assert await repos.cycle(feed, _utc(9, day=23), cap=6) == [0, 360, 390]
+
+        assert repos.feed_state_repo.get().last_error is None
+        assert all(repos.seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
+        assert sorted(repos.persisted) == ["M_A", "M_BURST", "M_LAST", "M_OVERSHOT_PAGE"]
+    finally:
+        repos.close()
+
+
+async def test_resumed_recovery_steps_back_when_rows_vanished_above(tmp_path):
+    """40 строк из области упёршейся попытки исчезли: её отметка указывает
+    на 40 строк глубже — шаг назад находит её строки, ниже ничего не
+    пропущено."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        gap = _with_matches(_rows("G", 300, publish_date="2026-10-22"), {125: "M_AFTER_GAP"})
+        feed.publish(gap)
+
+        assert await repos.cycle(feed, _utc(15), cap=4) == [0, 30, 60, 90]
+        feed.remove({row["protocolNo"] for row in gap[40:80]})
+        feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+        assert await repos.cycle(feed, _utc(21), cap=6) == [0, 30, 120, 90, 150, 180]
+        assert await repos.cycle(feed, _utc(23, 55), cap=6) == [0, 180, 210, 240, 270, 300]
+
+        assert repos.feed_state_repo.get().last_error is None
+        assert all(repos.seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
+        assert repos.persisted == ["M_AFTER_GAP"]
+    finally:
+        repos.close()
+
+
+async def test_attempt_killed_in_the_middle_of_a_resumed_recovery_loses_nothing(tmp_path):
+    """Продолжающую попытку убили после перескока: её отметка не записана,
+    следующая читает её строки насквозь (увидены — повторно не
+    обрабатываются), перескакивает от прежней отметки и доводит дело."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_with_matches(_rows("G", 300, publish_date="2026-10-22"), {140: "M_KILLED", 200: "M_AFTER"}))
+
+        assert await repos.cycle(feed, _utc(15), cap=4) == [0, 30, 60, 90]
+        feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+        feed.fail_after_requests(4, asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            await repos.cycle(feed, _utc(21), cap=6)
+        state = repos.feed_state_repo.get()
+        assert (state.recovery_resume_offset, state.recovery_resume_at) == (120, _utc(15))
+
+        feed.publish(_rows("N2_", 30, publish_date="2026-10-22"))
+        assert await repos.cycle(feed, _utc(23, 55), cap=6) == [0, 30, 60, 150, 180, 210]
+        assert await repos.cycle(feed, _utc(9, day=23), cap=6) == [0, 210, 240, 270, 300, 330]
+        assert await repos.cycle(feed, _utc(15, day=23), cap=6) == [0, 330, 360]
+
+        assert repos.feed_state_repo.get().last_error is None
+        assert all(repos.seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
+        assert sorted(repos.persisted) == ["M_AFTER", "M_KILLED"]
+    finally:
+        repos.close()
+
+
+async def test_jump_past_the_previous_rows_onto_processed_or_empty_pages_still_reads_the_rows_between(tmp_path):
+    """90 из 120 строк упёршейся попытки исчезли — перескок за конец feed'а.
+    Пустая страница и страница строк, обработанных последним успехом, не
+    доказывают, что между ними и прошлой попыткой нет непрочитанного: шаг
+    назад до страниц, уже прочитанных этим циклом, читает 30 строк между
+    ними (с совпадением)."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _LiveFeed(_rows("Y0_", 30, publish_date="2026-10-21"))
+        await repos.cycle(feed, _utc(9), first_run_max_pages=10)
+        gap = _with_matches(_rows("G", 150, publish_date="2026-10-22"), {135: "M_HIDDEN"})
+        feed.publish(gap)
+
+        assert await repos.cycle(feed, _utc(15), cap=4) == [0, 30, 60, 90]
+        feed.remove({row["protocolNo"] for row in gap[30:120]})
+        assert await repos.cycle(feed, _utc(21), cap=6) == [0, 90, 60, 30]
+
+        state = repos.feed_state_repo.get()
+        assert state.last_error is None
+        assert state.recovery_resume_offset is None
+        assert repos.persisted == ["M_HIDDEN"]
+    finally:
+        repos.close()
+
+
+async def test_cap_hit_before_the_previous_rows_are_found_keeps_the_old_mark(tmp_path):
+    """Страницы кончились во время шага назад: непрерывность прочитанного не
+    доказана — отметка прошлой попытки остаётся, и сообщение об этом
+    говорит; следующий цикл с большим лимитом выравнивается и сдвигает её."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_rows("G", 300, publish_date="2026-10-22"))
+        feed.publish_after_requests(2, _rows("BURST", 45, publish_date="2026-10-22"))
+        assert await repos.cycle(feed, _utc(15), cap=6) == [0, 30, 60, 90, 120, 150]
+        feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+
+        assert await repos.cycle(feed, _utc(21), cap=4) == [0, 30, 60, 210]
+        state = repos.feed_state_repo.get()
+        assert (state.recovery_resume_offset, state.recovery_resume_at) == (180, _utc(15))
+        assert "while looking for where the previous attempt stopped" in state.last_error
+
+        assert await repos.cycle(feed, _utc(23, 55), cap=8) == [0, 30, 60, 210, 180, 240, 270, 300]
+        assert repos.feed_state_repo.get().recovery_resume_offset == 330
+    finally:
+        repos.close()
+
+
+async def test_resume_mark_from_the_future_is_ignored(tmp_path):
+    """Отметка, записанная с часами "впереди", выдала бы строки этого же
+    цикла за прочитанные и перескочила бы непрочитанные: она не
+    учитывается, восстановление читает подряд."""
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_with_matches(_rows("G", 120, publish_date="2026-10-22"), {45: "M_SKIPPABLE"}))
+        repos.feed_state_repo.record_recovery_progress(offset=120, at=_utc(9, day=23))
+        repos.feed_state_repo.record_error("ConnectTimeout", at=_utc(15))
+
+        assert await repos.cycle(feed, _utc(21), cap=10) == [0, 30, 60, 90, 120]
+        assert repos.feed_state_repo.get().last_error is None
+        assert repos.persisted == ["M_SKIPPABLE"]
+    finally:
+        repos.close()

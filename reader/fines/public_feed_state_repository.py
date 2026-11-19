@@ -24,7 +24,17 @@ safety cap до того, как окно было покрыто — иначе
 нетронутым, и следующий цикл просто повторяет то же (или более широкое)
 окно заново, что безопасно благодаря fingerprint dedup (см. задачу
 "FEED CURSOR": "If poll fails halfway: do not advance cursor beyond
-unprocessed data")."""
+unprocessed data").
+
+recovery_resume_offset/recovery_resume_at — докуда дошло восстановление,
+упёршееся в лимит страниц (простой дольше ~1,5 суток: отставание больше
+лимита одного цикла): first_result сразу за последней прочитанной
+страницей и run_at того цикла. Следующее восстановление дочитывает новые
+строки сверху, перескакивает уже прочитанное и продолжает с этого места
+(см. GeorgiaCollectorJob/GeorgiaPublicFineFeedJob), а не начинает заново
+с первой страницы. Успешный цикл их сбрасывает. Колонки добавляются в уже
+существующую таблицу при открытии репозитория (ALTER TABLE ADD COLUMN,
+данные не меняются)."""
 
 import sqlite3
 from dataclasses import dataclass
@@ -38,15 +48,25 @@ CREATE TABLE IF NOT EXISTS georgia_public_feed_state (
     last_successful_poll_at  TIMESTAMP,
     last_completed_at        TIMESTAMP,
     last_error               TEXT,
-    last_error_at            TIMESTAMP
+    last_error_at            TIMESTAMP,
+    recovery_resume_offset   INTEGER,
+    recovery_resume_at       TIMESTAMP
 )
 """
+
+# Колонки, добавленные после первого выпуска таблицы: на уже существующей
+# базе (REDNET, production) их добавляет __init__.
+_ADDED_COLUMNS = (
+    ("recovery_resume_offset", "INTEGER"),
+    ("recovery_resume_at", "TIMESTAMP"),
+)
 
 _ENSURE_ROW = "INSERT OR IGNORE INTO georgia_public_feed_state (id) VALUES (1)"
 
 _SELECT = (
     "SELECT newest_seen_publish_date, last_successful_poll_at, last_completed_at, "
-    "last_error, last_error_at FROM georgia_public_feed_state WHERE id = 1"
+    "last_error, last_error_at, recovery_resume_offset, recovery_resume_at "
+    "FROM georgia_public_feed_state WHERE id = 1"
 )
 
 _RECORD_SUCCESS = """
@@ -55,12 +75,20 @@ SET newest_seen_publish_date = :newest_seen_publish_date,
     last_successful_poll_at = :polled_at,
     last_completed_at = :polled_at,
     last_error = NULL,
-    last_error_at = NULL
+    last_error_at = NULL,
+    recovery_resume_offset = NULL,
+    recovery_resume_at = NULL
 WHERE id = 1
 """
 
 _RECORD_ERROR = """
 UPDATE georgia_public_feed_state SET last_error = :message, last_error_at = :at WHERE id = 1
+"""
+
+_RECORD_RECOVERY_PROGRESS = """
+UPDATE georgia_public_feed_state
+SET recovery_resume_offset = :offset, recovery_resume_at = :at
+WHERE id = 1
 """
 
 
@@ -71,16 +99,20 @@ class PublicFeedState:
     last_completed_at: datetime | None
     last_error: str | None
     last_error_at: datetime | None
+    recovery_resume_offset: int | None = None
+    recovery_resume_at: datetime | None = None
 
 
 def _row_to_state(row) -> PublicFeedState:
-    newest, polled_at, completed_at, error, error_at = row
+    newest, polled_at, completed_at, error, error_at, resume_offset, resume_at = row
     return PublicFeedState(
         newest_seen_publish_date=date.fromisoformat(newest) if newest else None,
         last_successful_poll_at=datetime.fromisoformat(polled_at) if polled_at else None,
         last_completed_at=datetime.fromisoformat(completed_at) if completed_at else None,
         last_error=error,
         last_error_at=datetime.fromisoformat(error_at) if error_at else None,
+        recovery_resume_offset=resume_offset,
+        recovery_resume_at=datetime.fromisoformat(resume_at) if resume_at else None,
     )
 
 
@@ -89,6 +121,10 @@ class GeorgiaPublicFeedStateRepository:
         self._conn = sqlite3.connect(db_path)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute(_SCHEMA)
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(georgia_public_feed_state)")}
+        for name, column_type in _ADDED_COLUMNS:
+            if name not in existing:
+                self._conn.execute(f"ALTER TABLE georgia_public_feed_state ADD COLUMN {name} {column_type}")
         self._conn.execute(_ENSURE_ROW)
         self._conn.commit()
 
@@ -105,6 +141,13 @@ class GeorgiaPublicFeedStateRepository:
 
     def record_error(self, message: str, *, at: datetime) -> None:
         self._conn.execute(_RECORD_ERROR, {"message": message, "at": at.isoformat()})
+        self._conn.commit()
+
+    def record_recovery_progress(self, *, offset: int, at: datetime) -> None:
+        """Восстановление упёрлось в лимит страниц: offset — first_result
+        сразу за последней прочитанной страницей, at — run_at этого цикла
+        (см. докстрок модуля). last_error не трогает."""
+        self._conn.execute(_RECORD_RECOVERY_PROGRESS, {"offset": offset, "at": at.isoformat()})
         self._conn.commit()
 
     def close(self) -> None:
