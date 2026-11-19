@@ -1248,3 +1248,62 @@ async def test_debt_list_sorting_owners_and_pagination_are_unchanged(fx):
     assert "Автомобили со штрафами: 12" in second.text.splitlines()
     assert "🔴 Подтверждённая задолженность: 140 ₾ (10 шт.)" in second.text
     assert "🟢 Оплачено, ещё в базе полиции: 170 ₾ (3 шт.)" in second.text
+
+
+async def test_long_status_pages_stay_single_messages(tmp_path):
+    """Самые длинные блоки со статусами (все четыре строки, машины с
+    неизвестным числом штрафов, по 3 пользователя с максимальными именами)
+    под самым длинным заголовком: каждая страница — ОДНО сообщение Telegram,
+    каждая машина — ровно на одной странице."""
+    from reader.public_bot.handlers import _TELEGRAM_SAFE_TEXT_LIMIT, _split_telegram_text
+
+    run = DailyRecheckRun(
+        run_date=date(2026, 11, 18), status="stopped", started_at=datetime(2026, 11, 18, 19, 0),
+        heartbeat_at=datetime(2026, 11, 18, 19, 40), finished_at=datetime(2026, 11, 18, 19, 40),
+        total=4000, checked=1234, failed=567, stop_reason="blocked",
+    )
+    fixture = _Fixture(tmp_path, recheck_run=run)
+    fixture.tracker.record_source_updated_on(date(2026, 11, 12))
+    plates = [f"LP{100 + index}AA" for index in range(12)]
+    two_hours_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2)
+    untracked = FineCheckService(fixture.provider, fixture.tasks, fixture.fines, sleep=_instant)
+    for index, car in enumerate(plates):
+        fines = [(f"R{index}", 1000 + index), (f"Y{index}", 2000), (f"G{index}", 3000)]
+        task, _ = fixture.car(car, fines)
+        if index % 4 == 3:  # снимок новее статусов — число штрафов неизвестно
+            fixture.tracker.record_full_check(
+                car, [_record(car, protocol, amount) for protocol, amount in fines], complete=True, at=two_hours_ago,
+            )
+            fixture.provider.records[car].append(_record(car, f"N{index}", 99999))
+            await untracked.check_task(fixture.tasks.get(task.id))
+        else:
+            await fixture.check(task)
+            fixture.tracker.mark_needs_review(fixture.status(car, f"Y{index}").id, actor_user_id=_TRUSTED, note=None)
+            fixture.tracker.mark_paid(fixture.status(car, f"G{index}").id, actor_user_id=_TRUSTED, note="TBC 1")
+            _unverified_receipt(fixture, car, f"H{index}", 4000)
+        for owner_index in range(3):
+            user_id = 900001000 + index * 10 + owner_index
+            fixture.subscriptions.create(
+                monitoring_task_id=task.id, car_number=car, telegram_user_id=user_id, telegram_chat_id=user_id,
+                telegram_username=None, start_date=date(2026, 11, 1), end_date=UNLIMITED_END_DATE,
+            )
+            fixture.known.record_seen(
+                telegram_user_id=user_id, telegram_chat_id=user_id, telegram_username=f"user_{user_id}",
+                first_name="Я" * 64, last_name="Ж" * 64,
+            )
+
+    first_page = fixture.controller._format_statistics_reply()
+    total_pages = first_page.debt_list_total_pages
+    assert total_pages > 2
+
+    seen: list[str] = []
+    for page in range(total_pages):
+        reply = fixture.controller.handle_debt_list_page(page, telegram_user_id=_TRUSTED)
+        assert len(reply.text) <= _TELEGRAM_SAFE_TEXT_LIMIT
+        assert _split_telegram_text(reply.text) == [reply.text]
+        seen.extend(car for car in plates if format_plate_for_telegram(car) in reply.text)
+    assert sorted(seen) == sorted(plates)
+    assert "(количество уточнится при следующей проверке)" in "".join(
+        fixture.controller.handle_debt_list_page(page, telegram_user_id=_TRUSTED).text for page in range(total_pages)
+    )
+    fixture.close()

@@ -904,12 +904,13 @@ def format_debt_row(
 
     Число штрафов — сумма debt_count тех же состояний GİB и KGM, из которых
     сложена сумма (см. TurkeyProviderDebtState; Avrasya не прибавляется —
-    её долг уже внутри KGM, как и в сумме). Нет состояний или в них нет
-    числа — только сумма, число не выдумывается. Строки "оплачено" у
-    Turkey нет: источники не сообщают об оплате."""
+    её долг уже внутри KGM, как и в сумме). Число показывается, только если
+    оно есть у каждого провайдера с долгом; нет состояний или у провайдера
+    с суммой нет числа — только сумма, число не выдумывается. Строки
+    "оплачено" у Turkey нет: источники не сообщают об оплате."""
     debt_text = _format_try_amount(total_amount)
     fine_count = sum(state.debt_count for state in provider_states)
-    if fine_count > 0:
+    if fine_count > 0 and all(state.debt_count > 0 for state in provider_states if state.amount > 0):
         debt_text = f"{fine_count} {_russian_plural(fine_count, 'штраф', 'штрафа', 'штрафов')} — {debt_text}"
     lines = [f"🚗 Госномер: {format_plate_for_telegram(car_number)}"]
     if all(state.freshness == TurkeyProviderFreshness.CURRENT for state in provider_states):

@@ -173,8 +173,10 @@ Where statuses are shown:
     (🟡) as a count only («🟡 Требуют проверки: 3 штрафа»), and no 🟡 line at
     all when nothing needs review;
   - «Автомобили со штрафами» counts every car in the list, cars with only 🟢
-    fines included. 🟢 sums are never added to «🔴 Неоплачено» or «🔴
-    Подтверждённая задолженность» (see the saved-total exception below);
+    fines included. No 🟢 status is added to «🔴 Неоплачено» or «🔴
+    Подтверждённая задолженность». The one exception is a saved total the
+    statuses do not explain (next bullet but one): it is shown whole, and it
+    may include a receipt marked 🟢, until the next full check;
   - per-car lines give the number of fines and their sum, each line only when
     its number is above zero: «🔴 Неоплачено» is 🔴 plus 🟡, then «🟡 Из них
     требуют проверки», «🟢 Оплачено» (not part of the unpaid sum) and «⏳ Ждут

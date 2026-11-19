@@ -563,6 +563,20 @@ def test_debt_row_without_a_known_count_shows_the_amount_only():
     assert without_states.splitlines()[1] == "🔴 Неоплачено: 500 ₺"
 
 
+def test_debt_row_shows_no_count_when_a_provider_with_debt_has_none():
+    """Сумма KGM без числа записей — число неполное, поэтому только сумма
+    (а не «1 штраф» за всю сумму GİB + KGM)."""
+    states = (
+        _state("gib", TurkeyProviderFreshness.CURRENT, Decimal(100), last_success_at=_NOV_11,
+               last_attempt_at=_NOV_11, debt_count=1),
+        _state("kgm", TurkeyProviderFreshness.CURRENT, Decimal(50), last_success_at=_NOV_11, last_attempt_at=_NOV_11),
+    )
+
+    text = texts.format_debt_row(car_number="34ABC123", owners=[], total_amount=Decimal(150), provider_states=states)
+
+    assert text.splitlines()[1] == "🔴 Неоплачено: 150 ₺"
+
+
 @pytest.mark.parametrize("gib_count, kgm_count, expected", [
     (1, 0, "1 штраф"), (1, 1, "2 штрафа"), (2, 2, "4 штрафа"), (2, 3, "5 штрафов"), (10, 1, "11 штрафов"),
     (20, 1, "21 штраф"), (20, 2, "22 штрафа"), (100, 11, "111 штрафов"), (100, 22, "122 штрафа"),
