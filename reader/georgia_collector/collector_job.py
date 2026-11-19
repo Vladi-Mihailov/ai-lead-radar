@@ -393,6 +393,11 @@ class GeorgiaCollectorJob:
         except ProductionApiError:
             logger.warning("GeorgiaCollectorJob: production недоступна, feed-match остаётся в outbox")
             return
+        except Exception:
+            # Непредвиденный ответ (например, 2xx не в JSON): совпадение уже
+            # в outbox, обход продолжается.
+            logger.exception("GeorgiaCollectorJob: непредвиденная ошибка отправки, feed-match остаётся в outbox")
+            return
         self._outbox.remove(outbox_id)
 
     async def _run_bootstrap(self, run_at: datetime) -> None:
@@ -443,7 +448,15 @@ class GeorgiaCollectorJob:
                     self._outbox.remove(entry.id)
                     continue
                 self._outbox.remove(entry.id)
-            except ProductionApiError:
+            except Exception as exc:
+                # ProductionApiError (production недоступна) или непредвиденный
+                # ответ — запись остаётся, попытка засчитывается, остальные
+                # записи и сам цикл (обход feed'а, bootstrap) идут дальше.
+                if not isinstance(exc, ProductionApiError):
+                    logger.warning(
+                        "GeorgiaCollectorJob: outbox entry %d (kind=%s) — непредвиденная ошибка %s",
+                        entry.id, entry.kind, type(exc).__name__,
+                    )
                 self._outbox.record_attempt(entry.id)
                 attempts_so_far = entry.attempts + 1
                 if attempts_so_far >= _STUCK_OUTBOX_ATTEMPTS_WARNING_THRESHOLD:

@@ -1007,11 +1007,12 @@ async def test_match_is_not_lost_when_the_cycle_dies_during_its_submit(tmp_path,
     if isinstance(exc, asyncio.CancelledError):
         with pytest.raises(asyncio.CancelledError):
             await job.run(_utc(21))
+        assert feed_state_repo.get().last_error is not None  # "cycle in progress" stays
     else:
         await job.run(_utc(21))
+        assert feed_state_repo.get().last_error is None  # the traversal went on
     assert seen_repo.is_seen("MATCH_IN_FLIGHT")
     assert [entry.payload["external_fine_id"] for entry in outbox_repo.list_all()] == ["MATCH_IN_FLIGHT"]
-    assert feed_state_repo.get().last_error is not None
 
     job2, *_ = _make_job(tmp_path, session, production, first_run_max_pages=10)
     await job2.run(_utc(23, 55))
@@ -1030,3 +1031,46 @@ async def test_submitted_match_leaves_nothing_in_the_outbox(tmp_path):
 
     assert _submitted(production) == ["MATCH_OK"]
     assert outbox_repo.list_all() == []
+
+
+class _UnparseableAnswers(_FakeProductionClient):
+    """Production accepts feed matches but answers `failures` times in a row
+    with a body the client cannot parse (not a ProductionApiError)."""
+
+    def __init__(self, failures: int, **kwargs):
+        super().__init__(**kwargs)
+        self._failures = failures
+
+    async def submit_feed_match(self, payload: dict) -> dict:
+        if self._failures > 0:
+            self._failures -= 1
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+        return await super().submit_feed_match(payload)
+
+
+async def test_a_recurring_unexpected_submit_error_never_stops_the_feed_poll(tmp_path):
+    """The queued match keeps failing with an unexpected error on the next
+    flushes: each cycle still reads the feed and runs bootstrap, the attempts
+    are counted, and the match goes out once production answers normally."""
+    production = _UnparseableAnswers(3, active_plates=["AA001AA"], pending_plates=["BB002BB"])
+    feed = _LiveFeed(_rows("Y0_", 30, publish_date="2026-10-21"))
+    feed.publish(_rows("A", 20, publish_date="2026-10-22") + [
+        _entry(protocol_no="MATCH_BAD_ANSWER", plate="AA001AA", publish_date="2026-10-22"),
+    ])
+    job, feed_state_repo, seen_repo, outbox_repo = _make_job(tmp_path, feed, production, first_run_max_pages=10)
+
+    await job.run(_utc(9))
+    for cycle, run_at in enumerate((_utc(15), _utc(21))):
+        feed.publish(_rows(f"N{cycle}_", 10, publish_date="2026-10-22"))
+        feed.requested_offsets.clear()
+        await job.run(run_at)
+        assert feed.requested_offsets, cycle
+        assert feed_state_repo.get().last_error is None
+    assert [entry.attempts for entry in outbox_repo.list_all()] == [2]
+    assert len(production.submitted_bootstrap_results) == 3
+
+    await job.run(_utc(23, 55))
+
+    assert outbox_repo.list_all() == []
+    assert _submitted(production) == ["MATCH_BAD_ANSWER"]
+    assert all(seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
