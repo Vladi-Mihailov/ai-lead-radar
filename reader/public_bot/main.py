@@ -318,6 +318,26 @@ def build_payment_page_markers(fine_monitor) -> PaymentPageMarkers:
     )
 
 
+def build_daily_recheck_service(
+    fine_monitor, repository, task_repository, check_service, status_tracker, *, gate,
+) -> DailyRecheckService:
+    """settings.fine_monitor.daily_recheck_* -> DailyRecheckService (окно —
+    по fine_monitor.timezone)."""
+    return DailyRecheckService(
+        repository, task_repository, check_service, status_tracker,
+        gate=gate,
+        tz=ZoneInfo(fine_monitor.timezone),
+        start_time=fine_monitor.daily_recheck_time,
+        cutoff_time=fine_monitor.daily_recheck_cutoff_time,
+        inter_car_delay_seconds=fine_monitor.daily_recheck_inter_car_delay_seconds,
+        batch_size=fine_monitor.daily_recheck_batch_size,
+        batch_pause_seconds=fine_monitor.daily_recheck_batch_pause_seconds,
+        max_plates=fine_monitor.daily_recheck_max_plates,
+        max_consecutive_errors=fine_monitor.daily_recheck_max_consecutive_errors,
+        scope=fine_monitor.daily_recheck_scope,
+    )
+
+
 async def _run_concurrently(coroutines: list) -> None:
     """Как asyncio.gather, но при ошибке в одной корутине отменяет
     остальные — тот же приём, что и reader/main.py::_run_concurrently (не
@@ -543,23 +563,15 @@ async def run() -> None:
         # она добавляет запросы к police.ge через REDNET.
         daily_recheck_service = None
         if daily_recheck_repository is not None:
-            fine_monitor = settings.fine_monitor
-            daily_recheck_service = DailyRecheckService(
-                daily_recheck_repository, task_repository, check_service, fine_status_tracker,
-                gate=batch_gate,
-                tz=ZoneInfo(fine_monitor.timezone),
-                start_time=fine_monitor.daily_recheck_time,
-                cutoff_time=fine_monitor.daily_recheck_cutoff_time,
-                inter_car_delay_seconds=fine_monitor.daily_recheck_inter_car_delay_seconds,
-                batch_size=fine_monitor.daily_recheck_batch_size,
-                batch_pause_seconds=fine_monitor.daily_recheck_batch_pause_seconds,
-                max_plates=fine_monitor.daily_recheck_max_plates,
-                max_consecutive_errors=fine_monitor.daily_recheck_max_consecutive_errors,
+            daily_recheck_service = build_daily_recheck_service(
+                settings.fine_monitor, daily_recheck_repository, task_repository, check_service,
+                fine_status_tracker, gate=batch_gate,
             )
             logger.info(
-                "Georgia daily recheck enabled: %s-%s %s",
-                fine_monitor.daily_recheck_time.strftime("%H:%M"),
-                fine_monitor.daily_recheck_cutoff_time.strftime("%H:%M"), fine_monitor.timezone,
+                "Georgia daily recheck enabled: %s-%s %s, scope %s, at most %d plates",
+                settings.fine_monitor.daily_recheck_time.strftime("%H:%M"),
+                settings.fine_monitor.daily_recheck_cutoff_time.strftime("%H:%M"), settings.fine_monitor.timezone,
+                daily_recheck_service.scope, daily_recheck_service.max_plates,
             )
 
         # "ВРЕМЕННЫЙ manager workflow для Georgia fines bot" (см. задачу) —

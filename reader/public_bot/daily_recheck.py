@@ -27,9 +27,11 @@ delivery_service.py).
 Прогресс — в БД (georgia_daily_recheck_runs/_items): после рестарта
 процесса тот же день продолжается с непроверенных номеров, второй запуск
 того же дня не начнётся; номера, до которых не дошли (остановка/окно
-закончилось), завтра окажутся в начале очереди — сортировка по давности
-последней успешной проверки; номера, на которых вчерашний проход упал, —
-в конце (два "вечно падающих" номера не останавливают весь проход).
+закончилось), завтра окажутся в начале очереди — очередь по давности
+последней успешной проверки или попытки прохода (неудачная попытка тоже
+отправляет номер в конец очереди); номера, упавшие в последнем прогоне,
+где они были, идут в конце своего прохода (два "вечно падающих" номера не
+останавливают проход раньше остальных), а не дошедшие — нет.
 Прогон, оставшийся 'running' после рестарта вне окна, закрывается как
 прерванный.
 
@@ -73,6 +75,14 @@ STOP_ERRORS = "errors"
 STOP_CUTOFF = "cutoff"
 STOP_BUSY = "busy"
 STOP_INTERRUPTED = "interrupted"
+
+# Какие номера берёт проход (см. DailyRecheckService.select_plates): "all" —
+# все номера с известными штрафами, включая только ⏳ историю; "debt" — те,
+# что видны в статистике долга (снимок суммы или статус 🔴/🟡/🟢) — пилот
+# вместе с небольшим max_plates.
+SCOPE_ALL = "all"
+SCOPE_DEBT = "debt"
+RECHECK_SCOPES = (SCOPE_ALL, SCOPE_DEBT)
 
 _GATE_HOLDER = "daily_recheck"
 _TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -226,19 +236,23 @@ class DailyRecheckRepository:
             cursor = self._conn.execute(query, params)
         return cursor.rowcount
 
-    def failed_plates_of_previous_run(self, before: date) -> set[str]:
-        """Номера, на которых упал последний прогон ДО before."""
-        row = self._conn.execute(
-            "SELECT run_date FROM georgia_daily_recheck_runs WHERE run_date < ? ORDER BY run_date DESC LIMIT 1",
-            (before.isoformat(),),
-        ).fetchone()
-        if row is None:
-            return set()
+    def last_attempts(self) -> dict[str, datetime]:
+        """Когда номер последний раз был в проходе (проверен, упал или
+        пропущен) — для очереди select_plates."""
         rows = self._conn.execute(
-            "SELECT car_number FROM georgia_daily_recheck_items WHERE run_date = ? AND state = ?",
-            (row[0], ITEM_ERROR),
+            "SELECT car_number, MAX(checked_at) FROM georgia_daily_recheck_items "
+            "WHERE checked_at IS NOT NULL GROUP BY car_number",
         ).fetchall()
-        return {r[0] for r in rows}
+        return {row[0]: _parse_ts(row[1]) for row in rows}
+
+    def latest_run_states(self) -> dict[str, str]:
+        """Состояние позиции номера в последнем прогоне, где он был; 'pending'
+        — до номера не дошли. SQLite при единственном MAX() берёт остальные
+        столбцы из той же строки."""
+        rows = self._conn.execute(
+            "SELECT car_number, MAX(run_date), state FROM georgia_daily_recheck_items GROUP BY car_number",
+        ).fetchall()
+        return {row[0]: row[2] for row in rows}
 
     def heartbeat(self, run_date: date, *, now: datetime) -> None:
         self._conn.execute(
@@ -294,6 +308,8 @@ class _CheckServiceLike(Protocol):
 class _StatusTrackerLike(Protocol):
     def listed_car_numbers(self) -> list[str]: ...
 
+    def debt_car_numbers(self) -> list[str]: ...
+
     def recently_gone_car_numbers(self) -> list[str]: ...
 
 
@@ -318,6 +334,7 @@ class DailyRecheckService:
         batch_pause_seconds: float = 60.0,
         max_plates: int = 200,
         max_consecutive_errors: int = 2,
+        scope: str = SCOPE_ALL,
         busy_wait_seconds: float = 30.0,
         stale_after: timedelta = timedelta(minutes=5),
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -327,6 +344,8 @@ class DailyRecheckService:
             raise ValueError("daily_recheck_cutoff_time должен быть позже daily_recheck_time (в пределах одних суток)")
         if batch_size < 1 or max_plates < 1 or max_consecutive_errors < 1:
             raise ValueError("daily_recheck_batch_size/max_plates/max_consecutive_errors должны быть >= 1")
+        if scope not in RECHECK_SCOPES:
+            raise ValueError(f"daily_recheck_scope должен быть одним из {RECHECK_SCOPES}, а не {scope!r}")
         self._repository = repository
         self._tasks = task_repository
         self._check_service = check_service
@@ -340,11 +359,20 @@ class DailyRecheckService:
         self._batch_pause_seconds = batch_pause_seconds
         self._max_plates = max_plates
         self._max_consecutive_errors = max_consecutive_errors
+        self._scope = scope
         self._busy_wait_seconds = busy_wait_seconds
         self._stale_after = stale_after
         self._sleep = sleep
         self._clock = clock
         self._running = False
+
+    @property
+    def scope(self) -> str:
+        return self._scope
+
+    @property
+    def max_plates(self) -> int:
+        return self._max_plates
 
     def is_running(self) -> bool:
         return self._running
@@ -356,18 +384,31 @@ class DailyRecheckService:
         local_time = now.astimezone(self._tz).time()
         return self._start_time <= local_time < self._cutoff_time
 
-    def select_plates(self, *, today: date | None = None) -> list[str]:
+    def select_plates(self) -> list[str]:
         """Номера с известными штрафами в базе полиции: положительный снимок
         долга (как у "🔄 Проверить авто со штрафами"), номера с не-⚪
         статусами (в т.ч. найденные feed'ом после последней проверки и
         оплаченные, но ещё видимые на police.ge) и номера, у которых штраф
         стал ⚪ в последние дни (ложное ⚪ сменится на "снова найден").
-        Сначала — те, что дольше всего не проверялись; номера, на которых
-        упал вчерашний проход, — в конце."""
+        Область "debt" не берёт номера, у которых только ⏳ история без
+        отметок менеджера.
+
+        Сначала — те, что дольше всего не проверялись и не попадали в
+        проход: неудачная попытка тоже отправляет номер в конец очереди,
+        иначе при max_plates меньше числа номеров "вечно падающий" номер
+        возвращался бы в начало через ночь. Номера, упавшие в последнем
+        прогоне, где они были, — в конце своего прохода: два таких подряд в
+        начале остановили бы проход до проверки остальных. Номер, до
+        которого прогон не дошёл, не "упал": иначе при проходах, кончающихся
+        раньше хвоста, он оставался бы в конце и не проверялся никогда."""
         last_checked: dict[str, datetime | None] = {}
         for group in self._tasks.list_debt_car_groups():
             last_checked[group.car_number] = _naive_utc(group.checked_at)
-        for car_number in [*self._statuses.listed_car_numbers(), *self._statuses.recently_gone_car_numbers()]:
+        status_plates = (
+            self._statuses.listed_car_numbers() if self._scope == SCOPE_ALL
+            else self._statuses.debt_car_numbers()
+        )
+        for car_number in [*status_plates, *self._statuses.recently_gone_car_numbers()]:
             if car_number in last_checked:
                 continue
             stamps = [
@@ -376,12 +417,17 @@ class DailyRecheckService:
                 if task.last_successful_checked_at is not None
             ]
             last_checked[car_number] = max(stamps) if stamps else None
-        failed_yesterday = self._repository.failed_plates_of_previous_run(
-            today or self._clock().astimezone(self._tz).date(),
-        )
-        plates = [car for car in last_checked if not is_fine_output_suppressed(car)]
-        plates.sort(key=lambda car: (car in failed_yesterday, last_checked[car] or datetime.min, car))
-        return plates[: self._max_plates]
+        attempts = self._repository.last_attempts()
+        latest_states = self._repository.latest_run_states()
+
+        def queue_key(car: str) -> tuple[datetime, str]:
+            stamps = [stamp for stamp in (last_checked[car], attempts.get(car)) if stamp is not None]
+            return (max(stamps) if stamps else datetime.min, car)
+
+        plates = sorted((car for car in last_checked if not is_fine_output_suppressed(car)), key=queue_key)
+        plates = plates[: self._max_plates]
+        plates.sort(key=lambda car: latest_states.get(car) == ITEM_ERROR)
+        return plates
 
     def _tasks_for_plate(self, car_number: str) -> tuple[list[FineMonitoringTask], list[FineMonitoringTask]]:
         """(задачи, по которым создаются строки detected_fines и
@@ -427,7 +473,7 @@ class DailyRecheckService:
             return None
         existing = self._repository.get_run(run_date)
         if existing is None:
-            plates = self.select_plates(today=run_date)
+            plates = self.select_plates()
             if not self._repository.create_run(run_date, plates, now=now):
                 return None
             if not plates:

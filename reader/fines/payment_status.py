@@ -458,6 +458,14 @@ class FineStatusRepository:
         ).fetchall()
         return [row[0] for row in rows]
 
+    def list_debt_car_numbers(self) -> list[str]:
+        rows = self._conn.execute(
+            f"SELECT DISTINCT car_number FROM georgia_fine_status "
+            f"WHERE presence IN ('{PRESENCE_LISTED}', '{PRESENCE_MISSING}') "
+            f"OR (presence = '{PRESENCE_UNVERIFIED}' AND payment_status != '{PAYMENT_UNPAID}') ORDER BY car_number",
+        ).fetchall()
+        return [row[0] for row in rows]
+
     def list_car_numbers_with_statuses(self, car_numbers: list[str]) -> set[str]:
         if not car_numbers:
             return set()
@@ -989,6 +997,15 @@ class FineStatusTracker:
 
     def listed_car_numbers(self) -> list[str]:
         return [car for car in self._repository.list_listed_car_numbers() if not is_fine_output_suppressed(car)]
+
+    def debt_car_numbers(self) -> list[str]:
+        """Номера, которые статистика долга показывает по статусам (🔴/🟡/🟢,
+        см. breakdown_of): квитанция в базе полиции ('listed' или 'missing',
+        с любой отметкой оплаты) или ⏳ с отметкой менеджера (🟡 — в долге,
+        🟢 — оплачено, но присутствие ещё не перепроверено). Номера, у которых
+        только ⏳ без отметок, сюда не входят (см. DailyRecheckService,
+        область "debt")."""
+        return [car for car in self._repository.list_debt_car_numbers() if not is_fine_output_suppressed(car)]
 
     def recently_gone_car_numbers(self, *, within: timedelta = GONE_FOLLOW_UP, at: datetime | None = None) -> list[str]:
         since = self._now(at) - within

@@ -97,6 +97,21 @@ class _Fixture:
         self.db_path = tmp_path / "users.db"
         self.clock = _Clock(start)
         self.tasks = FineMonitoringTaskRepository(self.db_path)
+        # В production и время успешной проверки задачи, и позиции прохода
+        # пишутся по одним (реальным) часам; здесь позиции идут по
+        # фейковым, поэтому и задачи тоже — иначе порядок очереди зависел
+        # бы от сегодняшней даты.
+        record_successful_check = self.tasks.record_successful_check
+
+        def record_with_fake_clock(task_id, **kwargs):
+            record_successful_check(task_id, **kwargs)
+            self.tasks._conn.execute(
+                "UPDATE fine_monitoring_tasks SET last_successful_checked_at = ? WHERE id = ?",
+                (self.clock.naive().strftime("%Y-%m-%d %H:%M:%S"), task_id),
+            )
+            self.tasks._conn.commit()
+
+        self.tasks.record_successful_check = record_with_fake_clock
         self.fines = DetectedFineRepository(self.db_path)
         self.status_repository = FineStatusRepository(self.db_path)
         self.tracker = FineStatusTracker(
@@ -397,14 +412,18 @@ async def test_yesterdays_failures_go_to_the_end_of_the_queue(fx):
     first = await fx.service.tick()
     assert first.status == RUN_STOPPED and first.stop_reason == "errors"
     assert "CC333DD" not in _plates_checked(fx.provider)
+    # номер, который проверили вручную уже после неудачного прохода
+    manual_check = (fx.clock.naive() + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    fx.car_with_fines("DD444EE", "GE4", checked_at=manual_check)
 
     fx.provider.calls.clear()
     fx.clock.now += timedelta(days=1)
     second = await fx.make_service().tick()
 
-    # вчерашние "вечно падающие" номера — в конце, остальные проверены
-    assert _plates_checked(fx.provider)[0] == "CC333DD"
-    assert second.checked == 1
+    # вчерашние "вечно падающие" номера — в конце прохода, даже после
+    # проверенного позже них; остальные проверены
+    assert _plates_checked(fx.provider) == ["CC333DD", "DD444EE", "AA111BB", "BB222CC"]
+    assert second.checked == 2
 
 
 async def test_inactive_task_gets_snapshot_only_and_new_fine_reaches_operator_once(fx):
@@ -504,3 +523,218 @@ async def test_invalid_window_is_rejected(fx):
             fx.repository, fx.tasks, fx.check_service, fx.tracker, gate=fx.gate, tz=_TBILISI,
             start_time=time(23, 0), cutoff_time=time(22, 0),
         )
+
+
+# ---- область "debt": пилот на номерах с известным долгом ----
+
+
+def _history_only_plate(fixture, car: str):
+    """Номер, у которого только ⏳ история (старый ответ police.ge её не показал)."""
+    task = fixture.tasks.create(
+        car_number=car, label=None, start_date=date(2026, 11, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=-1, created_by_user_id=1,
+    )
+    fine = fixture.fines.create(
+        monitoring_task_id=task.id, car_number=car, external_fine_id=f"OLD-{car}", fingerprint=f"fp-old-{car}",
+        penalty_date=None, due_date=None, delivered_status=None, raw_data="{}", amount=20,
+    )
+    fixture.tasks.record_successful_check(task.id, total_amount=0)
+    fixture.tasks._conn.execute(
+        "UPDATE fine_monitoring_tasks SET last_successful_checked_at = '2026-10-01 10:00:00' WHERE id = ?", (task.id,),
+    )
+    fixture.tasks._conn.commit()
+    fixture.fines._conn.execute("UPDATE detected_fines SET last_seen_at = '2026-09-01 10:00:00' WHERE id = ?", (fine.id,))
+    fixture.fines._conn.commit()
+    fixture.tracker.seed_from_detected_fines()
+    assert fixture.tracker.statuses_by_protocol(car)[f"OLD-{car}"].presence == "unverified"
+
+
+async def test_debt_scope_selects_only_plates_with_known_debt(tmp_path):
+    fixture = _Fixture(tmp_path, scope="debt")
+    fixture.car_with_fines("AA111BB", "GE1")
+    feed_task = fixture.tasks.create(
+        car_number="FF777GG", label=None, start_date=date(2026, 11, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=-1, created_by_user_id=1,
+    )
+    await fixture.check_service.persist_feed_match(feed_task, _record("FF777GG", "GE7"))  # в базе, снимок 0
+    _history_only_plate(fixture, "GG888HH")
+
+    assert set(fixture.service.select_plates()) == {"AA111BB", "FF777GG"}
+    fixture.close()
+
+
+async def test_all_scope_still_takes_plates_with_history_only(tmp_path):
+    fixture = _Fixture(tmp_path)
+    fixture.car_with_fines("AA111BB", "GE1")
+    _history_only_plate(fixture, "GG888HH")
+
+    assert set(fixture.service.select_plates()) == {"AA111BB", "GG888HH"}
+    fixture.close()
+
+
+async def test_debt_scope_cap_takes_the_least_recently_checked_debt_plates(tmp_path):
+    """Пилот: max_plates номеров с известным долгом, начиная с давно не
+    проверявшихся; номера только с ⏳ (даже проверенные ещё раньше) не берутся."""
+    fixture = _Fixture(tmp_path, scope="debt", max_plates=2)
+    for index, car in enumerate(["AA111BB", "BB222CC", "CC333DD"]):
+        fixture.car_with_fines(car, f"GE{index}", checked_at=f"2026-11-1{index} 10:00:00")
+    _history_only_plate(fixture, "GG888HH")
+
+    assert fixture.service.select_plates() == ["AA111BB", "BB222CC"]
+    fixture.close()
+
+
+async def test_debt_scope_keeps_the_follow_up_of_receipts_that_went_gone(tmp_path):
+    fixture = _Fixture(tmp_path, scope="debt")
+    fixture.car_with_fines("AA111BB", "GE1")
+    fixture.provider.records["AA111BB"] = []
+    await fixture.service.tick()
+    fixture.clock.now += timedelta(days=1)
+    await fixture.make_service().tick()
+    assert fixture.tracker.statuses_by_protocol("AA111BB")["GE1"].presence == PRESENCE_GONE
+
+    fixture.clock.now += timedelta(days=1)
+    assert "AA111BB" in fixture.make_service().select_plates()
+    fixture.clock.now += timedelta(days=5)
+    assert "AA111BB" not in fixture.make_service().select_plates()
+    fixture.close()
+
+
+async def test_debt_scope_takes_unverified_receipts_with_a_manager_mark(tmp_path):
+    """Статистика долга показывает ⏳ с отметкой 🟡 (в долге) и 🟢 (оплачено,
+    присутствие не перепроверено) — пилот перепроверяет и их; ⏳ без
+    отметки — нет."""
+    fixture = _Fixture(tmp_path, scope="debt")
+    for car in ("GG111HH", "GG222HH", "GG333HH"):
+        _history_only_plate(fixture, car)
+    fixture.tracker.mark_needs_review(
+        fixture.tracker.statuses_by_protocol("GG111HH")["OLD-GG111HH"].id, actor_user_id=1, note=None,
+    )
+    fixture.tracker.mark_paid(
+        fixture.tracker.statuses_by_protocol("GG222HH")["OLD-GG222HH"].id, actor_user_id=1, note="TBC 5",
+    )
+
+    assert set(fixture.service.select_plates()) == {"GG111HH", "GG222HH"}
+    fixture.close()
+
+
+async def test_debt_scope_takes_paid_receipts_still_listed(tmp_path):
+    """🟢, которую police.ge ещё показывает, — в статистике ("оплачено, ещё
+    видно"): без перепроверки она не станет ⚪."""
+    fixture = _Fixture(tmp_path, scope="debt")
+    feed_task = fixture.tasks.create(
+        car_number="FF777GG", label=None, start_date=date(2026, 11, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=-1, created_by_user_id=1,
+    )
+    await fixture.check_service.persist_feed_match(feed_task, _record("FF777GG", "GE7"))  # снимок 0
+    fixture.tracker.mark_paid(
+        fixture.tracker.statuses_by_protocol("FF777GG")["GE7"].id, actor_user_id=1, note="BOG 3",
+    )
+
+    assert fixture.service.select_plates() == ["FF777GG"]
+    fixture.close()
+
+
+async def test_debt_scope_takes_a_positive_snapshot_without_statuses(tmp_path):
+    """Операторский процесс обновляет снимок суммы, не записывая статусов:
+    новый долг виден в статистике только по снимку — пилот берёт и его."""
+    fixture = _Fixture(tmp_path, scope="debt")
+    task = fixture.tasks.create(
+        car_number="SS555TT", label=None, start_date=date(2026, 11, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=-1, created_by_user_id=1,
+    )
+    fixture.tasks.record_successful_check(task.id, total_amount=70)
+
+    assert fixture.service.select_plates() == ["SS555TT"]
+    fixture.close()
+
+
+async def test_failing_plates_do_not_block_a_capped_pass(tmp_path):
+    """max_plates меньше числа номеров, два номера падают каждый раз: после
+    неудачи номер уходит в конец очереди (не возвращается в начало через
+    ночь) и в своём проходе идёт последним — исправные номера проверяются
+    каждую ночь, падающие повторяются в свою очередь."""
+    fixture = _Fixture(tmp_path, max_plates=3)
+    for index, car in enumerate(["AA111BB", "BB222CC", "CC333DD", "DD444EE", "EE555FF"]):
+        fixture.car_with_fines(car, f"GE{index}", checked_at=f"2026-11-1{index} 10:00:00")
+    failing = {"AA111BB", "BB222CC"}
+    for car in failing:
+        fixture.provider.errors[car] = FineProviderError("timeout")
+
+    first = await fixture.service.tick()
+    assert first.checked == 0  # первая ночь: истории попыток ещё нет
+
+    nights = []
+    for _ in range(4):
+        fixture.provider.calls.clear()
+        fixture.clock.now += timedelta(days=1)
+        run = await fixture.make_service().tick()
+        nights.append((run, _plates_checked(fixture.provider)))
+
+    assert [calls for _, calls in nights] == [
+        ["CC333DD", "DD444EE", "EE555FF"],  # после неудачи падающие ушли в конец очереди
+        ["CC333DD", "AA111BB", "BB222CC"],  # дошла их очередь — идут последними
+        ["DD444EE", "EE555FF", "CC333DD"],
+        ["DD444EE", "AA111BB", "BB222CC"],
+    ]
+    assert all(run.checked >= 1 for run, _ in nights)
+    fixture.close()
+
+
+async def test_a_failed_plate_is_retried_when_passes_end_before_its_turn(tmp_path):
+    """Окно вмещает 3 номера из 5: номер, упавший один раз, не остаётся в
+    конце навсегда — в прогоне, где до него не дошли, он не "упал" и на
+    следующую ночь идёт в свою очередь."""
+    fixture = _Fixture(tmp_path, inter_car_delay_seconds=900, batch_size=100)
+    for index, car in enumerate(["AA111BB", "BB222CC", "CC333DD", "DD444EE", "EE555FF"]):
+        fixture.car_with_fines(car, f"GE{index}", checked_at=f"2026-11-1{index} 10:00:00")
+    fixture.provider.errors["AA111BB"] = FineProviderError("timeout")
+
+    first = await fixture.service.tick()
+    assert first.status == RUN_POSTPONED
+    assert _plates_checked(fixture.provider) == ["AA111BB", "BB222CC", "CC333DD"]
+    del fixture.provider.errors["AA111BB"]
+
+    nights = []
+    for _ in range(2):
+        fixture.provider.calls.clear()
+        fixture.clock.now = fixture.clock.now.replace(hour=19, minute=0, second=30) + timedelta(days=1)
+        await fixture.make_service().tick()
+        nights.append(_plates_checked(fixture.provider))
+
+    assert nights == [
+        ["DD444EE", "EE555FF", "BB222CC"],  # упавший — в конце, до него не дошли
+        ["AA111BB", "CC333DD", "DD444EE"],  # не дошли — не "упал": идёт в свою очередь
+    ]
+    fixture.close()
+
+
+async def test_a_plate_that_recovered_is_not_kept_at_the_end(fx):
+    """Упал одну ночь, на следующую прошёл — дальше обычная очередь, а не
+    "когда-то падал — всегда в конце"."""
+    for index, car in enumerate(["AA111BB", "BB222CC", "CC333DD"]):
+        fx.car_with_fines(car, f"GE{index}", checked_at=f"2026-11-1{index} 10:00:00")
+    fx.provider.errors["AA111BB"] = FineProviderError("timeout")
+    await fx.service.tick()
+    del fx.provider.errors["AA111BB"]
+    fx.clock.now += timedelta(days=1)
+    await fx.make_service().tick()
+    # остальные проверили вручную уже после второго прохода
+    later = (fx.clock.naive() + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    for car in ("BB222CC", "CC333DD"):
+        fx.tasks._conn.execute(
+            "UPDATE fine_monitoring_tasks SET last_successful_checked_at = ? WHERE car_number = ?", (later, car),
+        )
+    fx.tasks._conn.commit()
+
+    fx.provider.calls.clear()
+    fx.clock.now += timedelta(days=1)
+    await fx.make_service().tick()
+
+    assert _plates_checked(fx.provider) == ["AA111BB", "BB222CC", "CC333DD"]
+
+
+async def test_unknown_scope_is_rejected(fx):
+    with pytest.raises(ValueError):
+        DailyRecheckService(fx.repository, fx.tasks, fx.check_service, fx.tracker, gate=fx.gate, tz=_TBILISI,
+                            scope="everything")

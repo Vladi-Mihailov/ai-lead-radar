@@ -288,6 +288,10 @@ class FineMonitorSettings(BaseModel):
     daily_recheck_batch_pause_seconds: float = 60.0
     daily_recheck_max_plates: int = 200
     daily_recheck_max_consecutive_errors: int = 2
+    # "all" — все номера с известными штрафами (включая только ⏳ историю);
+    # "debt" — только с известным долгом: пилот на ограниченной группе вместе
+    # с daily_recheck_max_plates (см. DailyRecheckService.select_plates).
+    daily_recheck_scope: str = "all"
     # Штраф считается исчезнувшим из базы полиции (⚪), если его нет в двух
     # успешных полных проверках, между которыми прошло не меньше этого
     # интервала (см. reader/fines/payment_status.py).
@@ -553,6 +557,14 @@ class Settings(BaseModel):
     dm_outreach: DmOutreachSettings = Field(default_factory=DmOutreachSettings)
 
 
+def _parse_recheck_scope(value) -> str:
+    """fine_monitor.daily_recheck_scope — "all" или "debt"; опечатка в
+    конфиге должна остановить старт, а не тихо включить другую выборку."""
+    if value not in ("all", "debt"):
+        raise ConfigError(f'fine_monitor.daily_recheck_scope должен быть "all" или "debt", а не {value!r}')
+    return value
+
+
 def load_settings(config_path: Path) -> Settings:
     config_path = Path(config_path)
     if not config_path.exists():
@@ -787,6 +799,7 @@ def load_settings(config_path: Path) -> Settings:
                 daily_recheck_max_consecutive_errors=int(
                     fine_monitor_raw.get("daily_recheck_max_consecutive_errors", 2)
                 ),
+                daily_recheck_scope=_parse_recheck_scope(fine_monitor_raw.get("daily_recheck_scope", "all")),
                 fine_disappearance_min_gap_hours=float(
                     fine_monitor_raw.get("fine_disappearance_min_gap_hours", 12.0)
                 ),
