@@ -39,15 +39,20 @@ class _Clock:
 
 
 class _Telegram:
-    """send(text) для deliver(): failing=True — Telegram сообщение не принимает."""
+    """send(text) для deliver(): failing=True — Telegram сообщения не
+    принимает; fail_next=N — не примет только N следующих."""
 
     def __init__(self):
         self.sent: list[str] = []
         self.failing = False
+        self.fail_next = 0
         self.attempts = 0
 
     async def send(self, text: str) -> None:
         self.attempts += 1
+        if self.fail_next > 0:
+            self.fail_next -= 1
+            raise ConnectionError("telegram unavailable")
         if self.failing:
             raise ConnectionError("telegram unavailable")
         self.sent.append(text)
@@ -307,12 +312,12 @@ def test_delivery_keeps_queue_order_when_the_head_fails():
     clock.advance(hours=20)
     monitor.check_silence()
     assert len(_deliver(monitor, telegram)) == 1
-    telegram.failing = True
     monitor.observe(_recovering())  # "✅ снова на связи", затем предупреждение о проблеме
-    assert _deliver(monitor, telegram) == []
-    telegram.failing = False
+    telegram.fail_next = 1  # Telegram не принял только первое из двух
+    assert _deliver(monitor, telegram) == []  # второе не обгоняет голову очереди
+    assert telegram.attempts == 2
     clock.advance(seconds=30)
-    assert _deliver(monitor, telegram) == []  # голова очереди ждёт повтора — вторая её не обгоняет
+    assert _deliver(monitor, telegram) == []  # голова ждёт паузы повтора, вторая — за ней
     clock.advance(seconds=30)
     back, problem = _deliver(monitor, telegram)
     assert back == f"✅ {_TITLE}: снова на связи."

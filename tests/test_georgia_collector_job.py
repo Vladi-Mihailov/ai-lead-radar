@@ -1422,6 +1422,61 @@ async def test_jump_past_the_end_of_the_feed_still_reads_the_rows_between(tmp_pa
     assert _unseen(feed, seen_repo) == []
 
 
+async def test_a_burst_during_the_cycle_does_not_inflate_the_region_length(tmp_path, monkeypatch):
+    """45 rows published between finding a region's first rows and its last
+    ones make the measured distance 45 rows too long. Only a smaller
+    measurement replaces the row count, so the saved region still spans
+    exactly N000..G164 (the burst sits above it and is read next cycle)."""
+    from reader.fines import public_feed_traversal
+
+    monkeypatch.setattr(public_feed_traversal, "BOTTOM_ANCHOR_ROWS", 30)
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
+    feed_state_repo, seen_repo = await _first_run_before_the_outage(tmp_path, production, feed)
+    feed.publish(_rows("G", 300, publish_date="2026-10-22"))
+    assert await _cycle(tmp_path, feed, production, _utc(15), cap=4) == [0, 30, 60, 90]
+    feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+    feed.publish_after_requests(2, _rows("B", 45, publish_date="2026-10-22"))
+
+    # G000 on page 30; the burst shifts the region down, so the search reads
+    # on from 120 to its last rows (150), then in order.
+    assert await _cycle(tmp_path, feed, production, _utc(21), cap=6) == [0, 30, 120, 150, 180, 210]
+    [region] = feed_state_repo.get().recovery_regions
+    assert (region.length, region.top[0], region.bottom[-1]) == (30 + 120 + 45, "N000", "G164")
+
+    assert await _cycles_until_success(tmp_path, feed, production, feed_state_repo, seen_repo, cap=10) == 1
+    assert _unseen(feed, seen_repo) == []
+
+
+async def test_rows_reshown_above_the_region_end_by_a_burst_are_not_counted_again(tmp_path, monkeypatch):
+    """90 rows published right after the page where the region's last rows
+    were found: the next page re-shows rows from the middle of the region.
+    They are recognised as a re-read (seen, above its last rows), not taken
+    for rows below it, so the region keeps its true length and the jump to
+    its last row still happens."""
+    from reader.fines import public_feed_traversal
+
+    monkeypatch.setattr(public_feed_traversal, "BOTTOM_ANCHOR_ROWS", 60)
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    feed = _LiveFeed(_rows("E", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
+    feed_state_repo, seen_repo = await _first_run_before_the_outage(tmp_path, production, feed)
+    feed.publish(_rows("G", 600, publish_date="2026-10-22"))
+    assert await _cycle(tmp_path, feed, production, _utc(15), cap=8) == [i * 30 for i in range(8)]
+    feed.publish(_rows("N", 59, publish_date="2026-10-22"))
+    feed.publish_after_requests(3, _rows("B", 90, publish_date="2026-10-22"))
+
+    # 240: G181.. (end rows found); burst; 270: G121..G150 (re-read, not
+    # counted); 300: G151..G180 — G180 is an end row: jump to the last (360).
+    assert await _cycle(tmp_path, feed, production, _utc(21), cap=10) == [
+        0, 30, 240, 270, 300, 360, 390, 420, 450, 480,
+    ]
+    [region] = feed_state_repo.get().recovery_regions
+    assert (region.length, region.bottom[-1]) == (59 + 240 + 121, "G360")  # N + G000..G239 + G240..G360
+
+    assert await _cycles_until_success(tmp_path, feed, production, feed_state_repo, seen_repo, cap=20) <= 2
+    assert _unseen(feed, seen_repo) == []
+
+
 async def test_horizon_page_met_while_searching_is_an_overshoot_not_the_end(tmp_path):
     """A region whose row count is far too high sends the search onto
     yesterday's rows (a horizon page). That only says the jump went too far:
@@ -1450,6 +1505,9 @@ async def test_horizon_page_met_while_searching_is_an_overshoot_not_the_end(tmp_
     assert state.last_error is not None
     [region] = state.recovery_regions
     assert (region.length, region.top[0], region.bottom[-1]) == (150, "G000", "G149")
+    # Search pages are only read: their rows stay unread until read in
+    # order, so an unread row keeps meaning "past the region's end".
+    assert not seen_repo.is_seen("G150") and not seen_repo.is_seen("G270")
 
     assert await _cycles_until_success(tmp_path, feed, production, feed_state_repo, seen_repo, cap=10) == 1
     assert _unseen(feed, seen_repo) == []

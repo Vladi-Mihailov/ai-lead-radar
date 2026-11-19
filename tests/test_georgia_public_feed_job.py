@@ -2179,6 +2179,61 @@ async def test_jump_past_the_end_of_the_feed_still_reads_the_rows_between(tmp_pa
         repos.close()
 
 
+async def test_a_burst_during_the_cycle_does_not_inflate_the_region_length(tmp_path, monkeypatch):
+    """45 строк, опубликованных между началом участка и его концом, делают
+    измеренное расстояние на 45 строк длиннее. Число строк заменяет только
+    меньшее измерение, так что записанный участок по-прежнему ровно
+    N000..G164 (пачка выше него, её прочитает следующий цикл)."""
+    from reader.fines import public_feed_traversal
+
+    monkeypatch.setattr(public_feed_traversal, "BOTTOM_ANCHOR_ROWS", 30)
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_rows("G", 300, publish_date="2026-10-22"))
+        assert await repos.cycle(feed, _utc(15), cap=4) == [0, 30, 60, 90]
+        feed.publish(_rows("N", 30, publish_date="2026-10-22"))
+        feed.publish_after_requests(2, _rows("B", 45, publish_date="2026-10-22"))
+
+        assert await repos.cycle(feed, _utc(21), cap=6) == [0, 30, 120, 150, 180, 210]
+        [region] = repos.feed_state_repo.get().recovery_regions
+        assert (region.length, region.top[0], region.bottom[-1]) == (30 + 120 + 45, "N000", "G164")
+
+        assert await repos.cycles_until_success(feed, cap=10) == 1
+        assert repos.unseen(feed) == []
+    finally:
+        repos.close()
+
+
+async def test_rows_reshown_above_the_region_end_by_a_burst_are_not_counted_again(tmp_path, monkeypatch):
+    """90 строк опубликованы сразу после страницы, где нашлись последние
+    строки участка: следующая страница снова показывает строки из его
+    середины. Они узнаются как перечитывание (увиденные, выше последних
+    строк), а не принимаются за строки под участком, — участок сохраняет
+    настоящую длину, и перескок к его последней строке всё равно делается."""
+    from reader.fines import public_feed_traversal
+
+    monkeypatch.setattr(public_feed_traversal, "BOTTOM_ANCHOR_ROWS", 60)
+    repos = _Repos(tmp_path)
+    try:
+        feed = _feed_before_the_outage()
+        await repos.first_run_before_the_outage(feed)
+        feed.publish(_rows("G", 600, publish_date="2026-10-22"))
+        assert await repos.cycle(feed, _utc(15), cap=8) == [i * 30 for i in range(8)]
+        feed.publish(_rows("N", 59, publish_date="2026-10-22"))
+        feed.publish_after_requests(3, _rows("B", 90, publish_date="2026-10-22"))
+
+        assert await repos.cycle(feed, _utc(21), cap=10) == [0, 30, 240, 270, 300, 360, 390, 420, 450, 480]
+        [region] = repos.feed_state_repo.get().recovery_regions
+        assert (region.length, region.bottom[-1]) == (59 + 240 + 121, "G360")
+
+        assert await repos.cycles_until_success(feed, cap=20) <= 2
+        assert repos.unseen(feed) == []
+    finally:
+        repos.close()
+
+
 async def test_horizon_page_met_while_searching_is_an_overshoot_not_the_end(tmp_path):
     """Участок с сильно завышенным числом строк отправляет поиск на
     вчерашние строки (страницу горизонта). Это значит только "перелетели":
@@ -2206,6 +2261,9 @@ async def test_horizon_page_met_while_searching_is_an_overshoot_not_the_end(tmp_
         assert state.last_error is not None
         [region] = state.recovery_regions
         assert (region.length, region.top[0], region.bottom[-1]) == (150, "G000", "G149")
+        # Страницы поиска только читаются: их строки остаются непрочитанными
+        # до чтения подряд — непрочитанная строка по-прежнему значит "за концом".
+        assert not repos.seen_repo.is_seen("G150") and not repos.seen_repo.is_seen("G270")
 
         assert await repos.cycles_until_success(feed, cap=10) == 1
         assert repos.unseen(feed) == []
