@@ -237,6 +237,66 @@ async def test_unverified_line_is_hidden_for_suppressed_plates_and_without_statu
     fixture.close()
 
 
+async def test_manager_marks_on_unconfirmed_history_as_the_subscriber_sees_them(fx):
+    """Подписчику квитанция без подтверждения police.ge — ⏳ и с отметкой 🟡
+    (отказ платёжной страницы — не подтверждение долга), как и в доставке;
+    🟢 — оплачена, в строку ⏳ не входит. У менеджеров 🟡 остаётся долгом."""
+    task, subscription = fx.car(_CAR, [("GE1", 50)], owner=_OWNER)
+    review = _make_unverified(fx, "OLD1", 40)
+    fx.tracker.mark_needs_review(review.id, actor_user_id=_TRUSTED, note="ჯარიმის გადახდა ვერ მოხერხდა!")
+    paid = _make_unverified(fx, "OLD2", 25)
+    fx.tracker.mark_paid(paid.id, actor_user_id=_TRUSTED, note="TBC 1")
+
+    reply = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=_OWNER)
+    stats = fx.controller._format_statistics_reply().text
+
+    assert "💰 К оплате: 50 ₾" in reply.text
+    assert "⏳ Ждут повторной проверки police.ge: 40 ₾ (1 шт.)" in reply.text
+    assert "🟡 Неопределённый статус оплаты: 40 ₾ (1 шт.)" in stats
+
+
+async def test_cached_unconfirmed_receipt_with_a_failed_payment_mark_is_not_offered_for_payment(fx):
+    task, subscription = fx.car(_CAR, [("OLD1", 40)], owner=_OWNER)
+    outcome = await fx.subscription_service.check_now(subscription.id, telegram_user_id=_OWNER)
+    status = fx.status(_CAR, "OLD1")
+    fx.tracker._repository._conn.execute(
+        "UPDATE georgia_fine_status SET presence = 'unverified' WHERE id = ?", (status.id,),
+    )
+    fx.tracker._repository._conn.commit()
+    fx.tracker.mark_needs_review(status.id, actor_user_id=_TRUSTED, note="ჯარიმის გადახდა ვერ მოხერხდა!")
+
+    reply = fx.controller._format_check_now_outcome_reply(outcome)
+
+    assert "Статус: ⏳ Ждёт повторной проверки police.ge" in reply.text
+    assert "💰 К оплате: 0 ₾" in reply.text
+    assert "⏳ Ждут повторной проверки police.ge: 40 ₾ (1 шт.)" in reply.text
+    assert reply.cta_buttons is None
+
+
+async def test_owner_add_car_summary_shows_unverified_history(fx):
+    fx.provider.records[_CAR] = [_record(_CAR, "GE1", 50)]
+    _make_unverified(fx, "OLD1", 30)
+
+    reply = await fx.controller._complete_self_add_car(
+        car_number=_CAR, username=None, today=date(2026, 11, 19), chat_id=_OWNER, telegram_user_id=_OWNER,
+        first_name=None, last_name=None,
+    )
+
+    assert reply.text.endswith("⏳ Ждут повторной проверки police.ge: 30 ₾ (1 шт.) — в сумму к оплате не входят")
+
+
+async def test_trusted_add_car_for_a_client_summary_shows_unverified_history(fx):
+    fx.provider.records[_CAR] = [_record(_CAR, "GE1", 50)]
+    _make_unverified(fx, "OLD1", 30)
+
+    reply = await fx.controller._complete_delegated_add_car(
+        car_number=_CAR, owner_username="client_user", today=date(2026, 11, 19), chat_id=_CHAT,
+        telegram_user_id=_TRUSTED,
+    )
+
+    assert "⏳ Ждут повторной проверки police.ge: 30 ₾ (1 шт.) — в сумму к оплате не входят" in reply.text
+
+
 async def test_trusted_add_car_summary_shows_unverified_history(fx):
     fx.provider.records[_CAR] = [_record(_CAR, "GE1", 50)]
     _make_unverified(fx, "OLD1", 30)

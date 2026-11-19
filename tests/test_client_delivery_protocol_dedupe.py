@@ -238,3 +238,15 @@ async def test_unverified_history_with_a_manager_mark_is_not_announced_either(fx
     await fx.service.run_once()
 
     assert fx.sender.sent == []
+
+
+async def test_unconfirmed_paid_history_is_not_announced(fx):
+    task = fx.task()
+    fx.fine(task, "GE1")
+    status = _make_unverified(fx, "GE1")
+    fx.tracker.mark_paid(status.id, actor_user_id=1, note="TBC 1")
+    fx.subscribe(task)
+
+    await fx.service.run_once()
+
+    assert fx.sender.sent == []

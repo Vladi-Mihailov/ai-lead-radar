@@ -216,6 +216,16 @@ Client delivery:
   «Проверить сейчас» from the cache gets its ⏳ label, stays out of «К
   оплате» and alone brings no payment buttons. Suppressed plates show no ⏳
   line.
+  - For subscribers such a receipt is ⏳ even with a 🟡 mark: a refused
+    payment is no proof of debt, and for a receipt police.ge did not even
+    show it more likely means "already paid". Managers' statistics keep
+    counting 🟡 as debt. A 🟢-marked one is paid: neither sent nor on the ⏳
+    line.
+  - Not covered: a check that bypasses the statuses (the operator process,
+    a failed status write) leaves the receipt ⏳ for subscribers until the
+    next check with statuses, while statistics already show the saved total.
+    The bootstrap and manual «штрафов не найдено» messages, the claim and
+    «включить уведомления» say nothing about ⏳.
   - A receipt missing only once is still delivered, as before.
 - In the Georgian bot only, if the operator was already notified about a
   receipt through another task, the new task's row is created as already

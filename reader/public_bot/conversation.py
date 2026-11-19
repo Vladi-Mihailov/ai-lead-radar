@@ -106,13 +106,13 @@ from reader.fines.payment_status import (
     PAYMENT_NEEDS_REVIEW,
     PAYMENT_PAID,
     PAYMENT_UNPAID,
+    PRESENCE_UNVERIFIED,
     SNAPSHOT_TOLERANCE,
     SOURCE_PAYMENT_PAGE,
     DebtBreakdown,
     FineStatus,
     FineStatusTracker,
     PaymentPageVerdict,
-    breakdown_of,
     classify_payment_page_text,
     clean_note,
     payment_status_for_verdict,
@@ -305,6 +305,18 @@ def _snapshot_has_unexplained_debt(
     if snapshot <= debt + 0.005:
         return False
     return not _statuses_are_current(last_full_check_at, snapshot_at)
+
+
+def _subscriber_display_status(status: FineStatus) -> str:
+    """Статус квитанции для подписчика ("Проверить сейчас", строка ⏳):
+    пока police.ge не подтвердил её присутствие ('unverified'), она ⏳ —
+    даже с отметкой менеджера 🟡 (отказ платёжной страницы чаще значит "уже
+    оплачено", чем долг; у менеджеров в статистике 🟡 остаётся долгом), —
+    кроме 🟢. Ровно те же квитанции ClientDeliveryService не присылает
+    новыми штрафами."""
+    if status.presence == PRESENCE_UNVERIFIED and status.payment_status != PAYMENT_PAID:
+        return DISPLAY_UNVERIFIED
+    return status.display_status
 
 
 def _statuses_are_current(last_full_check_at: datetime | None, snapshot_at: datetime | None) -> bool:
@@ -680,15 +692,22 @@ class ConversationController:
     def _unverified_totals(self, car_number: str) -> dict:
         """⏳ номера для подписчика ({unverified_count, unverified_amount} —
         kwargs текстов): квитанции из истории, чьё присутствие police.ge ещё
-        не подтвердил; новыми штрафами они не приходят (см.
-        ClientDeliveryService), поэтому показываются отдельной строкой.
-        Пусто без статусов и для скрытых номеров (suppression)."""
+        не подтвердил (см. _subscriber_display_status); новыми штрафами они
+        не приходят (см. ClientDeliveryService), поэтому показываются
+        отдельной строкой. Пусто без статусов и для скрытых номеров
+        (suppression)."""
         if self._fine_status is None or is_fine_output_suppressed(car_number):
             return {}
-        breakdown = breakdown_of(self._fine_status.statuses_for_car(car_number, include_gone=False))
-        if not breakdown.unverified_count:
+        unconfirmed = [
+            status for status in self._fine_status.statuses_for_car(car_number, include_gone=False)
+            if _subscriber_display_status(status) == DISPLAY_UNVERIFIED
+        ]
+        if not unconfirmed:
             return {}
-        return {"unverified_count": breakdown.unverified_count, "unverified_amount": breakdown.unverified_amount}
+        return {
+            "unverified_count": len(unconfirmed),
+            "unverified_amount": sum(status.amount or 0.0 for status in unconfirmed),
+        }
 
     def _today(self) -> date:
         return datetime.now(timezone.utc).astimezone(self._tz).date()
@@ -2785,7 +2804,7 @@ class ConversationController:
         statuses = None
         if self._fine_status is not None and outcome.check_ok and outcome.fines:
             statuses = {
-                protocol_no: status.display_status
+                protocol_no: _subscriber_display_status(status)
                 for protocol_no, status in self._fine_status.statuses_by_protocol(outcome.car_number).items()
             }
         # ⏳ (из кэша) к оплате не предлагается, как 🟢 и ⚪.
