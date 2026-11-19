@@ -169,8 +169,9 @@ Where statuses are shown:
   - the «💳 Оплатить в рублях» button disappears when no fine is left in «К
     оплате».
 - «📊 Статистика»:
-  - confirmed debt (🔴), uncertain (🟡) and paid but still listed (🟢), with
-    counts;
+  - confirmed debt (🔴) and paid but still listed (🟢), with counts; uncertain
+    (🟡) as a count only («🟡 Требуют проверки: 3 штрафа»), and no 🟡 line at
+    all when nothing needs review;
   - per-car lines: «💰 Задолженность» is 🔴 plus 🟡, then «🟡 Из них…» and
     «🟢 Оплачено» lines. A car whose receipts are all ⚪ is not shown, even if
     an old task still has a positive total;
