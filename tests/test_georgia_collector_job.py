@@ -27,8 +27,14 @@ from reader.fines.public_feed_seen_repository import (
 from reader.fines.public_feed_state_repository import (
     GeorgiaPublicFeedStateRepository,
 )
-from reader.georgia_collector.__main__ import load_fast_lookahead_pages, load_page_limits
-from reader.georgia_collector.collector_job import FAST_LOOKAHEAD_PAGES, GeorgiaCollectorJob
+from reader.georgia_collector.__main__ import (
+    load_fast_lookahead_pages,
+    load_page_limits,
+)
+from reader.georgia_collector.collector_job import (
+    FAST_LOOKAHEAD_PAGES,
+    GeorgiaCollectorJob,
+)
 from reader.georgia_collector.outbox_repository import (
     KIND_FEED_MATCH,
     CollectorOutboxRepository,
@@ -1154,6 +1160,7 @@ async def test_fast_does_not_stop_on_old_rows_on_two_pages_above_the_real_bounda
     assert sorted(_submitted(production)) == ["ავ000009100", "კვ000000130"]
     assert _counters(caplog) == {"new_rows": 95, "seen_among_new": 2, "quiet_pages": 3, "lookahead_new": 0}
     assert all(seen_repo.is_seen(p) for p in _protocols(new))
+    assert feed_state_repo.get().last_error is None
 
     # The next cycle: 30 new rows on top, then the pages read above are quiet.
     session2 = _FakeSession(_feed_pages(_receipts("ავ", 19999, 30) + rows))

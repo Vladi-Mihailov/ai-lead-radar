@@ -12,7 +12,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import pytest
 
-from reader.georgia_collector.__main__ import load_fast_lookahead_pages, load_page_limits, load_timeouts
+from reader.georgia_collector.__main__ import (
+    load_fast_lookahead_pages,
+    load_page_limits,
+    load_timeouts,
+)
 from reader.georgia_collector.collector_job import FAST_LOOKAHEAD_PAGES
 
 

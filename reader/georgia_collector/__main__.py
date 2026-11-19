@@ -33,7 +33,10 @@ from reader.fines.police_ge_session import PoliceGeSession
 from reader.fines.public_feed_seen_repository import GeorgiaPublicFeedSeenRepository
 from reader.fines.public_feed_state_repository import GeorgiaPublicFeedStateRepository
 from reader.georgia_collector.check_now_server import run_check_now_server_forever
-from reader.georgia_collector.collector_job import FAST_LOOKAHEAD_PAGES, GeorgiaCollectorJob
+from reader.georgia_collector.collector_job import (
+    FAST_LOOKAHEAD_PAGES,
+    GeorgiaCollectorJob,
+)
 from reader.georgia_collector.outbox_repository import CollectorOutboxRepository
 from reader.georgia_collector.production_client import ProductionApiClient
 
