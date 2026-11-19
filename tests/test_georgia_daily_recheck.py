@@ -504,3 +504,82 @@ async def test_invalid_window_is_rejected(fx):
             fx.repository, fx.tasks, fx.check_service, fx.tracker, gate=fx.gate, tz=_TBILISI,
             start_time=time(23, 0), cutoff_time=time(22, 0),
         )
+
+
+# ---- область "debt": пилот на номерах с известным долгом ----
+
+
+def _history_only_plate(fixture, car: str):
+    """Номер, у которого только ⏳ история (старый ответ police.ge её не показал)."""
+    task = fixture.tasks.create(
+        car_number=car, label=None, start_date=date(2026, 11, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=-1, created_by_user_id=1,
+    )
+    fine = fixture.fines.create(
+        monitoring_task_id=task.id, car_number=car, external_fine_id=f"OLD-{car}", fingerprint=f"fp-old-{car}",
+        penalty_date=None, due_date=None, delivered_status=None, raw_data="{}", amount=20,
+    )
+    fixture.tasks.record_successful_check(task.id, total_amount=0)
+    fixture.tasks._conn.execute(
+        "UPDATE fine_monitoring_tasks SET last_successful_checked_at = '2026-10-01 10:00:00' WHERE id = ?", (task.id,),
+    )
+    fixture.tasks._conn.commit()
+    fixture.fines._conn.execute("UPDATE detected_fines SET last_seen_at = '2026-09-01 10:00:00' WHERE id = ?", (fine.id,))
+    fixture.fines._conn.commit()
+    fixture.tracker.seed_from_detected_fines()
+    assert fixture.tracker.statuses_by_protocol(car)[f"OLD-{car}"].presence == "unverified"
+
+
+async def test_debt_scope_selects_only_plates_with_known_debt(tmp_path):
+    fixture = _Fixture(tmp_path, scope="debt")
+    fixture.car_with_fines("AA111BB", "GE1")
+    feed_task = fixture.tasks.create(
+        car_number="FF777GG", label=None, start_date=date(2026, 11, 1), end_date=date(2026, 12, 31),
+        telegram_chat_id=-1, created_by_user_id=1,
+    )
+    await fixture.check_service.persist_feed_match(feed_task, _record("FF777GG", "GE7"))  # в базе, снимок 0
+    _history_only_plate(fixture, "GG888HH")
+
+    assert set(fixture.service.select_plates()) == {"AA111BB", "FF777GG"}
+    fixture.close()
+
+
+async def test_all_scope_still_takes_plates_with_history_only(tmp_path):
+    fixture = _Fixture(tmp_path)
+    fixture.car_with_fines("AA111BB", "GE1")
+    _history_only_plate(fixture, "GG888HH")
+
+    assert set(fixture.service.select_plates()) == {"AA111BB", "GG888HH"}
+    fixture.close()
+
+
+async def test_debt_scope_cap_takes_the_least_recently_checked_debt_plates(tmp_path):
+    """Пилот: max_plates номеров с известным долгом, начиная с давно не
+    проверявшихся; номера только с ⏳ (даже проверенные ещё раньше) не берутся."""
+    fixture = _Fixture(tmp_path, scope="debt", max_plates=2)
+    for index, car in enumerate(["AA111BB", "BB222CC", "CC333DD"]):
+        fixture.car_with_fines(car, f"GE{index}", checked_at=f"2026-11-1{index} 10:00:00")
+    _history_only_plate(fixture, "GG888HH")
+
+    assert fixture.service.select_plates() == ["AA111BB", "BB222CC"]
+    fixture.close()
+
+
+async def test_debt_scope_keeps_the_follow_up_of_receipts_that_went_gone(tmp_path):
+    fixture = _Fixture(tmp_path, scope="debt")
+    fixture.car_with_fines("AA111BB", "GE1")
+    fixture.provider.records["AA111BB"] = []
+    await fixture.service.tick()
+    fixture.clock.now += timedelta(days=1)
+    await fixture.make_service().tick()
+    assert fixture.tracker.statuses_by_protocol("AA111BB")["GE1"].presence == PRESENCE_GONE
+
+    fixture.clock.now += timedelta(days=1)
+    assert "AA111BB" in fixture.make_service().select_plates()
+    fixture.close()
+
+
+async def test_unknown_scope_is_rejected(fx):
+    with pytest.raises(ValueError):
+        DailyRecheckService(fx.repository, fx.tasks, fx.check_service, fx.tracker, gate=fx.gate, tz=_TBILISI,
+                            scope="everything")

@@ -71,6 +71,14 @@ STOP_BLOCKED = "blocked"
 STOP_UNAVAILABLE = "unavailable"
 STOP_ERRORS = "errors"
 STOP_CUTOFF = "cutoff"
+
+# Какие номера берёт проход (см. DailyRecheckService.select_plates): "all" —
+# все номера с известными штрафами, включая только ⏳ историю; "debt" —
+# только с известным долгом (снимок суммы или квитанция в базе полиции) —
+# пилот на ограниченной группе вместе с max_plates.
+SCOPE_ALL = "all"
+SCOPE_DEBT = "debt"
+RECHECK_SCOPES = (SCOPE_ALL, SCOPE_DEBT)
 STOP_BUSY = "busy"
 STOP_INTERRUPTED = "interrupted"
 
@@ -294,6 +302,8 @@ class _CheckServiceLike(Protocol):
 class _StatusTrackerLike(Protocol):
     def listed_car_numbers(self) -> list[str]: ...
 
+    def confirmed_car_numbers(self) -> list[str]: ...
+
     def recently_gone_car_numbers(self) -> list[str]: ...
 
 
@@ -318,6 +328,7 @@ class DailyRecheckService:
         batch_pause_seconds: float = 60.0,
         max_plates: int = 200,
         max_consecutive_errors: int = 2,
+        scope: str = SCOPE_ALL,
         busy_wait_seconds: float = 30.0,
         stale_after: timedelta = timedelta(minutes=5),
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -327,6 +338,8 @@ class DailyRecheckService:
             raise ValueError("daily_recheck_cutoff_time должен быть позже daily_recheck_time (в пределах одних суток)")
         if batch_size < 1 or max_plates < 1 or max_consecutive_errors < 1:
             raise ValueError("daily_recheck_batch_size/max_plates/max_consecutive_errors должны быть >= 1")
+        if scope not in RECHECK_SCOPES:
+            raise ValueError(f"daily_recheck_scope должен быть одним из {RECHECK_SCOPES}, а не {scope!r}")
         self._repository = repository
         self._tasks = task_repository
         self._check_service = check_service
@@ -340,6 +353,7 @@ class DailyRecheckService:
         self._batch_pause_seconds = batch_pause_seconds
         self._max_plates = max_plates
         self._max_consecutive_errors = max_consecutive_errors
+        self._scope = scope
         self._busy_wait_seconds = busy_wait_seconds
         self._stale_after = stale_after
         self._sleep = sleep
@@ -362,12 +376,17 @@ class DailyRecheckService:
         статусами (в т.ч. найденные feed'ом после последней проверки и
         оплаченные, но ещё видимые на police.ge) и номера, у которых штраф
         стал ⚪ в последние дни (ложное ⚪ сменится на "снова найден").
+        Область "debt" не берёт номера, у которых только ⏳ история.
         Сначала — те, что дольше всего не проверялись; номера, на которых
         упал вчерашний проход, — в конце."""
         last_checked: dict[str, datetime | None] = {}
         for group in self._tasks.list_debt_car_groups():
             last_checked[group.car_number] = _naive_utc(group.checked_at)
-        for car_number in [*self._statuses.listed_car_numbers(), *self._statuses.recently_gone_car_numbers()]:
+        status_plates = (
+            self._statuses.listed_car_numbers() if self._scope == SCOPE_ALL
+            else self._statuses.confirmed_car_numbers()
+        )
+        for car_number in [*status_plates, *self._statuses.recently_gone_car_numbers()]:
             if car_number in last_checked:
                 continue
             stamps = [

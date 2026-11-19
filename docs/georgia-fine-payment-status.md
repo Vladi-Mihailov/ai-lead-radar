@@ -375,11 +375,21 @@ fine_monitor:
   daily_recheck_batch_pause_seconds: 60
   daily_recheck_max_plates: 200
   daily_recheck_max_consecutive_errors: 2
+  daily_recheck_scope: all              # "debt": known-debt plates only (pilot)
   fine_disappearance_min_gap_hours: 12
   payment_page_already_paid_markers: []  # only an observed, distinct message
   # payment_page_failed_markers: built-in «ჯარიმის გადახდა ვერ მოხერხდა»
   payment_page_technical_error_markers: []
 ```
+
+`daily_recheck_scope: debt` limits the selection to plates with known debt: a
+positive saved total, or a receipt still in the police base (any payment mark).
+Plates whose only receipts are ⏳ history are left out; plates with a receipt
+that went ⚪ in the last 3 days stay in, for the follow-up. With
+`daily_recheck_max_plates` (e.g. 15) this gives a pilot on a limited group:
+the least recently checked known-debt plates first. With the default `all` and
+the same cap, the first plates would be ⏳-history plates (they are the least
+recently checked). Any other value stops the bot at start-up.
 
 Markers must be YAML lists of at least 6 characters. A marker that is part of
 the generic MIA failure message is rejected at start-up, so that message can

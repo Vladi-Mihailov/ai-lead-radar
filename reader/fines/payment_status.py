@@ -458,6 +458,13 @@ class FineStatusRepository:
         ).fetchall()
         return [row[0] for row in rows]
 
+    def list_confirmed_car_numbers(self) -> list[str]:
+        rows = self._conn.execute(
+            f"SELECT DISTINCT car_number FROM georgia_fine_status "
+            f"WHERE presence IN ('{PRESENCE_LISTED}', '{PRESENCE_MISSING}') ORDER BY car_number",
+        ).fetchall()
+        return [row[0] for row in rows]
+
     def list_car_numbers_with_statuses(self, car_numbers: list[str]) -> set[str]:
         if not car_numbers:
             return set()
@@ -989,6 +996,12 @@ class FineStatusTracker:
 
     def listed_car_numbers(self) -> list[str]:
         return [car for car in self._repository.list_listed_car_numbers() if not is_fine_output_suppressed(car)]
+
+    def confirmed_car_numbers(self) -> list[str]:
+        """Номера с квитанцией в базе полиции по последним данным ('listed'
+        или 'missing', с любой отметкой оплаты) — без номеров, у которых
+        только ⏳ история (см. DailyRecheckService, область "debt")."""
+        return [car for car in self._repository.list_confirmed_car_numbers() if not is_fine_output_suppressed(car)]
 
     def recently_gone_car_numbers(self, *, within: timedelta = GONE_FOLLOW_UP, at: datetime | None = None) -> list[str]:
         since = self._now(at) - within

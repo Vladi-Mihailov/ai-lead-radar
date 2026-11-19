@@ -555,11 +555,13 @@ async def run() -> None:
                 batch_pause_seconds=fine_monitor.daily_recheck_batch_pause_seconds,
                 max_plates=fine_monitor.daily_recheck_max_plates,
                 max_consecutive_errors=fine_monitor.daily_recheck_max_consecutive_errors,
+                scope=fine_monitor.daily_recheck_scope,
             )
             logger.info(
-                "Georgia daily recheck enabled: %s-%s %s",
+                "Georgia daily recheck enabled: %s-%s %s, scope %s, at most %d plates",
                 fine_monitor.daily_recheck_time.strftime("%H:%M"),
                 fine_monitor.daily_recheck_cutoff_time.strftime("%H:%M"), fine_monitor.timezone,
+                fine_monitor.daily_recheck_scope, fine_monitor.daily_recheck_max_plates,
             )
 
         # "ВРЕМЕННЫЙ manager workflow для Georgia fines bot" (см. задачу) —

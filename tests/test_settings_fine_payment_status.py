@@ -41,6 +41,7 @@ def test_defaults_are_safe(tmp_path, monkeypatch):
     assert fine_monitor.daily_recheck_batch_pause_seconds == 60.0
     assert fine_monitor.daily_recheck_max_plates == 200
     assert fine_monitor.daily_recheck_max_consecutive_errors == 2
+    assert fine_monitor.daily_recheck_scope == "all"
     assert fine_monitor.fine_disappearance_min_gap_hours == 12.0
     markers = build_payment_page_markers(fine_monitor)
     assert markers.already_paid == ()
@@ -79,3 +80,12 @@ def test_overrides_are_parsed(tmp_path, monkeypatch):
     assert markers.already_paid == ("ქვითარი უკვე გადახდილია",)
     assert markers.payment_failed == ("payment failed",)
     assert markers.technical_error == ("technical error",)
+
+
+def test_recheck_scope_debt_is_parsed(tmp_path, monkeypatch):
+    assert _load(tmp_path, monkeypatch, {"daily_recheck_scope": "debt"}).daily_recheck_scope == "debt"
+
+
+def test_recheck_scope_typo_stops_the_start(tmp_path, monkeypatch):
+    with pytest.raises(ConfigError):
+        _load(tmp_path, monkeypatch, {"daily_recheck_scope": "dept"})
