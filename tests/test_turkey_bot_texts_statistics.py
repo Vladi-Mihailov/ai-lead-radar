@@ -579,7 +579,8 @@ def test_debt_row_shows_no_count_when_a_provider_with_debt_has_none():
 
 @pytest.mark.parametrize("gib_count, kgm_count, expected", [
     (1, 0, "1 штраф"), (1, 1, "2 штрафа"), (2, 2, "4 штрафа"), (2, 3, "5 штрафов"), (10, 1, "11 штрафов"),
-    (20, 1, "21 штраф"), (20, 2, "22 штрафа"), (100, 11, "111 штрафов"), (100, 22, "122 штрафа"),
+    (10, 2, "12 штрафов"), (7, 7, "14 штрафов"), (20, 1, "21 штраф"), (20, 2, "22 штрафа"),
+    (100, 11, "111 штрафов"), (100, 12, "112 штрафов"), (100, 22, "122 штрафа"),
 ])
 def test_debt_row_count_uses_the_russian_plural(gib_count, kgm_count, expected):
     states = (
