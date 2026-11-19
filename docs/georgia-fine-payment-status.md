@@ -283,8 +283,10 @@ The re-check, once a day:
   - Order: least recently checked or attempted first. A failed attempt also
     sends the plate to the back of the queue, so with a cap smaller than the
     number of plates an always-failing plate does not return to the front
-    every other night. Plates whose last attempt failed go at the end of
-    their pass, so two always-failing plates cannot stop it before the others.
+    every other night. Plates that failed in their latest run go at the end
+    of their pass, so two always-failing plates cannot stop it before the
+    others. A plate the latest run did not reach does not count as failed,
+    so it is not kept at the end when passes keep ending early.
   - At most `daily_recheck_max_plates`.
   - Fine rows and notifications are created only for the plate's active
     tasks; with no active task, only for its freshest task with a positive

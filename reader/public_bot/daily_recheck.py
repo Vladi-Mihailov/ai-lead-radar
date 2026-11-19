@@ -29,9 +29,9 @@ delivery_service.py).
 того же дня не начнётся; номера, до которых не дошли (остановка/окно
 закончилось), завтра окажутся в начале очереди — очередь по давности
 последней успешной проверки или попытки прохода (неудачная попытка тоже
-отправляет номер в конец очереди); номера, на которых последняя попытка
-упала, идут в конце своего прохода (два "вечно падающих" номера не
-останавливают проход раньше остальных).
+отправляет номер в конец очереди); номера, упавшие в последнем прогоне,
+где они были, идут в конце своего прохода (два "вечно падающих" номера не
+останавливают проход раньше остальных), а не дошедшие — нет.
 Прогон, оставшийся 'running' после рестарта вне окна, закрывается как
 прерванный.
 
@@ -236,15 +236,23 @@ class DailyRecheckRepository:
             cursor = self._conn.execute(query, params)
         return cursor.rowcount
 
-    def last_attempts(self) -> dict[str, tuple[datetime, str]]:
-        """Последняя попытка прохода по каждому номеру: (когда, состояние
-        позиции). SQLite при единственном MAX() берёт остальные столбцы из
-        той же строки."""
+    def last_attempts(self) -> dict[str, datetime]:
+        """Когда номер последний раз был в проходе (проверен, упал или
+        пропущен) — для очереди select_plates."""
         rows = self._conn.execute(
-            "SELECT car_number, MAX(checked_at), state FROM georgia_daily_recheck_items "
+            "SELECT car_number, MAX(checked_at) FROM georgia_daily_recheck_items "
             "WHERE checked_at IS NOT NULL GROUP BY car_number",
         ).fetchall()
-        return {row[0]: (_parse_ts(row[1]), row[2]) for row in rows}
+        return {row[0]: _parse_ts(row[1]) for row in rows}
+
+    def latest_run_states(self) -> dict[str, str]:
+        """Состояние позиции номера в последнем прогоне, где он был; 'pending'
+        — до номера не дошли. SQLite при единственном MAX() берёт остальные
+        столбцы из той же строки."""
+        rows = self._conn.execute(
+            "SELECT car_number, MAX(run_date), state FROM georgia_daily_recheck_items GROUP BY car_number",
+        ).fetchall()
+        return {row[0]: row[2] for row in rows}
 
     def heartbeat(self, run_date: date, *, now: datetime) -> None:
         self._conn.execute(
@@ -388,9 +396,11 @@ class DailyRecheckService:
         Сначала — те, что дольше всего не проверялись и не попадали в
         проход: неудачная попытка тоже отправляет номер в конец очереди,
         иначе при max_plates меньше числа номеров "вечно падающий" номер
-        возвращался бы в начало через ночь. Номера, на которых последняя
-        попытка упала, — в конце своего прохода: два таких подряд в начале
-        остановили бы проход до проверки остальных."""
+        возвращался бы в начало через ночь. Номера, упавшие в последнем
+        прогоне, где они были, — в конце своего прохода: два таких подряд в
+        начале остановили бы проход до проверки остальных. Номер, до
+        которого прогон не дошёл, не "упал": иначе при проходах, кончающихся
+        раньше хвоста, он оставался бы в конце и не проверялся никогда."""
         last_checked: dict[str, datetime | None] = {}
         for group in self._tasks.list_debt_car_groups():
             last_checked[group.car_number] = _naive_utc(group.checked_at)
@@ -408,15 +418,15 @@ class DailyRecheckService:
             ]
             last_checked[car_number] = max(stamps) if stamps else None
         attempts = self._repository.last_attempts()
+        latest_states = self._repository.latest_run_states()
 
         def queue_key(car: str) -> tuple[datetime, str]:
-            attempted_at = attempts[car][0] if car in attempts else None
-            stamps = [stamp for stamp in (last_checked[car], attempted_at) if stamp is not None]
+            stamps = [stamp for stamp in (last_checked[car], attempts.get(car)) if stamp is not None]
             return (max(stamps) if stamps else datetime.min, car)
 
         plates = sorted((car for car in last_checked if not is_fine_output_suppressed(car)), key=queue_key)
         plates = plates[: self._max_plates]
-        plates.sort(key=lambda car: car in attempts and attempts[car][1] == ITEM_ERROR)
+        plates.sort(key=lambda car: latest_states.get(car) == ITEM_ERROR)
         return plates
 
     def _tasks_for_plate(self, car_number: str) -> tuple[list[FineMonitoringTask], list[FineMonitoringTask]]:
