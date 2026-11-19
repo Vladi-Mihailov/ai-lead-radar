@@ -138,13 +138,19 @@ def load_fast_lookahead_pages(env: dict[str, str] | None = None) -> int:
     """GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES — сколько ещё тихих страниц FAST
     читает после первой страницы без новых строк, прежде чем остановиться
     (по умолчанию collector_job.FAST_LOOKAHEAD_PAGES, там же — данные за это
-    значение). Тот же приём, что и load_page_limits(): не целое число или
-    < 1 — ValueError при старте, а не молчаливый откат к умолчанию."""
+    значение). Тот же приём, что и load_page_limits(): не целое число, < 1
+    или не меньше GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE того же env (с таким
+    K каждый FAST-цикл упирался бы в лимит) — ValueError при старте, а не
+    молчаливый откат к умолчанию."""
     if env is None:
         env = os.environ
     pages = int(env.get("GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES", str(FAST_LOOKAHEAD_PAGES)))
-    if pages < 1:
-        raise ValueError("GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES must be >= 1")
+    max_pages_per_cycle, _first_run_max_pages = load_page_limits(env)
+    if not 1 <= pages < max_pages_per_cycle:
+        raise ValueError(
+            "GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES must be >= 1 and below "
+            f"GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE ({max_pages_per_cycle})"
+        )
     return pages
 
 

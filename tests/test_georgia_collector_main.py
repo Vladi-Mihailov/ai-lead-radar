@@ -92,7 +92,24 @@ def test_load_fast_lookahead_pages_rejects_invalid_values(value):
         load_fast_lookahead_pages(env={"GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES": value})
 
 
+@pytest.mark.parametrize("max_pages, lookahead, expected", [
+    ("5", "4", 4), ("5", "5", None), ("5", "6", None), (None, "299", 299), (None, "300", None),
+])
+def test_load_fast_lookahead_pages_must_stay_below_the_page_cap(max_pages, lookahead, expected):
+    """With K >= GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE (default 300) every
+    FAST cycle would end at the cap: refused at start-up."""
+    env = {"GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES": lookahead}
+    if max_pages is not None:
+        env["GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE"] = max_pages
+    if expected is None:
+        with pytest.raises(ValueError, match="below GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE"):
+            load_fast_lookahead_pages(env=env)
+    else:
+        assert load_fast_lookahead_pages(env=env) == expected
+
+
 def test_load_fast_lookahead_pages_falls_back_to_os_environ_when_env_omitted(monkeypatch):
+    monkeypatch.delenv("GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE", raising=False)
     monkeypatch.setenv("GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES", "4")
     assert load_fast_lookahead_pages() == 4
     monkeypatch.delenv("GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES")

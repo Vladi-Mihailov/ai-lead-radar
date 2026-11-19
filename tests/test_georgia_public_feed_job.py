@@ -48,7 +48,8 @@ from reader.jobs.georgia_public_feed_job import (  # noqa: E402
     GeorgiaPublicFineFeedJob,
 )
 
-pytestmark = pytest.mark.asyncio
+# Async-тесты запускаются через asyncio_mode = auto (pytest.ini): общей
+# asyncio-метки модуля нет — из-за неё предупреждали синхронные тесты.
 
 _CHAT_ID = -100999
 _USER_ID = 111
@@ -1517,17 +1518,18 @@ async def test_fast_cap_has_its_own_message(tmp_path):
     feed_state_repo = _make_feed_state_repo(tmp_path)
     seen_repo = _make_seen_repo(tmp_path)
     try:
+        # Лимит в 2 страницы при 2 страницах look-ahead больше не допускается.
         _establish_fast_mode(feed_state_repo, at=_utc(15))
         session = _FakeFeedSession(
-            {i * 30: _page(_rows(f"N{i}_", 30, publish_date="2026-10-22")) for i in range(3)}
+            {i * 30: _page(_rows(f"N{i}_", 30, publish_date="2026-10-22")) for i in range(4)}
         )
         job, _provider = _make_job(
-            session, task_repo, fine_repo, feed_state_repo, seen_repo, max_pages_per_cycle=2,
+            session, task_repo, fine_repo, feed_state_repo, seen_repo, max_pages_per_cycle=3,
         )
         await job.run(_utc(21))
 
         error = feed_state_repo.get().last_error
-        assert error.startswith("safety cap of 2 pages reached before the frontier")
+        assert error.startswith("safety cap of 3 pages reached before the frontier")
         assert "fine_monitor.public_feed_max_pages_per_cycle" in error
     finally:
         task_repo.close()
@@ -1946,14 +1948,27 @@ def test_fast_lookahead_is_two_pages_by_default_and_matches_the_collector():
     assert FAST_LOOKAHEAD_PAGES == collector_job.FAST_LOOKAHEAD_PAGES == 2
 
 
-def test_feed_job_rejects_a_lookahead_below_one(feed_repos):
+@pytest.mark.parametrize("lookahead, max_pages, valid", [
+    (0, 30, False), (1, 2, True), (2, 3, True), (3, 3, False), (4, 3, False),
+])
+def test_feed_job_takes_a_lookahead_from_one_to_below_the_page_cap(feed_repos, lookahead, max_pages, valid):
+    """K < 1 — нет look-ahead; K не меньше лимита страниц — каждый FAST-цикл
+    упирался бы в лимит."""
     task_repo, fine_repo, feed_state_repo, seen_repo = feed_repos
     check_service = FineCheckService(_FakeCircuitProvider(), task_repo, fine_repo)
-    with pytest.raises(ValueError):
-        GeorgiaPublicFineFeedJob(
+
+    def build():
+        return GeorgiaPublicFineFeedJob(
             _FakeFeedSession(), task_repo, check_service, feed_state_repo, seen_repo,
-            run_times=_DEFAULT_RUN_TIMES, tz=_TBILISI, fast_lookahead_pages=0,
+            run_times=_DEFAULT_RUN_TIMES, tz=_TBILISI,
+            max_pages_per_cycle=max_pages, fast_lookahead_pages=lookahead,
         )
+
+    if valid:
+        build()
+    else:
+        with pytest.raises(ValueError):
+            build()
 
 
 @pytest.mark.parametrize("old_on_page0", [1, 3], ids=["one_old_row", "several_old_rows"])

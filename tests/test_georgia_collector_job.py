@@ -41,7 +41,8 @@ from reader.georgia_collector.outbox_repository import (
 )
 from reader.georgia_collector.production_client import ProductionApiError
 
-pytestmark = pytest.mark.asyncio
+# Async tests run through asyncio_mode = auto (pytest.ini): no module-wide
+# asyncio mark, which only made the synchronous tests here warn.
 
 _TBILISI = ZoneInfo("Asia/Tbilisi")
 _DEFAULT_RUN_TIMES = [dt_time(9, 0), dt_time(15, 0), dt_time(21, 0), dt_time(23, 55)]
@@ -767,15 +768,16 @@ async def test_first_run_cap_has_its_own_message(tmp_path):
 
 
 async def test_fast_cap_has_its_own_message(tmp_path):
+    # A cap of 2 pages is no longer allowed with the 2 look-ahead pages.
     production = _FakeProductionClient(active_plates=["AA001AA"])
-    session = _FakeSession({i * 30: _page(_rows(f"N{i}_", 30, publish_date="2026-10-22")) for i in range(3)})
-    job, feed_state_repo, *_ = _make_job(tmp_path, session, production, max_pages_per_cycle=2)
+    session = _FakeSession({i * 30: _page(_rows(f"N{i}_", 30, publish_date="2026-10-22")) for i in range(4)})
+    job, feed_state_repo, *_ = _make_job(tmp_path, session, production, max_pages_per_cycle=3)
     feed_state_repo.record_successful_cycle(newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15))
 
     await job.run(_utc(21))
 
     error = feed_state_repo.get().last_error
-    assert error.startswith("safety cap of 2 pages reached before the frontier")
+    assert error.startswith("safety cap of 3 pages reached before the frontier")
     assert "GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE" in error
 
 
@@ -1098,14 +1100,27 @@ def test_fast_lookahead_is_two_pages_by_default():
     assert load_fast_lookahead_pages(env={}) == 2
 
 
-def test_collector_job_rejects_a_lookahead_below_one(tmp_path):
+@pytest.mark.parametrize("lookahead, max_pages, valid", [
+    (0, 30, False), (1, 2, True), (2, 3, True), (3, 3, False), (4, 3, False),
+])
+def test_collector_job_takes_a_lookahead_from_one_to_below_the_page_cap(tmp_path, lookahead, max_pages, valid):
+    """K < 1 makes no look-ahead; K >= the page cap makes every FAST cycle
+    end at the cap."""
     db_path = tmp_path / "collector.db"
-    with pytest.raises(ValueError):
-        GeorgiaCollectorJob(
+
+    def build():
+        return GeorgiaCollectorJob(
             _FakeSession(), _FakeProductionClient(), GeorgiaPublicFeedStateRepository(db_path),
             GeorgiaPublicFeedSeenRepository(db_path), CollectorOutboxRepository(db_path),
-            run_times=_DEFAULT_RUN_TIMES, tz=_TBILISI, fast_lookahead_pages=0,
+            run_times=_DEFAULT_RUN_TIMES, tz=_TBILISI,
+            max_pages_per_cycle=max_pages, fast_lookahead_pages=lookahead,
         )
+
+    if valid:
+        build()
+    else:
+        with pytest.raises(ValueError):
+            build()
 
 
 @pytest.mark.parametrize("old_on_page0", [1, 3], ids=["one_old_row", "several_old_rows"])

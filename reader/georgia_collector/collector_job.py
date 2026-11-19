@@ -136,9 +136,19 @@ Data behind K = 2 (production, 2026-11-19):
   effect. Deep insertion of new rows below the boundary was not observed;
   if the data.count delta ever exceeds the new rows read, revisit (a DEEP
   trigger or a daily sweep, ~190–210 pages a day).
-K = 2 covers ~60 rows beyond the first quiet page for at most +2 page
-requests per ordinary FAST cycle (~+8 a day at four cycles), well inside
-the 300-page cap."""
+K = 2 looks up to ~60 rows below the first quiet page: it counts pages,
+and one fresh old row makes a page quiet, so pages a burst partly repeats
+cover less. Cost, measured in simulation: +1.94 pages per FAST cycle
+without bursts and +2.68 with them (repeat pages are neutral), about +10
+requests a day (~5 % of the daily total), well inside the 300-page cap.
+K must stay below max_pages_per_cycle (the jobs refuse it otherwise, the
+collector already at start-up): every FAST cycle would end at the cap.
+
+Expected one-off: right after a true first run that saw fewer than ~4
+pages (early in the day), the seen region is shallower than a quiet page
+plus K, so the next FAST cycle reads on into older rows no cycle has seen
+(they count as new) up to the page cap and records an error; the DEEP
+recovery after it completes normally."""
 
 # Отметка "цикл идёт" в georgia_public_feed_state.last_error (см. отметку
 # перед циклом страниц): если она осталась, цикл был прерван.
@@ -184,11 +194,13 @@ class _FeedCycleCounters:
     - seen_among_new: rows seen before this cycle standing above a new row
       on the same page (an old row re-shown among new ones). The old rows
       under the last new row of the boundary page are not counted — every
-      cycle has them;
+      cycle has them. DEEP cycles count it too;
     - quiet_pages: pages with no new row and at least one row seen before
-      this cycle that it had not read yet;
-    - lookahead_new: FAST only — new rows on pages after a quiet page,
-      i.e. rows inserted below a boundary that the look-ahead found;
+      this cycle that it had not read yet. DEEP cycles count them too (there
+      rows marked by failed attempts make pages quiet as well);
+    - lookahead_new: FAST only — every new row on a page after the cycle's
+      first quiet page, also after a look-ahead reset: rows inserted below a
+      boundary that the look-ahead found (or a burst deeper than that page);
     - reported_count: data.count of page 0 (the feed total), and
       reported_count_delta: its change since the previous cycle's page 0 in
       this process (n/a after a restart). A delta above new_rows hints at
@@ -228,8 +240,9 @@ class GeorgiaCollectorJob:
         retention_days: int = 7,
         fast_lookahead_pages: int = FAST_LOOKAHEAD_PAGES,
     ):
-        if fast_lookahead_pages < 1:
-            raise ValueError("fast_lookahead_pages must be >= 1")
+        if not 1 <= fast_lookahead_pages < max_pages_per_cycle:
+            # K не меньше лимита — каждый FAST-цикл упирался бы в лимит.
+            raise ValueError("fast_lookahead_pages must be >= 1 and below max_pages_per_cycle")
         self._session = session
         self._production = production_client
         self._feed_state = feed_state_repository
