@@ -237,6 +237,17 @@ async def test_unverified_line_is_hidden_for_suppressed_plates_and_without_statu
     fixture.close()
 
 
+async def test_trusted_add_car_summary_shows_unverified_history(fx):
+    fx.provider.records[_CAR] = [_record(_CAR, "GE1", 50)]
+    _make_unverified(fx, "OLD1", 30)
+
+    reply = await fx.controller._complete_delegated_add_car_without_client(
+        car_number=_CAR, today=date(2026, 11, 19), chat_id=_CHAT, telegram_user_id=_TRUSTED,
+    )
+
+    assert reply.text.endswith("⏳ Ждут повторной проверки police.ge: 30 ₾ (1 шт.) — в сумму к оплате не входят")
+
+
 def test_add_car_summaries_show_unverified_history_on_its_own_line():
     common = {"car_number": _CAR, "check_ok": True, "new_fines_count": 1}
     line = "⏳ Ждут повторной проверки police.ge: 30 ₾ (1 шт.) — в сумму к оплате не входят"
