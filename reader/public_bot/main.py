@@ -612,6 +612,7 @@ async def run() -> None:
                 host=settings.fine_monitor.collector_api_host,
                 port=settings.fine_monitor.collector_api_port,
                 alert_chat_id=settings.public_bot.support_chat_id,
+                health_db_path=db_path,
             )
 
         controller = ConversationController(

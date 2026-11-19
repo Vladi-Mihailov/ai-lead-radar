@@ -412,65 +412,162 @@ async def test_health_problem_alerts_the_support_chat_once_and_says_when_it_is_o
     assert telegram_client.sent_messages[1][1].startswith("✅ ")
 
 
-async def test_health_alert_without_a_support_chat_is_only_logged(tmp_path):
-    app, *_rest, telegram_client = _make_app(tmp_path)
+async def test_health_single_error_is_not_alerted_the_second_in_a_row_is(tmp_path):
+    app, *_rest, telegram_client = _make_app(tmp_path, alert_chat_id=-100555)
     async with TestClient(TestServer(app)) as client:
         assert await _post_health(client, {"status": "error", "detail": "ConnectTimeout"}) == 200
+        assert telegram_client.sent_messages == []
+        assert await _post_health(client, {"status": "error", "detail": "ConnectTimeout"}) == 200
+
+    assert len(telegram_client.sent_messages) == 1
+    assert telegram_client.sent_messages[0][1].startswith("⚠️ ")
+
+
+async def test_health_alert_without_a_support_chat_is_only_logged(tmp_path, caplog):
+    import logging
+
+    app, *_rest, telegram_client = _make_app(tmp_path)
+    with caplog.at_level(logging.WARNING, logger="reader.public_bot.collector_api"):
+        async with TestClient(TestServer(app)) as client:
+            assert await _post_health(client, {"status": "error", "detail": "ConnectTimeout"}) == 200
+            assert await _post_health(client, {"status": "error", "detail": "ConnectTimeout"}) == 200
 
     assert telegram_client.sent_messages == []
+    assert any("support_chat_id not configured" in r.getMessage() for r in caplog.records)
 
 
-async def test_health_alert_that_cannot_be_sent_still_acknowledges(tmp_path):
-    class _FailingTelegramClient:
+async def test_health_alert_that_cannot_be_sent_still_acknowledges_and_stays_queued(tmp_path):
+    from reader.public_bot.collector_health import CollectorHealthMonitor, CollectorHealthStore
+
+    class _FlakyTelegramClient(_FakeTelegramClient):
+        failing = True
+
         async def send_message(self, chat_id: int, text: str) -> None:
-            raise RuntimeError("telegram unavailable")
+            if self.failing:
+                raise RuntimeError("telegram unavailable")
+            await super().send_message(chat_id, text)
 
-    app, *_rest = _make_app(tmp_path, telegram_client=_FailingTelegramClient(), alert_chat_id=-100555)
+    telegram_client = _FlakyTelegramClient()
+    monitor = CollectorHealthMonitor(CollectorHealthStore(tmp_path / "users.db"))
+    app, *_rest = _make_app(tmp_path, telegram_client=telegram_client, alert_chat_id=-100555,
+                            health_monitor=monitor)
     async with TestClient(TestServer(app)) as client:
-        assert await _post_health(client, {"status": "error", "detail": "ConnectTimeout"}) == 200
+        assert await _post_health(client, {"status": "recovering", "detail": "cap", "pages": 300}) == 200
+
+    assert telegram_client.sent_messages == []
+    [queued] = monitor.store.queued()
+    assert queued.attempts == 1
+    assert monitor.store.load().problem_alerted_at is None
+
+
+async def test_health_answers_without_waiting_for_a_slow_telegram_and_delivers_in_the_background(
+    tmp_path, monkeypatch,
+):
+    """A hanging Telegram must not hold the answer past the collector
+    client's timeout (it would re-send the report): the handler waits a few
+    seconds at most and the delivery finishes in the background."""
+    import asyncio
+
+    from reader.public_bot import collector_api
+
+    monkeypatch.setattr(collector_api, "_HEALTH_DELIVERY_WAIT_SECONDS", 0.05)
+    release = asyncio.Event()
+
+    class _SlowTelegramClient(_FakeTelegramClient):
+        async def send_message(self, chat_id: int, text: str) -> None:
+            await release.wait()
+            await super().send_message(chat_id, text)
+
+    telegram_client = _SlowTelegramClient()
+    app, *_rest = _make_app(tmp_path, telegram_client=telegram_client, alert_chat_id=-100555)
+    async with TestClient(TestServer(app)) as client:
+        assert await _post_health(client, {"status": "recovering", "detail": "cap", "pages": 300}) == 200
+        assert telegram_client.sent_messages == []
+        release.set()
+        for _ in range(100):
+            if telegram_client.sent_messages:
+                break
+            await asyncio.sleep(0.01)
+
+    assert len(telegram_client.sent_messages) == 1
+    assert telegram_client.sent_messages[0][1].startswith("⚠️ ")
 
 
 async def test_health_with_a_non_object_json_body_is_acknowledged(tmp_path):
     app, *_rest, telegram_client = _make_app(tmp_path, alert_chat_id=-100555)
     async with TestClient(TestServer(app)) as client:
         assert await _post_health(client, ["not", "an", "object"]) == 200
+        assert await _post_health(client, ["not", "an", "object"]) == 200
 
     assert len(telegram_client.sent_messages) == 1
     assert telegram_client.sent_messages[0][1].startswith("⚠️ ")
 
 
-async def test_watch_collector_silence_sends_one_alert_after_13_silent_hours():
+async def test_watchdog_alerts_after_13_silent_hours_and_retries_undelivered_alerts():
     import asyncio
     from datetime import timedelta
 
-    from reader.public_bot.collector_api import watch_collector_silence
+    from reader.public_bot.collector_api import watch_collector_health
     from reader.public_bot.collector_health import CollectorHealthMonitor
 
     now = [datetime(2026, 11, 20, 5, 0, tzinfo=timezone.utc)]
     monitor = CollectorHealthMonitor(clock=lambda: now[0])
     monitor.observe({"status": "ok"})
     sent: list[str] = []
+    failures = [1]
     sleeps: list[float] = []
 
     async def send(text: str) -> None:
+        if failures[0]:
+            failures[0] -= 1
+            raise ConnectionError("telegram unavailable")
         sent.append(text)
 
     async def fake_sleep(seconds: float) -> None:
         sleeps.append(seconds)
-        if len(sleeps) > 3:
+        if len(sleeps) > 4:
             raise asyncio.CancelledError
-        now[0] += timedelta(hours=7)
+        now[0] += timedelta(hours=7) if len(sleeps) <= 2 else timedelta(minutes=1)
 
     with pytest.raises(asyncio.CancelledError):
-        await watch_collector_silence(monitor, send, sleep=fake_sleep)
+        await watch_collector_health(monitor, send, sleep=fake_sleep)
 
+    # 12:00 — тихо; 19:00 — 14 ч молчания, Telegram не принял; 19:01 — повтор доставлен.
     assert len(sent) == 1
     assert "нет отчётов 14 ч" in sent[0]
-    assert sleeps == [600, 600, 600, 600]
+    assert sleeps == [60, 60, 60, 60, 60]
 
 
-async def test_run_collector_api_forever_hands_the_alert_chat_to_the_app_and_stops_the_watchdog(tmp_path, monkeypatch):
+async def test_watchdog_survives_an_unexpected_error():
     import asyncio
+
+    from reader.public_bot.collector_api import watch_collector_health
+
+    class _BrokenMonitor:
+        calls = 0
+
+        def check_silence(self):
+            self.calls += 1
+            raise RuntimeError("db locked")
+
+    monitor = _BrokenMonitor()
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) > 2:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await watch_collector_health(monitor, None, sleep=fake_sleep)
+    assert monitor.calls == 2
+
+
+async def test_run_collector_api_forever_keeps_alert_state_in_the_production_db_and_stops_the_watchdog(
+    tmp_path, monkeypatch,
+):
+    import asyncio
+    import sqlite3
 
     from reader.public_bot import collector_api
     from reader.public_bot.collector_health import CollectorHealthMonitor
@@ -486,7 +583,7 @@ async def test_run_collector_api_forever_hands_the_alert_chat_to_the_app_and_sto
     monkeypatch.setattr(collector_api, "build_collector_api_app", spy_build)
     task = asyncio.create_task(collector_api.run_collector_api_forever(
         ingest_service, hmac_secret=_SECRET, telegram_client=_FakeTelegramClient(),
-        host="127.0.0.1", port=0, alert_chat_id=-100777,
+        host="127.0.0.1", port=0, alert_chat_id=-100777, health_db_path=tmp_path / "users.db",
     ))
     for _ in range(50):
         if captured:
@@ -499,3 +596,6 @@ async def test_run_collector_api_forever_hands_the_alert_chat_to_the_app_and_sto
 
     assert captured["alert_chat_id"] == -100777
     assert isinstance(captured["health_monitor"], CollectorHealthMonitor)
+    tables = {row[0] for row in sqlite3.connect(tmp_path / "users.db").execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert {"georgia_collector_health", "georgia_collector_alert_outbox"} <= tables

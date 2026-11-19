@@ -122,37 +122,64 @@ A successful run prints `OK: HTTP 200, {"plates": [...]}`. Then watch
 (09:00/15:00/21:00/23:55 Asia/Tbilisi, or whatever `GEORGIA_COLLECTOR_RUN_TIMES`
 is set to) for a successful poll cycle.
 
-## 8. Long outages: resumed recovery and alerts
+## 8. Long outages: recovery over several cycles and alerts
 
 A cycle reads at most `GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE` pages (300 by
-default, about 1.5 days of publications). After a longer outage the cycle
-that hits the cap records where it stopped
-(`georgia_public_feed_state.recovery_resume_offset` / `recovery_resume_at`).
-Each following cycle:
+default, about 1.5 days of publications). After a longer outage the backlog
+is read over several cycles. After every page a cycle saves what it has read
+in order as *regions* (`georgia_public_feed_state.recovery_regions`, JSON):
+for each region, the protocol numbers of its first 30 and last 600 rows and
+its row count. No plates, no other fields. Each following cycle:
 
 1. reads the new rows on top as usual;
-2. at the rows the previous attempt already read, jumps to just before where
-   that attempt stopped;
-3. checks that it landed among that attempt's rows, stepping back page by
-   page if not;
-4. goes on, until it reaches the rows of the last successful cycle.
+2. at a row whose protocol number starts a region, jumps into the region's
+   last rows (estimated from its row count);
+3. reads forward until it finds one of those last rows by its number. Pages
+   read while searching are not processed: they are read in order later;
+4. jumps to the region's very last row (the distance inside a region is
+   exact) and goes on in order from there;
+5. on a sign of overshooting (an unread row, a row of a lower region, an
+   empty page or a page of already processed rows), jumps back higher and
+   searches again. If the search fails, the region is read in order from its
+   first page;
+6. goes on to the next region, and finally to the rows of the last
+   successful cycle.
 
-Nothing is skipped and every cycle stays within the cap. Until the gap is
-closed the cycle ends as "recovering". The two columns are added to the
-existing state database automatically when the collector starts
-(`ALTER TABLE ... ADD COLUMN`); no existing value changes.
+A jump is trusted only after the region's last rows are found by their
+numbers, so nothing is skipped, even when publications arrive during the
+cycle. Every cycle stays within the cap. Until the gap is closed the cycle
+ends as "recovering". A cycle that is stopped mid-way (restart, OOM) keeps
+the regions saved after its last page. A successful cycle clears them. The
+column is added to the existing state database automatically when the
+collector starts (`ALTER TABLE ... ADD COLUMN`; a second process doing the
+same at the same moment is not an error); no existing value changes. The
+same traversal (`reader/fines/public_feed_traversal.py`) serves the
+in-process job.
 
 After every feed poll the collector POSTs its outcome to production's
-`/internal/georgia/health`: status, mode, page count and dates only, no
-plates. The production bot (`ai-lead-radar-geshtrafbot.service`) alerts the
-managers' group (`public_bot.support_chat_id`):
+`/internal/georgia/health`: status, mode, page count, row counts, dates and
+the time of the last complete cycle; no plates or protocol numbers. A cycle
+skipped because the police.ge circuit breaker is open is reported too. The
+production bot (`ai-lead-radar-geshtrafbot.service`) alerts the managers'
+group (`public_bot.support_chat_id`):
 
-- the first "recovering" or "error" report;
+- "recovering": at the first report;
+- "error": at the second report in a row that is not "ok" (a single failure
+  that the next cycle fixes alerts nobody);
 - a reminder at most every 12 h while it lasts;
-- ✅ when cycles complete again;
-- one alert if no report arrives for more than 13 h, and ✅ when reports
-  resume. This watch starts with the first report after the bot starts, so
-  deploying the bot before the collector never raises a false alarm.
+- ✅ when cycles complete again, only if the alert was delivered;
+- an alert if no report arrives for more than 13 h, reminders every 12 h, and
+  ✅ when reports resume. The watch starts with the first report ever
+  received, so deploying the bot before the collector never raises a false
+  alarm.
+
+The bot keeps this state and the alert queue in its database (tables
+`georgia_collector_health`, `georgia_collector_alert_outbox`), so a bot
+restart neither forgets an outage nor repeats alerts. An alert counts as sent
+only after Telegram accepts it. Otherwise it is retried every 1, 2, 4, …
+minutes, at most every 30 minutes. Alerts are sent in order. An alert not
+sent yet is updated by newer reports, and is dropped if the problem ends
+first.
 
 A report that fails is logged on REDNET and never affects the cycle.
 
