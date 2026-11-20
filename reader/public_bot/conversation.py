@@ -1408,6 +1408,9 @@ class ConversationController:
                 car_count=len(rows), totals=totals,
                 source_updated_on=source[0] if source else None,
                 recheck_line=texts.format_daily_recheck_line(run),
+                debt_count_is_lower_bound=any(
+                    isinstance(breakdown, texts.SnapshotDebt) for _, _, breakdown in rows
+                ),
             )
 
         page: int | None = None
@@ -1461,10 +1464,12 @@ class ConversationController:
                 breakdown, snapshot, snapshot_times.get(car_number), last_full_checks.get(car_number),
             ):
                 # Сумма снимка остаётся неоплаченной, как и раньше; число
-                # штрафов неизвестно. Квитанции ⏳ этой машины не
-                # добавляются: более новый снимок уже включает всё, что
-                # police.ge тогда показал.
-                breakdown = DebtBreakdown(unpaid_amount=snapshot, unpaid_count=1)
+                # штрафов неизвестно — SnapshotDebt говорит об этом явно
+                # (строка машины — сумма без числа, см. texts.format_debt_row),
+                # а unpaid_count=1 в итогах — нижняя граница. Квитанции ⏳
+                # этой машины не добавляются: более новый снимок уже включает
+                # всё, что police.ge тогда показал.
+                breakdown = texts.SnapshotDebt(unpaid_amount=snapshot, unpaid_count=1)
             elif breakdown.listed_count == 0:
                 # Ни долга, ни оплаченного в базе полиции по статусам,
                 # сверенным не раньше снимка: старый снимок долгом не

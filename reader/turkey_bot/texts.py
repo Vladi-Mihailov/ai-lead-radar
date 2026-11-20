@@ -860,6 +860,49 @@ def _format_debt_owner_lines(owner: DebtOwner) -> list[str]:
     return [f"👤 Пользователь: {name_text}", f"🔗 Telegram: {username_text}"]
 
 
+def _russian_plural(count: int, one: str, few: str, many: str) -> str:
+    """Форма существительного после числа: 1, 21, 101 -> one ("штраф");
+    2–4, 22–24 -> few ("штрафа"); 0, 5–20, 25–30, 111–114 -> many ("штрафов").
+    Тот же алгоритм, что и в reader/public_bot/texts.py (боты не
+    импортируют друг друга)."""
+    last_two = abs(count) % 100
+    last = last_two % 10
+    if last == 1 and last_two != 11:
+        return one
+    if 2 <= last <= 4 and not 12 <= last_two <= 14:
+        return few
+    return many
+
+
+# Как называть записи долга провайдера рядом с числом (см. format_debt_row):
+# у GİB — штрафы, у KGM — неоплаченные проезды (штраф за проезд начисляется
+# только после срока «Без штрафа до», см. HELP_TERMS_TEXT), поэтому KGM
+# штрафами не называется.
+_DEBT_RECORD_FORMS = {
+    "gib": ("штраф", "штрафа", "штрафов"),
+    "kgm": ("неоплаченный проезд", "неоплаченных проезда", "неоплаченных проездов"),
+}
+_DEBT_RECORD_FALLBACK_FORMS = ("запись", "записи", "записей")
+
+
+def _format_debt_record_counts(provider_states: tuple[TurkeyProviderDebtState, ...]) -> str | None:
+    """"3 штрафа GİB, 4 неоплаченных проезда KGM" — записи долга за суммой
+    строки, по провайдерам, чья сумма в неё вошла (amount > 0): записи
+    провайдера без суммы (например, штрафы GİB, у которых сумма не
+    разобралась) за суммой строки не стоят и не считаются. None — число
+    ненадёжно: ни у одного провайдера нет суммы или у провайдера с суммой
+    нет числа записей."""
+    with_amount = [state for state in provider_states if state.amount > 0]
+    if not with_amount or any(state.debt_count <= 0 for state in with_amount):
+        return None
+    parts = []
+    for state in with_amount:
+        forms = _DEBT_RECORD_FORMS.get(state.provider, _DEBT_RECORD_FALLBACK_FORMS)
+        name = _DEBT_PROVIDER_DISPLAY.get(state.provider, state.provider)
+        parts.append(f"{state.debt_count} {_russian_plural(state.debt_count, *forms)} {name}")
+    return ", ".join(parts)
+
+
 def format_debt_row(
     *, car_number: str, owners: list[DebtOwner], total_amount: Decimal,
     provider_states: tuple[TurkeyProviderDebtState, ...] = (),
@@ -867,7 +910,7 @@ def format_debt_row(
     """Блок одной машины debt-списка (см. задачу "дополнить статистику
     штрафов информацией о пользователях"):
         🚗 Госномер: <номер>
-        💰 Задолженность: <сумма> ₺
+        🔴 Неоплаченные записи: <сумма> ₺ — <N штрафов GİB>, <M неоплаченных проездов KGM>
         👤 Пользователь: <имя>
         🔗 Telegram: @<username>
     БЕЗ даты/checked_at/"сегодня"/"вчера"/"N дней назад" и БЕЗ "≥"/"·
@@ -886,13 +929,25 @@ def format_debt_row(
     под ней по одной строке на GİB и KGM — что подтверждено последней
     проверкой, что известно только по более ранней успешной проверке (с
     её датой и датой неответа), по какому провайдеру достоверных данных
-    нет."""
-    amount_text = _format_try_amount(total_amount)
+    нет.
+
+    После суммы — сколько за ней записей, отдельно по провайдерам
+    (_format_debt_record_counts): debt_count тех же состояний GİB и KGM, из
+    которых сложена сумма (см. TurkeyProviderDebtState; Avrasya не
+    прибавляется — её долг уже внутри KGM, как и в сумме). GİB — штрафы,
+    KGM — неоплаченные проезды. Считаются только провайдеры, чья сумма вошла
+    в строку; число показывается, только если оно есть у каждого из них;
+    иначе — только сумма, число не выдумывается. Строки "оплачено" у Turkey
+    нет: источники не сообщают об оплате."""
+    debt_text = _format_try_amount(total_amount)
+    record_counts = _format_debt_record_counts(provider_states)
+    if record_counts:
+        debt_text = f"{debt_text} — {record_counts}"
     lines = [f"🚗 Госномер: {format_plate_for_telegram(car_number)}"]
     if all(state.freshness == TurkeyProviderFreshness.CURRENT for state in provider_states):
-        lines.append(f"💰 Задолженность: {amount_text}")
+        lines.append(f"🔴 Неоплаченные записи: {debt_text}")
     else:
-        lines.append(f"💰 Задолженность: ⚠️ {amount_text}")
+        lines.append(f"🔴 Неоплаченные записи: ⚠️ {debt_text}")
         lines.extend(f"   {_format_debt_provider_state(state)}" for state in provider_states)
     if not owners:
         lines.append(DEBT_OWNER_NOT_LINKED_LINE)

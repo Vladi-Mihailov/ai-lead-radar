@@ -920,11 +920,31 @@ def _format_debt_owner_lines(owner: DebtOwner) -> list[str]:
     return [f"👤 Пользователь: {name_text}{mark}", f"🔗 Telegram: {username_text}"]
 
 
+@dataclass(frozen=True)
+class SnapshotDebt(DebtBreakdown):
+    """Долг машины debt-списка, когда статусы оплаты не объясняют снимок
+    суммы последней успешной проверки (см. conversation.
+    _snapshot_has_unexplained_debt): сумма снимка показывается неоплаченной,
+    а сколько за ней штрафов — неизвестно. format_debt_row печатает тогда
+    только сумму с пометкой, без числа штрафов. unpaid_count (1) — нижняя
+    граница для итогов (положительная сумма — хотя бы один штраф), в строке
+    машины оно не показывается."""
+
+
+_DEBT_COUNT_UNKNOWN_NOTE = "(количество уточнится при следующей проверке)"
+
+
+def _format_fine_count_and_amount(count: int, amount: float) -> str:
+    """"3 штрафа — 150 ₾" — число штрафов и их сумма в строках блока машины
+    (см. format_debt_row), форма "штраф" — по _russian_plural."""
+    return f"{count} {_russian_plural(count, 'штраф', 'штрафа', 'штрафов')} — {_format_search_amount(amount)}"
+
+
 def format_debt_row(
     *, car_number: str, owners: list[DebtOwner], total_amount: float, breakdown: DebtBreakdown | None = None,
 ) -> str:
     """Блок одной машины debt-списка (см. задачу "дополнить статистику
-    штрафов информацией о пользователях"):
+    штрафов информацией о пользователях"), без статусов оплаты:
         🚗 Госномер: <номер>
         💰 Задолженность: <сумма> ₾
         👤 Пользователь: <имя>
@@ -937,25 +957,43 @@ def format_debt_row(
     Пустой owners (машина без клиента, см. add_delegated_car_without_client)
     -> "👤 Пользователь не привязан".
 
-    breakdown (статусы оплаты ведутся) — "💰 Задолженность" это всё, что
-    не подтверждено оплаченным (🔴 и 🟡), 🟡 — строкой "из них", 🟢 —
-    отдельной строкой; total_amount тогда не используется."""
+    breakdown (статусы оплаты ведутся) — по каждому статусу число штрафов и
+    их сумма, отдельными строками и только при числе больше нуля (см.
+    задачу "показывать по каждой машине количество и сумму отдельно"):
+        🔴 Неоплачено: N штрафов — X ₾  (🔴 и 🟡: всё, что не подтверждено оплаченным)
+        🟡 Из них требуют проверки: M штрафов — Z ₾  (🟡 остаётся долгом)
+        🟢 Оплачено: K штрафов — Y ₾  (ещё в базе полиции, в "Неоплачено" не входит)
+        ⏳ Ждут повторной проверки: L штрафов — W ₾  (не долг, см. DISPLAY_UNVERIFIED)
+    Машина только с 🟢 — одна строка 🟢, без строки 🔴. SnapshotDebt (число
+    штрафов неизвестно) — только сумма с пометкой, число не выдумывается.
+    total_amount тогда не используется. Без статусов (breakdown None) —
+    прежняя строка "💰 Задолженность" с суммой снимка: числа штрафов там
+    нет, и оплату такой режим не различает."""
     if breakdown is None:
         lines = [
             f"🚗 Госномер: {format_plate_for_telegram(car_number)}",
             f"💰 Задолженность: {_format_search_amount(total_amount)}",
         ]
     else:
-        lines = [
-            f"🚗 Госномер: {format_plate_for_telegram(car_number)}",
-            f"💰 Задолженность: {_format_search_amount(breakdown.unpaid_amount + breakdown.needs_review_amount)}",
-        ]
+        lines = [f"🚗 Госномер: {format_plate_for_telegram(car_number)}"]
+        debt_count = breakdown.unpaid_count + breakdown.needs_review_count
+        debt_amount = breakdown.unpaid_amount + breakdown.needs_review_amount
+        if isinstance(breakdown, SnapshotDebt):
+            lines.append(f"🔴 Неоплачено: {_format_search_amount(debt_amount)} {_DEBT_COUNT_UNKNOWN_NOTE}")
+        elif debt_count:
+            lines.append(f"🔴 Неоплачено: {_format_fine_count_and_amount(debt_count, debt_amount)}")
         if breakdown.needs_review_count:
-            lines.append(f"🟡 Из них требует проверки: {_format_search_amount(breakdown.needs_review_amount)}")
+            lines.append(
+                "🟡 Из них требуют проверки: "
+                f"{_format_fine_count_and_amount(breakdown.needs_review_count, breakdown.needs_review_amount)}"
+            )
         if breakdown.paid_count:
-            lines.append(f"🟢 Оплачено: {_format_search_amount(breakdown.paid_amount)}")
+            lines.append(f"🟢 Оплачено: {_format_fine_count_and_amount(breakdown.paid_count, breakdown.paid_amount)}")
         if breakdown.unverified_count:
-            lines.append(f"⏳ Ждут повторной проверки: {_format_search_amount(breakdown.unverified_amount)}")
+            lines.append(
+                "⏳ Ждут повторной проверки: "
+                f"{_format_fine_count_and_amount(breakdown.unverified_count, breakdown.unverified_amount)}"
+            )
     if not owners:
         lines.append(DEBT_OWNER_NOT_LINKED_LINE)
     for owner in owners:
@@ -968,8 +1006,8 @@ def format_debt_list_section(row_lines: list[str], *, page: int, total_pages: in
     см. ConversationController._build_debt_section) — итоговый блок ВСЕГДА
     либо полностью присутствует, либо полностью отсутствует, никогда не
     показывается "пустым". БЕЗ отдельного заголовка списка (см. задачу
-    п.7 — пример показывает строки СРАЗУ после аггрегата, без "Автомобили
-    со штрафами:"). Пагинация (см. задачу п.7: "если список большой —
+    п.7 — пример показывает строки СРАЗУ после аггрегата, без заголовка
+    над ними). Пагинация (см. задачу п.7: "если список большой —
     сохранить существующую pagination") — тот же footer, что и у Search
     (format_search_pagination_footer), показывается ТОЛЬКО когда страниц
     больше одной. Блоки машин (см. format_debt_row) многострочные —
@@ -997,25 +1035,43 @@ def _russian_plural(count: int, one: str, few: str, many: str) -> str:
 
 def format_debt_status_summary_block(
     *, car_count: int, totals: DebtBreakdown, source_updated_on: date | None, recheck_line: str | None,
+    debt_count_is_lower_bound: bool = False,
 ) -> str:
     """Заголовок "🚨 Штрафы по последней проверке", когда ведутся статусы
     оплаты (см. задачу: "отдельно показывать подтверждённую задолженность,
     оплаченные штрафы и случаи с неопределённым статусом").
 
-    🟡 — компактно, только число штрафов без суммы ("🟡 Требуют проверки:
-    3 штрафа"), и только когда оно больше нуля: при нуле строки нет вовсе.
-    Суммы 🟡 остаются в блоках машин (format_debt_row) и на экране
-    "🧾 Статусы оплаты"."""
+    "🔴 Неоплачено" — 🔴 и 🟡 вместе (оплата не подтверждена), то же правило,
+    что у строки "🔴 Неоплачено" в блоке машины (format_debt_row): суммы
+    машин складываются ровно в эту сумму. debt_count_is_lower_bound — у
+    части машин число штрафов неизвестно (SnapshotDebt, каждая посчитана
+    одним штрафом): тогда "не менее N штрафов", нижняя граница не выдаётся
+    за точное число.
+
+    🟡 — подмножество строки 🔴 ("Из них"), компактно: только число штрафов
+    без суммы (их сумма уже внутри 🔴 и второй раз не прибавляется), и только
+    когда оно больше нуля: при нуле строки нет вовсе. Суммы 🟡 остаются в
+    блоках машин и на экране "🧾 Статусы оплаты". 🟢 и ⏳ в 🔴 не входят."""
+    debt_count = totals.unpaid_count + totals.needs_review_count
+    debt_amount = totals.unpaid_amount + totals.needs_review_amount
+    if debt_count_is_lower_bound:
+        # "не менее" — родительный падеж: не менее 1 штрафа, 2 штрафов, 5 штрафов
+        debt_text = (
+            f"не менее {debt_count} {_russian_plural(debt_count, 'штрафа', 'штрафов', 'штрафов')}"
+            f" — {_format_search_amount(debt_amount)}"
+        )
+    else:
+        debt_text = _format_fine_count_and_amount(debt_count, debt_amount)
     lines = [
         "🚨 Штрафы по последней проверке",
-        f"Автомобилей: {car_count}",
-        f"🔴 Подтверждённая задолженность: {_format_search_amount(totals.unpaid_amount)}"
-        f" ({totals.unpaid_count} шт.)",
+        f"Автомобили со штрафами: {car_count}",
+        f"🔴 Неоплачено: {debt_text}",
     ]
     if totals.needs_review_count:
         review_count = totals.needs_review_count
         lines.append(
-            f"🟡 Требуют проверки: {review_count} {_russian_plural(review_count, 'штраф', 'штрафа', 'штрафов')}"
+            "🟡 Из них требуют проверки: "
+            f"{review_count} {_russian_plural(review_count, 'штраф', 'штрафа', 'штрафов')}"
         )
     lines.append(
         f"🟢 Оплачено, ещё в базе полиции: {_format_search_amount(totals.paid_amount)}"
@@ -1535,13 +1591,15 @@ def format_manual_bootstrap_pending_queue(plates: list[str]) -> str:
 def format_full_check_summary(outcome: FullCheckOutcome) -> str:
     """Итог оператору ПОСЛЕ завершения скана (см. задачу п.10) — НЕ
     перечисляет номера машин (см. задачу: "не перечислять все номера в
-    Telegram") — только агрегированные счётчики."""
+    Telegram") — только агрегированные счётчики. "С суммой в police.ge" —
+    задачи, у которых проверка нашла сумму больше нуля: это не
+    подтверждённый долг (police.ge показывает и оплаченные штрафы)."""
     return (
         "✅ Полная проверка завершена\n\n"
         f"Всего: {outcome.total}\n"
         f"Проверено успешно: {outcome.checked_ok}\n"
-        f"С задолженностью: {outcome.with_debt}\n"
-        f"Без задолженности: {outcome.without_debt}\n"
+        f"С суммой в police.ge: {outcome.with_debt}\n"
+        f"Без суммы в police.ge: {outcome.without_debt}\n"
         f"Не удалось проверить: {outcome.failed}\n"
         f"Время выполнения: {_format_duration(outcome.duration_seconds)}"
     )

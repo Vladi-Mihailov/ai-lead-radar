@@ -662,3 +662,46 @@ async def test_rendered_unified_result_contains_translated_text():
     assert "Превышение скорости" in rendered
     assert "İstanbul" not in rendered
     assert "Hız sınırı ihlali" not in rendered
+
+
+def _kgm_item(operator: str, amount: Decimal) -> KgmDebtItem:
+    return KgmDebtItem(
+        operator=operator, date_time=datetime(2026, 9, 15, 9, 39, 48),  # noqa: DTZ001
+        entry_station="A", exit_station="B", vehicle_class="1",
+        base_toll=amount, payable_amount=amount, penalty_free_deadline=date(2026, 9, 30),
+    )
+
+
+async def test_has_debt_counts_are_the_records_behind_each_total():
+    """debt_count видят менеджеры (📊 Статистика, «🔴 Неоплачено: N штрафов»):
+    у GİB — штрафы, из которых сложена сумма; у KGM — строки всех операторов
+    (включая секцию Avrasya внутри KGM), сумма которых равна итогу страницы."""
+    gib_provider = _FakeGibProvider(outcome=GibSubmitOutcome(
+        kind="has_debt", messages=(), raw_data=None,
+        fines=tuple(
+            GibFineRecord(
+                protocol_no=f"P{index}", plate="34ABC123", amount=amount, description="d",
+                violation_date=None, authority=None, late_fee=None, discount=None,
+            )
+            for index, amount in enumerate((Decimal(100), Decimal(137)))
+        ),
+    ))
+    kgm_provider = _FakeKgmProvider(outcome=KgmSubmitOutcome(
+        kind="has_debt",
+        operators=(
+            KgmOperatorResult(
+                operator_key="kgm", operator_name="KGM", items=(_kgm_item("kgm", Decimal(60)),), subtotal=Decimal(60),
+            ),
+            KgmOperatorResult(
+                operator_key="avrasya", operator_name="Avrasya Tüneli",
+                items=(_kgm_item("avrasya", Decimal(200)), _kgm_item("avrasya", Decimal(140))), subtotal=Decimal(340),
+            ),
+        ),
+        kgm_total=Decimal(60), yid_total=Decimal(340), grand_total=Decimal(400),
+    ))
+
+    result = await _make_service(gib_provider=gib_provider, kgm_provider=kgm_provider).check("34ABC123")
+
+    gib, kgm = result.provider_result("gib"), result.provider_result("kgm")
+    assert (gib.debt_count, gib.total_amount) == (2, Decimal(237))
+    assert (kgm.debt_count, kgm.total_amount) == (3, Decimal(400))

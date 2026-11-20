@@ -61,7 +61,13 @@ class TurkeyProviderDebtState:
     по последнему УСПЕШНОМУ результату (0 — успешная проверка без долга
     или NO_DATA); last_success_at/last_attempt_at — finished_at
     соответствующих runs (None, если их не было); last_attempt_error_type
-    — error_type последней попытки, если она — ошибка."""
+    — error_type последней попытки, если она — ошибка.
+
+    debt_count — сколько записей долга за amount: debt_count того же
+    последнего успешного результата (GİB — штрафы, из которых сложена его
+    сумма; KGM — строки неоплаченных проездов, сумма которых сверена
+    парсером с итогом страницы); 0 — как и amount, когда успешного
+    результата с долгом нет."""
 
     provider: str
     freshness: TurkeyProviderFreshness
@@ -69,6 +75,7 @@ class TurkeyProviderDebtState:
     last_success_at: datetime | None
     last_attempt_at: datetime | None
     last_attempt_error_type: str | None
+    debt_count: int = 0
 
 
 def _amount_by_freshness(
@@ -318,6 +325,7 @@ class TurkeyStatisticsService:
             last_success_at=last_success.finished_at if last_success is not None else None,
             last_attempt_at=last_attempt.finished_at if last_attempt is not None else None,
             last_attempt_error_type=last_attempt.result.error_type if attempt_failed else None,
+            debt_count=last_success.result.debt_count if has_debt else 0,
         )
 
     def get_known_username(self, telegram_user_id: int) -> str | None:

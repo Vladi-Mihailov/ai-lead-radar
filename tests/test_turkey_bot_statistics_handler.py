@@ -193,10 +193,11 @@ async def test_debt_owner_shown_with_name_and_username(fx):
 
 def _debt_block(car_number: str, amount: str, *owner_lines: str) -> str:
     """Ожидаемый блок машины debt-списка (см. texts.format_debt_row) — для
-    полной проверки (GİB + KGM, без строк по провайдерам)."""
+    полной проверки (GİB + KGM, без строк по провайдерам): _full_check —
+    один штраф GİB (debt_count=1), KGM без долга."""
     return "\n".join([
         f"🚗 Госномер: {format_plate_for_telegram(car_number)}",
-        f"💰 Задолженность: {amount}",
+        f"🔴 Неоплаченные записи: {amount} — 1 штраф GİB",
         *owner_lines,
     ])
 
@@ -284,7 +285,7 @@ async def test_sums_order_and_totals_unchanged_with_owner_lines(fx):
     assert "Общая сумма: 1 500,50 ₺" in reply.text
     # Сортировка прежняя — по сумме по убыванию.
     assert debt_list.index(format_plate_for_telegram("34BBB222")) < debt_list.index(format_plate_for_telegram("34AAA111"))
-    assert debt_list.count("💰 Задолженность:") == 2
+    assert debt_list.count("🔴 Неоплаченные записи:") == 2
 
 
 async def test_owner_text_from_profile_cannot_inject_telegram_markdown(fx):
@@ -406,3 +407,56 @@ async def test_large_debt_list_splits_into_multiple_messages_without_truncation(
     for i in range(500):
         assert format_plate_for_telegram(f"P{i:04d}AA01") in full_text  # никто не потерян/не обрезан
     assert "Автомобилей: 500" in reply.text
+
+
+# ---- число неоплаченных штрафов в строке машины (задача "показывать по
+# каждой машине количество и сумму отдельно") ----
+
+
+def _counted(provider: str, amount: Decimal, debt_count: int) -> ProviderCheckResult:
+    return ProviderCheckResult(
+        provider=provider, status=ProviderStatus.HAS_DEBT, debt_count=debt_count,
+        principal_amount=amount, penalty_amount=Decimal(0), total_amount=amount,
+        items=(), error_type=None, checked_at=datetime.now(timezone.utc),
+    )
+
+
+async def test_debt_list_counts_gib_and_kgm_records_and_never_shows_paid():
+    """Число — записи GİB и KGM из тех же результатов, что и сумма; Avrasya
+    (уже внутри KGM) не прибавляется ни к сумме, ни к числу. Строки
+    «оплачено» у Turkey нет."""
+    manager = 900000001
+    fx = _Fixture(trusted_operator_user_ids=frozenset({manager}))
+    fx.add_car(telegram_user_id=1, car_number="34ABC123")
+    fx.save_run(telegram_user_id=1, plate="34ABC123", providers=(
+        _counted("gib", Decimal(80), 2), _counted("avrasya", Decimal(330), 1), _counted("kgm", Decimal(2660), 3),
+    ))
+
+    full_text = await _statistics_text(fx, telegram_user_id=manager)
+
+    assert "\n".join([
+        f"🚗 Госномер: {format_plate_for_telegram('34ABC123')}",
+        "🔴 Неоплаченные записи: 2 740 ₺ — 2 штрафа GİB, 3 неоплаченных проезда KGM",
+        "👤 Пользователь: Имя не указано",
+        "🔗 Telegram: Логин не указан",
+    ]) in full_text
+    assert "Автомобилей: 1" in full_text
+    assert "Общая сумма: 2 740 ₺" in full_text
+    assert "🟢" not in full_text
+    assert "оплачено" not in full_text.lower()
+
+
+async def test_debt_list_skips_records_whose_amount_did_not_parse():
+    """Ревью: GİB has_debt без разобранных сумм (итог 0, debt_count 2) и KGM
+    615 ₺ в 3 строках — сумма 615 ₺, и за ней только 3 проезда KGM."""
+    manager = 900000001
+    fx = _Fixture(trusted_operator_user_ids=frozenset({manager}))
+    fx.add_car(telegram_user_id=1, car_number="34ABC123")
+    fx.save_run(telegram_user_id=1, plate="34ABC123", providers=(
+        _counted("gib", Decimal(0), 2), _provider(ProviderStatus.NO_DEBT, Decimal(0), provider="avrasya"),
+        _counted("kgm", Decimal(615), 3),
+    ))
+
+    full_text = await _statistics_text(fx, telegram_user_id=manager)
+
+    assert "🔴 Неоплаченные записи: 615 ₺ — 3 неоплаченных проезда KGM" in full_text.splitlines()
