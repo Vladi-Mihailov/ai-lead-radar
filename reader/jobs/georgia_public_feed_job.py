@@ -93,7 +93,8 @@ baseline ≈ 4 цикла × 4 запроса ≈ 16 запросов/день �
   max_pages раньше горизонта — по-прежнему остаётся в DEEP-режиме и на
   следующем цикле (см. задачу: "Do not silently declare catch-up complete").
 - В любом режиме пустая или неполная страница завершает обход, только если
-  это настоящий конец списка (её строки доходят до data.count); раньше —
+  это настоящий конец списка (её строки доходят до наибольшего за цикл
+  data.count); раньше —
   это сбой источника и ошибка: принять её за конец значило бы потерять
   всё ниже. Без data.count пустая страница, как раньше, считается концом
   (с предупреждением).
@@ -433,11 +434,12 @@ class GeorgiaPublicFineFeedJob(Job):
         # DEEP-горизонт с тем же look-ahead: обработанных страниц подряд
         # (см. _page_already_processed); DEEP завершается, когда их 1 + K.
         horizon_run = 0
-        # data.count последней страницы, где он был (за обход только растёт):
-        # отличает настоящий конец списка от пустого/неполного ответа посреди
-        # него. None — источник его не сообщил: пустая страница, как раньше,
-        # считается концом (с предупреждением).
-        latest_count: int | None = None
+        # Наибольший data.count за цикл (за обход он только растёт, пока
+        # строки не удаляют): отличает настоящий конец списка от пустого или
+        # неполного ответа посреди него. Наибольший, а не последний: сбойная
+        # страница может сообщить и count 0. None — источник его не сообщил:
+        # пустая страница, как раньше, считается концом (с предупреждением).
+        max_count: int | None = None
         warned_no_count = False
         counters = _FeedCycleCounters()
 
@@ -463,7 +465,7 @@ class GeorgiaPublicFineFeedJob(Job):
 
                 page_count = extract_reported_count(raw)
                 if page_count is not None:
-                    latest_count = page_count
+                    max_count = page_count if max_count is None else max(max_count, page_count)
                 if page_index == 0:
                     # Только для журнала: data.count — всего строк в списке
                     # (проба 19.11: 298 570), разница с прошлым циклом —
@@ -475,20 +477,21 @@ class GeorgiaPublicFineFeedJob(Job):
 
                 if len(raw_results) < _PAGE_SIZE:
                     # Пустая или неполная страница — конец списка, только если
-                    # строк до её конца не меньше data.count. Иначе это сбой
+                    # строк до её конца не меньше data.count (наибольшего за
+                    # цикл). Иначе это сбой
                     # источника посреди списка ({success: true, results: []}):
                     # всё ниже было бы потеряно, а неполная страница молча
                     # пропустила бы остаток своих 30 мест, — ошибка, без
                     # успеха; следующий цикл пойдёт DEEP.
-                    if latest_count is None:
+                    if max_count is None:
                         if not warned_no_count:
                             warned_no_count = True
                             logger.warning(
                                 "GeorgiaPublicFineFeedJob: police.ge reports no data.count — an empty page is taken as "
                                 "the end of the list, as before (a transient one cannot be told apart)"
                             )
-                    elif first_result + len(raw_results) < latest_count:
-                        message = _incomplete_page_message(first_result, len(raw_results), latest_count)
+                    elif first_result + len(raw_results) < max_count:
+                        message = _incomplete_page_message(first_result, len(raw_results), max_count)
                         logger.warning("GeorgiaPublicFineFeedJob: %s", message)
                         self._record_error(message, at=run_at)
                         return

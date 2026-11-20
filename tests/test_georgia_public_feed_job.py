@@ -2397,10 +2397,14 @@ def _job_over_pages(feed_repos, pages, old_rows, *, deep, **kwargs):
 
 @pytest.mark.parametrize("deep", [False, True], ids=["fast", "deep"])
 @pytest.mark.parametrize("rows_on_page", [0, 20], ids=["empty_page", "short_page"])
-async def test_an_incomplete_page_before_the_end_of_the_list_is_an_error_not_the_end(feed_repos, deep, rows_on_page):
+@pytest.mark.parametrize("bad_count", ["total", "zero"])
+async def test_an_incomplete_page_before_the_end_of_the_list_is_an_error_not_the_end(
+    feed_repos, deep, rows_on_page, bad_count,
+):
     """Случайный {success: true, results: []} — или неполная страница —
     посреди списка (по data.count дальше ещё есть строки): не конец списка, а
-    ошибка. Успех не записан, следующий цикл (DEEP) дочитывает строки ниже,
+    ошибка — даже если сама страница сообщает count 0 (решает наибольший
+    count цикла). Успех не записан, следующий цикл (DEEP) дочитывает строки ниже,
     вместе с совпадением среди них."""
     _task, fine_repo, feed_state_repo, seen_repo = feed_repos
     old = _receipts("ავ", 5999, 150)
@@ -2408,7 +2412,7 @@ async def test_an_incomplete_page_before_the_end_of_the_list_is_an_error_not_the
     new[65] = _receipt_match("კვ", 190)   # страница 2
     rows = new + old
     pages = _feed_pages(rows)
-    pages[60] = _raw_page(new[60:60 + rows_on_page], count=len(rows))
+    pages[60] = _raw_page(new[60:60 + rows_on_page], count=len(rows) if bad_count == "total" else 0)
     job, session, persisted = _job_over_pages(feed_repos, pages, old, deep=deep)
 
     await job.run(_utc(21))
@@ -2475,12 +2479,12 @@ async def test_without_data_count_an_empty_page_still_ends_the_list_with_a_warni
 
 
 @pytest.mark.parametrize("pages, offset, reported", [
-    # Список вырос за обход: решает последний count, а не первой страницы.
+    # Список вырос за обход: решает наибольший count, а не первой страницы.
     ({0: 60, 30: 90, 60: 120}, 60, 120),
     # У пустой страницы count нет — берётся последний из прежних.
     ({0: 300, 30: None}, 30, 300),
-], ids=["latest_count", "earlier_count"])
-async def test_the_most_recent_data_count_decides_whether_a_page_ends_the_list(feed_repos, pages, offset, reported):
+], ids=["grown_count", "earlier_count"])
+async def test_the_largest_data_count_decides_whether_a_page_ends_the_list(feed_repos, pages, offset, reported):
     feed_state_repo = feed_repos[2]
     new = _receipts("ავ", 9999, 60)
     raw_pages = {

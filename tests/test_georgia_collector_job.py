@@ -1546,10 +1546,15 @@ def _job_over_pages(tmp_path, pages, old_rows, production, *, deep, **kwargs):
 
 @pytest.mark.parametrize("deep", [False, True], ids=["fast", "deep"])
 @pytest.mark.parametrize("rows_on_page", [0, 20], ids=["empty_page", "short_page"])
-async def test_an_incomplete_page_before_the_end_of_the_list_is_an_error_not_the_end(tmp_path, deep, rows_on_page):
+@pytest.mark.parametrize("bad_count", ["total", "zero"])
+async def test_an_incomplete_page_before_the_end_of_the_list_is_an_error_not_the_end(
+    tmp_path, deep, rows_on_page, bad_count,
+):
     """A transient {success: true, results: []} — or a short page — in the
     middle of the list (data.count says there is more): not the end of the
-    list but an error. No success is recorded, and the next cycle (DEEP)
+    list but an error, also when that page itself reports count 0 (the
+    largest count of the cycle decides). No success is recorded, and the
+    next cycle (DEEP)
     reads the rows below it, the match among them included."""
     production = _FakeProductionClient(active_plates=["AA001AA"])
     old = _receipts("ავ", 5999, 150)
@@ -1557,7 +1562,7 @@ async def test_an_incomplete_page_before_the_end_of_the_list_is_an_error_not_the
     new[65] = _receipt_match("კვ", 190)   # page 2
     rows = new + old
     pages = _feed_pages(rows)
-    pages[60] = _raw_page(new[60:60 + rows_on_page], count=len(rows))
+    pages[60] = _raw_page(new[60:60 + rows_on_page], count=len(rows) if bad_count == "total" else 0)
     job, session, feed_state_repo, seen_repo = _job_over_pages(tmp_path, pages, old, production, deep=deep)
 
     await job.run(_utc(21))
@@ -1624,12 +1629,12 @@ async def test_without_data_count_an_empty_page_still_ends_the_list_with_a_warni
 
 
 @pytest.mark.parametrize("pages, offset, reported", [
-    # The list grew during the traversal: the latest count decides, not page 0's.
+    # The list grew during the traversal: the largest count decides, not page 0's.
     ({0: 60, 30: 90, 60: 120}, 60, 120),
     # The empty page carries no count: the latest earlier one is used.
     ({0: 300, 30: None}, 30, 300),
-], ids=["latest_count", "earlier_count"])
-async def test_the_most_recent_data_count_decides_whether_a_page_ends_the_list(tmp_path, pages, offset, reported):
+], ids=["grown_count", "earlier_count"])
+async def test_the_largest_data_count_decides_whether_a_page_ends_the_list(tmp_path, pages, offset, reported):
     production = _FakeProductionClient(active_plates=["AA001AA"])
     new = _receipts("ავ", 9999, 60)
     raw_pages = {
