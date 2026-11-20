@@ -92,15 +92,20 @@ def test_load_fast_lookahead_pages_rejects_invalid_values(value):
         load_fast_lookahead_pages(env={"GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES": value})
 
 
-@pytest.mark.parametrize("max_pages, lookahead, expected", [
-    ("5", "4", 4), ("5", "5", None), ("5", "6", None), (None, "299", 299), (None, "300", None),
+@pytest.mark.parametrize("max_pages, first_run, lookahead, expected", [
+    ("5", None, "4", 4), ("5", None, "5", None), ("5", None, "6", None),
+    (None, "4", "3", 3), (None, "3", "3", None),
+    (None, None, "299", 299), (None, None, "300", None),
 ])
-def test_load_fast_lookahead_pages_must_stay_below_the_page_cap(max_pages, lookahead, expected):
-    """With K >= GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE (default 300) every
-    FAST cycle would end at the cap: refused at start-up."""
+def test_load_fast_lookahead_pages_must_stay_below_both_page_caps(max_pages, first_run, lookahead, expected):
+    """With K at or above GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE or
+    GEORGIA_COLLECTOR_FIRST_RUN_MAX_PAGES (both 300 by default) every cycle of
+    that kind would end at the cap: refused at start-up."""
     env = {"GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES": lookahead}
     if max_pages is not None:
         env["GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE"] = max_pages
+    if first_run is not None:
+        env["GEORGIA_COLLECTOR_FIRST_RUN_MAX_PAGES"] = first_run
     if expected is None:
         with pytest.raises(ValueError, match="below GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE"):
             load_fast_lookahead_pages(env=env)

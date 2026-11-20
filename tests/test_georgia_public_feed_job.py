@@ -707,11 +707,14 @@ async def test_first_run_incomplete_within_cap_stays_in_deep_mode(tmp_path, capl
     try:
         _create_active_task(task_repo, "AA001AA")
         # Каждая страница непустая -> пустая страница никогда не наступает
-        # в пределах first_run_max_pages=2.
-        pages = {offset: _page([_entry(protocol_no=f"P{offset}_{i}") for i in range(30)]) for offset in (0, 30)}
+        # в пределах first_run_max_pages=3 (лимит 2 при 2 страницах
+        # look-ahead больше не допускается).
+        pages = {
+            offset: _page([_entry(protocol_no=f"P{offset}_{i}") for i in range(30)]) for offset in (0, 30, 60)
+        }
         session = _FakeFeedSession(pages)
         job, _provider = _make_job(
-            session, task_repo, fine_repo, feed_state_repo, seen_repo, first_run_max_pages=2,
+            session, task_repo, fine_repo, feed_state_repo, seen_repo, first_run_max_pages=3,
         )
 
         with caplog.at_level(logging.WARNING, logger="reader.jobs.georgia_public_feed_job"):
@@ -964,7 +967,8 @@ def _spy_persisted(job) -> list[str]:
 async def test_first_run_completes_at_first_page_older_than_today_then_fast(tmp_path):
     """До пустой страницы реального feed'а не дойти (~10 тыс. страниц) —
     первый запуск читает только сегодняшние публикации и завершается на
-    первой странице, целиком опубликованной раньше сегодняшнего дня."""
+    первой странице, целиком опубликованной раньше сегодняшнего дня, и
+    двух страницах look-ahead за ней."""
     task_repo = _make_task_repo(tmp_path)
     fine_repo = _make_fine_repo(tmp_path)
     feed_state_repo = _make_feed_state_repo(tmp_path)
@@ -977,6 +981,8 @@ async def test_first_run_completes_at_first_page_older_than_today_then_fast(tmp_
             30: _page(_rows("T1_", 30, publish_date="2026-10-22")),
             60: _page(_rows("Y0_", 30, publish_date="2026-10-21")),
             90: _page(_rows("Y1_", 30, publish_date="2026-10-21")),
+            120: _page(_rows("Y2_", 30, publish_date="2026-10-21")),
+            150: _page(_rows("Y3_", 30, publish_date="2026-10-21")),
         })
         job, _provider = _make_job(
             session, task_repo, fine_repo, feed_state_repo, seen_repo, first_run_max_pages=10,
@@ -984,7 +990,7 @@ async def test_first_run_completes_at_first_page_older_than_today_then_fast(tmp_
 
         await job.run(_utc(21))
 
-        assert session.requested_offsets == [0, 30, 60]
+        assert session.requested_offsets == [0, 30, 60, 90, 120]
         assert len(fine_repo.list_by_car_number("AA001AA")) == 1
         state = feed_state_repo.get()
         assert state.last_successful_poll_at == _utc(21)
@@ -1010,33 +1016,30 @@ async def test_first_run_cap_on_todays_rows_is_an_error_and_next_cycle_stays_dee
     feed_state_repo = _make_feed_state_repo(tmp_path)
     seen_repo = _make_seen_repo(tmp_path)
     try:
-        pages = {
-            0: _page(_rows("T0_", 30, publish_date="2026-10-22")),
-            30: _page(_rows("T1_", 30, publish_date="2026-10-22")),
-            60: _page(_rows("Y0_", 30, publish_date="2026-10-21")),
-        }
+        pages = {i * 30: _page(_rows(f"T{i}_", 30, publish_date="2026-10-22")) for i in range(3)}
+        pages.update({(3 + i) * 30: _page(_rows(f"Y{i}_", 30, publish_date="2026-10-21")) for i in range(3)})
         session = _FakeFeedSession(pages)
         job, _provider = _make_job(
-            session, task_repo, fine_repo, feed_state_repo, seen_repo, first_run_max_pages=2,
+            session, task_repo, fine_repo, feed_state_repo, seen_repo, first_run_max_pages=3,
         )
 
         await job.run(_utc(21))
 
-        assert session.requested_offsets == [0, 30]
+        assert session.requested_offsets == [0, 30, 60]
         state = feed_state_repo.get()
         assert state.last_successful_poll_at is None
         assert "safety cap" in state.last_error
 
         # Следующий цикл всё ещё DEEP: уже виденные сегодняшние строки его не
-        # останавливают (FAST остановился бы на [0, 30]) — доходит до
-        # вчерашней страницы и только тогда завершается.
+        # останавливают (FAST остановился бы на них) — доходит до вчерашних
+        # страниц и завершается после первой из них и двух страниц look-ahead.
         session2 = _FakeFeedSession(pages)
         job2, _p2 = _make_job(
-            session2, task_repo, fine_repo, feed_state_repo, seen_repo, first_run_max_pages=3,
+            session2, task_repo, fine_repo, feed_state_repo, seen_repo, first_run_max_pages=6,
         )
         await job2.run(_utc(23, 55))
 
-        assert session2.requested_offsets == [0, 30, 60]
+        assert session2.requested_offsets == [0, 30, 60, 90, 120, 150]
         assert feed_state_repo.get().last_error is None
     finally:
         task_repo.close()
@@ -1056,19 +1059,23 @@ async def test_recovery_stops_at_rows_seen_before_last_success_of_the_same_day(t
         feed_state_repo.record_successful_cycle(
             newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15),
         )
-        earlier = _rows("E0_", 30, publish_date="2026-10-22")
+        earlier = _rows("E0_", 90, publish_date="2026-10-22")
         _mark_seen_at(seen_repo, earlier, seen_at=_utc(9))
         feed_state_repo.record_error("ConnectTimeout", at=_utc(21))
         session = _FakeFeedSession({
             0: _page(_rows("N0_", 30, publish_date="2026-10-22")),
-            30: _page(earlier),
-            60: _page(_rows("E1_", 30, publish_date="2026-10-22")),
+            30: _page(earlier[:30]),
+            60: _page(earlier[30:60]),
+            90: _page(earlier[60:]),
+            120: _page(_rows("E1_", 30, publish_date="2026-10-22")),
         })
         job, _provider = _make_job(session, task_repo, fine_repo, feed_state_repo, seen_repo)
 
         await job.run(_utc(23, 55))
 
-        assert session.requested_offsets == [0, 30]
+        # Три страницы увиденных до успеха строк (одна + 2 look-ahead);
+        # остальной день ниже не перечитывается.
+        assert session.requested_offsets == [0, 30, 60, 90]
         assert feed_state_repo.get().last_error is None
     finally:
         task_repo.close()
@@ -1110,12 +1117,13 @@ async def test_recovery_reads_through_rows_marked_after_last_success_and_fills_t
             60: _page(gap),
             90: _page(base),
             120: _page(_rows("O0_", 30, publish_date="2026-10-21")),
+            150: _page(_rows("O1_", 30, publish_date="2026-10-21")),
         })
         job2, _p2 = _make_job(session, task_repo, fine_repo, feed_state_repo, seen_repo)
         persisted = _spy_persisted(job2)
         await job2.run(_utc(23, 55))
 
-        assert session.requested_offsets == [0, 30, 60, 90]
+        assert session.requested_offsets == [0, 30, 60, 90, 120, 150]
         assert persisted == ["GAP_MATCH"]
         assert len(fine_repo.list_by_car_number("AA001AA")) == 1
         assert feed_state_repo.get().last_error is None
@@ -1142,12 +1150,13 @@ async def test_recovery_stops_at_page_older_than_last_success_date_without_seen_
             0: _page(_rows("N0_", 30, publish_date="2026-10-23")),
             30: _page(_rows("OLD0_", 30, publish_date="2026-10-21")),
             60: _page(_rows("OLD1_", 30, publish_date="2026-10-21")),
+            90: _page(_rows("OLD2_", 30, publish_date="2026-10-21")),
         })
         job, _provider = _make_job(session, task_repo, fine_repo, feed_state_repo, seen_repo)
 
         await job.run(_utc(15, day=23))
 
-        assert session.requested_offsets == [0, 30]
+        assert session.requested_offsets == [0, 30, 60, 90]
         assert feed_state_repo.get().last_error is None
     finally:
         task_repo.close()
@@ -1166,6 +1175,8 @@ async def test_row_without_publish_date_does_not_complete_deep_by_date(tmp_path)
         session = _FakeFeedSession({
             0: _page(_rows("Y0_", 29, publish_date="2026-10-21") + [undated]),
             30: _page(_rows("Y1_", 30, publish_date="2026-10-21")),
+            60: _page(_rows("Y2_", 30, publish_date="2026-10-21")),
+            90: _page(_rows("Y3_", 30, publish_date="2026-10-21")),
         })
         job, _provider = _make_job(
             session, task_repo, fine_repo, feed_state_repo, seen_repo, first_run_max_pages=10,
@@ -1173,7 +1184,7 @@ async def test_row_without_publish_date_does_not_complete_deep_by_date(tmp_path)
 
         await job.run(_utc(21))
 
-        assert session.requested_offsets == [0, 30]
+        assert session.requested_offsets == [0, 30, 60, 90]
         assert feed_state_repo.get().last_error is None
     finally:
         task_repo.close()
@@ -1221,7 +1232,8 @@ async def test_recovery_after_two_failed_cycles_fits_the_page_cap(tmp_path):
     сбоя 22.10. Только date-горизонт (дата 21.10) требовал бы перечитать
     ВСЕ строки 21.10: 6 + 8 + 1 = 15 страниц > лимита 10 — и так на каждом
     следующем цикле. Строки, увиденные до успеха, завершают восстановление
-    на 7-й странице."""
+    на 7-й странице и двух страницах look-ahead — 9 страниц, в пределах
+    лимита."""
     task_repo = _make_task_repo(tmp_path)
     fine_repo = _make_fine_repo(tmp_path)
     feed_state_repo = _make_feed_state_repo(tmp_path)
@@ -1253,7 +1265,7 @@ async def test_recovery_after_two_failed_cycles_fits_the_page_cap(tmp_path):
 
         await job.run(_utc(21))
 
-        assert len(session.requested_offsets) == 7
+        assert len(session.requested_offsets) == 9
         state = feed_state_repo.get()
         assert state.last_error is None
         assert state.last_successful_poll_at == _utc(21)
@@ -1281,7 +1293,7 @@ async def test_rows_marked_by_an_earlier_successful_cycle_complete_a_later_recov
         first = _FakeFeedSession({0: _page(rows_a), 30: _page(yesterday)})
         job1, _p1 = _make_job(first, task_repo, fine_repo, feed_state_repo, seen_repo)
         await job1.run(_utc(15))
-        assert first.requested_offsets == [0, 30]
+        assert first.requested_offsets == [0, 30, 60]  # look-ahead доходит до конца списка
 
         second = _FakeFeedSession({0: _page(rows_b), 30: _page(rows_a), 60: _page(yesterday)})
         job2, _p2 = _make_job(second, task_repo, fine_repo, feed_state_repo, seen_repo)
@@ -1303,7 +1315,8 @@ async def test_rows_marked_by_an_earlier_successful_cycle_complete_a_later_recov
         job4, _p4 = _make_job(recovery, task_repo, fine_repo, feed_state_repo, seen_repo)
         await job4.run(_utc(9, day=23))
 
-        assert recovery.requested_offsets == [0, 30, 60]
+        # B (отмечены последним успехом) и две страницы look-ahead: A и Y.
+        assert recovery.requested_offsets == [0, 30, 60, 90, 120]
         assert feed_state_repo.get().last_error is None
     finally:
         task_repo.close()
@@ -1350,12 +1363,13 @@ async def test_interrupted_cycle_is_followed_by_deep_recovery_that_reads_below_t
             90: _page(k2),
             120: _page(rows_s),
             150: _page(yesterday),
+            180: _page(_rows("Y1_", 30, publish_date="2026-10-21")),
         })
         job3, _p3 = _make_job(recovery, task_repo, fine_repo, feed_state_repo, seen_repo)
         persisted = _spy_persisted(job3)
         await job3.run(_utc(23, 55))
 
-        assert recovery.requested_offsets == [0, 30, 60, 90, 120]
+        assert recovery.requested_offsets == [0, 30, 60, 90, 120, 150, 180]
         assert persisted == ["LOST_MATCH"]
         assert feed_state_repo.get().last_error is None
     finally:
@@ -1398,7 +1412,8 @@ async def test_recovery_ignores_first_seen_times_when_last_success_is_not_in_the
         with caplog.at_level(logging.WARNING, logger="reader.jobs.georgia_public_feed_job"):
             await job2.run(_utc(23, 55))
 
-        assert recovery.requested_offsets == [0, 30, 60, 90]
+        # Только по дате обработана лишь Y0: look-ahead доходит до конца списка.
+        assert recovery.requested_offsets == [0, 30, 60, 90, 120]
         assert persisted == ["SKEW_MATCH"]
         assert any("clock skew" in r.getMessage() for r in caplog.records)
         assert feed_state_repo.get().last_error is None
@@ -1447,7 +1462,7 @@ async def test_future_dated_row_does_not_move_the_recovery_date_horizon_past_the
         persisted = _spy_persisted(job3)
         await job3.run(_utc(9, day=23))
 
-        assert recovery.requested_offsets == [0, 30, 60, 90]
+        assert recovery.requested_offsets == [0, 30, 60, 90, 120]
         assert persisted == ["FUT_GAP_MATCH"]
         assert feed_state_repo.get().last_error is None
     finally:
@@ -1492,17 +1507,17 @@ async def test_first_run_cap_has_its_own_message(tmp_path):
     feed_state_repo = _make_feed_state_repo(tmp_path)
     seen_repo = _make_seen_repo(tmp_path)
     try:
-        session = _FakeFeedSession({
-            0: _page(_rows("T0_", 30, publish_date="2026-10-22")),
-            30: _page(_rows("T1_", 30, publish_date="2026-10-22")),
-        })
+        # Лимит первого запуска в 2 страницы при 2 страницах look-ahead больше не допускается.
+        session = _FakeFeedSession(
+            {i * 30: _page(_rows(f"T{i}_", 30, publish_date="2026-10-22")) for i in range(3)}
+        )
         job, _provider = _make_job(
-            session, task_repo, fine_repo, feed_state_repo, seen_repo, first_run_max_pages=2,
+            session, task_repo, fine_repo, feed_state_repo, seen_repo, first_run_max_pages=3,
         )
         await job.run(_utc(21))
 
         error = feed_state_repo.get().last_error
-        assert error.startswith("first-run catch-up: safety cap of 2 pages")
+        assert error.startswith("first-run catch-up: safety cap of 3 pages")
         assert "fine_monitor.public_feed_first_run_max_pages" in error
         assert "recovery could not reach" not in error
     finally:
@@ -1566,8 +1581,9 @@ async def test_fast_page_of_rows_seen_before_last_success_still_gets_its_lookahe
 
 
 async def test_match_on_the_page_that_completes_deep_is_still_processed(tmp_path):
-    """Страница, завершающая DEEP, сначала обрабатывается целиком (цикл
-    обнаружения не меняется) и только потом останавливает обход."""
+    """Страница, дошедшая до DEEP-горизонта, сначала обрабатывается целиком
+    (цикл обнаружения не меняется) и только потом засчитывается в остановку
+    (здесь look-ahead доходит до конца списка)."""
     task_repo = _make_task_repo(tmp_path)
     fine_repo = _make_fine_repo(tmp_path)
     feed_state_repo = _make_feed_state_repo(tmp_path)
@@ -1588,7 +1604,7 @@ async def test_match_on_the_page_that_completes_deep_is_still_processed(tmp_path
 
         await job.run(_utc(21))
 
-        assert session.requested_offsets == [0, 30]
+        assert session.requested_offsets == [0, 30, 60]
         assert persisted == ["H_MATCH"]
         assert seen_repo.is_seen("Y0_000")
     finally:
@@ -1609,6 +1625,8 @@ async def test_first_run_horizon_uses_the_tbilisi_date_not_utc(tmp_path):
             0: _page(_rows("D23_", 30, publish_date="2026-10-23")),
             30: _page(_rows("D22_", 30, publish_date="2026-10-22")),
             60: _page(_rows("D22B_", 30, publish_date="2026-10-22")),
+            90: _page(_rows("D22C_", 30, publish_date="2026-10-22")),
+            120: _page(_rows("D22D_", 30, publish_date="2026-10-22")),
         })
         job, _provider = _make_job(
             session, task_repo, fine_repo, feed_state_repo, seen_repo, first_run_max_pages=10,
@@ -1616,7 +1634,9 @@ async def test_first_run_horizon_uses_the_tbilisi_date_not_utc(tmp_path):
 
         await job.run(_utc(1, day=23))
 
-        assert session.requested_offsets == [0, 30]
+        # Страницы 22.10 обработаны (одна + 2 look-ahead); при "сегодня" по
+        # UTC (22.10) обход дочитал бы до конца списка.
+        assert session.requested_offsets == [0, 30, 60, 90]
     finally:
         task_repo.close()
         fine_repo.close()
@@ -1948,12 +1968,15 @@ def test_fast_lookahead_is_two_pages_by_default_and_matches_the_collector():
     assert FAST_LOOKAHEAD_PAGES == collector_job.FAST_LOOKAHEAD_PAGES == 2
 
 
-@pytest.mark.parametrize("lookahead, max_pages, valid", [
-    (0, 30, False), (1, 2, True), (2, 3, True), (3, 3, False), (4, 3, False),
+@pytest.mark.parametrize("lookahead, max_pages, first_run, valid", [
+    (0, 30, 100, False), (1, 2, 100, True), (2, 3, 100, True), (3, 3, 100, False), (4, 3, 100, False),
+    (2, 30, 2, False), (2, 30, 3, True),
 ])
-def test_feed_job_takes_a_lookahead_from_one_to_below_the_page_cap(feed_repos, lookahead, max_pages, valid):
-    """K < 1 — нет look-ahead; K не меньше лимита страниц — каждый FAST-цикл
-    упирался бы в лимит."""
+def test_feed_job_takes_a_lookahead_from_one_to_below_the_page_cap(
+    feed_repos, lookahead, max_pages, first_run, valid,
+):
+    """K < 1 — нет look-ahead; K не меньше любого из лимитов страниц — каждый
+    цикл такого рода упирался бы в лимит (и FAST, и DEEP читают ещё K)."""
     task_repo, fine_repo, feed_state_repo, seen_repo = feed_repos
     check_service = FineCheckService(_FakeCircuitProvider(), task_repo, fine_repo)
 
@@ -1961,7 +1984,7 @@ def test_feed_job_takes_a_lookahead_from_one_to_below_the_page_cap(feed_repos, l
         return GeorgiaPublicFineFeedJob(
             _FakeFeedSession(), task_repo, check_service, feed_state_repo, seen_repo,
             run_times=_DEFAULT_RUN_TIMES, tz=_TBILISI,
-            max_pages_per_cycle=max_pages, fast_lookahead_pages=lookahead,
+            max_pages_per_cycle=max_pages, first_run_max_pages=first_run, fast_lookahead_pages=lookahead,
         )
 
     if valid:
@@ -2235,11 +2258,11 @@ async def test_fast_killed_mid_cycle_is_followed_by_a_deep_recovery_that_loses_n
     await job2.run(_utc(23, 55))
 
     # DEEP читает до первой страницы строк, увиденных последним успехом
-    # (смещение 210), и останавливается на ней; FAST остановился бы на
-    # страницах убитой попытки (смещение 90). Закреплён только конец: как
-    # восстановление проходит страницы, прочитанные прошлой попыткой, —
-    # не предмет этого правила.
-    assert recovery.requested_offsets[-1] == max(recovery.requested_offsets) == 210
+    # (смещение 210), и двух страниц look-ahead за ней и останавливается
+    # (270); FAST остановился бы на страницах убитой попытки (смещение 90).
+    # Закреплён только конец: как восстановление проходит страницы,
+    # прочитанные прошлой попыткой, — не предмет этого правила.
+    assert recovery.requested_offsets[-1] == max(recovery.requested_offsets) == 270
     assert sorted(persisted + persisted2) == ["ავ000009300", "კვ000000160"]
     assert len(fine_repo.list_by_car_number("AA001AA")) == 2
     assert all(seen_repo.is_seen(p) for p in _protocols(top + new))
@@ -2274,8 +2297,9 @@ async def test_fast_cap_before_the_boundary_is_an_error_and_the_next_cycle_reads
     job2, persisted2 = _feed_job(feed_repos, session2)
     await job2.run(_utc(23, 55))
 
-    # DEEP заканчивает на первой странице строк, увиденных последним успехом (120).
-    assert session2.requested_offsets[-1] == max(session2.requested_offsets) == 120
+    # DEEP заканчивает через две страницы look-ahead после первой страницы
+    # строк, увиденных последним успехом (120): на 180.
+    assert session2.requested_offsets[-1] == max(session2.requested_offsets) == 180
     assert persisted2 == ["კვ000000130"]
     assert all(seen_repo.is_seen(p) for p in _protocols(new))
     state = feed_state_repo.get()
@@ -2314,8 +2338,9 @@ async def test_fast_cap_during_the_lookahead_is_an_error_not_a_success(feed_repo
     await job2.run(_utc(23, 55))
 
     # DEEP: новые сверху, страница той попытки (не покрыта последним
-    # успехом), затем первая страница, покрытая им (60); FAST пошёл бы до 90.
-    assert session2.requested_offsets[-1] == max(session2.requested_offsets) == 60
+    # успехом), первая страница, покрытая им (60), и две страницы look-ahead
+    # (120); FAST остановился бы на 90.
+    assert session2.requested_offsets[-1] == max(session2.requested_offsets) == 120
     assert persisted2 == ["კვ000000170"]
     assert all(seen_repo.is_seen(p) for p in _protocols(top + new))
     state = feed_state_repo.get()
@@ -2342,6 +2367,250 @@ async def test_lookahead_parameter_sets_how_far_below_the_quiet_page_fast_reads(
 
     assert seen_repo.is_seen("ავ000001999") is read
     assert len(fine_repo.list_by_car_number("AA001AA")) == (1 if read else 0)
+    assert feed_state_repo.get().last_error is None
+
+
+# ==== защита от ложного успеха: пустая или неполная страница до data.count
+# и look-ahead DEEP-горизонта (зеркало tests/test_georgia_collector_job.py) ====
+
+
+def _raw_page(rows: list[dict], *, count: int | None) -> dict:
+    """Страница police.ge с данным data.count (None — без count вовсе)."""
+    data: dict = {"results": rows}
+    if count is not None:
+        data["count"] = count
+    return {"success": True, "data": data}
+
+
+def _job_over_pages(feed_repos, pages, old_rows, *, deep, **kwargs):
+    """Job над неизменными страницами: последний успех в 15:00 видел
+    old_rows; с deep — следующая попытка упала в 17:00, и цикл будет DEEP."""
+    _task, _fine, feed_state_repo, seen_repo = feed_repos
+    session = _FakeFeedSession(pages)
+    job, persisted = _feed_job(feed_repos, session, **kwargs)
+    feed_state_repo.record_successful_cycle(newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15))
+    _mark_seen_at(seen_repo, old_rows, seen_at=_utc(15))
+    if deep:
+        feed_state_repo.record_error("ConnectTimeout", at=_utc(17))
+    return job, session, persisted
+
+
+@pytest.mark.parametrize("deep", [False, True], ids=["fast", "deep"])
+@pytest.mark.parametrize("rows_on_page", [0, 20], ids=["empty_page", "short_page"])
+async def test_an_incomplete_page_before_the_end_of_the_list_is_an_error_not_the_end(feed_repos, deep, rows_on_page):
+    """Случайный {success: true, results: []} — или неполная страница —
+    посреди списка (по data.count дальше ещё есть строки): не конец списка, а
+    ошибка. Успех не записан, следующий цикл (DEEP) дочитывает строки ниже,
+    вместе с совпадением среди них."""
+    _task, fine_repo, feed_state_repo, seen_repo = feed_repos
+    old = _receipts("ავ", 5999, 150)
+    new = _receipts("ავ", 9999, 90)
+    new[65] = _receipt_match("კვ", 190)   # страница 2
+    rows = new + old
+    pages = _feed_pages(rows)
+    pages[60] = _raw_page(new[60:60 + rows_on_page], count=len(rows))
+    job, session, persisted = _job_over_pages(feed_repos, pages, old, deep=deep)
+
+    await job.run(_utc(21))
+
+    assert session.requested_offsets == [0, 30, 60]
+    state = feed_state_repo.get()
+    assert state.last_successful_poll_at == _utc(15)
+    page = "an empty page" if rows_on_page == 0 else "20 of 30 rows"
+    assert state.last_error.startswith(f"police.ge returned {page} at offset 60, although the list reports 240 rows")
+    assert persisted == []
+
+    session2 = _FakeFeedSession(_feed_pages(rows))
+    job2, persisted2 = _feed_job(feed_repos, session2)
+    await job2.run(_utc(23, 55))
+
+    assert session2.requested_offsets[-1] == max(session2.requested_offsets) == 150
+    assert persisted2 == ["კვ000000190"]
+    assert len(fine_repo.list_by_car_number("AA001AA")) == 1
+    assert all(seen_repo.is_seen(p) for p in _protocols(new))
+    assert (feed_state_repo.get().last_error, feed_state_repo.get().last_successful_poll_at) == (None, _utc(23, 55))
+
+
+@pytest.mark.parametrize("deep", [False, True], ids=["fast", "first_run"])
+async def test_the_real_end_of_the_list_still_ends_the_traversal_as_a_success(feed_repos, deep):
+    """Неполная последняя страница и пустая страница на data.count — настоящий
+    конец списка: цикл успешен (ещё до конца своего look-ahead)."""
+    feed_state_repo = feed_repos[2]
+    if deep:
+        rows = _receipts("ავ", 9999, 45)   # первый запуск: только сегодняшние строки
+        session = _FakeFeedSession({**_feed_pages(rows), 60: _raw_page([], count=len(rows))})
+        job, _persisted = _feed_job(feed_repos, session, first_run_max_pages=10)
+    else:
+        old = _receipts("ავ", 5999, 40)
+        rows = _receipts("ავ", 9999, 12) + old
+        job, session, _persisted = _job_over_pages(
+            feed_repos, {**_feed_pages(rows), 60: _raw_page([], count=len(rows))}, old, deep=False,
+        )
+
+    await job.run(_utc(21))
+
+    assert session.requested_offsets == [0, 30, 60]
+    state = feed_state_repo.get()
+    assert (state.last_error, state.last_successful_poll_at) == (None, _utc(21))
+
+
+async def test_without_data_count_an_empty_page_still_ends_the_list_with_a_warning(feed_repos, caplog):
+    """police.ge не сообщил data.count: пустую страницу не отличить от конца,
+    поэтому она, как раньше, завершает обход — с предупреждением без чисел."""
+    caplog.set_level(logging.WARNING, logger=_FEED_JOB_LOGGER)
+    feed_state_repo = feed_repos[2]
+    old = _receipts("ავ", 5999, 18)
+    rows = _receipts("ავ", 9999, 12) + old
+    job, session, _persisted = _job_over_pages(
+        feed_repos, {0: _raw_page(rows, count=None), 30: _raw_page([], count=None)}, old, deep=False,
+    )
+
+    await job.run(_utc(21))
+
+    assert session.requested_offsets == [0, 30]
+    assert (feed_state_repo.get().last_error, feed_state_repo.get().last_successful_poll_at) == (None, _utc(21))
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and "data.count" in r.getMessage()]
+    assert len(warnings) == 1
+    assert not re.search(r"\d", warnings[0])
+
+
+@pytest.mark.parametrize("pages, offset, reported", [
+    # Список вырос за обход: решает последний count, а не первой страницы.
+    ({0: 60, 30: 90, 60: 120}, 60, 120),
+    # У пустой страницы count нет — берётся последний из прежних.
+    ({0: 300, 30: None}, 30, 300),
+], ids=["latest_count", "earlier_count"])
+async def test_the_most_recent_data_count_decides_whether_a_page_ends_the_list(feed_repos, pages, offset, reported):
+    feed_state_repo = feed_repos[2]
+    new = _receipts("ავ", 9999, 60)
+    raw_pages = {
+        first: _raw_page(new[first:first + 30] if first < offset else [], count=count)
+        for first, count in pages.items()
+    }
+    job, session, _persisted = _job_over_pages(feed_repos, raw_pages, [], deep=False)
+
+    await job.run(_utc(21))
+
+    assert session.requested_offsets[-1] == offset
+    state = feed_state_repo.get()
+    assert state.last_successful_poll_at == _utc(15)
+    assert state.last_error.startswith(
+        f"police.ge returned an empty page at offset {offset}, although the list reports {reported} rows"
+    )
+
+
+@pytest.mark.parametrize("block", [30, 60])
+async def test_deep_reads_past_a_block_of_re_shown_old_rows(feed_repos, block):
+    """Блок старых квитанций, снова показанных наверху, занимает целые
+    страницы, которые DEEP-горизонт принимает. Одна (или две) такие страницы
+    больше не завершают восстановление: новые строки под блоком читаются (с
+    совпадением), а DEEP останавливается только после 1 + K страниц
+    обработанных строк."""
+    feed_state_repo, seen_repo = feed_repos[2], feed_repos[3]
+    old = _receipts("ავ", 5999, 240)
+    below = _receipts("ავ", 8999, 30)
+    below[10] = _receipt_match("კვ", 180)
+    rows = _receipts("ავ", 9999, 30) + old[:block] + below + old[block:]
+    job, session, persisted = _job_over_pages(feed_repos, _feed_pages(rows), old, deep=True)
+
+    await job.run(_utc(21))
+
+    # страница 0 новая; блок (1 или 2 страницы); новые строки под ним; затем
+    # 3 страницы обработанных строк.
+    assert session.requested_offsets == [i * 30 for i in range(block // 30 + 5)]
+    assert persisted == ["კვ000000180"]
+    assert all(seen_repo.is_seen(p) for p in _protocols(below))
+    assert (feed_state_repo.get().last_error, feed_state_repo.get().last_successful_poll_at) == (None, _utc(21))
+
+
+async def test_deep_cap_during_the_lookahead_is_an_error_not_a_success(feed_repos):
+    feed_state_repo = feed_repos[2]
+    old = _receipts("ავ", 5999, 150)
+    rows = _receipts("ავ", 9999, 30) + old
+    job, session, _persisted = _job_over_pages(
+        feed_repos, _feed_pages(rows), old, deep=True, max_pages_per_cycle=3,
+    )
+
+    await job.run(_utc(21))
+
+    assert session.requested_offsets == [0, 30, 60]
+    state = feed_state_repo.get()
+    assert state.last_successful_poll_at == _utc(15)
+    assert state.last_error.startswith(
+        "recovery reached rows covered by the last successful cycle, but the safety cap of 3 pages came "
+        "during the look-ahead (look-ahead: 1 of 2 pages read)"
+    )
+    assert "fine_monitor.public_feed_max_pages_per_cycle" in state.last_error
+
+    session2 = _FakeFeedSession(_feed_pages(rows))
+    job2, _persisted2 = _feed_job(feed_repos, session2)
+    await job2.run(_utc(23, 55))
+
+    # Страница 0 той попытки не покрыта последним успехом (её строки отмечены
+    # после него): затем три обработанные страницы, конец на 90.
+    assert session2.requested_offsets[-1] == max(session2.requested_offsets) == 90
+    assert feed_state_repo.get().last_error is None
+
+
+async def test_first_run_reads_past_a_page_of_older_rows_followed_by_todays_rows(feed_repos):
+    """Горизонт первого запуска (строки, опубликованные раньше сегодняшнего
+    дня) с тем же look-ahead: одна страница вчерашних строк, за которой снова
+    сегодняшние (с совпадением), его не завершает; три вчерашние подряд —
+    завершают."""
+    feed_state_repo = feed_repos[2]
+    today = _receipts("ავ", 9999, 60)
+    today[45] = _receipt_match("კვ", 170)   # страница 2
+    yesterday = _receipts("ავ", 5999, 120, publish_date="2026-10-21")
+    rows = today[:30] + yesterday[:30] + today[30:] + yesterday[30:]
+    session = _FakeFeedSession(_feed_pages(rows))
+    job, persisted = _feed_job(feed_repos, session, first_run_max_pages=10)
+
+    await job.run(_utc(21))
+
+    assert session.requested_offsets == [0, 30, 60, 90, 120, 150]
+    assert persisted == ["კვ000000170"]
+    assert feed_state_repo.get().last_successful_poll_at == _utc(21)
+
+
+async def test_first_run_cap_during_the_lookahead_is_an_error_not_a_success(feed_repos):
+    feed_state_repo = feed_repos[2]
+    rows = _receipts("ავ", 9999, 30) + _receipts("ავ", 5999, 90, publish_date="2026-10-21")
+    session = _FakeFeedSession(_feed_pages(rows))
+    job, _persisted = _feed_job(feed_repos, session, first_run_max_pages=3)
+
+    await job.run(_utc(21))
+
+    assert session.requested_offsets == [0, 30, 60]
+    state = feed_state_repo.get()
+    assert state.last_successful_poll_at is None
+    assert state.last_error.startswith(
+        "first-run catch-up: safety cap of 3 pages reached during the look-ahead after rows published "
+        "before today (look-ahead: 1 of 2 pages read)"
+    )
+    assert "fine_monitor.public_feed_first_run_max_pages" in state.last_error
+
+
+async def test_deep_burst_repeats_do_not_count_as_horizon_pages(feed_repos):
+    """30 строк, опубликованных сразу после первой обработанной страницы
+    DEEP, снова показывают её: повтор нейтрален, поэтому DEEP всё равно
+    читает две свежие обработанные страницы — а вставленные под ними строки
+    сбрасывают look-ahead и читаются."""
+    feed_state_repo, seen_repo = feed_repos[2], feed_repos[3]
+    old, yesterday = _old_feed_rows()
+    inserted = [_receipt_match("ავ", 1999)] + _receipts("კვ", 199, 2)
+    feed = _CountingLiveFeed(_receipts("ავ", 9999, 12) + old[:90] + inserted + old[90:] + yesterday)
+    job, persisted = _feed_job(feed_repos, feed)
+    feed_state_repo.record_successful_cycle(newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15))
+    _mark_seen_at(seen_repo, old + yesterday, seen_at=_utc(15))
+    feed_state_repo.record_error("ConnectTimeout", at=_utc(17))
+    feed.publish_after_requests(2, _receipts("ავ", 19999, 30))
+
+    await job.run(_utc(21))
+
+    # 0 новые; 30 обработанная; 60 повторяет 30 (нейтральна); 90 обработанная;
+    # 120 вставка (сброс); 150–210 три обработанные страницы.
+    assert feed.requested_offsets == [i * 30 for i in range(8)]
+    assert persisted == ["ავ000001999"]
     assert feed_state_repo.get().last_error is None
 
 
