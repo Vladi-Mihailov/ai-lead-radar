@@ -983,22 +983,44 @@ def format_debt_list_section(row_lines: list[str], *, page: int, total_pages: in
     return "\n".join(parts)
 
 
+def _russian_plural(count: int, one: str, few: str, many: str) -> str:
+    """Форма существительного после числа: 1, 21, 101 -> one ("штраф");
+    2–4, 22–24 -> few ("штрафа"); 0, 5–20, 25–30, 111–114 -> many ("штрафов")."""
+    last_two = abs(count) % 100
+    last = last_two % 10
+    if last == 1 and last_two != 11:
+        return one
+    if 2 <= last <= 4 and not 12 <= last_two <= 14:
+        return few
+    return many
+
+
 def format_debt_status_summary_block(
     *, car_count: int, totals: DebtBreakdown, source_updated_on: date | None, recheck_line: str | None,
 ) -> str:
     """Заголовок "🚨 Штрафы по последней проверке", когда ведутся статусы
     оплаты (см. задачу: "отдельно показывать подтверждённую задолженность,
-    оплаченные штрафы и случаи с неопределённым статусом")."""
+    оплаченные штрафы и случаи с неопределённым статусом").
+
+    🟡 — компактно, только число штрафов без суммы ("🟡 Требуют проверки:
+    3 штрафа"), и только когда оно больше нуля: при нуле строки нет вовсе.
+    Суммы 🟡 остаются в блоках машин (format_debt_row) и на экране
+    "🧾 Статусы оплаты"."""
     lines = [
         "🚨 Штрафы по последней проверке",
         f"Автомобилей: {car_count}",
         f"🔴 Подтверждённая задолженность: {_format_search_amount(totals.unpaid_amount)}"
         f" ({totals.unpaid_count} шт.)",
-        f"🟡 Неопределённый статус оплаты: {_format_search_amount(totals.needs_review_amount)}"
-        f" ({totals.needs_review_count} шт.)",
-        f"🟢 Оплачено, ещё в базе полиции: {_format_search_amount(totals.paid_amount)}"
-        f" ({totals.paid_count} шт.)",
     ]
+    if totals.needs_review_count:
+        review_count = totals.needs_review_count
+        lines.append(
+            f"🟡 Требуют проверки: {review_count} {_russian_plural(review_count, 'штраф', 'штрафа', 'штрафов')}"
+        )
+    lines.append(
+        f"🟢 Оплачено, ещё в базе полиции: {_format_search_amount(totals.paid_amount)}"
+        f" ({totals.paid_count} шт.)"
+    )
     if totals.unverified_count:
         # Квитанции из истории, которых не было в последнем ответе police.ge
         # до перехода на статусы: не долг и не ⚪, пока две новые проверки не
