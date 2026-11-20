@@ -13,8 +13,8 @@ settings.fine_monitor.public_feed_times/timezone), тем же способом,
 FineJob.run_times/tz (см. reader/jobs/fine_job.py::should_run).
 
 KNOWN TECHNICAL DEBT (см. задачу "Georgia remote collector architecture
-(REDNET)" + её интеграционный review): run()'s DEEP/FAST frontier+one-
-overlap-page state machine below is DUPLICATED (not imported) by
+(REDNET)" + её интеграционный review): run()'s DEEP/FAST frontier+look-
+ahead state machine below is DUPLICATED (not imported) by
 reader/georgia_collector/collector_job.py::GeorgiaCollectorJob._poll_feed()
 for the REDNET collector process. Extraction into a shared module was
 deliberately reviewed and rejected — this class is already-merged,
@@ -40,22 +40,18 @@ date-based overlap-окна (которое требовало пересмат�
 каждом цикле) — ПЕРСИСТЕНТНЫЙ "seen"-индекс protocolNo (см.
 GeorgiaPublicFeedSeenRepository, НЕ detected_fines — только
 protocol_no/publish_date, НИКАКИХ деталей штрафа для несовпавших строк, см.
-задачу "DATA MINIMIZATION"). Обычный цикл идёт newest-first со страницы 0;
-как только страница содержит ХОТЯ БЫ ОДНУ уже знакомую (seen) запись —
-это установленная "граница" с прошлого цикла — он ЗАПРАШИВАЕТ РОВНО ОДНУ
-ДОПОЛНИТЕЛЬНУЮ ("overlap") страницу (см. "One final safety adjustment
-before merge": защита от сдвига страниц/порядка — newest-first поведение
-проверено вживую, но НЕ доказана идеальная долгосрочная стабильность
-порядка/backfill), полностью её обрабатывает (её новые строки — НЕ
-отбрасываются) и только затем останавливается — без цепочки дальнейших
-overlap'ов, если только overlap-страница не оказалась целиком новой (см.
-"FAST" ниже). Поэтому стоимость цикла — O(число НОВЫХ записей с прошлого
-раза) + 1 страница, а НЕ O(глубина backlog'а за день). Примеры (см.
-задачу):
-  - граница на странице 1 (ничего нового с прошлого раза) -> 2 запроса
-    (сама страница + overlap).
-  - 30 новых, граница на странице 2 -> overlap на странице 3 -> 3 запроса.
-  - 75 новых, граница на странице 3 -> overlap на странице 4 -> 4 запроса.
+задачу "DATA MINIMIZATION"). Обычный цикл идёт newest-first со страницы 0
+и обрабатывает каждую страницу целиком (новые строки любой страницы — НЕ
+отбрасываются); граница с прошлого цикла — первая "тихая" страница (ни
+одной новой строки, хотя бы одна строка, увиденная до этого цикла), но
+цикл останавливается, только прочитав за ней ещё FAST_LOOKAHEAD_PAGES
+тихих страниц (look-ahead, см. "FAST" ниже): новая строка на любой из них
+сбрасывает счёт. Поэтому стоимость цикла — O(число НОВЫХ записей с
+прошлого раза) + 1 + K страниц, а НЕ O(глубина backlog'а за день). Примеры
+(K = 2):
+  - ничего нового с прошлого раза -> 3 запроса (тихая страница + 2).
+  - 30 новых, граница ровно по краю первой страницы -> 4 запроса.
+  - 75 новых (на третьей странице — 15 новых и 15 старых) -> 6 запросов.
 
 РАСПИСАНИЕ (см. задачу "schedule Georgia public feed three times daily" +
 корректирующую задачу "IMPORTANT SCHEDULE UPDATE"): ЧЕТЫРЕ ФИКСИРОВАННЫХ
@@ -66,8 +62,8 @@ overlap'ов, если только overlap-страница не оказала
 следующего, и служит end-of-day sweep'ом, подбирающим публикации между
 обычным циклом 21:00 и концом дня (минимизирует риск оставить сегодняшние
 публикации необработанными на ночь). Типичный (ничего не накопилось сверх
-одной страницы) цикл — frontier-страница + 1 overlap-страница = ТИПИЧНЫЙ
-baseline ≈ 4 цикла × 2 запроса ≈ 8 запросов/день — НЕ гарантия: если между
+одной страницы) цикл — страница-граница + тихая страница + K = ТИПИЧНЫЙ
+baseline ≈ 4 цикла × 4 запроса ≈ 16 запросов/день — НЕ гарантия: если между
 циклами накопилось больше 30 новых записей, pagination сама сделает больше
 запросов (см. примеры выше), а первый-в-жизни DEEP catch-up (или любое
 восстановление после сбоя) может потребовать заметно больше страниц — это
@@ -81,27 +77,43 @@ baseline ≈ 4 цикла × 2 запроса ≈ 8 запросов/день �
   что именно она отражает после сбоя/никогда не запускалась), жёстко
   ограничен max_pages (first_run_max_pages для истинного первого запуска,
   max_pages_per_cycle для восстановления после сбоя — обычно меньше).
-  Завершается успешно на пустой странице ИЛИ на странице, ВСЕ строки
-  которой уже обработаны (DEEP-горизонт, см. _page_already_processed):
-  при истинном первом запуске — опубликованы раньше сегодняшнего дня; при
+  Завершается успешно в настоящем конце списка ИЛИ после 1 +
+  FAST_LOOKAHEAD_PAGES страниц подряд, ВСЕ строки которых уже обработаны
+  (DEEP-горизонт, см. _page_already_processed; страница из одних повторов
+  счёт не меняет, необработанная строка его сбрасывает): при истинном
+  первом запуске — опубликованы раньше сегодняшнего дня; при
   восстановлении — опубликованы раньше даты самой новой строки последнего
   успешного цикла (но не позже его собственного дня) ЛИБО впервые увидены
   этим циклом или раньше (first_seen_at <= его run_at; строки, отмеченные
   сбойными или прерванными попытками после него, не считаются — "дыра"
-  под ними будет дочитана). Дойти до пустой страницы реального feed'а
-  (~10 тыс. страниц, ~5–6,3 тыс. публикаций в сутки) невозможно — без
-  горизонта DEEP не завершался никогда. Упёрся в max_pages раньше
-  горизонта — по-прежнему остаётся в DEEP-режиме и на следующем цикле
-  (см. задачу: "Do not silently declare catch-up complete").
+  под ними будет дочитана). Одной обработанной страницы мало: её даёт и
+  блок из 30+ переопубликованных старых строк над новыми. Дойти до конца
+  реального feed'а (~10 тыс. страниц, ~5–6,3 тыс. публикаций в сутки)
+  невозможно — без горизонта DEEP не завершался никогда. Упёрся в
+  max_pages раньше горизонта — по-прежнему остаётся в DEEP-режиме и на
+  следующем цикле (см. задачу: "Do not silently declare catch-up complete").
+- В любом режиме пустая или неполная страница завершает обход, только если
+  это настоящий конец списка (её строки доходят до наибольшего за цикл
+  data.count); раньше —
+  это сбой источника и ошибка: принять её за конец значило бы потерять
+  всё ниже. Без data.count пустая страница, как раньше, считается концом
+  (с предупреждением).
 - "FAST" (обычный установившийся режим, после хотя бы одного успешного
-  DEEP-прохода И без свежей ошибки) — останавливается на ВТОРОЙ странице,
-  содержащей уже известную (seen) запись, увиденную ДО этого цикла (обычно
-  это сразу следующая, overlap-страница; см. выше про защиту от сдвига
-  страниц). Строки, уже отмеченные этим же циклом, границей не считаются:
-  они появляются снова, когда новые публикации сдвигают страницы во время
-  обхода (в production — пачки по 70–360 строк), и граница на них — как и
-  страница, целиком занятая такой пачкой сразу после границы, — оставила бы
-  новые строки под ними непрочитанными навсегда.
+  DEEP-прохода И без свежей ошибки) — останавливается только на "тихой"
+  странице (ни одной новой строки, хотя бы одна строка, увиденная ДО этого
+  цикла и ещё не прочитанная им), за которой прочитаны ещё
+  FAST_LOOKAHEAD_PAGES тихих страниц; страница с новой строкой сбрасывает
+  счёт. Старая строка над новыми (переопубликованная квитанция — production,
+  19.11.2026) обход больше не завершает: раньше хватало второй страницы с
+  такой строкой, и новые строки между ней и настоящей границей не читались
+  никогда. Строки, уже отмеченные этим же циклом, и строки, увиденные до
+  него, но уже прочитанные им, появляются снова, когда новые публикации
+  сдвигают страницы во время обхода (в production — пачки по 70–360
+  строк): страницу тихой они не делают и счёт не сбрасывают — остановка на
+  них оставила бы новые строки ниже непрочитанными навсегда. Счётчики
+  цикла (seen_among_new, quiet_pages, lookahead_new) и data.count первой
+  страницы с разницей от прошлого цикла — в итоговой строке журнала, без
+  номеров протоколов.
 
 ВОССТАНОВЛЕНИЕ ПОСЛЕ СБОЯ (см. задачу "ATOMICITY": "mid-pagination
 failure does not cause data loss"): ЛЮБОЕ исключение в середине цикла
@@ -132,6 +144,7 @@ from reader.fines.models import FineMonitoringTask
 from reader.fines.parser import (
     FineParseError,
     extract_published_protocols_results,
+    extract_reported_count,
     parse_published_protocol_entry,
 )
 from reader.fines.police_ge_session import PoliceGeSession
@@ -145,6 +158,50 @@ from reader.jobs.base import Job
 logger = logging.getLogger(__name__)
 
 _PAGE_SIZE = 30
+
+FAST_LOOKAHEAD_PAGES = 2
+"""K: how many more quiet pages FAST reads after the first quiet page (a
+page without unseen rows that shows at least one row seen before this
+cycle and not yet read by it) before it stops; a page with unseen rows
+among them resets the count. DEEP (first run and recovery) ends the same
+way: on 1 + K consecutive pages whose rows are all already processed (its
+horizon), so a block of re-shown old rows cannot end it early either. Mirrors reader/georgia_collector/collector_job.py::
+FAST_LOOKAHEAD_PAGES (the collector's GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES
+overrides it there; this job has no setting for it).
+
+Data behind K = 2 (production, 2026-11-19):
+- both FAST cycles that day had one old row re-shown above new rows
+  (17:00 UTC: 1197 of the 1200 rows read were new, the old row directly
+  above the boundary page; 19:55 UTC: 238 of 240). The old "second page
+  with a seen row" stop happened to end on the real boundary both times;
+  a second such row on another page above it would have ended the
+  traversal early;
+- new rows numbered below numbers already seen (1–7 rows in 10 of 32
+  cycles, 63 once): the shallow number-space overlaps are <= 5 rows;
+- a page-0 probe showed the feed ordered by publication, not by protocol
+  number (the series interleave), with the day's rows as one contiguous
+  block on top; at 19:55 every new number was above every old one, so the
+  re-shown row is a re-published or updated receipt, not a number-ordering
+  effect. Deep insertion of new rows below the boundary was not observed;
+  if the data.count delta ever exceeds the new rows read, revisit (a DEEP
+  trigger or a daily sweep, ~190–210 pages a day).
+K = 2 looks up to ~60 rows below the first quiet page: it counts pages,
+and one fresh old row makes a page quiet, so pages a burst partly repeats
+cover less. Cost, measured in simulation: +1.94 pages per FAST cycle
+without bursts and +2.68 with them (repeat pages are neutral), about +10
+requests a day (~5 % of the daily total), plus K pages per DEEP cycle
+(first run or recovery), well inside the 300-page cap. K must stay below
+both page caps, max_pages_per_cycle and first_run_max_pages (the jobs
+refuse it otherwise, the collector already at start-up): every cycle would
+end at the cap.
+
+Expected one-off: a true first run that finds its page 0 already older
+than today (no row published today yet) sees only 1 + K pages; shifted by
+the next cycle's new rows they can give one quiet page fewer than 1 + K, so
+that FAST cycle reads on into older rows no cycle has seen (they count as
+new) up to the page cap and records an error; the DEEP recovery after it
+completes normally. A first run that finds any row from today is not
+affected: it sees at least 2 + K pages."""
 
 # Отметка "цикл идёт" в georgia_public_feed_state.last_error (см. отметку
 # перед циклом страниц): если она осталась, цикл был прерван.
@@ -171,6 +228,44 @@ class GeorgiaPublicFineFeedJobStatus:
     last_error_at: datetime | None = None
 
 
+@dataclass
+class _FeedCycleCounters:
+    """Per-cycle feed diagnostics for the log, never protocol numbers or
+    plates (mirrors reader/georgia_collector/collector_job.py):
+    - new_rows: rows this cycle saw for the first time;
+    - seen_among_new: rows seen before this cycle standing above a new row
+      on the same page (an old row re-shown among new ones). The old rows
+      under the last new row of the boundary page are not counted — every
+      cycle has them. DEEP cycles count it too;
+    - quiet_pages: pages with no new row and at least one row seen before
+      this cycle that it had not read yet. DEEP cycles count them too (there
+      rows marked by failed attempts make pages quiet as well);
+    - lookahead_new: FAST only — every new row on a page after the cycle's
+      first quiet page, also after a look-ahead reset: rows inserted below a
+      boundary that the look-ahead found (or a burst deeper than that page);
+    - reported_count: data.count of page 0 (the feed total), and
+      reported_count_delta: its change since the previous cycle's page 0 in
+      this process (n/a after a restart). A delta above new_rows hints at
+      rows added out of reach; a single cycle can also differ by rows a
+      burst pushed into the previous cycle's pages."""
+
+    new_rows: int = 0
+    seen_among_new: int = 0
+    quiet_pages: int = 0
+    lookahead_new: int = 0
+    reported_count: int | None = None
+    reported_count_delta: int | None = None
+
+    def describe(self) -> str:
+        reported = "n/a" if self.reported_count is None else str(self.reported_count)
+        delta = "n/a" if self.reported_count_delta is None else f"{self.reported_count_delta:+d}"
+        return (
+            f"new_rows={self.new_rows}, seen_among_new={self.seen_among_new}, "
+            f"quiet_pages={self.quiet_pages}, lookahead_new={self.lookahead_new}, "
+            f"reported_count={reported}, reported_count_delta={delta}"
+        )
+
+
 class GeorgiaPublicFineFeedJob(Job):
     name = "georgia_public_fine_feed"
 
@@ -187,7 +282,14 @@ class GeorgiaPublicFineFeedJob(Job):
         max_pages_per_cycle: int = 30,
         first_run_max_pages: int = 100,
         retention_days: int = 7,
+        fast_lookahead_pages: int = FAST_LOOKAHEAD_PAGES,
     ):
+        if not 1 <= fast_lookahead_pages < min(max_pages_per_cycle, first_run_max_pages):
+            # K не меньше лимита — каждый цикл упирался бы в лимит: и FAST, и
+            # DEEP читают после первой тихой/обработанной страницы ещё K.
+            raise ValueError(
+                "fast_lookahead_pages must be >= 1 and below max_pages_per_cycle and first_run_max_pages"
+            )
         self._session = session
         self._task_repository = task_repository
         self._check_service = check_service
@@ -198,6 +300,10 @@ class GeorgiaPublicFineFeedJob(Job):
         self._max_pages_per_cycle = max_pages_per_cycle
         self._first_run_max_pages = first_run_max_pages
         self._retention_days = retention_days
+        self._fast_lookahead_pages = fast_lookahead_pages
+        # data.count первой страницы прошлого цикла этого процесса — только
+        # для журнала (см. run()), в БД не хранится.
+        self._previous_reported_count: int | None = None
         # Только в памяти, тот же приём, что и reader/jobs/fine_job.py::
         # FineJob._last_run_slot — какой именно (день, время-слот) из
         # run_times уже отработан, НЕ источник истины про DEEP/FAST режим
@@ -307,17 +413,6 @@ class GeorgiaPublicFineFeedJob(Job):
         pages_fetched = 0
         newest_seen_this_cycle: date | None = None
         completed = False
-        # "One page of overlap after frontier" (см. корректирующую задачу
-        # "One final safety adjustment before merge") — после страницы, на
-        # которой НАЙДЕНА установленная граница (page_has_seen_row), FAST-
-        # режим не останавливается немедленно: следующие страницы тоже
-        # полностью обрабатываются (их новые строки — НЕ отбрасываются), и
-        # цикл останавливается на ВТОРОЙ странице со строкой, увиденной до
-        # этого цикла, — обычно это сразу следующая (overlap) страница. Если
-        # пачка публикаций сдвинула список сразу после границы и следующая
-        # страница целиком новая, обход продолжается, иначе самые старые
-        # строки пачки остались бы непрочитанными навсегда.
-        pending_overlap = False
         # Отмеченные этим циклом: пока идёт обход, наверху feed'а появляются
         # новые публикации, страницы сдвигаются вниз, и следующая страница
         # снова показывает уже прочитанные строки (в production — пачки по
@@ -325,6 +420,28 @@ class GeorgiaPublicFineFeedJob(Job):
         # только строка, увиденная до этого цикла, иначе FAST остановился бы
         # на повторе и не дочитал бы новые строки под ним.
         marked_this_cycle: set[str] = set()
+        # Строки, увиденные до этого цикла, которые он уже прочитал: такая
+        # строка, снова показанная ниже после сдвига пачкой, страницу "тихой"
+        # не делает — иначе пачка во время look-ahead израсходовала бы его на
+        # уже прочитанные строки, не заглянув под тихую страницу.
+        seen_before_read: set[str] = set()
+        # FAST-граница (см. FAST_LOOKAHEAD_PAGES): тихих страниц подряд с
+        # последней страницы с новыми строками; обход завершается, когда их
+        # 1 + K. Все страницы, включая look-ahead, обрабатываются целиком (их
+        # новые строки — НЕ отбрасываются). Отдельная старая строка над
+        # новыми (переопубликованная квитанция) обход больше не завершает.
+        quiet_run = 0
+        # DEEP-горизонт с тем же look-ahead: обработанных страниц подряд
+        # (см. _page_already_processed); DEEP завершается, когда их 1 + K.
+        horizon_run = 0
+        # Наибольший data.count за цикл (за обход он только растёт, пока
+        # строки не удаляют): отличает настоящий конец списка от пустого или
+        # неполного ответа посреди него. Наибольший, а не последний: сбойная
+        # страница может сообщить и count 0. None — источник его не сообщил:
+        # пустая страница, как раньше, считается концом (с предупреждением).
+        max_count: int | None = None
+        warned_no_count = False
+        counters = _FeedCycleCounters()
 
         # Отметка "цикл идёт": если процесс остановят посреди цикла (SIGTERM,
         # OOM, CancelledError — их не ловит ни один except ниже), last_error
@@ -346,15 +463,47 @@ class GeorgiaPublicFineFeedJob(Job):
                     self._record_error(str(exc), at=run_at)
                     return
 
-                if not raw_results:
-                    # Пустая страница — конец релевантного backlog'а,
-                    # достигнутый ДО overlap'а или ВО ВРЕМЯ него (см. задачу:
-                    # "do not make unnecessary requests beyond an empty
-                    # result") — в обоих случаях останавливаемся немедленно.
-                    completed = True
-                    break
+                page_count = extract_reported_count(raw)
+                if page_count is not None:
+                    max_count = page_count if max_count is None else max(max_count, page_count)
+                if page_index == 0:
+                    # Только для журнала: data.count — всего строк в списке
+                    # (проба 19.11: 298 570), разница с прошлым циклом —
+                    # сколько добавилось с его первой страницы.
+                    counters.reported_count = page_count
+                    if counters.reported_count is not None and self._previous_reported_count is not None:
+                        counters.reported_count_delta = counters.reported_count - self._previous_reported_count
+                    self._previous_reported_count = counters.reported_count
 
-                page_has_seen_row = False
+                if len(raw_results) < _PAGE_SIZE:
+                    # Пустая или неполная страница — конец списка, только если
+                    # строк до её конца не меньше data.count (наибольшего за
+                    # цикл). Иначе это сбой
+                    # источника посреди списка ({success: true, results: []}):
+                    # всё ниже было бы потеряно, а неполная страница молча
+                    # пропустила бы остаток своих 30 мест, — ошибка, без
+                    # успеха; следующий цикл пойдёт DEEP.
+                    if max_count is None:
+                        if not warned_no_count:
+                            warned_no_count = True
+                            logger.warning(
+                                "GeorgiaPublicFineFeedJob: police.ge reports no data.count — an empty page is taken as "
+                                "the end of the list, as before (a transient one cannot be told apart)"
+                            )
+                    elif first_result + len(raw_results) < max_count:
+                        message = _incomplete_page_message(first_result, len(raw_results), max_count)
+                        logger.warning("GeorgiaPublicFineFeedJob: %s", message)
+                        self._record_error(message, at=run_at)
+                        return
+                    if not raw_results:
+                        # Настоящий конец списка — дальше не запрашиваем ("do
+                        # not make unnecessary requests beyond an empty result").
+                        completed = True
+                        break
+
+                page_new = 0
+                page_quiet_rows = 0
+                seen_above_new = 0
                 for entry in raw_results:
                     entry_date = _parse_publish_date(entry.get("publishDate"))
                     if entry_date is not None and (
@@ -367,13 +516,15 @@ class GeorgiaPublicFineFeedJob(Job):
                         continue
 
                     if self._seen.is_seen(protocol_no):
-                        if protocol_no not in marked_this_cycle:
-                            page_has_seen_row = True
+                        if protocol_no not in marked_this_cycle and protocol_no not in seen_before_read:
+                            seen_before_read.add(protocol_no)
+                            page_quiet_rows += 1
+                            seen_above_new += 1
                         continue
 
                     # Впервые видим эту конкретную запись feed'а (неважно,
                     # совпадёт ли она с отслеживаемым номером, и неважно,
-                    # является ли эта страница overlap'ом — см. задачу:
+                    # является ли эта страница look-ahead'ом — см. задачу:
                     # "All unseen rows found on the overlap page must be
                     # handled normally") — отмечаем ДО попытки сопоставления,
                     # см. GeorgiaPublicFeedSeenRepository докстрок.
@@ -381,30 +532,50 @@ class GeorgiaPublicFineFeedJob(Job):
                         protocol_no, publish_date=entry_date or run_at.date(), seen_at=run_at,
                     )
                     marked_this_cycle.add(protocol_no)
+                    page_new += 1
+                    # Старые строки над новой на этой странице (не хвост
+                    # страницы-границы под последней новой строкой).
+                    counters.seen_among_new += seen_above_new
+                    seen_above_new = 0
                     matched_count += await self._maybe_process_entry(entry, monitored)
 
-                if deep_mode and _page_already_processed(
-                    raw_results, self._seen,
-                    published_before=processed_before_date, seen_at_or_before=processed_before_time,
-                ):
-                    # DEEP дошёл до уже обработанных строк (см. DEEP-горизонт) —
-                    # цикл завершён честно, а не упором в лимит страниц.
-                    completed = True
-                    break
+                if page_new:
+                    if not deep_mode and counters.quiet_pages:
+                        # Новые строки ниже тихой страницы — вставка под
+                        # границей: без look-ahead их бы не прочитали.
+                        counters.lookahead_new += page_new
+                    quiet_run = 0
+                elif page_quiet_rows:
+                    counters.quiet_pages += 1
+                    quiet_run += 1
 
-                if not deep_mode and page_has_seen_row:
-                    if pending_overlap:
-                        # Вторая страница со строками, увиденными до этого
-                        # цикла: ниже — только уже обработанное. Страница
-                        # без них (пачка публикаций сдвинула список сразу
-                        # после границы) обход не завершает.
+                if deep_mode:
+                    if page_new or page_quiet_rows:
+                        # DEEP-горизонт с тем же look-ahead, что у FAST: 1 + K
+                        # страниц подряд, все строки которых уже обработаны.
+                        # Необработанная строка сбрасывает счёт; страница из
+                        # одних повторов (пачка сдвинула список) его не
+                        # меняет. Иначе блок из 30+ переопубликованных старых
+                        # строк над новыми завершал DEEP, и новые строки под
+                        # ним терялись.
+                        if _page_already_processed(
+                            raw_results, self._seen,
+                            published_before=processed_before_date, seen_at_or_before=processed_before_time,
+                        ):
+                            horizon_run += 1
+                        else:
+                            horizon_run = 0
+                    if horizon_run > self._fast_lookahead_pages:
+                        # DEEP дошёл до уже обработанных строк — цикл завершён
+                        # честно, а не упором в лимит страниц.
                         completed = True
                         break
-                    # Установленная граница с прошлого цикла найдена — не
-                    # останавливаемся немедленно (см. задачу про защиту от
-                    # сдвига страниц/порядка), а запрашиваем ещё страницу.
-                    pending_overlap = True
-                    continue
+                elif quiet_run > self._fast_lookahead_pages:
+                    # Тихая страница и K тихих за ней: ниже — только уже
+                    # обработанное. Страница из одних повторов (пачка
+                    # сдвинула список) счёт не меняет.
+                    completed = True
+                    break
             else:
                 completed = False
         except FineProviderError as exc:
@@ -416,12 +587,17 @@ class GeorgiaPublicFineFeedJob(Job):
             logger.exception("GeorgiaPublicFineFeedJob: неожиданная ошибка")
             return
 
+        counters.new_rows = len(marked_this_cycle)
         if not completed:
+            lookahead_run = horizon_run if deep_mode else quiet_run
             message = _safety_cap_message(
                 max_pages, is_true_first_run=is_true_first_run, deep_mode=deep_mode,
+                lookahead_pages_read=lookahead_run - 1 if lookahead_run else None,
+                lookahead_pages=self._fast_lookahead_pages,
             )
             logger.warning(
-                "GeorgiaPublicFineFeedJob: %s (matched=%d this attempt)", message, matched_count,
+                "GeorgiaPublicFineFeedJob: %s (matched=%d this attempt, pages=%d, %s)",
+                message, matched_count, pages_fetched, counters.describe(),
             )
             self._record_error(message, at=run_at)
             return
@@ -442,8 +618,8 @@ class GeorgiaPublicFineFeedJob(Job):
         self.status.last_success_at = run_at
         logger.info(
             "GeorgiaPublicFineFeedJob finished: pages=%d, matched=%d, deep_mode=%s, "
-            "retention_removed=%d",
-            pages_fetched, matched_count, deep_mode, removed,
+            "retention_removed=%d, %s",
+            pages_fetched, matched_count, deep_mode, removed, counters.describe(),
         )
 
     def _build_monitored_plate_map(self) -> dict[str, list[FineMonitoringTask]]:
@@ -553,20 +729,60 @@ def _as_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
-def _safety_cap_message(max_pages: int, *, is_true_first_run: bool, deep_mode: bool) -> str:
+def _incomplete_page_message(first_result: int, rows: int, reported_count: int) -> str:
+    """Пустая или неполная страница до data.count — сбой источника, а не
+    конец списка (см. проверку в цикле страниц). Без номеров протоколов."""
+    page = "an empty page" if rows == 0 else f"{rows} of {_PAGE_SIZE} rows"
+    return (
+        f"police.ge returned {page} at offset {first_result}, although the list reports "
+        f"{reported_count} rows; not taken as the end of the list — the next cycle runs deep recovery"
+    )
+
+
+def _safety_cap_message(
+    max_pages: int,
+    *,
+    is_true_first_run: bool,
+    deep_mode: bool,
+    lookahead_pages_read: int | None = None,
+    lookahead_pages: int = FAST_LOOKAHEAD_PAGES,
+) -> str:
     """Свой текст для каждого режима, с именем настройки лимита.
     Восстановление, не дошедшее до строк последнего успеха за max_pages
-    страниц, само уже не завершится: новые строки только отодвигают их."""
+    страниц, само уже не завершится: новые строки только отодвигают их.
+    lookahead_pages_read — лимит наступил во время look-ahead (после первой
+    тихой страницы у FAST, после первой уже обработанной у DEEP): граница не
+    подтверждена, это тоже не успех."""
+    lookahead = f"look-ahead: {lookahead_pages_read} of {lookahead_pages} pages read"
     if is_true_first_run:
+        if lookahead_pages_read is not None:
+            return (
+                f"first-run catch-up: safety cap of {max_pages} pages reached during the look-ahead "
+                f"after rows published before today ({lookahead}); retrying in deep mode next cycle "
+                f"(raise {_FIRST_RUN_PAGES_SETTING} if this repeats)"
+            )
         return (
             f"first-run catch-up: safety cap of {max_pages} pages reached before rows published "
             f"before today; retrying in deep mode next cycle (raise {_FIRST_RUN_PAGES_SETTING} "
             "if this repeats)"
         )
     if deep_mode:
+        if lookahead_pages_read is not None:
+            return (
+                "recovery reached rows covered by the last successful cycle, but the safety cap of "
+                f"{max_pages} pages came during the look-ahead ({lookahead}); it keeps failing until "
+                f"{_PAGES_PER_CYCLE_SETTING} is raised"
+            )
         return (
             "recovery could not reach rows covered by the last successful cycle within "
             f"{max_pages} pages; it keeps failing until {_PAGES_PER_CYCLE_SETTING} is raised"
+        )
+    if lookahead_pages_read is not None:
+        return (
+            f"safety cap of {max_pages} pages reached before the frontier was confirmed "
+            f"(look-ahead: {lookahead_pages_read} of {lookahead_pages} pages read after a page "
+            "without new rows); the next cycle runs deep recovery, which needs even more pages "
+            f"— raise {_PAGES_PER_CYCLE_SETTING}"
         )
     return (
         f"safety cap of {max_pages} pages reached before the frontier (already-seen rows); "

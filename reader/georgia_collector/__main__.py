@@ -33,7 +33,10 @@ from reader.fines.police_ge_session import PoliceGeSession
 from reader.fines.public_feed_seen_repository import GeorgiaPublicFeedSeenRepository
 from reader.fines.public_feed_state_repository import GeorgiaPublicFeedStateRepository
 from reader.georgia_collector.check_now_server import run_check_now_server_forever
-from reader.georgia_collector.collector_job import GeorgiaCollectorJob
+from reader.georgia_collector.collector_job import (
+    FAST_LOOKAHEAD_PAGES,
+    GeorgiaCollectorJob,
+)
 from reader.georgia_collector.outbox_repository import CollectorOutboxRepository
 from reader.georgia_collector.production_client import ProductionApiClient
 
@@ -131,6 +134,28 @@ def load_page_limits(env: dict[str, str] | None = None) -> tuple[int, int]:
     return max_pages, first_run
 
 
+def load_fast_lookahead_pages(env: dict[str, str] | None = None) -> int:
+    """GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES — сколько ещё тихих страниц FAST
+    читает после первой страницы без новых строк, прежде чем остановиться
+    (по умолчанию collector_job.FAST_LOOKAHEAD_PAGES, там же — данные за это
+    значение; тот же K — у look-ahead DEEP-горизонта). Тот же приём, что и
+    load_page_limits(): не целое число, < 1 или не меньше любого из лимитов
+    страниц того же env (GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE,
+    GEORGIA_COLLECTOR_FIRST_RUN_MAX_PAGES: с таким K каждый цикл упирался бы
+    в лимит) — ValueError при старте, а не молчаливый откат к умолчанию."""
+    if env is None:
+        env = os.environ
+    pages = int(env.get("GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES", str(FAST_LOOKAHEAD_PAGES)))
+    max_pages_per_cycle, first_run_max_pages = load_page_limits(env)
+    if not 1 <= pages < min(max_pages_per_cycle, first_run_max_pages):
+        raise ValueError(
+            "GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES must be >= 1 and below "
+            f"GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE ({max_pages_per_cycle}) and "
+            f"GEORGIA_COLLECTOR_FIRST_RUN_MAX_PAGES ({first_run_max_pages})"
+        )
+    return pages
+
+
 def load_checknow_server_config(env: dict[str, str] | None = None) -> tuple[str, int]:
     """(host, port) для run_check_now_server_forever() — та же тестируемая-
     без-event-loop функция, что и load_timeouts() выше (см. её докстрок про
@@ -215,18 +240,21 @@ async def main() -> None:
     )
 
     max_pages_per_cycle, first_run_max_pages = load_page_limits()
+    fast_lookahead_pages = load_fast_lookahead_pages()
     job = GeorgiaCollectorJob(
         session, production_client, feed_state_repository, seen_repository, outbox_repository,
         run_times=run_times, tz=tz,
         max_pages_per_cycle=max_pages_per_cycle, first_run_max_pages=first_run_max_pages,
+        fast_lookahead_pages=fast_lookahead_pages,
     )
 
     logger.info(
         "Georgia collector starting: production=%s, run_times=%s, tz=%s, db=%s, "
-        "request_timeout=%ss, submission_timeout=%ss, checknow=%s:%d, max_pages=%d/%d",
+        "request_timeout=%ss, submission_timeout=%ss, checknow=%s:%d, max_pages=%d/%d, "
+        "fast_lookahead_pages=%d",
         production_base_url, [t.strftime("%H:%M") for t in run_times], tz, db_path,
         request_timeout, submission_timeout, checknow_host, checknow_port,
-        max_pages_per_cycle, first_run_max_pages,
+        max_pages_per_cycle, first_run_max_pages, fast_lookahead_pages,
     )
 
     # Та же SAME session (= тот же circuit breaker), что и у polling job'а

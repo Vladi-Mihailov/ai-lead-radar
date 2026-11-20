@@ -7,6 +7,8 @@ breaker gate, error recording via the local feed_state), and the
 no-Telegram-import architectural guarantee."""
 
 import asyncio
+import logging
+import re
 import sys
 from datetime import date, datetime, timezone
 from datetime import time as dt_time
@@ -25,15 +27,22 @@ from reader.fines.public_feed_seen_repository import (
 from reader.fines.public_feed_state_repository import (
     GeorgiaPublicFeedStateRepository,
 )
-from reader.georgia_collector.__main__ import load_page_limits
-from reader.georgia_collector.collector_job import GeorgiaCollectorJob
+from reader.georgia_collector.__main__ import (
+    load_fast_lookahead_pages,
+    load_page_limits,
+)
+from reader.georgia_collector.collector_job import (
+    FAST_LOOKAHEAD_PAGES,
+    GeorgiaCollectorJob,
+)
 from reader.georgia_collector.outbox_repository import (
     KIND_FEED_MATCH,
     CollectorOutboxRepository,
 )
 from reader.georgia_collector.production_client import ProductionApiError
 
-pytestmark = pytest.mark.asyncio
+# Async tests run through asyncio_mode = auto (pytest.ini): no module-wide
+# asyncio mark, which only made the synchronous tests here warn.
 
 _TBILISI = ZoneInfo("Asia/Tbilisi")
 _DEFAULT_RUN_TIMES = [dt_time(9, 0), dt_time(15, 0), dt_time(21, 0), dt_time(23, 55)]
@@ -380,13 +389,16 @@ async def test_first_run_completes_at_first_page_older_than_today_then_fast(tmp_
         30: _page(_rows("T1_", 30, publish_date="2026-10-22")),
         60: _page(_rows("Y0_", 30, publish_date="2026-10-21")),
         90: _page(_rows("Y1_", 30, publish_date="2026-10-21")),
+        120: _page(_rows("Y2_", 30, publish_date="2026-10-21")),
+        150: _page(_rows("Y3_", 30, publish_date="2026-10-21")),
     })
     production = _FakeProductionClient(active_plates=["AA001AA"])
     job, feed_state_repo, _seen, _outbox = _make_job(tmp_path, session, production, first_run_max_pages=10)
 
     await job.run(_utc(21))
 
-    assert session.requested_offsets == [0, 30, 60]
+    # The first page published before today and its two look-ahead pages.
+    assert session.requested_offsets == [0, 30, 60, 90, 120]
     assert [m["external_fine_id"] for m in production.submitted_feed_matches] == ["MATCH001"]
     state = feed_state_repo.get()
     assert state.last_successful_poll_at == _utc(21)
@@ -401,37 +413,36 @@ async def test_first_run_completes_at_first_page_older_than_today_then_fast(tmp_
 
 
 async def test_first_run_cap_on_todays_rows_is_an_error_and_next_cycle_stays_deep(tmp_path):
-    pages = {
-        0: _page(_rows("T0_", 30, publish_date="2026-10-22")),
-        30: _page(_rows("T1_", 30, publish_date="2026-10-22")),
-        60: _page(_rows("Y0_", 30, publish_date="2026-10-21")),
-    }
+    pages = {i * 30: _page(_rows(f"T{i}_", 30, publish_date="2026-10-22")) for i in range(3)}
+    pages.update({(3 + i) * 30: _page(_rows(f"Y{i}_", 30, publish_date="2026-10-21")) for i in range(3)})
     production = _FakeProductionClient(active_plates=["AA001AA"])
     session = _FakeSession(pages)
-    job, feed_state_repo, _seen, _outbox = _make_job(tmp_path, session, production, first_run_max_pages=2)
+    job, feed_state_repo, _seen, _outbox = _make_job(tmp_path, session, production, first_run_max_pages=3)
 
     await job.run(_utc(21))
 
-    assert session.requested_offsets == [0, 30]
+    assert session.requested_offsets == [0, 30, 60]
     state = feed_state_repo.get()
     assert state.last_successful_poll_at is None
     assert "safety cap" in state.last_error
 
     session2 = _FakeSession(pages)
-    job2, feed_state_repo2, *_ = _make_job(tmp_path, session2, production, first_run_max_pages=3)
+    job2, feed_state_repo2, *_ = _make_job(tmp_path, session2, production, first_run_max_pages=6)
     await job2.run(_utc(23, 55))
 
-    assert session2.requested_offsets == [0, 30, 60]
+    assert session2.requested_offsets == [0, 30, 60, 90, 120, 150]
     assert feed_state_repo2.get().last_error is None
 
 
 async def test_recovery_stops_at_rows_seen_before_last_success_of_the_same_day(tmp_path):
     production = _FakeProductionClient(active_plates=["AA001AA"])
-    earlier = _rows("E0_", 30, publish_date="2026-10-22")
+    earlier = _rows("E0_", 90, publish_date="2026-10-22")
     session = _FakeSession({
         0: _page(_rows("N0_", 30, publish_date="2026-10-22")),
-        30: _page(earlier),
-        60: _page(_rows("E1_", 30, publish_date="2026-10-22")),
+        30: _page(earlier[:30]),
+        60: _page(earlier[30:60]),
+        90: _page(earlier[60:]),
+        120: _page(_rows("E1_", 30, publish_date="2026-10-22")),
     })
     job, feed_state_repo, seen_repo, _outbox = _make_job(tmp_path, session, production)
     feed_state_repo.record_successful_cycle(newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15))
@@ -440,7 +451,9 @@ async def test_recovery_stops_at_rows_seen_before_last_success_of_the_same_day(t
 
     await job.run(_utc(23, 55))
 
-    assert session.requested_offsets == [0, 30]
+    # Three pages seen before the last success (one + two look-ahead); the
+    # rest of the day below is not re-read.
+    assert session.requested_offsets == [0, 30, 60, 90]
     assert feed_state_repo.get().last_error is None
 
 
@@ -466,11 +479,12 @@ async def test_recovery_reads_through_rows_marked_after_last_success_and_fills_t
         60: _page(gap),
         90: _page(base),
         120: _page(_rows("O0_", 30, publish_date="2026-10-21")),
+        150: _page(_rows("O1_", 30, publish_date="2026-10-21")),
     })
     job2, feed_state_repo2, *_ = _make_job(tmp_path, session, production)
     await job2.run(_utc(23, 55))
 
-    assert session.requested_offsets == [0, 30, 60, 90]
+    assert session.requested_offsets == [0, 30, 60, 90, 120, 150]
     assert [m["external_fine_id"] for m in production.submitted_feed_matches] == ["GAP_MATCH"]
     assert feed_state_repo2.get().last_error is None
 
@@ -481,6 +495,7 @@ async def test_recovery_stops_at_page_older_than_last_success_date_without_seen_
         0: _page(_rows("N0_", 30, publish_date="2026-10-23")),
         30: _page(_rows("OLD0_", 30, publish_date="2026-10-21")),
         60: _page(_rows("OLD1_", 30, publish_date="2026-10-21")),
+        90: _page(_rows("OLD2_", 30, publish_date="2026-10-21")),
     })
     job, feed_state_repo, _seen, _outbox = _make_job(tmp_path, session, production)
     feed_state_repo.record_successful_cycle(newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(23, 55))
@@ -488,7 +503,7 @@ async def test_recovery_stops_at_page_older_than_last_success_date_without_seen_
 
     await job.run(_utc(15, day=23))
 
-    assert session.requested_offsets == [0, 30]
+    assert session.requested_offsets == [0, 30, 60, 90]
     assert feed_state_repo.get().last_error is None
 
 
@@ -497,37 +512,42 @@ async def test_row_without_publish_date_does_not_complete_deep_by_date(tmp_path)
     session = _FakeSession({
         0: _page(_rows("Y0_", 29, publish_date="2026-10-21") + [undated]),
         30: _page(_rows("Y1_", 30, publish_date="2026-10-21")),
+        60: _page(_rows("Y2_", 30, publish_date="2026-10-21")),
+        90: _page(_rows("Y3_", 30, publish_date="2026-10-21")),
     })
     production = _FakeProductionClient(active_plates=["AA001AA"])
     job, feed_state_repo, _seen, _outbox = _make_job(tmp_path, session, production, first_run_max_pages=10)
 
     await job.run(_utc(21))
 
-    assert session.requested_offsets == [0, 30]
+    assert session.requested_offsets == [0, 30, 60, 90]
     assert feed_state_repo.get().last_error is None
 
 
 async def test_busy_fast_cycle_reaches_the_frontier_under_the_default_cap(tmp_path):
     """The busiest cycle (~3.5k new rows ≈ 120 pages) used to hit the old
     implicit 30/100-page caps; with the collector default (load_page_limits)
-    FAST reaches the frontier and the cycle succeeds."""
+    FAST reaches the frontier, reads its look-ahead pages and the cycle
+    succeeds (120 + 1 quiet page + 2 look-ahead pages)."""
     max_pages_per_cycle, _first_run = load_page_limits(env={})
     frontier = _rows("SEEN_", 30, publish_date="2026-10-22")
     pages = {i * 30: _page(_rows(f"P{i:03d}_", 30, publish_date="2026-10-22")) for i in range(120)}
     after = _rows("AFTER_", 30, publish_date="2026-10-22")
+    after2 = _rows("AFTER2_", 30, publish_date="2026-10-22")
     pages[120 * 30] = _page(frontier)
     pages[121 * 30] = _page(after)
+    pages[122 * 30] = _page(after2)
     session = _FakeSession(pages)
     production = _FakeProductionClient(active_plates=["AA001AA"])
     job, feed_state_repo, seen_repo, _outbox = _make_job(
         tmp_path, session, production, max_pages_per_cycle=max_pages_per_cycle,
     )
     feed_state_repo.record_successful_cycle(newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15))
-    _mark_seen_at(seen_repo, frontier + after, seen_at=_utc(15))
+    _mark_seen_at(seen_repo, frontier + after + after2, seen_at=_utc(15))
 
     await job.run(_utc(21))
 
-    assert len(session.requested_offsets) == 122
+    assert len(session.requested_offsets) == 123
     assert feed_state_repo.get().last_error is None
 
 
@@ -535,7 +555,8 @@ async def test_recovery_after_two_failed_cycles_fits_the_page_cap(tmp_path):
     """Regression for the "stuck recovery": last success late on 21.10, two
     failed cycles on 22.10. A date-only horizon (21.10) would need to re-read
     ALL rows of 21.10 (6 + 8 + 1 = 15 pages > cap 10, worse every cycle);
-    rows seen before the success complete recovery on page 7."""
+    rows seen before the success complete recovery on page 7 and its two
+    look-ahead pages — 9 pages, within the cap."""
     production = _FakeProductionClient(active_plates=["AA001AA"])
     yesterday_pages = [_rows(f"Y{i}_", 30, publish_date="2026-10-21") for i in range(8)]
     failing = _FakeSession(errors={0: FineProviderError("ConnectTimeout")})
@@ -560,7 +581,7 @@ async def test_recovery_after_two_failed_cycles_fits_the_page_cap(tmp_path):
 
     await job.run(_utc(21))
 
-    assert len(session.requested_offsets) == 7
+    assert len(session.requested_offsets) == 9
     state = feed_state_repo2.get()
     assert state.last_error is None
     assert state.last_successful_poll_at == _utc(21)
@@ -579,12 +600,12 @@ async def test_rows_marked_by_an_earlier_successful_cycle_complete_a_later_recov
     first = _FakeSession({0: _page(rows_a), 30: _page(yesterday)})
     job1, feed_state_repo, *_ = _make_job(tmp_path, first, production)
     await job1.run(_utc(15))
-    assert first.requested_offsets == [0, 30]
+    assert first.requested_offsets == [0, 30, 60]  # the look-ahead meets the end of the list
 
     second = _FakeSession({0: _page(rows_b), 30: _page(rows_a), 60: _page(yesterday)})
     job2, *_ = _make_job(tmp_path, second, production)
     await job2.run(_utc(21))
-    assert second.requested_offsets == [0, 30, 60]
+    assert second.requested_offsets == [0, 30, 60, 90]  # FAST: quiet page + look-ahead up to the empty page
 
     failing = _FakeSession({0: _page(rows_k)}, errors={30: FineProviderError("ConnectTimeout")})
     job3, *_ = _make_job(tmp_path, failing, production)
@@ -601,7 +622,8 @@ async def test_rows_marked_by_an_earlier_successful_cycle_complete_a_later_recov
     job4, feed_state_repo4, *_ = _make_job(tmp_path, recovery, production)
     await job4.run(_utc(9, day=23))
 
-    assert recovery.requested_offsets == [0, 30, 60]
+    # B (marked by the last success) and the two look-ahead pages A and Y.
+    assert recovery.requested_offsets == [0, 30, 60, 90, 120]
     assert feed_state_repo4.get().last_error is None
 
 
@@ -642,11 +664,12 @@ async def test_interrupted_cycle_is_followed_by_deep_recovery_that_reads_below_t
         90: _page(k2),
         120: _page(rows_s),
         150: _page(yesterday),
+        180: _page(_rows("Y1_", 30, publish_date="2026-10-21")),
     })
     job3, feed_state_repo3, *_ = _make_job(tmp_path, recovery, production)
     await job3.run(_utc(23, 55))
 
-    assert recovery.requested_offsets == [0, 30, 60, 90, 120]
+    assert recovery.requested_offsets == [0, 30, 60, 90, 120, 150, 180]
     assert _submitted(production) == ["LOST_MATCH"]
     assert feed_state_repo3.get().last_error is None
 
@@ -680,7 +703,8 @@ async def test_recovery_ignores_first_seen_times_when_last_success_is_not_in_the
     with caplog.at_level(logging.WARNING, logger="reader.georgia_collector.collector_job"):
         await job2.run(_utc(23, 55))
 
-    assert recovery.requested_offsets == [0, 30, 60, 90]
+    # By date alone only Y0 is processed: the look-ahead runs into the end of the list.
+    assert recovery.requested_offsets == [0, 30, 60, 90, 120]
     assert _submitted(production) == ["SKEW_MATCH"]
     assert any("clock skew" in r.getMessage() for r in caplog.records)
     assert feed_state_repo2.get().last_error is None
@@ -715,7 +739,7 @@ async def test_future_dated_row_does_not_move_the_recovery_date_horizon_past_the
     job3, feed_state_repo3, *_ = _make_job(tmp_path, recovery, production)
     await job3.run(_utc(9, day=23))
 
-    assert recovery.requested_offsets == [0, 30, 60, 90]
+    assert recovery.requested_offsets == [0, 30, 60, 90, 120]
     assert _submitted(production) == ["FUT_GAP_MATCH"]
     assert feed_state_repo3.get().last_error is None
 
@@ -741,52 +765,53 @@ async def test_capped_recovery_says_it_cannot_reach_the_last_success_and_names_t
 
 async def test_first_run_cap_has_its_own_message(tmp_path):
     production = _FakeProductionClient(active_plates=["AA001AA"])
-    session = _FakeSession({
-        0: _page(_rows("T0_", 30, publish_date="2026-10-22")),
-        30: _page(_rows("T1_", 30, publish_date="2026-10-22")),
-    })
-    job, feed_state_repo, *_ = _make_job(tmp_path, session, production, first_run_max_pages=2)
+    # A first-run cap of 2 pages is no longer allowed with 2 look-ahead pages.
+    session = _FakeSession({i * 30: _page(_rows(f"T{i}_", 30, publish_date="2026-10-22")) for i in range(3)})
+    job, feed_state_repo, *_ = _make_job(tmp_path, session, production, first_run_max_pages=3)
 
     await job.run(_utc(21))
 
     error = feed_state_repo.get().last_error
-    assert error.startswith("first-run catch-up: safety cap of 2 pages")
+    assert error.startswith("first-run catch-up: safety cap of 3 pages")
     assert "GEORGIA_COLLECTOR_FIRST_RUN_MAX_PAGES" in error
     assert "recovery could not reach" not in error
 
 
 async def test_fast_cap_has_its_own_message(tmp_path):
+    # A cap of 2 pages is no longer allowed with the 2 look-ahead pages.
     production = _FakeProductionClient(active_plates=["AA001AA"])
-    session = _FakeSession({i * 30: _page(_rows(f"N{i}_", 30, publish_date="2026-10-22")) for i in range(3)})
-    job, feed_state_repo, *_ = _make_job(tmp_path, session, production, max_pages_per_cycle=2)
+    session = _FakeSession({i * 30: _page(_rows(f"N{i}_", 30, publish_date="2026-10-22")) for i in range(4)})
+    job, feed_state_repo, *_ = _make_job(tmp_path, session, production, max_pages_per_cycle=3)
     feed_state_repo.record_successful_cycle(newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15))
 
     await job.run(_utc(21))
 
     error = feed_state_repo.get().last_error
-    assert error.startswith("safety cap of 2 pages reached before the frontier")
+    assert error.startswith("safety cap of 3 pages reached before the frontier")
     assert "GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE" in error
 
 
-async def test_fast_page_of_rows_seen_before_last_success_still_gets_its_overlap_page(tmp_path):
+async def test_fast_page_of_rows_seen_before_last_success_still_gets_its_lookahead_pages(tmp_path):
     """The DEEP horizon does not apply in FAST: a page of rows seen before the
-    last success is an ordinary frontier, followed by one overlap page."""
+    last success is an ordinary quiet page, followed by the look-ahead pages."""
     production = _FakeProductionClient(active_plates=["AA001AA"])
     old = _rows("OLD_", 30, publish_date="2026-10-22")
     older = _rows("OLDER_", 30, publish_date="2026-10-22")
-    session = _FakeSession({0: _page(old), 30: _page(older)})
+    oldest = _rows("OLDEST_", 30, publish_date="2026-10-22")
+    session = _FakeSession({0: _page(old), 30: _page(older), 60: _page(oldest)})
     job, feed_state_repo, seen_repo, _outbox = _make_job(tmp_path, session, production)
     feed_state_repo.record_successful_cycle(newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15))
-    _mark_seen_at(seen_repo, old + older, seen_at=_utc(9))
+    _mark_seen_at(seen_repo, old + older + oldest, seen_at=_utc(9))
 
     await job.run(_utc(21))
 
-    assert session.requested_offsets == [0, 30]
+    assert session.requested_offsets == [0, 30, 60]
 
 
 async def test_match_on_the_page_that_completes_deep_is_still_processed(tmp_path):
-    """The page that completes DEEP is processed in full first (the detection
-    loop is unchanged); only then does it stop the traversal."""
+    """A page that reaches the DEEP horizon is processed in full first (the
+    detection loop is unchanged); only then does it count towards the stop
+    (here the look-ahead meets the end of the list)."""
     production = _FakeProductionClient(active_plates=["AA001AA"])
     horizon_page = _rows("Y0_", 29, publish_date="2026-10-21") + [
         _entry(protocol_no="H_MATCH", plate="AA001AA", publish_date="2026-10-21"),
@@ -796,7 +821,7 @@ async def test_match_on_the_page_that_completes_deep_is_still_processed(tmp_path
 
     await job.run(_utc(21))
 
-    assert session.requested_offsets == [0, 30]
+    assert session.requested_offsets == [0, 30, 60]
     assert _submitted(production) == ["H_MATCH"]
     assert seen_repo.is_seen("Y0_000")
 
@@ -808,12 +833,16 @@ async def test_first_run_horizon_uses_the_tbilisi_date_not_utc(tmp_path):
         0: _page(_rows("D23_", 30, publish_date="2026-10-23")),
         30: _page(_rows("D22_", 30, publish_date="2026-10-22")),
         60: _page(_rows("D22B_", 30, publish_date="2026-10-22")),
+        90: _page(_rows("D22C_", 30, publish_date="2026-10-22")),
+        120: _page(_rows("D22D_", 30, publish_date="2026-10-22")),
     })
     job, *_ = _make_job(tmp_path, session, production, first_run_max_pages=10)
 
     await job.run(_utc(1, day=23))
 
-    assert session.requested_offsets == [0, 30]
+    # 22.10 pages count as processed (one + two look-ahead); with a UTC
+    # "today" (22.10) the run would read on to the end of the list.
+    assert session.requested_offsets == [0, 30, 60, 90]
 
 
 # ==== live feed: publications between cycles and DURING a traversal
@@ -865,8 +894,8 @@ class _LiveFeed:
 async def test_fast_reads_new_rows_below_a_page_it_already_read_when_publications_shift_the_pages(tmp_path):
     """60 rows published after the 2nd page shift the list by two pages: pages
     3–4 repeat rows this cycle already marked. They are not the frontier —
-    FAST goes on, reads the remaining new rows (and their match) and stops one
-    page after rows seen BEFORE this cycle."""
+    FAST goes on, reads the remaining new rows (and their match) and stops
+    after a page of rows seen BEFORE this cycle plus the look-ahead pages."""
     production = _FakeProductionClient(active_plates=["AA001AA"])
     feed = _LiveFeed(_rows("OLD", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
     job1, feed_state_repo, seen_repo, _outbox = _make_job(tmp_path, feed, production, first_run_max_pages=10)
@@ -881,7 +910,7 @@ async def test_fast_reads_new_rows_below_a_page_it_already_read_when_publication
     job2, *_ = _make_job(tmp_path, feed, production)
     await job2.run(_utc(21))
 
-    assert feed.requested_offsets == [0, 30, 60, 90, 120, 150, 180, 210]
+    assert feed.requested_offsets == [0, 30, 60, 90, 120, 150, 180, 210, 240]
     assert _submitted(production) == ["DEEP_MATCH"]
     assert feed_state_repo.get().last_error is None
 
@@ -889,7 +918,7 @@ async def test_fast_reads_new_rows_below_a_page_it_already_read_when_publication
     job3, *_ = _make_job(tmp_path, feed, production)
     await job3.run(_utc(23, 55))
 
-    assert feed.requested_offsets == [0, 30, 60, 90]
+    assert feed.requested_offsets == [0, 30, 60, 90, 120]
     assert all(seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
     assert _submitted(production) == ["DEEP_MATCH"]
 
@@ -933,9 +962,11 @@ async def test_interrupted_cycle_then_recovery_with_shifting_pages_reads_every_r
 
 async def test_fast_keeps_reading_when_a_burst_fills_the_overlap_page_right_after_the_frontier(tmp_path):
     """The frontier is on page 0 and 150 rows are published right after it:
-    the next page holds only new rows. FAST does not stop there — it ends on
-    the second page with rows seen before this cycle, so the oldest rows of
-    the burst (and their match) are read now, not lost for good."""
+    the next page holds only new rows. FAST does not stop there — it ends
+    only after a quiet page and the look-ahead pages, so the oldest rows of
+    the burst (and their match) are read now, not lost for good. The page
+    where the burst re-shows the frontier's old rows (offset 150) is not
+    quiet: this cycle has read those rows already."""
     production = _FakeProductionClient(active_plates=["AA001AA"])
     feed = _LiveFeed(_rows("OLD", 60, publish_date="2026-10-22") + _rows("Y0_", 30, publish_date="2026-10-21"))
     job1, feed_state_repo, seen_repo, _outbox = _make_job(tmp_path, feed, production, first_run_max_pages=10)
@@ -949,7 +980,7 @@ async def test_fast_keeps_reading_when_a_burst_fills_the_overlap_page_right_afte
     job2, *_ = _make_job(tmp_path, feed, production)
     await job2.run(_utc(21))
 
-    assert feed.requested_offsets == [0, 30, 60, 90, 120, 150]
+    assert feed.requested_offsets == [0, 30, 60, 90, 120, 150, 180, 210, 240]
     assert _submitted(production) == ["BURST_MATCH"]
 
     job3, *_ = _make_job(tmp_path, feed, production)
@@ -972,10 +1003,768 @@ async def test_one_job_instance_runs_consecutive_cycles_like_production(tmp_path
         feed.publish(_rows(f"C{cycle}_", 45, publish_date="2026-10-22"))
         feed.requested_offsets.clear()
         await job.run(run_at)
-        assert feed.requested_offsets == [0, 30, 60], cycle
+        # 45 new rows (pages 0–1), a quiet page, two look-ahead pages.
+        assert feed.requested_offsets == [0, 30, 60, 90, 120], cycle
         assert feed_state_repo.get().last_error is None
 
     assert all(seen_repo.is_seen(row["protocolNo"]) for row in feed.rows)
+
+
+# ==== FAST boundary: a quiet page plus FAST_LOOKAHEAD_PAGES more (mirrors
+# tests/test_georgia_public_feed_job.py). Only run() and the fakes are used,
+# so the same tests hold for the shared traversal of PR #57 once it is
+# rebased onto this change — and fail if the old "second page with a seen
+# row" stop comes back. Protocol numbers are synthetic. ====
+
+_COLLECTOR_LOGGER = "reader.georgia_collector.collector_job"
+
+
+def _receipts(series: str, first: int, count: int, *, publish_date: str = "2026-10-22") -> list[dict]:
+    """count synthetic receipts of one protocol series ('ავ' or 'კვ'),
+    numbers descending from first; their plates are never monitored."""
+    return [
+        _entry(protocol_no=f"{series}{first - i:09d}", plate=f"ZZ{i % 1000:03d}ZZ", publish_date=publish_date)
+        for i in range(count)
+    ]
+
+
+def _receipt_match(series: str, number: int, *, publish_date: str = "2026-10-22") -> dict:
+    return _entry(protocol_no=f"{series}{number:09d}", plate="AA001AA", publish_date=publish_date)
+
+
+def _feed_pages(rows: list[dict]) -> dict[int, dict]:
+    """rows (newest first) as police.ge pages of 30; data.count = all rows."""
+    return {
+        offset: {"success": True, "data": {"count": len(rows), "results": rows[offset:offset + 30]}}
+        for offset in range(0, len(rows), 30)
+    }
+
+
+def _protocols(rows: list[dict]) -> list[str]:
+    return [row["protocolNo"] for row in rows]
+
+
+def _poll_fields(caplog) -> dict[str, str]:
+    """key=value fields of the job's last "feed poll finished" line."""
+    lines = [
+        record.getMessage() for record in caplog.records
+        if record.name == _COLLECTOR_LOGGER and "finished: pages=" in record.getMessage()
+    ]
+    assert lines, "no feed poll finished line"
+    return dict(re.findall(r"(\w+)=([^,\s]+)", lines[-1]))
+
+
+def _counters(caplog) -> dict[str, int]:
+    fields = _poll_fields(caplog)
+    return {key: int(fields[key]) for key in ("new_rows", "seen_among_new", "quiet_pages", "lookahead_new")}
+
+
+def _fast_job_over(tmp_path, rows, old_rows, production, **kwargs):
+    """A job whose next cycle is FAST over a fixed feed: the last success at
+    15:00 Tbilisi saw old_rows."""
+    session = _FakeSession(_feed_pages(rows))
+    job, feed_state_repo, seen_repo, _outbox = _make_job(tmp_path, session, production, **kwargs)
+    feed_state_repo.record_successful_cycle(newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15))
+    _mark_seen_at(seen_repo, old_rows, seen_at=_utc(15))
+    return job, session, feed_state_repo, seen_repo
+
+
+def _old_rows_on_two_pages_above_the_boundary(old: list[dict], new: list[dict]) -> list[dict]:
+    """95 new rows: re-shown old rows above new ones on pages 0 and 1, all-new
+    page 2, the boundary on page 3 (7 new rows), quiet pages from page 4."""
+    assert len(new) == 95
+    return (
+        new[0:10] + old[:1] + new[10:29]
+        + new[29:49] + old[1:2] + new[49:58]
+        + new[58:88]
+        + new[88:95] + old[2:25]
+        + old[25:]
+    )
+
+
+class _CountingLiveFeed(_LiveFeed):
+    """_LiveFeed whose data.count is the whole list when the request comes,
+    as on police.ge (page-0 probe, 19.11: count = all published rows)."""
+
+    async def fetch_published_protocols(self, *, first_result: int) -> dict:
+        total = len(self.rows)
+        page = await super().fetch_published_protocols(first_result=first_result)
+        page["data"]["count"] = total
+        return page
+
+
+async def _first_run(tmp_path, production, feed):
+    """Successful DEEP first run at 09:00 over today's 150 'old' rows (and a
+    page of yesterday's): every later cycle in these tests is FAST."""
+    job, feed_state_repo, seen_repo, _outbox = _make_job(tmp_path, feed, production, first_run_max_pages=10)
+    await job.run(_utc(9))
+    assert feed_state_repo.get().last_error is None
+    feed.requested_offsets.clear()
+    return job, feed_state_repo, seen_repo
+
+
+def _old_feed_rows() -> tuple[list[dict], list[dict]]:
+    return _receipts("ავ", 5999, 150), _receipts("ავ", 3999, 30, publish_date="2026-10-21")
+
+
+def test_fast_lookahead_is_two_pages_by_default():
+    """K = 2 (the data is in FAST_LOOKAHEAD_PAGES' docstring); the scenarios
+    below pin it in behaviour: rows on the 1st and 2nd page below the quiet
+    page are read, rows on the 3rd are not."""
+    assert FAST_LOOKAHEAD_PAGES == 2
+    assert load_fast_lookahead_pages(env={}) == 2
+
+
+@pytest.mark.parametrize("lookahead, max_pages, first_run, valid", [
+    (0, 30, 100, False), (1, 2, 100, True), (2, 3, 100, True), (3, 3, 100, False), (4, 3, 100, False),
+    (2, 30, 2, False), (2, 30, 3, True),
+])
+def test_collector_job_takes_a_lookahead_from_one_to_below_the_page_cap(
+    tmp_path, lookahead, max_pages, first_run, valid,
+):
+    """K < 1 makes no look-ahead; K at or above either page cap makes every
+    cycle of that kind end at the cap (FAST and DEEP both read K more pages)."""
+    db_path = tmp_path / "collector.db"
+
+    def build():
+        return GeorgiaCollectorJob(
+            _FakeSession(), _FakeProductionClient(), GeorgiaPublicFeedStateRepository(db_path),
+            GeorgiaPublicFeedSeenRepository(db_path), CollectorOutboxRepository(db_path),
+            run_times=_DEFAULT_RUN_TIMES, tz=_TBILISI,
+            max_pages_per_cycle=max_pages, first_run_max_pages=first_run, fast_lookahead_pages=lookahead,
+        )
+
+    if valid:
+        build()
+    else:
+        with pytest.raises(ValueError):
+            build()
+
+
+@pytest.mark.parametrize("old_on_page0", [1, 3], ids=["one_old_row", "several_old_rows"])
+async def test_fast_reads_past_old_rows_shown_among_new_rows(tmp_path, caplog, old_on_page0):
+    """Old rows re-shown among new ones on a page (a re-published receipt —
+    production, 19.11), one or several: FAST does not stop there; it reads to
+    the real boundary, a quiet page and two look-ahead pages, and counts the
+    old rows that stood above new ones (not the boundary page's old tail)."""
+    caplog.set_level(logging.INFO, logger=_COLLECTOR_LOGGER)
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    old = _receipts("ავ", 5999, 150)
+    on_page0 = 30 - old_on_page0
+    new = _receipts("ავ", 9999, on_page0 + 40)
+    new[on_page0 + 15] = _receipt_match("ავ", 9000)   # page 1
+    new[on_page0 + 35] = _receipt_match("კვ", 120)    # page 2, the boundary
+    if old_on_page0 == 1:
+        page0 = new[:10] + old[:1] + new[10:on_page0]
+    else:
+        page0 = new[:5] + old[:1] + new[5:8] + old[1:3] + new[8:on_page0]
+    rows = page0 + new[on_page0:] + old[old_on_page0:]
+    job, session, feed_state_repo, _seen = _fast_job_over(tmp_path, rows, old, production)
+
+    await job.run(_utc(21))
+
+    # page 0 (old rows among new), page 1 (new), page 2 (10 new + the
+    # boundary), pages 3–5: the quiet page and two look-ahead pages.
+    assert session.requested_offsets == [0, 30, 60, 90, 120, 150]
+    assert sorted(_submitted(production)) == ["ავ000009000", "კვ000000120"]
+    assert _counters(caplog) == {
+        "new_rows": on_page0 + 40, "seen_among_new": old_on_page0, "quiet_pages": 3, "lookahead_new": 0,
+    }
+    assert feed_state_repo.get().last_error is None
+
+
+async def test_fast_does_not_stop_on_old_rows_on_two_pages_above_the_real_boundary(tmp_path, caplog):
+    """The case the old rule lost rows in: re-shown old rows on two different
+    pages above the real boundary. The old "second page with a seen row" stop
+    ended on page 1 and pages 2–3 were never read, now or later. FAST now
+    reads to the boundary and its look-ahead; each match is submitted once."""
+    caplog.set_level(logging.INFO, logger=_COLLECTOR_LOGGER)
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    old = _receipts("ავ", 5999, 150)
+    new = _receipts("ავ", 9999, 95)
+    new[70] = _receipt_match("ავ", 9100)   # page 2
+    new[90] = _receipt_match("კვ", 130)    # page 3, the boundary
+    rows = _old_rows_on_two_pages_above_the_boundary(old, new)
+    job, session, feed_state_repo, seen_repo = _fast_job_over(tmp_path, rows, old, production)
+
+    await job.run(_utc(21))
+
+    assert session.requested_offsets == [0, 30, 60, 90, 120, 150, 180]
+    assert sorted(_submitted(production)) == ["ავ000009100", "კვ000000130"]
+    assert _counters(caplog) == {"new_rows": 95, "seen_among_new": 2, "quiet_pages": 3, "lookahead_new": 0}
+    assert all(seen_repo.is_seen(p) for p in _protocols(new))
+    assert feed_state_repo.get().last_error is None
+
+    # The next cycle: 30 new rows on top, then the pages read above are quiet.
+    session2 = _FakeSession(_feed_pages(_receipts("ავ", 19999, 30) + rows))
+    job2, *_ = _make_job(tmp_path, session2, production)
+    await job2.run(_utc(23, 55))
+    assert session2.requested_offsets == [0, 30, 60, 90]
+    assert sorted(_submitted(production)) == ["ავ000009100", "კვ000000130"]
+
+
+@pytest.mark.parametrize("lookahead_page", [1, 2])
+async def test_fast_reads_rows_inserted_within_the_lookahead_below_a_quiet_page(tmp_path, caplog, lookahead_page):
+    """New rows below a fully old (quiet) page, on the first or the second
+    look-ahead page: FAST resets, reads them (and their match) and stops only
+    after a new quiet page and two look-ahead pages. lookahead_new counts
+    them — the evidence of an insertion below a boundary."""
+    caplog.set_level(logging.INFO, logger=_COLLECTOR_LOGGER)
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    old = _receipts("ავ", 5999, 240)
+    new = _receipts("ავ", 9999, 12)
+    inserted = [_receipt_match("ავ", 1999)] + _receipts("კვ", 199, 2)
+    at = 28 + 30 * lookahead_page   # 10 rows into the look-ahead page
+    rows = new + old[:at] + inserted + old[at:]
+    job, session, feed_state_repo, seen_repo = _fast_job_over(tmp_path, rows, old, production)
+
+    await job.run(_utc(21))
+
+    # page 0: new rows + the boundary; page 1 quiet; the look-ahead page with
+    # the inserted rows resets; then a quiet page and two look-ahead pages.
+    assert session.requested_offsets == [i * 30 for i in range(lookahead_page + 5)]
+    assert _submitted(production) == ["ავ000001999"]
+    assert all(seen_repo.is_seen(p) for p in _protocols(inserted))
+    assert _counters(caplog) == {
+        "new_rows": 15, "seen_among_new": 10, "quiet_pages": lookahead_page + 3, "lookahead_new": 3,
+    }
+    assert feed_state_repo.get().last_error is None
+
+
+async def test_fast_stops_two_pages_below_a_quiet_page_and_misses_rows_inserted_further_down(tmp_path, caplog):
+    """Documented limitation: new rows inserted more than two look-ahead
+    pages below the first quiet page are not read, by this cycle or later
+    ones. Not observed in production (the feed is ordered by publication);
+    the count diagnostic would show it — page 0's data.count grows by more
+    than the new rows read. Nothing in the log names a receipt or a plate."""
+    caplog.set_level(logging.INFO, logger=_COLLECTOR_LOGGER)
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    old, yesterday = _old_feed_rows()
+    feed = _CountingLiveFeed(old + yesterday)
+    job, feed_state_repo, seen_repo = await _first_run(tmp_path, production, feed)
+    assert (_poll_fields(caplog)["reported_count"], _poll_fields(caplog)["reported_count_delta"]) == ("180", "n/a")
+
+    feed.publish(_receipts("ავ", 9999, 12))
+    inserted = [_receipt_match("ავ", 1999)] + _receipts("კვ", 199, 2)
+    feed.rows[130:130] = inserted   # page 4: below the quiet page 1 and look-ahead pages 2–3
+    await job.run(_utc(15))   # the same job object, as in production
+
+    assert feed.requested_offsets == [0, 30, 60, 90]
+    assert _submitted(production) == []
+    assert not any(seen_repo.is_seen(p) for p in _protocols(inserted))
+    state = feed_state_repo.get()
+    assert (state.last_error, state.last_successful_poll_at) == (None, _utc(15))
+    assert _counters(caplog) == {"new_rows": 12, "seen_among_new": 0, "quiet_pages": 3, "lookahead_new": 0}
+    # 15 rows more since the previous cycle's page 0, 12 of them read: 3 out of reach.
+    assert (_poll_fields(caplog)["reported_count"], _poll_fields(caplog)["reported_count_delta"]) == ("195", "+15")
+
+    feed.publish(_receipts("ავ", 19999, 30))
+    feed.requested_offsets.clear()
+    await job.run(_utc(21))
+
+    assert feed.requested_offsets == [0, 30, 60, 90]
+    assert not any(seen_repo.is_seen(p) for p in _protocols(inserted))
+    assert _submitted(production) == []
+    fields = _poll_fields(caplog)
+    assert (fields["new_rows"], fields["reported_count"], fields["reported_count_delta"]) == ("30", "225", "+30")
+    named = set(_protocols(feed.rows)) | {row["protocolAuto"] for row in feed.rows}
+    assert not [
+        record for record in caplog.records
+        if record.name == _COLLECTOR_LOGGER and any(value in record.getMessage() for value in named)
+    ]
+
+
+async def test_old_receipt_re_shown_among_new_rows_is_not_processed_again(tmp_path, caplog):
+    """A receipt an earlier cycle saw (and submitted) is re-shown on top
+    among new rows (re-publication or update): it is not submitted again, it
+    is counted in seen_among_new, and FAST reads on to the boundary and the
+    new match next to it."""
+    caplog.set_level(logging.INFO, logger=_COLLECTOR_LOGGER)
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    old, yesterday = _old_feed_rows()
+    old[40] = _receipt_match("ავ", 5000)
+    feed = _LiveFeed(old + yesterday)
+    job, _feed_state, seen_repo = await _first_run(tmp_path, production, feed)
+    assert _submitted(production) == ["ავ000005000"]
+
+    new = _receipts("ავ", 9999, 50)
+    new[45] = _receipt_match("ავ", 9500)   # page 1
+    feed.rows.remove(old[40])
+    feed.publish(new[:7] + [old[40]] + new[7:])
+    await job.run(_utc(15))
+
+    # page 0: 29 new rows + the re-shown receipt; page 1: 21 new + the
+    # boundary; pages 2–4: the quiet page and two look-ahead pages.
+    assert feed.requested_offsets == [0, 30, 60, 90, 120]
+    assert _submitted(production) == ["ავ000005000", "ავ000009500"]
+    assert _counters(caplog) == {"new_rows": 50, "seen_among_new": 1, "quiet_pages": 3, "lookahead_new": 0}
+    assert all(seen_repo.is_seen(p) for p in _protocols(feed.rows))
+
+
+async def test_rows_a_burst_re_shows_in_the_same_cycle_are_not_processed_twice_or_quiet(tmp_path, caplog):
+    """90 rows published after the 4th page re-show three pages this cycle
+    has read: the same receipts (one of them a match) come twice in one
+    cycle. They are not submitted twice and not counted as seen before, so
+    those three pages are not a quiet page plus look-ahead: FAST reads on to
+    the new rows below them (another match) and the real boundary."""
+    caplog.set_level(logging.INFO, logger=_COLLECTOR_LOGGER)
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    old, yesterday = _old_feed_rows()
+    feed = _LiveFeed(old + yesterday)
+    job, _feed_state, seen_repo = await _first_run(tmp_path, production, feed)
+
+    new = _receipts("ავ", 9999, 150)
+    new[45] = _receipt_match("ავ", 9500)   # page 1, re-shown on page 5
+    new[130] = _receipt_match("კვ", 150)   # page 7, below the re-shown pages
+    feed.publish(new)
+    feed.publish_after_requests(4, _receipts("ავ", 19999, 90))
+    await job.run(_utc(15))
+
+    # pages 0–3 new; the burst re-shows new[30:120] on pages 4–6; page 7 new;
+    # pages 8–10: the quiet page and two look-ahead pages.
+    assert feed.requested_offsets == [i * 30 for i in range(11)]
+    assert sorted(_submitted(production)) == ["ავ000009500", "კვ000000150"]
+    assert _counters(caplog) == {"new_rows": 150, "seen_among_new": 0, "quiet_pages": 3, "lookahead_new": 0}
+
+    # The burst on top is read by the next cycle; every receipt exactly once.
+    feed.requested_offsets.clear()
+    await job.run(_utc(21))
+    assert feed.requested_offsets == [0, 30, 60, 90, 120, 150]
+    assert all(seen_repo.is_seen(p) for p in _protocols(feed.rows))
+    assert sorted(_submitted(production)) == ["ავ000009500", "კვ000000150"]
+
+
+async def test_a_burst_during_the_lookahead_does_not_use_it_up(tmp_path, caplog):
+    """60 rows published right after the first quiet page shift the list by
+    two pages: the next two pages re-show rows this cycle has already read
+    (its new rows, the boundary, the quiet page). They are not look-ahead
+    pages — FAST still reads two fresh pages below the quiet page and finds
+    the rows inserted there."""
+    caplog.set_level(logging.INFO, logger=_COLLECTOR_LOGGER)
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    old, yesterday = _old_feed_rows()
+    feed = _LiveFeed(old + yesterday)
+    job, _feed_state, seen_repo = await _first_run(tmp_path, production, feed)
+
+    feed.publish(_receipts("ავ", 9999, 12))
+    inserted = [_receipt_match("ავ", 1999)] + _receipts("კვ", 199, 2)
+    feed.rows[102:102] = inserted   # the second look-ahead page, before the burst
+    feed.publish_after_requests(2, _receipts("ავ", 19999, 60))
+    await job.run(_utc(15))
+
+    # page 0: new rows + the boundary; page 1 quiet; pages 2–3 re-show pages
+    # 0–1; page 4 look-ahead; page 5 the inserted rows (reset); pages 6–8.
+    assert feed.requested_offsets == [i * 30 for i in range(9)]
+    assert _submitted(production) == ["ავ000001999"]
+    assert _counters(caplog) == {"new_rows": 15, "seen_among_new": 12, "quiet_pages": 5, "lookahead_new": 3}
+    assert all(seen_repo.is_seen(p) for p in _protocols(inserted))
+
+
+@pytest.mark.parametrize(
+    "kill_at, pages_read", [(120, 4), (210, 7)], ids=["above_the_boundary", "in_the_lookahead"],
+)
+async def test_fast_killed_mid_cycle_is_followed_by_a_deep_recovery_that_loses_nothing(
+    tmp_path, kill_at, pages_read,
+):
+    """A FAST cycle killed (CancelledError) while reading new rows between
+    re-shown old rows and the boundary, or during its look-ahead: the
+    "cycle in progress" marker stays and no success is recorded. The
+    restarted job runs DEEP recovery: it reads through the pages the killed
+    attempt marked (for FAST they would be quiet pages) down to rows the last
+    success had seen, and every match is submitted exactly once."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    old = _receipts("ავ", 5999, 150)
+    new = _receipts("ავ", 9999, 155)
+    new[130] = _receipt_match("ავ", 9300)   # page 4
+    rows = (
+        new[0:10] + old[:1] + new[10:29]
+        + new[29:49] + old[1:2] + new[49:58]
+        + new[58:148]                          # pages 2–4
+        + new[148:155] + old[2:25]             # page 5: the boundary
+        + old[25:]                             # pages 6–...: quiet
+    )
+    session = _FakeSession(_feed_pages(rows), errors={kill_at: asyncio.CancelledError()})
+    job, feed_state_repo, seen_repo, _outbox = _make_job(tmp_path, session, production)
+    feed_state_repo.record_successful_cycle(newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15))
+    _mark_seen_at(seen_repo, old, seen_at=_utc(15))
+
+    with pytest.raises(asyncio.CancelledError):
+        await job.run(_utc(21))
+    assert len(session.requested_offsets) == pages_read + 1
+    state = feed_state_repo.get()
+    assert state.last_error.startswith("cycle in progress")
+    assert state.last_successful_poll_at == _utc(15)
+
+    top = _receipts("ავ", 19999, 30)
+    top[3] = _receipt_match("კვ", 160)
+    recovery = _FakeSession(_feed_pages(top + rows))
+    job2, feed_state_repo2, *_ = _make_job(tmp_path, recovery, production)   # restart
+    await job2.run(_utc(23, 55))
+
+    # DEEP reads down to the first page of rows the last success had seen
+    # (offset 210) and its two look-ahead pages, and stops there (270); FAST
+    # would have stopped on the killed attempt's pages (offset 90). Only the
+    # end is pinned: how a recovery crosses pages an earlier attempt read is
+    # not this rule's business.
+    assert recovery.requested_offsets[-1] == max(recovery.requested_offsets) == 270
+    assert sorted(_submitted(production)) == ["ავ000009300", "კვ000000160"]
+    assert all(seen_repo.is_seen(p) for p in _protocols(top + new))
+    state = feed_state_repo2.get()
+    assert (state.last_error, state.last_successful_poll_at) == (None, _utc(23, 55))
+
+
+async def test_fast_cap_before_the_boundary_is_an_error_and_the_next_cycle_reads_the_rest(tmp_path):
+    """Re-shown old rows on pages 0 and 1 and a cap of 3 pages: the old rule
+    declared success on page 1 and never read below. Now the cap comes
+    first — an error, no success recorded, nothing stored that makes the
+    next cycle skip rows — and the next cycle (DEEP) reads from the top
+    through the capped attempt's rows to the boundary."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    old = _receipts("ავ", 5999, 150)
+    new = _receipts("ავ", 9999, 95)
+    new[70] = _receipt_match("ავ", 9100)   # page 2
+    new[90] = _receipt_match("კვ", 130)    # page 3, the boundary
+    rows = _old_rows_on_two_pages_above_the_boundary(old, new)
+    job, session, feed_state_repo, seen_repo = _fast_job_over(
+        tmp_path, rows, old, production, max_pages_per_cycle=3,
+    )
+
+    await job.run(_utc(21))
+
+    assert session.requested_offsets == [0, 30, 60]
+    state = feed_state_repo.get()
+    assert (state.last_successful_poll_at, state.newest_seen_publish_date) == (_utc(15), date(2026, 10, 22))
+    assert state.last_error.startswith("safety cap of 3 pages reached before the frontier (already-seen rows)")
+    assert "GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE" in state.last_error
+    assert _submitted(production) == ["ავ000009100"]
+
+    session2 = _FakeSession(_feed_pages(rows))
+    job2, feed_state_repo2, *_ = _make_job(tmp_path, session2, production)
+    await job2.run(_utc(23, 55))
+
+    # DEEP ends two look-ahead pages after the first page of rows the last
+    # success had seen (120): on 180.
+    assert session2.requested_offsets[-1] == max(session2.requested_offsets) == 180
+    assert sorted(_submitted(production)) == ["ავ000009100", "კვ000000130"]
+    assert all(seen_repo.is_seen(p) for p in _protocols(new))
+    state = feed_state_repo2.get()
+    assert (state.last_error, state.last_successful_poll_at) == (None, _utc(23, 55))
+
+
+async def test_fast_cap_during_the_lookahead_is_an_error_not_a_success(tmp_path):
+    """The cap ends the cycle after the first quiet page, before the
+    look-ahead is complete: the boundary is not confirmed, so no success is
+    recorded and the error names the look-ahead. The next cycle runs DEEP:
+    the capped attempt's rows are not covered by the last success, so it
+    reads them again (with the rows published since) and stops at rows the
+    last success had seen."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    old = _receipts("ავ", 5999, 150)
+    new = _receipts("ავ", 9999, 12)
+    new[4] = _receipt_match("ავ", 9400)
+    rows = new + old
+    job, session, feed_state_repo, seen_repo = _fast_job_over(
+        tmp_path, rows, old, production, max_pages_per_cycle=3,
+    )
+
+    await job.run(_utc(21))
+
+    assert session.requested_offsets == [0, 30, 60]
+    state = feed_state_repo.get()
+    assert (state.last_successful_poll_at, state.newest_seen_publish_date) == (_utc(15), date(2026, 10, 22))
+    assert state.last_error.startswith(
+        "safety cap of 3 pages reached before the frontier was confirmed "
+        "(look-ahead: 1 of 2 pages read after a page without new rows)"
+    )
+    assert "GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE" in state.last_error
+    assert _submitted(production) == ["ავ000009400"]
+
+    top = _receipts("ავ", 19999, 30)
+    top[7] = _receipt_match("კვ", 170)
+    session2 = _FakeSession(_feed_pages(top + rows))
+    job2, feed_state_repo2, *_ = _make_job(tmp_path, session2, production)
+    await job2.run(_utc(23, 55))
+
+    # DEEP: the new rows on top, the capped attempt's page (not covered by
+    # the last success), the first page the last success covered (60) and
+    # its two look-ahead pages (120); FAST would have stopped on 90.
+    assert session2.requested_offsets[-1] == max(session2.requested_offsets) == 120
+    assert sorted(_submitted(production)) == ["ავ000009400", "კვ000000170"]
+    assert all(seen_repo.is_seen(p) for p in _protocols(top + new))
+    state = feed_state_repo2.get()
+    assert (state.last_error, state.last_successful_poll_at) == (None, _utc(23, 55))
+
+
+@pytest.mark.parametrize("setting, read", [("1", False), ("3", True)])
+async def test_lookahead_setting_sets_how_far_below_the_quiet_page_fast_reads(tmp_path, setting, read):
+    """GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES: rows inserted on the second
+    page below the first quiet page are read with K = 3, not with K = 1."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    old = _receipts("ავ", 5999, 240)
+    rows = _receipts("ავ", 9999, 12) + old[:88] + [_receipt_match("ავ", 1999)] + old[88:]
+    db_path = tmp_path / "collector.db"
+    feed_state_repo = GeorgiaPublicFeedStateRepository(db_path)
+    seen_repo = GeorgiaPublicFeedSeenRepository(db_path)
+    job = GeorgiaCollectorJob(
+        _FakeSession(_feed_pages(rows)), production, feed_state_repo, seen_repo, CollectorOutboxRepository(db_path),
+        run_times=_DEFAULT_RUN_TIMES, tz=_TBILISI,
+        fast_lookahead_pages=load_fast_lookahead_pages(env={"GEORGIA_COLLECTOR_FAST_LOOKAHEAD_PAGES": setting}),
+    )
+    feed_state_repo.record_successful_cycle(newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15))
+    _mark_seen_at(seen_repo, old, seen_at=_utc(15))
+
+    await job.run(_utc(21))
+
+    assert seen_repo.is_seen("ავ000001999") is read
+    assert _submitted(production) == (["ავ000001999"] if read else [])
+    assert feed_state_repo.get().last_error is None
+
+
+# ==== false-success guards: an empty or short page before data.count, and
+# the DEEP horizon look-ahead (mirrors tests/test_georgia_public_feed_job.py) ====
+
+
+def _raw_page(rows: list[dict], *, count: int | None) -> dict:
+    """A police.ge page with the given data.count (None: no count at all)."""
+    data: dict = {"results": rows}
+    if count is not None:
+        data["count"] = count
+    return {"success": True, "data": data}
+
+
+def _job_over_pages(tmp_path, pages, old_rows, production, *, deep, **kwargs):
+    """A job over fixed pages: the last success at 15:00 saw old_rows; with
+    deep, a later attempt failed at 17:00, so the next cycle is DEEP."""
+    session = _FakeSession(pages)
+    job, feed_state_repo, seen_repo, _outbox = _make_job(tmp_path, session, production, **kwargs)
+    feed_state_repo.record_successful_cycle(newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15))
+    _mark_seen_at(seen_repo, old_rows, seen_at=_utc(15))
+    if deep:
+        feed_state_repo.record_error("ConnectTimeout", at=_utc(17))
+    return job, session, feed_state_repo, seen_repo
+
+
+@pytest.mark.parametrize("deep", [False, True], ids=["fast", "deep"])
+@pytest.mark.parametrize("rows_on_page", [0, 20], ids=["empty_page", "short_page"])
+@pytest.mark.parametrize("bad_count", ["total", "zero"])
+async def test_an_incomplete_page_before_the_end_of_the_list_is_an_error_not_the_end(
+    tmp_path, deep, rows_on_page, bad_count,
+):
+    """A transient {success: true, results: []} — or a short page — in the
+    middle of the list (data.count says there is more): not the end of the
+    list but an error, also when that page itself reports count 0 (the
+    largest count of the cycle decides). No success is recorded, and the
+    next cycle (DEEP)
+    reads the rows below it, the match among them included."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    old = _receipts("ავ", 5999, 150)
+    new = _receipts("ავ", 9999, 90)
+    new[65] = _receipt_match("კვ", 190)   # page 2
+    rows = new + old
+    pages = _feed_pages(rows)
+    pages[60] = _raw_page(new[60:60 + rows_on_page], count=len(rows) if bad_count == "total" else 0)
+    job, session, feed_state_repo, seen_repo = _job_over_pages(tmp_path, pages, old, production, deep=deep)
+
+    await job.run(_utc(21))
+
+    assert session.requested_offsets == [0, 30, 60]
+    state = feed_state_repo.get()
+    assert state.last_successful_poll_at == _utc(15)
+    page = "an empty page" if rows_on_page == 0 else "20 of 30 rows"
+    assert state.last_error.startswith(f"police.ge returned {page} at offset 60, although the list reports 240 rows")
+    assert _submitted(production) == []
+
+    session2 = _FakeSession(_feed_pages(rows))
+    job2, feed_state_repo2, *_ = _make_job(tmp_path, session2, production)
+    await job2.run(_utc(23, 55))
+
+    assert session2.requested_offsets[-1] == max(session2.requested_offsets) == 150
+    assert _submitted(production) == ["კვ000000190"]
+    assert all(seen_repo.is_seen(p) for p in _protocols(new))
+    assert (feed_state_repo2.get().last_error, feed_state_repo2.get().last_successful_poll_at) == (None, _utc(23, 55))
+
+
+@pytest.mark.parametrize("deep", [False, True], ids=["fast", "first_run"])
+async def test_the_real_end_of_the_list_still_ends_the_traversal_as_a_success(tmp_path, deep):
+    """A short last page and an empty page at data.count are the real end of
+    the list: the cycle succeeds there (before its look-ahead completes)."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    if deep:
+        rows = _receipts("ავ", 9999, 45)   # a first run over today's rows only
+        session = _FakeSession({**_feed_pages(rows), 60: _raw_page([], count=len(rows))})
+        job, feed_state_repo, *_ = _make_job(tmp_path, session, production, first_run_max_pages=10)
+    else:
+        old = _receipts("ავ", 5999, 40)
+        rows = _receipts("ავ", 9999, 12) + old
+        job, session, feed_state_repo, _seen = _job_over_pages(
+            tmp_path, {**_feed_pages(rows), 60: _raw_page([], count=len(rows))}, old, production, deep=False,
+        )
+
+    await job.run(_utc(21))
+
+    assert session.requested_offsets == [0, 30, 60]
+    state = feed_state_repo.get()
+    assert (state.last_error, state.last_successful_poll_at) == (None, _utc(21))
+
+
+async def test_without_data_count_an_empty_page_still_ends_the_list_with_a_warning(tmp_path, caplog):
+    """No data.count from police.ge: an empty page cannot be told from the
+    real end, so it ends the traversal as before — with a warning that
+    carries no numbers."""
+    caplog.set_level(logging.WARNING, logger=_COLLECTOR_LOGGER)
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    old = _receipts("ავ", 5999, 18)
+    rows = _receipts("ავ", 9999, 12) + old
+    job, session, feed_state_repo, _seen = _job_over_pages(
+        tmp_path, {0: _raw_page(rows, count=None), 30: _raw_page([], count=None)}, old, production, deep=False,
+    )
+
+    await job.run(_utc(21))
+
+    assert session.requested_offsets == [0, 30]
+    assert (feed_state_repo.get().last_error, feed_state_repo.get().last_successful_poll_at) == (None, _utc(21))
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and "data.count" in r.getMessage()]
+    assert len(warnings) == 1
+    assert not re.search(r"\d", warnings[0])
+
+
+@pytest.mark.parametrize("pages, offset, reported", [
+    # The list grew during the traversal: the largest count decides, not page 0's.
+    ({0: 60, 30: 90, 60: 120}, 60, 120),
+    # The empty page carries no count: the latest earlier one is used.
+    ({0: 300, 30: None}, 30, 300),
+], ids=["grown_count", "earlier_count"])
+async def test_the_largest_data_count_decides_whether_a_page_ends_the_list(tmp_path, pages, offset, reported):
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    new = _receipts("ავ", 9999, 60)
+    raw_pages = {
+        first: _raw_page(new[first:first + 30] if first < offset else [], count=count)
+        for first, count in pages.items()
+    }
+    job, session, feed_state_repo, _seen = _job_over_pages(tmp_path, raw_pages, [], production, deep=False)
+
+    await job.run(_utc(21))
+
+    assert session.requested_offsets[-1] == offset
+    state = feed_state_repo.get()
+    assert state.last_successful_poll_at == _utc(15)
+    assert state.last_error.startswith(
+        f"police.ge returned an empty page at offset {offset}, although the list reports {reported} rows"
+    )
+
+
+@pytest.mark.parametrize("block", [30, 60])
+async def test_deep_reads_past_a_block_of_re_shown_old_rows(tmp_path, block):
+    """A block of old receipts re-shown on top fills whole pages that DEEP's
+    horizon accepts. One (or two) such pages no longer end the recovery: the
+    new rows below the block are read (with their match), and DEEP stops only
+    after 1 + K pages of processed rows."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    old = _receipts("ავ", 5999, 240)
+    below = _receipts("ავ", 8999, 30)
+    below[10] = _receipt_match("კვ", 180)
+    rows = _receipts("ავ", 9999, 30) + old[:block] + below + old[block:]
+    job, session, feed_state_repo, seen_repo = _job_over_pages(
+        tmp_path, _feed_pages(rows), old, production, deep=True,
+    )
+
+    await job.run(_utc(21))
+
+    # page 0 new; the block (1 or 2 pages); the new rows below it; then 3
+    # pages of processed rows.
+    assert session.requested_offsets == [i * 30 for i in range(block // 30 + 5)]
+    assert _submitted(production) == ["კვ000000180"]
+    assert all(seen_repo.is_seen(p) for p in _protocols(below))
+    assert (feed_state_repo.get().last_error, feed_state_repo.get().last_successful_poll_at) == (None, _utc(21))
+
+
+async def test_deep_cap_during_the_lookahead_is_an_error_not_a_success(tmp_path):
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    old = _receipts("ავ", 5999, 150)
+    rows = _receipts("ავ", 9999, 30) + old
+    job, session, feed_state_repo, _seen = _job_over_pages(
+        tmp_path, _feed_pages(rows), old, production, deep=True, max_pages_per_cycle=3,
+    )
+
+    await job.run(_utc(21))
+
+    assert session.requested_offsets == [0, 30, 60]
+    state = feed_state_repo.get()
+    assert state.last_successful_poll_at == _utc(15)
+    assert state.last_error.startswith(
+        "recovery reached rows covered by the last successful cycle, but the safety cap of 3 pages came "
+        "during the look-ahead (look-ahead: 1 of 2 pages read)"
+    )
+    assert "GEORGIA_COLLECTOR_MAX_PAGES_PER_CYCLE" in state.last_error
+
+    session2 = _FakeSession(_feed_pages(rows))
+    job2, feed_state_repo2, *_ = _make_job(tmp_path, session2, production)
+    await job2.run(_utc(23, 55))
+
+    # The capped attempt's page 0 is not covered by the last success (its rows
+    # were marked after it): then three processed pages, ending on 90.
+    assert session2.requested_offsets[-1] == max(session2.requested_offsets) == 90
+    assert feed_state_repo2.get().last_error is None
+
+
+async def test_first_run_reads_past_a_page_of_older_rows_followed_by_todays_rows(tmp_path):
+    """The first-run horizon (rows published before today) has the same
+    look-ahead: one page of yesterday's rows followed by today's rows (with a
+    match) does not end it; three pages of yesterday's rows in a row do."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    today = _receipts("ავ", 9999, 60)
+    today[45] = _receipt_match("კვ", 170)   # page 2
+    yesterday = _receipts("ავ", 5999, 120, publish_date="2026-10-21")
+    rows = today[:30] + yesterday[:30] + today[30:] + yesterday[30:]
+    session = _FakeSession(_feed_pages(rows))
+    job, feed_state_repo, *_ = _make_job(tmp_path, session, production, first_run_max_pages=10)
+
+    await job.run(_utc(21))
+
+    assert session.requested_offsets == [0, 30, 60, 90, 120, 150]
+    assert _submitted(production) == ["კვ000000170"]
+    assert feed_state_repo.get().last_successful_poll_at == _utc(21)
+
+
+async def test_first_run_cap_during_the_lookahead_is_an_error_not_a_success(tmp_path):
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    rows = _receipts("ავ", 9999, 30) + _receipts("ავ", 5999, 90, publish_date="2026-10-21")
+    session = _FakeSession(_feed_pages(rows))
+    job, feed_state_repo, *_ = _make_job(tmp_path, session, production, first_run_max_pages=3)
+
+    await job.run(_utc(21))
+
+    assert session.requested_offsets == [0, 30, 60]
+    state = feed_state_repo.get()
+    assert state.last_successful_poll_at is None
+    assert state.last_error.startswith(
+        "first-run catch-up: safety cap of 3 pages reached during the look-ahead after rows published "
+        "before today (look-ahead: 1 of 2 pages read)"
+    )
+    assert "GEORGIA_COLLECTOR_FIRST_RUN_MAX_PAGES" in state.last_error
+
+
+async def test_deep_burst_repeats_do_not_count_as_horizon_pages(tmp_path):
+    """30 rows published right after DEEP's first processed page re-show that
+    page: the repeat is neutral, so DEEP still reads two fresh processed pages
+    — and the rows inserted below them reset the look-ahead and are read."""
+    production = _FakeProductionClient(active_plates=["AA001AA"])
+    old, yesterday = _old_feed_rows()
+    inserted = [_receipt_match("ავ", 1999)] + _receipts("კვ", 199, 2)
+    feed = _CountingLiveFeed(_receipts("ავ", 9999, 12) + old[:90] + inserted + old[90:] + yesterday)
+    job, feed_state_repo, seen_repo, _outbox = _make_job(tmp_path, feed, production)
+    feed_state_repo.record_successful_cycle(newest_seen_publish_date=date(2026, 10, 22), polled_at=_utc(15))
+    _mark_seen_at(seen_repo, old + yesterday, seen_at=_utc(15))
+    feed_state_repo.record_error("ConnectTimeout", at=_utc(17))
+    feed.publish_after_requests(2, _receipts("ავ", 19999, 30))
+
+    await job.run(_utc(21))
+
+    # 0 new; 30 processed; 60 repeats 30 (neutral); 90 processed; 120 the
+    # inserted rows (reset); 150–210 three processed pages.
+    assert feed.requested_offsets == [i * 30 for i in range(8)]
+    assert _submitted(production) == ["ავ000001999"]
+    assert feed_state_repo.get().last_error is None
 
 
 class _SubmitFails(_FakeProductionClient):
