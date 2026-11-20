@@ -963,8 +963,9 @@ def format_debt_row(
         🔴 Неоплачено: N штрафов — X ₾  (🔴 и 🟡: всё, что не подтверждено оплаченным)
         🟡 Из них требуют проверки: M штрафов — Z ₾  (🟡 остаётся долгом)
         🟢 Оплачено: K штрафов — Y ₾  (ещё в базе полиции, в "Неоплачено" не входит)
-        ⏳ Ждут повторной проверки: L штрафов — W ₾  (не долг, см. DISPLAY_UNVERIFIED)
-    Машина только с 🟢 — одна строка 🟢, без строки 🔴. SnapshotDebt (число
+    ⏳ (неподтверждённые квитанции из истории) в основной статистике не
+    показываются вовсе: это не долг, и отдельно их не перепроверяют; они
+    видны только на экране "🧾 Статусы оплаты". Машина только с 🟢 — одна строка 🟢, без строки 🔴. SnapshotDebt (число
     штрафов неизвестно) — только сумма с пометкой, число не выдумывается.
     total_amount тогда не используется. Без статусов (breakdown None) —
     прежняя строка "💰 Задолженность" с суммой снимка: числа штрафов там
@@ -989,11 +990,6 @@ def format_debt_row(
             )
         if breakdown.paid_count:
             lines.append(f"🟢 Оплачено: {_format_fine_count_and_amount(breakdown.paid_count, breakdown.paid_amount)}")
-        if breakdown.unverified_count:
-            lines.append(
-                "⏳ Ждут повторной проверки: "
-                f"{_format_fine_count_and_amount(breakdown.unverified_count, breakdown.unverified_amount)}"
-            )
     if not owners:
         lines.append(DEBT_OWNER_NOT_LINKED_LINE)
     for owner in owners:
@@ -1051,7 +1047,9 @@ def format_debt_status_summary_block(
     🟡 — подмножество строки 🔴 ("Из них"), компактно: только число штрафов
     без суммы (их сумма уже внутри 🔴 и второй раз не прибавляется), и только
     когда оно больше нуля: при нуле строки нет вовсе. Суммы 🟡 остаются в
-    блоках машин и на экране "🧾 Статусы оплаты". 🟢 и ⏳ в 🔴 не входят."""
+    блоках машин и на экране "🧾 Статусы оплаты". 🟢 в 🔴 не входит. ⏳
+    (неподтверждённые квитанции из истории) здесь не показываются ни числом,
+    ни суммой: это не долг и не повод для отдельных запросов к police.ge."""
     debt_count = totals.unpaid_count + totals.needs_review_count
     debt_amount = totals.unpaid_amount + totals.needs_review_amount
     if debt_count_is_lower_bound:
@@ -1077,14 +1075,6 @@ def format_debt_status_summary_block(
         f"🟢 Оплачено, ещё в базе полиции: {_format_search_amount(totals.paid_amount)}"
         f" ({totals.paid_count} шт.)"
     )
-    if totals.unverified_count:
-        # Квитанции из истории, которых не было в последнем ответе police.ge
-        # до перехода на статусы: не долг и не ⚪, пока две новые проверки не
-        # решат (см. reader/fines/payment_status.py, 'unverified').
-        lines.append(
-            f"⏳ Ждут повторной проверки police.ge: {_format_search_amount(totals.unverified_amount)}"
-            f" ({totals.unverified_count} шт.)"
-        )
     if source_updated_on is not None:
         lines.append(f"🗓 База police.ge обновлена: {_fmt_date(source_updated_on)}")
     if recheck_line:

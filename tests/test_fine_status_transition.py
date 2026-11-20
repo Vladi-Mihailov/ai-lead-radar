@@ -242,8 +242,8 @@ async def test_statistics_keep_every_old_debt_and_show_history_separately(legacy
             for line in debt_lines
         ), (car, total)
     assert header_line == "🔴 Неоплачено: 5 штрафов — 340 ₾"  # 150 + 40 + 60 + 90 (feed)
-    # история — не долг и не ⚪, но видна отдельной строкой
-    assert "⏳ Ждут повторной проверки police.ge: 125 ₾ (3 шт.)" in text
+    # история — не долг и не ⚪, и в основной статистике её нет вовсе
+    assert not any(line.startswith("⏳") for line in text.splitlines())
     assert "BB" + "222" not in text.replace("*", "")  # машина только с историей — без строки долга
     repository.close()
 
