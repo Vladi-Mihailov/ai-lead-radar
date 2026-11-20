@@ -194,11 +194,13 @@ both page caps, max_pages_per_cycle and first_run_max_pages (the jobs
 refuse it otherwise, the collector already at start-up): every cycle would
 end at the cap.
 
-Expected one-off: right after a true first run that saw fewer than ~4
-pages (early in the day), the seen region is shallower than a quiet page
-plus K, so the next FAST cycle reads on into older rows no cycle has seen
-(they count as new) up to the page cap and records an error; the DEEP
-recovery after it completes normally."""
+Expected one-off: a true first run that finds its page 0 already older
+than today (no row published today yet) sees only 1 + K pages; shifted by
+the next cycle's new rows they can give one quiet page fewer than 1 + K, so
+that FAST cycle reads on into older rows no cycle has seen (they count as
+new) up to the page cap and records an error; the DEEP recovery after it
+completes normally. A first run that finds any row from today is not
+affected: it sees at least 2 + K pages."""
 
 # Отметка "цикл идёт" в georgia_public_feed_state.last_error (см. отметку
 # перед циклом страниц): если она осталась, цикл был прерван.
