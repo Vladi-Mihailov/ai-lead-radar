@@ -1473,8 +1473,8 @@ class ConversationController:
             elif breakdown.listed_count == 0:
                 # Ни долга, ни оплаченного в базе полиции по статусам,
                 # сверенным не раньше снимка: старый снимок долгом не
-                # считается. Квитанции ⏳ (ждут повторной проверки) —
-                # только в итоговой строке, без строки машины.
+                # считается. Квитанции ⏳ этой машины остаются только в
+                # итогах (на экран статистики они не выводятся).
                 totals = totals.add(DebtBreakdown(
                     unverified_amount=breakdown.unverified_amount,
                     unverified_count=breakdown.unverified_count,

@@ -473,7 +473,9 @@ async def test_car_with_only_gone_receipts_leaves_statistics_despite_old_snapsho
     assert "🔴 Неоплачено: 0 штрафов — 0 ₾" in reply.text
 
 
-async def test_unverified_history_is_shown_separately_not_as_debt(fx):
+async def test_unverified_history_is_not_in_the_main_statistics(fx):
+    """⏳ (квитанции из истории) — ни в заголовке, ни в блоке машины
+    основной статистики; видны только на экране «🧾 Статусы оплаты»."""
     task, _ = fx.car(_CAR, [("GE1", 50)])
     await fx.check(task)
     old = fx.tracker._repository.insert_listed(
@@ -488,8 +490,8 @@ async def test_unverified_history_is_shown_separately_not_as_debt(fx):
     screen = await _open_car(fx)
 
     assert stats.splitlines().count("🔴 Неоплачено: 1 штраф — 50 ₾") == 2  # заголовок и машина, без ⏳
-    assert "⏳ Ждут повторной проверки police.ge: 30 ₾ (1 шт.)" in stats
-    assert "⏳ Ждут повторной проверки: 1 штраф — 30 ₾" in stats  # строка в блоке машины
+    assert not any(line.startswith("⏳") for line in stats.splitlines())
+    assert "30 ₾" not in stats
     assert "№OLD1 — 30 ₾ — ⏳ Ждёт повторной проверки police.ge" in screen.text
 
 
@@ -1073,7 +1075,7 @@ def test_debt_row_never_mixes_paid_and_unpaid_sums():
 def test_debt_row_unverified_history_is_not_unpaid():
     lines = _debt_row_lines(DebtBreakdown(unpaid_amount=50, unpaid_count=1, unverified_amount=30, unverified_count=1))
 
-    assert lines[1:3] == ["🔴 Неоплачено: 1 штраф — 50 ₾", "⏳ Ждут повторной проверки: 1 штраф — 30 ₾"]
+    assert lines[1:] == ["🔴 Неоплачено: 1 штраф — 50 ₾", texts.DEBT_OWNER_NOT_LINKED_LINE]
 
 
 def test_debt_row_lines_keep_their_order_and_owners_stay_last():
@@ -1091,7 +1093,6 @@ def test_debt_row_lines_keep_their_order_and_owners_stay_last():
         "🔴 Неоплачено: 2 штрафа — 90 ₾",
         "🟡 Из них требуют проверки: 1 штраф — 40 ₾",
         "🟢 Оплачено: 1 штраф — 30 ₾",
-        "⏳ Ждут повторной проверки: 1 штраф — 20 ₾",
         "👤 Пользователь: Иван",
         "🔗 Telegram: @ivan_p",
         "👤 Пользователь: Имя не указано (уведомления выключены)",
@@ -1132,11 +1133,8 @@ def test_debt_row_uses_the_russian_plural_on_every_line(count, word):
     ))
     review_lines = _debt_row_lines(DebtBreakdown(needs_review_amount=40, needs_review_count=count))
 
-    assert lines[1:4] == [
-        f"🔴 Неоплачено: {count} {word} — 10 ₾",
-        f"🟢 Оплачено: {count} {word} — 20 ₾",
-        f"⏳ Ждут повторной проверки: {count} {word} — 30 ₾",
-    ]
+    assert lines[1:3] == [f"🔴 Неоплачено: {count} {word} — 10 ₾", f"🟢 Оплачено: {count} {word} — 20 ₾"]
+    assert not any(line.startswith("⏳") for line in lines)
     assert review_lines[1:3] == [
         f"🔴 Неоплачено: {count} {word} — 40 ₾", f"🟡 Из них требуют проверки: {count} {word} — 40 ₾",
     ]
@@ -1185,7 +1183,7 @@ async def test_unverified_only_and_gone_only_cars_stay_out_of_the_list(fx):
     assert format_plate_for_telegram("CC333DD") not in text
     assert "Автомобили со штрафами: 1" in text.splitlines()
     assert text.splitlines().count("🔴 Неоплачено: 1 штраф — 50 ₾") == 2  # заголовок и AA111BB
-    assert "⏳ Ждут повторной проверки police.ge: 40 ₾ (1 шт.)" in text
+    assert not any(line.startswith("⏳") for line in text.splitlines())  # история — не в основной статистике
 
 
 async def test_unknown_count_car_keeps_exact_amounts_and_sorting(fx):
@@ -1257,8 +1255,8 @@ _DEBT_LINE = re.compile(r"🔴 Неоплачено: (?:не менее )?(\d+) 
 
 async def test_header_and_cards_agree_on_mixed_data(fx):
     """🔴 заголовка — 🔴 + 🟡 всех машин: суммы и числа строк «🔴 Неоплачено»
-    машин складываются ровно в него; 🟡 — подмножество (только число), 🟢 и
-    ⏳ — отдельно и в 🔴 не входят."""
+    машин складываются ровно в него; 🟡 — подмножество (только число), 🟢 —
+    отдельно и в 🔴 не входит; ⏳ не показывается вовсе."""
     mixed, _ = fx.car("AA111BB", [("GE1", 50), ("GE2", 100), ("GE3", 70)])
     with_paid, _ = fx.car("BB222CC", [("GE4", 40), ("GE5", 25)])
     review_only, _ = fx.car("CC333DD", [("GE6", 20), ("GE7", 15)])
@@ -1274,12 +1272,12 @@ async def test_header_and_cards_agree_on_mixed_data(fx):
     lines = fx.controller._format_statistics_reply().text.splitlines()
 
     header_index = lines.index("Автомобили со штрафами: 4")
-    assert lines[header_index + 1:header_index + 5] == [
+    assert lines[header_index + 1:header_index + 4] == [
         "🔴 Неоплачено: 6 штрафов — 295 ₾",  # 🔴 50 + 100 + 40, 🟡 70 + 20 + 15
         "🟡 Из них требуют проверки: 3 штрафа",
         "🟢 Оплачено, ещё в базе полиции: 85 ₾ (2 шт.)",
-        "⏳ Ждут повторной проверки police.ge: 30 ₾ (1 шт.)",
     ]
+    assert not any(line.startswith("⏳") for line in lines)
     header, *cards = [_DEBT_LINE.fullmatch(line) for line in lines if line.startswith("🔴 Неоплачено:")]
     assert len(cards) == 3  # у машины только с 🟢 строки 🔴 нет
     assert sum(int(card[1]) for card in cards) == int(header[1])
@@ -1287,7 +1285,7 @@ async def test_header_and_cards_agree_on_mixed_data(fx):
     assert "🔴 Неоплачено: 3 штрафа — 220 ₾" in lines and "🟡 Из них требуют проверки: 1 штраф — 70 ₾" in lines
     assert "🔴 Неоплачено: 2 штрафа — 35 ₾" in lines and "🟡 Из них требуют проверки: 2 штрафа — 35 ₾" in lines
     assert "🔴 Неоплачено: 1 штраф — 40 ₾" in lines and "🟢 Оплачено: 1 штраф — 25 ₾" in lines
-    assert "🟢 Оплачено: 1 штраф — 60 ₾" in lines and "⏳ Ждут повторной проверки: 1 штраф — 30 ₾" in lines
+    assert "🟢 Оплачено: 1 штраф — 60 ₾" in lines
 
 
 @pytest.mark.parametrize("count, expected", [
@@ -1375,7 +1373,6 @@ def test_debt_row_lines_are_decided_by_count_not_amount():
         "🔴 Неоплачено: 2 штрафа — 0 ₾",
         "🟡 Из них требуют проверки: 1 штраф — 0 ₾",
         "🟢 Оплачено: 1 штраф — 0 ₾",
-        "⏳ Ждут повторной проверки: 1 штраф — 0 ₾",
         texts.DEBT_OWNER_NOT_LINKED_LINE,
     ]
 
