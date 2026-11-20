@@ -138,8 +138,10 @@ On its first start the bot creates statuses from the existing
   That answer came before the empty-answer protection and may have been
   falsely empty, so it confirms nothing:
   - not ⚪ and not confirmed debt; not shown in the managers' statistics
-    (neither a count nor a sum) and not re-checked on their own, only marked
-    ⏳ on the «🧾 Статусы оплаты» screen;
+    (neither a count nor a sum). With `daily_recheck_scope: debt` they are
+    not re-checked on their own (see "Daily evening re-check" below). Managers see
+    them marked ⏳ on the «🧾 Статусы оплаты» screen; subscribers get a
+    separate ⏳ line (see "Client delivery" below);
   - a manager mark wins: a ⏳ receipt marked 🟡 is counted as 🟡 debt, and
     one marked 🟢 as paid;
   - ⚪ only after two *new* successful complete checks without it, at least
