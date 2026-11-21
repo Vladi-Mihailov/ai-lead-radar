@@ -804,3 +804,87 @@ def test_auto_cap_is_enforced_in_the_insert(fx):
         check_date=date(2026, 11, 1), started_at=_tbilisi(date(2026, 11, 1), 13, 10), max_sessions_per_day=40,
         max_auto_per_day=2,
     ), int)
+
+
+# ---- Разовая первичная актуализация ----
+
+from reader.fines.payable_amount import TRIGGER_INITIAL  # noqa: E402
+
+
+def test_initial_actualization_reads_each_unrefined_receipt_once_silently(fx):
+    for index in range(4):
+        fx.receipt(car="AA111BB", protocol=f"R{index}", base=100.0)
+    paid = fx.receipt(car="BB222CC", protocol="P1")
+    fx.status_repository.update_payment(paid.id, payment_status=PAYMENT_PAID, source="receipt", note="BOG",
+                                        actor_user_id=_MANAGER, at=datetime(2026, 9, 2), event="paid")
+    fx.amounts.store_amount(car_number="AA111BB", protocol_no="R0", amount=300.0, currency="GEL",
+                            observed_at=datetime(2026, 11, 21, 11, 0), source="pilot", check_id=None)
+    fx.gc.amounts.update({"R1": 300.0, "R2": 300.0, "R3": 100.0})
+    fx.at(date(2026, 11, 21), 19, 0)
+
+    result = asyncio.run(fx.service.initial_actualization(limit=70, delay_seconds=0))
+
+    assert (result.eligible, result.sessions, result.fetched) == (3, 3, 3)
+    assert sorted(protocol for _, protocol in fx.gc.calls) == ["R1", "R2", "R3"]  # без R0 (уже есть) и 🟢
+    assert fx.amounts.events_since(datetime(2000, 1, 1)) == []  # первичные снимки — без уведомлений
+    assert fx.amounts.get_amount("AA111BB", "R1").first_amount == 300.0
+    # повторный запуск ничего не открывает
+    again = asyncio.run(fx.service.initial_actualization(limit=70, delay_seconds=0))
+    assert (again.eligible, again.sessions) == (0, 0) and len(fx.gc.calls) == 3
+
+
+def test_initial_actualization_stops_on_a_gateway_block(fx):
+    for index in range(5):
+        fx.receipt(car=f"AA{index}11BB", protocol=f"R{index}")
+    fx.gc.outcomes = [OUTCOME_OK, OUTCOME_BLOCKED]
+    fx.at(date(2026, 11, 21), 19, 0)
+    result = asyncio.run(fx.service.initial_actualization(limit=70, delay_seconds=0))
+    assert (result.sessions, result.stop_reason) == (2, "blocked")
+    assert len(fx.gc.calls) == 2 and fx.service.suspended()
+
+
+def test_initial_actualization_stops_after_consecutive_errors_and_never_repeats_failed_ones(fx):
+    for index in range(5):
+        fx.receipt(car=f"AA{index}11BB", protocol=f"R{index}")
+    fx.gc.outcomes = [OUTCOME_ERROR, OUTCOME_TIMEOUT]
+    fx.at(date(2026, 11, 21), 19, 0)
+    result = asyncio.run(fx.service.initial_actualization(limit=70, delay_seconds=0))
+    assert (result.sessions, result.failed, result.stop_reason) == (2, 2, "errors")
+    again = asyncio.run(fx.service.initial_actualization(limit=70, delay_seconds=0))
+    assert again.eligible == 3 and again.sessions == 3  # только ещё не тронутые
+    assert len(fx.gc.calls) == 5
+
+
+def test_initial_actualization_respects_its_own_limit(fx):
+    for index in range(5):
+        fx.receipt(car=f"AA{index}11BB", protocol=f"R{index}")
+    fx.at(date(2026, 11, 21), 19, 0)
+    result = asyncio.run(fx.service.initial_actualization(limit=2, delay_seconds=0))
+    assert (result.sessions, result.stop_reason) == (2, "limit")
+
+
+def test_initial_actualization_does_not_use_up_the_clients_daily_limit(tmp_path):
+    fixture = _Fixture(tmp_path, max_sessions_per_day=3)
+    for index in range(6):
+        fixture.receipt(car=f"AA{index}11BB", protocol=f"R{index}")
+    fixture.receipt(car="ZZ999ZZ", protocol="M1")
+    fixture.amounts.store_amount(car_number="ZZ999ZZ", protocol_no="M1", amount=50.0, currency="GEL",
+                                 observed_at=datetime(2026, 11, 1), source="manual", check_id=None)
+    fixture.at(date(2026, 11, 21), 19, 0)
+    result = asyncio.run(fixture.service.initial_actualization(limit=70, delay_seconds=0))
+    assert result.sessions == 6  # больше общего лимита 3: актуализация в него не входит
+    subscription = fixture.subscriptions.list_by_car_number("ZZ999ZZ")[0]
+    outcome = asyncio.run(fixture.service.refresh_for_subscription(subscription, telegram_user_id=_CLIENT))
+    assert [r.status for r in outcome.results] == [STATUS_FETCHED]
+    assert [c.trigger for c in fixture.amounts.checks_for_receipt("AA011BB", "R0")] == [TRIGGER_INITIAL]
+    fixture.close()
+
+
+def test_initial_increase_over_the_original_closes_an_open_window_silently(fx):
+    fx.receipt(protocol="R1", base=100.0, term_end=date(2026, 11, 15))
+    fx.gc.amounts["R1"] = 300.0
+    fx.at(date(2026, 11, 21), 19, 0)
+    asyncio.run(fx.service.initial_actualization(limit=70, delay_seconds=0))
+    fx.run_days(date(2026, 11, 22), date(2026, 11, 25))
+    assert fx.auto_checks() == []  # рост найден первичной проверкой — период закрыт
+    assert fx.amounts.events_since(datetime(2000, 1, 1)) == []

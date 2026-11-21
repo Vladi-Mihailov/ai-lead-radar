@@ -143,18 +143,23 @@ def format_payable_lines(summary: AmountSummary, *, tz: ZoneInfo, with_date: boo
 
 
 def format_header_payable_lines(summary: AmountSummary, *, tz: ZoneInfo) -> list[str]:
-    """Шапка статистики: дата — одна и только когда все суммы выборки
-    актуальны; иначе «Предварительно к оплате» и сколько требуют уточнения
-    (в том числе когда не уточнена ни одна)."""
+    """Шапка статистики: «💰 К оплате» с одной датой — только когда все суммы
+    выборки уточнены; иначе «💰 Сумма к оплате» без даты (известные суммы
+    Georgian Card плюс исходные суммы остальных — решение владельца
+    2026-11-21: без отдельной строки о неуточнённых)."""
     if summary.count == 0:
         return ["💰 К оплате: 0 ₾"]
     if summary.all_known:
         return format_payable_lines(summary, tz=tz)
-    count = summary.unknown_count
-    return [
-        f"💰 Предварительно к оплате: {format_money(summary.preliminary_total)}",
-        f"⚠️ По {count} {_plural(count, 'штрафу', 'штрафам', 'штрафам')} сумма требует уточнения",
-    ]
+    return [f"💰 Сумма к оплате: {format_money(summary.preliminary_total)}"]
+
+
+def format_statistics_row_payable_line(summary: AmountSummary) -> str:
+    """Строка машины в статистике: «💰 К оплате», если уточнены все её
+    штрафы, иначе «💰 Сумма к оплате» (как в шапке, без даты)."""
+    if summary.all_known:
+        return f"💰 К оплате: {format_money(summary.known_total)}"
+    return f"💰 Сумма к оплате: {format_money(summary.preliminary_total)}"
 
 
 def _number(value: float) -> str:

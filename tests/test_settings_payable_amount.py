@@ -45,7 +45,7 @@ def test_everything_is_off_by_default(tmp_path, monkeypatch):
     assert fine_monitor.payable_amount_auto_time == time(13, 0)
     assert fine_monitor.payable_amount_auto_cutoff_time == time(14, 0)
     assert fine_monitor.payable_amount_max_sessions_per_day == 40
-    assert fine_monitor.payable_amount_max_auto_sessions_per_day == 10
+    assert fine_monitor.payable_amount_max_auto_sessions_per_day is None  # отдельного предела нет
     assert fine_monitor.payable_amount_max_consecutive_errors == 2
     assert fine_monitor.payable_amount_manual_min_interval_hours == 12.0
     assert fine_monitor.payable_amount_manual_max_sessions_per_user_per_day == 5

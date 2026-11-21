@@ -6,6 +6,8 @@
     python -m scripts.georgia_payable_amount fetch --car-number AB123CD --protocol-no 0123456789
     python -m scripts.georgia_payable_amount fetch --car-number AB123CD --protocol-no 0123456789 --execute
     python -m scripts.georgia_payable_amount fetch ... --merchant-id M --page-id P   # без правки config.yaml
+    python -m scripts.georgia_payable_amount actualize                       # dry-run: сколько квитанций
+    python -m scripts.georgia_payable_amount actualize --execute [--limit 70] [--delay 20]
     python -m scripts.georgia_payable_amount clear-suspension
 
 status — сколько сумм сохранено, проверок сегодня (по триггерам и исходам),
@@ -25,6 +27,14 @@ fetch — пилот на ОДНОЙ квитанции. Без --execute нич
 единственная сессия пилота была понятна и при неожиданном ответе.
 --merchant-id/--page-id — merch_id/page_id МВД из JavaScript police.ge для
 этого запуска (config.yaml при этом не меняется).
+
+actualize — разовая первичная актуализация: одна сессия Georgian Card на
+каждую 🔴/🟡 квитанцию в базе полиции без сохранённой суммы (без 🟢, ⏳, ⚪;
+квитанции с прежней попыткой актуализации не повторяются), строго по
+очереди с паузой --delay; суммы — первичные снимки, без уведомлений;
+остановка на 403/429/WAF (приостановка на сутки), после ошибок подряд и на
+--limit сессий. В общий дневной лимит не входит, ручные уточнения клиентов
+не затрагивает.
 
 clear-suspension — явно снять приостановку сессий после 403/429.
 
@@ -68,7 +78,9 @@ def _mask(value: str) -> str:
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("action", choices=("status", "plan", "fetch", "clear-suspension"))
+    parser.add_argument("action", choices=("status", "plan", "fetch", "actualize", "clear-suspension"))
+    parser.add_argument("--limit", type=int, default=70, help="actualize: не больше стольких сессий за запуск.")
+    parser.add_argument("--delay", type=float, default=20.0, help="actualize: пауза между сессиями, с.")
     parser.add_argument("--date", default=None, help="plan: день (YYYY-MM-DD), по умолчанию сегодня.")
     parser.add_argument("--car-number", default=None, help="fetch: госномер.")
     parser.add_argument("--protocol-no", default=None, help="fetch: номер квитанции.")
@@ -138,8 +150,8 @@ def _status(ctx: _Context) -> None:
     print(f"Функция в боте: {'ВКЛ' if fm.payable_amount_enabled else 'выкл'}; "
           f"автоматические проверки: {'ВКЛ' if fm.payable_amount_auto_checks_enabled else 'выкл'}; "
           f"Georgian Card: {'настроен' if ctx.client.configured else 'НЕ настроен (merch_id/page_id)'}")
-    print(f"Лимит сессий в сутки: {fm.payable_amount_max_sessions_per_day} (из них автоматических "
-          f"{fm.payable_amount_max_auto_sessions_per_day}); окно автоматических проверок "
+    print(f"Лимит сессий в сутки: {fm.payable_amount_max_sessions_per_day} (отдельный предел автоматических: "
+          f"{fm.payable_amount_max_auto_sessions_per_day or 'нет'}); окно автоматических проверок "
           f"{fm.payable_amount_auto_time:%H:%M}–{fm.payable_amount_auto_cutoff_time:%H:%M} {fm.timezone}")
     suspended = ctx.amounts.suspended_until()
     if suspended is not None and suspended[0] > datetime.now(timezone.utc).replace(tzinfo=None):
@@ -162,9 +174,9 @@ def _plan(ctx: _Context, day: date) -> None:
     by_period: dict[int, int] = {}
     for _, period in candidates:
         by_period[period.index] = by_period.get(period.index, 0) + 1
-    cap = ctx.fine_monitor.payable_amount_max_auto_sessions_per_day
+    cap = ctx.fine_monitor.payable_amount_max_auto_sessions_per_day or ctx.fine_monitor.payable_amount_max_sessions_per_day
     print(f"Автоматический проход {day}: квитанций к проверке {len(candidates)}; сессий Georgian Card будет "
-          f"не больше {min(len(candidates), cap)} (лимит автоматических {cap}, общий "
+          f"не больше {min(len(candidates), cap)} (общий дневной лимит "
           f"{ctx.fine_monitor.payable_amount_max_sessions_per_day}).")
     for index in sorted(by_period):
         print(f"  период {index} ({index * 30} дней): {by_period[index]}")
@@ -217,6 +229,25 @@ def _fetch(ctx: _Context, car_number: str, protocol_no: str, *, execute: bool) -
     return 0 if result.status == "fetched" else 2
 
 
+def _actualize(ctx: _Context, *, execute: bool, limit: int, delay: float) -> int:
+    refs = ctx.service.initial_actualization_receipts()
+    print(f"Первичная актуализация: квитанций без суммы Georgian Card {len(refs)} "
+          f"(номеров {len({ref.car_number for ref in refs})}); за запуск — не больше {limit} сессий, пауза {delay:.0f} с.")
+    if not ctx.client.configured:
+        print("Georgian Card не настроен (payable_amount_gc_merchant_id/page_id) — сессии невозможны.")
+        return 1
+    if not execute:
+        print("Dry-run — ни одного запроса не отправлено.")
+        return 0
+    started = time_module.monotonic()
+    result = asyncio.run(ctx.service.initial_actualization(limit=limit, delay_seconds=delay))
+    print(f"Итог: сессий {result.sessions}; сумма получена {result.fetched}; без суммы {result.failed}; "
+          f"пропущено (заняты/лимит) {result.skipped}; остановка: {result.stop_reason or 'нет'}; "
+          f"{time_module.monotonic() - started:.0f} с")
+    print(f"Исходы: {dict(sorted(result.outcomes.items()))}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.config and not Path(args.config).is_file():
@@ -234,6 +265,8 @@ def main(argv: list[str] | None = None) -> int:
             day = date.fromisoformat(args.date) if args.date else datetime.now(timezone.utc).astimezone(ctx.tz).date()
             _plan(ctx, day)
             return 0
+        if args.action == "actualize":
+            return _actualize(ctx, execute=args.execute, limit=args.limit, delay=args.delay)
         if args.action == "clear-suspension":
             ctx.amounts.clear_suspension()
             print("Приостановка снята.")

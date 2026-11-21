@@ -54,6 +54,10 @@ MAX_AUTO_CHECKS_PER_PERIOD = 10
 TRIGGER_AUTO = "auto"
 TRIGGER_MANUAL = "manual"
 TRIGGER_PILOT = "pilot"
+# Разовая первичная актуализация всех неоплаченных квитанций (решение владельца
+# 2026-11-21): свой лимит у команды, в общий дневной лимит не входит — иначе
+# она съела бы ручные уточнения клиентов на весь день.
+TRIGGER_INITIAL = "initial"
 
 # Исход одной сессии (georgia_fine_amount_checks.outcome).
 OUTCOME_IN_PROGRESS = "in_progress"
@@ -524,6 +528,7 @@ class PayableAmountRepository:
             "started_at": _fmt(started_at), "in_progress": OUTCOME_IN_PROGRESS, "lease_cutoff": lease_cutoff,
             "max_per_day": max_sessions_per_day, "auto": TRIGGER_AUTO, "max_per_period": MAX_AUTO_CHECKS_PER_PERIOD,
             "manual": TRIGGER_MANUAL, "max_user": max_manual_per_user, "max_auto": max_auto_per_day,
+            "initial": TRIGGER_INITIAL,
         }
         cursor = self._conn.execute(
             """
@@ -537,7 +542,10 @@ class PayableAmountRepository:
                     WHERE car_number = :car_number AND protocol_no = :protocol_no
                       AND outcome = :in_progress AND started_at > :lease_cutoff
                 )
-              AND (SELECT COUNT(*) FROM georgia_fine_amount_checks WHERE check_date = :check_date) < :max_per_day
+              AND (
+                    SELECT COUNT(*) FROM georgia_fine_amount_checks
+                    WHERE check_date = :check_date AND trigger != :initial
+                ) < :max_per_day
               AND (
                     :trigger != :auto OR (
                         NOT EXISTS (
@@ -581,7 +589,8 @@ class PayableAmountRepository:
         if busy:
             return REFUSAL_BUSY
         today = self._conn.execute(
-            "SELECT COUNT(*) FROM georgia_fine_amount_checks WHERE check_date = :check_date", params,
+            "SELECT COUNT(*) FROM georgia_fine_amount_checks WHERE check_date = :check_date AND trigger != :initial",
+            params,
         ).fetchone()[0]
         if today >= params["max_per_day"]:
             return REFUSAL_DAILY_LIMIT
@@ -688,6 +697,13 @@ class PayableAmountRepository:
                 "AND trigger = ?",
                 (car_number, protocol_no, check_date.isoformat(), trigger),
             ).fetchone()
+        return row is not None
+
+    def had_check(self, car_number: str, protocol_no: str, *, trigger: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM georgia_fine_amount_checks WHERE car_number = ? AND protocol_no = ? AND trigger = ?",
+            (car_number, protocol_no, trigger),
+        ).fetchone()
         return row is not None
 
     def last_check_started_at(self, car_number: str, protocol_no: str) -> datetime | None:

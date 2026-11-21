@@ -210,16 +210,14 @@ def test_one_date_only_when_every_amount_is_known_and_it_is_the_earliest():
 def test_partly_known_amounts_are_preliminary_with_a_count():
     summary = summarize([_receipt(50, 150, _REFRESHED_AT), _receipt(100)])
     lines = format_header_payable_lines(summary, tz=_TBILISI)
-    assert lines == ["💰 Предварительно к оплате: 250 ₾", "⚠️ По 1 штрафу сумма требует уточнения"]
+    assert lines == ["💰 Сумма к оплате: 250 ₾"]
     assert not any("🕒" in line for line in lines)
 
 
 def test_unknown_amount_is_never_shown_as_confirmed():
     summary = summarize([_receipt(50)])
     assert format_payable_lines(summary, tz=_TBILISI) == ["💰 К оплате: требуется уточнение"]
-    assert format_header_payable_lines(summary, tz=_TBILISI) == [
-        "💰 Предварительно к оплате: 50 ₾", "⚠️ По 1 штрафу сумма требует уточнения",
-    ]
+    assert format_header_payable_lines(summary, tz=_TBILISI) == ["💰 Сумма к оплате: 50 ₾"]
 
 
 def test_debt_row_with_amounts_matches_the_agreed_layout():
@@ -378,10 +376,9 @@ async def test_statistics_with_unknown_amounts_is_preliminary(fx):
 
     lines = fx.controller._format_statistics_reply().text.splitlines()
 
-    assert "💰 Предварительно к оплате: 250 ₾" in lines
-    assert "⚠️ По 1 штрафу сумма требует уточнения" in lines
+    assert lines.count("💰 Сумма к оплате: 250 ₾") == 2  # шапка и машина: 150 известно + 100 исходная
+    assert not any("требует уточнения" in line or "Предварительно" in line for line in lines)
     assert not any(line.startswith("🕒") for line in lines)
-    assert "💰 Предварительно к оплате: 250 ₾" in lines  # машина: 150 известно + 100 исходная
     assert fx.gc.calls == []
 
 
