@@ -31,6 +31,7 @@ from telethon import TelegramClient
 from reader.fines.batch_gate import BatchCheckGate
 from reader.fines.check_service import FineCheckService
 from reader.fines.detected_fine_repository import DetectedFineRepository
+from reader.fines.notification_control import GeorgiaNotificationControl
 from reader.fines.payment_status import FineStatusRepository, FineStatusTracker, PaymentPageMarkers
 from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository
 from reader.fines.police_ge_circuit_breaker import PoliceGeCircuitBreaker
@@ -387,6 +388,9 @@ async def run() -> None:
     conversation_state_repository = BotConversationStateRepository(db_path)
     known_users_repository = BotKnownUsersRepository(db_path)
     delivery_repository = ClientFineDeliveryRepository(db_path)
+    # Пауза и граница уведомлений Грузии (см. reader/fines/notification_control.py)
+    # — одно состояние на БД, общее с операторским flush'ем main-процесса.
+    notification_control = GeorgiaNotificationControl(db_path)
     # Статусы оплаты (см. reader/fines/payment_status.py) — та же БД.
     fine_status_repository = FineStatusRepository(db_path)
     fine_status_tracker = FineStatusTracker(
@@ -623,6 +627,7 @@ async def run() -> None:
                 telegram_client=client,
                 host=settings.fine_monitor.collector_api_host,
                 port=settings.fine_monitor.collector_api_port,
+                notification_paused=notification_control.is_paused,
             )
 
         controller = ConversationController(
@@ -654,6 +659,7 @@ async def run() -> None:
         register(
             client, controller, known_users_repository, support=support,
             manager_chat_id=settings.public_bot.support_chat_id,
+            notification_paused=notification_control.is_paused,
         )
         register_support_group_handlers(client, support)
 
@@ -663,6 +669,7 @@ async def run() -> None:
             tz=ZoneInfo(settings.fine_monitor.timezone),
             payment_help_contact_username=settings.public_bot.payment_help_contact_username,
             status_lookup=fine_status_tracker,
+            notification_control=notification_control,
         )
 
         # token передаётся ЗДЕСЬ и только здесь.
@@ -700,6 +707,7 @@ async def run() -> None:
         if support_repository is not None:
             support_repository.close()
         delivery_repository.close()
+        notification_control.close()
         fine_status_repository.close()
         if daily_recheck_repository is not None:
             daily_recheck_repository.close()

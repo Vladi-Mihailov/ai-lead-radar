@@ -64,6 +64,17 @@ CREATE INDEX IF NOT EXISTS idx_detected_fines_car_number
     ON detected_fines (car_number)
 """
 
+# Явное исключение из операторской рассылки (см. reader/fines/
+# notification_control.py): notification_sent_at остаётся NULL — штраф не
+# отправлен, — но list_pending_notifications() его больше не возвращает.
+_OPERATOR_EXCLUSIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS fine_operator_notification_exclusions (
+    detected_fine_id  INTEGER PRIMARY KEY REFERENCES detected_fines(id),
+    reason            TEXT NOT NULL,
+    excluded_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+)
+"""
+
 _INSERT = """
 INSERT INTO detected_fines (
     monitoring_task_id, car_number, external_fine_id, fingerprint,
@@ -99,6 +110,7 @@ _SELECT_BY_CAR_NUMBER = f"""
 
 _SELECT_PENDING_NOTIFICATIONS = f"""
     SELECT {_SELECT_FIELDS} FROM detected_fines WHERE notification_sent_at IS NULL
+      AND id NOT IN (SELECT detected_fine_id FROM fine_operator_notification_exclusions)
 """
 
 # Emergency Check Now (см. задачу "back off when police.ge is unavailable" /
@@ -235,6 +247,7 @@ class DetectedFineRepository:
         self._migrate_missing_columns()
         self._conn.execute(_UNIQUE_INDEX)
         self._conn.execute(_CAR_NUMBER_INDEX)
+        self._conn.execute(_OPERATOR_EXCLUSIONS_SCHEMA)
         self._conn.commit()
 
     def _migrate_missing_columns(self) -> None:
@@ -443,6 +456,27 @@ class DetectedFineRepository:
     def mark_notification_sent(self, fine_id: int) -> None:
         self._conn.execute(_MARK_NOTIFIED, (fine_id,))
         self._conn.commit()
+
+    def exclude_from_operator_notifications(self, fine_ids: list[int], *, reason: str) -> int:
+        """Явно исключает штрафы из операторской рассылки (см.
+        _OPERATOR_EXCLUSIONS_SCHEMA). Уже исключённые не меняются. Возвращает
+        число исключённых этим вызовом."""
+        excluded = 0
+        for fine_id in fine_ids:
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO fine_operator_notification_exclusions (detected_fine_id, reason) "
+                "VALUES (?, ?)",
+                (fine_id, reason),
+            )
+            excluded += cursor.rowcount
+        self._conn.commit()
+        return excluded
+
+    def operator_exclusion_reason(self, fine_id: int) -> str | None:
+        row = self._conn.execute(
+            "SELECT reason FROM fine_operator_notification_exclusions WHERE detected_fine_id = ?", (fine_id,),
+        ).fetchone()
+        return row[0] if row else None
 
     def close(self) -> None:
         self._conn.close()

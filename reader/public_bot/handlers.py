@@ -10,6 +10,7 @@ Identity — ВСЕГДА event.sender_id (numeric), никогда не usernam
 """
 
 import logging
+from collections.abc import Callable
 
 from telethon import Button, TelegramClient, events
 from telethon.errors.rpcerrorlist import QueryIdInvalidError
@@ -128,6 +129,7 @@ def register(
     known_users_repository: BotKnownUsersRepository | None = None,
     support: ProtocolSupportService | None = None,
     manager_chat_id: int | None = None,
+    notification_paused: Callable[[], bool] | None = None,
 ) -> None:
     """Регистрирует NewMessage/CallbackQuery handlers на уже
     сконфигурированном bot-mode TelegramClient (см. reader/public_bot/
@@ -172,7 +174,7 @@ def register(
     async def _notify_manager_new_user(
         event, username: str | None, first_name: str | None, last_name: str | None,
     ) -> None:
-        if manager_chat_id is None:
+        if manager_chat_id is None or _paused("manager alert (новый пользователь)"):
             return
         text = manager_alerts.format_new_user_alert(
             telegram_user_id=event.sender_id, username=username,
@@ -186,9 +188,20 @@ def register(
             # обычное взаимодействие пользователя с ботом.
             logger.exception("manager alert (новый пользователь): не удалось отправить")
 
+    def _paused(kind: str) -> bool:
+        """Пауза уведомлений Грузии (см. reader/fines/notification_control.py):
+        побочные сообщения менеджерам и клиентам не отправляются, сам ответ
+        пользователю — отправляется."""
+        if notification_paused is None or not notification_paused():
+            return False
+        logger.info("notifications paused: %s not sent", kind)
+        return True
+
     async def _notify_manager_alert_if_any(event, reply) -> None:
         text = getattr(reply, "manager_alert_text", None)
         if manager_chat_id is None or not text:
+            return
+        if _paused("manager alert"):
             return
         raw_buttons = getattr(reply, "manager_alert_buttons", None)
         buttons = (
@@ -209,6 +222,8 @@ def register(
         доставки одному клиенту не должен мешать остальным/менеджеру)."""
         messages = getattr(reply, "customer_notify_messages", None)
         if not messages:
+            return
+        if _paused(f"{len(messages)} customer message(s)"):
             return
         for chat_id, text in messages:
             try:

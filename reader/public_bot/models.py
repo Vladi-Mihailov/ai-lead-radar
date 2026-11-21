@@ -112,6 +112,10 @@ class ClientFineDelivery:
     delivered_at: datetime | None
     last_attempt_at: datetime | None
     attempt_count: int
+    # Явное исключение из рассылки (см. reader/fines/notification_control.py):
+    # не доставлено и больше не отправляется, причина сохраняется.
+    excluded_at: datetime | None = None
+    exclusion_reason: str | None = None
 
 
 @dataclass(frozen=True)

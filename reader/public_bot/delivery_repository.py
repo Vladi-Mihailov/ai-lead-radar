@@ -37,8 +37,21 @@ CREATE TABLE IF NOT EXISTS client_fine_deliveries (
 
 _SELECT_FIELDS = (
     "id, detected_fine_id, subscription_id, recipient_role, "
-    "delivered_at, last_attempt_at, attempt_count"
+    "delivered_at, last_attempt_at, attempt_count, excluded_at, exclusion_reason"
 )
+
+# Явное исключение из рассылки (см. reader/fines/notification_control.py):
+# строка остаётся недоставленной (delivered_at IS NULL), попытки — какими
+# были; уже доставленное не трогается.
+_EXCLUDE = """
+INSERT INTO client_fine_deliveries
+    (detected_fine_id, subscription_id, recipient_role, attempt_count, excluded_at, exclusion_reason)
+VALUES (:detected_fine_id, :subscription_id, :recipient_role, 0, CURRENT_TIMESTAMP, :reason)
+ON CONFLICT(detected_fine_id, subscription_id, recipient_role) DO UPDATE SET
+    excluded_at = CURRENT_TIMESTAMP,
+    exclusion_reason = :reason
+WHERE delivered_at IS NULL AND excluded_at IS NULL
+"""
 
 _SELECT_BY_KEY = f"""
     SELECT {_SELECT_FIELDS} FROM client_fine_deliveries
@@ -67,7 +80,10 @@ WHERE detected_fine_id = :detected_fine_id AND subscription_id = :subscription_i
 
 
 def _row_to_delivery(row) -> ClientFineDelivery:
-    id_, detected_fine_id, subscription_id, recipient_role, delivered_at, last_attempt_at, attempt_count = row
+    (
+        id_, detected_fine_id, subscription_id, recipient_role, delivered_at, last_attempt_at, attempt_count,
+        excluded_at, exclusion_reason,
+    ) = row
     return ClientFineDelivery(
         id=id_,
         detected_fine_id=detected_fine_id,
@@ -76,6 +92,8 @@ def _row_to_delivery(row) -> ClientFineDelivery:
         delivered_at=datetime.fromisoformat(delivered_at) if delivered_at else None,
         last_attempt_at=datetime.fromisoformat(last_attempt_at) if last_attempt_at else None,
         attempt_count=attempt_count,
+        excluded_at=datetime.fromisoformat(excluded_at) if excluded_at else None,
+        exclusion_reason=exclusion_reason,
     )
 
 
@@ -89,7 +107,23 @@ class ClientFineDeliveryRepository:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute(_SCHEMA)
         self._migrate_recipient_role_if_needed()
+        self._migrate_exclusion_columns_if_needed()
         self._conn.commit()
+
+    def _migrate_exclusion_columns_if_needed(self) -> None:
+        """excluded_at/exclusion_reason (см. exclude()) — nullable-колонки,
+        ALTER TABLE ADD COLUMN без пересоздания таблицы."""
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(client_fine_deliveries)")}
+        for name, column_type in (("excluded_at", "TIMESTAMP"), ("exclusion_reason", "TEXT")):
+            if name in columns:
+                continue
+            try:
+                self._conn.execute(f"ALTER TABLE client_fine_deliveries ADD COLUMN {name} {column_type}")
+            except sqlite3.OperationalError as exc:
+                # Другой процесс (бот или скрипт) добавил колонку между
+                # PRAGMA и ALTER — это не ошибка.
+                if "duplicate column" not in str(exc):
+                    raise
 
     def _migrate_recipient_role_if_needed(self) -> None:
         """Существующие (Stage 1) базы имеют UNIQUE(detected_fine_id,
@@ -194,6 +228,40 @@ class ClientFineDeliveryRepository:
     ) -> bool:
         delivery = self.get(detected_fine_id, subscription_id, recipient_role)
         return delivery is not None and delivery.delivered_at is not None
+
+    def exclude(
+        self, detected_fine_id: int, subscription_id: int, recipient_role: RecipientRole, *, reason: str,
+    ) -> bool:
+        """Явно исключает тройку из рассылки (см. reader/fines/
+        notification_control.py): delivered_at остаётся NULL, attempt_count —
+        каким был (0, если попыток не было). Уже доставленная или уже
+        исключённая тройка не меняется. True — исключена этим вызовом."""
+        cursor = self._conn.execute(
+            _EXCLUDE,
+            {
+                "detected_fine_id": detected_fine_id,
+                "subscription_id": subscription_id,
+                "recipient_role": recipient_role,
+                "reason": reason,
+            },
+        )
+        self._conn.commit()
+        return bool(cursor.rowcount)
+
+    def handled_protocols(self, subscription_id: int) -> dict[str, set[str]]:
+        """Как delivered_protocols(), но вместе с явно исключёнными: такую
+        квитанцию этой подписке больше не рассылают ни по какой строке."""
+        rows = self._conn.execute(
+            "SELECT d.recipient_role, df.external_fine_id FROM client_fine_deliveries d "
+            "JOIN detected_fines df ON df.id = d.detected_fine_id "
+            "WHERE d.subscription_id = ? AND (d.delivered_at IS NOT NULL OR d.excluded_at IS NOT NULL) "
+            "AND df.external_fine_id IS NOT NULL AND df.external_fine_id != ''",
+            (subscription_id,),
+        ).fetchall()
+        result: dict[str, set[str]] = {}
+        for role, protocol_no in rows:
+            result.setdefault(role, set()).add(protocol_no)
+        return result
 
     def delivered_protocols(self, subscription_id: int) -> dict[str, set[str]]:
         """{recipient_role: {protocolNo}} — какие квитанции этой подписке уже

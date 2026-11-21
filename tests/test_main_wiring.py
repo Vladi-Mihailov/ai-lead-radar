@@ -1289,3 +1289,33 @@ def test_load_settings_parses_payment_help_contact_username_override(tmp_path, m
     settings = load_settings(config_path)
 
     assert settings.public_bot.payment_help_contact_username == "another_contact"
+
+
+async def test_build_fine_monitor_components_passes_the_georgian_notification_control(tmp_path, monkeypatch):
+    """Пауза уведомлений Грузии должна доходить до операторского flush'а
+    (reader/fines/notification_control.py) — без неё пауза молча не
+    действовала бы на операторский чат."""
+    from reader.fines.notification_control import GeorgiaNotificationControl
+
+    _set_required_env(monkeypatch)
+    settings = load_settings(_write_config(tmp_path, _CONFIG_YAML))
+    user_repository = UserRepository(tmp_path / "users.db")
+    source = TelegramSource(settings.telegram, groups=[], user_repository=user_repository)
+    task_repository = FineMonitoringTaskRepository(tmp_path / "users.db")
+    detected_fine_repository = DetectedFineRepository(tmp_path / "users.db")
+    control = GeorgiaNotificationControl(tmp_path / "users.db")
+    http_client = httpx.AsyncClient()
+    try:
+        fine_job, _scheduler, _service, _dispatcher, fine_command = build_fine_monitor_components(
+            settings, source, task_repository, detected_fine_repository, http_client,
+            resolve_notification_chat_ids(settings), settings.fine_monitor.allowed_user_ids,
+            user_repository=user_repository, notification_control=control,
+        )
+        assert fine_job._notification_coordinator._notification_control is control
+        assert fine_command._notification_coordinator is fine_job._notification_coordinator
+    finally:
+        await http_client.aclose()
+        control.close()
+        detected_fine_repository.close()
+        task_repository.close()
+        user_repository.close()
