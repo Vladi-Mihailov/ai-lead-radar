@@ -94,6 +94,60 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_fine_subscriptions_claim_token
     WHERE claim_token IS NOT NULL
 """
 
+# Журнал ⛔ менеджера (см. stop_all_for_task_by_manager): какие именно
+# подписки отключило это действие и в каком виде их оставило. По нему ▶️
+# менеджера восстанавливает только их (restore_after_manager_resume) — и
+# только если с тех пор их никто не менял. Подписки, отключённые раньше
+# появления журнала, причину отключения не сохранили и не восстанавливаются.
+_MANAGER_STOP_SCHEMA = (
+    """
+    CREATE TABLE IF NOT EXISTS fine_task_manager_stops (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        monitoring_task_id  INTEGER NOT NULL,
+        stopped_by          INTEGER,
+        stopped_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        resumed_at          TIMESTAMP,
+        resume_outcome      TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_fine_task_manager_stops_task ON fine_task_manager_stops (monitoring_task_id)",
+    """
+    CREATE TABLE IF NOT EXISTS fine_task_manager_stop_subscriptions (
+        stop_id          INTEGER NOT NULL REFERENCES fine_task_manager_stops(id),
+        subscription_id  INTEGER NOT NULL,
+        previous_status  TEXT NOT NULL,
+        stopped_at       TIMESTAMP,
+        updated_at       TIMESTAMP,
+        outcome          TEXT,
+        PRIMARY KEY (stop_id, subscription_id)
+    )
+    """,
+)
+
+# Как _STOP_ALL_FOR_TASK, но stopped_at — с миллисекундами: клиентские
+# включение/выключение пишут CURRENT_TIMESTAMP (секунды), поэтому значение,
+# оставленное менеджером, ни с одним клиентским действием не совпадёт даже в ту
+# же секунду (см. restore_after_manager_resume). datetime.fromisoformat
+# читает оба вида.
+_STOP_ALL_FOR_TASK_BY_MANAGER = """
+UPDATE fine_monitoring_subscriptions
+SET status = 'stopped', stopped_at = strftime('%Y-%m-%d %H:%M:%f', 'now'), updated_at = CURRENT_TIMESTAMP
+WHERE monitoring_task_id = :monitoring_task_id
+  AND status IN ('active', 'pending_claim')
+"""
+
+# Исход восстановления одной подписки (fine_task_manager_stop_subscriptions.outcome).
+MANAGER_RESUME_RESTORED = "restored"
+# После ⛔ подписку меняли (клиент включил, выключил заново, удалил машину,
+# переехала на другую задачу) — это уже не состояние, оставленное менеджером.
+MANAGER_RESUME_CHANGED = "changed_since_stop"
+MANAGER_RESUME_CAR_DELETED = "car_deleted"
+MANAGER_RESUME_INVITATION_EXPIRED = "invitation_expired"
+# У того же клиента на этой машине уже есть действующая подписка — вторую не
+# включаем (дубль).
+MANAGER_RESUME_LIVE_SIBLING = "live_sibling"
+MANAGER_RESUME_MISSING = "missing"
+
 _INSERT = """
 INSERT INTO fine_monitoring_subscriptions (
     monitoring_task_id, car_number, telegram_user_id, telegram_chat_id,
@@ -411,6 +465,8 @@ class FineSubscriptionRepository:
         self._conn.execute(_USER_STATUS_INDEX)
         self._conn.execute(_PENDING_CLAIM_UNIQUE_INDEX)
         self._conn.execute(_CLAIM_TOKEN_UNIQUE_INDEX)
+        for statement in _MANAGER_STOP_SCHEMA:
+            self._conn.execute(statement)
         self._conn.commit()
 
     def _migrate_nullable_owner_columns_if_needed(self) -> None:
@@ -866,6 +922,151 @@ class FineSubscriptionRepository:
         )
         self._conn.commit()
         return cursor.rowcount
+
+    def stop_all_for_task_by_manager(self, monitoring_task_id: int, *, stopped_by: int | None) -> int:
+        """⛔ менеджера: то же, что stop_all_for_task, плюс запись в журнал
+        (fine_task_manager_stops/_subscriptions) — какие подписки отключены
+        ИМЕННО этим действием, их прежний статус и stopped_at/updated_at,
+        которые оставило действие. Одна транзакция (BEGIN IMMEDIATE): журнал
+        и остановка не расходятся. Более ранние невосстановленные записи этой
+        задачи помечаются superseded — восстанавливается только последнее
+        действие менеджера."""
+        self._conn.commit()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            targets = self._conn.execute(
+                "SELECT id, status FROM fine_monitoring_subscriptions "
+                "WHERE monitoring_task_id = ? AND status IN ('active', 'pending_claim')",
+                (monitoring_task_id,),
+            ).fetchall()
+            self._conn.execute(
+                "UPDATE fine_task_manager_stops SET resumed_at = CURRENT_TIMESTAMP, resume_outcome = 'superseded' "
+                "WHERE monitoring_task_id = ? AND resumed_at IS NULL",
+                (monitoring_task_id,),
+            )
+            stop_id = self._conn.execute(
+                "INSERT INTO fine_task_manager_stops (monitoring_task_id, stopped_by) VALUES (?, ?)",
+                (monitoring_task_id, stopped_by),
+            ).lastrowid
+            cursor = self._conn.execute(_STOP_ALL_FOR_TASK_BY_MANAGER, {"monitoring_task_id": monitoring_task_id})
+            for subscription_id, previous_status in targets:
+                stopped_at, updated_at = self._conn.execute(
+                    "SELECT stopped_at, updated_at FROM fine_monitoring_subscriptions WHERE id = ?",
+                    (subscription_id,),
+                ).fetchone()
+                self._conn.execute(
+                    "INSERT INTO fine_task_manager_stop_subscriptions "
+                    "(stop_id, subscription_id, previous_status, stopped_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (stop_id, subscription_id, previous_status, stopped_at, updated_at),
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return cursor.rowcount
+
+    def restore_after_manager_resume(
+        self, monitoring_task_id: int, *, now: datetime,
+    ) -> tuple[list[FineMonitoringSubscription], dict[str, int]]:
+        """▶️ менеджера: возвращает прежний статус подпискам, которые
+        отключило последнее ⛔ этой задачи (см. stop_all_for_task_by_manager),
+        — только тем, что с тех пор остались ровно в оставленном виде
+        (status='stopped' с теми же stopped_at/updated_at). Не
+        восстанавливаются: удалённые машины, подписки, которые клиент с тех
+        пор включал/выключал сам, приглашения с истёкшим сроком, подписки,
+        у клиента которых уже есть другая действующая подписка на эту машину.
+        Запись журнала закрывается — повторное ▶️ ничего не делает.
+
+        Возвращает восстановленные подписки и счётчики исходов. now — naive
+        UTC (сравнение со сроком приглашения)."""
+        now_text = now.replace(microsecond=0).isoformat(sep=" ")
+        restored_ids: list[int] = []
+        outcomes: dict[str, int] = {}
+        self._conn.commit()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            stop = self._conn.execute(
+                "SELECT id FROM fine_task_manager_stops WHERE monitoring_task_id = ? AND resumed_at IS NULL "
+                "ORDER BY id DESC LIMIT 1",
+                (monitoring_task_id,),
+            ).fetchone()
+            if stop is None:
+                self._conn.commit()
+                return [], {}
+            records = self._conn.execute(
+                "SELECT subscription_id, previous_status, stopped_at, updated_at "
+                "FROM fine_task_manager_stop_subscriptions WHERE stop_id = ? ORDER BY subscription_id",
+                (stop[0],),
+            ).fetchall()
+            for subscription_id, previous_status, stopped_at, updated_at in records:
+                outcome = self._restore_one(
+                    subscription_id, previous_status, stopped_at, updated_at,
+                    monitoring_task_id=monitoring_task_id, now_text=now_text,
+                )
+                if outcome == MANAGER_RESUME_RESTORED:
+                    restored_ids.append(subscription_id)
+                outcomes[outcome] = outcomes.get(outcome, 0) + 1
+                self._conn.execute(
+                    "UPDATE fine_task_manager_stop_subscriptions SET outcome = ? WHERE stop_id = ? AND subscription_id = ?",
+                    (outcome, stop[0], subscription_id),
+                )
+            self._conn.execute(
+                "UPDATE fine_task_manager_stops SET resumed_at = ?, resume_outcome = 'resumed' WHERE id = ?",
+                (now_text, stop[0]),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return [subscription for subscription in map(self.get, restored_ids) if subscription is not None], outcomes
+
+    def _restore_one(
+        self, subscription_id: int, previous_status: str, stopped_at: str | None, updated_at: str | None, *,
+        monitoring_task_id: int, now_text: str,
+    ) -> str:
+        row = self._conn.execute(
+            "SELECT status, stopped_at, updated_at, monitoring_task_id, telegram_user_id, car_number, "
+            "owner_username_hint, claim_token_expires_at FROM fine_monitoring_subscriptions WHERE id = ?",
+            (subscription_id,),
+        ).fetchone()
+        if row is None:
+            return MANAGER_RESUME_MISSING
+        status, current_stopped_at, current_updated_at, task_id, user_id, car_number, hint, claim_expires = row
+        if status == "archived":
+            return MANAGER_RESUME_CAR_DELETED
+        if (
+            status != "stopped" or current_stopped_at != stopped_at or current_updated_at != updated_at
+            or task_id != monitoring_task_id
+        ):
+            return MANAGER_RESUME_CHANGED
+        if previous_status == "pending_claim":
+            if not claim_expires or str(claim_expires) <= now_text:
+                return MANAGER_RESUME_INVITATION_EXPIRED
+            sibling = self._conn.execute(
+                "SELECT 1 FROM fine_monitoring_subscriptions WHERE id != ? AND monitoring_task_id = ? "
+                "AND owner_username_hint = ? AND status = 'pending_claim'",
+                (subscription_id, task_id, hint),
+            ).fetchone()
+        elif previous_status == "active":
+            sibling = self._conn.execute(
+                "SELECT 1 FROM fine_monitoring_subscriptions WHERE id != ? AND telegram_user_id = ? "
+                "AND car_number = ? AND status IN ('active', 'pending_claim')",
+                (subscription_id, user_id, car_number),
+            ).fetchone() if user_id is not None else None
+        else:
+            return MANAGER_RESUME_CHANGED
+        if sibling is not None:
+            return MANAGER_RESUME_LIVE_SIBLING
+        try:
+            cursor = self._conn.execute(
+                "UPDATE fine_monitoring_subscriptions SET status = ?, stopped_at = NULL, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'stopped' AND stopped_at IS ? "
+                "AND updated_at IS ?",
+                (previous_status, subscription_id, stopped_at, updated_at),
+            )
+        except sqlite3.IntegrityError:
+            return MANAGER_RESUME_LIVE_SIBLING
+        return MANAGER_RESUME_RESTORED if cursor.rowcount else MANAGER_RESUME_CHANGED
 
     def list_all_deliverable(self, *, today: date) -> list[FineMonitoringSubscription]:
         """Все подписки, которым машина ещё нужна и у которых есть хоть

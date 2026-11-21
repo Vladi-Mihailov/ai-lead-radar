@@ -140,6 +140,23 @@ class NotificationControlLike(Protocol):
     ) -> bool: ...
 
 
+def exclude_known_fines_for_subscription(
+    subscription: FineMonitoringSubscription, *, detected_fine_repository: DetectedFineRepository,
+    delivery_repository: ClientFineDeliveryRepository, reason: str,
+) -> int:
+    """Явно исключает из рассылки этой подписке ВСЕ уже сохранённые штрафы
+    номера (каждая строка detected_fines, каждый получатель подписки) — для
+    подписки, которую включили обратно не сами клиенты (▶️ менеджера, см.
+    SubscriptionService.resume_task_with_client_subscriptions): известные
+    штрафы новыми событиями не считаются. Уже доставленное и уже
+    исключённое не меняется. Возвращает число новых исключений."""
+    excluded = 0
+    for fine in detected_fine_repository.list_by_car_number(subscription.car_number):
+        for role in _applicable_roles(subscription):
+            excluded += int(bool(delivery_repository.exclude(fine.id, subscription.id, role, reason=reason)))
+    return excluded
+
+
 class ClientDeliveryService:
     def __init__(
         self,

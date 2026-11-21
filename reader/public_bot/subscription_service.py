@@ -7,6 +7,7 @@ reader/public_bot/main.py — сборка). Никакой отдельной �
 provider/check-логики здесь нет.
 """
 
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -36,6 +37,8 @@ from reader.public_bot.subscription_repository import (
 )
 from reader.users.models import TelegramUserInfo
 from reader.users.repository import UserRepository
+
+logger = logging.getLogger(__name__)
 
 _SOURCE = "geshtrafbot"
 
@@ -125,6 +128,15 @@ class CheckNowOutcome:
     # вместо общего "попробуйте позже". Default False сохраняет поведение
     # существующих вызовов CheckNowOutcome(...) без правки.
     provider_unavailable: bool = False
+
+
+@dataclass(frozen=True)
+class TrustedResumeOutcome:
+    """▶️ менеджера (см. SubscriptionService.resume_task_with_client_subscriptions):
+    задача и клиентские подписки, которые вернулись вместе с ней."""
+
+    task: FineMonitoringTask
+    restored_subscriptions: list[FineMonitoringSubscription]
 
 
 @dataclass(frozen=True)
@@ -244,7 +256,16 @@ class SubscriptionService:
         # SubscriptionService(...) без этого параметра (тесты и т.п.)
         # продолжают работать бит в бит как раньше.
         plate_bootstrap_repository: GeorgiaPlateBootstrapRepository | None = None,
+        # ▶️ менеджера восстанавливает отключённые его ⛔ клиентские подписки
+        # (см. resume_task_with_client_subscriptions), но только вместе с
+        # явным исключением уже известных штрафов номера из их рассылки —
+        # это делает переданная функция (reader/public_bot/delivery_service.py::
+        # exclude_known_fines_for_subscription). None — подписки не
+        # восстанавливаются вовсе (прежнее поведение): без исключения
+        # восстановленный клиент получил бы старые штрафы как новые.
+        restored_history_excluder: Callable[[FineMonitoringSubscription], int] | None = None,
     ):
+        self._restored_history_excluder = restored_history_excluder
         self._task_repository = task_repository
         self._subscription_repository = subscription_repository
         self._user_repository = user_repository
@@ -1128,9 +1149,27 @@ class SubscriptionService:
         completed) — идемпотентно безопасно вызвать даже для уже активной
         задачи.
 
-        Существующие client-подписки этой задачи (если есть) НЕ трогает —
-        это отдельный, subscription-based ON/OFF слой (см. turn_on_car/
-        turn_off_car выше), вне зоны действия этого task-level действия.
+        Клиентские подписки, отключённые предыдущим ⛔ менеджера, возвращаются
+        (см. resume_task_with_client_subscriptions).
+
+        None — задача не существует."""
+        outcome = self.resume_task_with_client_subscriptions(task_id, today=today)
+        return outcome.task if outcome is not None else None
+
+    def resume_task_with_client_subscriptions(
+        self, task_id: int, *, today: date, now: datetime | None = None,
+    ) -> TrustedResumeOutcome | None:
+        """▶️ менеджера: включает задачу (как resume_task_for_trusted_admin) и
+        возвращает клиентские подписки, которые отключило ИМЕННО последнее ⛔
+        менеджера по этой задаче и которые с тех пор никто не менял (см.
+        FineSubscriptionRepository.restore_after_manager_resume): решения
+        клиентов (выключил сам до или после, удалил машину), истёкшие
+        приглашения и подписки без записи о причине отключения не трогаются.
+        Для каждой восстановленной подписки все уже известные штрафы номера
+        явно исключаются из рассылки — после включения клиент получает
+        только новые штрафы. Повторное нажатие ничего не восстанавливает и
+        ничего не дублирует. Без restored_history_excluder подписки не
+        восстанавливаются.
 
         None — задача не существует."""
         task = self._task_repository.get(task_id)
@@ -1140,7 +1179,18 @@ class SubscriptionService:
         self._task_repository.return_to_active_monitoring(
             task_id, start_date=today, end_date=UNLIMITED_END_DATE,
         )
-        return self._task_repository.get(task_id)
+        restored: list[FineMonitoringSubscription] = []
+        if self._restored_history_excluder is not None:
+            moment = now or datetime.now(timezone.utc).replace(tzinfo=None)
+            restored, outcomes = self._subscription_repository.restore_after_manager_resume(task_id, now=moment)
+            for subscription in restored:
+                self._restored_history_excluder(subscription)
+            if outcomes:
+                logger.info(
+                    "Georgia manager resume task=%d: client subscriptions %s",
+                    task_id, ", ".join(f"{name}={count}" for name, count in sorted(outcomes.items())),
+                )
+        return TrustedResumeOutcome(task=self._task_repository.get(task_id), restored_subscriptions=restored)
 
     def get_active_task_for_trusted_admin(self, task_id: int) -> FineMonitoringTask | None:
         """None — задача не существует ИЛИ уже не 'active' (завершена/
@@ -1383,7 +1433,7 @@ class SubscriptionService:
         САМОГО подписчика — никаких новых записей пользователей."""
         return self._user_repository.get_many(telegram_user_ids)
 
-    def stop_task_for_trusted_admin(self, task_id: int) -> bool:
+    def stop_task_for_trusted_admin(self, task_id: int, *, stopped_by: int | None = None) -> bool:
         """Task-level ⛔ Остановить мониторинг для trusted-оператора —
         останавливает саму задачу (тот же task_repository.set_status(...,
         "stopped"), что и у reader/commands/fine.py::_handle_stop — не
@@ -1398,6 +1448,10 @@ class SubscriptionService:
         существующий статус 'stopped' (тот же путь отображения, что и при
         обычном user-initiated Stop) — новой колонки/статуса не требуется.
 
+        Какие подписки отключены этим действием, записывается (stopped_by —
+        менеджер): по этой записи ▶️ вернёт ровно их (см.
+        resume_task_with_client_subscriptions).
+
         False — задача не существует/уже не активна (см.
         get_active_task_for_trusted_admin) — вызывающий код не должен
         показывать "остановлено" в этом случае."""
@@ -1406,5 +1460,5 @@ class SubscriptionService:
             return False
 
         self._task_repository.set_status(task_id, "stopped")
-        self._subscription_repository.stop_all_for_task(task_id)
+        self._subscription_repository.stop_all_for_task_by_manager(task_id, stopped_by=stopped_by)
         return True
