@@ -99,7 +99,7 @@ from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 from reader.fines.models import OneOffCheckResult
-from reader.fines.payable_amount import amount_is_current
+from reader.fines.payable_amount import amount_is_current, display_payable
 from reader.fines.payment_status import (
     DISPLAY_GONE,
     DISPLAY_UNVERIFIED,
@@ -2935,7 +2935,7 @@ class ConversationController:
                 by_protocol[status.protocol_no] = ReceiptAmount(
                     protocol_no=status.protocol_no,
                     base_amount=status.amount,
-                    payable=amount.amount if current else None,
+                    payable=display_payable(amount.amount, status.amount) if current else None,
                     observed_at=amount.observed_at if current else None,
                 )
             result[car_number] = by_protocol
@@ -2964,7 +2964,7 @@ class ConversationController:
             result[protocol_no] = ReceiptAmount(
                 protocol_no=protocol_no,
                 base_amount=fine.amount,
-                payable=receipt.payable if receipt else None,
+                payable=display_payable(receipt.payable, fine.amount) if receipt else None,
                 observed_at=receipt.observed_at if receipt else None,
             )
         return result
