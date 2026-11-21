@@ -40,6 +40,7 @@ from reader.fines.payable_amount import (
     OUTCOME_OK,
     OUTCOME_REFUSED,
     REFUSAL_BUSY,
+    REFUSAL_AUTO_DAILY_LIMIT,
     REFUSAL_DAILY_LIMIT,
     TRIGGER_AUTO,
     TRIGGER_MANUAL,
@@ -73,6 +74,8 @@ _NON_ERROR_OUTCOMES = frozenset({OUTCOME_OK, OUTCOME_REFUSED})
 @dataclass(frozen=True)
 class PayableAmountLimits:
     max_sessions_per_day: int = 40
+    # Из них автоматических — не больше (ручные уточнения клиентов идут в общий лимит).
+    max_auto_sessions_per_day: int = 10
     max_consecutive_errors: int = 2
     manual_min_interval: timedelta = timedelta(hours=12)
     manual_max_sessions_per_user_per_day: int = 5
@@ -235,6 +238,7 @@ class PayableAmountService:
             max_manual_per_user=(
                 self._limits.manual_max_sessions_per_user_per_day if trigger == TRIGGER_MANUAL else None
             ),
+            max_auto_per_day=self._limits.max_auto_sessions_per_day if trigger == TRIGGER_AUTO else None,
         )
         if isinstance(begun, str):
             status = STATUS_BUSY if begun == REFUSAL_BUSY else STATUS_LIMITED
@@ -352,8 +356,10 @@ class PayableAmountService:
         """Квитанции, которым сегодня положена автоматическая проверка: окно
         контрольного периода открыто, период не закрыт (увеличение, отказ
         МВД, лимит проверок), сегодня по квитанции ещё ничего не открывали,
-        у номера есть действующая клиентская подписка. Сначала — более
-        ранние периоды (дольше без сверки)."""
+        у номера есть действующая клиентская подписка. Порядок — по очереди:
+        сначала ни разу не проверявшиеся, затем дольше всех не проверявшиеся
+        (при дневном лимите меньше числа квитанций одни и те же не
+        выигрывают каждый день), при равенстве — более ранние периоды."""
         car_numbers = [car for car in self._statuses.listed_car_numbers() if not is_fine_output_suppressed(car)]
         linked = self.client_linked_car_numbers(car_numbers, today=today)
         cars = [car for car in car_numbers if car in linked]
@@ -372,7 +378,14 @@ class PayableAmountService:
                 if self._repository.period_closed_reason(ref.car_number, ref.protocol_no, period, tz=self._tz):
                     continue
                 candidates.append((ref, period))
-        candidates.sort(key=lambda item: (item[1].start, item[0].car_number, item[0].protocol_no))
+        last_checked = {
+            (ref.car_number, ref.protocol_no): self._repository.last_check_started_at(ref.car_number, ref.protocol_no)
+            for ref, _ in candidates
+        }
+        candidates.sort(key=lambda item: (
+            last_checked[(item[0].car_number, item[0].protocol_no)] or datetime.min,
+            item[1].start, item[0].car_number, item[0].protocol_no,
+        ))
         return candidates
 
     def _in_window(self, now: datetime) -> bool:
@@ -412,6 +425,9 @@ class PayableAmountService:
                 return self._finish(today, "stopped", "not_configured")
             if result.status == STATUS_LIMITED and result.refusal == REFUSAL_DAILY_LIMIT:
                 return self._finish(today, "stopped", "daily_limit")
+            if result.status == STATUS_LIMITED and result.refusal == REFUSAL_AUTO_DAILY_LIMIT:
+                # Остальные квитанции — в следующие дни окна; очереди повторов нет.
+                return self._finish(today, "stopped", "auto_daily_limit")
             if result.status in (STATUS_BUSY, STATUS_LIMITED):
                 continue
             is_error = result.outcome not in _NON_ERROR_OUTCOMES

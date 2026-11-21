@@ -345,6 +345,7 @@ def build_payable_amount_service(
         tz=ZoneInfo(fine_monitor.timezone),
         limits=PayableAmountLimits(
             max_sessions_per_day=fine_monitor.payable_amount_max_sessions_per_day,
+            max_auto_sessions_per_day=fine_monitor.payable_amount_max_auto_sessions_per_day,
             max_consecutive_errors=fine_monitor.payable_amount_max_consecutive_errors,
             manual_min_interval=timedelta(hours=fine_monitor.payable_amount_manual_min_interval_hours),
             manual_max_sessions_per_user_per_day=fine_monitor.payable_amount_manual_max_sessions_per_user_per_day,

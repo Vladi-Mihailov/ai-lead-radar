@@ -382,6 +382,7 @@ REFUSAL_DAILY_LIMIT = "daily_limit"  # дневной лимит сессий и
 REFUSAL_ALREADY_TODAY = "already_today"  # автоматическая проверка сегодня уже была
 REFUSAL_PERIOD_LIMIT = "period_limit"  # MAX_AUTO_CHECKS_PER_PERIOD исчерпан
 REFUSAL_USER_LIMIT = "user_limit"  # дневной лимит ручных уточнений пользователя
+REFUSAL_AUTO_DAILY_LIMIT = "auto_daily_limit"  # дневной лимит автоматических проверок
 
 
 _AMOUNT_FIELDS = (
@@ -501,7 +502,7 @@ class PayableAmountRepository:
     def begin_check(
         self, *, car_number: str, protocol_no: str, trigger: str, period_index: int | None,
         requested_by: int | None, check_date: date, started_at: datetime, max_sessions_per_day: int,
-        max_manual_per_user: int | None = None,
+        max_manual_per_user: int | None = None, max_auto_per_day: int | None = None,
     ) -> int | str:
         """Атомарно начинает проверку (строка in_progress) и возвращает её id —
         или причину отказа (REFUSAL_*). Все лимиты — в одном INSERT ... SELECT
@@ -512,7 +513,9 @@ class PayableAmountRepository:
         триггеры); для TRIGGER_AUTO — одна автоматическая проверка квитанции
         в сутки и не больше MAX_AUTO_CHECKS_PER_PERIOD в периоде; для
         TRIGGER_MANUAL — не больше max_manual_per_user ручных сессий
-        пользователя в сутки."""
+        пользователя в сутки; для TRIGGER_AUTO — ещё и не больше
+        max_auto_per_day автоматических сессий в сутки (внутри общего
+        max_sessions_per_day)."""
         self.abandon_stale_checks(now=started_at)
         lease_cutoff = _fmt(_as_naive_utc(started_at) - CHECK_LEASE)
         params = {
@@ -520,7 +523,7 @@ class PayableAmountRepository:
             "period_index": period_index, "requested_by": requested_by, "check_date": check_date.isoformat(),
             "started_at": _fmt(started_at), "in_progress": OUTCOME_IN_PROGRESS, "lease_cutoff": lease_cutoff,
             "max_per_day": max_sessions_per_day, "auto": TRIGGER_AUTO, "max_per_period": MAX_AUTO_CHECKS_PER_PERIOD,
-            "manual": TRIGGER_MANUAL, "max_user": max_manual_per_user,
+            "manual": TRIGGER_MANUAL, "max_user": max_manual_per_user, "max_auto": max_auto_per_day,
         }
         cursor = self._conn.execute(
             """
@@ -548,6 +551,12 @@ class PayableAmountRepository:
                               AND trigger = :auto AND period_index = :period_index
                         ) < :max_per_period
                     )
+                )
+              AND (
+                    :trigger != :auto OR :max_auto IS NULL OR (
+                        SELECT COUNT(*) FROM georgia_fine_amount_checks
+                        WHERE check_date = :check_date AND trigger = :auto
+                    ) < :max_auto
                 )
               AND (
                     :trigger != :manual OR :max_user IS NULL OR (
@@ -578,6 +587,13 @@ class PayableAmountRepository:
             return REFUSAL_DAILY_LIMIT
         if params["trigger"] == TRIGGER_MANUAL and params["max_user"] is not None:
             return REFUSAL_USER_LIMIT
+        if params["trigger"] == TRIGGER_AUTO and params["max_auto"] is not None:
+            auto_today = self._conn.execute(
+                "SELECT COUNT(*) FROM georgia_fine_amount_checks WHERE check_date = :check_date AND trigger = :auto",
+                params,
+            ).fetchone()[0]
+            if auto_today >= params["max_auto"]:
+                return REFUSAL_AUTO_DAILY_LIMIT
         already = self._conn.execute(
             "SELECT 1 FROM georgia_fine_amount_checks WHERE car_number = :car_number AND protocol_no = :protocol_no "
             "AND trigger = :auto AND check_date = :check_date",

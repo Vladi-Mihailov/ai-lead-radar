@@ -422,8 +422,11 @@ async def test_increase_is_sent_once_to_the_client(fx):
     assert len(fx.sender.sent) == 1
     chat_id, text, buttons = fx.sender.sent[0]
     assert chat_id == _OWNER
-    assert text.splitlines()[0] == "⚠️ Сумма к оплате по вашему штрафу увеличилась: 100 → 150 ₾"
-    assert "🧾 Штраф: 50 ₾" in text and "💰 К оплате: 150 ₾" in text and "🕒 Сумма уточнена 21.11 в 15:20" in text
+    lines = text.splitlines()
+    assert lines[0] == "⚠️ Сумма штрафа увеличилась!" and lines[1] == ""
+    assert f"🚗 Автомобиль: {format_plate_for_telegram(_CAR)}" in lines
+    assert "🧾 Первоначальный штраф: 50 ₾" in lines and "💰 Было к оплате: 100 ₾" in lines
+    assert "💰 Теперь к оплате: 150 ₾" in lines and "📄 Штраф №: GE1" in lines
     assert buttons is not None
 
 
@@ -496,7 +499,7 @@ async def test_manager_of_a_delegated_subscription_gets_the_manager_text_without
     await fx.delivery.run_once()
     by_chat = {chat_id: (text, buttons) for chat_id, text, buttons in fx.sender.sent}
     assert set(by_chat) == {_OWNER, _TRUSTED}
-    assert by_chat[_TRUSTED][0].startswith("⚠️ Сумма к оплате по штрафу автомобиля, поставленного вами на мониторинг")
+    assert by_chat[_TRUSTED][0].startswith("⚠️ Сумма штрафа увеличилась! (автомобиль, поставленный вами на мониторинг)")
     assert by_chat[_TRUSTED][1] is None
 
 
@@ -616,7 +619,7 @@ async def test_first_enable_never_sends_increases_found_before_it(fx):
 
     await fx.delivery.run_once()
 
-    assert len(fx.sender.sent) == 1 and "150 → 200 ₾" in fx.sender.sent[0][1]
+    assert len(fx.sender.sent) == 1 and "💰 Теперь к оплате: 200 ₾" in fx.sender.sent[0][1]
     assert fx.amounts.get_delivery(old, subscription.id, "owner").exclusion_reason == EXCLUSION_BEFORE_NOTIFICATIONS
     assert fx.amounts.get_delivery(new, subscription.id, "owner").delivered_at is not None
 

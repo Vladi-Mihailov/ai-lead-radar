@@ -98,14 +98,18 @@ def format_check_now_fines_message(
     return "\n\n".join(blocks)
 
 
+AMOUNT_INCREASE_TITLE = "⚠️ Сумма штрафа увеличилась!"
+
+
 def _amount_card_lines(
-    *, protocol_no: str, base_amount: float | None, new_amount: float, observed_at: datetime, tz: ZoneInfo,
+    *, protocol_no: str, base_amount: float | None, old_amount: float, new_amount: float,
 ) -> list[str]:
+    """Номер квитанции — у машины их бывает несколько."""
     lines = [f"📄 Штраф №: {protocol_no}"]
     if base_amount is not None:
-        lines.append(f"🧾 Штраф: {format_money(base_amount)}")
-    lines.append(f"💰 К оплате: {format_money(new_amount)}")
-    lines.append(format_refreshed_at(observed_at, tz=tz))
+        lines.append(f"🧾 Первоначальный штраф: {format_money(base_amount)}")
+    lines.append(f"💰 Было к оплате: {format_money(old_amount)}")
+    lines.append(f"💰 Теперь к оплате: {format_money(new_amount)}")
     return lines
 
 
@@ -113,13 +117,20 @@ def format_owner_amount_increase_message(
     *, car_number: str, protocol_no: str, base_amount: float | None, old_amount: float, new_amount: float,
     observed_at: datetime, tz: ZoneInfo,
 ) -> str:
-    """Подтверждённое увеличение суммы к оплате (см. AmountIncreaseDeliveryService)."""
+    """Подтверждённое увеличение суммы к оплате (см. AmountIncreaseDeliveryService):
+        ⚠️ Сумма штрафа увеличилась!
+
+        🚗 Автомобиль: AB123CD
+        📄 Штраф №: ...
+        🧾 Первоначальный штраф: 50 ₾
+        💰 Было к оплате: 100 ₾
+        💰 Теперь к оплате: 150 ₾"""
     return "\n".join([
-        format_amount_increase_line(old_amount, new_amount),
+        AMOUNT_INCREASE_TITLE,
         "",
         f"🚗 Автомобиль: {format_plate_for_telegram(car_number)}",
         *_amount_card_lines(
-            protocol_no=protocol_no, base_amount=base_amount, new_amount=new_amount, observed_at=observed_at, tz=tz,
+            protocol_no=protocol_no, base_amount=base_amount, old_amount=old_amount, new_amount=new_amount,
         ),
     ])
 
@@ -129,13 +140,13 @@ def format_trusted_operator_amount_increase_message(
     observed_at: datetime, tz: ZoneInfo, owner_display: str | None,
 ) -> str:
     lines = [
-        format_trusted_amount_increase_line(old_amount, new_amount),
+        f"{AMOUNT_INCREASE_TITLE} (автомобиль, поставленный вами на мониторинг)",
         "",
-        f"🚗 {format_plate_for_telegram(car_number)}",
+        f"🚗 Автомобиль: {format_plate_for_telegram(car_number)}",
     ]
     if owner_display:
         lines.append(f"👤 Владелец: @{owner_display}")
     lines.extend(_amount_card_lines(
-        protocol_no=protocol_no, base_amount=base_amount, new_amount=new_amount, observed_at=observed_at, tz=tz,
+        protocol_no=protocol_no, base_amount=base_amount, old_amount=old_amount, new_amount=new_amount,
     ))
     return "\n".join(lines)

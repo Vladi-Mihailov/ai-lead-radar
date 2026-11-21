@@ -757,3 +757,50 @@ def test_failing_term_write_does_not_break_the_status_update(fx, monkeypatch):
 
 
 import sqlite3  # noqa: E402
+
+
+# ---- Отдельный дневной лимит автоматических проверок ----
+
+
+def test_automatic_checks_have_their_own_daily_cap_inside_the_total(tmp_path):
+    fixture = _Fixture(tmp_path, max_auto_sessions_per_day=10, max_sessions_per_day=40)
+    for index in range(15):
+        fixture.receipt(car=f"AA{index:02d}1BB", protocol=f"R{index}")
+    fixture.at(date(2026, 11, 1))
+    assert fixture.run() == "stopped"
+    assert len(fixture.gc.calls) == 10
+    assert fixture.amounts.get_run(date(2026, 11, 1)).stop_reason == "auto_daily_limit"
+    # Ручное уточнение клиента после этого — в пределах общего лимита.
+    subscription = fixture.subscriptions.list_by_car_number("AA141BB")[0]
+    fixture.at(date(2026, 11, 1), 15, 0)
+    outcome = asyncio.run(fixture.service.refresh_for_subscription(subscription, telegram_user_id=_CLIENT))
+    assert [result.status for result in outcome.results] == [STATUS_FETCHED]
+    # На следующий день — снова не больше 10, и первыми — ещё не проверенные.
+    fixture.at(date(2026, 11, 2))
+    fixture.run()
+    day2 = fixture.gc.calls[11:]
+    assert len(day2) == 10
+    assert {protocol for _, protocol in day2[:4]} == {"R10", "R11", "R12", "R13"}
+    fixture.close()
+
+
+def test_auto_cap_is_enforced_in_the_insert(fx):
+    from reader.fines.payable_amount import REFUSAL_AUTO_DAILY_LIMIT
+
+    for index in range(2):
+        assert isinstance(fx.amounts.begin_check(
+            car_number=f"C{index}", protocol_no="R", trigger=TRIGGER_AUTO, period_index=1, requested_by=None,
+            check_date=date(2026, 11, 1), started_at=_tbilisi(date(2026, 11, 1), 13, index), max_sessions_per_day=40,
+            max_auto_per_day=2,
+        ), int)
+    assert fx.amounts.begin_check(
+        car_number="C9", protocol_no="R", trigger=TRIGGER_AUTO, period_index=1, requested_by=None,
+        check_date=date(2026, 11, 1), started_at=_tbilisi(date(2026, 11, 1), 13, 9), max_sessions_per_day=40,
+        max_auto_per_day=2,
+    ) == REFUSAL_AUTO_DAILY_LIMIT
+    # ручные в этот лимит не входят
+    assert isinstance(fx.amounts.begin_check(
+        car_number="C9", protocol_no="R", trigger=TRIGGER_MANUAL, period_index=None, requested_by=_CLIENT,
+        check_date=date(2026, 11, 1), started_at=_tbilisi(date(2026, 11, 1), 13, 10), max_sessions_per_day=40,
+        max_auto_per_day=2,
+    ), int)

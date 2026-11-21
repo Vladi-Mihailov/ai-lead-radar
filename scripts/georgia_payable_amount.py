@@ -120,6 +120,7 @@ class _Context:
             tz=self.tz,
             limits=PayableAmountLimits(
                 max_sessions_per_day=fm.payable_amount_max_sessions_per_day,
+                max_auto_sessions_per_day=fm.payable_amount_max_auto_sessions_per_day,
                 blocked_suspension=timedelta(hours=fm.payable_amount_blocked_suspension_hours),
             ),
             trusted_user_ids=frozenset(settings.public_bot.trusted_operator_user_ids),
@@ -137,7 +138,8 @@ def _status(ctx: _Context) -> None:
     print(f"Функция в боте: {'ВКЛ' if fm.payable_amount_enabled else 'выкл'}; "
           f"автоматические проверки: {'ВКЛ' if fm.payable_amount_auto_checks_enabled else 'выкл'}; "
           f"Georgian Card: {'настроен' if ctx.client.configured else 'НЕ настроен (merch_id/page_id)'}")
-    print(f"Лимит сессий в сутки: {fm.payable_amount_max_sessions_per_day}; окно автоматических проверок "
+    print(f"Лимит сессий в сутки: {fm.payable_amount_max_sessions_per_day} (из них автоматических "
+          f"{fm.payable_amount_max_auto_sessions_per_day}); окно автоматических проверок "
           f"{fm.payable_amount_auto_time:%H:%M}–{fm.payable_amount_auto_cutoff_time:%H:%M} {fm.timezone}")
     suspended = ctx.amounts.suspended_until()
     if suspended is not None and suspended[0] > datetime.now(timezone.utc).replace(tzinfo=None):
@@ -160,8 +162,10 @@ def _plan(ctx: _Context, day: date) -> None:
     by_period: dict[int, int] = {}
     for _, period in candidates:
         by_period[period.index] = by_period.get(period.index, 0) + 1
-    print(f"Автоматический проход {day}: квитанций к проверке {len(candidates)} "
-          f"(= сессий Georgian Card, лимит {ctx.fine_monitor.payable_amount_max_sessions_per_day}).")
+    cap = ctx.fine_monitor.payable_amount_max_auto_sessions_per_day
+    print(f"Автоматический проход {day}: квитанций к проверке {len(candidates)}; сессий Georgian Card будет "
+          f"не больше {min(len(candidates), cap)} (лимит автоматических {cap}, общий "
+          f"{ctx.fine_monitor.payable_amount_max_sessions_per_day}).")
     for index in sorted(by_period):
         print(f"  период {index} ({index * 30} дней): {by_period[index]}")
     print("Сеть не использовалась.")

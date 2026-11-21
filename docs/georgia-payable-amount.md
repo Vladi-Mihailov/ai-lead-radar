@@ -163,7 +163,13 @@ period. Later amounts are compared with the stored Georgian Card amount:
 
 - one session at a time, with a pause between sessions (30 s);
 - the oldest periods go first;
+- receipts go in turn: never-checked ones first, then the least recently
+  checked, so with a cap below the number of receipts the same ones do not
+  win every day; ties go to the earlier period;
 - it stops for the day:
+  - at the automatic cap (`payable_amount_max_auto_sessions_per_day`, default
+    10), which counts inside the total; the rest wait for the next days of
+    their window, with no retry queue;
   - at the daily session cap (all triggers together, default 40);
   - after 2 errors in a row (a refusal is not an error);
   - on HTTP 403/429, which also suspends all sessions, manual ones included,
@@ -278,10 +284,11 @@ plus notes:
 `reader/public_bot/amount_delivery_service.py` runs in the same poller as the
 "new fine" delivery.
 
-- One message per event and recipient. The owner gets «⚠️ Сумма к оплате по
-  вашему штрафу увеличилась: 100 → 150 ₾» with the card and the buttons. The
-  manager of a delegated subscription gets the manager variant without
-  buttons.
+- One message per event and recipient. The owner gets «⚠️ Сумма штрафа
+  увеличилась!» with the car, the receipt number, «🧾 Первоначальный штраф»,
+  «💰 Было к оплате» and «💰 Теперь к оплате», plus [🔄 Уточнить сумму] and
+  the payment row. The manager of a delegated subscription gets the manager
+  variant without buttons.
 - An event is created only by a confirmed increase over the stored Georgian
   Card amount. One event per new amount of a receipt, so getting the same
   amount again never notifies.
@@ -327,6 +334,7 @@ fine_monitor:
   payable_amount_auto_cutoff_time: "14:00"
   payable_amount_auto_delay_seconds: 30
   payable_amount_max_sessions_per_day: 40    # all triggers together, hard cap
+  payable_amount_max_auto_sessions_per_day: 10  # of them automatic, per day
   payable_amount_max_consecutive_errors: 2
   payable_amount_manual_min_interval_hours: 12
   payable_amount_manual_max_sessions_per_user_per_day: 5

@@ -329,6 +329,8 @@ class FineMonitorSettings(BaseModel):
     payable_amount_auto_cutoff_time: time = time(14, 0)
     payable_amount_auto_delay_seconds: float = 30.0
     payable_amount_max_sessions_per_day: int = 40
+    # Из общего дневного лимита — не больше стольких автоматических проверок.
+    payable_amount_max_auto_sessions_per_day: int = 10
     payable_amount_max_consecutive_errors: int = 2
     payable_amount_manual_min_interval_hours: float = 12.0
     payable_amount_manual_max_sessions_per_user_per_day: int = 5
@@ -901,6 +903,9 @@ def load_settings(config_path: Path) -> Settings:
                 ),
                 payable_amount_max_sessions_per_day=_parse_positive_int(
                     fine_monitor_raw, "payable_amount_max_sessions_per_day", 40,
+                ),
+                payable_amount_max_auto_sessions_per_day=_parse_positive_int(
+                    fine_monitor_raw, "payable_amount_max_auto_sessions_per_day", 10,
                 ),
                 payable_amount_max_consecutive_errors=_parse_positive_int(
                     fine_monitor_raw, "payable_amount_max_consecutive_errors", 2,
