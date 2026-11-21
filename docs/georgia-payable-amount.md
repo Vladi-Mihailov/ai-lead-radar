@@ -281,22 +281,38 @@ plus notes:
 
 **«📊 Статистика»:**
 
-- **Header:** «🔴 Неоплачено: N штрафов» (count only), then «💰 К оплате: X ₾»
-  with one «🕒 Суммы уточнены …». That date is the earliest of the readings,
-  and it is shown only when every payable receipt has a current amount.
-  Otherwise «💰 Сумма к оплате: X ₾» with no date: the known Georgian Card
-  amounts plus the original amounts of the rest. There is no separate line
-  about unrefined receipts (owner's decision, 2026-11-21).
-- **Per car:** «🚗 Автомобиль», «🧾 Штрафы: 3 шт. — 150 ₾», then «💰 К оплате»
-  if every fine of the car is refined, otherwise «💰 Сумма к оплате», with no
-  date; then the 🟡/🟢 lines and the users as before.
+- **Header:** «🔴 Неоплачено: N штрафов» (count only), then «💰 Сумма к оплате:
+  X ₾»: for each unpaid fine its current Georgian Card amount when known,
+  otherwise the original amount. When every payable receipt has a current
+  amount, one «🕒 Суммы уточнены …» follows (the earliest of the readings).
+  Then the 🟡 count (when above zero) and «🟢 Оплачено: X ₾ (N шт.)». There is
+  no separate line about unrefined receipts and never «Предварительно к
+  оплате» (owner's decision, 2026-11-21).
+- **Per car:** «🚗 Госномер», «🔴 Неоплачено: 3 штрафа — 150 ₾» (original
+  amounts), «💰 Сумма к оплате: 450 ₾» (same rule, no date), then the 🟡/🟢
+  lines and the users as before.
+- Example:
+
+  ```
+  🚨 Штрафы по последней проверке
+  Автомобили со штрафами: 33
+  🔴 Неоплачено: 67 штрафов
+  💰 Сумма к оплате: 4820 ₾
+  🟢 Оплачено: 0 ₾ (0 шт.)
+
+  🚗 Госномер: AA111BB
+  🔴 Неоплачено: 1 штраф — 100 ₾
+  💰 Сумма к оплате: 300 ₾
+  👤 Пользователь не привязан
+  ```
 - A Georgian Card amount is current if it was read after the start of the
   latest control period that has begun.
 - Paid fines are not in «К оплате». The original and the refined amount of one
   receipt are never added together (the refined one already includes the
   original). The preliminary total is the known amounts plus the original
   amounts of the rest, a lower bound.
-- Hidden lines (⏳, subscription counts) stay hidden.
+- Hidden lines (⏳, subscription counts, police.ge base date, evening recheck,
+  ℹ️ notes) stay hidden.
 
 ## Notifications
 

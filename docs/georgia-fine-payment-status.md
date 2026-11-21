@@ -171,23 +171,26 @@ Where statuses are shown:
   - the «💳 Оплатить в рублях» button disappears when no fine is left in «К
     оплате».
 - «📊 Статистика»:
-  - «🔴 Неоплачено: 6 штрафов — 295 ₾» is 🔴 plus 🟡 (payment not
-    confirmed), the same rule as the per-car «🔴 Неоплачено» lines, so those
-    add up to it. When some cars' counts are unknown (saved totals, below),
+  - «🔴 Неоплачено: 6 штрафов» is 🔴 plus 🟡 (payment not confirmed), the
+    same rule as the per-car «🔴 Неоплачено» lines, so those add up to it;
+    under it «💰 Сумма к оплате: 295 ₾» (see georgia-payable-amount.md). When some cars' counts are unknown (saved totals, below),
     the number is a lower bound and reads «не менее 3 штрафов». Under it,
     «🟡 Из них требуют проверки: 3 штрафа» is a count only (its sum is already
     in 🔴), with no line at all when nothing needs review. Paid but still
-    listed (🟢) has its own line and is not part of 🔴. ⏳ history is not
-    shown, neither as a count nor as a sum;
+    listed (🟢) has its own line, «🟢 Оплачено: 85 ₾ (2 шт.)», and is not
+    part of 🔴. ⏳ history is not shown, neither as a count nor as a sum. The
+    police.ge base date, the evening recheck and the ℹ️ notes are not shown
+    either (owner's decision, 2026-11-21);
   - «Автомобили со штрафами» counts every car in the list, cars with only 🟢
     fines included. No 🟢 status is added to «🔴 Неоплачено». The one
     exception is a saved total the statuses do not explain (next bullet but
     one): it is shown whole, and it may include a receipt marked 🟢, until
     the next full check (known limitation, issue #62);
   - per-car lines give the number of fines and their sum, each line only when
-    its number is above zero: «🔴 Неоплачено» is 🔴 plus 🟡, then «🟡 Из них
-    требуют проверки» and «🟢 Оплачено» (not part of the unpaid sum), for
-    example «🔴 Неоплачено: 3 штрафа — 150 ₾». ⏳ receipts get no line. A car
+    its number is above zero: «🚗 Госномер», «🔴 Неоплачено» (🔴 plus 🟡),
+    «💰 Сумма к оплате», then «🟡 Из них требуют проверки» and «🟢 Оплачено»
+    (not part of the unpaid sum), for example «🔴 Неоплачено: 3 штрафа — 150
+    ₾». ⏳ receipts get no line. A car
     with only 🟢 has just its 🟢 line. A car whose receipts are all ⚪ is not
     shown, even if an old task still has a positive total, and neither is a
     car with only ⏳ receipts;
