@@ -1478,10 +1478,10 @@ class ConversationController:
         self, debt_groups: list,
     ) -> tuple[list[tuple[str, float, DebtBreakdown | None]], DebtBreakdown]:
         """Строки debt-списка по статусам оплаты: машины с положительным
-        снимком долга И машины, у которых есть штрафы в базе полиции по
-        статусам (например, только что найденные feed'ом или уже
-        оплаченные, но ещё видимые). Порядок — подтверждённый долг, затем
-        неопределённый статус, затем оплаченное."""
+        снимком долга И машины с неоплаченными (🔴/🟡) штрафами в базе
+        полиции по статусам (например, только что найденными feed'ом).
+        Машины только с оплаченными (🟢) не показываются. Порядок — долг по
+        убыванию, затем оплаченное, затем номер."""
         assert self._fine_status is not None
         snapshot_totals = {group.car_number: group.total_amount for group in debt_groups}
         snapshot_times = {group.car_number: group.checked_at for group in debt_groups}
@@ -1514,6 +1514,11 @@ class ConversationController:
                     unverified_amount=breakdown.unverified_amount,
                     unverified_count=breakdown.unverified_count,
                 ))
+                continue
+            elif breakdown.unpaid_count + breakdown.needs_review_count == 0:
+                # Только оплаченные (🟢): оплаченные в статистику не входят
+                # (решение владельца 2026-11-21) — машины нет ни в списке, ни
+                # в «Автомобили со штрафами».
                 continue
             rows.append((car_number, snapshot, breakdown))
             totals = totals.add(breakdown)

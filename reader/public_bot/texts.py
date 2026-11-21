@@ -31,14 +31,12 @@ from reader.public_bot.delivery_texts import format_check_now_fines_message
 from reader.public_bot.full_check_service import FullCheckOutcome
 from reader.public_bot.models import FineMonitoringSubscription
 from reader.public_bot.payable_amount_texts import (
-    AMOUNTS_FOOTNOTE,
     AmountSummary,
     ReceiptAmount,
     format_fine_payable_line,
     format_fines_line,
-    format_header_payable_lines,
     format_payable_lines,
-    format_statistics_row_payable_line,
+    format_refreshed_at,
     summarize,
 )
 from reader.public_bot.statistics_service import BotStatistics
@@ -1090,48 +1088,33 @@ def format_debt_row(
     прежняя строка "💰 Задолженность" с суммой снимка: числа штрафов там
     нет, и оплату такой режим не различает.
 
-    amounts (сумма к оплате включена, только вместе с breakdown) —
-        🚗 Автомобиль: <номер>
-        🧾 Штрафы: 3 шт. — 150 ₾  (исходные суммы 🔴 и 🟡)
-        💰 К оплате: 450 ₾  (или «требуется уточнение» / «Предварительно»)
-    без даты (она одна, в шапке); строки 🟡/🟢 и пользователи — как раньше.
-    SnapshotDebt — прежняя строка суммы снимка и «требуется уточнение»."""
+    Со статусами (breakdown) — компактно (решение владельца 2026-11-21):
+        🚗 Госномер: <номер>
+        🔴 Неоплачено: 3 штрафа — 150 ₾   (исходные суммы 🔴 и 🟡)
+        💰 Сумма к оплате: 450 ₾          (Georgian Card, где известна, иначе исходная)
+        👤 Пользователь / 🔗 Telegram
+    без строк 🟡/🟢 и без даты (статусы и расчёт не меняются). amounts None
+    (сумма к оплате выключена) — сумма к оплате равна исходной. SnapshotDebt —
+    прежняя строка суммы снимка и та же сумма к оплате."""
     if breakdown is None:
         lines = [
             f"🚗 Госномер: {format_plate_for_telegram(car_number)}",
             f"💰 Задолженность: {_format_search_amount(total_amount)}",
         ]
-    elif amounts is not None:
-        lines = [f"🚗 Автомобиль: {format_plate_for_telegram(car_number)}"]
-        debt_amount = breakdown.unpaid_amount + breakdown.needs_review_amount
-        if isinstance(breakdown, SnapshotDebt):
-            lines.append(f"🔴 Неоплачено: {_format_search_amount(debt_amount)} {_DEBT_COUNT_UNKNOWN_NOTE}")
-        elif amounts.count:
-            lines.append(format_fines_line(amounts.count, amounts.base_total))
-        if amounts.count:
-            lines.append(format_statistics_row_payable_line(amounts))
-        if breakdown.needs_review_count:
-            lines.append(
-                "🟡 Из них требуют проверки: "
-                f"{_format_fine_count_and_amount(breakdown.needs_review_count, breakdown.needs_review_amount)}"
-            )
-        if breakdown.paid_count:
-            lines.append(f"🟢 Оплачено: {_format_fine_count_and_amount(breakdown.paid_count, breakdown.paid_amount)}")
     else:
+        # Компактно (решение владельца 2026-11-21): исходные суммы
+        # неоплаченных (🔴 и 🟡) и сумма к оплате — Georgian Card, где известна,
+        # иначе исходная; строк 🟡/🟢 нет (статусы не меняются).
         lines = [f"🚗 Госномер: {format_plate_for_telegram(car_number)}"]
         debt_count = breakdown.unpaid_count + breakdown.needs_review_count
         debt_amount = breakdown.unpaid_amount + breakdown.needs_review_amount
+        payable = amounts.preliminary_total if amounts is not None and amounts.count else debt_amount
         if isinstance(breakdown, SnapshotDebt):
             lines.append(f"🔴 Неоплачено: {_format_search_amount(debt_amount)} {_DEBT_COUNT_UNKNOWN_NOTE}")
         elif debt_count:
             lines.append(f"🔴 Неоплачено: {_format_fine_count_and_amount(debt_count, debt_amount)}")
-        if breakdown.needs_review_count:
-            lines.append(
-                "🟡 Из них требуют проверки: "
-                f"{_format_fine_count_and_amount(breakdown.needs_review_count, breakdown.needs_review_amount)}"
-            )
-        if breakdown.paid_count:
-            lines.append(f"🟢 Оплачено: {_format_fine_count_and_amount(breakdown.paid_count, breakdown.paid_amount)}")
+        if debt_count or isinstance(breakdown, SnapshotDebt):
+            lines.append(f"💰 Сумма к оплате: {_format_search_amount(payable)}")
     if not owners:
         lines.append(DEBT_OWNER_NOT_LINKED_LINE)
     for owner in owners:
@@ -1172,73 +1155,45 @@ def _russian_plural(count: int, one: str, few: str, many: str) -> str:
 
 
 def format_debt_status_summary_block(
-    *, car_count: int, totals: DebtBreakdown, source_updated_on: date | None, recheck_line: str | None,
+    *, car_count: int, totals: DebtBreakdown, source_updated_on: date | None = None, recheck_line: str | None = None,
     debt_count_is_lower_bound: bool = False, amounts: AmountSummary | None = None, tz: ZoneInfo | None = None,
 ) -> str:
-    """Заголовок "🚨 Штрафы по последней проверке", когда ведутся статусы
-    оплаты (см. задачу: "отдельно показывать подтверждённую задолженность,
-    оплаченные штрафы и случаи с неопределённым статусом").
+    """Заголовок "🚨 Штрафы по последней проверке", компактно (решение
+    владельца 2026-11-21 — без технических показателей):
+        🚨 Штрафы по последней проверке
+        Автомобили со штрафами: 2
+        🔴 Неоплачено: 4 штрафа
+        💰 Сумма к оплате: 550 ₾
+    и «🕒 Суммы уточнены …» — только когда суммы Georgian Card известны по
+    всем неоплаченным штрафам.
 
-    "🔴 Неоплачено" — 🔴 и 🟡 вместе (оплата не подтверждена), то же правило,
-    что у строки "🔴 Неоплачено" в блоке машины (format_debt_row): суммы
-    машин складываются ровно в эту сумму. debt_count_is_lower_bound — у
-    части машин число штрафов неизвестно (SnapshotDebt, каждая посчитана
-    одним штрафом): тогда "не менее N штрафов", нижняя граница не выдаётся
-    за точное число.
+    "🔴 Неоплачено" — число 🔴 и 🟡 вместе (оплата не подтверждена);
+    debt_count_is_lower_bound — у части машин число штрафов неизвестно
+    (SnapshotDebt): "не менее N штрафов". "💰 Сумма к оплате" — по
+    штрафу сумма Georgian Card, если известна, иначе исходная (amounts.
+    preliminary_total); без суммы к оплате (amounts None) — исходные суммы
+    🔴 и 🟡. Оплаченные (🟢) не входят; исходная и уточнённая суммы одного
+    штрафа не складываются.
 
-    🟡 — подмножество строки 🔴 ("Из них"), компактно: только число штрафов
-    без суммы (их сумма уже внутри 🔴 и второй раз не прибавляется), и только
-    когда оно больше нуля: при нуле строки нет вовсе. Суммы 🟡 остаются в
-    блоках машин и на экране "🧾 Статусы оплаты". 🟢 в 🔴 не входит. ⏳
-    (неподтверждённые квитанции из истории) здесь не показываются ни числом,
-    ни суммой: это не долг и не повод для отдельных запросов к police.ge.
-
-    amounts (сумма к оплате включена) — «🔴 Неоплачено» только числом, под ним
-    «💰 К оплате» по суммам Georgian Card с одной датой «🕒 Суммы уточнены»,
-    если актуальны все суммы, иначе «Предварительно к оплате» и сколько
-    штрафов требуют уточнения (format_header_payable_lines)."""
+    Больше не показываются (только отображение — данные, статусы и фоновые
+    проверки не меняются): строки 🟡 и 🟢, дата обновления базы police.ge
+    (source_updated_on), вечерняя перепроверка (recheck_line) и пояснения ℹ️."""
     debt_count = totals.unpaid_count + totals.needs_review_count
     debt_amount = totals.unpaid_amount + totals.needs_review_amount
     if debt_count_is_lower_bound:
         # "не менее" — родительный падеж: не менее 1 штрафа, 2 штрафов, 5 штрафов
-        debt_text = (
-            f"не менее {debt_count} {_russian_plural(debt_count, 'штрафа', 'штрафов', 'штрафов')}"
-            f" — {_format_search_amount(debt_amount)}"
-        )
+        count_text = f"не менее {debt_count} {_russian_plural(debt_count, 'штрафа', 'штрафов', 'штрафов')}"
     else:
-        debt_text = _format_fine_count_and_amount(debt_count, debt_amount)
-    if amounts is not None and tz is not None:
-        if debt_count_is_lower_bound:
-            debt_text = f"не менее {debt_count} {_russian_plural(debt_count, 'штрафа', 'штрафов', 'штрафов')}"
-        else:
-            debt_text = f"{debt_count} {_russian_plural(debt_count, 'штраф', 'штрафа', 'штрафов')}"
+        count_text = f"{debt_count} {_russian_plural(debt_count, 'штраф', 'штрафа', 'штрафов')}"
+    total = amounts.preliminary_total if amounts is not None and amounts.count else debt_amount
     lines = [
         "🚨 Штрафы по последней проверке",
         f"Автомобили со штрафами: {car_count}",
-        f"🔴 Неоплачено: {debt_text}",
+        f"🔴 Неоплачено: {count_text}",
+        f"💰 Сумма к оплате: {_format_search_amount(total)}",
     ]
-    if amounts is not None and tz is not None:
-        lines.extend(format_header_payable_lines(amounts, tz=tz))
-    if totals.needs_review_count:
-        review_count = totals.needs_review_count
-        lines.append(
-            "🟡 Из них требуют проверки: "
-            f"{review_count} {_russian_plural(review_count, 'штраф', 'штрафа', 'штрафов')}"
-        )
-    lines.append(
-        f"🟢 Оплачено, ещё в базе полиции: {_format_search_amount(totals.paid_amount)}"
-        f" ({totals.paid_count} шт.)"
-    )
-    if source_updated_on is not None:
-        lines.append(f"🗓 База police.ge обновлена: {_fmt_date(source_updated_on)}")
-    if recheck_line:
-        lines.append(recheck_line)
-    lines.extend([
-        "",
-        "ℹ️ 🟢 — оплата подтверждена, police.ge ещё показывает штраф. 🟡 — оплата не прошла, долг не снят.",
-    ])
-    if amounts is not None and tz is not None:
-        lines.append(AMOUNTS_FOOTNOTE)
+    if amounts is not None and tz is not None and amounts.all_known and amounts.oldest_observed_at is not None:
+        lines.append(format_refreshed_at(amounts.oldest_observed_at, tz=tz, plural=amounts.count > 1))
     return "\n".join(lines)
 
 
