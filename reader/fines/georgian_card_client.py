@@ -85,7 +85,8 @@ _START_BODY_KEYS = frozenset({
 _SETTINGS_BASE_RE = re.compile(r"openApi\s*:\s*\{[^}]*?baseUrl\s*:\s*[\"']([^\"']+)[\"']", re.DOTALL)
 _SETTINGS_VERSION_RE = re.compile(r"openApi\s*:\s*\{[^}]*?version\s*:\s*[\"'](v[0-9]{1,2})[\"']", re.DOTALL)
 _SETTINGS_PORTAL_RE = re.compile(rf"openApi\s*:\s*\{{[^}}]*?portal\s*:\s*[\"']({_API_ID})[\"']", re.DOTALL)
-_WAF_MARKERS = ("The URL you requested has been blocked", "Attack ID")
+_WAF_MARKERS = ("The URL you requested has been blocked", "Attack ID", "cf-chl-", "Just a moment...",
+                "Attention Required! | Cloudflare")
 _URL_RE = re.compile(r"https?://\S+|[?&][\w.]+=\S*", re.IGNORECASE)
 # Только буквы: коды приходят от шлюза, цифры могли бы оказаться номером
 # квитанции или госномера.
@@ -244,6 +245,8 @@ def _guard_request(method: str, url: str, *, gc_host: str, json_body: dict | Non
     if method == "GET":
         if json_body is not None:
             raise GeorgianCardSafetyError("get_body")
+        if not parts.path.startswith("/page1/"):
+            raise GeorgianCardSafetyError("get_path")
         return
     if method != "POST" or parts.query:
         raise GeorgianCardSafetyError("method_or_path")
@@ -306,15 +309,30 @@ def _json_strings(value) -> list[str]:
     return []
 
 
+_URL_KEYS = frozenset({"returnurl", "back_url_s", "back_url_f", "backurl", "url", "redirecturl"})
+
+
+def _receipt_locations(payload, protocol_no: str, prefix: str = "") -> list[str]:
+    """Пути полей ответа, где названа квитанция. Ссылки (returnUrl,
+    back_url_*, любое значение с "://" или "id=") — наши же параметры и не
+    считаются."""
+    found: list[str] = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            path = f"{prefix}{key}"
+            if str(key).lower() in _URL_KEYS:
+                continue
+            found.extend(_receipt_locations(value, protocol_no, f"{path}."))
+            if isinstance(value, str) and "://" not in value and "id=" not in value and _mentions_receipt(value, protocol_no):
+                found.append(path)
+    elif isinstance(payload, list):
+        for index, value in enumerate(payload):
+            found.extend(_receipt_locations(value, protocol_no, f"{prefix}{index}."))
+    return found
+
+
 def _json_mentions_receipt(payload, protocol_no: str) -> bool:
-    """Квитанция названа в значении ответа — не в ссылке (back_url_f,
-    returnUrl — наши же параметры)."""
-    for text in _json_strings(payload):
-        if "://" in text or "protocolId" in text or "id=" in text:
-            continue
-        if _mentions_receipt(text, protocol_no):
-            return True
-    return False
+    return bool(_receipt_locations(payload, protocol_no))
 
 
 def _find_key(payload, names: tuple[str, ...]):
@@ -336,12 +354,48 @@ def _find_key(payload, names: tuple[str, ...]):
     return None
 
 
+def _amount_values(payload, prefix: str = "", depth: int = 0) -> list[tuple[str, object]]:
+    found: list[tuple[str, object]] = []
+    if depth > 4:
+        return found
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            path = f"{prefix}{key}"
+            if str(key).lower() == "amount" and not isinstance(value, (dict, list)):
+                found.append((path, value))
+            else:
+                found.extend(_amount_values(value, f"{path}.", depth + 1))
+    elif isinstance(payload, list):
+        for index, value in enumerate(payload):
+            found.extend(_amount_values(value, f"{prefix}{index}.", depth + 1))
+    return found
+
+
+def _pick_amount(payload) -> tuple[str | None, object, bool]:
+    """(путь, значение, однозначно ли): amount верхнего уровня; иначе — только
+    если во всём ответе одно значение amount (несколько разных — разбивка,
+    например, сумма и комиссия: брать первое попавшееся нельзя)."""
+    if isinstance(payload, dict) and "amount" in payload and not isinstance(payload["amount"], (dict, list)):
+        return "amount", payload["amount"], True
+    values = _amount_values(payload)
+    if not values:
+        return None, None, True
+    distinct = {str(value) for _, value in values}
+    return values[0][0], values[0][1], len(distinct) == 1
+
+
 def _sanitize_state(value) -> str:
     return _STATE_SAFE_RE.sub("", str(value).lower())[:20] or "empty"
 
 
+_ERROR_CODE_RE = re.compile(r"^[A-Z][A-Z_]{2,39}$")
+
+
 def _sanitize_error(value) -> str:
-    return _ERROR_SAFE_RE.sub("", str(value))[:40] or "empty"
+    """Код ошибки шлюза — только если это целиком код вида RESTRICTED_BY_REGULATOR;
+    иначе 'other' (в произвольном тексте могли бы быть буквы госномера)."""
+    text = str(value).strip()
+    return text if _ERROR_CODE_RE.match(text) else "other"
 
 
 def _key_shape(payload, prefix: str = "", depth: int = 0) -> list[str]:
@@ -380,6 +434,18 @@ def _amount_from(raw, unit: str) -> float | None:
     if amount is not None and unit == AMOUNT_UNIT_MINOR:
         amount = amount / 100.0
     return amount
+
+
+def _blocked_detail(response, step: str) -> str | None:
+    """Ответ шлюза-защиты на любом шаге (403/429, страница WAF/Cloudflare) —
+    исход blocked: не обходить, приостановить сессии."""
+    if response.status_code in (403, 429):
+        return f"{step}_http_{response.status_code}"
+    if "html" in response.headers.get("content-type", "").lower():
+        text = response.text[:200_000]
+        if any(marker in text for marker in _WAF_MARKERS):
+            return f"{step}_waf_block"
+    return None
 
 
 class GeorgianCardAmountClient:
@@ -482,8 +548,10 @@ class GeorgianCardAmountClient:
 
         # 2. Адрес API и portal — из settings.js, который загружает страница.
         settings_response = await self._send(client, "GET", f"{self._config.base_url.rstrip('/')}/page1/settings.js")
-        if settings_response.status_code in (403, 429):
-            return AmountQuote(OUTCOME_BLOCKED, detail=f"settings_http_{settings_response.status_code}")
+        blocked = _blocked_detail(settings_response, "settings")
+        if blocked:
+            trace.append(f"settings {blocked}")
+            return AmountQuote(OUTCOME_BLOCKED, detail=blocked)
         settings_text = settings_response.text[:200_000]
         base = _SETTINGS_BASE_RE.search(settings_text)
         version = _SETTINGS_VERSION_RE.search(settings_text)
@@ -497,9 +565,10 @@ class GeorgianCardAmountClient:
 
         # 3. Токен платёжной сессии.
         token_response = await self._send(client, "POST", f"{api_base}/token", referer=page_url)
-        if token_response.status_code in (403, 429):
-            trace.append(f"token http {token_response.status_code}")
-            return AmountQuote(OUTCOME_BLOCKED, detail=f"token_http_{token_response.status_code}")
+        blocked = _blocked_detail(token_response, "token")
+        if blocked:
+            trace.append(f"token {blocked}")
+            return AmountQuote(OUTCOME_BLOCKED, detail=blocked)
         try:
             token_payload = token_response.json()
         except ValueError:
@@ -518,25 +587,35 @@ class GeorgianCardAmountClient:
         start_response = await self._send(
             client, "POST", f"{api_base}/payment/{token}/start", json_body=body, referer=page_url,
         )
-        if start_response.status_code in (403, 429):
-            trace.append(f"start http {start_response.status_code}")
-            return AmountQuote(OUTCOME_BLOCKED, detail=f"start_http_{start_response.status_code}")
+        blocked = _blocked_detail(start_response, "start")
+        if blocked:
+            trace.append(f"start {blocked}")
+            return AmountQuote(OUTCOME_BLOCKED, detail=blocked)
         try:
             payload = start_response.json()
         except ValueError:
             trace.append(f"start http {start_response.status_code}, not json")
             return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="start_not_json")
-        state = _find_key(payload, ("state",))
-        raw_amount = _find_key(payload, ("amount",))
-        currency = _find_key(payload, ("currency",))
+        state = payload.get("state") if isinstance(payload, dict) else None
+        if state is None:
+            state = _find_key(payload, ("state",))
+        amount_path, raw_amount, amount_unambiguous = _pick_amount(payload)
+        currency = payload.get("currency") if isinstance(payload, dict) and "currency" in payload else _find_key(
+            payload, ("currency",),
+        )
         currency = str(currency).strip().upper() if currency is not None else None
         amount = _amount_from(raw_amount, self._config.amount_unit)
-        receipt_in_answer = _json_mentions_receipt(payload, protocol_no)
+        receipt_paths = _receipt_locations(payload, protocol_no)
+        receipt_in_answer = bool(receipt_paths)
+        shown_amount = raw_amount if isinstance(raw_amount, (int, float)) and not isinstance(raw_amount, bool) else (
+            raw_amount if isinstance(raw_amount, str) and re.fullmatch(r"[0-9.,]{1,12}", raw_amount) else "-"
+        )
         trace.append(
             f"start http {start_response.status_code}, keys {_key_shape(payload)}, "
             f"state {_sanitize_state(state) if state is not None else '-'}, "
-            f"amount {raw_amount if isinstance(raw_amount, (int, float)) and not isinstance(raw_amount, bool) else '-'}, "
-            f"currency {currency if currency and re.fullmatch(r'[A-Z0-9]{3}', currency) else '-'}, receipt in answer {'yes' if receipt_in_answer else 'no'}"
+            f"amount {shown_amount} at {amount_path or '-'}{'' if amount_unambiguous else ' (several different amounts)'}, "
+            f"currency {currency if currency and re.fullmatch(r'[A-Z0-9]{3}', currency) else '-'}, "
+            f"receipt in answer at {', '.join(receipt_paths[:5]) if receipt_paths else 'nowhere'}"
         )
         if start_response.status_code != 200:
             error = _find_key(payload, ("error", "code"))
@@ -557,6 +636,8 @@ class GeorgianCardAmountClient:
             return AmountQuote(OUTCOME_REFUSED, detail="state_result")
         if state_text != "offer":
             return AmountQuote(OUTCOME_INVALID_RESPONSE, detail=f"state_{_sanitize_state(state_text)}")
+        if not amount_unambiguous:
+            return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="amount_ambiguous")
         if amount is None:
             return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="amount_not_found")
         if currency is None or not _is_gel(currency):

@@ -205,11 +205,12 @@ def test_unknown_state_is_not_an_amount():
     assert quote.outcome == OUTCOME_INVALID_RESPONSE and quote.detail == "state_iframe"
 
 
-def test_start_error_is_reported_without_digits():
-    gateway = _Gateway(start=lambda request: httpx.Response(400, json={"error": f"BAD_ORDER {_RECEIPT}"}))
+def test_start_error_is_reported_only_as_a_known_code():
+    gateway = _Gateway(start=lambda request: httpx.Response(400, json={"error": f"BAD_ORDER {_RECEIPT} {_CAR}"}))
     quote = _fetch(gateway)
-    assert quote.outcome == OUTCOME_INVALID_RESPONSE
-    assert quote.detail.startswith("start_http_400_") and "0099887766" not in quote.detail
+    assert quote.outcome == OUTCOME_INVALID_RESPONSE and quote.detail == "start_http_400_other"
+    gateway = _Gateway(start=lambda request: httpx.Response(400, json={"error": "RESTRICTED_BY_REGULATOR"}))
+    assert _fetch(gateway).detail == "start_http_400_RESTRICTED_BY_REGULATOR"
 
 
 @pytest.mark.parametrize("step", ["page1", "settings", "token", "start"])
@@ -366,3 +367,53 @@ def test_trace_and_detail_never_contain_the_plate_receipt_or_token():
         for secret in ("AA111BB", _TOKEN, "0099887766"):
             assert secret not in text
     assert any("state offer" in step and "amount 15000" in step for step in _fetch(_Gateway()).trace)
+
+
+# ---- После второго review ----
+
+
+def test_nested_breakdown_with_several_amounts_is_rejected_not_guessed():
+    gateway = _Gateway(start=lambda request: httpx.Response(200, json={
+        "state": "offer", "currency": "981", "description": f"N {_RECEIPT}",
+        "items": [{"amount": 5000}, {"amount": 500}],
+    }))
+    quote = _fetch(gateway)
+    assert quote.outcome == OUTCOME_INVALID_RESPONSE and quote.detail == "amount_ambiguous"
+
+
+def test_top_level_amount_wins_over_nested_ones():
+    gateway = _Gateway(start=lambda request: httpx.Response(200, json=_offer(
+        amount=30000, descriptionParams={"amount": 100}, options={"x": {"amount": 1}},
+    )))
+    quote = _fetch(gateway, base_amount=100.0)
+    assert (quote.outcome, quote.amount) == (OUTCOME_OK, 300.0)
+
+
+def test_trace_shows_where_the_amount_and_the_receipt_were_found():
+    gateway = _Gateway(start=lambda request: httpx.Response(200, json={
+        "state": "offer", "amount": 30000, "currency": "981", "params": {"protocolId": _RECEIPT},
+        "returnUrl": f"https://mpi.gc.ge/page1/?o.protocolId={_RECEIPT}",
+    }))
+    quote = _fetch(gateway, base_amount=100.0)
+    start = [step for step in quote.trace if step.startswith("start http")][0]
+    assert "amount 30000 at amount" in start and "receipt in answer at params.protocolId" in start
+    assert "returnUrl" not in start.split("receipt in answer at")[1]
+
+
+@pytest.mark.parametrize("step", ["settings", "token", "start"])
+def test_waf_or_cloudflare_page_at_a_later_step_is_a_block(step):
+    page = lambda request: httpx.Response(  # noqa: E731
+        503, text="<html><title>Just a moment...</title>cf-chl-</html>", headers={"content-type": "text/html"},
+    )
+    quote = _fetch(_Gateway(**{step: page}))
+    assert quote.outcome == OUTCOME_BLOCKED and quote.detail == f"{step}_waf_block"
+
+
+def test_get_outside_the_payment_page_is_refused():
+    with pytest.raises(GeorgianCardSafetyError):
+        _guard_request("GET", "https://mpi.gc.ge/open/api//v4/P/payment/TOKEN12345/accept", gc_host="mpi.gc.ge",
+                       json_body=None)
+    gateway = _Gateway(page1=lambda request: httpx.Response(302, headers={"location": "https://mpi.gc.ge/admin/x"}))
+    quote = _fetch(gateway)
+    assert quote.outcome == OUTCOME_ERROR and quote.detail == "safety_get_path"
+    assert len(gateway.requests) == 1

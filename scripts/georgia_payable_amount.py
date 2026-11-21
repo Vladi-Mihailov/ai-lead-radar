@@ -76,7 +76,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--merchant-id", default=None, help="fetch: merch_id МВД для этого запуска (вместо config).")
     parser.add_argument("--page-id", default=None, help="fetch: page_id МВД для этого запуска (вместо config).")
     parser.add_argument("--config", default=None,
-                        help="config.yaml (по умолчанию — из этого checkout); его каталог задаёт БД и .env.")
+                        help="config.yaml (по умолчанию — из этого checkout); от его каталога считается путь к БД.")
     return parser.parse_args(argv)
 
 
@@ -186,6 +186,11 @@ def _fetch(ctx: _Context, car_number: str, protocol_no: str, *, execute: bool) -
     if not ctx.client.configured:
         print("Georgian Card не настроен (payable_amount_gc_merchant_id/page_id) — сессия невозможна.")
         return 1
+    pilots = [check for check in ctx.amounts.checks_for_receipt(car_number, protocol_no) if check.trigger == TRIGGER_PILOT]
+    if pilots:
+        print(f"Пилот по этой квитанции уже был ({pilots[-1].started_at:%Y-%m-%d %H:%M} UTC, исход {pilots[-1].outcome}) — "
+              "повторная сессия не открывается.")
+        return 1
     if not execute:
         print("\nDry-run — ни одного запроса не отправлено. С --execute будет открыта ОДНА сессия Georgian Card "
               "(без карты и оплаты), сумма сохранится молча.")
@@ -210,6 +215,9 @@ def _fetch(ctx: _Context, car_number: str, protocol_no: str, *, execute: bool) -
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.config and not Path(args.config).is_file():
+        print(f"config не найден: {args.config}", file=sys.stderr)
+        return 1
     ctx = _Context(
         merchant_id=args.merchant_id, page_id=args.page_id,
         config_path=Path(args.config) if args.config else CONFIG_PATH,
