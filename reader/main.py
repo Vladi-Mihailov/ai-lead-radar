@@ -44,6 +44,7 @@ from reader.dm_campaigns.sender_state import DmSenderStateRepository  # noqa: E4
 from reader.dm_campaigns.source_access import DmSourceAccessRepository  # noqa: E402
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
+from reader.fines.notification_control import GeorgiaNotificationControl  # noqa: E402
 from reader.fines.notification_coordinator import FineNotificationCoordinator  # noqa: E402
 from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository  # noqa: E402
 from reader.fines.police_ge_circuit_breaker import PoliceGeCircuitBreaker  # noqa: E402
@@ -138,6 +139,7 @@ def build_fine_monitor_components(
     plate_bootstrap_repository: GeorgiaPlateBootstrapRepository | None = None,
     feed_state_repository: GeorgiaPublicFeedStateRepository | None = None,
     feed_seen_repository: GeorgiaPublicFeedSeenRepository | None = None,
+    notification_control: GeorgiaNotificationControl | None = None,
 ) -> tuple[FineJob, Scheduler, TelegramNotificationService, CommandDispatcher, FineCommand]:
     """Чистая сборка зависимостей мониторинга штрафов — без единого await,
     без обращения к сети/Telegram (конструкторы ничего не подключают, только
@@ -173,8 +175,12 @@ def build_fine_monitor_components(
     notification_service = TelegramNotificationService(
         source.client, notification_chat_ids, fine_monitor.source_url
     )
+    # notification_control — пауза и граница уведомлений Грузии (см.
+    # reader/fines/notification_control.py): общая с ботом таблица в той же
+    # БД, читается на каждом flush, поэтому пауза не требует перезапуска.
     notification_coordinator = FineNotificationCoordinator(
-        detected_fine_repository, task_repository, notification_service, user_repository
+        detected_fine_repository, task_repository, notification_service, user_repository,
+        notification_control=notification_control,
     )
 
     # Circuit breaker (см. задачу "back off when police.ge is
@@ -443,6 +449,7 @@ async def _run_fine_monitor(
                 plate_bootstrap_repository=plate_bootstrap_repository,
                 feed_state_repository=feed_state_repository,
                 feed_seen_repository=feed_seen_repository,
+                notification_control=GeorgiaNotificationControl(settings.app.users_db_file),
             )
         )
 

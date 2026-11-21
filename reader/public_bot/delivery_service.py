@@ -23,6 +23,10 @@ from telethon.errors import FloodWaitError
 
 from reader.fines.detected_fine_repository import DetectedFineRepository
 from reader.fines.models import DetectedFine
+from reader.fines.notification_control import (
+    EXCLUSION_KNOWN_BEFORE_BOUNDARY,
+    NotificationControlState,
+)
 from reader.fines.suppression import is_fine_output_suppressed
 from reader.public_bot.delivery_repository import ClientFineDeliveryRepository, RecipientRole
 from reader.public_bot.delivery_texts import (
@@ -80,6 +84,10 @@ def _as_aware_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
+def _as_naive_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is None else value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def _is_due_for_attempt(delivery: ClientFineDelivery | None, *, now: datetime) -> bool:
     """None (ни разу не пытались) — всегда due. Уже доставлено — никогда
     (delivered fine никогда повторно не отправляется — явное требование
@@ -88,7 +96,7 @@ def _is_due_for_attempt(delivery: ClientFineDelivery | None, *, now: datetime) -
     соответствующая пауза из RETRY_BACKOFF."""
     if delivery is None:
         return True
-    if delivery.delivered_at is not None:
+    if delivery.delivered_at is not None or delivery.excluded_at is not None:
         return False
     if delivery.attempt_count >= MAX_DELIVERY_ATTEMPTS:
         return False
@@ -120,6 +128,18 @@ class FineStatusLookupLike(Protocol):
     def undeliverable_protocols(self, car_number: str) -> set[str]: ...
 
 
+class NotificationControlLike(Protocol):
+    """Ровно то, что нужно отсюда от GeorgiaNotificationControl (см.
+    reader/fines/notification_control.py)."""
+
+    def state(self) -> NotificationControlState: ...
+
+    def known_before(
+        self, boundary_at: datetime, *, car_number: str, protocol_no: str | None,
+        row_first_detected_at: datetime | None,
+    ) -> bool: ...
+
+
 class ClientDeliveryService:
     def __init__(
         self,
@@ -131,7 +151,10 @@ class ClientDeliveryService:
         tz: ZoneInfo,
         payment_help_contact_username: str = "tplgee",
         status_lookup: FineStatusLookupLike | None = None,
+        notification_control: NotificationControlLike | None = None,
     ):
+        # None — пауза и граница уведомлений не ведутся (прежнее поведение).
+        self._notification_control = notification_control
         # None — статусы оплаты не ведутся: дедуп по квитанции работает,
         # пропуска исчезнувших из базы полиции квитанций нет.
         self._status_lookup = status_lookup
@@ -156,6 +179,13 @@ class ClientDeliveryService:
         # того, вызван ли этот метод.
         self._subscription_repository.expire_elapsed(today=today)
 
+        control = self._notification_control.state() if self._notification_control is not None else None
+        if control is not None and control.paused:
+            # Пауза уведомлений Грузии (см. reader/fines/notification_control.py):
+            # ни попыток, ни отметок — неотправленное остаётся неотправленным.
+            return DeliveryTickResult(delivered=0, failed=0, flood_wait_hit=False)
+        boundary_at = control.boundary_at if control is not None else None
+
         delivered = 0
         failed = 0
 
@@ -171,14 +201,24 @@ class ClientDeliveryService:
                 continue
             fines = self._deliverable_fines(subscription)
             delivered_protocols = (
-                self._delivery_repository.delivered_protocols(subscription.id) if fines else {}
+                self._delivery_repository.handled_protocols(subscription.id) if fines else {}
             )
             for fine in fines:
                 for role in _applicable_roles(subscription):
                     if fine.external_fine_id and fine.external_fine_id in delivered_protocols.get(role, set()):
-                        # Эта квитанция уже доставлена этому получателю по
-                        # другой строке (другая задача того же номера) —
-                        # второй "🚨 Обнаружен новый штраф" не нужен.
+                        # Эта квитанция уже доставлена (или явно исключена)
+                        # этому получателю по другой строке (другая задача
+                        # того же номера) — второй "🚨 Обнаружен новый штраф"
+                        # не нужен.
+                        continue
+                    if boundary_at is not None and self._known_before_boundary(
+                        fine, subscription, role, boundary_at,
+                    ):
+                        # Квитанция известна с до границы включения
+                        # уведомлений — не новое событие (см.
+                        # reader/fines/notification_control.py).
+                        if fine.external_fine_id:
+                            delivered_protocols.setdefault(role, set()).add(fine.external_fine_id)
                         continue
                     outcome = await self._attempt_delivery(fine, subscription, role, now=now)
                     if outcome == "delivered" and fine.external_fine_id:
@@ -202,6 +242,66 @@ class ClientDeliveryService:
                     # "not_due" — ничего не считаем, это не попытка.
 
         return DeliveryTickResult(delivered=delivered, failed=failed, flood_wait_hit=False)
+
+    def _known_before_boundary(
+        self, fine: DetectedFine, subscription: FineMonitoringSubscription, role: RecipientRole,
+        boundary_at: datetime,
+    ) -> bool:
+        """True — тройку не отправлять: она уже доставлена или исключена,
+        либо квитанцию впервые увидели раньше границы (тогда тройка явно
+        исключается). Доставка квитанции, увиденной после границы, этим не
+        затрагивается — в том числе уже начатая."""
+        existing = self._delivery_repository.get(fine.id, subscription.id, role)
+        if existing is not None and (
+            existing.delivered_at is not None or existing.excluded_at is not None
+            or existing.attempt_count >= MAX_DELIVERY_ATTEMPTS
+        ):
+            # Доставлено, исключено или попытки исчерпаны (история остаётся
+            # как есть, см. exclude_pending) — отправлять нечего.
+            return True
+        first_detected_at = _as_naive_utc(fine.first_detected_at) if fine.first_detected_at else None
+        if not self._notification_control.known_before(
+            boundary_at, car_number=subscription.car_number, protocol_no=fine.external_fine_id,
+            row_first_detected_at=first_detected_at,
+        ):
+            return False
+        self._delivery_repository.exclude(
+            fine.id, subscription.id, role, reason=EXCLUSION_KNOWN_BEFORE_BOUNDARY,
+        )
+        return True
+
+    def exclude_pending(self, *, reason: str, now: datetime | None = None, dry_run: bool = False) -> int:
+        """Явно исключает из рассылки всё, что сейчас ждёт отправки (см.
+        scripts/georgia_notifications.py resume): ещё не доставленные и не
+        исключённые тройки текущих подписок, включая ждущие повтора после
+        неудачи. Исчерпавшие попытки не трогает — они и так больше не
+        отправляются, их история остаётся как есть. ⏳/⚪ сюда не входят (их
+        и сейчас не отправляют); квитанцию, подтверждённую позже, исключит
+        граница при первой встрече. dry_run — только подсчёт."""
+        now = now or datetime.now(timezone.utc)
+        today = now.astimezone(self._tz).date()
+        excluded = 0
+        for subscription in self._subscription_repository.list_all_deliverable(today=today):
+            if is_fine_output_suppressed(subscription.car_number):
+                continue
+            fines = self._deliverable_fines(subscription)
+            handled = self._delivery_repository.handled_protocols(subscription.id) if fines else {}
+            for fine in fines:
+                for role in _applicable_roles(subscription):
+                    if fine.external_fine_id and fine.external_fine_id in handled.get(role, set()):
+                        continue
+                    existing = self._delivery_repository.get(fine.id, subscription.id, role)
+                    if existing is not None and (
+                        existing.delivered_at is not None or existing.excluded_at is not None
+                        or existing.attempt_count >= MAX_DELIVERY_ATTEMPTS
+                    ):
+                        continue
+                    if not dry_run:
+                        self._delivery_repository.exclude(fine.id, subscription.id, role, reason=reason)
+                    if fine.external_fine_id:
+                        handled.setdefault(role, set()).add(fine.external_fine_id)
+                    excluded += 1
+        return excluded
 
     def _deliverable_fines(self, subscription: FineMonitoringSubscription) -> list[DetectedFine]:
         """Строки detected_fines номера подписки, по одной на квитанцию

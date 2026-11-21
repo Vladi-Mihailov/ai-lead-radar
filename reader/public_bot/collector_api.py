@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
+from dataclasses import replace
 
 from aiohttp import web
 from telethon import TelegramClient
@@ -56,7 +58,11 @@ _MAX_REQUEST_BODY_SIZE = 64 * 1024
 
 def build_collector_api_app(
     ingest_service: CollectorIngestService, *, hmac_secret: str, telegram_client: TelegramClient,
+    notification_paused: Callable[[], bool] | None = None,
 ) -> web.Application:
+    """notification_paused — пауза уведомлений Грузии (см. reader/fines/
+    notification_control.py): пока она стоит, "штрафов не найдено" после
+    bootstrap'а не отправляется (bootstrap при этом завершается как обычно)."""
     app = web.Application(
         middlewares=[build_hmac_middleware(hmac_secret)], client_max_size=_MAX_REQUEST_BODY_SIZE,
     )
@@ -99,6 +105,12 @@ def build_collector_api_app(
 
         outcome = await ingest_service.ingest_bootstrap_result(car_number, records, mode=mode)
 
+        if outcome.customer_notify_messages and notification_paused is not None and notification_paused():
+            logger.info(
+                "Georgia collector API: notifications paused, %d 'штрафов не найдено' message(s) not sent",
+                len(outcome.customer_notify_messages),
+            )
+            outcome = replace(outcome, customer_notify_messages=[])
         for chat_id, text in outcome.customer_notify_messages:
             try:
                 await telegram_client.send_message(chat_id, text)
@@ -142,7 +154,7 @@ def build_collector_api_app(
 
 async def run_collector_api_forever(
     ingest_service: CollectorIngestService, *, hmac_secret: str, telegram_client: TelegramClient,
-    host: str, port: int,
+    host: str, port: int, notification_paused: Callable[[], bool] | None = None,
 ) -> None:
     """Одна из корутин reader/public_bot/main.py's _run_concurrently([...])
     (ТОТ ЖЕ приём, что и client.run_until_disconnected()/
@@ -150,6 +162,7 @@ async def run_collector_api_forever(
     scheduler.run_forever() в reader/main.py."""
     app = build_collector_api_app(
         ingest_service, hmac_secret=hmac_secret, telegram_client=telegram_client,
+        notification_paused=notification_paused,
     )
     runner = web.AppRunner(app)
     await runner.setup()

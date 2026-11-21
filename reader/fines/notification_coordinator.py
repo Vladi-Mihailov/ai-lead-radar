@@ -4,10 +4,12 @@
 Ничего не знает про Telegram — только про NotificationService (интерфейс).
 """
 
+from datetime import datetime, timezone
 from typing import Protocol
 
 from reader.fines.detected_fine_repository import DetectedFineRepository
 from reader.fines.models import FineMonitoringTask, NewFineEvent
+from reader.fines.notification_control import EXCLUSION_KNOWN_BEFORE_BOUNDARY, NotificationControlState
 from reader.fines.suppression import is_fine_output_suppressed
 from reader.fines.task_repository import FineMonitoringTaskRepository
 from reader.notifications.base import NotificationResult, NotificationService
@@ -27,6 +29,18 @@ class UserLookupLike(Protocol):
     создал задачу мониторинга, см. докстрок _car_owner_display)."""
 
     def find_by_car_number(self, car_number: str) -> list[TelegramUserInfo]: ...
+
+
+class NotificationControlLike(Protocol):
+    """Ровно то, что нужно отсюда от GeorgiaNotificationControl (см.
+    reader/fines/notification_control.py)."""
+
+    def state(self) -> NotificationControlState: ...
+
+    def known_before(
+        self, boundary_at: datetime, *, car_number: str, protocol_no: str | None,
+        row_first_detected_at: datetime | None,
+    ) -> bool: ...
 
 
 def format_car_owner_display(users: list[TelegramUserInfo]) -> str:
@@ -66,7 +80,11 @@ class FineNotificationCoordinator:
         task_repository: FineMonitoringTaskRepository,
         notification_service: NotificationService,
         user_repository: UserLookupLike | None = None,
+        notification_control: NotificationControlLike | None = None,
     ):
+        # None — пауза и граница уведомлений Грузии не ведутся (прежнее
+        # поведение, см. reader/fines/notification_control.py).
+        self._notification_control = notification_control
         self._detected_fine_repository = detected_fine_repository
         self._task_repository = task_repository
         self._notification_service = notification_service
@@ -80,6 +98,11 @@ class FineNotificationCoordinator:
         """Штрафы с notification_sent_at IS NULL — свежесозданные в этом же
         проходе и оставшиеся с прошлых неудачных попыток одновременно (один
         и тот же признак, отдельной ветки для "повтора" не требуется)."""
+        control = self._notification_control.state() if self._notification_control is not None else None
+        if control is not None and control.paused:
+            # Пауза уведомлений Грузии: ничего не отправляется и ничего не
+            # отмечается — после паузы накопленное явно исключается.
+            return NotificationResult(delivered_event_ids=[], failed_event_ids=[])
         pending = self._detected_fine_repository.list_pending_notifications()
         # Denylisted car_number (см. reader/fines/suppression.py) —
         # исключён здесь на случай, если для него уже существует
@@ -90,6 +113,17 @@ class FineNotificationCoordinator:
         # остаётся pending навсегда — безвредно, просто никогда не
         # отправляется ни одному оператору.
         pending = [fine for fine in pending if not is_fine_output_suppressed(fine.car_number)]
+        if control is not None and control.boundary_at is not None:
+            # Квитанция, известная с до границы включения уведомлений, — не
+            # новый штраф (повторное обнаружение, другая задача номера,
+            # подтверждённая позже ⏳): явно исключается, не отправляется.
+            known = [fine for fine in pending if self._known_before(fine, control.boundary_at)]
+            if known:
+                self._detected_fine_repository.exclude_from_operator_notifications(
+                    [fine.id for fine in known], reason=EXCLUSION_KNOWN_BEFORE_BOUNDARY,
+                )
+                known_ids = {fine.id for fine in known}
+                pending = [fine for fine in pending if fine.id not in known_ids]
         if not pending:
             return NotificationResult(delivered_event_ids=[], failed_event_ids=[])
 
@@ -104,6 +138,30 @@ class FineNotificationCoordinator:
         # вызове flush_pending(), без какой-либо отдельной логики повтора.
 
         return result
+
+    def exclude_pending(self, *, reason: str, dry_run: bool = False) -> int:
+        """Явно исключает из операторской рассылки всё, что сейчас ждёт
+        отправки (см. scripts/georgia_notifications.py resume). Строки
+        скрытых номеров (denylist) не трогает — их и так никогда не
+        отправляют. dry_run — только подсчёт."""
+        pending = [
+            fine for fine in self._detected_fine_repository.list_pending_notifications()
+            if not is_fine_output_suppressed(fine.car_number)
+        ]
+        if dry_run:
+            return len(pending)
+        return self._detected_fine_repository.exclude_from_operator_notifications(
+            [fine.id for fine in pending], reason=reason,
+        )
+
+    def _known_before(self, fine, boundary_at: datetime) -> bool:
+        first_detected_at = fine.first_detected_at
+        if first_detected_at is not None and first_detected_at.tzinfo is not None:
+            first_detected_at = first_detected_at.astimezone(timezone.utc).replace(tzinfo=None)
+        return self._notification_control.known_before(
+            boundary_at, car_number=fine.car_number, protocol_no=fine.external_fine_id,
+            row_first_detected_at=first_detected_at,
+        )
 
     def _build_event(self, fine) -> NewFineEvent:
         task = self._task_repository.get(fine.monitoring_task_id)
