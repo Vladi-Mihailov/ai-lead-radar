@@ -38,6 +38,7 @@ def test_everything_is_off_by_default(tmp_path, monkeypatch):
     fine_monitor = _load(tmp_path, monkeypatch, {})
     assert fine_monitor.payable_amount_enabled is False
     assert fine_monitor.payable_amount_auto_checks_enabled is False
+    assert fine_monitor.payable_amount_increase_notifications_enabled is False
     assert fine_monitor.payable_amount_gc_merchant_id == "" and fine_monitor.payable_amount_gc_page_id == ""
     assert fine_monitor.payable_amount_gc_base_url == "https://mpi.gc.ge"
     assert fine_monitor.payable_amount_gc_amount_unit == "minor"

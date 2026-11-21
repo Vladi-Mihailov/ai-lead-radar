@@ -5,6 +5,7 @@ Georgian Card — заглушка (mock): ни одного сетевого з
 настоящий (tmp_path). Номера, квитанции и пользователи синтетические."""
 
 import asyncio
+import json
 import sys
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -141,9 +142,11 @@ class _Fixture:
                     monitoring_task_id=task.id, car_number=car, telegram_user_id=owner, telegram_chat_id=owner,
                     telegram_username=None, start_date=date(2026, 9, 1), end_date=UNLIMITED_END_DATE,
                 )
+        # Окончательный срок: квитанция уже считается врученной (activeDate).
+        raw = {"lastDate": term_end.isoformat(), "activeDate": (term_end - timedelta(days=31)).isoformat()}
         self.fines.create(
             monitoring_task_id=task.id, car_number=car, external_fine_id=protocol, fingerprint=f"fp-{car}-{protocol}",
-            penalty_date=None, due_date=term_end, delivered_status=None, raw_data="{}", amount=base,
+            penalty_date=None, due_date=term_end, delivered_status=None, raw_data=json.dumps(raw), amount=base,
         )
         return self.status_repository.insert_listed(
             car_number=car, protocol_no=protocol, amount=base, at=datetime(2026, 9, 1, 8, 0), source="check",
@@ -207,13 +210,12 @@ def test_open_period_only_inside_ten_day_windows():
     assert latest_started_period(_TERM_END, date(2026, 11, 20)).index == 1
 
 
-def test_term_end_uses_last_date_then_falls_back_to_delivery_and_publication():
-    assert term_end_of(date(2026, 10, 31), {"lastDate": "2026-12-31", "activeDate": "2026-10-01"}) == date(2026, 10, 31)
-    assert term_end_of(None, {"lastDate": "2026-10-31"}) == date(2026, 10, 31)
-    assert term_end_of(None, {"activeDate": "2026-10-01"}) == date(2026, 10, 31)
-    assert term_end_of(None, {"publishDate": "2026-09-01"}) == date(2026, 10, 31)
-    assert term_end_of(None, {"publishDate": "01.09.2026"}) == date(2026, 10, 31)
-    assert term_end_of(None, {}) is None
+def test_term_end_is_the_final_last_date_only():
+    """lastDate окончательный только вместе с activeDate (квитанция вручена);
+    ничего не прибавляется и не вычисляется."""
+    assert term_end_of(date(2026, 10, 26), date(2026, 9, 25)) == date(2026, 10, 26)
+    assert term_end_of(date(2026, 10, 25), None) is None  # предварительный срок до вручения
+    assert term_end_of(None, date(2026, 9, 25)) is None
     assert term_end_of(None, None) is None
 
 
@@ -659,3 +661,71 @@ def test_real_outcome_replaces_an_abandoned_mark(fx):
                             amount=150.0, increased=True)
     check = fx.amounts.get_check(check_id)
     assert check.outcome == OUTCOME_OK and check.increased
+
+
+# ---- Срок оплаты: предварительный и окончательный lastDate police.ge ----
+
+from reader.fines.models import ParsedFineRecord  # noqa: E402
+
+
+def _police_record(protocol, *, last_date, active_date=None, amount=50.0, car="AA111BB"):
+    raw = {"protocolNo": protocol, "publishDate": "2026-08-26", "lastDate": last_date}
+    if active_date:
+        raw["activeDate"] = active_date
+    return ParsedFineRecord(
+        car_number=car, external_fine_id=protocol, penalty_date=date(2026, 8, 26), due_date=date.fromisoformat(last_date),
+        delivered_status=None, fingerprint=f"fp-{car}-{protocol}", raw_data=raw, amount=amount,
+    )
+
+
+def test_fresh_police_answer_replaces_the_provisional_term_of_first_detection(fx):
+    """Обнаружена до вручения: lastDate 25.10 без activeDate. После вручения
+    police.ge отдаёт 26.10 и activeDate 25.09 — периоды считаются от 26.10."""
+    fx.receipt(protocol="R1", term_end=date(2026, 10, 25))
+    conn = fx.amounts._conn
+    conn.execute("UPDATE detected_fines SET raw_data = ? WHERE external_fine_id = 'R1'",
+                 (json.dumps({"lastDate": "2026-10-25"}),))
+    conn.commit()
+    assert fx.amounts.term_ends_for_cars(["AA111BB"])[("AA111BB", "R1")] is None  # только предварительный
+
+    fx.tracker.record_full_check(
+        "AA111BB", [_police_record("R1", last_date="2026-10-26", active_date="2026-09-25")], complete=True,
+        at=datetime(2026, 11, 20, 19, 0),
+    )
+    assert fx.amounts.term_ends_for_cars(["AA111BB"])[("AA111BB", "R1")] == date(2026, 10, 26)
+
+
+def test_no_automatic_check_while_only_a_provisional_term_is_known(fx):
+    fx.receipt(protocol="R1", term_end=date(2026, 10, 25))
+    conn = fx.amounts._conn
+    conn.execute("UPDATE detected_fines SET raw_data = ? WHERE external_fine_id = 'R1'",
+                 (json.dumps({"lastDate": "2026-10-25"}),))
+    conn.commit()
+    fx.run_days(date(2026, 10, 26), date(2026, 11, 5))
+    assert fx.gc.calls == []
+
+
+def test_window_opens_at_midnight_tbilisi_the_day_after_the_final_term(fx):
+    fx.receipt(protocol="R1", term_end=date(2026, 10, 26))
+    fx.at(date(2026, 10, 26), 23, 59)
+    assert fx.service.auto_candidates(date(2026, 10, 26)) == []
+    candidates = fx.service.auto_candidates(date(2026, 10, 27))
+    assert [(ref.protocol_no, period.index, period.start) for ref, period in candidates] == [("R1", 1, date(2026, 10, 27))]
+
+
+def test_older_observation_does_not_overwrite_a_newer_term(fx):
+    fx.receipt(protocol="R1", term_end=date(2026, 10, 26))
+    fx.tracker.record_full_check(
+        "AA111BB", [_police_record("R1", last_date="2026-10-26", active_date="2026-09-25")], complete=True,
+        at=datetime(2026, 11, 20, 19, 0),
+    )
+    fx.status_repository.record_terms("AA111BB", "R1", last_date="2026-10-25", active_date=None, publish_date=None,
+                                      at=datetime(2026, 11, 1, 10, 0))
+    assert fx.amounts.term_ends_for_cars(["AA111BB"])[("AA111BB", "R1")] == date(2026, 10, 26)
+
+
+def test_feed_match_also_records_the_term(fx):
+    fx.receipt(protocol="R1", term_end=date(2026, 10, 25))
+    fx.tracker.record_listed("AA111BB", _police_record("R1", last_date="2026-10-26", active_date="2026-09-25"),
+                             at=datetime(2026, 11, 20, 19, 0))
+    assert fx.amounts.term_ends_for_cars(["AA111BB"])[("AA111BB", "R1")] == date(2026, 10, 26)

@@ -18,7 +18,7 @@ import functools
 import logging
 import os
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -702,6 +702,14 @@ async def run() -> None:
                 settings.fine_monitor, payable_amount_repository, fine_status_tracker, subscription_repository,
                 trusted_user_ids=settings.public_bot.trusted_operator_user_ids,
             )
+            # Уведомления об увеличении — отдельный флаг; граница включения
+            # хранится в БД (события до неё не рассылаются никогда).
+            increase_notifications = settings.fine_monitor.payable_amount_increase_notifications_enabled
+            payable_amount_repository.set_increase_notifications(
+                enabled=increase_notifications, at=datetime.now(timezone.utc),
+            )
+            # Сервис нужен и при выключенных уведомлениях: ответ на «🔄 Уточнить
+            # сумму» исключает показанное увеличение для своего чата.
             amount_delivery_service = AmountIncreaseDeliveryService(
                 payable_amount_repository, subscription_repository, fine_status_tracker, _TelethonBotSender(client),
                 tz=ZoneInfo(settings.fine_monitor.timezone),
@@ -709,10 +717,11 @@ async def run() -> None:
                 notification_control=notification_control,
             )
             logger.info(
-                "Georgia payable amount enabled: Georgian Card %s, auto checks %s",
+                "Georgia payable amount enabled: Georgian Card %s, auto checks %s, increase notifications %s",
                 "configured" if settings.fine_monitor.payable_amount_gc_merchant_id
                 and settings.fine_monitor.payable_amount_gc_page_id else "NOT configured",
                 "on" if payable_amount_service.auto_enabled else "off",
+                "on" if increase_notifications else "off",
             )
 
         controller = ConversationController(
@@ -773,7 +782,11 @@ async def run() -> None:
         # принцип, что и в reader/main.py::run().
         background_tasks = [
             client.run_until_disconnected(),
-            _run_delivery_poller(delivery_service, amount_delivery_service),
+            _run_delivery_poller(
+                delivery_service,
+                amount_delivery_service
+                if settings.fine_monitor.payable_amount_increase_notifications_enabled else None,
+            ),
         ]
         if collector_api_coroutine is not None:
             background_tasks.append(collector_api_coroutine)

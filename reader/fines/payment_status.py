@@ -155,6 +155,23 @@ _SCHEMA = (
         last_full_check_at  TIMESTAMP NOT NULL
     )
     """,
+    # Сроки квитанции по последнему ответу police.ge. detected_fines хранит
+    # данные ПЕРВОГО обнаружения, а police.ge пересчитывает lastDate, когда
+    # квитанция считается врученной (activeDate появляется на 30-й день после
+    # публикации): до этого lastDate предварительный (например, 25.10), после —
+    # окончательный (26.10). По этой таблице считаются контрольные периоды
+    # суммы к оплате (reader/fines/payable_amount.py).
+    """
+    CREATE TABLE IF NOT EXISTS georgia_fine_terms (
+        car_number    TEXT NOT NULL,
+        protocol_no   TEXT NOT NULL,
+        last_date     TEXT,
+        active_date   TEXT,
+        publish_date  TEXT,
+        observed_at   TIMESTAMP NOT NULL,
+        PRIMARY KEY (car_number, protocol_no)
+    )
+    """,
 )
 
 _SELECT_FIELDS = """
@@ -222,6 +239,17 @@ class FineStatus:
         только один раз. 'unverified' — отдельная категория (см.
         DebtBreakdown), 'gone' — нигде."""
         return self.presence in (PRESENCE_LISTED, PRESENCE_MISSING)
+
+
+def _source_date(value) -> str | None:
+    """Дата police.ge ("YYYY-MM-DD", иногда с временем) -> "YYYY-MM-DD";
+    некорректное значение — None."""
+    if not isinstance(value, str) or len(value) < 10:
+        return None
+    try:
+        return date.fromisoformat(value[:10]).isoformat()
+    except ValueError:
+        return None
 
 
 def _row_to_status(row) -> FineStatus:
@@ -475,6 +503,22 @@ class FineStatusRepository:
             list(car_numbers),
         ).fetchall()
         return {row[0] for row in rows}
+
+    def record_terms(
+        self, car_number: str, protocol_no: str, *, last_date: str | None, active_date: str | None,
+        publish_date: str | None, at: datetime,
+    ) -> None:
+        """Сроки из последнего ответа police.ge; более раннее наблюдение более
+        позднее не перезаписывает."""
+        self._conn.execute(
+            "INSERT INTO georgia_fine_terms (car_number, protocol_no, last_date, active_date, publish_date, observed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (car_number, protocol_no) DO UPDATE SET "
+            "last_date = excluded.last_date, active_date = excluded.active_date, "
+            "publish_date = excluded.publish_date, observed_at = excluded.observed_at "
+            "WHERE excluded.observed_at >= georgia_fine_terms.observed_at",
+            (car_number, protocol_no, last_date, active_date, publish_date, _fmt(at)),
+        )
+        self._conn.commit()
 
     def record_full_check_time(self, car_number: str, at: datetime) -> None:
         self._conn.execute(
@@ -814,6 +858,7 @@ class FineStatusTracker:
         if not listed and not empty_confirmed:
             complete = False
         for protocol_no, record in listed.items():
+            self._note_terms(car_number, protocol_no, record, at=now)
             outcome = self._note_listed(car_number, protocol_no, record.amount, at=now, source=source)
             summary.listed += 1
             if outcome == "new":
@@ -857,7 +902,20 @@ class FineStatusTracker:
         """Одна квитанция из публичного feed'а: она точно в базе полиции, но
         это не полная проверка номера — остальные квитанции не трогаем."""
         if record.external_fine_id:
+            self._note_terms(car_number, record.external_fine_id, record, at=self._now(at))
             self._note_listed(car_number, record.external_fine_id, record.amount, at=self._now(at), source=source)
+
+    def _note_terms(self, car_number: str, protocol_no: str, record: ParsedFineRecord, *, at: datetime) -> None:
+        """Сроки квитанции из этого ответа police.ge (см. georgia_fine_terms).
+        Нет lastDate — нечего записывать."""
+        raw = record.raw_data if isinstance(record.raw_data, dict) else {}
+        last_date = _source_date(raw.get("lastDate"))
+        if last_date is None:
+            return
+        self._repository.record_terms(
+            car_number, protocol_no, last_date=last_date, active_date=_source_date(raw.get("activeDate")),
+            publish_date=_source_date(raw.get("publishDate")), at=at,
+        )
 
     def _note_listed(self, car_number: str, protocol_no: str, amount: float | None, *, at: datetime, source: str) -> str:
         existing = self._repository.get_by_protocol(car_number, protocol_no)

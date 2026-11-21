@@ -118,9 +118,20 @@ one-receipt pilot below.
 - Period 1 starts the day after `lastDate`.
 - Periods 2–6 start every 30 days after that: 30, 60, 90, 120, 150 and 180
   days.
-- Without `lastDate`, the end of the term is `activeDate` + 30 days, otherwise
-  `publishDate` + 60 days.
-- Without any of these dates there are no automatic checks.
+- Only the **final** `lastDate` counts: the one police.ge returns once the
+  receipt is deemed delivered (`activeDate` set, the 30th day after
+  publication).
+  - Before that, `lastDate` is provisional and police.ge later recalculates
+    it. One receipt read 2026-10-25 before delivery and 2026-10-26 after it.
+  - The site shows "Payment term" exactly as `lastDate` (`dateFormat` only
+    splits the date), so it was not a time zone issue.
+- `detected_fines` keeps the data of the first detection. The latest terms are
+  stored on every full check of the plate and on feed matches, in
+  `georgia_fine_terms`, and periods use those.
+- With only a provisional term, no automatic check is made until a final one
+  arrives. Manual refresh is allowed. Nothing is added or calculated.
+- The window opens at 00:00 Asia/Tbilisi on the day after the final
+  `lastDate`.
 
 **In each period:**
 
@@ -284,7 +295,18 @@ plus notes:
   - events older than 3 days (for example after a long pause): explicitly
     excluded (`event_too_old`);
   - an increase already shown in the reply to «🔄 Уточнить сумму» (excluded
-    for that chat).
+    for that chat);
+  - to a subscription that became active again after the event: a manager's
+    ▶️, the client's own ON or a claimed invitation. It is explicitly excluded
+    (`subscription_changed_after_event`), because while it was off the event
+    did not happen for it.
+- Increase notifications have their own flag,
+  `payable_amount_increase_notifications_enabled`, off by default.
+  - Its enable time is stored in the database
+    (`georgia_amount_notification_state`), and a restart keeps it.
+  - An event created before enabling is never sent: it is explicitly
+    excluded (`before_increase_notifications`). That holds for the first
+    enable and after any off/on.
 - The first amount, a migration or the initial filling never create events.
 
 ## Configuration
@@ -295,6 +317,7 @@ Keys under `fine_monitor:` in `config/config.yaml`, with their defaults:
 fine_monitor:
   payable_amount_enabled: false              # UI, «Уточнить сумму», increase notifications
   payable_amount_auto_checks_enabled: false  # daily automatic checks in control periods
+  payable_amount_increase_notifications_enabled: false  # client messages about confirmed increases
   payable_amount_gc_base_url: "https://mpi.gc.ge"
   payable_amount_gc_merchant_id: ""          # MIA merch_id from police.ge JavaScript
   payable_amount_gc_page_id: ""              # MIA page_id from police.ge JavaScript
@@ -331,6 +354,8 @@ New tables, all `CREATE TABLE IF NOT EXISTS`; no existing table is altered:
 - `georgia_fine_amount_deliveries`
 - `georgia_payable_amount_control`
 - `georgia_payable_amount_runs`
+- `georgia_amount_notification_state`
+- `georgia_fine_terms` (in the payment-status schema)
 
 ## Operator tool
 

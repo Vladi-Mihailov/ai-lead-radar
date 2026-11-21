@@ -315,6 +315,9 @@ class FineMonitorSettings(BaseModel):
     # JavaScript police.ge) ни одной сессии не открывается.
     payable_amount_enabled: bool = False
     payable_amount_auto_checks_enabled: bool = False
+    # Уведомления клиентам о подтверждённом увеличении суммы — отдельно от
+    # показа суммы; события до включения не рассылаются никогда.
+    payable_amount_increase_notifications_enabled: bool = False
     payable_amount_gc_base_url: str = "https://mpi.gc.ge"
     payable_amount_gc_merchant_id: str = ""
     payable_amount_gc_page_id: str = ""
@@ -874,6 +877,9 @@ def load_settings(config_path: Path) -> Settings:
                 payable_amount_enabled=bool(fine_monitor_raw.get("payable_amount_enabled", False)),
                 payable_amount_auto_checks_enabled=bool(
                     fine_monitor_raw.get("payable_amount_auto_checks_enabled", False)
+                ),
+                payable_amount_increase_notifications_enabled=bool(
+                    fine_monitor_raw.get("payable_amount_increase_notifications_enabled", False)
                 ),
                 payable_amount_gc_base_url=_parse_gc_base_url(
                     fine_monitor_raw.get("payable_amount_gc_base_url", "https://mpi.gc.ge")

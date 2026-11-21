@@ -130,6 +130,9 @@ class _Fixture:
             self.amounts, self.subscriptions, self.tracker, self.sender, tz=_TBILISI,
             notification_control=self.control,
         )
+        # Уведомления об увеличении включены давно (тесты доставки); граница
+        # включения проверяется отдельно.
+        self.amounts.set_increase_notifications(enabled=True, at=datetime(2026, 11, 1))
         self.controller = ConversationController(
             self.states, self.subscription_service,
             BotStatisticsService(self.known, self.subscriptions, self.fines), self.known, tz=_TBILISI,
@@ -153,7 +156,17 @@ class _Fixture:
                 telegram_username=None, start_date=date(2026, 11, 1), end_date=UNLIMITED_END_DATE,
                 created_by_telegram_user_id=created_by, created_by_telegram_chat_id=created_by,
             )
+            self.age_subscriptions()
         return task, subscription
+
+    def age_subscriptions(self):
+        """Подписки действуют давно — раньше любых событий теста."""
+        import sqlite3
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("UPDATE fine_monitoring_subscriptions SET created_at = '2026-11-01 00:00:00', "
+                     "updated_at = '2026-11-01 00:00:00'")
+        conn.commit()
+        conn.close()
 
     async def check(self, task):
         await self.check_service.check_task(self.tasks.get(task.id))
@@ -467,6 +480,7 @@ async def test_one_message_per_chat_even_with_two_subscriptions(fx):
         monitoring_task_id=second_task.id, car_number=_CAR, telegram_user_id=_OWNER, telegram_chat_id=_OWNER,
         telegram_username=None, start_date=date(2026, 11, 1), end_date=UNLIMITED_END_DATE,
     )
+    fx.age_subscriptions()
     event_id = _event(fx)
     await fx.delivery.run_once()
     assert len(fx.sender.sent) == 1
@@ -555,3 +569,111 @@ async def test_paid_fine_in_the_card_shows_the_fine_amount_without_amount_to_pay
     assert "💰 Сумма:" not in reply.text
     assert "🧾 Штраф: 100 ₾" in reply.text.splitlines()
     assert "🟢 Оплачено, ждёт обновления базы полиции: 100 ₾" in reply.text
+
+
+# ---- Запоздалые уведомления и граница включения ----
+
+import sqlite3 as _sqlite3  # noqa: E402
+
+from reader.public_bot.amount_delivery_service import (  # noqa: E402
+    EXCLUSION_BEFORE_NOTIFICATIONS,
+    EXCLUSION_SUBSCRIPTION_CHANGED,
+)
+
+
+def _set_event_created(fx, event_id, value: str):
+    conn = _sqlite3.connect(fx.db_path)
+    conn.execute("UPDATE georgia_fine_amount_events SET created_at = ? WHERE id = ?", (value, event_id))
+    conn.commit()
+    conn.close()
+
+
+async def test_increase_notifications_off_send_and_mark_nothing(fx):
+    task, subscription = fx.car(_CAR, [("GE1", 50)], owner=_OWNER)
+    await fx.check(task)
+    fx.amounts.set_increase_notifications(enabled=False, at=datetime.now(timezone.utc))
+    event_id = _event(fx)
+    await fx.delivery.run_once()
+    assert fx.sender.sent == [] and fx.amounts.get_delivery(event_id, subscription.id, "owner") is None
+
+
+async def test_first_enable_never_sends_increases_found_before_it(fx):
+    task, subscription = fx.car(_CAR, [("GE1", 50)], owner=_OWNER)
+    await fx.check(task)
+    fx.amounts.set_increase_notifications(enabled=False, at=datetime.now(timezone.utc))
+    old = _event(fx, old=100, new=150)
+    _set_event_created(fx, old, "2026-11-20 10:00:00")
+    fx.amounts.set_increase_notifications(enabled=True, at=datetime(2026, 11, 20, 12, 0))
+    new = _event(fx, old=150, new=200)
+
+    await fx.delivery.run_once()
+
+    assert len(fx.sender.sent) == 1 and "150 → 200 ₾" in fx.sender.sent[0][1]
+    assert fx.amounts.get_delivery(old, subscription.id, "owner").exclusion_reason == EXCLUSION_BEFORE_NOTIFICATIONS
+    assert fx.amounts.get_delivery(new, subscription.id, "owner").delivered_at is not None
+
+
+def test_restart_keeps_the_enable_boundary_and_off_on_resets_it(fx):
+    first = fx.amounts.set_increase_notifications(enabled=True, at=datetime(2026, 11, 21, 12, 0))
+    assert first == datetime(2026, 11, 1)  # включены раньше (фикстура) — перезапуск ничего не сдвигает
+    fx.amounts.set_increase_notifications(enabled=False, at=datetime(2026, 11, 21, 12, 5))
+    assert fx.amounts.increase_notifications_since() is None
+    again = fx.amounts.set_increase_notifications(enabled=True, at=datetime(2026, 11, 21, 12, 10))
+    assert again == datetime(2026, 11, 21, 12, 10)
+
+
+async def test_increase_found_while_the_manager_had_stopped_the_subscription_is_not_sent_after_resume(fx):
+    """⛔ менеджера -> рост суммы найден -> ▶️ менеджера: позднего «увеличилась»
+    нет; следующий рост после включения приходит, один раз."""
+    task, subscription = fx.car(_CAR, [("GE1", 50)], owner=_OWNER)
+    await fx.check(task)
+    fx.subscription_service.stop_task_for_trusted_admin(task.id, stopped_by=_TRUSTED)
+    during = _event(fx, old=100, new=150)
+    _set_event_created(fx, during, "2026-11-20 10:00:00")
+    conn = _sqlite3.connect(fx.db_path)
+    conn.execute("UPDATE georgia_fine_amount_events SET observed_at = created_at")
+    conn.commit()
+    conn.close()
+
+    fx.subscriptions.restore_after_manager_resume(task.id, now=datetime(2026, 11, 21, 9, 0), before_restore=lambda sub: 0)
+    assert fx.subscriptions.get(subscription.id).status == "active"
+    await fx.delivery.run_once()
+    await fx.delivery.run_once()
+    assert fx.sender.sent == []
+    assert fx.amounts.get_delivery(during, subscription.id, "owner").exclusion_reason == EXCLUSION_SUBSCRIPTION_CHANGED
+
+    import time
+    time.sleep(1.1)  # следующее событие — строго позже включения подписки
+    after = _event(fx, old=150, new=200)
+    await fx.delivery.run_once()
+    await fx.delivery.run_once()
+    assert [chat for chat, _, _ in fx.sender.sent] == [_OWNER]
+    assert fx.amounts.get_delivery(after, subscription.id, "owner").delivered_at is not None
+
+
+async def test_increase_found_while_the_client_had_notifications_off_is_not_sent_after_his_own_on(fx):
+    task, subscription = fx.car(_CAR, [("GE1", 50)], owner=_OWNER)
+    await fx.check(task)
+    fx.subscription_service.turn_off_car(subscription.id, telegram_user_id=_OWNER)
+    during = _event(fx)
+    _set_event_created(fx, during, "2026-11-20 10:00:00")
+    fx.subscription_service.turn_on_car(subscription.id, telegram_user_id=_OWNER, today=date(2026, 11, 21))
+    await fx.delivery.run_once()
+    assert fx.sender.sent == []
+    assert fx.amounts.get_delivery(during, subscription.id, "owner").exclusion_reason == EXCLUSION_SUBSCRIPTION_CHANGED
+
+
+async def test_repeated_ticks_and_restarts_never_send_the_excluded_history(fx):
+    task, subscription = fx.car(_CAR, [("GE1", 50)], owner=_OWNER)
+    await fx.check(task)
+    fx.subscription_service.turn_off_car(subscription.id, telegram_user_id=_OWNER)
+    during = _event(fx)
+    _set_event_created(fx, during, "2026-11-20 10:00:00")
+    fx.subscription_service.turn_on_car(subscription.id, telegram_user_id=_OWNER, today=date(2026, 11, 21))
+    for _ in range(3):
+        await fx.delivery.run_once()
+        # "перезапуск": новый сервис над той же БД
+        fx.delivery = AmountIncreaseDeliveryService(
+            fx.amounts, fx.subscriptions, fx.tracker, fx.sender, tz=_TBILISI, notification_control=fx.control,
+        )
+    assert fx.sender.sent == []
