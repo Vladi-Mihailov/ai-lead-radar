@@ -7,11 +7,10 @@ GET settings.js, POST /token, POST /payment/{token}/start; сумма в тет�
 карты, accept/decline/3ds, запросов к police.ge или чужим хостам."""
 
 import asyncio
-import json
 import logging
 import sys
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -91,7 +90,7 @@ class _Gateway:
 
     def start_body(self) -> dict:
         start = [r for r in self.requests if r.url.raw_path.decode().startswith(_START_PATH)]
-        return json.loads(start[-1].content)
+        return dict(parse_qsl(start[-1].content.decode("utf-8"), keep_blank_values=True))
 
 
 def _fetch(gateway: _Gateway, *, config=_CONFIG, base_amount=50.0):
@@ -107,6 +106,10 @@ def test_amount_is_read_through_the_page_api_like_the_browser():
         ("GET", "/page1/"), ("GET", "/page1/settings.js"), ("POST", _TOKEN_PATH), ("POST", _START_PATH),
     ]
     assert gateway.requests[2].content == b""  # /token без тела
+    for request in gateway.requests[2:]:  # как у страницы: форма + XMLHttpRequest
+        assert request.headers["X-Requested-With"] == "XMLHttpRequest"
+        assert request.headers["Content-Type"] == "application/x-www-form-urlencoded; charset=UTF-8"
+    assert gateway.requests[3].content.startswith(b"merchantId=MERCH1&state.redirect=post_params&")
 
 
 def test_start_body_is_exactly_what_the_page_sends_and_carries_no_card_fields():
@@ -117,7 +120,7 @@ def test_start_body_is_exactly_what_the_page_sends_and_carries_no_card_fields():
         "merchantId": "MERCH1", "state.redirect": "post_params", "state.in_progress": "no",
         "back_url_s": "https://police.ge/protocol/success.php",
         "back_url_f": f"https://police.ge/protocol/fail.php?id={_RECEIPT}",
-        "lang": "ka", "3ds2.supported": True,
+        "lang": "ka", "3ds2.supported": "true",
         "params.protocolId": _RECEIPT, "params.vehicleNumber": _CAR, "params.resourceAlias": "1",
         "returnUrl": body["returnUrl"],
     }

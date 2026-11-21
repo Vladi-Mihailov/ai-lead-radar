@@ -13,6 +13,10 @@ reader/fines/payable_amount.py и docs/georgia-payable-amount.md).
    МВД (check), и ответ — state "offer" с amount (в тетри: приложение
    показывает amount/100) и currency, либо отказ.
 
+Оба вызова приложение шлёт формой (перехватчик axios: Wa.stringify(data),
+Content-Type application/x-www-form-urlencoded; charset=UTF-8) с заголовком
+X-Requested-With: XMLHttpRequest; /token — без тела.
+
 Клиент повторяет ровно шаги браузера до формы карты: GET page1 с той же
 ссылкой, что строит police.ge (merch_id/page_id МВД — из config), GET
 settings.js (адрес API и portal), POST /token, POST /start. Карта не
@@ -219,6 +223,18 @@ def build_start_body(config: GeorgianCardConfig, *, car_number: str, protocol_no
     }
 
 
+def _form_value(value) -> str:
+    return ("true" if value else "false") if isinstance(value, bool) else str(value)
+
+
+def encode_form(fields: dict) -> str:
+    """Как qs.stringify у страницы: ключ=значение через &, всё, кроме
+    -_.~ и латиницы с цифрами, — в %XX (UTF-8)."""
+    return "&".join(
+        f"{quote(str(key), safe='-_.~')}={quote(_form_value(value), safe='-_.~')}" for key, value in fields.items()
+    )
+
+
 def _guard_request(method: str, url: str, *, gc_host: str, json_body: dict | None) -> None:
     parts = urlsplit(url)
     if gc_host not in ALLOWED_GC_HOSTS:
@@ -409,15 +425,21 @@ class GeorgianCardAmountClient:
 
     async def _send(self, client: httpx.AsyncClient, method: str, url: str, *, json_body: dict | None = None,
                     referer: str | None = None):
+        """json_body — поля тела; уходят формой, как у страницы (см. модульный
+        докстрок). Проверка _guard_request — по этим же полям, до отправки."""
         _guard_request(method, url, gc_host=self._config.host, json_body=json_body)
-        headers = {}
-        if method == "POST":
-            headers = {"Content-Type": "application/json;charset=UTF-8", "Accept": "application/json, text/plain, */*"}
-            if referer:
-                headers["Referer"] = referer
-        if json_body is not None:
-            return await client.request(method, url, json=json_body, headers=headers)
-        return await client.request(method, url, headers=headers or None)
+        if method != "POST":
+            return await client.request(method, url)
+        headers = {
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": self._config.base_url.rstrip("/"),
+        }
+        if referer:
+            headers["Referer"] = referer
+        content = encode_form(json_body).encode("utf-8") if json_body is not None else None
+        return await client.request(method, url, content=content, headers=headers)
 
     async def _fetch(
         self, client: httpx.AsyncClient, trace: list[str], *, car_number: str, protocol_no: str,
