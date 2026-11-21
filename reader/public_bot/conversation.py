@@ -99,6 +99,7 @@ from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 from reader.fines.models import OneOffCheckResult
+from reader.fines.payable_amount import amount_is_current
 from reader.fines.payment_status import (
     DISPLAY_GONE,
     DISPLAY_UNVERIFIED,
@@ -140,6 +141,22 @@ from reader.public_bot.manual_bootstrap_service import (
     parse_manual_amount,
 )
 from reader.public_bot.owner_resolution import OwnerResolutionError
+from reader.public_bot.payable_amount_service import (
+    STATUS_CACHED,
+    STATUS_FAILED,
+    STATUS_LIMITED,
+    STATUS_NOT_CONFIGURED,
+    STATUS_SUSPENDED,
+    PayableAmountService,
+)
+from reader.public_bot.payable_amount_texts import (
+    REFRESH_BUTTON_LABEL,
+    AmountSummary,
+    ReceiptAmount,
+    format_amount_increase_line,
+    summarize,
+    unknown_amount_summary,
+)
 from reader.public_bot.protocol_check_ephemeral_store import ProtocolCheckEphemeralStore
 from reader.public_bot.protocol_check_models import ProtocolCheckStatus
 from reader.public_bot.protocol_check_provider import ProtocolCheckProvider
@@ -620,7 +637,18 @@ class ConversationController:
         manual_bootstrap_service: ManualBootstrapService | None = None,
         fine_status_tracker: FineStatusTracker | None = None,
         daily_recheck_service: DailyRecheckService | None = None,
+        payable_amount_service: PayableAmountService | None = None,
+        amount_delivery_service=None,
     ):
+        # None — сумма к оплате выключена (fine_monitor.payable_amount_enabled):
+        # карточки и статистика без «💰 К оплате», кнопки «🔄 Уточнить сумму» нет.
+        # Работает только вместе со статусами оплаты.
+        self._payable_amount = payable_amount_service if fine_status_tracker is not None else None
+        # Исключение из рассылки увеличения, уже показанного в ответе на
+        # «🔄 Уточнить сумму» (см. AmountIncreaseDeliveryService.exclude_for_chat).
+        self._amount_delivery = amount_delivery_service
+        # Одно «🔄 Уточнить сумму» на подписку одновременно (повторное нажатие).
+        self._amount_refresh_in_progress: set[int] = set()
         # None — статусы оплаты не ведутся: "Проверить сейчас" и статистика
         # выглядят как раньше, "🧾 Статусы оплаты" недоступны.
         self._fine_status = fine_status_tracker
@@ -1400,10 +1428,12 @@ class ConversationController:
             )
             text = texts.format_debt_summary_block(debt)
             rows = [(group.car_number, group.total_amount, None) for group in debt_groups]
+            amounts_by_car = None
         else:
             rows, totals = self._debt_rows_with_statuses(debt_groups)
             source = self._fine_status.source_updated_on()
             run = self._daily_recheck.latest_run() if self._daily_recheck is not None else None
+            amounts_by_car = self._debt_amounts_by_car(rows) if self._payable_amount is not None else None
             text = texts.format_debt_status_summary_block(
                 car_count=len(rows), totals=totals,
                 source_updated_on=source[0] if source else None,
@@ -1411,6 +1441,10 @@ class ConversationController:
                 debt_count_is_lower_bound=any(
                     isinstance(breakdown, texts.SnapshotDebt) for _, _, breakdown in rows
                 ),
+                amounts=(
+                    sum(amounts_by_car.values(), AmountSummary()) if amounts_by_car is not None else None
+                ),
+                tz=self._tz,
             )
 
         page: int | None = None
@@ -1429,6 +1463,7 @@ class ConversationController:
                     owners=owners_by_car[car_number],
                     total_amount=total_amount,
                     breakdown=breakdown,
+                    amounts=amounts_by_car.get(car_number) if amounts_by_car is not None else None,
                 )
                 for car_number, total_amount, breakdown in rows
             ], char_budget=budget)
@@ -1486,6 +1521,27 @@ class ConversationController:
             -(row[2].unpaid_amount + row[2].needs_review_amount), -row[2].paid_amount, row[0],
         ))
         return rows, totals
+
+    def _debt_amounts_by_car(self, rows) -> dict[str, AmountSummary]:
+        """Сумма к оплате по каждой машине debt-списка: те же квитанции, что
+        и в «🔴 Неоплачено» (🔴 и 🟡 по отображаемому статусу), суммы
+        Georgian Card — только актуальные (см. _receipt_amounts_for_cars).
+        Сумма снимка без известных квитанций (SnapshotDebt) — одна квитанция
+        «требует уточнения». Только чтение БД."""
+        assert self._fine_status is not None
+        car_numbers = [car_number for car_number, _, _ in rows]
+        statuses_by_car: dict[str, list[FineStatus]] = {car_number: [] for car_number in car_numbers}
+        for status in self._fine_status.listed_statuses_for_cars(car_numbers):
+            if status.display_status in (PAYMENT_UNPAID, PAYMENT_NEEDS_REVIEW):
+                statuses_by_car.setdefault(status.car_number, []).append(status)
+        amounts = self._receipt_amounts_for_cars(statuses_by_car)
+        result: dict[str, AmountSummary] = {}
+        for car_number, _, breakdown in rows:
+            if isinstance(breakdown, texts.SnapshotDebt):
+                result[car_number] = unknown_amount_summary(breakdown.unpaid_amount)
+            else:
+                result[car_number] = summarize(amounts.get(car_number, {}).values())
+        return result
 
     def _debt_owners_by_car(self, car_numbers: list[str]) -> dict[str, list[texts.DebtOwner]]:
         """Пользователи, привязанные к каждой машине debt-списка (см.
@@ -2840,8 +2896,139 @@ class ConversationController:
         )
         cta = self._owner_cta_buttons() if outcome.is_owner and outcome.fines and has_payable else None
         unverified = self._unverified_totals(outcome.car_number) if outcome.check_ok else {}
+        payable = None
+        if self._payable_amount is not None and statuses is not None:
+            payable = self._check_now_receipt_amounts(outcome.car_number, outcome.fines, statuses)
+            subscription_id = getattr(outcome, "subscription_id", None)
+            if has_payable and subscription_id is not None:
+                # «🔄 Уточнить сумму» — владельцу и менеджеру делегированной
+                # подписки; ряд оплаты — как раньше, только владельцу.
+                refresh_row = [(REFRESH_BUTTON_LABEL, _mb_kb().payable_amount_refresh_callback(subscription_id))]
+                cta = [refresh_row] + (cta or [])
         return BotReply(
-            text=texts.format_check_now_result(outcome, statuses=statuses, **unverified), cta_buttons=cta,
+            text=texts.format_check_now_result(outcome, statuses=statuses, payable=payable, tz=self._tz, **unverified),
+            cta_buttons=cta,
+        )
+
+    # ---- Сумма к оплате (см. reader/public_bot/payable_amount_service.py) ----
+
+    def _receipt_amounts_for_cars(
+        self, statuses_by_car: dict[str, list[FineStatus]],
+    ) -> dict[str, dict[str, ReceiptAmount]]:
+        """{car: {protocolNo: ReceiptAmount}} — сохранённая сумма Georgian
+        Card, если она актуальна для текущего контрольного периода (см.
+        amount_is_current), иначе «нужно уточнить». Только чтение БД —
+        никаких запросов к Georgian Card."""
+        assert self._payable_amount is not None
+        car_numbers = list(statuses_by_car)
+        repository = self._payable_amount.repository
+        stored = repository.amounts_for_cars(car_numbers)
+        term_ends = repository.term_ends_for_cars(car_numbers)
+        today = self._today()
+        result: dict[str, dict[str, ReceiptAmount]] = {}
+        for car_number, statuses in statuses_by_car.items():
+            by_protocol: dict[str, ReceiptAmount] = {}
+            for status in statuses:
+                key = (car_number, status.protocol_no)
+                amount = stored.get(key)
+                current = amount_is_current(amount, term_ends.get(key), today=today, tz=self._tz)
+                by_protocol[status.protocol_no] = ReceiptAmount(
+                    protocol_no=status.protocol_no,
+                    base_amount=status.amount,
+                    payable=amount.amount if current else None,
+                    observed_at=amount.observed_at if current else None,
+                )
+            result[car_number] = by_protocol
+        return result
+
+    def _check_now_receipt_amounts(self, car_number: str, fines, statuses: dict[str, str]) -> dict[str, ReceiptAmount]:
+        """Суммы штрафов «к оплате» результата «🔎 Проверить сейчас» (без 🟢,
+        ⚪ и ⏳ по правилу подписчика); исходная сумма — из живой проверки."""
+        payable_protocols = {
+            fine.external_fine_id for fine in fines
+            if fine.external_fine_id
+            and statuses.get(fine.external_fine_id, PAYMENT_UNPAID) not in (PAYMENT_PAID, DISPLAY_GONE, DISPLAY_UNVERIFIED)
+        }
+        known = {
+            status.protocol_no: status
+            for status in self._fine_status.statuses_for_car(car_number, include_gone=False)
+            if status.protocol_no in payable_protocols
+        }
+        amounts = self._receipt_amounts_for_cars({car_number: list(known.values())}).get(car_number, {})
+        result = {}
+        for fine in fines:
+            protocol_no = fine.external_fine_id
+            if not protocol_no or protocol_no not in payable_protocols:
+                continue
+            receipt = amounts.get(protocol_no)
+            result[protocol_no] = ReceiptAmount(
+                protocol_no=protocol_no,
+                base_amount=fine.amount,
+                payable=receipt.payable if receipt else None,
+                observed_at=receipt.observed_at if receipt else None,
+            )
+        return result
+
+    async def handle_payable_amount_refresh(
+        self, subscription_id: int, *, telegram_user_id: int, chat_id: int,
+        on_check_started: Callable[[], Awaitable[None]] | None = None,
+    ) -> BotReply | None:
+        """«🔄 Уточнить сумму»: только получает и сохраняет сумму к оплате
+        (сессия Georgian Card без карты и оплаты), отвечает карточкой.
+        None — подписка не найдена/не своя или функция выключена."""
+        if self._payable_amount is None:
+            return None
+        subscription = self._subscriptions.get_actionable_subscription(
+            subscription_id, telegram_user_id=telegram_user_id,
+        )
+        if subscription is None:
+            return None
+        if subscription_id in self._amount_refresh_in_progress:
+            return CHECK_ALREADY_IN_PROGRESS
+        self._amount_refresh_in_progress.add(subscription_id)
+        try:
+            if on_check_started is not None:
+                await on_check_started()
+            outcome = await self._payable_amount.refresh_for_subscription(
+                subscription, telegram_user_id=telegram_user_id,
+            )
+        finally:
+            self._amount_refresh_in_progress.discard(subscription_id)
+
+        today = self._today()
+        notes: list[str] = []
+        for result in outcome.results:
+            if result.increased_from is not None and result.amount is not None:
+                notes.append(format_amount_increase_line(result.increased_from, result.amount.amount))
+                if result.event_id is not None and self._amount_delivery is not None:
+                    self._amount_delivery.exclude_for_chat(result.event_id, chat_id=chat_id, today=today)
+        statuses_seen = {result.status for result in outcome.results}
+        failed = sum(1 for result in outcome.results if result.status == STATUS_FAILED)
+        if statuses_seen & {STATUS_SUSPENDED, STATUS_NOT_CONFIGURED}:
+            notes.append(texts.PAYABLE_AMOUNT_UNAVAILABLE_TEXT)
+        elif failed:
+            notes.append(texts.format_payable_amount_failed_note(failed))
+        if STATUS_LIMITED in statuses_seen:
+            notes.append(texts.PAYABLE_AMOUNT_LIMIT_TEXT)
+        if STATUS_CACHED in statuses_seen:
+            notes.append(texts.PAYABLE_AMOUNT_RECENT_TEXT)
+
+        debt = [
+            status for status in self._fine_status.statuses_for_car(subscription.car_number, include_gone=False)
+            if status.counts_as_listed and status.payment_status != PAYMENT_PAID
+        ] if not is_fine_output_suppressed(subscription.car_number) else []
+        amounts = self._receipt_amounts_for_cars({subscription.car_number: debt}).get(subscription.car_number, {})
+        receipts = [amounts[status.protocol_no] for status in debt if status.protocol_no in amounts]
+        cta = None
+        if receipts:
+            cta = [[(REFRESH_BUTTON_LABEL, _mb_kb().payable_amount_refresh_callback(subscription.id))]]
+            if subscription.telegram_user_id == telegram_user_id:
+                cta += self._owner_cta_buttons()
+        return BotReply(
+            text=texts.format_payable_amount_card(
+                car_number=subscription.car_number, receipts=receipts, tz=self._tz, notes=notes,
+            ),
+            cta_buttons=cta,
         )
 
     async def handle_my_car_check_now_once(

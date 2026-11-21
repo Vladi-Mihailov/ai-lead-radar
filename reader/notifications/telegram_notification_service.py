@@ -41,7 +41,7 @@ def _format_amount(value: float | None) -> str | None:
     return f"{text} GEL"
 
 
-def format_fine_block(event: NewFineEvent) -> str:
+def format_fine_block(event: NewFineEvent, *, payable_lines: list[str] | None = None) -> str:
     """Публичная (без ведущего "_") — переиспользуется
     reader/public_bot/delivery_texts.py для клиентских уведомлений (см.
     design report Stage 4 и новый расширенный формат уведомлений), чтобы не
@@ -49,7 +49,11 @@ def format_fine_block(event: NewFineEvent) -> str:
     другого канала доставки. Каждая строка — опциональна (пропускается,
     если поле отсутствует, включая старые detected_fines без новых колонок,
     см. миграцию DetectedFineRepository — доставка таких штрафов не должна
-    падать, просто эти строки не показываются)."""
+    падать, просто эти строки не показываются).
+
+    payable_lines — сумма к оплате (клиентская карточка "🔎 Проверить
+    сейчас", см. reader/public_bot/payable_amount_texts.py): строка суммы
+    становится "🧾 Штраф: N ₾", под ней — эти строки. None — как раньше."""
     lines = []
 
     if event.external_fine_id:
@@ -68,9 +72,14 @@ def format_fine_block(event: NewFineEvent) -> str:
         if penalty_date:
             lines.append(f"📅 Дата протокола: {penalty_date}")
 
-    amount = _format_amount(event.amount)
-    if amount:
-        lines.append(f"💰 Сумма: {amount}")
+    if payable_lines is not None:
+        if event.amount is not None:
+            lines.append(f"🧾 Штраф: {_format_amount(event.amount).removesuffix(' GEL')} ₾")
+        lines.extend(payable_lines)
+    else:
+        amount = _format_amount(event.amount)
+        if amount:
+            lines.append(f"💰 Сумма: {amount}")
 
     # Русский перевод (place_ru/violation_description_ru, см. reader/
     # fines/translation.py) — приоритет; если перевода ещё нет (temporary

@@ -32,7 +32,9 @@ from telethon import TelegramClient
 from reader.fines.batch_gate import BatchCheckGate
 from reader.fines.check_service import FineCheckService
 from reader.fines.detected_fine_repository import DetectedFineRepository
+from reader.fines.georgian_card_client import GeorgianCardAmountClient, GeorgianCardConfig
 from reader.fines.notification_control import EXCLUSION_SUBSCRIPTION_RESTORED, GeorgiaNotificationControl
+from reader.fines.payable_amount import PayableAmountRepository
 from reader.fines.payment_status import FineStatusRepository, FineStatusTracker, PaymentPageMarkers
 from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository
 from reader.fines.police_ge_circuit_breaker import PoliceGeCircuitBreaker
@@ -67,7 +69,13 @@ from reader.public_bot.debt_refresh_service import DebtRefreshService
 from reader.public_bot.delivery_repository import (
     ClientFineDeliveryRepository,
 )
+from reader.public_bot.amount_delivery_service import AmountIncreaseDeliveryService
 from reader.public_bot.delivery_service import ClientDeliveryService, exclude_known_fines_for_subscription
+from reader.public_bot.payable_amount_service import (
+    PayableAmountLimits,
+    PayableAmountService,
+    run_payable_amount_loop,
+)
 from reader.public_bot.full_check_service import FullCheckService
 from reader.public_bot.handlers import register
 from reader.public_bot.keyboards import main_menu_keyboard
@@ -286,11 +294,16 @@ def read_bot_token() -> str:
     return token
 
 
-async def _run_delivery_poller(delivery_service: ClientDeliveryService) -> None:
+async def _run_delivery_poller(
+    delivery_service: ClientDeliveryService, amount_delivery_service: AmountIncreaseDeliveryService | None = None,
+) -> None:
     """Бесконечный цикл — тикает раз в _DELIVERY_POLL_INTERVAL_SECONDS,
     независимо от результата предыдущего тика (ошибка одного тика не
     останавливает поллер, см. design report: "failure одного recipient не
-    блокирует другого" — то же самое верно и для тика целиком)."""
+    блокирует другого" — то же самое верно и для тика целиком).
+    amount_delivery_service — уведомления об увеличении суммы к оплате
+    (только при fine_monitor.payable_amount_enabled), в том же тике после
+    новых штрафов."""
     while True:
         try:
             result = await delivery_service.run_once()
@@ -301,8 +314,47 @@ async def _run_delivery_poller(delivery_service: ClientDeliveryService) -> None:
                 )
         except Exception:
             logger.exception("Client delivery poller: тик завершился с ошибкой")
+        if amount_delivery_service is not None:
+            try:
+                result = await amount_delivery_service.run_once()
+                if result.delivered or result.failed or result.flood_wait_hit:
+                    logger.info(
+                        "Amount increase delivery tick: delivered=%d, failed=%d, flood_wait=%s",
+                        result.delivered, result.failed, result.flood_wait_hit,
+                    )
+            except Exception:
+                logger.exception("Amount increase delivery: тик завершился с ошибкой")
 
         await asyncio.sleep(_DELIVERY_POLL_INTERVAL_SECONDS)
+
+
+def build_payable_amount_service(
+    fine_monitor, repository, status_tracker, subscription_repository, *, trusted_user_ids,
+) -> PayableAmountService:
+    """settings.fine_monitor.payable_amount_* -> PayableAmountService."""
+    client = GeorgianCardAmountClient(GeorgianCardConfig(
+        base_url=fine_monitor.payable_amount_gc_base_url,
+        merchant_id=fine_monitor.payable_amount_gc_merchant_id,
+        page_id=fine_monitor.payable_amount_gc_page_id,
+        amount_unit=fine_monitor.payable_amount_gc_amount_unit,
+        request_timeout_seconds=fine_monitor.payable_amount_request_timeout_seconds,
+    ))
+    return PayableAmountService(
+        repository, client, status_tracker, subscription_repository,
+        tz=ZoneInfo(fine_monitor.timezone),
+        limits=PayableAmountLimits(
+            max_sessions_per_day=fine_monitor.payable_amount_max_sessions_per_day,
+            max_consecutive_errors=fine_monitor.payable_amount_max_consecutive_errors,
+            manual_min_interval=timedelta(hours=fine_monitor.payable_amount_manual_min_interval_hours),
+            manual_max_sessions_per_user_per_day=fine_monitor.payable_amount_manual_max_sessions_per_user_per_day,
+            blocked_suspension=timedelta(hours=fine_monitor.payable_amount_blocked_suspension_hours),
+            auto_delay_seconds=fine_monitor.payable_amount_auto_delay_seconds,
+        ),
+        trusted_user_ids=frozenset(trusted_user_ids),
+        auto_enabled=fine_monitor.payable_amount_auto_checks_enabled,
+        auto_start_time=fine_monitor.payable_amount_auto_time,
+        auto_cutoff_time=fine_monitor.payable_amount_auto_cutoff_time,
+    )
 
 
 def build_payment_page_markers(fine_monitor) -> PaymentPageMarkers:
@@ -407,6 +459,11 @@ async def run() -> None:
         logger.info("Georgia fine status: seeded %d receipt statuses from detected_fines", seeded)
     daily_recheck_repository = (
         DailyRecheckRepository(db_path) if settings.fine_monitor.daily_recheck_enabled else None
+    )
+    # Сумма к оплате (см. docs/georgia-payable-amount.md) — только когда
+    # явно включена: таблицы появляются только тогда.
+    payable_amount_repository = (
+        PayableAmountRepository(db_path) if settings.fine_monitor.payable_amount_enabled else None
     )
 
     http_client = httpx.AsyncClient(
@@ -638,6 +695,26 @@ async def run() -> None:
                 notification_paused=notification_control.is_paused,
             )
 
+        payable_amount_service = None
+        amount_delivery_service = None
+        if payable_amount_repository is not None:
+            payable_amount_service = build_payable_amount_service(
+                settings.fine_monitor, payable_amount_repository, fine_status_tracker, subscription_repository,
+                trusted_user_ids=settings.public_bot.trusted_operator_user_ids,
+            )
+            amount_delivery_service = AmountIncreaseDeliveryService(
+                payable_amount_repository, subscription_repository, fine_status_tracker, _TelethonBotSender(client),
+                tz=ZoneInfo(settings.fine_monitor.timezone),
+                payment_help_contact_username=settings.public_bot.payment_help_contact_username,
+                notification_control=notification_control,
+            )
+            logger.info(
+                "Georgia payable amount enabled: Georgian Card %s, auto checks %s",
+                "configured" if settings.fine_monitor.payable_amount_gc_merchant_id
+                and settings.fine_monitor.payable_amount_gc_page_id else "NOT configured",
+                "on" if payable_amount_service.auto_enabled else "off",
+            )
+
         controller = ConversationController(
             conversation_state_repository,
             subscription_service,
@@ -654,6 +731,8 @@ async def run() -> None:
             manual_bootstrap_service=manual_bootstrap_service,
             fine_status_tracker=fine_status_tracker,
             daily_recheck_service=daily_recheck_service,
+            payable_amount_service=payable_amount_service,
+            amount_delivery_service=amount_delivery_service,
         )
 
         # «👨‍💼 Оператор»: живой диалог через группу менеджеров (общая
@@ -694,12 +773,14 @@ async def run() -> None:
         # принцип, что и в reader/main.py::run().
         background_tasks = [
             client.run_until_disconnected(),
-            _run_delivery_poller(delivery_service),
+            _run_delivery_poller(delivery_service, amount_delivery_service),
         ]
         if collector_api_coroutine is not None:
             background_tasks.append(collector_api_coroutine)
         if daily_recheck_service is not None:
             background_tasks.append(run_daily_recheck_loop(daily_recheck_service))
+        if payable_amount_service is not None and payable_amount_service.auto_enabled:
+            background_tasks.append(run_payable_amount_loop(payable_amount_service))
         await _run_concurrently(background_tasks)
     finally:
         await http_client.aclose()
@@ -719,6 +800,8 @@ async def run() -> None:
         fine_status_repository.close()
         if daily_recheck_repository is not None:
             daily_recheck_repository.close()
+        if payable_amount_repository is not None:
+            payable_amount_repository.close()
 
 
 def main() -> None:

@@ -305,6 +305,31 @@ class FineMonitorSettings(BaseModel):
     payment_page_already_paid_markers: list[str] = Field(default_factory=list)
     payment_page_failed_markers: list[str] | None = None
     payment_page_technical_error_markers: list[str] = Field(default_factory=list)
+    # Сумма к оплате с начислениями через платёжную страницу Georgian Card
+    # (см. docs/georgia-payable-amount.md). Каждое получение суммы — сессия
+    # Georgian Card (без карты и без оплаты). Выключено по умолчанию:
+    # payable_amount_enabled — карточки/статистика с «💰 К оплате», кнопка
+    # «🔄 Уточнить сумму» и уведомления об увеличении;
+    # payable_amount_auto_checks_enabled — ещё и дневные автоматические
+    # проверки в контрольных периодах. Без merch_id/page_id МВД (из
+    # JavaScript police.ge) ни одной сессии не открывается.
+    payable_amount_enabled: bool = False
+    payable_amount_auto_checks_enabled: bool = False
+    payable_amount_gc_base_url: str = "https://mpi.gc.ge"
+    payable_amount_gc_merchant_id: str = ""
+    payable_amount_gc_page_id: str = ""
+    # В каких единицах amount ответа .../start: "major" (лари) или "minor"
+    # (тетри) — сверяется пилотом.
+    payable_amount_gc_amount_unit: str = "major"
+    payable_amount_request_timeout_seconds: float = 20.0
+    payable_amount_auto_time: time = time(13, 0)
+    payable_amount_auto_cutoff_time: time = time(14, 0)
+    payable_amount_auto_delay_seconds: float = 30.0
+    payable_amount_max_sessions_per_day: int = 40
+    payable_amount_max_consecutive_errors: int = 2
+    payable_amount_manual_min_interval_hours: float = 12.0
+    payable_amount_manual_max_sessions_per_user_per_day: int = 5
+    payable_amount_blocked_suspension_hours: float = 24.0
 
 
 class InviterWorkerSettings(BaseModel):
@@ -567,6 +592,22 @@ def _parse_recheck_scope(value) -> str:
     return value
 
 
+def _parse_amount_unit(value) -> str:
+    """fine_monitor.payable_amount_gc_amount_unit — "major" или "minor"."""
+    if value not in ("major", "minor"):
+        raise ConfigError(
+            f'fine_monitor.payable_amount_gc_amount_unit должен быть "major" или "minor", а не {value!r}'
+        )
+    return value
+
+
+def _parse_positive_int(raw: dict, key: str, default: int) -> int:
+    value = int(raw.get(key, default))
+    if value < 1:
+        raise ConfigError(f"fine_monitor.{key} должен быть больше 0")
+    return value
+
+
 def load_settings(config_path: Path) -> Settings:
     config_path = Path(config_path)
     if not config_path.exists():
@@ -812,6 +853,43 @@ def load_settings(config_path: Path) -> Settings:
                 payment_page_technical_error_markers=_parse_marker_list(
                     fine_monitor_raw, "payment_page_technical_error_markers",
                 ) or [],
+                payable_amount_enabled=bool(fine_monitor_raw.get("payable_amount_enabled", False)),
+                payable_amount_auto_checks_enabled=bool(
+                    fine_monitor_raw.get("payable_amount_auto_checks_enabled", False)
+                ),
+                payable_amount_gc_base_url=str(
+                    fine_monitor_raw.get("payable_amount_gc_base_url", "https://mpi.gc.ge")
+                ).rstrip("/"),
+                payable_amount_gc_merchant_id=str(fine_monitor_raw.get("payable_amount_gc_merchant_id") or "").strip(),
+                payable_amount_gc_page_id=str(fine_monitor_raw.get("payable_amount_gc_page_id") or "").strip(),
+                payable_amount_gc_amount_unit=_parse_amount_unit(
+                    fine_monitor_raw.get("payable_amount_gc_amount_unit", "major")
+                ),
+                payable_amount_request_timeout_seconds=float(
+                    fine_monitor_raw.get("payable_amount_request_timeout_seconds", 20.0)
+                ),
+                payable_amount_auto_time=_parse_check_time(fine_monitor_raw.get("payable_amount_auto_time", "13:00")),
+                payable_amount_auto_cutoff_time=_parse_check_time(
+                    fine_monitor_raw.get("payable_amount_auto_cutoff_time", "14:00")
+                ),
+                payable_amount_auto_delay_seconds=float(
+                    fine_monitor_raw.get("payable_amount_auto_delay_seconds", 30.0)
+                ),
+                payable_amount_max_sessions_per_day=_parse_positive_int(
+                    fine_monitor_raw, "payable_amount_max_sessions_per_day", 40,
+                ),
+                payable_amount_max_consecutive_errors=_parse_positive_int(
+                    fine_monitor_raw, "payable_amount_max_consecutive_errors", 2,
+                ),
+                payable_amount_manual_min_interval_hours=float(
+                    fine_monitor_raw.get("payable_amount_manual_min_interval_hours", 12.0)
+                ),
+                payable_amount_manual_max_sessions_per_user_per_day=_parse_positive_int(
+                    fine_monitor_raw, "payable_amount_manual_max_sessions_per_user_per_day", 5,
+                ),
+                payable_amount_blocked_suspension_hours=float(
+                    fine_monitor_raw.get("payable_amount_blocked_suspension_hours", 24.0)
+                ),
             ),
             inviter=InviterSettings(
                 worker=InviterWorkerSettings(

@@ -8,6 +8,7 @@ reader/public_bot/keyboards.py (Telethon-кнопки), чтобы формул�
 import re
 from dataclasses import dataclass
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from reader.fines.models import FineMonitoringTask, NewFineEvent
 from reader.fines.payment_status import (
@@ -29,6 +30,16 @@ from reader.public_bot.debt_refresh_service import DebtSummary, RefreshOutcome
 from reader.public_bot.delivery_texts import format_check_now_fines_message
 from reader.public_bot.full_check_service import FullCheckOutcome
 from reader.public_bot.models import FineMonitoringSubscription
+from reader.public_bot.payable_amount_texts import (
+    AMOUNTS_FOOTNOTE,
+    AmountSummary,
+    ReceiptAmount,
+    format_fine_payable_line,
+    format_fines_line,
+    format_header_payable_lines,
+    format_payable_lines,
+    summarize,
+)
 from reader.public_bot.statistics_service import BotStatistics
 from reader.telegram_markdown import escape_telethon_markdown, safe_telegram_username
 
@@ -218,6 +229,7 @@ _TRUSTED_STOP_CONFIRM_BUTTON_WITH_CLIENTS = "⛔ Остановить для в�
 
 def format_check_now_result(
     outcome, *, statuses: dict[str, str] | None = None, unverified_count: int = 0, unverified_amount: float = 0.0,
+    payable: dict[str, ReceiptAmount] | None = None, tz: ZoneInfo | None = None,
 ) -> str:
     """outcome: reader.public_bot.subscription_service.CheckNowOutcome.
     Без технической детали ошибки в тексте клиенту (см. design: та же
@@ -235,7 +247,12 @@ def format_check_now_result(
     понятное сообщение вместо общего "попробуйте позже", когда circuit
     breaker уже признал police.ge недоступным (не единичный сбой, а
     известное временное состояние источника) — быстрый ответ БЕЗ
-    ожидания повторного request_timeout."""
+    ожидания повторного request_timeout.
+
+    payable (сумма к оплате включена, см. reader/public_bot/
+    payable_amount_service.py) — {protocolNo: ReceiptAmount} для штрафов «к
+    оплате»: под каждым — «🧾 Штраф»/«💰 К оплате», в итоге — сумма к оплате
+    вместо исходной (или «требуется уточнение»), одна дата уточнения."""
     if not outcome.check_ok:
         if outcome.provider_unavailable:
             return "⚠️ Сервис police.ge временно недоступен.\nПопробуйте проверить штрафы позже."
@@ -260,6 +277,13 @@ def format_check_now_result(
         for fine in outcome.fines
         if fine.external_fine_id
     }
+    if payable is not None and tz is not None:
+        payable_lines = {protocol_no: [format_fine_payable_line(receipt)] for protocol_no, receipt in payable.items()}
+        blocks = format_check_now_fines_message(
+            car_number=outcome.car_number, fines=outcome.fines, status_labels=labels, payable_lines=payable_lines,
+        )
+        summary = format_check_now_payable_summary(outcome.fines, statuses, payable, tz=tz)
+        return f"{blocks}\n\n{summary}{unverified_line}"
     blocks = format_check_now_fines_message(car_number=outcome.car_number, fines=outcome.fines, status_labels=labels)
     return f"{blocks}\n\n{format_check_now_status_summary(outcome.fines, statuses)}{unverified_line}"
 
@@ -316,6 +340,84 @@ def format_check_now_status_summary(fines: list[NewFineEvent], statuses: dict[st
         lines.append(f"🟡 Из них оплата требует проверки: {_format_search_amount(review)}")
     if paid_count:
         lines.append(f"🟢 Оплачено, ждёт обновления базы полиции: {_format_search_amount(paid)}")
+    return "\n".join(lines)
+
+
+def format_check_now_payable_summary(
+    fines: list[NewFineEvent], statuses: dict[str, str], payable: dict[str, ReceiptAmount], *, tz: ZoneInfo,
+) -> str:
+    """Итог "🔎 Проверить сейчас", когда сумма к оплате включена: «🧾 Штраф»
+    (исходные суммы штрафов к оплате), «💰 К оплате» по суммам Georgian Card
+    и одна дата уточнения — или «требуется уточнение» / «Предварительно к
+    оплате». Строки 🟡 и 🟢 — как в format_check_now_status_summary."""
+    receipts: list[ReceiptAmount] = []
+    review = paid = 0.0
+    review_count = paid_count = 0
+    for fine in fines:
+        status = statuses.get(fine.external_fine_id or "", PAYMENT_UNPAID)
+        amount = fine.amount or 0.0
+        if status == PAYMENT_PAID:
+            paid += amount
+            paid_count += 1
+            continue
+        if status in (DISPLAY_GONE, DISPLAY_UNVERIFIED):
+            continue
+        receipts.append(
+            payable.get(fine.external_fine_id or "")
+            or ReceiptAmount(
+                protocol_no=fine.external_fine_id or "", base_amount=fine.amount, payable=None, observed_at=None,
+            )
+        )
+        if status == PAYMENT_NEEDS_REVIEW:
+            review += amount
+            review_count += 1
+    summary = summarize(receipts)
+    lines = []
+    if summary.count:
+        lines.append(format_fines_line(summary.count, summary.base_total))
+        lines.extend(format_payable_lines(summary, tz=tz))
+    else:
+        lines.append(f"💰 К оплате: {_format_search_amount(0.0)}")
+    if review_count:
+        lines.append(f"🟡 Из них оплата требует проверки: {_format_search_amount(review)}")
+    if paid_count:
+        lines.append(f"🟢 Оплачено, ждёт обновления базы полиции: {_format_search_amount(paid)}")
+    return "\n".join(lines)
+
+
+PAYABLE_AMOUNT_NOTHING_TO_REFRESH_TEXT = "✅ {car_number}: неоплаченных штрафов для уточнения суммы нет."
+PAYABLE_AMOUNT_UNAVAILABLE_TEXT = "⚠️ Уточнение суммы сейчас недоступно — попробуйте позже."
+PAYABLE_AMOUNT_LIMIT_TEXT = "⚠️ Лимит уточнений на сегодня исчерпан — попробуйте завтра."
+PAYABLE_AMOUNT_RECENT_TEXT = "ℹ️ Сумму уже уточняли недавно — показана сохранённая."
+
+
+def format_payable_amount_failed_note(count: int) -> str:
+    return (
+        f"⚠️ По {count} {_russian_plural(count, 'штрафу', 'штрафам', 'штрафам')} "
+        "уточнить сумму сейчас не удалось — попробуйте позже."
+    )
+
+
+def format_payable_amount_card(
+    *, car_number: str, receipts: list[ReceiptAmount], tz: ZoneInfo, notes: list[str],
+) -> str:
+    """Карточка после «🔄 Уточнить сумму»:
+        🚗 Автомобиль: AB123CD
+        🧾 Штраф: 50 ₾
+        💰 К оплате: 150 ₾
+        🕒 Сумма уточнена 21.11 в 15:20
+    notes — что произошло при уточнении (увеличение, недоступность, лимит)."""
+    if not receipts:
+        return PAYABLE_AMOUNT_NOTHING_TO_REFRESH_TEXT.format(car_number=format_plate_for_telegram(car_number))
+    summary = summarize(receipts)
+    lines = [
+        f"🚗 Автомобиль: {format_plate_for_telegram(car_number)}",
+        format_fines_line(summary.count, summary.base_total),
+        *format_payable_lines(summary, tz=tz),
+    ]
+    if notes:
+        lines.append("")
+        lines.extend(notes)
     return "\n".join(lines)
 
 
@@ -937,6 +1039,8 @@ class SnapshotDebt(DebtBreakdown):
 
 
 _DEBT_COUNT_UNKNOWN_NOTE = "(количество уточнится при следующей проверке)"
+# Строке машины дата не нужна (with_date=False), часовой пояс не используется.
+_UTC = ZoneInfo("UTC")
 
 
 def _format_fine_count_and_amount(count: int, amount: float) -> str:
@@ -947,6 +1051,7 @@ def _format_fine_count_and_amount(count: int, amount: float) -> str:
 
 def format_debt_row(
     *, car_number: str, owners: list[DebtOwner], total_amount: float, breakdown: DebtBreakdown | None = None,
+    amounts: AmountSummary | None = None,
 ) -> str:
     """Блок одной машины debt-списка (см. задачу "дополнить статистику
     штрафов информацией о пользователях"), без статусов оплаты:
@@ -974,12 +1079,35 @@ def format_debt_row(
     штрафов неизвестно) — только сумма с пометкой, число не выдумывается.
     total_amount тогда не используется. Без статусов (breakdown None) —
     прежняя строка "💰 Задолженность" с суммой снимка: числа штрафов там
-    нет, и оплату такой режим не различает."""
+    нет, и оплату такой режим не различает.
+
+    amounts (сумма к оплате включена, только вместе с breakdown) —
+        🚗 Автомобиль: <номер>
+        🧾 Штрафы: 3 шт. — 150 ₾  (исходные суммы 🔴 и 🟡)
+        💰 К оплате: 450 ₾  (или «требуется уточнение» / «Предварительно»)
+    без даты (она одна, в шапке); строки 🟡/🟢 и пользователи — как раньше.
+    SnapshotDebt — прежняя строка суммы снимка и «требуется уточнение»."""
     if breakdown is None:
         lines = [
             f"🚗 Госномер: {format_plate_for_telegram(car_number)}",
             f"💰 Задолженность: {_format_search_amount(total_amount)}",
         ]
+    elif amounts is not None:
+        lines = [f"🚗 Автомобиль: {format_plate_for_telegram(car_number)}"]
+        debt_amount = breakdown.unpaid_amount + breakdown.needs_review_amount
+        if isinstance(breakdown, SnapshotDebt):
+            lines.append(f"🔴 Неоплачено: {_format_search_amount(debt_amount)} {_DEBT_COUNT_UNKNOWN_NOTE}")
+        elif amounts.count:
+            lines.append(format_fines_line(amounts.count, amounts.base_total))
+        if amounts.count:
+            lines.extend(format_payable_lines(amounts, tz=_UTC, with_date=False))
+        if breakdown.needs_review_count:
+            lines.append(
+                "🟡 Из них требуют проверки: "
+                f"{_format_fine_count_and_amount(breakdown.needs_review_count, breakdown.needs_review_amount)}"
+            )
+        if breakdown.paid_count:
+            lines.append(f"🟢 Оплачено: {_format_fine_count_and_amount(breakdown.paid_count, breakdown.paid_amount)}")
     else:
         lines = [f"🚗 Госномер: {format_plate_for_telegram(car_number)}"]
         debt_count = breakdown.unpaid_count + breakdown.needs_review_count
@@ -1036,7 +1164,7 @@ def _russian_plural(count: int, one: str, few: str, many: str) -> str:
 
 def format_debt_status_summary_block(
     *, car_count: int, totals: DebtBreakdown, source_updated_on: date | None, recheck_line: str | None,
-    debt_count_is_lower_bound: bool = False,
+    debt_count_is_lower_bound: bool = False, amounts: AmountSummary | None = None, tz: ZoneInfo | None = None,
 ) -> str:
     """Заголовок "🚨 Штрафы по последней проверке", когда ведутся статусы
     оплаты (см. задачу: "отдельно показывать подтверждённую задолженность,
@@ -1054,7 +1182,12 @@ def format_debt_status_summary_block(
     когда оно больше нуля: при нуле строки нет вовсе. Суммы 🟡 остаются в
     блоках машин и на экране "🧾 Статусы оплаты". 🟢 в 🔴 не входит. ⏳
     (неподтверждённые квитанции из истории) здесь не показываются ни числом,
-    ни суммой: это не долг и не повод для отдельных запросов к police.ge."""
+    ни суммой: это не долг и не повод для отдельных запросов к police.ge.
+
+    amounts (сумма к оплате включена) — «🔴 Неоплачено» только числом, под ним
+    «💰 К оплате» по суммам Georgian Card с одной датой «🕒 Суммы уточнены»,
+    если актуальны все суммы, иначе «Предварительно к оплате» и сколько
+    штрафов требуют уточнения (format_header_payable_lines)."""
     debt_count = totals.unpaid_count + totals.needs_review_count
     debt_amount = totals.unpaid_amount + totals.needs_review_amount
     if debt_count_is_lower_bound:
@@ -1065,11 +1198,18 @@ def format_debt_status_summary_block(
         )
     else:
         debt_text = _format_fine_count_and_amount(debt_count, debt_amount)
+    if amounts is not None and tz is not None:
+        if debt_count_is_lower_bound:
+            debt_text = f"не менее {debt_count} {_russian_plural(debt_count, 'штрафа', 'штрафов', 'штрафов')}"
+        else:
+            debt_text = f"{debt_count} {_russian_plural(debt_count, 'штраф', 'штрафа', 'штрафов')}"
     lines = [
         "🚨 Штрафы по последней проверке",
         f"Автомобили со штрафами: {car_count}",
         f"🔴 Неоплачено: {debt_text}",
     ]
+    if amounts is not None and tz is not None:
+        lines.extend(format_header_payable_lines(amounts, tz=tz))
     if totals.needs_review_count:
         review_count = totals.needs_review_count
         lines.append(
@@ -1088,6 +1228,8 @@ def format_debt_status_summary_block(
         "",
         "ℹ️ 🟢 — оплата подтверждена, police.ge ещё показывает штраф. 🟡 — оплата не прошла, долг не снят.",
     ])
+    if amounts is not None and tz is not None:
+        lines.append(AMOUNTS_FOOTNOTE)
     return "\n".join(lines)
 
 
