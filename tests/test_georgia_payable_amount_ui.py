@@ -581,6 +581,12 @@ from reader.public_bot.amount_delivery_service import (  # noqa: E402
 )
 
 
+def _hours_ago(hours: float) -> str:
+    """Время в прошлом относительно реальных часов (run_once берёт "сейчас"
+    из них) — тесты не зависят от даты запуска."""
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _set_event_created(fx, event_id, value: str):
     conn = _sqlite3.connect(fx.db_path)
     conn.execute("UPDATE georgia_fine_amount_events SET created_at = ? WHERE id = ?", (value, event_id))
@@ -602,8 +608,10 @@ async def test_first_enable_never_sends_increases_found_before_it(fx):
     await fx.check(task)
     fx.amounts.set_increase_notifications(enabled=False, at=datetime.now(timezone.utc))
     old = _event(fx, old=100, new=150)
-    _set_event_created(fx, old, "2026-11-20 10:00:00")
-    fx.amounts.set_increase_notifications(enabled=True, at=datetime(2026, 11, 20, 12, 0))
+    _set_event_created(fx, old, _hours_ago(2))
+    fx.amounts.set_increase_notifications(
+        enabled=True, at=datetime.now(timezone.utc) - timedelta(hours=1),
+    )
     new = _event(fx, old=150, new=200)
 
     await fx.delivery.run_once()
@@ -629,13 +637,15 @@ async def test_increase_found_while_the_manager_had_stopped_the_subscription_is_
     await fx.check(task)
     fx.subscription_service.stop_task_for_trusted_admin(task.id, stopped_by=_TRUSTED)
     during = _event(fx, old=100, new=150)
-    _set_event_created(fx, during, "2026-11-20 10:00:00")
+    _set_event_created(fx, during, _hours_ago(2))
     conn = _sqlite3.connect(fx.db_path)
     conn.execute("UPDATE georgia_fine_amount_events SET observed_at = created_at")
     conn.commit()
     conn.close()
 
-    fx.subscriptions.restore_after_manager_resume(task.id, now=datetime(2026, 11, 21, 9, 0), before_restore=lambda sub: 0)
+    fx.subscriptions.restore_after_manager_resume(
+        task.id, now=datetime.now(timezone.utc).replace(tzinfo=None), before_restore=lambda sub: 0,
+    )
     assert fx.subscriptions.get(subscription.id).status == "active"
     await fx.delivery.run_once()
     await fx.delivery.run_once()
@@ -656,8 +666,8 @@ async def test_increase_found_while_the_client_had_notifications_off_is_not_sent
     await fx.check(task)
     fx.subscription_service.turn_off_car(subscription.id, telegram_user_id=_OWNER)
     during = _event(fx)
-    _set_event_created(fx, during, "2026-11-20 10:00:00")
-    fx.subscription_service.turn_on_car(subscription.id, telegram_user_id=_OWNER, today=date(2026, 11, 21))
+    _set_event_created(fx, during, _hours_ago(2))
+    fx.subscription_service.turn_on_car(subscription.id, telegram_user_id=_OWNER, today=datetime.now(timezone.utc).date())
     await fx.delivery.run_once()
     assert fx.sender.sent == []
     assert fx.amounts.get_delivery(during, subscription.id, "owner").exclusion_reason == EXCLUSION_SUBSCRIPTION_CHANGED
@@ -668,8 +678,8 @@ async def test_repeated_ticks_and_restarts_never_send_the_excluded_history(fx):
     await fx.check(task)
     fx.subscription_service.turn_off_car(subscription.id, telegram_user_id=_OWNER)
     during = _event(fx)
-    _set_event_created(fx, during, "2026-11-20 10:00:00")
-    fx.subscription_service.turn_on_car(subscription.id, telegram_user_id=_OWNER, today=date(2026, 11, 21))
+    _set_event_created(fx, during, _hours_ago(2))
+    fx.subscription_service.turn_on_car(subscription.id, telegram_user_id=_OWNER, today=datetime.now(timezone.utc).date())
     for _ in range(3):
         await fx.delivery.run_once()
         # "перезапуск": новый сервис над той же БД
@@ -677,3 +687,28 @@ async def test_repeated_ticks_and_restarts_never_send_the_excluded_history(fx):
             fx.amounts, fx.subscriptions, fx.tracker, fx.sender, tz=_TBILISI, notification_control=fx.control,
         )
     assert fx.sender.sent == []
+
+
+async def test_failed_first_attempt_then_off_and_on_does_not_resend_the_old_increase(fx):
+    task, subscription = fx.car(_CAR, [("GE1", 50)], owner=_OWNER)
+    await fx.check(task)
+    event_id = _event(fx)
+    _set_event_created(fx, event_id, _hours_ago(1))
+
+    class _Failing:
+        async def send_message(self, chat_id, text, *, buttons=None):
+            raise RuntimeError("telegram down")
+
+    failing = AmountIncreaseDeliveryService(
+        fx.amounts, fx.subscriptions, fx.tracker, _Failing(), tz=_TBILISI, notification_control=fx.control,
+    )
+    await failing.run_once()
+    assert fx.amounts.get_delivery(event_id, subscription.id, "owner").attempt_count == 1
+
+    fx.subscription_service.turn_off_car(subscription.id, telegram_user_id=_OWNER)
+    fx.subscription_service.turn_on_car(subscription.id, telegram_user_id=_OWNER, today=datetime.now(timezone.utc).date())
+    await fx.delivery.run_once(now=datetime.now(timezone.utc) + timedelta(minutes=2))
+
+    assert fx.sender.sent == []
+    delivery = fx.amounts.get_delivery(event_id, subscription.id, "owner")
+    assert delivery.exclusion_reason == EXCLUSION_SUBSCRIPTION_CHANGED and delivery.delivered_at is None

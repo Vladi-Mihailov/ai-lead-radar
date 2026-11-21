@@ -729,3 +729,31 @@ def test_feed_match_also_records_the_term(fx):
     fx.tracker.record_listed("AA111BB", _police_record("R1", last_date="2026-10-26", active_date="2026-09-25"),
                              at=datetime(2026, 11, 20, 19, 0))
     assert fx.amounts.term_ends_for_cars(["AA111BB"])[("AA111BB", "R1")] == date(2026, 10, 26)
+
+
+def test_final_term_is_never_downgraded_by_a_later_record_without_delivery_date(fx):
+    fx.receipt(protocol="R1", term_end=date(2026, 10, 26))
+    fx.tracker.record_full_check(
+        "AA111BB", [_police_record("R1", last_date="2026-10-26", active_date="2026-09-25")], complete=True,
+        at=datetime(2026, 11, 20, 19, 0),
+    )
+    fx.tracker.record_listed("AA111BB", _police_record("R1", last_date="2026-10-25"), at=datetime(2026, 11, 21, 9, 0))
+    assert fx.amounts.term_ends_for_cars(["AA111BB"])[("AA111BB", "R1")] == date(2026, 10, 26)
+
+
+def test_failing_term_write_does_not_break_the_status_update(fx, monkeypatch):
+    status = fx.receipt(protocol="R1", term_end=date(2026, 10, 26))
+
+    def broken(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(fx.status_repository, "record_terms", broken)
+    summary = fx.tracker.record_full_check(
+        "AA111BB", [_police_record("R1", last_date="2026-10-26", active_date="2026-09-25")], complete=True,
+        at=datetime(2026, 11, 20, 19, 0),
+    )
+    assert summary.listed == 1
+    assert fx.tracker.get(status.id).last_listed_at == datetime(2026, 11, 20, 19, 0)
+
+
+import sqlite3  # noqa: E402

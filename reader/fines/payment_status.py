@@ -509,12 +509,17 @@ class FineStatusRepository:
         publish_date: str | None, at: datetime,
     ) -> None:
         """Сроки из последнего ответа police.ge; более раннее наблюдение более
-        позднее не перезаписывает."""
+        позднее не перезаписывает. Окончательный срок (с activeDate) не
+        заменяется предварительным: activeDate у квитанции не исчезает, а
+        запись без него могла прийти из более старого источника (feed)."""
         self._conn.execute(
             "INSERT INTO georgia_fine_terms (car_number, protocol_no, last_date, active_date, publish_date, observed_at) "
             "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (car_number, protocol_no) DO UPDATE SET "
-            "last_date = excluded.last_date, active_date = excluded.active_date, "
-            "publish_date = excluded.publish_date, observed_at = excluded.observed_at "
+            "last_date = CASE WHEN excluded.active_date IS NULL AND georgia_fine_terms.active_date IS NOT NULL "
+            "THEN georgia_fine_terms.last_date ELSE excluded.last_date END, "
+            "active_date = COALESCE(excluded.active_date, georgia_fine_terms.active_date), "
+            "publish_date = COALESCE(excluded.publish_date, georgia_fine_terms.publish_date), "
+            "observed_at = excluded.observed_at "
             "WHERE excluded.observed_at >= georgia_fine_terms.observed_at",
             (car_number, protocol_no, last_date, active_date, publish_date, _fmt(at)),
         )
@@ -912,10 +917,15 @@ class FineStatusTracker:
         last_date = _source_date(raw.get("lastDate"))
         if last_date is None:
             return
-        self._repository.record_terms(
-            car_number, protocol_no, last_date=last_date, active_date=_source_date(raw.get("activeDate")),
-            publish_date=_source_date(raw.get("publishDate")), at=at,
-        )
+        try:
+            self._repository.record_terms(
+                car_number, protocol_no, last_date=last_date, active_date=_source_date(raw.get("activeDate")),
+                publish_date=_source_date(raw.get("publishDate")), at=at,
+            )
+        except Exception:
+            # Сроки нужны только сумме к оплате — сбой их записи не должен
+            # прерывать обновление статусов квитанций.
+            logger.warning("Georgia fine status: could not record payment terms", exc_info=True)
 
     def _note_listed(self, car_number: str, protocol_no: str, amount: float | None, *, at: datetime, source: str) -> str:
         existing = self._repository.get_by_protocol(car_number, protocol_no)

@@ -145,7 +145,10 @@ class AmountIncreaseDeliveryService:
                     existing = self._repository.get_delivery(event.id, subscription.id, role)
                     if not _is_due_for_attempt(existing, now=now):
                         continue
-                    reason = exclusion or (EXCLUSION_SUBSCRIPTION_CHANGED if changed_after and existing is None else None)
+                    # И при ожидающем повторе: если подписку выключили и снова
+                    # включили после неудачной первой отправки, старое событие
+                    # для неё тоже уже не новое.
+                    reason = exclusion or (EXCLUSION_SUBSCRIPTION_CHANGED if changed_after else None)
                     if reason is not None:
                         self._repository.exclude_delivery(event.id, subscription.id, role, chat_id, reason=reason)
                         continue

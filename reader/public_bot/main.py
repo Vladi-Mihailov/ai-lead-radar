@@ -302,7 +302,8 @@ async def _run_delivery_poller(
     останавливает поллер, см. design report: "failure одного recipient не
     блокирует другого" — то же самое верно и для тика целиком).
     amount_delivery_service — уведомления об увеличении суммы к оплате
-    (только при fine_monitor.payable_amount_enabled), в том же тике после
+    (только при fine_monitor.payable_amount_enabled и
+    payable_amount_increase_notifications_enabled), в том же тике после
     новых штрафов."""
     while True:
         try:
