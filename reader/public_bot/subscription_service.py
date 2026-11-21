@@ -128,6 +128,9 @@ class CheckNowOutcome:
     # вместо общего "попробуйте позже". Default False сохраняет поведение
     # существующих вызовов CheckNowOutcome(...) без правки.
     provider_unavailable: bool = False
+    # Подписка, из которой вызвана проверка (кнопка «🔄 Уточнить сумму»);
+    # None — task-level проверки менеджера.
+    subscription_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1041,6 +1044,7 @@ class SubscriptionService:
                 fines=check_result.current_fines if check_result.shows_as_ok else [],
                 is_owner=subscription.telegram_user_id == telegram_user_id,
                 provider_unavailable=check_result.provider_unavailable,
+                subscription_id=subscription.id,
             )
         finally:
             # try/finally (а не просто код после await) — освобождает guard

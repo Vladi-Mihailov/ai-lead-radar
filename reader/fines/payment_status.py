@@ -1020,6 +1020,10 @@ class FineStatusTracker:
     def last_full_check_by_car(self, car_numbers: list[str]) -> dict[str, datetime]:
         return self._repository.last_full_check_by_car(car_numbers)
 
+    def listed_statuses_for_cars(self, car_numbers: list[str]) -> list[FineStatus]:
+        """Статусы номеров, кроме ⚪ (один запрос на все номера)."""
+        return self._repository.list_listed_for_cars(car_numbers)
+
     def breakdown_for_cars(self, car_numbers: list[str]) -> dict[str, DebtBreakdown]:
         by_car: dict[str, list[FineStatus]] = {}
         for status in self._repository.list_listed_for_cars(car_numbers):

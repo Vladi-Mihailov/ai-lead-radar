@@ -31,6 +31,7 @@ from reader.public_bot.keyboards import (
     decode_add_car_confirm_callback,
     decode_add_client_decision_callback,
     decode_check_now_callback,
+    decode_payable_amount_refresh_callback,
     decode_debt_list_page_callback,
     decode_debt_refresh_cancel_callback,
     decode_debt_refresh_confirm_callback,
@@ -347,6 +348,20 @@ def register(
                 event,
                 lambda on_check_started: controller.handle_check_now_choice(
                     check_now_id, telegram_user_id=event.sender_id, on_check_started=on_check_started,
+                ),
+                is_trusted=is_trusted,
+            )
+            return
+
+        payable_amount_refresh_id = decode_payable_amount_refresh_callback(data)
+        if payable_amount_refresh_id is not None:
+            # «🔄 Уточнить сумму» — сессия Georgian Card идёт секунды, тот же
+            # "⏳ -> результат", что и у «🔎 Проверить сейчас».
+            await _ack_hourglass_then_await_slow_check(
+                event,
+                lambda on_check_started: controller.handle_payable_amount_refresh(
+                    payable_amount_refresh_id, telegram_user_id=event.sender_id, chat_id=event.chat_id,
+                    on_check_started=on_check_started,
                 ),
                 is_trusted=is_trusted,
             )
@@ -1046,9 +1061,14 @@ async def _send_reply(
         # Manual "🔎 Проверить сейчас" — коммерческие CTA (см.
         # ConversationController._owner_cta_buttons); conversation.py
         # намеренно передаёт их как (label, url), не Telethon Button —
-        # реальные кнопки строятся только здесь.
+        # реальные кнопки строятся только здесь. bytes вместо url —
+        # callback-кнопка («🔄 Уточнить сумму» рядом с оплатой).
         buttons = [
-            [Button.url(label, url) for label, url in row] for row in reply.cta_buttons
+            [
+                Button.inline(label, target) if isinstance(target, bytes) else Button.url(label, target)
+                for label, target in row
+            ]
+            for row in reply.cta_buttons
         ]
     elif reply.show_turkey_bot_link:
         # См. design report "унификация UI" — переход в Turkey-бот теперь

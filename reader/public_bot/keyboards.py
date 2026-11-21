@@ -34,6 +34,7 @@ page в my-car-* callback'ах — ТОЛЬКО для навигации (ку�
 from telethon import Button
 
 from reader.protocol_support.texts import OPERATOR_LABEL
+from reader.public_bot.payable_amount_texts import REFRESH_BUTTON_LABEL as PAYABLE_AMOUNT_REFRESH_LABEL
 from reader.public_bot.texts import (
     ADD_CAR_CONFIRM_LABEL,
     ADD_CAR_LABEL,
@@ -752,6 +753,30 @@ def owner_fine_cta_buttons(contact_username: str) -> list[list[Button]]:
         Button.url(_INSURANCE_BUTTON_LABEL, url),
     ]]
 
+
+
+# «🔄 Уточнить сумму» (см. reader/public_bot/payable_amount_service.py) —
+# subscription_id публичен, владение перепроверяется при нажатии (тот же
+# принцип, что и у «🔎 Проверить сейчас»).
+_PAYABLE_AMOUNT_REFRESH_PREFIX = b"amtref:"
+
+
+def payable_amount_refresh_callback(subscription_id: int) -> bytes:
+    return _PAYABLE_AMOUNT_REFRESH_PREFIX + str(subscription_id).encode("ascii")
+
+
+def decode_payable_amount_refresh_callback(data: bytes | None) -> int | None:
+    return _decode_id(data, _PAYABLE_AMOUNT_REFRESH_PREFIX)
+
+
+def payable_amount_card_buttons(
+    subscription_id: int, *, contact_username: str, include_payment: bool,
+) -> list[list[Button]]:
+    """[🔄 Уточнить сумму], под ним — прежний ряд оплаты (только владельцу)."""
+    rows = [[Button.inline(PAYABLE_AMOUNT_REFRESH_LABEL, payable_amount_refresh_callback(subscription_id))]]
+    if include_payment:
+        rows.extend(owner_fine_cta_buttons(contact_username))
+    return rows
 
 # ==== manager/trusted Search (см. задачу "manager/trusted Search") —
 # ТОЛЬКО trusted-facing клавиатуры, self-service не затронут. Query
