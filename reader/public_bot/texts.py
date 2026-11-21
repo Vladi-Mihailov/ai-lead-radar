@@ -790,7 +790,9 @@ def format_statistics_header(stats: BotStatistics) -> str:
     результате "🔄 Проверить авто со штрафами" (см. задачу "manager
     Statistics / refresh для обоих ботов" п.7 — там НЕ нужны 👥
     Пользователи/🚗 Подписки, только сам факт проверки + актуальный
-    debt-блок)."""
+    debt-блок). Числа активных и остановленных подписок здесь не
+    показываются (решение владельца), хотя BotStatisticsService
+    по-прежнему их считает."""
     return "\n".join([
         "📊 Статистика бота",
         "",
@@ -798,9 +800,6 @@ def format_statistics_header(stats: BotStatistics) -> str:
         f"🆕 Новых сегодня: {stats.new_users_today}",
         f"🆕 Новых за 7 дней: {stats.new_users_7d}",
         f"🆕 Новых за 30 дней: {stats.new_users_30d}",
-        "",
-        f"🚗 Активных подписок: {stats.active_subscriptions}",
-        f"⏸ Остановленных подписок: {stats.stopped_subscriptions}",
         "",
         f"🚨 Новых штрафов найдено сегодня: {stats.new_fines_today}",
     ])

@@ -3077,8 +3077,11 @@ async def test_trusted_operator_sees_statistics(trusted_fx):
 
     assert "📊 Статистика бота" in reply.text
     assert "👥 Всего пользователей: 2" in reply.text
-    assert "🚗 Активных подписок: 0" in reply.text
-    assert "⏸ Остановленных подписок: 1" in reply.text
+    # Числа подписок (здесь одна остановленная) в статистике не показываются.
+    assert "Активных подписок" not in reply.text
+    assert "Остановленных подписок" not in reply.text
+    assert "🚨 Новых штрафов найдено сегодня: 0" in reply.text
+    assert "\n\n\n" not in reply.text
     assert reply.show_main_menu is True
 
 
