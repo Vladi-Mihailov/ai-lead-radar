@@ -230,16 +230,17 @@ def test_repeated_resume_changes_nothing_and_creates_no_duplicates(fx):
 
 
 def test_valid_invitation_is_restored_and_expired_one_is_not(fx):
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = datetime.now(timezone.utc)
     valid = fx.invitation(expires_at=now + timedelta(days=3))
     fx.stop()
     fx.resume()
     assert fx.status(valid) == "pending_claim"
 
     fx.stop()
+    # истекло час назад (в тот же день по UTC) — в формате, который пишет production
     conn = sqlite3.connect(fx.db_path)
     conn.execute("UPDATE fine_monitoring_subscriptions SET claim_token_expires_at = ? WHERE id = ?",
-                 ((now - timedelta(hours=1)).isoformat(sep=" "), valid.id))
+                 ((now - timedelta(minutes=1)).isoformat(), valid.id))
     conn.commit()
     conn.close()
     fx.resume()
@@ -361,3 +362,82 @@ def test_resume_closes_the_journal_entry_with_each_outcome(fx):
         conn.close()
     assert stop[0] is not None and stop[1] == "resumed"
     assert outcomes == {restored.id: "restored", deleted.id: "car_deleted"}
+
+
+# ---- После независимого review ----
+
+
+def test_later_stop_keeps_earlier_untouched_subscriptions_restorable(fx):
+    """A и B; ⛔; A включил сам (задача поднялась); ⛔ снова; ▶️ — возвращаются
+    оба: B никто не трогал с первого ⛔."""
+    first = fx.client(_CLIENT_A)
+    second = fx.client(_CLIENT_B)
+    fx.stop()
+    fx.service.turn_on_car(first.id, telegram_user_id=_CLIENT_A, today=_TODAY)
+    assert fx.tasks.get(fx.task.id).status == "active"
+    fx.stop()
+
+    reply = fx.resume()
+
+    assert fx.status(first) == "active" and fx.status(second) == "active"
+    assert "включены снова: 2" in reply.text
+
+
+def test_failed_history_exclusion_restores_nothing_and_a_retry_completes_it(tmp_path):
+    fixture = _Fixture(tmp_path)
+    subscription = fixture.client(_CLIENT_A)
+    old = fixture.fine("OLD1")
+    fixture.fine("OLD2")
+    fixture.stop()
+    real_excluder = fixture.service._restored_history_excluder
+    calls = []
+
+    def failing_excluder(sub):
+        calls.append(sub.id)
+        fixture.deliveries.exclude(old.id, sub.id, "owner", reason="partial")
+        raise sqlite3.OperationalError("database is locked")
+
+    fixture.service._restored_history_excluder = failing_excluder
+    with pytest.raises(sqlite3.OperationalError):
+        fixture.resume()
+    assert fixture.status(subscription) == "stopped"  # ничего не включено — старое не уйдёт
+    asyncio.run(fixture.delivery.run_once())
+    assert fixture.sender.sent == []
+
+    fixture.service._restored_history_excluder = real_excluder
+    fixture.resume()  # повтор: запись журнала осталась открытой
+    asyncio.run(fixture.delivery.run_once())
+    assert fixture.status(subscription) == "active"
+    assert fixture.sender.sent == []
+    assert calls == [subscription.id]
+    fixture.close()
+
+
+def test_invitation_is_not_restored_when_the_person_was_invited_again(fx):
+    now = datetime.now(timezone.utc)
+    invitation = fx.invitation(expires_at=now + timedelta(days=3))
+    fx.stop()
+    new_task = fx.tasks.create(
+        car_number=_CAR, label=None, start_date=date(2026, 11, 20), end_date=UNLIMITED_END_DATE,
+        telegram_chat_id=_MANAGER, created_by_user_id=_MANAGER, monitoring_scope="client_bot",
+    )
+    fx.subscriptions.create_pending_claim(
+        monitoring_task_id=new_task.id, car_number=_CAR, owner_username_hint="FUTURE_client",
+        created_by_telegram_user_id=_MANAGER, created_by_telegram_chat_id=_MANAGER,
+        start_date=date(2026, 11, 20), end_date=UNLIMITED_END_DATE, claim_token="tok-new",
+        claim_token_expires_at=now + timedelta(days=7),
+    )
+
+    fx.resume()
+
+    assert fx.status(invitation) == "stopped"
+
+
+def test_restored_invitation_excludes_history_for_the_future_owner_too(fx):
+    invitation = fx.invitation(expires_at=datetime.now(timezone.utc) + timedelta(days=3))
+    old = fx.fine("OLD1")
+    fx.stop()
+    fx.resume()
+    assert fx.status(invitation) == "pending_claim"
+    for role in ("trusted_operator", "owner"):
+        assert fx.deliveries.get(old.id, invitation.id, role).exclusion_reason == EXCLUSION_SUBSCRIPTION_RESTORED

@@ -1182,9 +1182,11 @@ class SubscriptionService:
         restored: list[FineMonitoringSubscription] = []
         if self._restored_history_excluder is not None:
             moment = now or datetime.now(timezone.utc).replace(tzinfo=None)
-            restored, outcomes = self._subscription_repository.restore_after_manager_resume(task_id, now=moment)
-            for subscription in restored:
-                self._restored_history_excluder(subscription)
+            # Исключение известных штрафов — ДО включения каждой подписки (см.
+            # restore_after_manager_resume): сбой посередине ничего не включает.
+            restored, outcomes = self._subscription_repository.restore_after_manager_resume(
+                task_id, now=moment, before_restore=self._restored_history_excluder,
+            )
             if outcomes:
                 logger.info(
                     "Georgia manager resume task=%d: client subscriptions %s",
