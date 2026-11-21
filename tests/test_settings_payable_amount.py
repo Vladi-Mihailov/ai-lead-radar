@@ -40,7 +40,7 @@ def test_everything_is_off_by_default(tmp_path, monkeypatch):
     assert fine_monitor.payable_amount_auto_checks_enabled is False
     assert fine_monitor.payable_amount_gc_merchant_id == "" and fine_monitor.payable_amount_gc_page_id == ""
     assert fine_monitor.payable_amount_gc_base_url == "https://mpi.gc.ge"
-    assert fine_monitor.payable_amount_gc_amount_unit == "major"
+    assert fine_monitor.payable_amount_gc_amount_unit == "minor"
     assert fine_monitor.payable_amount_auto_time == time(13, 0)
     assert fine_monitor.payable_amount_auto_cutoff_time == time(14, 0)
     assert fine_monitor.payable_amount_max_sessions_per_day == 40
@@ -56,14 +56,14 @@ def test_overrides_are_parsed(tmp_path, monkeypatch):
         "payable_amount_auto_checks_enabled": True,
         "payable_amount_gc_merchant_id": " M1 ",
         "payable_amount_gc_page_id": "P1",
-        "payable_amount_gc_amount_unit": "minor",
+        "payable_amount_gc_amount_unit": "major",
         "payable_amount_auto_time": "12:30",
         "payable_amount_auto_cutoff_time": "13:15",
         "payable_amount_max_sessions_per_day": 10,
     })
     assert fine_monitor.payable_amount_enabled and fine_monitor.payable_amount_auto_checks_enabled
     assert fine_monitor.payable_amount_gc_merchant_id == "M1"
-    assert fine_monitor.payable_amount_gc_amount_unit == "minor"
+    assert fine_monitor.payable_amount_gc_amount_unit == "major"
     assert fine_monitor.payable_amount_auto_time == time(12, 30)
     assert fine_monitor.payable_amount_max_sessions_per_day == 10
 

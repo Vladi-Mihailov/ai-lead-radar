@@ -1,12 +1,14 @@
 """Клиент суммы к оплате Georgian Card (reader/fines/georgian_card_client.py)
 на mock-транспорте httpx: ни одного реального запроса.
 
-Главное — что клиент делает только то, что делает браузер до ввода карты:
-GET страниц Georgian Card и один POST .../start с пустым телом; никаких
-полей карты, оплаты/авторизации и запросов к police.ge или чужим хостам."""
+Протокол — как у самой страницы mpi.gc.ge/page1/ (приложение): GET page1,
+GET settings.js, POST /token, POST /payment/{token}/start; сумма в тетри.
+Главное — клиент делает только шаги браузера до формы карты: никаких полей
+карты, accept/decline/3ds, запросов к police.ge или чужим хостам."""
 
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -18,7 +20,7 @@ import httpx  # noqa: E402
 import pytest  # noqa: E402
 
 from reader.fines.georgian_card_client import (  # noqa: E402
-    AMOUNT_UNIT_MINOR,
+    AMOUNT_UNIT_MAJOR,
     GeorgianCardAmountClient,
     GeorgianCardConfig,
     GeorgianCardSafetyError,
@@ -36,41 +38,60 @@ from reader.fines.payable_amount import (  # noqa: E402
     OUTCOME_TIMEOUT,
 )
 
-_RECEIPT = "0099887766"
+_RECEIPT = "კბ0099887766"
 _CAR = "AA111BB"
+_TOKEN = "TOKEN0123456789"
 _CONFIG = GeorgianCardConfig(merchant_id="MERCH1", page_id="PAGE1")
-_CARD_PAGE = "https://mpi.gc.ge/v4/MERCHX/payment/TOKEN123"
-_START_PATH = "/open/api//v4/MERCHX/payment/TOKEN123/start"
+_SETTINGS = '''window.settings = {
+    baseUrl: "page1/",
+    openApi: {
+    baseUrl: "https://mpi.gc.ge/open/api/",
+    version: "v4",
+    portal: "PORTAL1",
+  },
+  enableApiLangParam: true,
+};'''
+_TOKEN_PATH = "/open/api//v4/PORTAL1/token"
+_START_PATH = f"/open/api//v4/PORTAL1/payment/{_TOKEN}/start"
+_SHELL = "<html><head><title>Bank of Georgia</title></head><body><div id='app'></div></body></html>"
 
 
-def _card_html(*, receipt_visible=True, button: str | None = None) -> str:
-    receipt = f"<p>ჯარიმის ქვითარი {_RECEIPT}</p>" if receipt_visible else ""
-    hidden = f'<input type="hidden" name="back" value="https://police.ge/protocol/fail.php?id={_RECEIPT}">'
-    pay = f"<button>{button}</button>" if button else ""
-    return f"<html><body>{receipt}{hidden}<input id='src-pan'>{pay}</body></html>"
+def _offer(**overrides):
+    payload = {
+        "state": "offer", "amount": 15000, "currency": "981",
+        "description": f"ჯარიმის ქვითარი {_RECEIPT}", "options": {"lang": "ka"},
+    }
+    payload.update(overrides)
+    return payload
 
 
 class _Gateway:
     """Mock Georgian Card: записывает каждый запрос и отвечает по сценарию."""
 
-    def __init__(self, *, page1=None, card_page=None, start=None):
+    def __init__(self, *, page1=None, settings=None, token=None, start=None):
         self.requests: list[httpx.Request] = []
-        self.page1 = page1 or (lambda request: httpx.Response(302, headers={"location": _CARD_PAGE}))
-        self.card_page = card_page or (lambda request: httpx.Response(200, text=_card_html()))
-        self.start = start or (lambda request: httpx.Response(200, json={
-            "state": "offer", "amount": 150, "currency": "GEL", "description": f"ჯარიმა {_RECEIPT}",
-        }))
+        self.page1 = page1 or (lambda request: httpx.Response(200, text=_SHELL))
+        self.settings = settings or (lambda request: httpx.Response(200, text=_SETTINGS))
+        self.token = token or (lambda request: httpx.Response(200, json={"token": _TOKEN}))
+        self.start = start or (lambda request: httpx.Response(200, json=_offer()))
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         assert request.url.host == "mpi.gc.ge", f"request to a foreign host: {request.url.host}"
-        if request.url.path == "/page1/":
+        path = request.url.raw_path.decode().split("?")[0]
+        if path == "/page1/" and request.method == "GET":
             return self.page1(request)
-        if request.url.path == "/v4/MERCHX/payment/TOKEN123":
-            return self.card_page(request)
-        if request.url.path == _START_PATH:
+        if path == "/page1/settings.js" and request.method == "GET":
+            return self.settings(request)
+        if path == _TOKEN_PATH and request.method == "POST":
+            return self.token(request)
+        if path == _START_PATH and request.method == "POST":
             return self.start(request)
-        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
+        raise AssertionError(f"unexpected request {request.method} {path}")
+
+    def start_body(self) -> dict:
+        start = [r for r in self.requests if r.url.raw_path.decode().startswith(_START_PATH)]
+        return json.loads(start[-1].content)
 
 
 def _fetch(gateway: _Gateway, *, config=_CONFIG, base_amount=50.0):
@@ -78,25 +99,33 @@ def _fetch(gateway: _Gateway, *, config=_CONFIG, base_amount=50.0):
     return asyncio.run(client.fetch_amount(car_number=_CAR, protocol_no=_RECEIPT, base_amount=base_amount))
 
 
-def _assert_only_safe_requests(gateway: _Gateway) -> None:
-    for request in gateway.requests:
-        assert request.url.host == "mpi.gc.ge"
-        if request.method == "POST":
-            assert request.url.path == _START_PATH
-            assert request.content == b"{}"
-        else:
-            assert request.method == "GET" and request.content == b""
-        body = request.content.decode()
-        for card_field in ("pan", "cvc", "cvv", "expiry", "card"):
-            assert card_field not in body.lower()
-
-
-def test_amount_from_the_start_endpoint():
+def test_amount_is_read_through_the_page_api_like_the_browser():
     gateway = _Gateway()
     quote = _fetch(gateway)
-    assert (quote.outcome, quote.amount, quote.currency) == (OUTCOME_OK, 150.0, "GEL")
-    assert [request.method for request in gateway.requests] == ["GET", "GET", "POST"]
-    _assert_only_safe_requests(gateway)
+    assert (quote.outcome, quote.amount, quote.currency) == (OUTCOME_OK, 150.0, "GEL")  # 15000 тетри
+    assert [(r.method, r.url.raw_path.decode().split("?")[0]) for r in gateway.requests] == [
+        ("GET", "/page1/"), ("GET", "/page1/settings.js"), ("POST", _TOKEN_PATH), ("POST", _START_PATH),
+    ]
+    assert gateway.requests[2].content == b""  # /token без тела
+
+
+def test_start_body_is_exactly_what_the_page_sends_and_carries_no_card_fields():
+    gateway = _Gateway()
+    _fetch(gateway)
+    body = gateway.start_body()
+    assert body == {
+        "merchantId": "MERCH1", "state.redirect": "post_params", "state.in_progress": "no",
+        "back_url_s": "https://police.ge/protocol/success.php",
+        "back_url_f": f"https://police.ge/protocol/fail.php?id={_RECEIPT}",
+        "lang": "ka", "3ds2.supported": True,
+        "params.protocolId": _RECEIPT, "params.vehicleNumber": _CAR, "params.resourceAlias": "1",
+        "returnUrl": body["returnUrl"],
+    }
+    assert body["returnUrl"].endswith(f"#{_TOKEN}") and body["returnUrl"].startswith("https://mpi.gc.ge/page1/?")
+    for request in gateway.requests:
+        text = request.content.decode("utf-8", errors="ignore").lower()
+        for card_field in ('"pan"', "expiry", '"csc"', "cvc", "cardholder", "src.type"):
+            assert card_field not in text
 
 
 def test_page1_url_is_the_police_ge_payment_link():
@@ -104,124 +133,135 @@ def test_page1_url_is_the_police_ge_payment_link():
     parts = urlsplit(url)
     query = parse_qs(parts.query)
     assert (parts.scheme, parts.hostname, parts.path) == ("https", "mpi.gc.ge", "/page1/")
-    assert query["merch_id"] == ["MERCH1"] and query["page_id"] == ["PAGE1"]
+    assert query["merch_id"] == ["MERCH1"] and query["page_id"] == ["PAGE1"] and query["lang_code"] == ["ka"]
     assert query["o.protocolId"] == [_RECEIPT] and query["o.vehicleNumber"] == [_CAR]
     assert query["o.resourceAlias"] == ["1"]
+    assert query["back_url_s"] == ["https://police.ge/protocol/success.php"]
     assert query["back_url_f"] == [f"https://police.ge/protocol/fail.php?id={_RECEIPT}"]
+    assert "back_url_f=https://police.ge/protocol/fail.php?id=" in url  # как склеивает police.ge
 
 
-def test_amount_from_the_pay_button_alone():
-    gateway = _Gateway(
-        page1=lambda request: httpx.Response(200, text=_card_html(button="გადახდა (150.00 ₾)")),
-    )
-    quote = _fetch(gateway)
-    assert (quote.outcome, quote.amount) == (OUTCOME_OK, 150.0)
-    assert [request.method for request in gateway.requests] == ["GET"]
-
-
-def test_amount_in_tetri_when_configured():
-    gateway = _Gateway(start=lambda request: httpx.Response(200, json={
-        "state": "offer", "amount": 15000, "currency": "981", "description": f"N {_RECEIPT}",
-    }))
-    quote = _fetch(gateway, config=GeorgianCardConfig(merchant_id="M", page_id="P", amount_unit=AMOUNT_UNIT_MINOR))
+def test_amount_unit_lari_when_configured():
+    gateway = _Gateway(start=lambda request: httpx.Response(200, json=_offer(amount="150.00")))
+    quote = _fetch(gateway, config=GeorgianCardConfig(merchant_id="M", page_id="P", amount_unit=AMOUNT_UNIT_MAJOR))
     assert (quote.outcome, quote.amount) == (OUTCOME_OK, 150.0)
 
 
 def test_wrong_unit_is_rejected_as_implausible_not_saved():
-    gateway = _Gateway(start=lambda request: httpx.Response(200, json={
-        "state": "offer", "amount": 15000, "currency": "GEL", "description": f"N {_RECEIPT}",
-    }))
-    quote = _fetch(gateway)  # major, а пришли тетри
+    gateway = _Gateway(start=lambda request: httpx.Response(200, json=_offer(amount=15000)))
+    quote = _fetch(gateway, config=GeorgianCardConfig(merchant_id="M", page_id="P", amount_unit=AMOUNT_UNIT_MAJOR))
     assert quote.outcome == OUTCOME_INVALID_RESPONSE and quote.amount is None
 
 
-def test_currency_other_than_gel_is_rejected():
-    gateway = _Gateway(start=lambda request: httpx.Response(200, json={
-        "state": "offer", "amount": 150, "currency": "USD", "description": f"N {_RECEIPT}",
-    }))
-    assert _fetch(gateway).outcome == OUTCOME_CURRENCY_MISMATCH
+def test_small_fine_read_in_the_wrong_unit_is_rejected():
+    gateway = _Gateway(start=lambda request: httpx.Response(200, json=_offer(amount=1000)))
+    quote = _fetch(gateway, config=GeorgianCardConfig(merchant_id="M", page_id="P", amount_unit=AMOUNT_UNIT_MAJOR),
+                   base_amount=10.0)
+    assert quote.outcome == OUTCOME_INVALID_RESPONSE
+
+
+@pytest.mark.parametrize("currency,outcome", [("GEL", OUTCOME_OK), ("981", OUTCOME_OK), ("USD", OUTCOME_CURRENCY_MISMATCH),
+                                              ("840", OUTCOME_CURRENCY_MISMATCH)])
+def test_only_gel_is_accepted(currency, outcome):
+    gateway = _Gateway(start=lambda request: httpx.Response(200, json=_offer(currency=currency)))
+    assert _fetch(gateway).outcome == outcome
 
 
 def test_receipt_only_in_our_own_links_does_not_confirm_the_answer():
-    gateway = _Gateway(
-        card_page=lambda request: httpx.Response(200, text=_card_html(receipt_visible=False)),
-        start=lambda request: httpx.Response(200, json={
-            "state": "offer", "amount": 150, "currency": "GEL",
-            "backUrl": f"https://police.ge/protocol/fail.php?id={_RECEIPT}",
-        }),
-    )
+    gateway = _Gateway(start=lambda request: httpx.Response(200, json={
+        "state": "offer", "amount": 15000, "currency": "981",
+        "returnUrl": f"https://mpi.gc.ge/page1/?o.protocolId={_RECEIPT}",
+        "backUrl": f"https://police.ge/protocol/fail.php?id={_RECEIPT}",
+    }))
     assert _fetch(gateway).outcome == OUTCOME_RECEIPT_UNCONFIRMED
 
 
-def test_state_other_than_offer_is_not_an_amount():
+def test_receipt_echoed_in_order_params_confirms_the_answer():
     gateway = _Gateway(start=lambda request: httpx.Response(200, json={
-        "state": "rejected", "amount": 150, "currency": "GEL", "description": f"N {_RECEIPT}",
+        "state": "offer", "amount": 15000, "currency": "GEL", "params": {"protocolId": _RECEIPT},
     }))
+    assert _fetch(gateway).outcome == OUTCOME_OK
+
+
+def test_redirect_state_to_the_fail_page_is_a_refusal():
+    gateway = _Gateway(start=lambda request: httpx.Response(200, json={
+        "state": "redirect", "url": f"https://police.ge/protocol/fail.php?id={_RECEIPT}", "post": True,
+    }))
+    assert _fetch(gateway).outcome == OUTCOME_REFUSED
+
+
+def test_result_state_without_a_card_is_a_refusal_never_a_payment():
+    gateway = _Gateway(start=lambda request: httpx.Response(200, json={"state": "result", "status": "FAILED"}))
     quote = _fetch(gateway)
-    assert quote.outcome == OUTCOME_INVALID_RESPONSE and quote.detail == "state_rejected"
+    assert quote.outcome == OUTCOME_REFUSED and quote.amount is None
 
 
-def test_redirect_to_the_fail_page_is_a_refusal_and_police_ge_is_never_requested():
+def test_unknown_state_is_not_an_amount():
+    gateway = _Gateway(start=lambda request: httpx.Response(200, json=_offer(state="iframe")))
+    quote = _fetch(gateway)
+    assert quote.outcome == OUTCOME_INVALID_RESPONSE and quote.detail == "state_iframe"
+
+
+def test_start_error_is_reported_without_digits():
+    gateway = _Gateway(start=lambda request: httpx.Response(400, json={"error": f"BAD_ORDER {_RECEIPT}"}))
+    quote = _fetch(gateway)
+    assert quote.outcome == OUTCOME_INVALID_RESPONSE
+    assert quote.detail.startswith("start_http_400_") and "0099887766" not in quote.detail
+
+
+@pytest.mark.parametrize("step", ["page1", "settings", "token", "start"])
+def test_rate_limit_or_block_at_any_step_is_reported(step):
+    gateway = _Gateway(**{step: lambda request: httpx.Response(403)})
+    assert _fetch(gateway).outcome == OUTCOME_BLOCKED
+
+
+def test_waf_page_is_a_block_and_nothing_else_is_requested():
     gateway = _Gateway(page1=lambda request: httpx.Response(
-        302, headers={"location": f"https://police.ge/protocol/fail.php?id={_RECEIPT}"},
+        200, text="<title>The URL you requested has been blocked</title> Attack ID: 20000051",
     ))
     quote = _fetch(gateway)
-    assert quote.outcome == OUTCOME_REFUSED
-    assert [request.url.host for request in gateway.requests] == ["mpi.gc.ge"]
-
-
-def test_redirect_to_the_success_page_is_never_treated_as_an_amount():
-    gateway = _Gateway(page1=lambda request: httpx.Response(
-        302, headers={"location": "https://police.ge/protocol/success.php"},
-    ))
-    quote = _fetch(gateway)
-    assert quote.outcome == OUTCOME_INVALID_RESPONSE and quote.detail == "success_redirect"
+    assert quote.outcome == OUTCOME_BLOCKED and quote.detail == "waf_block"
     assert len(gateway.requests) == 1
 
 
-def test_redirect_to_a_foreign_host_is_not_followed():
-    gateway = _Gateway(page1=lambda request: httpx.Response(302, headers={"location": "https://evil.example/x"}))
+def test_unrecognized_settings_stop_before_any_api_call():
+    gateway = _Gateway(settings=lambda request: httpx.Response(200, text="window.settings = {};"))
+    assert _fetch(gateway).outcome == OUTCOME_INVALID_RESPONSE
+    assert [r.method for r in gateway.requests] == ["GET", "GET"]
+
+
+def test_api_on_a_foreign_host_in_settings_is_never_called():
+    gateway = _Gateway(settings=lambda request: httpx.Response(200, text=_SETTINGS.replace(
+        "https://mpi.gc.ge/open/api/", "https://evil.example/open/api/",
+    )))
     quote = _fetch(gateway)
-    assert quote.outcome == OUTCOME_INVALID_RESPONSE and quote.detail == "foreign_redirect"
-    assert len(gateway.requests) == 1
+    assert quote.outcome == OUTCOME_INVALID_RESPONSE and quote.detail == "settings_foreign_api"
+    assert [r.method for r in gateway.requests] == ["GET", "GET"]
 
 
-@pytest.mark.parametrize("status", [403, 429])
-def test_rate_limit_or_block_is_reported(status):
-    gateway = _Gateway(page1=lambda request: httpx.Response(status))
-    assert _fetch(gateway).outcome == OUTCOME_BLOCKED
-    gateway = _Gateway(start=lambda request: httpx.Response(status))
-    assert _fetch(gateway).outcome == OUTCOME_BLOCKED
+@pytest.mark.parametrize("payload", [{}, {"token": "bad token!"}, {"token": 12345678}])
+def test_missing_or_malformed_token_stops_before_start(payload):
+    gateway = _Gateway(token=lambda request: httpx.Response(200, json=payload))
+    assert _fetch(gateway).outcome == OUTCOME_INVALID_RESPONSE
+    assert all(not r.url.raw_path.decode().endswith("/start") for r in gateway.requests)
 
 
 def test_timeout():
-    def page1(request):
+    def token(request):
         raise httpx.ReadTimeout("slow", request=request)
 
-    assert _fetch(_Gateway(page1=page1)).outcome == OUTCOME_TIMEOUT
+    assert _fetch(_Gateway(token=token)).outcome == OUTCOME_TIMEOUT
 
 
-def test_server_error_and_unknown_page():
-    assert _fetch(_Gateway(page1=lambda request: httpx.Response(502))).outcome == OUTCOME_ERROR
-    quote = _fetch(_Gateway(page1=lambda request: httpx.Response(200, text="<html>მიმდინარეობს</html>")))
-    assert quote.outcome == OUTCOME_INVALID_RESPONSE and quote.detail == "amount_not_found"
+def test_zero_amount_and_missing_amount_are_not_an_amount():
+    assert _fetch(_Gateway(start=lambda r: httpx.Response(200, json=_offer(amount=0)))).outcome == OUTCOME_INVALID_RESPONSE
+    payload = _offer()
+    del payload["amount"]
+    assert _fetch(_Gateway(start=lambda r: httpx.Response(200, json=payload))).outcome == OUTCOME_INVALID_RESPONSE
 
 
 def test_start_answer_that_is_not_json():
     gateway = _Gateway(start=lambda request: httpx.Response(200, text="<html>oops</html>"))
-    assert _fetch(gateway).outcome == OUTCOME_INVALID_RESPONSE
-
-
-def test_pay_button_and_start_amount_must_agree():
-    gateway = _Gateway(card_page=lambda request: httpx.Response(200, text=_card_html(button="გადახდა (100 ₾)")))
-    quote = _fetch(gateway)
-    assert quote.outcome == OUTCOME_INVALID_RESPONSE and quote.detail == "amount_mismatch"
-
-
-def test_zero_amount_is_not_an_amount():
-    gateway = _Gateway(start=lambda request: httpx.Response(200, json={
-        "state": "offer", "amount": 0, "currency": "GEL", "description": f"N {_RECEIPT}",
-    }))
     assert _fetch(gateway).outcome == OUTCOME_INVALID_RESPONSE
 
 
@@ -232,57 +272,6 @@ def test_not_configured_sends_nothing():
     assert gateway.requests == []
 
 
-def test_too_many_redirects():
-    gateway = _Gateway(page1=lambda request: httpx.Response(302, headers={"location": "https://mpi.gc.ge/page1/"}))
-    assert _fetch(gateway).outcome == OUTCOME_INVALID_RESPONSE
-
-
-@pytest.mark.parametrize("method,url,body", [
-    ("POST", "https://mpi.gc.ge/open/api//v4/M/payment/T/pay", b"{}"),
-    ("POST", "https://mpi.gc.ge/open/api//v4/M/payment/T/start", b'{"pan": "4000000000000001"}'),
-    ("POST", "https://mpi.gc.ge/page1/", b""),
-    ("PUT", "https://mpi.gc.ge/open/api//v4/M/payment/T/start", b"{}"),
-    ("GET", "https://police.ge/protocol/fail.php", None),
-    ("GET", "http://mpi.gc.ge/page1/", None),
-    ("GET", "https://mpi.gc.ge.evil.example/page1/", None),
-])
-def test_guard_blocks_anything_but_reading_the_payment_page(method, url, body):
-    with pytest.raises(GeorgianCardSafetyError):
-        _guard_request(method, url, gc_host="mpi.gc.ge", body=body)
-
-
-def test_guard_allows_exactly_the_browser_steps():
-    _guard_request("GET", "https://mpi.gc.ge/page1/?a=1", gc_host="mpi.gc.ge", body=None)
-    _guard_request("POST", "https://mpi.gc.ge" + _START_PATH, gc_host="mpi.gc.ge", body=b"{}")
-
-
-def test_detail_never_contains_the_receipt_or_plate():
-    for gateway in (
-        _Gateway(page1=lambda request: httpx.Response(403)),
-        _Gateway(start=lambda request: httpx.Response(200, json={"state": f"x{_RECEIPT}", "amount": 1})),
-        _Gateway(card_page=lambda request: httpx.Response(200, text=_card_html(receipt_visible=False)),
-                 start=lambda request: httpx.Response(200, json={"state": "offer", "amount": 150, "currency": "GEL"})),
-    ):
-        quote = _fetch(gateway)
-        assert _RECEIPT not in (quote.detail or "") and _CAR not in (quote.detail or "")
-        assert json.dumps(quote.__dict__, default=str).find(_RECEIPT) == -1
-
-
-# ---- После независимого review ----
-
-
-def test_httpx_request_log_never_contains_the_plate_receipt_or_session_token(caplog):
-    import logging
-
-    caplog.set_level(logging.INFO, logger="httpx")
-    gateway = _Gateway()
-    assert _fetch(gateway).outcome == OUTCOME_OK
-    assert "HTTP Request" in caplog.text  # httpx действительно пишет каждую строку запроса
-    for secret in (_RECEIPT, _CAR, "TOKEN123", "MERCH1", "PAGE1"):
-        assert secret not in caplog.text
-    assert "https://mpi.gc.ge/<redacted>" in caplog.text
-
-
 @pytest.mark.parametrize("base_url", ["https://police.ge", "https://mpi.gc.ge.evil.example", "http://mpi.gc.ge",
                                       "https://mpi.gc.ge:8443"])
 def test_misconfigured_gateway_host_sends_nothing(base_url):
@@ -291,18 +280,18 @@ def test_misconfigured_gateway_host_sends_nothing(base_url):
     assert quote.request_sent is False and gateway.requests == []
 
 
-def test_guard_refuses_a_non_georgian_card_configuration_and_other_ports():
-    with pytest.raises(GeorgianCardSafetyError):
-        _guard_request("GET", "https://police.ge/protocol/index.php", gc_host="police.ge", body=None)
-    with pytest.raises(GeorgianCardSafetyError):
-        _guard_request("GET", "https://mpi.gc.ge:8443/page1/", gc_host="mpi.gc.ge", body=None)
+def test_redirect_to_the_fail_page_is_a_refusal_and_police_ge_is_never_requested():
+    gateway = _Gateway(page1=lambda request: httpx.Response(
+        302, headers={"location": "https://police.ge/protocol/fail.php?id=1"},
+    ))
+    assert _fetch(gateway).outcome == OUTCOME_REFUSED
+    assert [request.url.host for request in gateway.requests] == ["mpi.gc.ge"]
 
 
-def test_small_fine_read_in_the_wrong_unit_is_rejected():
-    gateway = _Gateway(start=lambda request: httpx.Response(200, json={
-        "state": "offer", "amount": 1000, "currency": "GEL", "description": f"N {_RECEIPT}",
-    }))
-    assert _fetch(gateway, base_amount=10.0).outcome == OUTCOME_INVALID_RESPONSE
+def test_redirect_to_a_foreign_host_is_not_followed():
+    gateway = _Gateway(page1=lambda request: httpx.Response(302, headers={"location": "https://evil.example/x"}))
+    quote = _fetch(gateway)
+    assert quote.outcome == OUTCOME_INVALID_RESPONSE and len(gateway.requests) == 1
 
 
 def _chain(hops: int):
@@ -310,7 +299,7 @@ def _chain(hops: int):
         step = int(request.url.params.get("hop", "0"))
         if step < hops:
             return httpx.Response(302, headers={"location": f"https://mpi.gc.ge/page1/?hop={step + 1}"})
-        return httpx.Response(200, text=_card_html(button="გადახდა (150 ₾)"))
+        return httpx.Response(200, text=_SHELL)
 
     return page1
 
@@ -319,3 +308,58 @@ def test_exactly_the_allowed_number_of_redirects_is_followed():
     assert _fetch(_Gateway(page1=_chain(6))).outcome == OUTCOME_OK
     quote = _fetch(_Gateway(page1=_chain(7)))
     assert quote.outcome == OUTCOME_INVALID_RESPONSE and quote.detail == "too_many_redirects"
+
+
+_ALLOWED_BODY = {"merchantId": "M", "state.redirect": "post_params", "params.protocolId": "1", "3ds2.supported": True}
+
+
+@pytest.mark.parametrize("method,url,body", [
+    ("POST", "https://mpi.gc.ge/open/api//v4/P/payment/TOKEN12345/accept", {}),
+    ("POST", "https://mpi.gc.ge/open/api//v4/P/payment/TOKEN12345/decline", None),
+    ("POST", "https://mpi.gc.ge/open/api//v4/P/payment/TOKEN12345/3ds2-prepare/accept", {}),
+    ("POST", "https://mpi.gc.ge/open/api//v4/P/payment/TOKEN12345/start", {**_ALLOWED_BODY, "pan": "4000000000000001"}),
+    ("POST", "https://mpi.gc.ge/open/api//v4/P/payment/TOKEN12345/start", {**_ALLOWED_BODY, "src.type": "card"}),
+    ("POST", "https://mpi.gc.ge/open/api//v4/P/payment/TOKEN12345/start", {"merchantId": {"nested": 1}}),
+    ("POST", "https://mpi.gc.ge/open/api//v4/P/token", {"x": "1"}),
+    ("POST", "https://mpi.gc.ge/page1/", None),
+    ("PUT", "https://mpi.gc.ge/open/api//v4/P/token", None),
+    ("GET", "https://police.ge/protocol/fail.php", None),
+    ("GET", "http://mpi.gc.ge/page1/", None),
+    ("GET", "https://mpi.gc.ge:8443/page1/", None),
+    ("GET", "https://mpi.gc.ge.evil.example/page1/", None),
+])
+def test_guard_blocks_anything_but_reading_the_amount(method, url, body):
+    with pytest.raises(GeorgianCardSafetyError):
+        _guard_request(method, url, gc_host="mpi.gc.ge", json_body=body)
+
+
+def test_guard_allows_exactly_the_browser_steps_and_refuses_a_bad_config_host():
+    _guard_request("GET", "https://mpi.gc.ge/page1/?a=1", gc_host="mpi.gc.ge", json_body=None)
+    _guard_request("POST", "https://mpi.gc.ge" + _TOKEN_PATH, gc_host="mpi.gc.ge", json_body=None)
+    _guard_request("POST", "https://mpi.gc.ge" + _START_PATH, gc_host="mpi.gc.ge", json_body=_ALLOWED_BODY)
+    with pytest.raises(GeorgianCardSafetyError):
+        _guard_request("GET", "https://police.ge/protocol/index.php", gc_host="police.ge", json_body=None)
+
+
+def test_httpx_request_log_never_contains_the_plate_receipt_or_session_token(caplog):
+    caplog.set_level(logging.INFO, logger="httpx")
+    gateway = _Gateway()
+    assert _fetch(gateway).outcome == OUTCOME_OK
+    assert "HTTP Request" in caplog.text
+    for secret in ("AA111BB", _TOKEN, "MERCH1", "PAGE1", "0099887766"):
+        assert secret not in caplog.text
+    assert "https://mpi.gc.ge/<redacted>" in caplog.text
+
+
+def test_trace_and_detail_never_contain_the_plate_receipt_or_token():
+    for gateway in (
+        _Gateway(),
+        _Gateway(start=lambda request: httpx.Response(200, json=_offer(state=f"x{_RECEIPT}"))),
+        _Gateway(start=lambda request: httpx.Response(200, json={"state": "offer", "amount": 15000, "currency": "981"})),
+        _Gateway(page1=lambda request: httpx.Response(403)),
+    ):
+        quote = _fetch(gateway)
+        text = " ".join(quote.trace) + " " + (quote.detail or "")
+        for secret in ("AA111BB", _TOKEN, "0099887766"):
+            assert secret not in text
+    assert any("state offer" in step and "amount 15000" in step for step in _fetch(_Gateway()).trace)

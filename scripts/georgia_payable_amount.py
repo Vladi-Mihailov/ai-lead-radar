@@ -5,6 +5,7 @@
     python -m scripts.georgia_payable_amount plan [--date 2026-12-01]
     python -m scripts.georgia_payable_amount fetch --car-number AB123CD --protocol-no 0123456789
     python -m scripts.georgia_payable_amount fetch --car-number AB123CD --protocol-no 0123456789 --execute
+    python -m scripts.georgia_payable_amount fetch ... --merchant-id M --page-id P   # без правки config.yaml
     python -m scripts.georgia_payable_amount clear-suspension
 
 status — сколько сумм сохранено, проверок сегодня (по триггерам и исходам),
@@ -19,7 +20,11 @@ fetch — пилот на ОДНОЙ квитанции. Без --execute нич
 сделано. С --execute — ровно одна сессия Georgian Card (без карты, без
 оплаты): сумма сохраняется молча (триггер pilot, без уведомлений), даже
 если функция в боте выключена. Сессия учитывается в дневном лимите; при
-приостановке после 403/429 не выполняется.
+приостановке после 403/429 не выполняется. Печатает обезличенный ход
+сессии (шаги, коды ответов, имена полей, state/currency/amount) — чтобы
+единственная сессия пилота была понятна и при неожиданном ответе.
+--merchant-id/--page-id — merch_id/page_id МВД из JavaScript police.ge для
+этого запуска (config.yaml при этом не меняется).
 
 clear-suspension — явно снять приостановку сессий после 403/429.
 
@@ -68,12 +73,33 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--car-number", default=None, help="fetch: госномер.")
     parser.add_argument("--protocol-no", default=None, help="fetch: номер квитанции.")
     parser.add_argument("--execute", action="store_true", help="fetch: реально открыть одну сессию Georgian Card.")
+    parser.add_argument("--merchant-id", default=None, help="fetch: merch_id МВД для этого запуска (вместо config).")
+    parser.add_argument("--page-id", default=None, help="fetch: page_id МВД для этого запуска (вместо config).")
+    parser.add_argument("--config", default=None,
+                        help="config.yaml (по умолчанию — из этого checkout); его каталог задаёт БД и .env.")
     return parser.parse_args(argv)
 
 
+class _TracingClient:
+    """Обёртка клиента: запоминает обезличенный ход последней сессии."""
+
+    def __init__(self, client):
+        self._client = client
+        self.last_trace: tuple[str, ...] = ()
+
+    @property
+    def configured(self) -> bool:
+        return self._client.configured
+
+    async def fetch_amount(self, **kwargs):
+        quote = await self._client.fetch_amount(**kwargs)
+        self.last_trace = quote.trace
+        return quote
+
+
 class _Context:
-    def __init__(self):
-        settings = load_settings(CONFIG_PATH)
+    def __init__(self, *, merchant_id: str | None = None, page_id: str | None = None, config_path: Path = CONFIG_PATH):
+        settings = load_settings(config_path)
         self.fine_monitor = settings.fine_monitor
         self.tz = ZoneInfo(settings.fine_monitor.timezone)
         db_path = settings.app.users_db_file
@@ -82,13 +108,13 @@ class _Context:
         self.statuses = FineStatusTracker(self._statuses_repository)
         self.subscriptions = FineSubscriptionRepository(db_path)
         fm = settings.fine_monitor
-        self.client = GeorgianCardAmountClient(GeorgianCardConfig(
+        self.client = _TracingClient(GeorgianCardAmountClient(GeorgianCardConfig(
             base_url=fm.payable_amount_gc_base_url,
-            merchant_id=fm.payable_amount_gc_merchant_id,
-            page_id=fm.payable_amount_gc_page_id,
+            merchant_id=(merchant_id or fm.payable_amount_gc_merchant_id).strip(),
+            page_id=(page_id or fm.payable_amount_gc_page_id).strip(),
             amount_unit=fm.payable_amount_gc_amount_unit,
             request_timeout_seconds=fm.payable_amount_request_timeout_seconds,
-        ))
+        )))
         self.service = PayableAmountService(
             self.amounts, self.client, self.statuses, self.subscriptions,
             tz=self.tz,
@@ -169,6 +195,10 @@ def _fetch(ctx: _Context, car_number: str, protocol_no: str, *, execute: bool) -
     elapsed = time_module.monotonic() - started
     checks = ctx.amounts.checks_for_receipt(car_number, protocol_no)
     last = checks[-1] if checks else None
+    if ctx.client.last_trace:
+        print("Ход сессии (обезличенно):")
+        for step in ctx.client.last_trace:
+            print(f"  - {step}")
     print(f"\nРезультат: {result.status}; исход Georgian Card: {result.outcome or '—'}"
           + (f" ({last.detail})" if last is not None and last.detail else "")
           + f"; {elapsed:.1f} с")
@@ -180,7 +210,10 @@ def _fetch(ctx: _Context, car_number: str, protocol_no: str, *, execute: bool) -
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    ctx = _Context()
+    ctx = _Context(
+        merchant_id=args.merchant_id, page_id=args.page_id,
+        config_path=Path(args.config) if args.config else CONFIG_PATH,
+    )
     try:
         if args.action == "status":
             _status(ctx)

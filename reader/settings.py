@@ -318,9 +318,9 @@ class FineMonitorSettings(BaseModel):
     payable_amount_gc_base_url: str = "https://mpi.gc.ge"
     payable_amount_gc_merchant_id: str = ""
     payable_amount_gc_page_id: str = ""
-    # В каких единицах amount ответа .../start: "major" (лари) или "minor"
-    # (тетри) — сверяется пилотом.
-    payable_amount_gc_amount_unit: str = "major"
+    # В каких единицах amount ответа .../start: "minor" (тетри — так его
+    # показывает сама страница: amount/100) или "major" (лари).
+    payable_amount_gc_amount_unit: str = "minor"
     payable_amount_request_timeout_seconds: float = 20.0
     payable_amount_auto_time: time = time(13, 0)
     payable_amount_auto_cutoff_time: time = time(14, 0)
@@ -881,7 +881,7 @@ def load_settings(config_path: Path) -> Settings:
                 payable_amount_gc_merchant_id=str(fine_monitor_raw.get("payable_amount_gc_merchant_id") or "").strip(),
                 payable_amount_gc_page_id=str(fine_monitor_raw.get("payable_amount_gc_page_id") or "").strip(),
                 payable_amount_gc_amount_unit=_parse_amount_unit(
-                    fine_monitor_raw.get("payable_amount_gc_amount_unit", "major")
+                    fine_monitor_raw.get("payable_amount_gc_amount_unit", "minor")
                 ),
                 payable_amount_request_timeout_seconds=_parse_request_timeout(
                     fine_monitor_raw.get("payable_amount_request_timeout_seconds", 20.0)

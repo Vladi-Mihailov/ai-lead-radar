@@ -1,37 +1,35 @@
 """Сумма к оплате штрафа из платёжной страницы Georgian Card (см.
 reader/fines/payable_amount.py и docs/georgia-payable-amount.md).
 
-Повторяет ровно то, что делает браузер плательщика ДО ввода карты:
+Страница оплаты mpi.gc.ge/page1/ — JavaScript-приложение (статическая
+оболочка + settings.js + бандл). Сумму оно получает само, двумя вызовами
+своего API (разобрано по коду приложения 2026-11-21):
 
-1. GET mpi.gc.ge/page1/?... — та же ссылка, что строит JavaScript police.ge
-   для кнопки Visa/Mastercard (merch_id/page_id МВД — из config). Georgian
-   Card создаёт транзакцию и спрашивает у МВД, можно ли оплатить и сколько.
-2. Редиректы — только внутри хоста Georgian Card. Редирект на
-   police.ge/protocol/fail.php означает отказ МВД (OUTCOME_REFUSED); туда
-   запрос не отправляется. Любой другой внешний хост — ошибка.
-3. Сумма — из страницы оплаты (кнопка «გადახდა (<сумма> ₾)») и/или из ответа
-   POST /open/api//v4/{merchantId}/payment/{token}/start, который страница
-   вызывает сама при загрузке (state "offer", amount, currency — без данных
-   карты).
+1. POST {openApi.baseUrl}/{version}/{portal}/token -> {"token": ...};
+2. POST .../payment/{token}/start с параметрами страницы: merchantId
+   (merch_id МВД), back_url_s/back_url_f, lang, "3ds2.supported",
+   "params.protocolId"/"params.vehicleNumber"/"params.resourceAlias" (из
+   o.* ссылки police.ge), returnUrl. На этом шаге Georgian Card спрашивает
+   МВД (check), и ответ — state "offer" с amount (в тетри: приложение
+   показывает amount/100) и currency, либо отказ.
 
-Чего этот модуль не делает никогда: не заполняет и не отправляет поля карты,
-не вызывает оплату/авторизацию/подтверждение, не ходит на police.ge и на
-любой хост, кроме Georgian Card. Это не соглашение, а проверка: каждый
-запрос проходит через _guard_request — разрешены только GET к хосту
-Georgian Card и единственный POST на .../start с пустым телом {}.
+Клиент повторяет ровно шаги браузера до формы карты: GET page1 с той же
+ссылкой, что строит police.ge (merch_id/page_id МВД — из config), GET
+settings.js (адрес API и portal), POST /token, POST /start. Карта не
+вводится, оплата, авторизация, подтверждение, отклонение (accept/decline/
+3ds/googlepay/...) не вызываются, police.ge и любые другие хосты не
+запрашиваются. Это не соглашение, а проверка: каждый запрос проходит через
+_guard_request — разрешены только GET к хосту Georgian Card, POST /token
+без тела и POST /start с телом только из разрешённых полей.
 
-Ответ принимается, только если: МВД разрешило оплату (state "offer" или
-страница с кнопкой оплаты), валюта GEL, квитанция названа в ответе (не в
-наших же ссылках), сумма положительна и правдоподобна. Всё остальное —
-исход без суммы (OUTCOME_*), который ничего не сохраняет и оплатой не
-считается.
+Ответ принимается, только если: state "offer", валюта GEL (GEL/981),
+квитанция названа в самом ответе (не в наших же ссылках), сумма
+положительна и правдоподобна. Всё остальное — исход без суммы (OUTCOME_*),
+который ничего не сохраняет и оплатой не считается. Ограничения шлюза
+(Cloudflare, WAF, 403/429) не обходятся: такой ответ — OUTCOME_BLOCKED.
 
-Формат страницы оплаты для police.ge подтверждён только для отказа (запись
-2026-11-18); страница с суммой видена в другом сценарии (ОСАГО, reader/
-checkout/payment_gateway.py). Поэтому любой незнакомый ответ — OUTCOME_
-INVALID_RESPONSE с кодом в detail, а не догадка; формат сверяется пилотом на
-одной квитанции (см. docs/georgia-payable-amount.md).
-
+AmountQuote.trace — обезличенный ход сессии (шаги, коды, имена полей ответа,
+state/currency/amount) для пилота; печатает его только операторский скрипт.
 В логи и detail не попадают номер, квитанция, HTML, cookies и токены.
 """
 
@@ -42,7 +40,7 @@ import logging
 import re
 from dataclasses import dataclass
 from typing import Protocol
-from urllib.parse import urlencode, urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 
@@ -69,20 +67,26 @@ POLICE_GE_FAIL_URL = "https://police.ge/protocol/fail.php"
 _POLICE_GE_HOSTS = frozenset({"police.ge", "www.police.ge"})
 
 AMOUNT_UNIT_MAJOR = "major"  # GEL
-AMOUNT_UNIT_MINOR = "minor"  # тетри (1/100 GEL)
+AMOUNT_UNIT_MINOR = "minor"  # тетри (1/100 GEL) — так отвечает API страницы
 
-_START_PATH_RE = re.compile(r"^/open/api//?v4/[A-Za-z0-9_-]{1,128}/payment/[A-Za-z0-9_-]{1,256}/start$")
-# Где в странице/адресе может стоять пара merchantId/token для .../start.
-_START_ENDPOINT_RE = re.compile(r"/open/api//?v4/([A-Za-z0-9_-]{1,128})/payment/([A-Za-z0-9_-]{1,256})/start")
-_V4_PAYMENT_PATH_RE = re.compile(r"/v4/([A-Za-z0-9_-]{1,128})/payment/([A-Za-z0-9_-]{1,256})")
-# Кнопка оплаты: «გადახდა (50.00 ₾)» / «გადახდა (1 250,00 ₾)».
-_PAY_BUTTON_RE = re.compile(r"გადახდა\s*\(\s*([0-9][0-9\s., ]*)\s*₾\s*\)")
-_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
-_TAG_RE = re.compile(r"<[^>]+>")
+_API_ID = r"[A-Za-z0-9_-]{1,128}"
+_TOKEN_PATH_RE = re.compile(rf"^/open/api//?v[0-9]{{1,2}}/{_API_ID}/token$")
+_START_PATH_RE = re.compile(rf"^/open/api//?v[0-9]{{1,2}}/{_API_ID}/payment/[A-Za-z0-9_-]{{8,256}}/start$")
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{8,256}$")
+# Поля тела /start — ровно те, что собирает страница до формы карты.
+_START_BODY_KEYS = frozenset({
+    "merchantId", "state.redirect", "state.in_progress", "back_url_s", "back_url_f", "lang", "3ds2.supported",
+    "params.protocolId", "params.vehicleNumber", "params.resourceAlias", "returnUrl",
+})
+_SETTINGS_BASE_RE = re.compile(r"openApi\s*:\s*\{[^}]*?baseUrl\s*:\s*[\"']([^\"']+)[\"']", re.DOTALL)
+_SETTINGS_VERSION_RE = re.compile(r"openApi\s*:\s*\{[^}]*?version\s*:\s*[\"'](v[0-9]{1,2})[\"']", re.DOTALL)
+_SETTINGS_PORTAL_RE = re.compile(rf"openApi\s*:\s*\{{[^}}]*?portal\s*:\s*[\"']({_API_ID})[\"']", re.DOTALL)
+_WAF_MARKERS = ("The URL you requested has been blocked", "Attack ID")
 _URL_RE = re.compile(r"https?://\S+|[?&][\w.]+=\S*", re.IGNORECASE)
-# Только буквы: значение state приходит от шлюза, цифры могли бы оказаться
-# номером квитанции или госномера.
+# Только буквы: коды приходят от шлюза, цифры могли бы оказаться номером
+# квитанции или госномера.
 _STATE_SAFE_RE = re.compile(r"[^a-z_]")
+_ERROR_SAFE_RE = re.compile(r"[^A-Za-z_]")
 
 _GC_LOG_MARKER = "gc.ge"
 _GC_URL_RE = re.compile(r"(https?://[^/\s\"']*gc\.ge)[^\s\"']*", re.IGNORECASE)
@@ -121,7 +125,6 @@ def _install_gc_url_log_redaction() -> None:
 _install_gc_url_log_redaction()
 
 _MAX_BODY_CHARS = 2_000_000
-_START_BODY = b"{}"
 # Правдоподобие суммы — защита от ошибки разбора/единиц (тетри вместо лари),
 # а не расчёт начислений: сумма меньше половины исходной или больше
 # 6×исходной + 300 ₾ не сохраняется (тетри, прочитанные как лари, — это
@@ -140,7 +143,7 @@ class GeorgianCardConfig:
     base_url: str = "https://mpi.gc.ge"
     merchant_id: str = ""
     page_id: str = ""
-    amount_unit: str = AMOUNT_UNIT_MAJOR
+    amount_unit: str = AMOUNT_UNIT_MINOR
     request_timeout_seconds: float = 20.0
     max_redirects: int = 6
     user_agent: str = (
@@ -169,6 +172,8 @@ class AmountQuote:
     detail: str | None = None
     # False — ни одного запроса не отправлено (не настроено): сессии нет.
     request_sent: bool = True
+    # Обезличенный ход сессии для пилота (см. модульный докстрок).
+    trace: tuple[str, ...] = ()
 
 
 class GeorgianCardClientLike(Protocol):
@@ -178,32 +183,63 @@ class GeorgianCardClientLike(Protocol):
     async def fetch_amount(self, *, car_number: str, protocol_no: str, base_amount: float | None) -> AmountQuote: ...
 
 
+def _q(value: str) -> str:
+    return quote(value, safe="")
+
+
 def build_page1_url(config: GeorgianCardConfig, *, car_number: str, protocol_no: str) -> str:
-    """Та же ссылка, что у кнопки Visa/Mastercard на police.ge."""
-    query = urlencode([
-        ("lang_code", "ka"),
-        ("page_id", config.page_id),
-        ("merch_id", config.merchant_id),
-        ("back_url_s", POLICE_GE_SUCCESS_URL),
-        ("back_url_f", f"{POLICE_GE_FAIL_URL}?id={protocol_no}"),
-        ("o.protocolId", protocol_no),
-        ("o.vehicleNumber", car_number),
-        ("o.resourceAlias", "1"),
-    ])
-    return f"{config.base_url.rstrip('/')}/page1/?{query}"
+    """Та же ссылка, что строит payment(protocolNo, protocolAuto) на police.ge
+    (простая склейка строк; браузер кодирует только не-ASCII символы)."""
+    return (
+        f"{config.base_url.rstrip('/')}/page1/?lang_code=ka"
+        f"&page_id={_q(config.page_id)}"
+        f"&merch_id={_q(config.merchant_id)}"
+        f"&back_url_s={POLICE_GE_SUCCESS_URL}"
+        f"&back_url_f={POLICE_GE_FAIL_URL}?id={_q(protocol_no)}"
+        f"&o.protocolId={_q(protocol_no)}"
+        f"&o.vehicleNumber={_q(car_number)}"
+        "&o.resourceAlias=1"
+    )
 
 
-def _guard_request(method: str, url: str, *, gc_host: str, body: bytes | None) -> None:
+def build_start_body(config: GeorgianCardConfig, *, car_number: str, protocol_no: str, return_url: str) -> dict:
+    """Тело /start — как его собирает страница (dT() + returnUrl)."""
+    return {
+        "merchantId": config.merchant_id,
+        "state.redirect": "post_params",
+        "state.in_progress": "no",
+        "back_url_s": POLICE_GE_SUCCESS_URL,
+        "back_url_f": f"{POLICE_GE_FAIL_URL}?id={protocol_no}",
+        "lang": "ka",
+        "3ds2.supported": True,
+        "params.protocolId": protocol_no,
+        "params.vehicleNumber": car_number,
+        "params.resourceAlias": "1",
+        "returnUrl": return_url,
+    }
+
+
+def _guard_request(method: str, url: str, *, gc_host: str, json_body: dict | None) -> None:
     parts = urlsplit(url)
     if gc_host not in ALLOWED_GC_HOSTS:
         raise GeorgianCardSafetyError("config_host")
     if parts.scheme != "https" or (parts.hostname or "") != gc_host or parts.port not in (None, 443):
         raise GeorgianCardSafetyError("host")
     if method == "GET":
-        if body:
+        if json_body is not None:
             raise GeorgianCardSafetyError("get_body")
         return
-    if method == "POST" and _START_PATH_RE.match(parts.path) and not parts.query and body == _START_BODY:
+    if method != "POST" or parts.query:
+        raise GeorgianCardSafetyError("method_or_path")
+    if _TOKEN_PATH_RE.match(parts.path):
+        if json_body is not None:
+            raise GeorgianCardSafetyError("token_body")
+        return
+    if _START_PATH_RE.match(parts.path):
+        if not isinstance(json_body, dict) or not set(json_body) <= _START_BODY_KEYS:
+            raise GeorgianCardSafetyError("start_body")
+        if not all(isinstance(value, (str, bool)) for value in json_body.values()):
+            raise GeorgianCardSafetyError("start_body_value")
         return
     raise GeorgianCardSafetyError("method_or_path")
 
@@ -237,14 +273,6 @@ def _parse_number(text: str) -> float | None:
         return None
 
 
-def _visible_text(html: str) -> str:
-    """Текст страницы без скриптов, разметки и ссылок: квитанция в наших же
-    параметрах (back_url_f, o.protocolId) подтверждением не считается."""
-    text = _SCRIPT_STYLE_RE.sub(" ", html)
-    text = _TAG_RE.sub(" ", text)
-    return _URL_RE.sub(" ", text)
-
-
 def _mentions_receipt(text: str, protocol_no: str) -> bool:
     pattern = rf"(?<![0-9A-Za-z]){re.escape(protocol_no)}(?![0-9A-Za-z])"
     return re.search(pattern, text) is not None
@@ -263,6 +291,8 @@ def _json_strings(value) -> list[str]:
 
 
 def _json_mentions_receipt(payload, protocol_no: str) -> bool:
+    """Квитанция названа в значении ответа — не в ссылке (back_url_f,
+    returnUrl — наши же параметры)."""
     for text in _json_strings(payload):
         if "://" in text or "protocolId" in text or "id=" in text:
             continue
@@ -290,45 +320,24 @@ def _find_key(payload, names: tuple[str, ...]):
     return None
 
 
-def _extract_start_endpoint(final_url: str, html: str) -> tuple[str, str] | None:
-    for source in (final_url, html):
-        match = _START_ENDPOINT_RE.search(source) or _V4_PAYMENT_PATH_RE.search(source)
-        if match:
-            return match.group(1), match.group(2)
-    return None
-
-
 def _sanitize_state(value) -> str:
     return _STATE_SAFE_RE.sub("", str(value).lower())[:20] or "empty"
 
 
-@dataclass(frozen=True)
-class _ParsedStart:
-    amount: float | None
-    currency: str | None
-    state: str | None
-    mentions_receipt: bool
+def _sanitize_error(value) -> str:
+    return _ERROR_SAFE_RE.sub("", str(value))[:40] or "empty"
 
 
-def _parse_start_payload(payload, *, protocol_no: str, amount_unit: str) -> _ParsedStart:
-    raw_amount = _find_key(payload, ("amount", "totalamount", "total_amount", "sum"))
-    amount = None
-    if isinstance(raw_amount, bool):
-        amount = None
-    elif isinstance(raw_amount, (int, float)):
-        amount = float(raw_amount)
-    elif isinstance(raw_amount, str):
-        amount = _parse_number(raw_amount)
-    if amount is not None and amount_unit == AMOUNT_UNIT_MINOR:
-        amount = amount / 100.0
-    currency = _find_key(payload, ("currency", "currencycode", "currency_code", "ccy"))
-    state = _find_key(payload, ("state", "status"))
-    return _ParsedStart(
-        amount=amount,
-        currency=str(currency).strip().upper() if currency is not None else None,
-        state=str(state).strip().lower() if state is not None else None,
-        mentions_receipt=_json_mentions_receipt(payload, protocol_no),
-    )
+def _key_shape(payload, prefix: str = "", depth: int = 0) -> list[str]:
+    """Имена полей ответа (без значений) — для пилота."""
+    if not isinstance(payload, dict) or depth > 2:
+        return []
+    keys = []
+    for key, value in payload.items():
+        name = f"{prefix}{key}"
+        keys.append(name)
+        keys.extend(_key_shape(value, f"{name}.", depth + 1))
+    return keys[:60]
 
 
 def _is_gel(currency: str | None) -> bool:
@@ -341,6 +350,20 @@ def _plausible(amount: float, base_amount: float | None) -> bool:
     if base_amount is None or base_amount <= 0:
         return True
     return base_amount * _MIN_RATIO <= amount <= base_amount * _MAX_RATIO + _MAX_EXTRA
+
+
+def _amount_from(raw, unit: str) -> float | None:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        amount = float(raw)
+    elif isinstance(raw, str):
+        amount = _parse_number(raw)
+    else:
+        return None
+    if amount is not None and unit == AMOUNT_UNIT_MINOR:
+        amount = amount / 100.0
+    return amount
 
 
 class GeorgianCardAmountClient:
@@ -359,6 +382,7 @@ class GeorgianCardAmountClient:
         if not self._config.configured:
             return AmountQuote(OUTCOME_ERROR, detail="not_configured", request_sent=False)
         timeout = self._config.request_timeout_seconds
+        trace: list[str] = []
         try:
             async with httpx.AsyncClient(
                 transport=self._transport,
@@ -366,32 +390,47 @@ class GeorgianCardAmountClient:
                 follow_redirects=False,
                 headers={"User-Agent": self._config.user_agent, "Accept-Language": "ka,en;q=0.8"},
             ) as client:
-                return await asyncio.wait_for(
-                    self._fetch(client, car_number=car_number, protocol_no=protocol_no, base_amount=base_amount),
-                    timeout=timeout * 3,
+                quote_ = await asyncio.wait_for(
+                    self._fetch(client, trace, car_number=car_number, protocol_no=protocol_no,
+                                base_amount=base_amount),
+                    timeout=timeout * 4,
                 )
         except (asyncio.TimeoutError, httpx.TimeoutException):
-            return AmountQuote(OUTCOME_TIMEOUT, detail="timeout")
+            quote_ = AmountQuote(OUTCOME_TIMEOUT, detail="timeout")
         except GeorgianCardSafetyError as exc:
             logger.error("Georgian Card: запрос заблокирован проверкой безопасности (%s) — не отправлен", exc)
-            return AmountQuote(OUTCOME_ERROR, detail=f"safety_{exc}")
+            quote_ = AmountQuote(OUTCOME_ERROR, detail=f"safety_{exc}")
         except httpx.HTTPError as exc:
-            return AmountQuote(OUTCOME_ERROR, detail=f"transport_{type(exc).__name__}"[:60])
+            quote_ = AmountQuote(OUTCOME_ERROR, detail=f"transport_{type(exc).__name__}"[:60])
+        return AmountQuote(
+            quote_.outcome, amount=quote_.amount, currency=quote_.currency, detail=quote_.detail,
+            request_sent=quote_.request_sent, trace=tuple(trace),
+        )
 
-    async def _send(self, client: httpx.AsyncClient, method: str, url: str, *, body: bytes | None = None):
-        _guard_request(method, url, gc_host=self._config.host, body=body)
-        headers = {"Content-Type": "application/json", "Accept": "application/json"} if method == "POST" else None
-        return await client.request(method, url, content=body, headers=headers)
+    async def _send(self, client: httpx.AsyncClient, method: str, url: str, *, json_body: dict | None = None,
+                    referer: str | None = None):
+        _guard_request(method, url, gc_host=self._config.host, json_body=json_body)
+        headers = {}
+        if method == "POST":
+            headers = {"Content-Type": "application/json;charset=UTF-8", "Accept": "application/json, text/plain, */*"}
+            if referer:
+                headers["Referer"] = referer
+        if json_body is not None:
+            return await client.request(method, url, json=json_body, headers=headers)
+        return await client.request(method, url, headers=headers or None)
 
     async def _fetch(
-        self, client: httpx.AsyncClient, *, car_number: str, protocol_no: str, base_amount: float | None,
+        self, client: httpx.AsyncClient, trace: list[str], *, car_number: str, protocol_no: str,
+        base_amount: float | None,
     ) -> AmountQuote:
         gc_host = self._config.host
-        response = await self._send(client, "GET", build_page1_url(
-            self._config, car_number=car_number, protocol_no=protocol_no,
-        ))
+        page_url = build_page1_url(self._config, car_number=car_number, protocol_no=protocol_no)
+
+        # 1. Страница — как у браузера (оболочка приложения, без транзакции).
+        response = await self._send(client, "GET", page_url)
         for hop in range(self._config.max_redirects + 1):
             if response.status_code in (403, 429):
+                trace.append(f"page1 http {response.status_code}")
                 return AmountQuote(OUTCOME_BLOCKED, detail=f"http_{response.status_code}")
             if not response.is_redirect:
                 break
@@ -402,66 +441,105 @@ class GeorgianCardAmountClient:
                 return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="redirect_without_location")
             target = urljoin(str(response.url), location)
             kind = _classify_redirect(target, gc_host=gc_host)
+            trace.append(f"page1 redirect -> {kind}")
             if kind == "refused":
                 return AmountQuote(OUTCOME_REFUSED, detail="fail_redirect")
             if kind == "success":
-                # Без оплаты такого быть не может — ничего не сохраняем.
                 return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="success_redirect")
             if kind == "foreign":
                 return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="foreign_redirect")
             response = await self._send(client, "GET", target)
-
-        if response.status_code in (403, 429):
-            return AmountQuote(OUTCOME_BLOCKED, detail=f"http_{response.status_code}")
+        html = response.text[:_MAX_BODY_CHARS]
+        trace.append(f"page1 http {response.status_code}, {len(html)} chars")
+        if any(marker in html for marker in _WAF_MARKERS):
+            return AmountQuote(OUTCOME_BLOCKED, detail="waf_block")
         if response.status_code >= 500:
             return AmountQuote(OUTCOME_ERROR, detail=f"http_{response.status_code}")
         if response.status_code != 200:
             return AmountQuote(OUTCOME_INVALID_RESPONSE, detail=f"http_{response.status_code}")
 
-        html = response.text[:_MAX_BODY_CHARS]
-        visible = _visible_text(html)
-        html_amount = None
-        button = _PAY_BUTTON_RE.search(visible)
-        if button:
-            html_amount = _parse_number(button.group(1))
+        # 2. Адрес API и portal — из settings.js, который загружает страница.
+        settings_response = await self._send(client, "GET", f"{self._config.base_url.rstrip('/')}/page1/settings.js")
+        if settings_response.status_code in (403, 429):
+            return AmountQuote(OUTCOME_BLOCKED, detail=f"settings_http_{settings_response.status_code}")
+        settings_text = settings_response.text[:200_000]
+        base = _SETTINGS_BASE_RE.search(settings_text)
+        version = _SETTINGS_VERSION_RE.search(settings_text)
+        portal = _SETTINGS_PORTAL_RE.search(settings_text)
+        trace.append(f"settings http {settings_response.status_code}, api {'found' if base and version and portal else 'not found'}")
+        if settings_response.status_code != 200 or not (base and version and portal):
+            return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="settings_unrecognized")
+        api_base = f"{base.group(1)}/{version.group(1)}/{portal.group(1)}"
+        if (urlsplit(api_base).hostname or "") != gc_host:
+            return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="settings_foreign_api")
 
-        start: _ParsedStart | None = None
-        endpoint = _extract_start_endpoint(str(response.url), html)
-        if endpoint is not None:
-            merchant, token = endpoint
-            start_url = f"{self._config.base_url.rstrip('/')}/open/api//v4/{merchant}/payment/{token}/start"
-            start_response = await self._send(client, "POST", start_url, body=_START_BODY)
-            if start_response.status_code in (403, 429):
-                return AmountQuote(OUTCOME_BLOCKED, detail=f"start_http_{start_response.status_code}")
-            if start_response.status_code != 200:
-                return AmountQuote(OUTCOME_INVALID_RESPONSE, detail=f"start_http_{start_response.status_code}")
-            try:
-                payload = start_response.json()
-            except ValueError:
-                return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="start_not_json")
-            start = _parse_start_payload(payload, protocol_no=protocol_no, amount_unit=self._config.amount_unit)
-            if start.state is not None and start.state != "offer":
-                return AmountQuote(OUTCOME_INVALID_RESPONSE, detail=f"state_{_sanitize_state(start.state)}")
+        # 3. Токен платёжной сессии.
+        token_response = await self._send(client, "POST", f"{api_base}/token", referer=page_url)
+        if token_response.status_code in (403, 429):
+            trace.append(f"token http {token_response.status_code}")
+            return AmountQuote(OUTCOME_BLOCKED, detail=f"token_http_{token_response.status_code}")
+        try:
+            token_payload = token_response.json()
+        except ValueError:
+            token_payload = None
+        trace.append(f"token http {token_response.status_code}, keys {_key_shape(token_payload)}")
+        if token_response.status_code != 200 or not isinstance(token_payload, dict):
+            return AmountQuote(OUTCOME_INVALID_RESPONSE, detail=f"token_http_{token_response.status_code}")
+        token = token_payload.get("token")
+        if not isinstance(token, str) or not _TOKEN_RE.match(token):
+            return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="token_missing")
 
-        if start is None and html_amount is None:
-            return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="amount_not_found")
-
-        amount = start.amount if start is not None and start.amount is not None else html_amount
+        # 4. Старт: здесь Georgian Card спрашивает МВД, можно ли оплатить и сколько.
+        body = build_start_body(
+            self._config, car_number=car_number, protocol_no=protocol_no, return_url=f"{page_url}#{token}",
+        )
+        start_response = await self._send(
+            client, "POST", f"{api_base}/payment/{token}/start", json_body=body, referer=page_url,
+        )
+        if start_response.status_code in (403, 429):
+            trace.append(f"start http {start_response.status_code}")
+            return AmountQuote(OUTCOME_BLOCKED, detail=f"start_http_{start_response.status_code}")
+        try:
+            payload = start_response.json()
+        except ValueError:
+            trace.append(f"start http {start_response.status_code}, not json")
+            return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="start_not_json")
+        state = _find_key(payload, ("state",))
+        raw_amount = _find_key(payload, ("amount",))
+        currency = _find_key(payload, ("currency",))
+        currency = str(currency).strip().upper() if currency is not None else None
+        amount = _amount_from(raw_amount, self._config.amount_unit)
+        receipt_in_answer = _json_mentions_receipt(payload, protocol_no)
+        trace.append(
+            f"start http {start_response.status_code}, keys {_key_shape(payload)}, "
+            f"state {_sanitize_state(state) if state is not None else '-'}, "
+            f"amount {raw_amount if isinstance(raw_amount, (int, float)) and not isinstance(raw_amount, bool) else '-'}, "
+            f"currency {currency if currency and re.fullmatch(r'[A-Z0-9]{3}', currency) else '-'}, receipt in answer {'yes' if receipt_in_answer else 'no'}"
+        )
+        if start_response.status_code != 200:
+            error = _find_key(payload, ("error", "code"))
+            return AmountQuote(
+                OUTCOME_INVALID_RESPONSE,
+                detail=f"start_http_{start_response.status_code}_{_sanitize_error(error) if error else 'noerror'}"[:60],
+            )
+        if state is None:
+            return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="state_missing")
+        state_text = str(state).strip().lower()
+        if state_text == "redirect":
+            url = _find_key(payload, ("url",))
+            if isinstance(url, str) and _classify_redirect(url, gc_host=gc_host) == "refused":
+                return AmountQuote(OUTCOME_REFUSED, detail="state_redirect_fail")
+            return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="state_redirect")
+        if state_text == "result":
+            # Без карты оплаты быть не может: это отказ МВД/шлюза, не оплата.
+            return AmountQuote(OUTCOME_REFUSED, detail="state_result")
+        if state_text != "offer":
+            return AmountQuote(OUTCOME_INVALID_RESPONSE, detail=f"state_{_sanitize_state(state_text)}")
         if amount is None:
             return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="amount_not_found")
-        if start is not None and start.amount is not None and html_amount is not None:
-            if abs(start.amount - html_amount) >= 0.005:
-                return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="amount_mismatch")
-
-        if start is not None and start.amount is not None:
-            if start.currency is None or not _is_gel(start.currency):
-                return AmountQuote(OUTCOME_CURRENCY_MISMATCH, detail="currency")
-            if start.state is None:
-                return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="state_missing")
-        # Иначе сумма только из кнопки «გადახდა (N ₾)» — знак ₾ и есть валюта.
-
-        receipt_confirmed = (start is not None and start.mentions_receipt) or _mentions_receipt(visible, protocol_no)
-        if not receipt_confirmed:
+        if currency is None or not _is_gel(currency):
+            return AmountQuote(OUTCOME_CURRENCY_MISMATCH, detail="currency")
+        if not receipt_in_answer:
             return AmountQuote(OUTCOME_RECEIPT_UNCONFIRMED, detail="receipt_not_in_response")
         if not _plausible(amount, base_amount):
             return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="implausible_amount")
@@ -469,9 +547,5 @@ class GeorgianCardAmountClient:
 
 
 def describe_response_shape(payload) -> str:
-    """Ключи JSON без значений — для пилота (сверить формат ответа), без
-    персональных данных."""
-    if isinstance(payload, dict):
-        return "{" + ",".join(sorted(str(key) for key in payload))[:300] + "}"
-    return type(payload).__name__
-
+    """Ключи JSON без значений — для пилота, без персональных данных."""
+    return "{" + ",".join(_key_shape(payload))[:300] + "}"

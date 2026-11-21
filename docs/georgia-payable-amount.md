@@ -19,56 +19,72 @@ https://mpi.gc.ge/page1/?lang_code=ka&page_id=<MIA>&merch_id=<MIA>
   &o.protocolId=<receipt>&o.vehicleNumber=<plate>&o.resourceAlias=1
 ```
 
-Opening it makes Georgian Card create a transaction and send MIA a signed
-"check". MIA answers with the amount in tetri, or refuses. The page then shows
-the card form with the amount on the pay button, «გადახდა (<amount> ₾)». The
-same gateway's page calls `POST /open/api//v4/{merchantId}/payment/{token}/start`
-on load, which returns `amount`, `currency` and `state: "offer"` without any
-card data.
+`mpi.gc.ge/page1/` is a JavaScript application: a static shell, `settings.js`
+and a bundle. The app gets the amount itself through its own API. This was
+read from the app's code on 2026-11-21, with no receipt and no order
+involved:
+
+1. `POST {openApi.baseUrl}/{version}/{portal}/token` returns `{"token": ...}`.
+   `portal` comes from `settings.js`.
+2. `POST .../payment/{token}/start` carries the page parameters:
+   - `merchantId` (MIA's `merch_id`);
+   - `back_url_s`/`back_url_f`;
+   - `lang`;
+   - `3ds2.supported`;
+   - `params.protocolId`/`params.vehicleNumber`/`params.resourceAlias`, taken
+     from police.ge's `o.*` link parameters;
+   - `returnUrl`.
+
+   At this step Georgian Card asks MIA (the "check"). The answer is either
+   `state: "offer"` with `amount` and `currency`, or a refusal. `amount` is in
+   **tetri**: the app itself shows `amount/100`.
+
+The card form appears only after that; card fields and the pay button are
+separate later calls (`/accept`, 3-D Secure), which are never made.
 
 **Every reading of the amount is therefore a technical payment session at
-Georgian Card.** No card data is entered, nothing is authorised, nothing is
-charged, and an abandoned session most likely ends as CLIENT_LOST. There is no
-read-only "inquiry" call, and no sandbox can return MIA's amounts.
+Georgian Card** (`/token` + `/start`). No card data is entered, nothing is
+authorised, nothing is charged, and an abandoned session most likely ends as
+CLIENT_LOST. There is no read-only "inquiry" call, and no sandbox can return
+MIA's amounts.
 
-`reader/fines/georgian_card_client.py` repeats only what a browser does before
+`reader/fines/georgian_card_client.py` repeats only the browser's steps before
 the card form:
 
-1. `GET page1` with MIA's `merch_id`/`page_id` (configuration, taken from
-   police.ge's JavaScript).
-2. Redirects are followed only inside the Georgian Card host:
-   - a redirect to `police.ge/protocol/fail.php` is a refusal and is not
-     requested;
-   - `success.php` or any other host is an error.
-3. The amount is read from the pay button and/or the `.../start` answer.
+1. `GET page1` with the same link police.ge builds.
+2. `GET settings.js` (the API address and the portal).
+3. `POST /token`.
+4. `POST /start`.
 
-Every request passes `_guard_request`, which allows only two kinds of request
-and blocks everything else before it is sent:
+Redirects are followed only inside the Georgian Card host:
+
+- a redirect to `police.ge/protocol/fail.php` is a refusal and is not
+  requested;
+- `success.php` or any other host is an error.
+
+Gateway protections are never bypassed. A WAF block page, Cloudflare or HTTP
+403/429 is `blocked`. In September 2026 an automated browser from a cloud IP
+received a WAF block page («The URL you requested has been blocked»).
+
+Every request passes `_guard_request`, which allows only:
 
 - GET to the Georgian Card host;
-- the single `POST .../start` with the body `{}`.
+- `POST /token` without a body;
+- `POST /start` with a JSON body made only of the fields above.
 
-That blocks card fields, payment, authorisation, police.ge and any other host.
-The host is pinned to `mpi.gc.ge` in the code (`ALLOWED_GC_HOSTS`), so a typo
-in the configuration cannot send the plate and the receipt elsewhere. This is
-tested.
-
-httpx logs every request URL at INFO. A log filter installed by the module
-keeps only the host of Georgian Card URLs (`https://mpi.gc.ge/<redacted>`), so
-the plate, the receipt, MIA's ids and the session token never reach the
-journal.
+Card fields, `/accept`, `/decline`, 3-D Secure, wallets, police.ge and any
+other host are blocked before sending. This is tested.
 
 An amount is accepted only when all of these hold:
 
-- MIA allowed payment (`state "offer"`, or the card page with the pay button);
-- the currency is GEL (`GEL` or `981`; the pay button's ₾);
+- MIA allowed payment (`state "offer"`);
+- the currency is GEL (`GEL` or `981`);
 - the receipt number appears in the answer itself, not just in our own links
   (`back_url_f`, `o.protocolId`);
 - the amount is positive and plausible, that is between half the original
   amount and six times it plus 300 ₾. This guards against a parse or unit
   mistake (tetri read as lari is 100 times the original, rejected for any
   receipt above about 3 ₾); it is not a surcharge calculation;
-- if both the button and `.../start` carry an amount, they agree.
 
 Anything else is an outcome without an amount:
 
@@ -282,7 +298,7 @@ fine_monitor:
   payable_amount_gc_base_url: "https://mpi.gc.ge"
   payable_amount_gc_merchant_id: ""          # MIA merch_id from police.ge JavaScript
   payable_amount_gc_page_id: ""              # MIA page_id from police.ge JavaScript
-  payable_amount_gc_amount_unit: major       # "major" (lari) or "minor" (tetri) — confirm in the pilot
+  payable_amount_gc_amount_unit: minor       # tetri, as the page API answers; "major" = lari
   payable_amount_request_timeout_seconds: 20
   payable_amount_auto_time: "13:00"          # fine_monitor.timezone
   payable_amount_auto_cutoff_time: "14:00"
@@ -323,6 +339,7 @@ python -m scripts.georgia_payable_amount status
 python -m scripts.georgia_payable_amount plan [--date YYYY-MM-DD]
 python -m scripts.georgia_payable_amount fetch --car-number <plate> --protocol-no <receipt>            # dry run
 python -m scripts.georgia_payable_amount fetch --car-number <plate> --protocol-no <receipt> --execute  # ONE session
+python -m scripts.georgia_payable_amount fetch ... --merchant-id <M> --page-id <P>  # MIA ids for this run, config untouched
 python -m scripts.georgia_payable_amount clear-suspension
 ```
 
@@ -333,7 +350,10 @@ python -m scripts.georgia_payable_amount clear-suspension
 - stores the amount silently (trigger `pilot`, never an event), even with the
   feature off in the bot;
 - counts towards the daily cap and respects the suspension;
-- prints the plate and the receipt masked.
+- prints the plate and the receipt masked;
+- prints a depersonalised trace: steps, response codes, field names,
+  state/currency/amount. A single session is understandable even when the
+  answer is unexpected.
 
 ## Pilot on one allowed receipt (needs a separate GO)
 
