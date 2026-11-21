@@ -38,6 +38,7 @@ from reader.public_bot.payable_amount_texts import (
     format_fines_line,
     format_header_payable_lines,
     format_payable_lines,
+    format_statistics_row_payable_line,
     summarize,
 )
 from reader.public_bot.statistics_service import BotStatistics
@@ -1108,7 +1109,7 @@ def format_debt_row(
         elif amounts.count:
             lines.append(format_fines_line(amounts.count, amounts.base_total))
         if amounts.count:
-            lines.extend(format_payable_lines(amounts, tz=_UTC, with_date=False))
+            lines.append(format_statistics_row_payable_line(amounts))
         if breakdown.needs_review_count:
             lines.append(
                 "🟡 Из них требуют проверки: "

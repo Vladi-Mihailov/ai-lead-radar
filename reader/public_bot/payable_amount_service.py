@@ -40,8 +40,10 @@ from reader.fines.payable_amount import (
     OUTCOME_OK,
     OUTCOME_REFUSED,
     REFUSAL_BUSY,
+    REFUSAL_AUTO_DAILY_LIMIT,
     REFUSAL_DAILY_LIMIT,
     TRIGGER_AUTO,
+    TRIGGER_INITIAL,
     TRIGGER_MANUAL,
     ControlPeriod,
     PayableAmount,
@@ -73,6 +75,10 @@ _NON_ERROR_OUTCOMES = frozenset({OUTCOME_OK, OUTCOME_REFUSED})
 @dataclass(frozen=True)
 class PayableAmountLimits:
     max_sessions_per_day: int = 40
+    # Необязательный отдельный предел автоматических проверок в сутки (внутри
+    # общего); None — отдельного предела нет (решение владельца 2026-11-21:
+    # «10» — это 10 дней окна у квитанции, а не 10 проверок в сутки).
+    max_auto_sessions_per_day: int | None = None
     max_consecutive_errors: int = 2
     manual_min_interval: timedelta = timedelta(hours=12)
     manual_max_sessions_per_user_per_day: int = 5
@@ -98,6 +104,19 @@ class RefreshResult:
     increased_from: float | None = None
     event_id: int | None = None
     refusal: str | None = None
+
+
+@dataclass(frozen=True)
+class InitialActualization:
+    """Итог разовой первичной актуализации (initial_actualization)."""
+
+    eligible: int = 0
+    sessions: int = 0
+    fetched: int = 0
+    failed: int = 0
+    skipped: int = 0
+    stop_reason: str | None = None
+    outcomes: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -235,6 +254,7 @@ class PayableAmountService:
             max_manual_per_user=(
                 self._limits.manual_max_sessions_per_user_per_day if trigger == TRIGGER_MANUAL else None
             ),
+            max_auto_per_day=self._limits.max_auto_sessions_per_day if trigger == TRIGGER_AUTO else None,
         )
         if isinstance(begun, str):
             status = STATUS_BUSY if begun == REFUSAL_BUSY else STATUS_LIMITED
@@ -346,14 +366,87 @@ class PayableAmountService:
                 stop_status = STATUS_LIMITED
         return ManualRefreshOutcome(car_number=subscription.car_number, results=results)
 
+    # ---- Разовая первичная актуализация ----
+
+    def initial_actualization_receipts(self) -> list[ReceiptRef]:
+        """Все 🔴/🟡 квитанции в базе полиции (без 🟢, ⏳, ⚪ и скрытых номеров),
+        по которым ещё нет сохранённой суммы Georgian Card и не было попытки
+        первичной актуализации (повторных сессий нет)."""
+        refs = []
+        for car_number in self._statuses.listed_car_numbers():
+            for ref in self.debt_receipts(car_number):
+                if self._repository.get_amount(ref.car_number, ref.protocol_no) is not None:
+                    continue
+                if self._repository.had_check(ref.car_number, ref.protocol_no, trigger=TRIGGER_INITIAL):
+                    continue
+                refs.append(ref)
+        return refs
+
+    async def initial_actualization(self, *, limit: int, delay_seconds: float) -> InitialActualization:
+        """Одна сессия на квитанцию, строго по очереди, с паузой. Полученные
+        суммы — первичные снимки: событий и уведомлений нет. Останавливается
+        на 403/429/WAF (сессии приостанавливаются на сутки), после
+        max_consecutive_errors ошибок подряд и на limit сессий. Отказ МВД —
+        обычный ответ, не ошибка; оплатой не считается."""
+        refs = self.initial_actualization_receipts()
+        sessions = fetched = failed = skipped = 0
+        consecutive_errors = 0
+        outcomes: dict[str, int] = {}
+        stop_reason = None
+        for index, ref in enumerate(refs):
+            if sessions >= limit:
+                stop_reason = "limit"
+                break
+            if index and sessions:
+                await self._sleep(delay_seconds)
+            # Пока шла пауза, сумму могли получить (клиент нажал «Уточнить»)
+            # или квитанцию — взять другой запуск: тогда сессии нет.
+            if (
+                self._repository.get_amount(ref.car_number, ref.protocol_no) is not None
+                or self._repository.had_check(ref.car_number, ref.protocol_no, trigger=TRIGGER_INITIAL)
+            ):
+                skipped += 1
+                continue
+            result = await self.refresh(ref, trigger=TRIGGER_INITIAL, notify=False)
+            if result.status in (STATUS_SUSPENDED, STATUS_NOT_CONFIGURED):
+                stop_reason = result.status
+                break
+            if result.status in (STATUS_BUSY, STATUS_LIMITED):
+                skipped += 1
+                continue
+            sessions += 1
+            outcomes[result.outcome or "-"] = outcomes.get(result.outcome or "-", 0) + 1
+            if result.status in (STATUS_FETCHED, STATUS_STALE):
+                fetched += 1
+            else:
+                failed += 1
+            if result.outcome == OUTCOME_BLOCKED:
+                stop_reason = "blocked"
+                break
+            is_error = result.outcome not in _NON_ERROR_OUTCOMES
+            consecutive_errors = consecutive_errors + 1 if is_error else 0
+            if consecutive_errors >= self._limits.max_consecutive_errors:
+                stop_reason = "errors"
+                break
+        logger.info(
+            "Georgia payable amount: initial actualization — eligible %d, sessions %d, fetched %d, failed %d, stop %s",
+            len(refs), sessions, fetched, failed, stop_reason,
+        )
+        return InitialActualization(
+            eligible=len(refs), sessions=sessions, fetched=fetched, failed=failed, skipped=skipped,
+            stop_reason=stop_reason, outcomes=outcomes,
+        )
+
     # ---- Дневной автоматический проход ----
 
     def auto_candidates(self, today: date) -> list[tuple[ReceiptRef, ControlPeriod]]:
         """Квитанции, которым сегодня положена автоматическая проверка: окно
         контрольного периода открыто, период не закрыт (увеличение, отказ
         МВД, лимит проверок), сегодня по квитанции ещё ничего не открывали,
-        у номера есть действующая клиентская подписка. Сначала — более
-        ранние периоды (дольше без сверки)."""
+        у номера есть действующая клиентская подписка. Порядок — по очереди:
+        сначала ни разу не проверявшиеся, затем дольше всех не проверявшиеся
+        (при дневном лимите меньше числа квитанций одни и те же не
+        выигрывают каждый день), при равенстве — более ранние периоды."""
         car_numbers = [car for car in self._statuses.listed_car_numbers() if not is_fine_output_suppressed(car)]
         linked = self.client_linked_car_numbers(car_numbers, today=today)
         cars = [car for car in car_numbers if car in linked]
@@ -372,7 +465,14 @@ class PayableAmountService:
                 if self._repository.period_closed_reason(ref.car_number, ref.protocol_no, period, tz=self._tz):
                     continue
                 candidates.append((ref, period))
-        candidates.sort(key=lambda item: (item[1].start, item[0].car_number, item[0].protocol_no))
+        last_checked = {
+            (ref.car_number, ref.protocol_no): self._repository.last_check_started_at(ref.car_number, ref.protocol_no)
+            for ref, _ in candidates
+        }
+        candidates.sort(key=lambda item: (
+            last_checked[(item[0].car_number, item[0].protocol_no)] or datetime.min,
+            item[1].start, item[0].car_number, item[0].protocol_no,
+        ))
         return candidates
 
     def _in_window(self, now: datetime) -> bool:
@@ -412,6 +512,9 @@ class PayableAmountService:
                 return self._finish(today, "stopped", "not_configured")
             if result.status == STATUS_LIMITED and result.refusal == REFUSAL_DAILY_LIMIT:
                 return self._finish(today, "stopped", "daily_limit")
+            if result.status == STATUS_LIMITED and result.refusal == REFUSAL_AUTO_DAILY_LIMIT:
+                # Остальные квитанции — в следующие дни окна; очереди повторов нет.
+                return self._finish(today, "stopped", "auto_daily_limit")
             if result.status in (STATUS_BUSY, STATUS_LIMITED):
                 continue
             is_error = result.outcome not in _NON_ERROR_OUTCOMES

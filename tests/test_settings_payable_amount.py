@@ -45,6 +45,7 @@ def test_everything_is_off_by_default(tmp_path, monkeypatch):
     assert fine_monitor.payable_amount_auto_time == time(13, 0)
     assert fine_monitor.payable_amount_auto_cutoff_time == time(14, 0)
     assert fine_monitor.payable_amount_max_sessions_per_day == 40
+    assert fine_monitor.payable_amount_max_auto_sessions_per_day is None  # отдельного предела нет
     assert fine_monitor.payable_amount_max_consecutive_errors == 2
     assert fine_monitor.payable_amount_manual_min_interval_hours == 12.0
     assert fine_monitor.payable_amount_manual_max_sessions_per_user_per_day == 5
@@ -76,6 +77,7 @@ def test_overrides_are_parsed(tmp_path, monkeypatch):
     {"payable_amount_request_timeout_seconds": 61},
     {"payable_amount_request_timeout_seconds": 0},
     {"payable_amount_max_sessions_per_day": 0},
+    {"payable_amount_max_auto_sessions_per_day": 0},
     {"payable_amount_max_consecutive_errors": 0},
 ])
 def test_typos_stop_the_start(tmp_path, monkeypatch, overrides):

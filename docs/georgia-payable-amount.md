@@ -163,13 +163,36 @@ period. Later amounts are compared with the stored Georgian Card amount:
 
 - one session at a time, with a pause between sessions (30 s);
 - the oldest periods go first;
+- receipts go in turn: never-checked ones first, then the least recently
+  checked, so with a cap below the number of receipts the same ones do not
+  win every day; ties go to the earlier period;
 - it stops for the day:
+  - at the optional automatic cap (`payable_amount_max_auto_sessions_per_day`,
+    not set by default), which counts inside the total. "10" in the algorithm
+    means at most 10 daily checks of a receipt in a window, not 10 checks a
+    day for the whole system. Each receipt needs its own Georgian Card session,
+    so a car with 4 fines costs 4 sessions per check day, for at most 10 days
+    per control period;
   - at the daily session cap (all triggers together, default 40);
   - after 2 errors in a row (a refusal is not an error);
   - on HTTP 403/429, which also suspends all sessions, manual ones included,
     for 24 h; the suspension survives restarts.
 - A restart resumes the day: a receipt already checked that day is skipped.
 - A day never runs twice.
+
+**One-off initial actualization** (`scripts/georgia_payable_amount.py actualize
+--execute`), the owner's decision of 2026-11-21:
+
+- one session for each 🔴/🟡 receipt in the police base that has no Georgian
+  Card amount yet; never 🟢, ⏳ or ⚪;
+- receipts already tried by an earlier run are never repeated;
+- strictly one at a time, with a pause (`--delay`, default 20 s) and a cap per
+  run (`--limit`);
+- the amounts are first snapshots, so there are no events or notifications;
+- it stops on 403/429/WAF (sessions suspended for 24 h) and after errors in
+  a row;
+- trigger `initial`: it does not count towards the daily cap, so clients'
+  manual refreshes stay available all day.
 
 **Manual «🔄 Уточнить сумму»** (client card):
 
@@ -261,10 +284,12 @@ plus notes:
 - **Header:** «🔴 Неоплачено: N штрафов» (count only), then «💰 К оплате: X ₾»
   with one «🕒 Суммы уточнены …». That date is the earliest of the readings,
   and it is shown only when every payable receipt has a current amount.
-  Otherwise «💰 Предварительно к оплате» and «⚠️ По N штрафам сумма требует
-  уточнения».
-- **Per car:** «🚗 Автомобиль», «🧾 Штрафы: 3 шт. — 150 ₾», «💰 К оплате»
-  without a date, then the 🟡/🟢 lines and the users as before.
+  Otherwise «💰 Сумма к оплате: X ₾» with no date: the known Georgian Card
+  amounts plus the original amounts of the rest. There is no separate line
+  about unrefined receipts (owner's decision, 2026-11-21).
+- **Per car:** «🚗 Автомобиль», «🧾 Штрафы: 3 шт. — 150 ₾», then «💰 К оплате»
+  if every fine of the car is refined, otherwise «💰 Сумма к оплате», with no
+  date; then the 🟡/🟢 lines and the users as before.
 - A Georgian Card amount is current if it was read after the start of the
   latest control period that has begun.
 - Paid fines are not in «К оплате». The original and the refined amount of one
@@ -278,10 +303,11 @@ plus notes:
 `reader/public_bot/amount_delivery_service.py` runs in the same poller as the
 "new fine" delivery.
 
-- One message per event and recipient. The owner gets «⚠️ Сумма к оплате по
-  вашему штрафу увеличилась: 100 → 150 ₾» with the card and the buttons. The
-  manager of a delegated subscription gets the manager variant without
-  buttons.
+- One message per event and recipient. The owner gets «⚠️ Сумма штрафа
+  увеличилась!» with the car, the receipt number, «🧾 Первоначальный штраф»,
+  «💰 Было к оплате» and «💰 Теперь к оплате», plus [🔄 Уточнить сумму] and
+  the payment row. The manager of a delegated subscription gets the manager
+  variant without buttons.
 - An event is created only by a confirmed increase over the stored Georgian
   Card amount. One event per new amount of a receipt, so getting the same
   amount again never notifies.
@@ -327,6 +353,7 @@ fine_monitor:
   payable_amount_auto_cutoff_time: "14:00"
   payable_amount_auto_delay_seconds: 30
   payable_amount_max_sessions_per_day: 40    # all triggers together, hard cap
+  # payable_amount_max_auto_sessions_per_day: N  # optional separate cap for automatic checks
   payable_amount_max_consecutive_errors: 2
   payable_amount_manual_min_interval_hours: 12
   payable_amount_manual_max_sessions_per_user_per_day: 5

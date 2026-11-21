@@ -210,16 +210,14 @@ def test_one_date_only_when_every_amount_is_known_and_it_is_the_earliest():
 def test_partly_known_amounts_are_preliminary_with_a_count():
     summary = summarize([_receipt(50, 150, _REFRESHED_AT), _receipt(100)])
     lines = format_header_payable_lines(summary, tz=_TBILISI)
-    assert lines == ["💰 Предварительно к оплате: 250 ₾", "⚠️ По 1 штрафу сумма требует уточнения"]
+    assert lines == ["💰 Сумма к оплате: 250 ₾"]
     assert not any("🕒" in line for line in lines)
 
 
 def test_unknown_amount_is_never_shown_as_confirmed():
     summary = summarize([_receipt(50)])
     assert format_payable_lines(summary, tz=_TBILISI) == ["💰 К оплате: требуется уточнение"]
-    assert format_header_payable_lines(summary, tz=_TBILISI) == [
-        "💰 Предварительно к оплате: 50 ₾", "⚠️ По 1 штрафу сумма требует уточнения",
-    ]
+    assert format_header_payable_lines(summary, tz=_TBILISI) == ["💰 Сумма к оплате: 50 ₾"]
 
 
 def test_debt_row_with_amounts_matches_the_agreed_layout():
@@ -378,10 +376,9 @@ async def test_statistics_with_unknown_amounts_is_preliminary(fx):
 
     lines = fx.controller._format_statistics_reply().text.splitlines()
 
-    assert "💰 Предварительно к оплате: 250 ₾" in lines
-    assert "⚠️ По 1 штрафу сумма требует уточнения" in lines
+    assert lines.count("💰 Сумма к оплате: 250 ₾") == 2  # шапка и машина: 150 известно + 100 исходная
+    assert not any("требует уточнения" in line or "Предварительно" in line for line in lines)
     assert not any(line.startswith("🕒") for line in lines)
-    assert "💰 Предварительно к оплате: 250 ₾" in lines  # машина: 150 известно + 100 исходная
     assert fx.gc.calls == []
 
 
@@ -422,8 +419,11 @@ async def test_increase_is_sent_once_to_the_client(fx):
     assert len(fx.sender.sent) == 1
     chat_id, text, buttons = fx.sender.sent[0]
     assert chat_id == _OWNER
-    assert text.splitlines()[0] == "⚠️ Сумма к оплате по вашему штрафу увеличилась: 100 → 150 ₾"
-    assert "🧾 Штраф: 50 ₾" in text and "💰 К оплате: 150 ₾" in text and "🕒 Сумма уточнена 21.11 в 15:20" in text
+    lines = text.splitlines()
+    assert lines[0] == "⚠️ Сумма штрафа увеличилась!" and lines[1] == ""
+    assert f"🚗 Автомобиль: {format_plate_for_telegram(_CAR)}" in lines
+    assert "🧾 Первоначальный штраф: 50 ₾" in lines and "💰 Было к оплате: 100 ₾" in lines
+    assert "💰 Теперь к оплате: 150 ₾" in lines and "📄 Штраф №: GE1" in lines
     assert buttons is not None
 
 
@@ -496,7 +496,7 @@ async def test_manager_of_a_delegated_subscription_gets_the_manager_text_without
     await fx.delivery.run_once()
     by_chat = {chat_id: (text, buttons) for chat_id, text, buttons in fx.sender.sent}
     assert set(by_chat) == {_OWNER, _TRUSTED}
-    assert by_chat[_TRUSTED][0].startswith("⚠️ Сумма к оплате по штрафу автомобиля, поставленного вами на мониторинг")
+    assert by_chat[_TRUSTED][0].startswith("⚠️ Сумма штрафа увеличилась! (автомобиль, поставленный вами на мониторинг)")
     assert by_chat[_TRUSTED][1] is None
 
 
@@ -616,7 +616,7 @@ async def test_first_enable_never_sends_increases_found_before_it(fx):
 
     await fx.delivery.run_once()
 
-    assert len(fx.sender.sent) == 1 and "150 → 200 ₾" in fx.sender.sent[0][1]
+    assert len(fx.sender.sent) == 1 and "💰 Теперь к оплате: 200 ₾" in fx.sender.sent[0][1]
     assert fx.amounts.get_delivery(old, subscription.id, "owner").exclusion_reason == EXCLUSION_BEFORE_NOTIFICATIONS
     assert fx.amounts.get_delivery(new, subscription.id, "owner").delivered_at is not None
 
