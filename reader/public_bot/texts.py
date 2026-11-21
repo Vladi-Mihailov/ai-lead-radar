@@ -1092,8 +1092,9 @@ def format_debt_row(
         🚗 Госномер: <номер>
         🔴 Неоплачено: 3 штрафа — 150 ₾   (исходные суммы 🔴 и 🟡)
         💰 Сумма к оплате: 450 ₾          (Georgian Card, где известна, иначе исходная)
+        🟡 Из них требуют проверки / 🟢 Оплачено (как раньше, когда больше нуля)
         👤 Пользователь / 🔗 Telegram
-    без строк 🟡/🟢 и без даты (статусы и расчёт не меняются). amounts None
+    без даты (статусы и расчёт не меняются). amounts None
     (сумма к оплате выключена) — сумма к оплате равна исходной. SnapshotDebt —
     прежняя строка суммы снимка и та же сумма к оплате."""
     if breakdown is None:
@@ -1102,9 +1103,9 @@ def format_debt_row(
             f"💰 Задолженность: {_format_search_amount(total_amount)}",
         ]
     else:
-        # Компактно (решение владельца 2026-11-21): исходные суммы
-        # неоплаченных (🔴 и 🟡) и сумма к оплате — Georgian Card, где известна,
-        # иначе исходная; строк 🟡/🟢 нет (статусы не меняются).
+        # Решение владельца 2026-11-21: исходные суммы неоплаченных (🔴 и 🟡),
+        # сумма к оплате — Georgian Card, где известна, иначе исходная; затем
+        # строки 🟡/🟢, как раньше.
         lines = [f"🚗 Госномер: {format_plate_for_telegram(car_number)}"]
         debt_count = breakdown.unpaid_count + breakdown.needs_review_count
         debt_amount = breakdown.unpaid_amount + breakdown.needs_review_amount
@@ -1115,6 +1116,13 @@ def format_debt_row(
             lines.append(f"🔴 Неоплачено: {_format_fine_count_and_amount(debt_count, debt_amount)}")
         if debt_count or isinstance(breakdown, SnapshotDebt):
             lines.append(f"💰 Сумма к оплате: {_format_search_amount(payable)}")
+        if breakdown.needs_review_count:
+            lines.append(
+                "🟡 Из них требуют проверки: "
+                f"{_format_fine_count_and_amount(breakdown.needs_review_count, breakdown.needs_review_amount)}"
+            )
+        if breakdown.paid_count:
+            lines.append(f"🟢 Оплачено: {_format_fine_count_and_amount(breakdown.paid_count, breakdown.paid_amount)}")
     if not owners:
         lines.append(DEBT_OWNER_NOT_LINKED_LINE)
     for owner in owners:
@@ -1164,8 +1172,10 @@ def format_debt_status_summary_block(
         Автомобили со штрафами: 2
         🔴 Неоплачено: 4 штрафа
         💰 Сумма к оплате: 550 ₾
-    и «🕒 Суммы уточнены …» — только когда суммы Georgian Card известны по
-    всем неоплаченным штрафам.
+        🟢 Оплачено: 30 ₾ (1 шт.)
+    «🕒 Суммы уточнены …» (под суммой) — только когда суммы Georgian Card
+    известны по всем неоплаченным штрафам; «🟡 Из них требуют проверки: N
+    штрафов» (только число, сумма уже внутри 🔴) — только когда больше нуля.
 
     "🔴 Неоплачено" — число 🔴 и 🟡 вместе (оплата не подтверждена);
     debt_count_is_lower_bound — у части машин число штрафов неизвестно
@@ -1176,8 +1186,8 @@ def format_debt_status_summary_block(
     штрафа не складываются.
 
     Больше не показываются (только отображение — данные, статусы и фоновые
-    проверки не меняются): строки 🟡 и 🟢, дата обновления базы police.ge
-    (source_updated_on), вечерняя перепроверка (recheck_line) и пояснения ℹ️."""
+    проверки не меняются): дата обновления базы police.ge (source_updated_on),
+    вечерняя перепроверка (recheck_line) и пояснения ℹ️."""
     debt_count = totals.unpaid_count + totals.needs_review_count
     debt_amount = totals.unpaid_amount + totals.needs_review_amount
     if debt_count_is_lower_bound:
@@ -1194,6 +1204,13 @@ def format_debt_status_summary_block(
     ]
     if amounts is not None and tz is not None and amounts.all_known and amounts.oldest_observed_at is not None:
         lines.append(format_refreshed_at(amounts.oldest_observed_at, tz=tz, plural=amounts.count > 1))
+    if totals.needs_review_count:
+        review_count = totals.needs_review_count
+        lines.append(
+            "🟡 Из них требуют проверки: "
+            f"{review_count} {_russian_plural(review_count, 'штраф', 'штрафа', 'штрафов')}"
+        )
+    lines.append(f"🟢 Оплачено: {_format_search_amount(totals.paid_amount)} ({totals.paid_count} шт.)")
     return "\n".join(lines)
 
 

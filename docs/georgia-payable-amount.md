@@ -285,11 +285,12 @@ plus notes:
   X ₾»: for each unpaid fine its current Georgian Card amount when known,
   otherwise the original amount. When every payable receipt has a current
   amount, one «🕒 Суммы уточнены …» follows (the earliest of the readings).
-  There is no separate line about unrefined receipts and never «Предварительно
-  к оплате» (owner's decision, 2026-11-21).
+  Then the 🟡 count (when above zero) and «🟢 Оплачено: X ₾ (N шт.)». There is
+  no separate line about unrefined receipts and never «Предварительно к
+  оплате» (owner's decision, 2026-11-21).
 - **Per car:** «🚗 Госномер», «🔴 Неоплачено: 3 штрафа — 150 ₾» (original
-  amounts), «💰 Сумма к оплате: 450 ₾» (same rule, no date), then the users.
-  No 🟡/🟢 lines; cars with only paid fines are not listed.
+  amounts), «💰 Сумма к оплате: 450 ₾» (same rule, no date), then the 🟡/🟢
+  lines and the users as before.
 - Example:
 
   ```
@@ -297,12 +298,12 @@ plus notes:
   Автомобили со штрафами: 33
   🔴 Неоплачено: 67 штрафов
   💰 Сумма к оплате: 4820 ₾
+  🟢 Оплачено: 0 ₾ (0 шт.)
 
   🚗 Госномер: AA111BB
   🔴 Неоплачено: 1 штраф — 100 ₾
   💰 Сумма к оплате: 300 ₾
-  👤 Пользователь: Имя
-  🔗 Telegram: @username
+  👤 Пользователь не привязан
   ```
 - A Georgian Card amount is current if it was read after the start of the
   latest control period that has begun.
@@ -311,7 +312,7 @@ plus notes:
   original). The preliminary total is the known amounts plus the original
   amounts of the rest, a lower bound.
 - Hidden lines (⏳, subscription counts, police.ge base date, evening recheck,
-  🟡/🟢) stay hidden.
+  ℹ️ notes) stay hidden.
 
 ## Notifications
 
