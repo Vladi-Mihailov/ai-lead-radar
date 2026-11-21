@@ -48,6 +48,7 @@ from reader.fines.payable_amount import (
     ControlPeriod,
     PayableAmount,
     PayableAmountRepository,
+    display_payable,
     is_increase,
     open_period,
 )
@@ -301,13 +302,18 @@ class PayableAmountService:
             # только закрывает текущий контрольный период.
             increased = ref.base_amount is not None and is_increase(quote.amount, ref.base_amount)
         else:
-            increased = is_increase(quote.amount, stored.previous_amount)
+            # Сравниваются показанные суммы (не меньше исходной): ответ ниже
+            # исходной клиент видел как исходную, и её «рост» до исходной —
+            # не увеличение.
+            shown_before = display_payable(stored.previous_amount, ref.base_amount)
+            shown_now = display_payable(quote.amount, ref.base_amount)
+            increased = is_increase(shown_now, shown_before)
             if increased:
-                increased_from = stored.previous_amount
+                increased_from = shown_before
                 if notify:
                     event_id = self._repository.add_increase_event(
-                        car_number=ref.car_number, protocol_no=ref.protocol_no, old_amount=stored.previous_amount,
-                        new_amount=quote.amount, observed_at=started_at, check_id=check_id,
+                        car_number=ref.car_number, protocol_no=ref.protocol_no, old_amount=shown_before,
+                        new_amount=shown_now, observed_at=started_at, check_id=check_id,
                     )
                     if event_id is not None and on_event is not None:
                         try:

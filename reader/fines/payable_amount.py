@@ -232,6 +232,16 @@ def is_increase(new: float, old: float) -> bool:
     return new - old >= _AMOUNT_EPSILON
 
 
+def display_payable(amount: float | None, base_amount: float | None) -> float | None:
+    """Сумма «к оплате» для показа и для сравнения «было/стало»: не меньше
+    исходной суммы штрафа (решение владельца 2026-11-21 — Georgian Card
+    иногда отвечает меньшей суммой). Ответ шлюза хранится как есть
+    (georgia_fine_payable_amounts.amount, georgia_fine_amount_checks)."""
+    if amount is None or base_amount is None:
+        return amount
+    return max(amount, base_amount)
+
+
 # ---- Контрольные периоды ----
 
 

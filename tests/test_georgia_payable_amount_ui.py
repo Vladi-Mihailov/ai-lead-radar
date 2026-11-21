@@ -735,3 +735,62 @@ async def test_failed_first_attempt_then_off_and_on_does_not_resend_the_old_incr
     assert fx.sender.sent == []
     delivery = fx.amounts.get_delivery(event_id, subscription.id, "owner")
     assert delivery.exclusion_reason == EXCLUSION_SUBSCRIPTION_CHANGED and delivery.delivered_at is None
+
+# ---- Сумма Georgian Card ниже исходной (решение владельца 2026-11-21) ----
+
+
+@pytest.mark.parametrize("gc_amount, shown", [(40, "50 ₾"), (50, "50 ₾"), (150, "150 ₾")])
+async def test_amount_to_pay_is_never_shown_below_the_original_fine(fx, gc_amount, shown):
+    task, subscription = fx.car(_CAR, [("GE1", 50)], owner=_OWNER)
+    await fx.check(task)
+    fx.store(_CAR, "GE1", gc_amount)
+
+    card = (await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=_OWNER)).text.splitlines()
+    stats = fx.controller._format_statistics_reply().text.splitlines()
+
+    assert "🧾 Штраф: 50 ₾" in card and f"💰 К оплате: {shown}" in card
+    assert stats.count(f"💰 Сумма к оплате: {shown}") == 2  # шапка и машина
+    assert fx.amounts.get_amount(_CAR, "GE1").amount == gc_amount  # ответ шлюза хранится как есть
+    assert fx.gc.calls == []
+
+
+async def test_total_to_pay_uses_the_original_where_the_gateway_answered_less(fx):
+    task, _ = fx.car(_CAR, [("GE1", 50), ("GE2", 100)], owner=_OWNER)
+    await fx.check(task)
+    fx.store(_CAR, "GE1", 40)
+    fx.store(_CAR, "GE2", 300)
+
+    lines = fx.controller._format_statistics_reply().text.splitlines()
+
+    assert lines.count("💰 Сумма к оплате: 350 ₾") == 2  # 50 (не 40) + 300
+    assert "🔴 Неоплачено: 2 штрафа — 150 ₾" in lines
+
+
+@pytest.mark.parametrize("new_amount", [40.0, 45.0, 50.0])
+async def test_gateway_rising_up_to_the_original_is_not_an_increase(fx, new_amount):
+    """Клиенту показывали 50 ₾ (ответ шлюза 40 ниже исходной): ответ 45 или
+    50 — та же показанная сумма, события и уведомления нет."""
+    task, subscription = fx.car(_CAR, [("GE1", 50)], owner=_OWNER)
+    await fx.check(task)
+    fx.store(_CAR, "GE1", 40, at=_REFRESHED_AT - timedelta(days=1))
+    fx.gc.amounts["GE1"] = new_amount
+
+    reply = await fx.controller.handle_payable_amount_refresh(subscription.id, telegram_user_id=_OWNER, chat_id=_OWNER)
+
+    assert fx.gc.calls == ["GE1"]
+    assert "увеличилась" not in reply.text and "💰 К оплате: 50 ₾" in reply.text.splitlines()
+    assert fx.amounts.events_since(datetime(2000, 1, 1)) == []
+    assert fx.amounts.get_amount(_CAR, "GE1").amount == new_amount  # ответ шлюза хранится как есть
+
+
+async def test_increase_after_a_below_original_answer_counts_from_the_shown_amount(fx):
+    task, subscription = fx.car(_CAR, [("GE1", 50)], owner=_OWNER)
+    await fx.check(task)
+    fx.store(_CAR, "GE1", 40, at=_REFRESHED_AT - timedelta(days=1))
+    fx.gc.amounts["GE1"] = 150.0
+
+    reply = await fx.controller.handle_payable_amount_refresh(subscription.id, telegram_user_id=_OWNER, chat_id=_OWNER)
+
+    assert "⚠️ Сумма к оплате по вашему штрафу увеличилась: 50 → 150 ₾" in reply.text
+    [event] = fx.amounts.events_since(datetime(2000, 1, 1))
+    assert (event.old_amount, event.new_amount) == (50, 150)

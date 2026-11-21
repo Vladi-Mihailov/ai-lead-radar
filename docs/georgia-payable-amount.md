@@ -307,6 +307,10 @@ plus notes:
   ```
 - A Georgian Card amount is current if it was read after the start of the
   latest control period that has begun.
+- The shown amount to pay is never below the original fine (owner's decision,
+  2026-11-21: once Georgian Card answered 40 GEL for a 50 GEL fine). The
+  gateway's answer is stored unchanged; increases compare shown amounts, so
+  an answer rising from 40 to 50 GEL is not an increase.
 - Paid fines are not in «К оплате». The original and the refined amount of one
   receipt are never added together (the refined one already includes the
   original). The preliminary total is the known amounts plus the original
