@@ -2309,10 +2309,11 @@ def test_trusted_task_continue_turns_on_unlimited_and_returns_to_list(trusted_fx
 
 
 async def test_trusted_task_continue_does_not_reactivate_client_subscriptions(trusted_fx):
-    """Включение задачи менеджером — только сама задача: подписки
-    клиентов, остановленные вместе с ней (⚪ OFF останавливает и их, см.
-    stop_task_for_trusted_admin), остаются выключенными — их включает
-    только сам клиент (никакой массовой реактивации)."""
+    """Без исключения уже известных штрафов из рассылки (SubscriptionService
+    без restored_history_excluder, как в этой фикстуре) ▶️ менеджера
+    включает только саму задачу: подписки клиентов, остановленные вместе с
+    ней, остаются выключенными. Восстановление подписок, отключённых ⛔
+    менеджера, — см. tests/test_georgia_manager_resume_subscriptions.py."""
     trusted_fx.user_repository.upsert(
         TelegramUserInfo(user_id=777, username="real_owner", first_name=None, last_name=None)
     )

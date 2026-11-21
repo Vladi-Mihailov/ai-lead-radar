@@ -3092,7 +3092,7 @@ class ConversationController:
             return None
 
         if task.status == "active":
-            if not self._subscriptions.stop_task_for_trusted_admin(task_id):
+            if not self._subscriptions.stop_task_for_trusted_admin(task_id, stopped_by=telegram_user_id):
                 return BotReply(text=texts.CAR_ACTION_FAILED_TEXT, show_main_menu=True)
             task = self._subscriptions.get_task_for_trusted_admin(task_id)
             if task is None:
@@ -3130,11 +3130,13 @@ class ConversationController:
         if task is None:
             return None
 
-        resumed = self._subscriptions.resume_task_for_trusted_admin(task_id, today=self._today())
-        if resumed is None:
+        outcome = self._subscriptions.resume_task_with_client_subscriptions(task_id, today=self._today())
+        if outcome is None:
             return BotReply(text=texts.CAR_ACTION_FAILED_TEXT, show_main_menu=True)
 
-        confirmation = texts.format_trusted_task_resume_success(resumed.car_number)
+        confirmation = texts.format_trusted_task_resume_success(outcome.task.car_number)
+        if outcome.restored_subscriptions:
+            confirmation += "\n" + texts.format_trusted_resume_restored_clients(len(outcome.restored_subscriptions))
         list_reply = self._format_trusted_tasks_page_reply(page)
         return BotReply(
             text=confirmation + "\n\n" + list_reply.text,
@@ -3215,7 +3217,7 @@ class ConversationController:
         if task is None:
             return BotReply(text=texts.TRUSTED_STOP_FAILED_TEXT, show_main_menu=True)
 
-        stopped = self._subscriptions.stop_task_for_trusted_admin(task_id)
+        stopped = self._subscriptions.stop_task_for_trusted_admin(task_id, stopped_by=telegram_user_id)
         if not stopped:
             return BotReply(text=texts.TRUSTED_STOP_FAILED_TEXT, show_main_menu=True)
 

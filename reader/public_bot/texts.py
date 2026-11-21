@@ -683,6 +683,12 @@ TRUSTED_ONE_OFF_MONITOR_LABEL = "➕ На мониторинг"
 TRUSTED_ONE_OFF_ADD_LABEL = "➕ Добавить на мониторинг"
 TRUSTED_ONE_OFF_ANOTHER_LABEL = "🔎 Проверить другой номер"
 TRUSTED_RESUME_MONITORING_LABEL = "▶️ Продолжить мониторинг"
+
+
+def format_trusted_resume_restored_clients(count: int) -> str:
+    """Под подтверждением ▶️: сколько клиентских подписок, отключённых
+    предыдущим ⛔ менеджера, включено обратно."""
+    return f"🔔 Уведомления клиентов включены снова: {count}"
 ONE_OFF_CHECK_NOT_SAVED_LINE = "ℹ️ Разовая проверка: результат не сохранён, мониторинг не включён."
 ONE_OFF_CHECK_IN_PROGRESS_TEXT = "⏳ Проверка уже выполняется, дождитесь результата."
 

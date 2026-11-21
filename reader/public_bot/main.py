@@ -14,6 +14,7 @@ Telegram-сессии для этого.
 """
 
 import asyncio
+import functools
 import logging
 import os
 import sys
@@ -31,7 +32,7 @@ from telethon import TelegramClient
 from reader.fines.batch_gate import BatchCheckGate
 from reader.fines.check_service import FineCheckService
 from reader.fines.detected_fine_repository import DetectedFineRepository
-from reader.fines.notification_control import GeorgiaNotificationControl
+from reader.fines.notification_control import EXCLUSION_SUBSCRIPTION_RESTORED, GeorgiaNotificationControl
 from reader.fines.payment_status import FineStatusRepository, FineStatusTracker, PaymentPageMarkers
 from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository
 from reader.fines.police_ge_circuit_breaker import PoliceGeCircuitBreaker
@@ -66,7 +67,7 @@ from reader.public_bot.debt_refresh_service import DebtRefreshService
 from reader.public_bot.delivery_repository import (
     ClientFineDeliveryRepository,
 )
-from reader.public_bot.delivery_service import ClientDeliveryService
+from reader.public_bot.delivery_service import ClientDeliveryService, exclude_known_fines_for_subscription
 from reader.public_bot.full_check_service import FullCheckService
 from reader.public_bot.handlers import register
 from reader.public_bot.keyboards import main_menu_keyboard
@@ -524,6 +525,13 @@ async def run() -> None:
             task_repository, subscription_repository, user_repository, check_service,
             owner_resolver_client=client, bot_username=_BOT_USERNAME,
             plate_bootstrap_repository=plate_bootstrap_repository,
+            # ▶️ менеджера возвращает отключённые его ⛔ подписки клиентов без
+            # повторной рассылки уже известных штрафов.
+            restored_history_excluder=functools.partial(
+                exclude_known_fines_for_subscription,
+                detected_fine_repository=detected_fine_repository, delivery_repository=delivery_repository,
+                reason=EXCLUSION_SUBSCRIPTION_RESTORED,
+            ),
         )
         # "📊 Статистика" (trusted-operator-only) — поверх уже открытых
         # known_users_repository/subscription_repository/
