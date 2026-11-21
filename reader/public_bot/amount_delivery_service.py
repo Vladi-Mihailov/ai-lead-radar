@@ -12,6 +12,13 @@ payable_amount_service.py). Тикает в том же поллере, что �
   уже получивший это событие по другой подписке, второй раз не получает;
 - подписка, созданная после события, его не получает: новый подписчик видит
   текущую сумму в карточке;
+- подписка, которая снова стала действующей после события (▶️ менеджера
+  вернул её, клиент включил уведомления сам, приглашение принято), его тоже
+  не получает: явное исключение (subscription_changed_after_event) — пока она
+  была выключена, это событие для неё не происходило;
+- уведомления об увеличении включаются отдельным флагом; событие, созданное
+  до включения (в том числе при первом включении функции), не рассылается
+  никогда: явное исключение (before_increase_notifications);
 - квитанция, ставшая к моменту отправки 🟢, ⚪ или ⏳, — явное исключение;
 - событие старше max_event_age не рассылается (не «историческая» рассылка
   после долгого простоя или паузы): получателям — явное исключение
@@ -50,6 +57,8 @@ EXCLUSION_RECEIPT_NOT_PAYABLE = "receipt_not_payable"
 EXCLUSION_DUPLICATE_CHAT = "duplicate_chat"
 EXCLUSION_SHOWN_IN_REPLY = "shown_in_refresh_reply"
 EXCLUSION_EVENT_TOO_OLD = "event_too_old"
+EXCLUSION_BEFORE_NOTIFICATIONS = "before_increase_notifications"
+EXCLUSION_SUBSCRIPTION_CHANGED = "subscription_changed_after_event"
 
 DEFAULT_MAX_EVENT_AGE = timedelta(days=3)
 # Насколько назад смотреть, чтобы явно исключить устаревшие события.
@@ -91,6 +100,11 @@ class AmountIncreaseDeliveryService:
             return DeliveryTickResult(delivered=0, failed=0, flood_wait_hit=False)
         boundary_at = control.boundary_at if control is not None else None
 
+        enabled_since = self._repository.increase_notifications_since()
+        if enabled_since is None:
+            # Уведомления об увеличении выключены — ничего не отправляется и
+            # не отмечается (при включении всё прежнее будет исключено).
+            return DeliveryTickResult(delivered=0, failed=0, flood_wait_hit=False)
         too_old_before = _naive_utc(now) - self._max_event_age
         events = self._repository.events_since(_naive_utc(now) - _EXCLUSION_LOOKBACK)
         if not events:
@@ -108,6 +122,8 @@ class AmountIncreaseDeliveryService:
             exclusion = None
             if boundary_at is not None and event.created_at <= boundary_at:
                 exclusion = EXCLUSION_NOTIFICATION_BOUNDARY
+            elif event.created_at <= enabled_since:
+                exclusion = EXCLUSION_BEFORE_NOTIFICATIONS
             elif event.created_at < too_old_before:
                 exclusion = EXCLUSION_EVENT_TOO_OLD
             elif status is None or status.display_status in (PAYMENT_PAID, DISPLAY_GONE, DISPLAY_UNVERIFIED):
@@ -115,6 +131,11 @@ class AmountIncreaseDeliveryService:
             for subscription in by_car.get(event.car_number, []):
                 if subscription.created_at is not None and _naive_utc(subscription.created_at) > event.created_at:
                     continue
+                # Стала действующей позже события (▶️ менеджера, включение
+                # клиентом, принятие приглашения — все пишут updated_at).
+                changed_after = (
+                    subscription.updated_at is not None and _naive_utc(subscription.updated_at) >= event.created_at
+                )
                 for role in _applicable_roles(subscription):
                     chat_id = (
                         subscription.telegram_chat_id if role == "owner" else subscription.created_by_telegram_chat_id
@@ -124,8 +145,12 @@ class AmountIncreaseDeliveryService:
                     existing = self._repository.get_delivery(event.id, subscription.id, role)
                     if not _is_due_for_attempt(existing, now=now):
                         continue
-                    if exclusion is not None:
-                        self._repository.exclude_delivery(event.id, subscription.id, role, chat_id, reason=exclusion)
+                    # И при ожидающем повторе: если подписку выключили и снова
+                    # включили после неудачной первой отправки, старое событие
+                    # для неё тоже уже не новое.
+                    reason = exclusion or (EXCLUSION_SUBSCRIPTION_CHANGED if changed_after else None)
+                    if reason is not None:
+                        self._repository.exclude_delivery(event.id, subscription.id, role, chat_id, reason=reason)
                         continue
                     if self._repository.chat_handled(event.id, chat_id):
                         self._repository.exclude_delivery(

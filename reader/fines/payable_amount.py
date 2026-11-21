@@ -8,9 +8,12 @@ police.ge отдаёт только исходную сумму квитанци
 ограничено:
 
 - автоматически — только в контрольных периодах: первый начинается на
-  следующий день после lastDate (конец первоначального срока оплаты, 30
-  дней с вручения; ещё 30 дней сверху не прибавляются), следующие — через
-  каждые 30 дней, всего CONTROL_PERIOD_COUNT периодов (30/60/.../180 дней);
+  следующий день после окончательного lastDate (конец первоначального срока
+  оплаты, 30 дней с вручения; ещё 30 дней сверху не прибавляются), следующие
+  — через каждые 30 дней, всего CONTROL_PERIOD_COUNT периодов (30/60/.../180
+  дней). Окончательный lastDate — только с activeDate (квитанция считается
+  врученной): до этого police.ge отдаёт предварительный срок и потом
+  пересчитывает его (см. term_end_of);
 - в каждом периоде — не больше одной проверки в сутки и не больше
   MAX_AUTO_CHECKS_PER_PERIOD проверок, и только в первые CONTROL_WINDOW_DAYS
   календарных дней периода;
@@ -166,6 +169,18 @@ _SCHEMA = (
     )
     """,
     "INSERT OR IGNORE INTO georgia_payable_amount_control (id) VALUES (1)",
+    # Уведомления об увеличении суммы: с какого момента включены (NULL —
+    # выключены). События, созданные до этого момента, не рассылаются никогда
+    # (см. AmountIncreaseDeliveryService) — ни при первом включении, ни при
+    # повторном.
+    """
+    CREATE TABLE IF NOT EXISTS georgia_amount_notification_state (
+        id             INTEGER PRIMARY KEY CHECK (id = 1),
+        enabled_since  TIMESTAMP,
+        updated_at     TIMESTAMP
+    )
+    """,
+    "INSERT OR IGNORE INTO georgia_amount_notification_state (id) VALUES (1)",
     # Дневной автоматический проход (один на дату).
     """
     CREATE TABLE IF NOT EXISTS georgia_payable_amount_runs (
@@ -272,24 +287,18 @@ def _parse_source_date(value) -> date | None:
         return None
 
 
-def term_end_of(due_date: date | None, raw_data: dict | None) -> date | None:
-    """Конец первоначального срока оплаты: lastDate (detected_fines.due_date).
-    Без него — activeDate (дата вручения) + 30 дней, затем publishDate
-    (публикация; вручённой квитанция считается на 30-й день) + 60 дней.
-    None — срок неизвестен: автоматических проверок нет, только ручные."""
-    if due_date is not None:
-        return due_date
-    raw = raw_data or {}
-    last_date = _parse_source_date(raw.get("lastDate"))
-    if last_date is not None:
-        return last_date
-    active_date = _parse_source_date(raw.get("activeDate"))
-    if active_date is not None:
-        return active_date + timedelta(days=30)
-    publish_date = _parse_source_date(raw.get("publishDate"))
-    if publish_date is not None:
-        return publish_date + timedelta(days=60)
-    return None
+def term_end_of(last_date: date | None, active_date: date | None) -> date | None:
+    """Последний день первоначального срока оплаты — lastDate police.ge, но
+    только окончательный: пока квитанция не считается врученной (activeDate
+    пуст), police.ge отдаёт предварительный lastDate и после вручения
+    пересчитывает его (наблюдение 2026-11-21: 25.10 до вручения, 26.10 после,
+    сайт показывает "Payment term" ровно как lastDate). Предварительный срок
+    может оказаться раньше настоящего — None: автоматических проверок нет,
+    пока не придёт окончательный (обычная проверка номера), ручные — можно.
+    Ничего не прибавляется и не вычисляется."""
+    if last_date is None or active_date is None:
+        return None
+    return last_date
 
 
 # ---- Модели ----
@@ -855,32 +864,68 @@ class PayableAmountRepository:
     # ---- Сроки квитанций (detected_fines той же БД, только чтение) ----
 
     def term_ends_for_cars(self, car_numbers: list[str]) -> dict[tuple[str, str], date | None]:
-        """Конец первоначального срока каждой квитанции (см. term_end_of) по
-        самой свежей строке detected_fines с этим номером квитанции."""
-        exists = self._conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'detected_fines'"
-        ).fetchone()
-        if not exists:
-            return {}
+        """Конец первоначального срока каждой квитанции (см. term_end_of):
+        по последнему ответу police.ge (georgia_fine_terms, пишется при каждой
+        полной проверке номера), а если его ещё нет — по самой свежей строке
+        detected_fines (данные первого обнаружения)."""
+        tables = {row[0] for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         result: dict[tuple[str, str], date | None] = {}
         for start in range(0, len(car_numbers), 500):
             chunk = car_numbers[start:start + 500]
             placeholders = ",".join("?" * len(chunk))
-            rows = self._conn.execute(
-                f"SELECT car_number, external_fine_id, due_date, raw_data FROM detected_fines "
-                f"WHERE car_number IN ({placeholders}) AND external_fine_id IS NOT NULL ORDER BY id",
-                chunk,
-            ).fetchall()
-            for car_number, protocol_no, due_date, raw_data in rows:
-                try:
-                    raw = json.loads(raw_data) if raw_data else None
-                except (TypeError, ValueError):
-                    raw = None
-                parsed_due = _parse_source_date(due_date)
-                term_end = term_end_of(parsed_due, raw if isinstance(raw, dict) else None)
-                if term_end is not None or (car_number, protocol_no) not in result:
-                    result[(car_number, protocol_no)] = term_end
+            if "detected_fines" in tables:
+                rows = self._conn.execute(
+                    f"SELECT car_number, external_fine_id, due_date, raw_data FROM detected_fines "
+                    f"WHERE car_number IN ({placeholders}) AND external_fine_id IS NOT NULL ORDER BY id",
+                    chunk,
+                ).fetchall()
+                for car_number, protocol_no, due_date, raw_data in rows:
+                    try:
+                        raw = json.loads(raw_data) if raw_data else None
+                    except (TypeError, ValueError):
+                        raw = None
+                    raw = raw if isinstance(raw, dict) else {}
+                    last_date = _parse_source_date(raw.get("lastDate")) or _parse_source_date(due_date)
+                    result[(car_number, protocol_no)] = term_end_of(
+                        last_date, _parse_source_date(raw.get("activeDate")),
+                    )
+            if "georgia_fine_terms" in tables:
+                for car_number, protocol_no, last_date, active_date in self._conn.execute(
+                    f"SELECT car_number, protocol_no, last_date, active_date FROM georgia_fine_terms "
+                    f"WHERE car_number IN ({placeholders})",
+                    chunk,
+                ):
+                    result[(car_number, protocol_no)] = term_end_of(
+                        _parse_source_date(last_date), _parse_source_date(active_date),
+                    )
         return result
+
+    # ---- Уведомления об увеличении: граница включения ----
+
+    def set_increase_notifications(self, *, enabled: bool, at: datetime) -> datetime | None:
+        """Включены — enabled_since остаётся прежним (перезапуск ничего не
+        сдвигает) или ставится сейчас (первое включение / включение после
+        выключения); выключены — NULL, и следующее включение начнёт с нуля.
+        Возвращает действующую границу."""
+        if enabled:
+            self._conn.execute(
+                "UPDATE georgia_amount_notification_state SET enabled_since = COALESCE(enabled_since, ?), "
+                "updated_at = ? WHERE id = 1",
+                (_fmt(at), _fmt(at)),
+            )
+        else:
+            self._conn.execute(
+                "UPDATE georgia_amount_notification_state SET enabled_since = NULL, updated_at = ? WHERE id = 1",
+                (_fmt(at),),
+            )
+        self._conn.commit()
+        return self.increase_notifications_since()
+
+    def increase_notifications_since(self) -> datetime | None:
+        row = self._conn.execute(
+            "SELECT enabled_since FROM georgia_amount_notification_state WHERE id = 1"
+        ).fetchone()
+        return _parse_ts(row[0]) if row else None
 
 
 def amount_is_current(amount: PayableAmount | None, term_end: date | None, *, today: date, tz: ZoneInfo) -> bool:
