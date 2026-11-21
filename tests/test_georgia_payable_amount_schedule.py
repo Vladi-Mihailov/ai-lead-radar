@@ -880,6 +880,39 @@ def test_initial_actualization_does_not_use_up_the_clients_daily_limit(tmp_path)
     fixture.close()
 
 
+def test_initial_session_is_one_per_receipt_in_the_insert(fx):
+    from reader.fines.payable_amount import REFUSAL_ALREADY_INITIAL
+
+    def begin(minute):
+        return fx.amounts.begin_check(
+            car_number="C1", protocol_no="R1", trigger=TRIGGER_INITIAL, period_index=None, requested_by=None,
+            check_date=date(2026, 11, 21), started_at=_tbilisi(date(2026, 11, 21), 19, minute), max_sessions_per_day=40,
+        )
+
+    first = begin(0)
+    assert isinstance(first, int)
+    fx.amounts.finish_check(first, outcome=OUTCOME_ERROR, finished_at=_tbilisi(date(2026, 11, 21), 19, 1))
+    assert begin(5) == REFUSAL_ALREADY_INITIAL  # и после завершённой — второй нет (параллельный запуск)
+
+
+def test_initial_actualization_skips_a_receipt_refined_during_the_pause(tmp_path):
+    fixture = _Fixture(tmp_path)
+    for index in range(3):
+        fixture.receipt(car="AA111BB", protocol=f"R{index}")
+
+    async def client_refines_r1_meanwhile(_seconds):
+        if fixture.amounts.get_amount("AA111BB", "R1") is None:
+            fixture.amounts.store_amount(car_number="AA111BB", protocol_no="R1", amount=150.0, currency="GEL",
+                                         observed_at=datetime(2026, 11, 21, 15, 0), source="manual", check_id=None)
+
+    fixture.service._sleep = client_refines_r1_meanwhile
+    fixture.at(date(2026, 11, 21), 19, 0)
+    result = asyncio.run(fixture.service.initial_actualization(limit=70, delay_seconds=20))
+    assert (result.eligible, result.sessions, result.skipped) == (3, 2, 1)
+    assert sorted(protocol for _, protocol in fixture.gc.calls) == ["R0", "R2"]
+    fixture.close()
+
+
 def test_initial_increase_over_the_original_closes_an_open_window_silently(fx):
     fx.receipt(protocol="R1", base=100.0, term_end=date(2026, 11, 15))
     fx.gc.amounts["R1"] = 300.0

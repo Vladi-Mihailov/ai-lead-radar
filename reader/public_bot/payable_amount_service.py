@@ -399,6 +399,14 @@ class PayableAmountService:
                 break
             if index and sessions:
                 await self._sleep(delay_seconds)
+            # Пока шла пауза, сумму могли получить (клиент нажал «Уточнить»)
+            # или квитанцию — взять другой запуск: тогда сессии нет.
+            if (
+                self._repository.get_amount(ref.car_number, ref.protocol_no) is not None
+                or self._repository.had_check(ref.car_number, ref.protocol_no, trigger=TRIGGER_INITIAL)
+            ):
+                skipped += 1
+                continue
             result = await self.refresh(ref, trigger=TRIGGER_INITIAL, notify=False)
             if result.status in (STATUS_SUSPENDED, STATUS_NOT_CONFIGURED):
                 stop_reason = result.status

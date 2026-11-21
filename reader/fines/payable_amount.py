@@ -387,6 +387,7 @@ REFUSAL_ALREADY_TODAY = "already_today"  # автоматическая пров
 REFUSAL_PERIOD_LIMIT = "period_limit"  # MAX_AUTO_CHECKS_PER_PERIOD исчерпан
 REFUSAL_USER_LIMIT = "user_limit"  # дневной лимит ручных уточнений пользователя
 REFUSAL_AUTO_DAILY_LIMIT = "auto_daily_limit"  # дневной лимит автоматических проверок
+REFUSAL_ALREADY_INITIAL = "already_initial"  # первичная актуализация квитанции уже была
 
 
 _AMOUNT_FIELDS = (
@@ -517,7 +518,8 @@ class PayableAmountRepository:
         триггеры); для TRIGGER_AUTO — одна автоматическая проверка квитанции
         в сутки и не больше MAX_AUTO_CHECKS_PER_PERIOD в периоде; для
         TRIGGER_MANUAL — не больше max_manual_per_user ручных сессий
-        пользователя в сутки; для TRIGGER_AUTO — ещё и не больше
+        пользователя в сутки; для TRIGGER_INITIAL — одна такая сессия на
+        квитанцию за всё время; для TRIGGER_AUTO — ещё и не больше
         max_auto_per_day автоматических сессий в сутки (внутри общего
         max_sessions_per_day)."""
         self.abandon_stale_checks(now=started_at)
@@ -546,6 +548,12 @@ class PayableAmountRepository:
                     SELECT COUNT(*) FROM georgia_fine_amount_checks
                     WHERE check_date = :check_date AND trigger != :initial
                 ) < :max_per_day
+              AND (
+                    :trigger != :initial OR NOT EXISTS (
+                        SELECT 1 FROM georgia_fine_amount_checks
+                        WHERE car_number = :car_number AND protocol_no = :protocol_no AND trigger = :initial
+                    )
+                )
               AND (
                     :trigger != :auto OR (
                         NOT EXISTS (
@@ -588,6 +596,12 @@ class PayableAmountRepository:
         ).fetchone()
         if busy:
             return REFUSAL_BUSY
+        if params["trigger"] == TRIGGER_INITIAL and self._conn.execute(
+            "SELECT 1 FROM georgia_fine_amount_checks WHERE car_number = :car_number AND protocol_no = :protocol_no "
+            "AND trigger = :initial",
+            params,
+        ).fetchone():
+            return REFUSAL_ALREADY_INITIAL
         today = self._conn.execute(
             "SELECT COUNT(*) FROM georgia_fine_amount_checks WHERE check_date = :check_date AND trigger != :initial",
             params,
