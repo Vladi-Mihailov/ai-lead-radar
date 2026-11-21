@@ -60,6 +60,10 @@ from reader.fines.payable_amount import (
 
 logger = logging.getLogger(__name__)
 
+# Единственный хост, куда клиент вообще может отправить запрос (в том числе
+# при опечатке в payable_amount_gc_base_url).
+ALLOWED_GC_HOSTS = frozenset({"mpi.gc.ge"})
+
 POLICE_GE_SUCCESS_URL = "https://police.ge/protocol/success.php"
 POLICE_GE_FAIL_URL = "https://police.ge/protocol/fail.php"
 _POLICE_GE_HOSTS = frozenset({"police.ge", "www.police.ge"})
@@ -80,14 +84,51 @@ _URL_RE = re.compile(r"https?://\S+|[?&][\w.]+=\S*", re.IGNORECASE)
 # номером квитанции или госномера.
 _STATE_SAFE_RE = re.compile(r"[^a-z_]")
 
+_GC_LOG_MARKER = "gc.ge"
+_GC_URL_RE = re.compile(r"(https?://[^/\s\"']*gc\.ge)[^\s\"']*", re.IGNORECASE)
+
+
+class _RedactGeorgianCardUrlFilter(logging.Filter):
+    """httpx пишет на INFO "HTTP Request: GET <полный URL>": в ссылке page1 —
+    госномер и квитанция, в адресах Georgian Card — токен сессии. От URL
+    Georgian Card в записи остаётся только хост."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if isinstance(record.args, tuple) and record.args:
+                record.args = tuple(_redact_gc_url(value) for value in record.args)
+            if isinstance(record.msg, str) and _GC_LOG_MARKER in record.msg:
+                record.msg = _GC_URL_RE.sub(r"\1/<redacted>", record.msg)
+        except Exception:
+            return True
+        return True
+
+
+def _redact_gc_url(value: object) -> object:
+    text = str(value)
+    if _GC_LOG_MARKER not in text:
+        return value
+    return _GC_URL_RE.sub(r"\1/<redacted>", text)
+
+
+def _install_gc_url_log_redaction() -> None:
+    for name in ("httpx", "httpcore"):
+        target = logging.getLogger(name)
+        if not any(isinstance(f, _RedactGeorgianCardUrlFilter) for f in target.filters):
+            target.addFilter(_RedactGeorgianCardUrlFilter())
+
+
+_install_gc_url_log_redaction()
+
 _MAX_BODY_CHARS = 2_000_000
 _START_BODY = b"{}"
 # Правдоподобие суммы — защита от ошибки разбора/единиц (тетри вместо лари),
 # а не расчёт начислений: сумма меньше половины исходной или больше
-# 10×исходной + 1000 ₾ не сохраняется.
+# 6×исходной + 300 ₾ не сохраняется (тетри, прочитанные как лари, — это
+# 100×исходной: отсекается для любой квитанции дороже ~3 ₾).
 _MIN_RATIO = 0.5
-_MAX_RATIO = 10.0
-_MAX_EXTRA = 1000.0
+_MAX_RATIO = 6.0
+_MAX_EXTRA = 300.0
 
 
 class GeorgianCardSafetyError(RuntimeError):
@@ -108,7 +149,11 @@ class GeorgianCardConfig:
 
     @property
     def configured(self) -> bool:
-        return bool(self.merchant_id and self.page_id)
+        parts = urlsplit(self.base_url)
+        return bool(
+            self.merchant_id and self.page_id and parts.scheme == "https" and parts.port is None
+            and (parts.hostname or "") in ALLOWED_GC_HOSTS
+        )
 
     @property
     def host(self) -> str:
@@ -150,7 +195,9 @@ def build_page1_url(config: GeorgianCardConfig, *, car_number: str, protocol_no:
 
 def _guard_request(method: str, url: str, *, gc_host: str, body: bytes | None) -> None:
     parts = urlsplit(url)
-    if parts.scheme != "https" or (parts.hostname or "") != gc_host:
+    if gc_host not in ALLOWED_GC_HOSTS:
+        raise GeorgianCardSafetyError("config_host")
+    if parts.scheme != "https" or (parts.hostname or "") != gc_host or parts.port not in (None, 443):
         raise GeorgianCardSafetyError("host")
     if method == "GET":
         if body:
@@ -343,11 +390,13 @@ class GeorgianCardAmountClient:
         response = await self._send(client, "GET", build_page1_url(
             self._config, car_number=car_number, protocol_no=protocol_no,
         ))
-        for _ in range(self._config.max_redirects):
+        for hop in range(self._config.max_redirects + 1):
             if response.status_code in (403, 429):
                 return AmountQuote(OUTCOME_BLOCKED, detail=f"http_{response.status_code}")
             if not response.is_redirect:
                 break
+            if hop == self._config.max_redirects:
+                return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="too_many_redirects")
             location = response.headers.get("location")
             if not location:
                 return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="redirect_without_location")
@@ -361,8 +410,6 @@ class GeorgianCardAmountClient:
             if kind == "foreign":
                 return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="foreign_redirect")
             response = await self._send(client, "GET", target)
-        else:
-            return AmountQuote(OUTCOME_INVALID_RESPONSE, detail="too_many_redirects")
 
         if response.status_code in (403, 429):
             return AmountQuote(OUTCOME_BLOCKED, detail=f"http_{response.status_code}")

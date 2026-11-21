@@ -278,7 +278,15 @@ def format_check_now_result(
         if fine.external_fine_id
     }
     if payable is not None and tz is not None:
-        payable_lines = {protocol_no: [format_fine_payable_line(receipt)] for protocol_no, receipt in payable.items()}
+        # Штрафы не «к оплате» (🟢 и т.п.) — тоже «🧾 Штраф», но без «💰 К оплате».
+        payable_lines = {
+            fine.external_fine_id: (
+                [format_fine_payable_line(payable[fine.external_fine_id])]
+                if fine.external_fine_id in payable else []
+            )
+            for fine in outcome.fines
+            if fine.external_fine_id
+        }
         blocks = format_check_now_fines_message(
             car_number=outcome.car_number, fines=outcome.fines, status_labels=labels, payable_lines=payable_lines,
         )

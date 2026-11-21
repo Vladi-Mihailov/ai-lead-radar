@@ -601,6 +601,24 @@ def _parse_amount_unit(value) -> str:
     return value
 
 
+def _parse_gc_base_url(value) -> str:
+    """fine_monitor.payable_amount_gc_base_url — только https://mpi.gc.ge: при
+    опечатке номер и квитанция ушли бы на другой хост."""
+    text = str(value).strip().rstrip("/")
+    if text != "https://mpi.gc.ge":
+        raise ConfigError(f'fine_monitor.payable_amount_gc_base_url должен быть "https://mpi.gc.ge", а не {value!r}')
+    return text
+
+
+def _parse_request_timeout(value) -> float:
+    """Тайм-аут запроса к Georgian Card: 1..60 с (сессия держит квитанцию 5
+    минут, а вся сессия — до трёх тайм-аутов)."""
+    timeout = float(value)
+    if not 1.0 <= timeout <= 60.0:
+        raise ConfigError("fine_monitor.payable_amount_request_timeout_seconds должен быть от 1 до 60")
+    return timeout
+
+
 def _parse_positive_int(raw: dict, key: str, default: int) -> int:
     value = int(raw.get(key, default))
     if value < 1:
@@ -857,15 +875,15 @@ def load_settings(config_path: Path) -> Settings:
                 payable_amount_auto_checks_enabled=bool(
                     fine_monitor_raw.get("payable_amount_auto_checks_enabled", False)
                 ),
-                payable_amount_gc_base_url=str(
+                payable_amount_gc_base_url=_parse_gc_base_url(
                     fine_monitor_raw.get("payable_amount_gc_base_url", "https://mpi.gc.ge")
-                ).rstrip("/"),
+                ),
                 payable_amount_gc_merchant_id=str(fine_monitor_raw.get("payable_amount_gc_merchant_id") or "").strip(),
                 payable_amount_gc_page_id=str(fine_monitor_raw.get("payable_amount_gc_page_id") or "").strip(),
                 payable_amount_gc_amount_unit=_parse_amount_unit(
                     fine_monitor_raw.get("payable_amount_gc_amount_unit", "major")
                 ),
-                payable_amount_request_timeout_seconds=float(
+                payable_amount_request_timeout_seconds=_parse_request_timeout(
                     fine_monitor_raw.get("payable_amount_request_timeout_seconds", 20.0)
                 ),
                 payable_amount_auto_time=_parse_check_time(fine_monitor_raw.get("payable_amount_auto_time", "13:00")),

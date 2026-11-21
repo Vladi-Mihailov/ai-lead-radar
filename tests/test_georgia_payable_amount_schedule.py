@@ -616,3 +616,46 @@ def test_not_configured_manual_refresh_reports_it_without_a_session(fx):
     outcome = asyncio.run(fx.service.refresh_for_subscription(_subscription(fx), telegram_user_id=_CLIENT))
     assert [result.status for result in outcome.results] == [STATUS_NOT_CONFIGURED]
     assert fx.gc.calls == []
+
+
+# ---- После независимого review ----
+
+
+def test_per_user_manual_limit_holds_in_the_insert(fx):
+    kwargs = dict(trigger=TRIGGER_MANUAL, period_index=None, requested_by=_CLIENT, check_date=date(2026, 11, 1),
+                  max_sessions_per_day=100, max_manual_per_user=1)
+    assert isinstance(fx.amounts.begin_check(
+        car_number="AA111BB", protocol_no="R1", started_at=_tbilisi(date(2026, 11, 1)), **kwargs), int)
+    from reader.fines.payable_amount import REFUSAL_USER_LIMIT
+
+    assert fx.amounts.begin_check(
+        car_number="CC222DD", protocol_no="R9", started_at=_tbilisi(date(2026, 11, 1), 13, 6), **kwargs,
+    ) == REFUSAL_USER_LIMIT
+
+
+def test_tbilisi_date_decides_the_window_around_midnight(fx):
+    """02:00 по Тбилиси 01.11 — это ещё 31.10 по UTC: проверка относится к
+    01.11 (первый день периода 1), и найденное увеличение закрывает период."""
+    fx.receipt(base=50.0)
+    fx.amounts.store_amount(car_number="AA111BB", protocol_no="R1", amount=50.0, currency="GEL",
+                            observed_at=datetime(2026, 10, 20, 8, 0), source="manual", check_id=None)
+    fx.gc.amounts["R1"] = 150.0
+    fx.at(date(2026, 11, 1), 2, 0)
+    assert fx.clock.now.date() == date(2026, 10, 31)
+    outcome = asyncio.run(fx.service.refresh_for_subscription(_subscription(fx), telegram_user_id=_CLIENT))
+    assert outcome.results[0].increased_from == 50.0
+    assert fx.amounts.checks_for_receipt("AA111BB", "R1")[-1].check_date == date(2026, 11, 1)
+    fx.run_days(date(2026, 11, 1), date(2026, 11, 10))
+    assert fx.auto_checks() == []
+
+
+def test_real_outcome_replaces_an_abandoned_mark(fx):
+    check_id = fx.amounts.begin_check(
+        car_number="AA111BB", protocol_no="R1", trigger=TRIGGER_AUTO, period_index=1, requested_by=None,
+        check_date=date(2026, 11, 1), started_at=_tbilisi(date(2026, 11, 1)), max_sessions_per_day=100,
+    )
+    fx.amounts.abandon_stale_checks(now=_tbilisi(date(2026, 11, 1), 13, 30))
+    fx.amounts.finish_check(check_id, outcome=OUTCOME_OK, finished_at=_tbilisi(date(2026, 11, 1), 13, 31),
+                            amount=150.0, increased=True)
+    check = fx.amounts.get_check(check_id)
+    assert check.outcome == OUTCOME_OK and check.increased

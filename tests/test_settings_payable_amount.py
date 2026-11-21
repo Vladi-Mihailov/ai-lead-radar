@@ -70,6 +70,10 @@ def test_overrides_are_parsed(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("overrides", [
     {"payable_amount_gc_amount_unit": "tetri"},
+    {"payable_amount_gc_base_url": "https://police.ge"},
+    {"payable_amount_gc_base_url": "http://mpi.gc.ge"},
+    {"payable_amount_request_timeout_seconds": 61},
+    {"payable_amount_request_timeout_seconds": 0},
     {"payable_amount_max_sessions_per_day": 0},
     {"payable_amount_max_consecutive_errors": 0},
 ])

@@ -503,3 +503,55 @@ def test_same_new_amount_is_one_event(fx):
 def test_amount_summary_adds_up():
     total = sum([summarize([_receipt(50, 150, _REFRESHED_AT)]), summarize([_receipt(100)])], AmountSummary())
     assert (total.count, total.known_total, total.unknown_count, total.preliminary_total) == (2, 150, 1, 250)
+
+
+# ---- После независимого review ----
+
+
+async def test_poller_running_during_a_multi_fine_refresh_does_not_duplicate_the_shown_increase(fx):
+    task, subscription = fx.car(_CAR, [("GE1", 50), ("GE2", 60)], owner=_OWNER)
+    await fx.check(task)
+    fx.control.pause()
+    fx.control.resume(client_excluded=0, operator_excluded=0, at=datetime(2026, 11, 1))
+    fx.store(_CAR, "GE1", 100, at=_REFRESHED_AT - timedelta(days=1))
+    fx.gc.amounts["GE1"] = 150.0
+    original = fx.gc.fetch_amount
+
+    async def fetch_with_poller(*, car_number, protocol_no, base_amount):
+        if protocol_no == "GE2":
+            # поллер доставки срабатывает, пока идёт сессия второго штрафа
+            await fx.delivery.run_once(now=datetime.now(timezone.utc))
+        return await original(car_number=car_number, protocol_no=protocol_no, base_amount=base_amount)
+
+    fx.gc.fetch_amount = fetch_with_poller
+    reply = await fx.controller.handle_payable_amount_refresh(subscription.id, telegram_user_id=_OWNER, chat_id=_OWNER)
+
+    assert "100 → 150 ₾" in reply.text
+    assert fx.sender.sent == []
+
+
+async def test_refresh_button_of_a_deleted_car_opens_no_session(fx):
+    task, subscription = fx.car(_CAR, [("GE1", 50)], owner=_OWNER)
+    await fx.check(task)
+    fx.subscriptions.archive(subscription.id)
+    reply = await fx.controller.handle_payable_amount_refresh(subscription.id, telegram_user_id=_OWNER, chat_id=_OWNER)
+    assert reply is None and fx.gc.calls == []
+
+
+async def test_too_old_event_is_excluded_explicitly(fx):
+    task, subscription = fx.car(_CAR, [("GE1", 50)], owner=_OWNER)
+    await fx.check(task)
+    event_id = _event(fx)
+    await fx.delivery.run_once(now=datetime.now(timezone.utc) + timedelta(days=4))
+    delivery = fx.amounts.get_delivery(event_id, subscription.id, "owner")
+    assert fx.sender.sent == [] and delivery.exclusion_reason == "event_too_old" and delivery.delivered_at is None
+
+
+async def test_paid_fine_in_the_card_shows_the_fine_amount_without_amount_to_pay(fx):
+    task, subscription = fx.car(_CAR, [("GE1", 50), ("GE2", 100)], owner=_OWNER)
+    await fx.check(task)
+    fx.tracker.mark_paid(fx.tracker.statuses_by_protocol(_CAR)["GE2"].id, actor_user_id=_TRUSTED, note="BOG 1")
+    reply = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=_OWNER)
+    assert "💰 Сумма:" not in reply.text
+    assert "🧾 Штраф: 100 ₾" in reply.text.splitlines()
+    assert "🟢 Оплачено, ждёт обновления базы полиции: 100 ₾" in reply.text

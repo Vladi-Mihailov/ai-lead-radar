@@ -14,7 +14,8 @@ payable_amount_service.py). Тикает в том же поллере, что �
   текущую сумму в карточке;
 - квитанция, ставшая к моменту отправки 🟢, ⚪ или ⏳, — явное исключение;
 - событие старше max_event_age не рассылается (не «историческая» рассылка
-  после долгого простоя);
+  после долгого простоя или паузы): получателям — явное исключение
+  (event_too_old);
 - повторы — тот же ограниченный backoff, что у «новых штрафов».
 """
 
@@ -48,8 +49,11 @@ logger = logging.getLogger(__name__)
 EXCLUSION_RECEIPT_NOT_PAYABLE = "receipt_not_payable"
 EXCLUSION_DUPLICATE_CHAT = "duplicate_chat"
 EXCLUSION_SHOWN_IN_REPLY = "shown_in_refresh_reply"
+EXCLUSION_EVENT_TOO_OLD = "event_too_old"
 
 DEFAULT_MAX_EVENT_AGE = timedelta(days=3)
+# Насколько назад смотреть, чтобы явно исключить устаревшие события.
+_EXCLUSION_LOOKBACK = timedelta(days=30)
 
 
 def _naive_utc(value: datetime) -> datetime:
@@ -87,7 +91,8 @@ class AmountIncreaseDeliveryService:
             return DeliveryTickResult(delivered=0, failed=0, flood_wait_hit=False)
         boundary_at = control.boundary_at if control is not None else None
 
-        events = self._repository.events_since(_naive_utc(now) - self._max_event_age)
+        too_old_before = _naive_utc(now) - self._max_event_age
+        events = self._repository.events_since(_naive_utc(now) - _EXCLUSION_LOOKBACK)
         if not events:
             return DeliveryTickResult(delivered=0, failed=0, flood_wait_hit=False)
         today = now.astimezone(self._tz).date()
@@ -103,6 +108,8 @@ class AmountIncreaseDeliveryService:
             exclusion = None
             if boundary_at is not None and event.created_at <= boundary_at:
                 exclusion = EXCLUSION_NOTIFICATION_BOUNDARY
+            elif event.created_at < too_old_before:
+                exclusion = EXCLUSION_EVENT_TOO_OLD
             elif status is None or status.display_status in (PAYMENT_PAID, DISPLAY_GONE, DISPLAY_UNVERIFIED):
                 exclusion = EXCLUSION_RECEIPT_NOT_PAYABLE
             for subscription in by_car.get(event.car_number, []):
@@ -148,7 +155,8 @@ class AmountIncreaseDeliveryService:
                 role_chat = subscription.telegram_chat_id if role == "owner" else subscription.created_by_telegram_chat_id
                 if role_chat != chat_id:
                     continue
-                if self._repository.get_delivery(event.id, subscription.id, role) is None:
+                existing = self._repository.get_delivery(event.id, subscription.id, role)
+                if existing is None or (existing.delivered_at is None and existing.excluded_at is None):
                     self._repository.exclude_delivery(event.id, subscription.id, role, chat_id, reason=reason)
                     excluded += 1
         return excluded

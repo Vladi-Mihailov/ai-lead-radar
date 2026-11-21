@@ -49,7 +49,14 @@ and blocks everything else before it is sent:
 - the single `POST .../start` with the body `{}`.
 
 That blocks card fields, payment, authorisation, police.ge and any other host.
-This is tested.
+The host is pinned to `mpi.gc.ge` in the code (`ALLOWED_GC_HOSTS`), so a typo
+in the configuration cannot send the plate and the receipt elsewhere. This is
+tested.
+
+httpx logs every request URL at INFO. A log filter installed by the module
+keeps only the host of Georgian Card URLs (`https://mpi.gc.ge/<redacted>`), so
+the plate, the receipt, MIA's ids and the session token never reach the
+journal.
 
 An amount is accepted only when all of these hold:
 
@@ -58,8 +65,9 @@ An amount is accepted only when all of these hold:
 - the receipt number appears in the answer itself, not just in our own links
   (`back_url_f`, `o.protocolId`);
 - the amount is positive and plausible, that is between half the original
-  amount and ten times it plus 1000 ₾. This guards against a parse or unit
-  mistake (tetri read as lari); it is not a surcharge calculation;
+  amount and six times it plus 300 ₾. This guards against a parse or unit
+  mistake (tetri read as lari is 100 times the original, rejected for any
+  receipt above about 3 ₾); it is not a surcharge calculation;
 - if both the button and `.../start` carry an amount, they agree.
 
 Anything else is an outcome without an amount:
@@ -141,7 +149,7 @@ period. Later amounts are compared with the stored Georgian Card amount:
 - only reads and stores the amount;
 - a receipt read (or tried) less than 12 h ago is not opened again, and the
   stored amount is shown instead;
-- at most 5 sessions per user per day;
+- at most 5 sessions per user per day (checked in the same atomic insert);
 - the same suspension and daily cap apply.
 
 **Hard limits are in the database.** These limits are checked in the same
@@ -257,7 +265,8 @@ plus notes:
   - to a chat that already got the event through another subscription;
   - to a subscription created after the event;
   - when the receipt is now 🟢, ⚪ or ⏳;
-  - events older than 3 days;
+  - events older than 3 days (for example after a long pause): explicitly
+    excluded (`event_too_old`);
   - an increase already shown in the reply to «🔄 Уточнить сумму» (excluded
     for that chat).
 - The first amount, a migration or the initial filling never create events.
@@ -288,8 +297,10 @@ fine_monitor:
 - Without `merch_id`/`page_id` no session is ever opened.
 - Without `payable_amount_enabled`, nothing changes, and the new tables are
   not created by the bot.
-- A typo in `payable_amount_gc_amount_unit` stops every process that loads the
-  config, so check the edited file with `load_settings` before restarting.
+- A typo in `payable_amount_gc_amount_unit`, a base URL other than
+  `https://mpi.gc.ge`, a timeout outside 1–60 s or a limit below 1 stops every
+  process that loads the config, so check the edited file with `load_settings`
+  before restarting.
 
 **Requests come from the Georgian bot's own server (DE).** They never go
 through REDNET: a Georgian Card block must not cut the only path to police.ge.

@@ -202,10 +202,12 @@ class PayableAmountService:
 
     async def refresh(
         self, ref: ReceiptRef, *, trigger: str, period_index: int | None = None,
-        requested_by: int | None = None, notify: bool = True,
+        requested_by: int | None = None, notify: bool = True, on_event: Callable[[int], None] | None = None,
     ) -> RefreshResult:
         """Одна сессия Georgian Card для одной квитанции — если лимиты
-        позволяют. notify=False — увеличение не создаёт события (пилот)."""
+        позволяют. notify=False — увеличение не создаёт события (пилот).
+        on_event(event_id) вызывается сразу после записи события, без
+        переключения задач — до того, как поллер доставки может его увидеть."""
         key = (ref.car_number, ref.protocol_no)
         lock = self._locks.setdefault(key, asyncio.Lock())
         if lock.locked():
@@ -213,10 +215,12 @@ class PayableAmountService:
         async with lock:
             return await self._refresh_locked(
                 ref, trigger=trigger, period_index=period_index, requested_by=requested_by, notify=notify,
+                on_event=on_event,
             )
 
     async def _refresh_locked(
         self, ref: ReceiptRef, *, trigger: str, period_index: int | None, requested_by: int | None, notify: bool,
+        on_event: Callable[[int], None] | None,
     ) -> RefreshResult:
         key = (ref.car_number, ref.protocol_no)
         if not self._client.configured:
@@ -228,6 +232,9 @@ class PayableAmountService:
             car_number=ref.car_number, protocol_no=ref.protocol_no, trigger=trigger, period_index=period_index,
             requested_by=requested_by, check_date=self._today(started_at), started_at=started_at,
             max_sessions_per_day=self._limits.max_sessions_per_day,
+            max_manual_per_user=(
+                self._limits.manual_max_sessions_per_user_per_day if trigger == TRIGGER_MANUAL else None
+            ),
         )
         if isinstance(begun, str):
             status = STATUS_BUSY if begun == REFUSAL_BUSY else STATUS_LIMITED
@@ -282,6 +289,11 @@ class PayableAmountService:
                         car_number=ref.car_number, protocol_no=ref.protocol_no, old_amount=stored.previous_amount,
                         new_amount=quote.amount, observed_at=started_at, check_id=check_id,
                     )
+                    if event_id is not None and on_event is not None:
+                        try:
+                            on_event(event_id)
+                        except Exception:
+                            logger.exception("Georgia payable amount: on_event failed for event=%s", event_id)
         self._repository.finish_check(
             check_id, outcome=OUTCOME_OK, finished_at=finished_at, amount=quote.amount,
             previous_amount=stored.previous_amount, increased=increased,
@@ -299,6 +311,7 @@ class PayableAmountService:
 
     async def refresh_for_subscription(
         self, subscription: FineMonitoringSubscription, *, telegram_user_id: int,
+        on_event: Callable[[int], None] | None = None,
     ) -> ManualRefreshOutcome:
         """Все 🔴/🟡 квитанции номера подписки (авторизацию проверяет
         вызывающий код). Квитанция, которую уточняли не раньше
@@ -323,7 +336,9 @@ class PayableAmountService:
             ):
                 results.append(RefreshResult(ref, STATUS_LIMITED, amount=self._repository.get_amount(*key)))
                 continue
-            result = await self.refresh(ref, trigger=TRIGGER_MANUAL, requested_by=telegram_user_id)
+            result = await self.refresh(
+                ref, trigger=TRIGGER_MANUAL, requested_by=telegram_user_id, on_event=on_event,
+            )
             results.append(result)
             if result.status in (STATUS_SUSPENDED, STATUS_NOT_CONFIGURED) or result.outcome == OUTCOME_BLOCKED:
                 stop_status = STATUS_NOT_CONFIGURED if result.status == STATUS_NOT_CONFIGURED else STATUS_SUSPENDED

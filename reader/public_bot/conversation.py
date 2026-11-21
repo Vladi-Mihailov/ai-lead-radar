@@ -2981,27 +2981,34 @@ class ConversationController:
         subscription = self._subscriptions.get_actionable_subscription(
             subscription_id, telegram_user_id=telegram_user_id,
         )
-        if subscription is None:
+        if subscription is None or subscription.status == "archived":
+            # Удалённый автомобиль (кнопка из старого сообщения) — сессий нет.
             return None
         if subscription_id in self._amount_refresh_in_progress:
             return CHECK_ALREADY_IN_PROGRESS
+        today = self._today()
+
+        def exclude_shown_increase(event_id: int) -> None:
+            # Увеличение покажет этот ответ — поллер не должен прислать его
+            # сюда ещё раз. Исключение пишется сразу при создании события,
+            # до любых других сессий этого нажатия.
+            if self._amount_delivery is not None:
+                self._amount_delivery.exclude_for_chat(event_id, chat_id=chat_id, today=today)
+
         self._amount_refresh_in_progress.add(subscription_id)
         try:
             if on_check_started is not None:
                 await on_check_started()
             outcome = await self._payable_amount.refresh_for_subscription(
-                subscription, telegram_user_id=telegram_user_id,
+                subscription, telegram_user_id=telegram_user_id, on_event=exclude_shown_increase,
             )
         finally:
             self._amount_refresh_in_progress.discard(subscription_id)
 
-        today = self._today()
         notes: list[str] = []
         for result in outcome.results:
             if result.increased_from is not None and result.amount is not None:
                 notes.append(format_amount_increase_line(result.increased_from, result.amount.amount))
-                if result.event_id is not None and self._amount_delivery is not None:
-                    self._amount_delivery.exclude_for_chat(result.event_id, chat_id=chat_id, today=today)
         statuses_seen = {result.status for result in outcome.results}
         failed = sum(1 for result in outcome.results if result.status == STATUS_FAILED)
         if statuses_seen & {STATUS_SUSPENDED, STATUS_NOT_CONFIGURED}:

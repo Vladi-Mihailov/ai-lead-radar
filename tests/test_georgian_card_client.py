@@ -266,3 +266,56 @@ def test_detail_never_contains_the_receipt_or_plate():
         quote = _fetch(gateway)
         assert _RECEIPT not in (quote.detail or "") and _CAR not in (quote.detail or "")
         assert json.dumps(quote.__dict__, default=str).find(_RECEIPT) == -1
+
+
+# ---- После независимого review ----
+
+
+def test_httpx_request_log_never_contains_the_plate_receipt_or_session_token(caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="httpx")
+    gateway = _Gateway()
+    assert _fetch(gateway).outcome == OUTCOME_OK
+    assert "HTTP Request" in caplog.text  # httpx действительно пишет каждую строку запроса
+    for secret in (_RECEIPT, _CAR, "TOKEN123", "MERCH1", "PAGE1"):
+        assert secret not in caplog.text
+    assert "https://mpi.gc.ge/<redacted>" in caplog.text
+
+
+@pytest.mark.parametrize("base_url", ["https://police.ge", "https://mpi.gc.ge.evil.example", "http://mpi.gc.ge",
+                                      "https://mpi.gc.ge:8443"])
+def test_misconfigured_gateway_host_sends_nothing(base_url):
+    gateway = _Gateway()
+    quote = _fetch(gateway, config=GeorgianCardConfig(base_url=base_url, merchant_id="M", page_id="P"))
+    assert quote.request_sent is False and gateway.requests == []
+
+
+def test_guard_refuses_a_non_georgian_card_configuration_and_other_ports():
+    with pytest.raises(GeorgianCardSafetyError):
+        _guard_request("GET", "https://police.ge/protocol/index.php", gc_host="police.ge", body=None)
+    with pytest.raises(GeorgianCardSafetyError):
+        _guard_request("GET", "https://mpi.gc.ge:8443/page1/", gc_host="mpi.gc.ge", body=None)
+
+
+def test_small_fine_read_in_the_wrong_unit_is_rejected():
+    gateway = _Gateway(start=lambda request: httpx.Response(200, json={
+        "state": "offer", "amount": 1000, "currency": "GEL", "description": f"N {_RECEIPT}",
+    }))
+    assert _fetch(gateway, base_amount=10.0).outcome == OUTCOME_INVALID_RESPONSE
+
+
+def _chain(hops: int):
+    def page1(request):
+        step = int(request.url.params.get("hop", "0"))
+        if step < hops:
+            return httpx.Response(302, headers={"location": f"https://mpi.gc.ge/page1/?hop={step + 1}"})
+        return httpx.Response(200, text=_card_html(button="გადახდა (150 ₾)"))
+
+    return page1
+
+
+def test_exactly_the_allowed_number_of_redirects_is_followed():
+    assert _fetch(_Gateway(page1=_chain(6))).outcome == OUTCOME_OK
+    quote = _fetch(_Gateway(page1=_chain(7)))
+    assert quote.outcome == OUTCOME_INVALID_RESPONSE and quote.detail == "too_many_redirects"
