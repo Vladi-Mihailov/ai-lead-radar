@@ -18,6 +18,10 @@ Scheduler выполняет job'ы строго последовательно 
 (см. Scheduler.tick()), поэтому этот job и собственный flush_pending() в
 конце FineJob.run()/ArchiveFineJob.run() тоже никогда не пересекаются во
 времени — гонки нет и внутри одного процесса.
+
+Тем же тиком и тем же каналом — увеличение суммы к оплате (см.
+AmountIncreaseOperatorNotifier), независимо от новых штрафов: ошибка одной
+рассылки не мешает другой.
 """
 
 from datetime import datetime
@@ -29,8 +33,9 @@ from reader.jobs.base import Job
 class NotificationFlushJob(Job):
     name = "fine_notification_flush"
 
-    def __init__(self, notification_coordinator: FineNotificationCoordinator):
+    def __init__(self, notification_coordinator: FineNotificationCoordinator, amount_increase_notifier=None):
         self._notification_coordinator = notification_coordinator
+        self._amount_increase_notifier = amount_increase_notifier
 
     async def should_run(self, now: datetime) -> bool:
         # Каждый тик Scheduler'а — никакого расписания, флаш дешёв (один
@@ -38,4 +43,8 @@ class NotificationFlushJob(Job):
         return True
 
     async def run(self) -> None:
-        await self._notification_coordinator.flush_pending()
+        try:
+            await self._notification_coordinator.flush_pending()
+        finally:
+            if self._amount_increase_notifier is not None:
+                await self._amount_increase_notifier.run_once()

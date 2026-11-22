@@ -185,6 +185,16 @@ _SCHEMA = (
     )
     """,
     "INSERT OR IGNORE INTO georgia_amount_notification_state (id) VALUES (1)",
+    # Уведомления об увеличении оператору (main-процесс, см.
+    # AmountIncreaseOperatorNotifier): с какого момента ведутся. Ставится один
+    # раз — события, созданные раньше, оператору не отправляются никогда.
+    """
+    CREATE TABLE IF NOT EXISTS georgia_amount_operator_notification_state (
+        id             INTEGER PRIMARY KEY CHECK (id = 1),
+        enabled_since  TIMESTAMP
+    )
+    """,
+    "INSERT OR IGNORE INTO georgia_amount_operator_notification_state (id) VALUES (1)",
     # Дневной автоматический проход (один на дату).
     """
     CREATE TABLE IF NOT EXISTS georgia_payable_amount_runs (
@@ -980,6 +990,23 @@ class PayableAmountRepository:
     def increase_notifications_since(self) -> datetime | None:
         row = self._conn.execute(
             "SELECT enabled_since FROM georgia_amount_notification_state WHERE id = 1"
+        ).fetchone()
+        return _parse_ts(row[0]) if row else None
+
+    def start_operator_increase_notifications(self, *, at: datetime) -> datetime:
+        """Граница уведомлений оператору: ставится при первом запуске и
+        дальше не сдвигается (перезапуск ничего не меняет). Возвращает её."""
+        self._conn.execute(
+            "UPDATE georgia_amount_operator_notification_state SET enabled_since = COALESCE(enabled_since, ?) "
+            "WHERE id = 1",
+            (_fmt(at),),
+        )
+        self._conn.commit()
+        return self.operator_increase_notifications_since()
+
+    def operator_increase_notifications_since(self) -> datetime | None:
+        row = self._conn.execute(
+            "SELECT enabled_since FROM georgia_amount_operator_notification_state WHERE id = 1"
         ).fetchone()
         return _parse_ts(row[0]) if row else None
 

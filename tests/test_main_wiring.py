@@ -37,6 +37,8 @@ from reader.commands.insurance_ocr import InsuranceOcrCommand  # noqa: E402
 from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
 from reader.fines.notification_coordinator import FineNotificationCoordinator  # noqa: E402
+from reader.fines.payable_amount import PayableAmountRepository  # noqa: E402
+from reader.fines.payment_status import FineStatusRepository, FineStatusTracker  # noqa: E402
 from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository  # noqa: E402
 from reader.fines.police_ge_provider import PoliceGeProvider  # noqa: E402
 from reader.fines.public_feed_seen_repository import (  # noqa: E402
@@ -66,6 +68,7 @@ from reader.notifications.telegram_notification_service import (  # noqa: E402
     TelegramNotificationService,
 )
 from reader.ocr.service import OcrService  # noqa: E402
+from reader.public_bot.amount_delivery_service import AmountIncreaseOperatorNotifier  # noqa: E402
 from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
 from reader.settings import ConfigError, load_settings  # noqa: E402
 from reader.sinks.lead_ai_sink import LeadAiSink  # noqa: E402
@@ -1319,3 +1322,46 @@ async def test_build_fine_monitor_components_passes_the_georgian_notification_co
         detected_fine_repository.close()
         task_repository.close()
         user_repository.close()
+
+
+async def test_build_fine_monitor_components_sends_amount_increases_through_the_operator_channel(tmp_path, monkeypatch):
+    """Увеличение суммы к оплате — тем же NotificationFlushJob и тем же
+    TelegramNotificationService, что и новые штрафы; без репозитория суммы
+    (payable_amount_enabled=false) — как раньше."""
+    _set_required_env(monkeypatch)
+    settings = load_settings(_write_config(tmp_path, _CONFIG_YAML))
+    db_path = tmp_path / "users.db"
+    user_repository = UserRepository(db_path)
+    source = TelegramSource(settings.telegram, groups=[], user_repository=user_repository)
+    task_repository = FineMonitoringTaskRepository(db_path)
+    detected_fine_repository = DetectedFineRepository(db_path)
+    payable_amount_repository = PayableAmountRepository(db_path)
+    status_repository = FineStatusRepository(db_path)
+    http_client = httpx.AsyncClient()
+    try:
+        def build(**kwargs):
+            return build_fine_monitor_components(
+                settings, source, task_repository, detected_fine_repository,
+                http_client, resolve_notification_chat_ids(settings), settings.fine_monitor.allowed_user_ids,
+                user_repository=user_repository, **kwargs,
+            )
+
+        _, scheduler, notification_service, _, _ = build(
+            payable_amount_repository=payable_amount_repository,
+            fine_status_tracker=FineStatusTracker(status_repository),
+        )
+        [flush_job] = [job for job in scheduler._jobs if isinstance(job, NotificationFlushJob)]
+        notifier = flush_job._amount_increase_notifier
+        assert isinstance(notifier, AmountIncreaseOperatorNotifier)
+        assert notifier._notification_service is notification_service
+        assert notifier._repository is payable_amount_repository
+        assert notifier._users is user_repository
+
+        _, scheduler, _, _, _ = build()
+        [flush_job] = [job for job in scheduler._jobs if isinstance(job, NotificationFlushJob)]
+        assert flush_job._amount_increase_notifier is None
+    finally:
+        await http_client.aclose()
+        for repository in (status_repository, payable_amount_repository, detected_fine_repository, task_repository,
+                           user_repository):
+            repository.close()

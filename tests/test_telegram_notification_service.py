@@ -16,6 +16,7 @@ from reader.fines.models import NewFineEvent  # noqa: E402
 from reader.notifications.base import NotificationResult  # noqa: E402
 from reader.notifications.telegram_notification_service import (  # noqa: E402
     TelegramNotificationService,
+    _ResolvedTarget,
     format_fine_block,
 )
 
@@ -433,3 +434,23 @@ async def test_start_raises_runtime_error_when_chat_not_found():
 
     with pytest.raises(RuntimeError):
         await service.start()
+
+
+async def test_notify_text_reaches_every_recipient_and_survives_one_failure():
+    """Уведомление оператору об увеличении суммы — те же получатели и тот же
+    принцип, что у notify(): все чаты независимо, успех — хотя бы один."""
+    sent = []
+
+    class _Client:
+        async def send_message(self, entity, text, **kwargs):
+            if entity == "broken":
+                raise RuntimeError("telegram is down")
+            sent.append((entity, text, kwargs))
+
+    service = TelegramNotificationService(_Client(), [], "https://example.invalid")
+    service._resolved = [_ResolvedTarget("broken", "broken"), _ResolvedTarget("ok", "ok")]
+    assert await service.notify_text("⚠️ Увеличилась сумма штрафа!") is True
+    assert sent == [("ok", "⚠️ Увеличилась сумма штрафа!", {"parse_mode": "md", "link_preview": False})]
+
+    service._resolved = [_ResolvedTarget("broken", "broken")]
+    assert await service.notify_text("x") is False

@@ -28,3 +28,8 @@ class NotificationService(ABC):
         доставлены. Вызывается только когда events непусто — решение
         "отправлять или нет" принимает вызывающий код (FineJob), не сама
         реализация."""
+
+    async def notify_text(self, text: str) -> bool:
+        """Готовый текст тем же получателям (увеличение суммы к оплате, см.
+        AmountIncreaseOperatorNotifier). True — дошёл хотя бы до одного."""
+        raise NotImplementedError

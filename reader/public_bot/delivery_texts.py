@@ -20,6 +20,8 @@ from reader.public_bot.payable_amount_texts import (
     format_refreshed_at,
     format_trusted_amount_increase_line,
 )
+from reader.telegram_markdown import escape_telethon_markdown, safe_telegram_username
+from reader.users.models import TelegramUserInfo
 
 # Коммерческие CTA-кнопки — ТОЛЬКО в owner-уведомлении (не в
 # trusted_operator и не в существующем операторском чате, см. design
@@ -133,6 +135,44 @@ def format_owner_amount_increase_message(
             protocol_no=protocol_no, base_amount=base_amount, old_amount=old_amount, new_amount=new_amount,
         ),
     ])
+
+
+OPERATOR_AMOUNT_INCREASE_TITLE = "⚠️ Увеличилась сумма штрафа!"
+
+
+def format_operator_amount_increase_message(
+    *, car_number: str, base_amount: float | None, old_amount: float, new_amount: float,
+    clients: list[TelegramUserInfo],
+) -> str:
+    """Увеличение суммы к оплате — оператору (см. AmountIncreaseOperatorNotifier):
+        ⚠️ Увеличилась сумма штрафа!
+
+        🚗 Госномер: AB123CD
+        🧾 Первоначальный штраф: 50 ₾
+        💰 Было к оплате: 100 ₾
+        💰 Стало к оплате: 150 ₾
+        📈 Увеличение: +50 ₾
+        👤 Клиент: Иван Петров
+        🔗 Telegram: @ivan_example
+
+    clients — пользователи, привязанные к номеру (тот же источник, что у
+    «Telegram:» в уведомлении о новом штрафе, см. format_car_owner_display):
+    пара 👤/🔗 на каждого, никого — «👤 Клиент: не привязан». Отправляется в
+    Telethon md: имя обезвреживается, username — только настоящий."""
+    lines = [OPERATOR_AMOUNT_INCREASE_TITLE, "", f"🚗 Госномер: {car_number}"]
+    if base_amount is not None:
+        lines.append(f"🧾 Первоначальный штраф: {format_money(base_amount)}")
+    lines.append(f"💰 Было к оплате: {format_money(old_amount)}")
+    lines.append(f"💰 Стало к оплате: {format_money(new_amount)}")
+    lines.append(f"📈 Увеличение: +{format_money(new_amount - old_amount)}")
+    if not clients:
+        lines.append("👤 Клиент: не привязан")
+    for client in clients:
+        name = escape_telethon_markdown(client.full_name) if client.full_name else "Имя не указано"
+        username = safe_telegram_username(client.username)
+        lines.append(f"👤 Клиент: {name}")
+        lines.append(f"🔗 Telegram: @{username}" if username else f"🔗 Telegram: ID {client.user_id}")
+    return "\n".join(lines)
 
 
 def format_trusted_operator_amount_increase_message(
