@@ -355,6 +355,46 @@ plus notes:
     enable and after any off/on.
 - The first amount, a migration or the initial filling never create events.
 
+### Operator
+
+The operator gets each increase through the same channel as new fines:
+`AmountIncreaseOperatorNotifier` runs in the main process (`ai-lead-radar`)
+on every `NotificationFlushJob` tick and sends the message through
+`TelegramNotificationService.notify_text` to the same chats.
+
+```
+⚠️ Увеличилась сумма штрафа!
+
+🚗 Госномер: AB123CD
+🧾 Первоначальный штраф: 50 ₾
+💰 Было к оплате: 100 ₾
+💰 Стало к оплате: 150 ₾
+📈 Увеличение: +50 ₾
+👤 Клиент: Иван Петров
+🔗 Telegram: @ivan_example
+```
+
+- **Clients shown.** These are the users linked to the plate, from the same
+  source as «Telegram:» in the new-fine message. Each gets a 👤/🔗 pair; with
+  none linked the line reads «👤 Клиент: не привязан»; without a username the
+  line shows the Telegram ID.
+- **Same event rules as the client.** No sending during the pause or before
+  the boundary, none before the increase notifications flag, nothing older
+  than 3 days, and nothing for a receipt that is now 🟢, ⚪ or ⏳. Client
+  subscriptions do not limit the operator: as with new fines, the operator
+  hears about every increase.
+- **Its own boundary.** It is set the first time the main process starts with
+  this code (`georgia_amount_operator_notification_state`) and a restart keeps
+  it. An event created earlier is never sent to the operator; it is explicitly
+  excluded (`before_operator_notifications`).
+- **Delivery tracking.** There is one row per event in
+  `georgia_fine_amount_deliveries` (`recipient_role = operator`,
+  `subscription_id = 0`). A delivered event is never sent again. A failed
+  attempt (no chat reached) is retried with the same backoff as new fines.
+- **Independence.** Client and operator deliveries do not depend on each
+  other: separate rows, separate processes. Within the tick, an error in the
+  new-fine flush does not stop the increase notifications.
+
 ## Configuration
 
 Keys under `fine_monitor:` in `config/config.yaml`, with their defaults:

@@ -200,3 +200,15 @@ class TelegramNotificationService(NotificationService):
                 failed_ids.extend(group_ids)
 
         return NotificationResult(delivered_event_ids=delivered_ids, failed_event_ids=failed_ids)
+
+    async def notify_text(self, text: str) -> bool:
+        """Тем же получателям и так же, как notify(): во все чаты независимо,
+        доставлено — если дошло хотя бы до одного."""
+        delivered_to_any = False
+        for target in self._resolved:
+            try:
+                await self._client.send_message(target.entity, text, parse_mode="md", link_preview=False)
+                delivered_to_any = True
+            except Exception:
+                logger.exception("Не удалось отправить уведомление оператору в %s", target.label)
+        return delivered_to_any

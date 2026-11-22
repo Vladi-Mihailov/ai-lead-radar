@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -46,6 +46,8 @@ from reader.fines.check_service import FineCheckService  # noqa: E402
 from reader.fines.detected_fine_repository import DetectedFineRepository  # noqa: E402
 from reader.fines.notification_control import GeorgiaNotificationControl  # noqa: E402
 from reader.fines.notification_coordinator import FineNotificationCoordinator  # noqa: E402
+from reader.fines.payable_amount import PayableAmountRepository  # noqa: E402
+from reader.fines.payment_status import FineStatusRepository, FineStatusTracker  # noqa: E402
 from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository  # noqa: E402
 from reader.fines.police_ge_circuit_breaker import PoliceGeCircuitBreaker  # noqa: E402
 from reader.fines.police_ge_provider import PoliceGeProvider  # noqa: E402
@@ -67,6 +69,7 @@ from reader.notifications.telegram_notification_service import (  # noqa: E402
     TelegramNotificationService,
 )
 from reader.ocr.service import OcrService  # noqa: E402
+from reader.public_bot.amount_delivery_service import AmountIncreaseOperatorNotifier  # noqa: E402
 from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
 from reader.public_bot.subscription_service import (  # noqa: E402
     extend_client_bot_task_if_still_needed,
@@ -140,6 +143,8 @@ def build_fine_monitor_components(
     feed_state_repository: GeorgiaPublicFeedStateRepository | None = None,
     feed_seen_repository: GeorgiaPublicFeedSeenRepository | None = None,
     notification_control: GeorgiaNotificationControl | None = None,
+    payable_amount_repository: PayableAmountRepository | None = None,
+    fine_status_tracker: FineStatusTracker | None = None,
 ) -> tuple[FineJob, Scheduler, TelegramNotificationService, CommandDispatcher, FineCommand]:
     """Чистая сборка зависимостей мониторинга штрафов — без единого await,
     без обращения к сети/Telegram (конструкторы ничего не подключают, только
@@ -298,7 +303,18 @@ def build_fine_monitor_components(
     # Scheduler.tick()), поэтому конкурирующего вызова не бывает даже
     # внутри одного процесса, не говоря уже о бот-процессе (который вообще
     # не имеет доступа к notification_coordinator).
-    notification_flush_job = NotificationFlushJob(notification_coordinator)
+    # Увеличение суммы к оплате (см. AmountIncreaseOperatorNotifier) — тот же
+    # тик, тот же канал и те же получатели, что у новых штрафов; только когда
+    # сумма к оплате включена (payable_amount_repository передан).
+    amount_increase_notifier = (
+        AmountIncreaseOperatorNotifier(
+            payable_amount_repository, fine_status_tracker, notification_service,
+            user_repository=user_repository, notification_control=notification_control,
+        )
+        if payable_amount_repository is not None and fine_status_tracker is not None
+        else None
+    )
+    notification_flush_job = NotificationFlushJob(notification_coordinator, amount_increase_notifier)
 
     # См. задачу "fix the remaining issues discovered during live testing" —
     # production-инцидент: fine_job/client_fine_job/archive_fine_job
@@ -439,6 +455,18 @@ async def _run_fine_monitor(
         if settings.fine_monitor.public_feed_enabled
         else None
     )
+    # Уведомления оператору об увеличении суммы к оплате — та же БД, что у
+    # бота; граница ставится при первом запуске и дальше не сдвигается.
+    payable_amount_repository = None
+    fine_status_tracker = None
+    if settings.fine_monitor.payable_amount_enabled:
+        payable_amount_repository = PayableAmountRepository(settings.app.users_db_file)
+        fine_status_tracker = FineStatusTracker(
+            FineStatusRepository(settings.app.users_db_file),
+            disappearance_min_gap=timedelta(hours=settings.fine_monitor.fine_disappearance_min_gap_hours),
+        )
+        operator_since = payable_amount_repository.start_operator_increase_notifications(at=datetime.now(timezone.utc))
+        logger.info("Georgia amount increase operator notifications: events after %s UTC", operator_since)
     try:
         _fine_job, scheduler, notification_service, command_dispatcher, fine_command = (
             build_fine_monitor_components(
@@ -450,6 +478,8 @@ async def _run_fine_monitor(
                 feed_state_repository=feed_state_repository,
                 feed_seen_repository=feed_seen_repository,
                 notification_control=GeorgiaNotificationControl(settings.app.users_db_file),
+                payable_amount_repository=payable_amount_repository,
+                fine_status_tracker=fine_status_tracker,
             )
         )
 

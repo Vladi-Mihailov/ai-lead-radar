@@ -24,6 +24,9 @@ payable_amount_service.py). Тикает в том же поллере, что �
   после долгого простоя или паузы): получателям — явное исключение
   (event_too_old);
 - повторы — тот же ограниченный backoff, что у «новых штрафов».
+
+Оператору (AmountIncreaseOperatorNotifier, main-процесс) — те же правила
+события, своя строка доставки и своя граница включения.
 """
 
 from __future__ import annotations
@@ -45,6 +48,7 @@ from reader.public_bot.delivery_service import (
     _is_due_for_attempt,
 )
 from reader.public_bot.delivery_texts import (
+    format_operator_amount_increase_message,
     format_owner_amount_increase_message,
     format_trusted_operator_amount_increase_message,
 )
@@ -59,6 +63,12 @@ EXCLUSION_SHOWN_IN_REPLY = "shown_in_refresh_reply"
 EXCLUSION_EVENT_TOO_OLD = "event_too_old"
 EXCLUSION_BEFORE_NOTIFICATIONS = "before_increase_notifications"
 EXCLUSION_SUBSCRIPTION_CHANGED = "subscription_changed_after_event"
+EXCLUSION_BEFORE_OPERATOR_NOTIFICATIONS = "before_operator_notifications"
+
+# Доставка оператору не привязана к подписке: одна строка на событие.
+OPERATOR_ROLE = "operator"
+OPERATOR_SUBSCRIPTION_ID = 0
+_OPERATOR_CHAT_ID = 0
 
 DEFAULT_MAX_EVENT_AGE = timedelta(days=3)
 # Насколько назад смотреть, чтобы явно исключить устаревшие события.
@@ -69,6 +79,21 @@ def _naive_utc(value: datetime) -> datetime:
     if value.tzinfo is not None:
         return value.astimezone(timezone.utc).replace(tzinfo=None)
     return value
+
+
+def _event_exclusion(
+    event: AmountEvent, status, *, boundary_at: datetime | None, enabled_since: datetime, too_old_before: datetime,
+) -> str | None:
+    """Почему событие не рассылается никому (клиенту и оператору — одинаково)."""
+    if boundary_at is not None and event.created_at <= boundary_at:
+        return EXCLUSION_NOTIFICATION_BOUNDARY
+    if event.created_at <= enabled_since:
+        return EXCLUSION_BEFORE_NOTIFICATIONS
+    if event.created_at < too_old_before:
+        return EXCLUSION_EVENT_TOO_OLD
+    if status is None or status.display_status in (PAYMENT_PAID, DISPLAY_GONE, DISPLAY_UNVERIFIED):
+        return EXCLUSION_RECEIPT_NOT_PAYABLE
+    return None
 
 
 class AmountIncreaseDeliveryService:
@@ -119,15 +144,9 @@ class AmountIncreaseDeliveryService:
             if is_fine_output_suppressed(event.car_number):
                 continue
             status = self._statuses.statuses_by_protocol(event.car_number).get(event.protocol_no)
-            exclusion = None
-            if boundary_at is not None and event.created_at <= boundary_at:
-                exclusion = EXCLUSION_NOTIFICATION_BOUNDARY
-            elif event.created_at <= enabled_since:
-                exclusion = EXCLUSION_BEFORE_NOTIFICATIONS
-            elif event.created_at < too_old_before:
-                exclusion = EXCLUSION_EVENT_TOO_OLD
-            elif status is None or status.display_status in (PAYMENT_PAID, DISPLAY_GONE, DISPLAY_UNVERIFIED):
-                exclusion = EXCLUSION_RECEIPT_NOT_PAYABLE
+            exclusion = _event_exclusion(
+                event, status, boundary_at=boundary_at, enabled_since=enabled_since, too_old_before=too_old_before,
+            )
             for subscription in by_car.get(event.car_number, []):
                 if subscription.created_at is not None and _naive_utc(subscription.created_at) > event.created_at:
                     continue
@@ -218,3 +237,84 @@ class AmountIncreaseDeliveryService:
             return "failed"
         self._repository.mark_delivered(event.id, subscription.id, role)
         return "delivered"
+
+
+class AmountIncreaseOperatorNotifier:
+    """Подтверждённое увеличение суммы — оператору: тем же каналом и тем же
+    получателям, что и новые штрафы (TelegramNotificationService main-процесса,
+    тик NotificationFlushJob). Правила события — те же, что у клиента
+    (_event_exclusion: пауза и граница Грузии, флаг уведомлений об увеличении,
+    срок давности, квитанция к оплате), плюс своя граница: событие, созданное
+    до первого запуска операторских уведомлений, оператору не отправляется
+    никогда. Одна строка доставки на событие (role operator) — повтор той же
+    суммы события не создаёт, доставленное не повторяется; неудачная попытка
+    повторяется с тем же backoff, что у «новых штрафов». Клиентская доставка
+    (AmountIncreaseDeliveryService, бот-процесс) от неё не зависит. Подписки
+    клиентов на отправку оператору не влияют — как и о новых штрафах, оператор
+    узнаёт о каждом увеличении."""
+
+    def __init__(
+        self,
+        repository: PayableAmountRepository,
+        status_lookup,
+        notification_service,
+        *,
+        user_repository=None,
+        notification_control: NotificationControlLike | None = None,
+        max_event_age: timedelta = DEFAULT_MAX_EVENT_AGE,
+    ):
+        self._repository = repository
+        self._statuses = status_lookup
+        self._notification_service = notification_service
+        self._users = user_repository
+        self._notification_control = notification_control
+        self._max_event_age = max_event_age
+
+    async def run_once(self, *, now: datetime | None = None) -> DeliveryTickResult:
+        now = now or datetime.now(timezone.utc)
+        control = self._notification_control.state() if self._notification_control is not None else None
+        if control is not None and control.paused:
+            return DeliveryTickResult(delivered=0, failed=0, flood_wait_hit=False)
+        enabled_since = self._repository.increase_notifications_since()
+        operator_since = self._repository.operator_increase_notifications_since()
+        if enabled_since is None or operator_since is None:
+            return DeliveryTickResult(delivered=0, failed=0, flood_wait_hit=False)
+        too_old_before = _naive_utc(now) - self._max_event_age
+        delivered = failed = 0
+        for event in self._repository.events_since(_naive_utc(now) - _EXCLUSION_LOOKBACK):
+            if is_fine_output_suppressed(event.car_number):
+                continue
+            existing = self._repository.get_delivery(event.id, OPERATOR_SUBSCRIPTION_ID, OPERATOR_ROLE)
+            if not _is_due_for_attempt(existing, now=now):
+                continue
+            status = self._statuses.statuses_by_protocol(event.car_number).get(event.protocol_no)
+            reason = _event_exclusion(
+                event, status, boundary_at=control.boundary_at if control is not None else None,
+                enabled_since=enabled_since, too_old_before=too_old_before,
+            )
+            if reason is None and event.created_at <= operator_since:
+                reason = EXCLUSION_BEFORE_OPERATOR_NOTIFICATIONS
+            if reason is not None:
+                self._repository.exclude_delivery(
+                    event.id, OPERATOR_SUBSCRIPTION_ID, OPERATOR_ROLE, _OPERATOR_CHAT_ID, reason=reason,
+                )
+                continue
+            text = format_operator_amount_increase_message(
+                car_number=event.car_number, base_amount=status.amount, old_amount=event.old_amount,
+                new_amount=event.new_amount,
+                clients=self._users.find_by_car_number(event.car_number) if self._users is not None else [],
+            )
+            self._repository.record_delivery_attempt(
+                event.id, OPERATOR_SUBSCRIPTION_ID, OPERATOR_ROLE, _OPERATOR_CHAT_ID,
+            )
+            try:
+                sent = await self._notification_service.notify_text(text)
+            except Exception:
+                logger.exception("Не удалось отправить оператору уведомление о сумме event=%s", event.id)
+                sent = False
+            if sent:
+                self._repository.mark_delivered(event.id, OPERATOR_SUBSCRIPTION_ID, OPERATOR_ROLE)
+                delivered += 1
+            else:
+                failed += 1
+        return DeliveryTickResult(delivered=delivered, failed=failed, flood_wait_hit=False)

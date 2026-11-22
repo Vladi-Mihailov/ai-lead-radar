@@ -27,11 +27,16 @@ from reader.fines.provider import FineProvider  # noqa: E402
 from reader.fines.task_repository import FineMonitoringTaskRepository  # noqa: E402
 from reader.plate_display import format_plate_for_telegram  # noqa: E402
 from reader.public_bot import texts  # noqa: E402
+from reader.jobs.notification_flush_job import NotificationFlushJob  # noqa: E402
 from reader.public_bot.amount_delivery_service import (  # noqa: E402
+    EXCLUSION_BEFORE_OPERATOR_NOTIFICATIONS,
     EXCLUSION_DUPLICATE_CHAT,
     EXCLUSION_RECEIPT_NOT_PAYABLE,
     EXCLUSION_SHOWN_IN_REPLY,
+    OPERATOR_ROLE,
+    OPERATOR_SUBSCRIPTION_ID,
     AmountIncreaseDeliveryService,
+    AmountIncreaseOperatorNotifier,
 )
 from reader.public_bot.conversation import ConversationController  # noqa: E402
 from reader.public_bot.conversation_state_repository import BotConversationStateRepository  # noqa: E402
@@ -48,6 +53,7 @@ from reader.public_bot.payable_amount_texts import (  # noqa: E402
 from reader.public_bot.statistics_service import BotStatisticsService  # noqa: E402
 from reader.public_bot.subscription_repository import FineSubscriptionRepository  # noqa: E402
 from reader.public_bot.subscription_service import SubscriptionService  # noqa: E402
+from reader.users.models import TelegramUserInfo  # noqa: E402
 from reader.users.repository import UserRepository  # noqa: E402
 
 _TBILISI = ZoneInfo("Asia/Tbilisi")
@@ -794,3 +800,226 @@ async def test_increase_after_a_below_original_answer_counts_from_the_shown_amou
     assert "⚠️ Сумма к оплате по вашему штрафу увеличилась: 50 → 150 ₾" in reply.text
     [event] = fx.amounts.events_since(datetime(2000, 1, 1))
     assert (event.old_amount, event.new_amount) == (50, 150)
+
+
+# ---- Увеличение суммы — оператору (main-процесс) ----
+
+
+class _OperatorChannel:
+    """Заглушка TelegramNotificationService.notify_text: fail — Telegram недоступен."""
+
+    def __init__(self, *, fail=False):
+        self.fail = fail
+        self.texts: list[str] = []
+
+    async def notify_text(self, text):
+        if self.fail:
+            raise RuntimeError("telegram is down")
+        self.texts.append(text)
+        return True
+
+
+class _FailingSender:
+    async def send_message(self, chat_id, text, *, buttons=None):
+        raise RuntimeError("telegram is down")
+
+
+def _operator(fx, channel, *, since=datetime(2026, 11, 1)):
+    fx.amounts.start_operator_increase_notifications(at=since)
+    return AmountIncreaseOperatorNotifier(
+        fx.amounts, fx.tracker, channel, user_repository=fx.users, notification_control=fx.control,
+    )
+
+
+def _link_client(fx, *, user_id=_OWNER, username="ivan_example", first_name="Иван", last_name="Петров", car=_CAR):
+    fx.users.upsert(TelegramUserInfo(
+        user_id=user_id, username=username, first_name=first_name, last_name=last_name, is_bot=False,
+    ))
+    fx.users.add_car_numbers(user_id, [car])
+
+
+async def _car_with_open_notifications(fx):
+    task, subscription = fx.car(_CAR, [("GE1", 50)], owner=_OWNER)
+    await fx.check(task)
+    fx.control.pause()
+    fx.control.resume(client_excluded=0, operator_excluded=0, at=datetime(2026, 11, 1))
+    return subscription
+
+
+async def test_new_increase_reaches_both_the_client_and_the_operator(fx):
+    subscription = await _car_with_open_notifications(fx)
+    _link_client(fx)
+    channel = _OperatorChannel()
+    operator = _operator(fx, channel)
+    event_id = _event(fx)
+
+    await fx.delivery.run_once()
+    await operator.run_once()
+
+    assert [chat_id for chat_id, _, _ in fx.sender.sent] == [_OWNER]
+    assert fx.sender.sent[0][1].splitlines()[0] == "⚠️ Сумма штрафа увеличилась!"  # клиенту — прежний формат
+    assert channel.texts == ["\n".join([
+        "⚠️ Увеличилась сумма штрафа!",
+        "",
+        f"🚗 Госномер: {_CAR}",
+        "🧾 Первоначальный штраф: 50 ₾",
+        "💰 Было к оплате: 100 ₾",
+        "💰 Стало к оплате: 150 ₾",
+        "📈 Увеличение: +50 ₾",
+        "👤 Клиент: Иван Петров",
+        "🔗 Telegram: @ivan_example",
+    ])]
+    assert fx.amounts.get_delivery(event_id, subscription.id, "owner").delivered_at is not None
+    assert fx.amounts.get_delivery(event_id, OPERATOR_SUBSCRIPTION_ID, OPERATOR_ROLE).delivered_at is not None
+
+
+async def test_operator_message_without_a_linked_client(fx):
+    await _car_with_open_notifications(fx)
+    fx.users.upsert(TelegramUserInfo(user_id=_STRANGER, username=None, first_name=None, last_name=None, is_bot=False))
+    channel = _OperatorChannel()
+    _event(fx)
+
+    await _operator(fx, channel).run_once()
+
+    [text] = channel.texts
+    assert text.splitlines()[-1] == "👤 Клиент: не привязан"
+    assert "🔗" not in text
+
+
+async def test_operator_message_shows_id_when_the_client_has_no_username(fx):
+    await _car_with_open_notifications(fx)
+    _link_client(fx, username=None, first_name=None, last_name=None)
+    channel = _OperatorChannel()
+    _event(fx)
+
+    await _operator(fx, channel).run_once()
+
+    assert channel.texts[0].splitlines()[-2:] == ["👤 Клиент: Имя не указано", f"🔗 Telegram: ID {_OWNER}"]
+
+
+async def test_operator_failure_does_not_block_the_client_and_is_retried_once(fx):
+    subscription = await _car_with_open_notifications(fx)
+    channel = _OperatorChannel(fail=True)
+    operator = _operator(fx, channel)
+    event_id = _event(fx)
+    now = datetime.now(timezone.utc)
+
+    await operator.run_once(now=now)
+    await fx.delivery.run_once(now=now)
+
+    assert [chat_id for chat_id, _, _ in fx.sender.sent] == [_OWNER]
+    failed = fx.amounts.get_delivery(event_id, OPERATOR_SUBSCRIPTION_ID, OPERATOR_ROLE)
+    assert failed.delivered_at is None and failed.excluded_at is None and failed.attempt_count == 1
+
+    channel.fail = False
+    await operator.run_once(now=now + timedelta(minutes=2))
+    await operator.run_once(now=now + timedelta(minutes=10))
+
+    assert len(channel.texts) == 1
+    assert fx.amounts.get_delivery(event_id, OPERATOR_SUBSCRIPTION_ID, OPERATOR_ROLE).delivered_at is not None
+    assert fx.amounts.get_delivery(event_id, subscription.id, "owner").attempt_count == 1
+
+
+async def test_client_failure_does_not_block_the_operator(fx):
+    subscription = await _car_with_open_notifications(fx)
+    channel = _OperatorChannel()
+    failing = AmountIncreaseDeliveryService(
+        fx.amounts, fx.subscriptions, fx.tracker, _FailingSender(), tz=_TBILISI, notification_control=fx.control,
+    )
+    event_id = _event(fx)
+
+    await failing.run_once()
+    await _operator(fx, channel).run_once()
+
+    assert len(channel.texts) == 1
+    assert fx.amounts.get_delivery(event_id, subscription.id, "owner").delivered_at is None
+
+
+async def test_flush_job_sends_increases_even_when_new_fines_fail(fx):
+    await _car_with_open_notifications(fx)
+    channel = _OperatorChannel()
+
+    class _BrokenCoordinator:
+        async def flush_pending(self):
+            raise RuntimeError("new fines failed")
+
+    _event(fx)
+    job = NotificationFlushJob(_BrokenCoordinator(), _operator(fx, channel))
+
+    with pytest.raises(RuntimeError, match="new fines failed"):
+        await job.run()  # Scheduler залогирует ошибку новых штрафов
+    assert len(channel.texts) == 1
+
+
+async def test_operator_gets_each_increase_once_and_a_repeated_amount_creates_nothing(fx):
+    await _car_with_open_notifications(fx)
+    channel = _OperatorChannel()
+    operator = _operator(fx, channel)
+    _event(fx)
+    now = datetime.now(timezone.utc)
+
+    await operator.run_once(now=now)
+    await operator.run_once(now=now + timedelta(minutes=5))
+    assert _event(fx) is None  # та же сумма — события нет
+    await operator.run_once(now=now + timedelta(hours=4))
+
+    assert len(channel.texts) == 1
+
+
+async def test_operator_never_gets_increases_from_before_its_start_or_before_the_flag(fx):
+    await _car_with_open_notifications(fx)
+    channel = _OperatorChannel()
+    before_flag = _event(fx, old=100, new=150)
+    _set_event_created(fx, before_flag, _hours_ago(3))
+    fx.amounts.set_increase_notifications(enabled=False, at=datetime.now(timezone.utc))
+    fx.amounts.set_increase_notifications(enabled=True, at=datetime.now(timezone.utc) - timedelta(hours=2))
+    before_operator = _event(fx, old=150, new=200)
+    _set_event_created(fx, before_operator, _hours_ago(1.5))
+    operator = _operator(fx, channel, since=datetime.now(timezone.utc) - timedelta(hours=1))
+    new = _event(fx, old=200, new=250)
+
+    await operator.run_once()
+
+    assert len(channel.texts) == 1 and "💰 Стало к оплате: 250 ₾" in channel.texts[0]
+    def reason(event_id):
+        return fx.amounts.get_delivery(event_id, OPERATOR_SUBSCRIPTION_ID, OPERATOR_ROLE).exclusion_reason
+
+    assert reason(before_flag) == EXCLUSION_BEFORE_NOTIFICATIONS
+    assert reason(before_operator) == EXCLUSION_BEFORE_OPERATOR_NOTIFICATIONS
+    assert fx.amounts.get_delivery(new, OPERATOR_SUBSCRIPTION_ID, OPERATOR_ROLE).delivered_at is not None
+
+
+def test_operator_start_boundary_survives_a_restart(fx):
+    first = fx.amounts.start_operator_increase_notifications(at=datetime(2026, 11, 22, 10, 0))
+    again = fx.amounts.start_operator_increase_notifications(at=datetime(2026, 11, 22, 12, 0))
+    assert first == again == datetime(2026, 11, 22, 10, 0)
+
+
+async def test_operator_gets_nothing_while_paused_or_with_increase_notifications_off(fx):
+    await _car_with_open_notifications(fx)
+    channel = _OperatorChannel()
+    operator = _operator(fx, channel)
+    event_id = _event(fx)
+
+    fx.control.pause()
+    await operator.run_once()
+    fx.control.resume(client_excluded=0, operator_excluded=0, at=datetime(2026, 11, 1))
+    fx.amounts.set_increase_notifications(enabled=False, at=datetime.now(timezone.utc))
+    await operator.run_once()
+
+    assert channel.texts == []
+    assert fx.amounts.get_delivery(event_id, OPERATOR_SUBSCRIPTION_ID, OPERATOR_ROLE) is None
+
+
+async def test_operator_skips_a_receipt_paid_before_sending(fx):
+    await _car_with_open_notifications(fx)
+    channel = _OperatorChannel()
+    fx.tracker.mark_paid(fx.tracker.statuses_by_protocol(_CAR)["GE1"].id, actor_user_id=_TRUSTED, note="BOG 1")
+    event_id = _event(fx)
+
+    await _operator(fx, channel).run_once()
+
+    assert channel.texts == []
+    assert fx.amounts.get_delivery(event_id, OPERATOR_SUBSCRIPTION_ID, OPERATOR_ROLE).exclusion_reason == (
+        EXCLUSION_RECEIPT_NOT_PAYABLE
+    )
