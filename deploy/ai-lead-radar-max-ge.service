@@ -1,0 +1,31 @@
+[Unit]
+Description=AI Lead Radar - MAX Georgia fines bot (webhook)
+After=network-online.target
+Wants=network-online.target
+
+# TEMPLATE - not installed. Do not copy to /etc/systemd/system or enable it
+# without a separate, explicit go: enabling it makes the MAX Georgia bot answer
+# the public. See docs/max-bots.md ("Release plan").
+#
+# Separate process from ai-lead-radar.service and ai-lead-radar-geshtrafbot.service:
+# its own MAX token (MAX_GE_BOT_TOKEN), webhook secret and local port. The
+# scheduled police.ge monitoring stays in ai-lead-radar.service; this process
+# only runs on-demand checks (add car, check now, refresh amount) and MAX
+# delivery. .env is the same file (WorkingDirectory), MAX_GE_* must be filled
+# before the first start.
+[Service]
+Type=simple
+User=leadradar
+Group=leadradar
+WorkingDirectory=/home/leadradar/ai-lead-radar
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/leadradar/.venv/bin/python -m reader.max_bot.georgia.main
+
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
