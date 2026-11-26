@@ -1,0 +1,35 @@
+[Unit]
+Description=AI Lead Radar - MAX Turkey fines bot (webhook)
+After=network-online.target
+Wants=network-online.target
+
+# TEMPLATE - not installed. Do not copy to /etc/systemd/system or enable it
+# without a separate, explicit go. See docs/max-bots.md ("Release plan").
+#
+# Separate process from ai-lead-radar-turkeybot.service: its own MAX token
+# (MAX_TR_BOT_TOKEN), webhook secret and local port. Its daily monitoring job
+# (22:30-23:59 Europe/Istanbul, waits while the Telegram 21:00 batch is still
+# running) reuses that batch's results and only checks plates (providers)
+# that have no fresh result.
+#
+# KGM must use the same route as the Telegram Turkey bot (docs/kgm-relay.md):
+# the two lines below mirror the turkeybot drop-in kgm-relay.conf. Without
+# them KGM would go direct from the DE server, which is blocked.
+[Service]
+Type=simple
+User=leadradar
+Group=leadradar
+WorkingDirectory=/home/leadradar/ai-lead-radar
+Environment=PYTHONUNBUFFERED=1
+Environment=TURKEY_KGM_ROUTE=relay
+EnvironmentFile=-/etc/ai-lead-radar/turkeybot-kgm-relay.env
+ExecStart=/home/leadradar/.venv/bin/python -m reader.max_bot.turkey.main
+
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
