@@ -154,6 +154,7 @@ from reader.public_bot.payable_amount_texts import (
     AmountSummary,
     ReceiptAmount,
     format_amount_increase_line,
+    format_overdue_line,
     summarize,
     unknown_amount_summary,
 )
@@ -2917,8 +2918,9 @@ class ConversationController:
     ) -> dict[str, dict[str, ReceiptAmount]]:
         """{car: {protocolNo: ReceiptAmount}} — сохранённая сумма Georgian
         Card, если она актуальна для текущего контрольного периода (см.
-        amount_is_current), иначе «нужно уточнить». Только чтение БД —
-        никаких запросов к Georgian Card."""
+        amount_is_current), иначе «нужно уточнить»; overdue — окончательный
+        срок оплаты (term_ends_for_cars) истёк. Только чтение БД — никаких
+        запросов к Georgian Card."""
         assert self._payable_amount is not None
         car_numbers = list(statuses_by_car)
         repository = self._payable_amount.repository
@@ -2931,12 +2933,14 @@ class ConversationController:
             for status in statuses:
                 key = (car_number, status.protocol_no)
                 amount = stored.get(key)
-                current = amount_is_current(amount, term_ends.get(key), today=today, tz=self._tz)
+                term_end = term_ends.get(key)
+                current = amount_is_current(amount, term_end, today=today, tz=self._tz)
                 by_protocol[status.protocol_no] = ReceiptAmount(
                     protocol_no=status.protocol_no,
                     base_amount=status.amount,
                     payable=display_payable(amount.amount, status.amount) if current else None,
                     observed_at=amount.observed_at if current else None,
+                    overdue=term_end is not None and today > term_end,
                 )
             result[car_number] = by_protocol
         return result
@@ -2966,6 +2970,7 @@ class ConversationController:
                 base_amount=fine.amount,
                 payable=display_payable(receipt.payable, fine.amount) if receipt else None,
                 observed_at=receipt.observed_at if receipt else None,
+                overdue=receipt.overdue if receipt else False,
             )
         return result
 
@@ -3584,10 +3589,24 @@ class ConversationController:
             f"👤 {owner_display}",
             f"🚗 {format_plate_for_telegram(hit.car_number)}",
             texts.format_search_money_line(check_ok=check_ok, fines=fines, statuses=statuses),
+        ]
+        overdue = self._search_overdue_line(hit.car_number, fines, statuses) if statuses is not None else None
+        if overdue is not None:
+            lines.append(overdue)
+        lines.extend([
             texts.format_search_monitoring_line(monitoring_active=monitoring_active),
             texts.format_search_checked_at_line(checked_at),
-        ]
+        ])
         return "\n".join(lines)
+
+    def _search_overdue_line(self, car_number: str, fines, statuses: dict[str, str]) -> str | None:
+        """«⚠️ Срок оплаты истёк…» по неоплаченным штрафам живой проверки
+        (🟢 не входят — как в «💰 Штрафы»). Только чтение БД; без суммы к
+        оплате (функция выключена) — None."""
+        if self._payable_amount is None:
+            return None
+        receipts = self._check_now_receipt_amounts(car_number, fines, statuses)
+        return format_overdue_line(summarize(receipts.values())) if receipts else None
 
     async def _format_search_results_reply(self, query_type: str, query: str, page: int) -> BotReply:
         """page — ЛЮБОЕ int (forged/устаревший callback, см. задачу п.14) —

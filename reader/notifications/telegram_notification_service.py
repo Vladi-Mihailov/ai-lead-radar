@@ -41,7 +41,9 @@ def _format_amount(value: float | None) -> str | None:
     return f"{text} GEL"
 
 
-def format_fine_block(event: NewFineEvent, *, payable_lines: list[str] | None = None) -> str:
+def format_fine_block(
+    event: NewFineEvent, *, payable_lines: list[str] | None = None, original_amount: bool = False,
+) -> str:
     """Публичная (без ведущего "_") — переиспользуется
     reader/public_bot/delivery_texts.py для клиентских уведомлений (см.
     design report Stage 4 и новый расширенный формат уведомлений), чтобы не
@@ -53,7 +55,8 @@ def format_fine_block(event: NewFineEvent, *, payable_lines: list[str] | None = 
 
     payable_lines — сумма к оплате (клиентская карточка "🔎 Проверить
     сейчас", см. reader/public_bot/payable_amount_texts.py): строка суммы
-    становится "🧾 Штраф: N ₾", под ней — эти строки. None — как раньше."""
+    становится "🧾 Штраф: N ₾" (original_amount — "🧾 Первоначальный штраф",
+    срок оплаты истёк), под ней — эти строки. None — как раньше."""
     lines = []
 
     if event.external_fine_id:
@@ -74,7 +77,8 @@ def format_fine_block(event: NewFineEvent, *, payable_lines: list[str] | None = 
 
     if payable_lines is not None:
         if event.amount is not None:
-            lines.append(f"🧾 Штраф: {_format_amount(event.amount).removesuffix(' GEL')} ₾")
+            label = "Первоначальный штраф" if original_amount else "Штраф"
+            lines.append(f"🧾 {label}: {_format_amount(event.amount).removesuffix(' GEL')} ₾")
         lines.extend(payable_lines)
     else:
         amount = _format_amount(event.amount)
