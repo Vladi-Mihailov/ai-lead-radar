@@ -25,6 +25,9 @@ from reader.turkey_bot.keyboards import (
     client_link_pick_keyboard,
     client_link_screen_keyboard,
     client_link_unlink_confirm_keyboard,
+    orphan_confirm_keyboard,
+    orphan_list_keyboard,
+    orphan_picker_keyboard,
     check_now_picker_keyboard,
     debt_refresh_button_keyboard,
     debt_refresh_confirm_keyboard,
@@ -33,6 +36,7 @@ from reader.turkey_bot.keyboards import (
     decode_car_open_callback,
     decode_client_link_answer_callback,
     decode_client_link_callback,
+    decode_orphan_callback,
     decode_debt_refresh_cancel_callback,
     decode_debt_refresh_confirm_callback,
     decode_debt_refresh_pick_callback,
@@ -106,11 +110,12 @@ def register(
         last_name = getattr(sender, "last_name", None) if sender is not None else None
         _record_known_user(event.sender_id, event.chat_id, username, first_name, last_name)
         is_trusted = controller.is_trusted(event.sender_id)
+        is_admin = controller.is_admin(event.sender_id)
 
         reply = await controller.handle_text(
             text, chat_id=event.chat_id, telegram_user_id=event.sender_id,
         )
-        await _send_reply(event, reply, is_trusted=is_trusted)
+        await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin)
         await _deliver_outgoing(event, reply)
 
     @client.on(events.CallbackQuery(func=lambda e: e.is_private))
@@ -121,24 +126,25 @@ def register(
         last_name = getattr(sender, "last_name", None) if sender is not None else None
         _record_known_user(event.sender_id, event.chat_id, username, first_name, last_name)
         is_trusted = controller.is_trusted(event.sender_id)
+        is_admin = controller.is_admin(event.sender_id)
 
         if event.data == CANCEL_CALLBACK_DATA:
             reply = await controller.handle_cancel(chat_id=event.chat_id)
             await event.answer()
-            await _send_reply(event, reply, is_trusted=is_trusted)
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin)
             return
 
         if event.data == HELP_BACK_TO_MAIN_CALLBACK_DATA:
             reply = controller.handle_help_back_to_main()
             await event.answer()
-            await _send_reply(event, reply, is_trusted=is_trusted)
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin)
             return
 
         help_section = decode_help_callback(event.data)
         if help_section is not None:
             reply = controller.handle_help_callback(help_section)
             await event.answer()
-            await _send_reply(event, reply, is_trusted=is_trusted)
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin)
             return
 
         if event.data == BACK_TO_MY_CARS_CALLBACK_DATA:
@@ -148,7 +154,7 @@ def register(
             # уже отфильтрован по event.sender_id на уровне SQL).
             reply = controller.handle_my_cars(chat_id=event.chat_id, telegram_user_id=event.sender_id)
             await event.answer()
-            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin, prefer_edit=True)
             return
 
         car_open_id = decode_car_open_callback(event.data)
@@ -158,7 +164,7 @@ def register(
                 await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
                 return
             await event.answer()
-            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin, prefer_edit=True)
             return
 
         car_open_plate = decode_car_open_by_plate_callback(event.data)
@@ -168,7 +174,7 @@ def register(
                 await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
                 return
             await event.answer()
-            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin, prefer_edit=True)
             return
 
         car_action = decode_car_action_callback(event.data)
@@ -202,7 +208,7 @@ def register(
                     # alert-попапа.
                     await event.respond(UNKNOWN_BUTTON_TEXT)
                     return
-                await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=False)
+                await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin, prefer_edit=False)
                 return
             reply = await controller.handle_car_action(
                 action, car_id, chat_id=event.chat_id, telegram_user_id=event.sender_id,
@@ -218,7 +224,7 @@ def register(
             # его с "check": новое сообщение уместнее, чем правка карточки)
             # — back_to_car_id всё равно даёт путь назад к карточке (см.
             # _first_message_buttons).
-            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=action != "history")
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin, prefer_edit=action != "history")
             await _deliver_outgoing(event, reply)  # удаление машины-якоря — уведомление клиенту
             return
 
@@ -236,7 +242,7 @@ def register(
                 await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
                 return
             await event.answer()
-            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin, prefer_edit=True)
             return
 
         manager_car_open = decode_manager_car_open_callback(event.data)
@@ -247,7 +253,7 @@ def register(
                 await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
                 return
             await event.answer()
-            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin, prefer_edit=True)
             return
 
         manager_car_toggle = decode_manager_car_toggle_callback(event.data)
@@ -258,7 +264,7 @@ def register(
                 await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
                 return
             await event.answer()
-            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin, prefer_edit=True)
             return
 
         # 👤 Привязка клиента — менеджерские действия (is_trusted и car_id
@@ -275,7 +281,19 @@ def register(
             await event.answer()
             # Ссылку-приглашение и запрос — новым сообщением (менеджер её
             # пересылает), остальное — правкой экрана.
-            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=action not in ("invite", "username"))
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin, prefer_edit=action not in ("invite", "username"))
+            await _deliver_outgoing(event, reply)
+            return
+
+        orphan = decode_orphan_callback(event.data)
+        if orphan is not None:
+            action, first, extra, token = orphan
+            reply = controller.handle_orphan_action(action, first, extra, token, telegram_user_id=event.sender_id)
+            if reply is None:
+                await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
+                return
+            await event.answer()
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin, prefer_edit=True)
             await _deliver_outgoing(event, reply)
             return
 
@@ -287,7 +305,7 @@ def register(
                 await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
                 return
             await event.answer()
-            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin, prefer_edit=True)
             await _deliver_outgoing(event, reply)
             return
 
@@ -299,7 +317,7 @@ def register(
                 await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
                 return
             await event.answer()
-            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin, prefer_edit=True)
             return
 
         if decode_search_new_callback(event.data):
@@ -308,7 +326,7 @@ def register(
                 await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
                 return
             await event.answer()
-            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin, prefer_edit=True)
             return
 
         if decode_search_back_callback(event.data):
@@ -317,13 +335,13 @@ def register(
                 await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
                 return
             await event.answer()
-            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin, prefer_edit=True)
             return
 
         if decode_debt_refresh_pick_callback(event.data):
             reply = controller.handle_debt_refresh_pick(telegram_user_id=event.sender_id)
             await event.answer()
-            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin, prefer_edit=True)
             return
 
         if decode_debt_refresh_confirm_callback(event.data):
@@ -336,13 +354,13 @@ def register(
             # "зависшего" индикатора загрузки у менеджера.
             await event.answer()
             reply = await controller.handle_debt_refresh_confirm(telegram_user_id=event.sender_id)
-            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=False)
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin, prefer_edit=False)
             return
 
         if decode_debt_refresh_cancel_callback(event.data):
             reply = controller.handle_debt_refresh_cancel(telegram_user_id=event.sender_id)
             await event.answer()
-            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin, prefer_edit=True)
             return
 
         await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
@@ -363,7 +381,7 @@ def register(
     logger.info("✔ Turkey bot handlers зарегистрированы")
 
 
-def _first_message_buttons(reply: BotReply, *, is_trusted: bool, has_extra: bool):
+def _first_message_buttons(reply: BotReply, *, is_trusted: bool, has_extra: bool, is_admin: bool = False):
     """Приоритет клавiатур на ПЕРВОМ отправленном сообщении (Telethon не
     может совместить несколько видов сразу) — show_cancel_button >
     my_cars/check-picker > manager_cars_page_options > manager_car_detail_page >
@@ -392,6 +410,14 @@ def _first_message_buttons(reply: BotReply, *, is_trusted: bool, has_extra: bool
         return manager_car_detail_keyboard(reply.manager_car_detail_page, car_id=reply.manager_car_detail_car_id)
     if reply.client_link_confirm_id is not None:
         return client_link_confirm_keyboard(reply.client_link_confirm_id)
+    if reply.orphan_confirm is not None:
+        return orphan_confirm_keyboard(*reply.orphan_confirm)
+    if reply.orphan_picker is not None:
+        link_id, options = reply.orphan_picker
+        return orphan_picker_keyboard(link_id, list(options))
+    if reply.orphan_list is not None:
+        page, total_pages, options = reply.orphan_list
+        return orphan_list_keyboard(page, total_pages, list(options))
     if reply.client_link_unlink_confirm is not None:
         return client_link_unlink_confirm_keyboard(*reply.client_link_unlink_confirm)
     if reply.client_link_pick is not None:
@@ -438,7 +464,7 @@ def _first_message_buttons(reply: BotReply, *, is_trusted: bool, has_extra: bool
     if reply.debt_refresh_available and not has_extra:
         return debt_refresh_button_keyboard()
     if reply.show_main_menu and not has_extra:
-        return main_menu_keyboard(is_trusted=is_trusted)
+        return main_menu_keyboard(is_trusted=is_trusted, is_admin=is_admin)
     return None
 
 
@@ -490,7 +516,9 @@ def _split_telegram_text(text: str, *, limit: int = _TELEGRAM_SAFE_TEXT_LIMIT) -
     return chunks
 
 
-async def _send_reply(event, reply: BotReply, *, is_trusted: bool = False, prefer_edit: bool = False) -> None:
+async def _send_reply(
+    event, reply: BotReply, *, is_trusted: bool = False, prefer_edit: bool = False, is_admin: bool = False,
+) -> None:
     """extra_texts — дополнительные сообщения ПОСЛЕ основного; cta_buttons/
     show_main_menu (если установлены) прикрепляются к ПОСЛЕДНЕМУ из них, а
     не к первому — кнопки должны появиться там, где разговор реально
@@ -514,7 +542,7 @@ async def _send_reply(event, reply: BotReply, *, is_trusted: bool = False, prefe
     или нет."""
     has_extra = bool(reply.extra_texts)
 
-    first_buttons = _first_message_buttons(reply, is_trusted=is_trusted, has_extra=has_extra)
+    first_buttons = _first_message_buttons(reply, is_trusted=is_trusted, is_admin=is_admin, has_extra=has_extra)
     main_chunks = _split_telegram_text(reply.text)
     main_last_index = len(main_chunks) - 1
 
@@ -543,7 +571,7 @@ async def _send_reply(event, reply: BotReply, *, is_trusted: bool = False, prefe
         elif is_last_extra and reply.debt_refresh_available:
             extra_buttons = debt_refresh_button_keyboard()
         elif is_last_extra and reply.show_main_menu:
-            extra_buttons = main_menu_keyboard(is_trusted=is_trusted)
+            extra_buttons = main_menu_keyboard(is_trusted=is_trusted, is_admin=is_admin)
         else:
             extra_buttons = None
 

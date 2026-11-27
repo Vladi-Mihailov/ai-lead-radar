@@ -240,6 +240,21 @@ class TurkeyUserCarsRepository:
         row = self._conn.execute(_SELECT_ANY, (car_id,)).fetchone()
         return _row_to_car(row) if row else None
 
+    def transfer_car(self, car_id: int, *, new_owner_telegram_user_id: int) -> bool:
+        """Строка машины переходит другому владельцу целиком (кэш последней
+        проверки, имя клиента) — передача привязки администратором, когда у
+        нового менеджера этой машины ещё нет. False — у него она уже есть."""
+        try:
+            cursor = self._conn.execute(
+                "UPDATE turkey_bot_user_cars SET telegram_user_id = ? WHERE id = ?",
+                (new_owner_telegram_user_id, car_id),
+            )
+            self._conn.commit()
+        except sqlite3.IntegrityError:
+            self._conn.rollback()
+            return False
+        return cursor.rowcount == 1
+
     def get_client_display_name(self, car_id: int) -> str | None:
         row = self._conn.execute(
             "SELECT client_display_name FROM turkey_bot_user_cars WHERE id = ?", (car_id,),

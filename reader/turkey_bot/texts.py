@@ -1675,3 +1675,84 @@ def format_linked_telegram(
         name = _full_name(first_name, last_name)
         who = escape_telethon_markdown(name) if name else "аккаунт без @username"
     return f"{who} · привязан {linked_on.astimezone(_DISPLAY_TZ).strftime('%d.%m.%Y')}"
+
+
+# ---- 🔗 Привязки без менеджера (только администратор) — владелец машины
+# больше не менеджер, управлять привязкой некому ----
+
+ORPHAN_LINKS_LABEL = "🔗 Привязки без менеджера"
+ORPHAN_LINKS_EMPTY_TEXT = "✅ Привязок без менеджера нет."
+ORPHAN_STALE_TEXT = "⚠️ Экран устарел — откройте «🔗 Привязки без менеджера» заново."
+ORPHAN_DISABLE_LABEL = "❌ Отключить"
+ORPHAN_TRANSFER_LABEL = "👤 Передать"
+ORPHAN_DISABLE_YES_LABEL = "Да, отключить"
+ORPHAN_TRANSFER_YES_LABEL = "Да, передать"
+ORPHAN_NO_MANAGERS_TEXT = "⚠️ Нет действующих менеджеров, которым можно передать привязку."
+ORPHAN_REFUSAL_TEXTS = {
+    "gone": "⚠️ Привязка уже закрыта.",
+    "not_orphan": "ℹ️ У этой машины снова есть менеджер — привязкой управляет он.",
+    "not_manager": "⚠️ Этот пользователь больше не менеджер.",
+    "conflict": "⚠️ У этого менеджера к этой машине уже привязан клиент.",
+    "own_client": "⚠️ Этот менеджер и есть клиент привязки.",
+    "no_car": "⚠️ Машины бывшего менеджера уже нет — передать нечего. Отключите привязку.",
+}
+
+
+def format_orphan_block(*, plate: str, client: str, former_manager: str, since: datetime) -> str:
+    return "\n".join([
+        f"🚗 {format_plate_for_telegram(plate)}",
+        f"👤 Клиент: {client}",
+        f"👔 Бывший менеджер: {former_manager}",
+        f"📅 Привязана: {since.astimezone(_DISPLAY_TZ).strftime('%d.%m.%Y')}",
+    ])
+
+
+def format_orphan_list(blocks: list[str], *, count: int, page: int, total_pages: int) -> str:
+    header = f"🔗 Привязки без менеджера: {count}"
+    if total_pages > 1:
+        header += f" (стр. {page + 1}/{total_pages})"
+    hint = "Владелец машины больше не менеджер. Отключите привязку или передайте её действующему менеджеру."
+    return "\n\n".join([header, hint, *blocks])
+
+
+def format_orphan_disable_prompt(*, plate: str, client: str) -> str:
+    return "\n".join([
+        f"❌ Отключить привязку {format_plate_for_telegram(plate)}?",
+        f"👤 Клиент: {client}",
+        "",
+        "Клиент перестанет получать уведомления через сервис; если машину добавила привязка, "
+        "она уйдёт из его «📋 Мои авто». История проверок сохранится.",
+    ])
+
+
+def format_orphan_transfer_prompt(*, plate: str, client: str, manager: str, moved: bool) -> str:
+    detail = (
+        "Машина бывшего менеджера и её мониторинг перейдут этому менеджеру — проверка номера останется одна."
+        if moved else
+        "У менеджера уже есть эта машина — клиент будет получать уведомления из её проверки."
+    )
+    return "\n".join([
+        f"👤 Передать привязку {format_plate_for_telegram(plate)} менеджеру {manager}?",
+        f"👤 Клиент: {client}",
+        "",
+        detail,
+        "Уже отправленное клиенту не повторится.",
+    ])
+
+
+def format_orphan_disabled(plate: str) -> str:
+    return f"✅ Привязка {format_plate_for_telegram(plate)} отключена."
+
+
+def format_orphan_transferred(plate: str, *, manager: str, monitoring_active: bool) -> str:
+    text = f"✅ Привязка {format_plate_for_telegram(plate)} передана менеджеру {manager}."
+    if not monitoring_active:
+        text += "\n⚠️ Мониторинг этой машины у менеджера выключен — клиент получит уведомления после включения."
+    return text
+
+
+def format_orphan_transfer_notice(plate: str, *, client: str) -> str:
+    return (
+        f"👤 Вам передана привязка клиента {client} к {format_plate_for_telegram(plate)}. "
+        "Управление — в «📋 Мои авто» → машина → «👤 Данные клиента»."
+    )

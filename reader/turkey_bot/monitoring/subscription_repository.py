@@ -103,6 +103,38 @@ class TurkeyMonitoringSubscriptionRepository:
         )
         self._conn.commit()
 
+    def transfer(self, *, from_telegram_user_id: int, plate: str, to_telegram_user_id: int) -> bool:
+        """Подписка номера переходит другому пользователю с тем же состоянием
+        (ВКЛ/ВЫКЛ, расписание) — мониторинг остаётся ОДИН. Если у получателя
+        уже есть (выключенная) строка этого номера — она принимает состояние,
+        а строка отдающего выключается. False — у отдающего подписки нет."""
+        source = self.get(telegram_user_id=from_telegram_user_id, plate=plate)
+        if source is None:
+            return False
+        existing = self.get(telegram_user_id=to_telegram_user_id, plate=plate)
+        with self._conn:
+            if existing is None:
+                self._conn.execute(
+                    "UPDATE turkey_monitoring_subscriptions SET telegram_user_id = ?, telegram_chat_id = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (to_telegram_user_id, to_telegram_user_id, source.id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE turkey_monitoring_subscriptions SET active = ?, next_check_at = ?, "
+                    "telegram_chat_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (
+                        int(source.active), source.next_check_at.isoformat() if source.next_check_at else None,
+                        to_telegram_user_id, existing.id,
+                    ),
+                )
+                self._conn.execute(
+                    "UPDATE turkey_monitoring_subscriptions SET active = 0, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ?",
+                    (source.id,),
+                )
+        return True
+
     def deactivate_all(self) -> int:
         """⛔ Остановить мониторинг (manager) — ТОЛЬКО Turkey test monitoring
         (своя таблица/БД, физически не может задеть Georgian) — возвращает
