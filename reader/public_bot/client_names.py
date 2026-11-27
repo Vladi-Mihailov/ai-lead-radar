@@ -18,9 +18,9 @@ CLIENT_NAME_MAX_LENGTH = 64
 # Кроме букв любых алфавитов (с диакритикой), цифр и пробела — только
 # обычная пунктуация имён: "Александр-2", "O'Brien", "Ivan Jr.".
 _ALLOWED_PUNCTUATION = frozenset("-'.")
-# Буквы, которые на экране пустые (Hangul fillers): с ними имя выглядело бы
-# пустым — удаляются как невидимые символы.
-_INVISIBLE_LETTERS = frozenset("\u115f\u1160\u3164\uffa0")
+# Символы, которые на экране пустые (Hangul fillers, кхмерские «немые»
+# гласные): с ними имя выглядело бы пустым — удаляются как невидимые.
+_INVISIBLE_LETTERS = frozenset("\u115f\u1160\u3164\uffa0\u17b4\u17b5")
 # Не больше стольких комбинируемых знаков (ударения, огласовки) на одну
 # букву: длиннее стопки — уже не имя, а «zalgo»-мусор поверх соседних строк.
 _MAX_MARKS_PER_CHAR = 3
@@ -68,15 +68,21 @@ def normalize_client_name(raw: str) -> str:
     if not text or len(text) > CLIENT_NAME_MAX_LENGTH:
         raise ClientNameValidationError(_INVALID_NAME_TEXT)
     # Знаки считаются по разложенной форме: «á» после NFC — один символ, но
-    # стопка поверх него — те же комбинируемые знаки.
+    # стопка поверх него — те же комбинируемые знаки. Знак — только поверх
+    # буквы или цифры (не в начале, не после пробела/дефиса), не больше
+    # _MAX_MARKS_PER_CHAR подряд; охватывающие знаки (Me, «x⃝») в именах не
+    # встречаются и не принимаются.
     marks_in_a_row = 0
+    has_base = False
     for char in unicodedata.normalize("NFD", text):
-        if unicodedata.category(char)[0] == "M":
+        category = unicodedata.category(char)
+        if category[0] == "M":
             marks_in_a_row += 1
-            if marks_in_a_row > _MAX_MARKS_PER_CHAR:
+            if category == "Me" or not has_base or marks_in_a_row > _MAX_MARKS_PER_CHAR:
                 raise ClientNameValidationError(_INVALID_NAME_TEXT)
         else:
             marks_in_a_row = 0
+            has_base = category[0] in ("L", "N")
     for char in text:
         category = unicodedata.category(char)
         if category[0] in ("L", "M", "N") or char == " " or char in _ALLOWED_PUNCTUATION:

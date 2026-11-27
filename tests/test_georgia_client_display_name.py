@@ -222,6 +222,8 @@ def fx(tmp_path):
     ("  Иван \t  Иванов \n", "Иван Иванов"),
     ("Иван​Иванов", "ИванИванов"),  # невидимый символ из копирования убирается
     ("Ivanㅤ", "Ivan"),  # Hangul filler — тоже невидимый
+    ("Ivan\u17b5", "Ivan"),  # кхмерская «немая» гласная — тоже
+    ("\u1780\u17b4\u17b4\u17b4", "\u1780"),
     ("José", "José"),  # NFC
     ("a" + "́" * 3, "á́́"),  # до трёх знаков на букву
 ])
@@ -234,6 +236,8 @@ def test_client_name_accepts_any_alphabet(raw, expected):
     "a" * (CLIENT_NAME_MAX_LENGTH + 1),
     "ㅤ", "ﾠﾠ", "ㅤ ᅟᅠ",  # только «пустые» буквы
     "a" + "́" * 4, "Иван" + "̀" * 20,  # стопка знаков
+    "\u0301a", "Ivan \u0301", "Ivan-\u0301x",  # знак без буквы под ним
+    "x\u20dd", "x\u20dd\u20dd\u20dd",  # охватывающие знаки
 ])
 def test_client_name_rejects_markup_blank_and_stacked_text(raw):
     with pytest.raises(ClientNameValidationError):
@@ -282,8 +286,9 @@ async def test_manager_adds_a_car_with_a_known_telegram_and_name(fx):
     fx.known_user(_CLIENT, "real_owner")
     confirm = await fx.start_trusted_add(with_client="@real_owner")
     with_name = await fx.set_name_on_confirm("გიორგი")
-    # До добавления ничего не привязано — как на карточке.
-    assert "🔗 Telegram: не привязан\n⏳ Ждёт подтверждения: @real_owner" in with_name.text
+    # До добавления ничего ещё не создано — ни привязки, ни приглашения.
+    assert "👤 Клиент: გიორგი\n🔗 Telegram: @real_owner — будет привязан после добавления" in with_name.text
+    assert "Ждёт подтверждения" not in with_name.text
     assert confirm.text == texts.format_add_car_confirm_prompt(_CAR, owner_username="real_owner")  # без имени — как раньше
 
     summary = await fx.confirm()
@@ -635,6 +640,25 @@ async def test_stale_unlink_button_does_not_touch_later_links(fx):
     [third] = fx.subscriptions.list_by_user(4343)
     assert third.status == "active"
     assert again.text.startswith(texts.TASK_CLIENT_STALE_TEXT)
+
+
+@pytest.mark.parametrize("stale_action", ["linkyes", "unlinkyes"])
+async def test_stale_confirm_button_closes_the_open_input_step(fx, stale_action):
+    task_a = await fx.added_car()
+    task_b = await fx.added_car(car=_OTHER_CAR)
+    fx.action("name", task_a)
+
+    if stale_action == "linkyes":
+        stale = await fx.controller.handle_task_client_link_confirm(
+            task_b.id, 0, chat_id=_TRUSTED, telegram_user_id=_TRUSTED, token="deadbeef",
+        )
+    else:
+        stale = fx.action("unlinkyes", task_b, token="deadbeef")
+    await fx.text("Клиент 12345")
+
+    assert stale.text.startswith(texts.TASK_CLIENT_STALE_TEXT) and stale.trusted_task_detail_id == task_b.id
+    assert fx.names.get(_CAR) is None and fx.names.get(_OTHER_CAR) is None
+
 
 
 async def test_client_actions_are_manager_only(fx):

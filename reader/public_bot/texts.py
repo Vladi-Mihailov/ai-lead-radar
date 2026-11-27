@@ -206,15 +206,22 @@ def format_client_lines(
     return lines
 
 
-def _add_car_client_lines(*, owner_username: str | None, client_name: str | None, linked: bool) -> list[str]:
+def _add_car_client_lines(*, owner_username: str | None, client_name: str | None, stage: str) -> list[str]:
     """Клиент на подтверждении и в итоге Add Car: без имени — прежняя строка
     «👤 Владелец: @логин» (или ничего); с именем — «👤 Клиент» и «🔗 Telegram»,
-    как на карточке машины: логин — привязанным, только когда привязка уже
-    есть (linked), иначе «не привязан» и «⏳ Ждёт подтверждения: @логин»."""
+    как на карточке машины. stage: "planned" — подтверждение, ещё ничего не
+    создано («@логин — будет привязан после добавления»); "linked" — привязка
+    есть; "pending" — создано приглашение («не привязан» + «⏳ Ждёт
+    подтверждения: @логин»)."""
     if not client_name:
         return [f"👤 Владелец: @{owner_username}"] if owner_username else []
-    if owner_username and linked:
+    if owner_username and stage == "linked":
         return format_client_lines(client_name, [owner_username])
+    if owner_username and stage == "planned":
+        lines = format_client_lines(client_name, [])
+        username = safe_telegram_username(owner_username) or owner_username
+        lines[1] = f"🔗 Telegram: @{username} — будет привязан после добавления"
+        return lines
     return format_client_lines(client_name, [], pending_hints=[owner_username] if owner_username else [])
 
 # Бессрочный мониторинг (см. задачу "убрать выбор срока мониторинга") —
@@ -241,7 +248,7 @@ def format_add_car_confirm_prompt(
     клиента, которое указал менеджер (см. CLIENT_NAME_PROMPT)."""
     lines = [f"🚗 {format_plate_for_telegram(car_number)}"]
     # До добавления ничего ещё не привязано.
-    lines += _add_car_client_lines(owner_username=owner_username, client_name=client_name, linked=False)
+    lines += _add_car_client_lines(owner_username=owner_username, client_name=client_name, stage="planned")
     lines += ["", "Добавить автомобиль и включить проверку штрафов?"]
     return "\n".join(lines)
 
@@ -616,7 +623,7 @@ def format_delegated_add_car_summary(
     первая строка, что и у self-service (см. format_add_car_summary)."""
     formatted_car_number = format_plate_for_telegram(car_number)
     client_lines = _add_car_client_lines(
-        owner_username=owner_username, client_name=client_name, linked=not pending_claim,
+        owner_username=owner_username, client_name=client_name, stage="pending" if pending_claim else "linked",
     )
 
     if not check_ok:
@@ -666,7 +673,7 @@ def format_delegated_add_car_without_client_summary(
     никогда (см. design report: username клиента не обязателен)."""
     formatted_car_number = format_plate_for_telegram(car_number)
     # Без клиента имя всё равно можно указать (Telegram — «не привязан»).
-    client_lines = _add_car_client_lines(owner_username=None, client_name=client_name, linked=False)
+    client_lines = _add_car_client_lines(owner_username=None, client_name=client_name, stage="pending")
 
     if not check_ok:
         return "\n".join([

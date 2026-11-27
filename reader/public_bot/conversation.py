@@ -3659,10 +3659,13 @@ class ConversationController:
     ) -> dict | None:
         """Payload экрана подтверждения, если кнопка — с этого экрана (тот же
         менеджер, та же машина, тот же одноразовый код, не устарел); диалог
-        при этом закрывается — второе нажатие уже ничего не делает."""
+        при этом закрывается — второе нажатие уже ничего не делает. Чужая или
+        устаревшая кнопка тоже закрывает открытый шаг «Данных клиента»: иначе
+        следующий текст ушёл бы к машине, которую менеджер уже покинул."""
         state = self._fresh_task_client_state(chat_id, telegram_user_id, step)
         payload = (state.payload or {}) if state is not None else {}
         if state is None or not token or payload.get("token") != token or payload.get("task_id") != task_id:
+            self.drop_task_client_step(chat_id)
             return None
         self._clear_state(chat_id)
         return payload
