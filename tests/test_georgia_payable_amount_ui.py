@@ -1179,8 +1179,10 @@ async def test_amount_from_an_earlier_control_period_is_not_a_confirmed_increase
     (0, True),    # последний день срока — ещё не просрочка
 ])
 async def test_no_overdue_warning_without_a_final_expired_term(fx, last_date_offset, active):
+    today = _today_tbilisi()
+    fx.controller._today = lambda: today  # без гонки с полуночью по Тбилиси
     task, subscription = _dated_car(
-        fx, _CAR, [("GE1", 50)], last_date=_today_tbilisi() + timedelta(days=last_date_offset), active=active,
+        fx, _CAR, [("GE1", 50)], last_date=today + timedelta(days=last_date_offset), active=active,
     )
     await fx.check(task)
     fx.store(_CAR, "GE1", 150, at=_now_utc() - timedelta(hours=1))
@@ -1233,3 +1235,40 @@ async def test_manager_search_block_shows_overdue_after_the_fines_line(fx):
     money = lines.index("💰 Штрафы: 50 ₾")
     assert lines[money + 1] == _INCREASED_ONE
     assert fx.gc.calls == []
+
+
+async def test_refresh_card_with_only_some_fines_overdue_counts_them(fx):
+    fx.clock_now = _now_utc()
+    today = _today_tbilisi()
+    fx.controller._today = lambda: today
+    task, subscription = _dated_car(fx, _CAR, [("GE1", 50)], last_date=today - timedelta(days=5))
+    fx.provider.records[_CAR].append(ParsedFineRecord(
+        car_number=_CAR, external_fine_id="GE2", penalty_date=date(2026, 8, 21), due_date=today + timedelta(days=10),
+        delivered_status="Вручено", fingerprint=f"fp-{_CAR}-GE2",
+        raw_data={"protocolNo": "GE2", "lastDate": (today + timedelta(days=10)).isoformat(),
+                  "activeDate": (today - timedelta(days=20)).isoformat()},
+        amount=100,
+    ))
+    await fx.check(task)
+    fx.gc.amounts.update({"GE1": 150.0, "GE2": 100.0})
+
+    reply = await fx.controller.handle_payable_amount_refresh(subscription.id, telegram_user_id=_OWNER, chat_id=_OWNER)
+
+    assert reply.text.splitlines()[1:4] == [
+        "🧾 Первоначальные штрафы: 2 шт. — 150 ₾",
+        "💰 К оплате: 250 ₾",
+        "⚠️ Срок оплаты истёк по 1 из 2 штрафов. Сумма увеличилась по 1 из 2 штрафов.",
+    ]
+
+
+async def test_paid_fine_with_an_expired_term_keeps_the_plain_fine_label(fx):
+    task, subscription = _dated_car(fx, _CAR, [("GE1", 50), ("GE2", 100)], last_date=_today_tbilisi() - timedelta(days=5))
+    await fx.check(task)
+    fx.tracker.mark_paid(fx.tracker.statuses_by_protocol(_CAR)["GE2"].id, actor_user_id=_TRUSTED, note="BOG 1")
+
+    reply = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=_OWNER)
+
+    lines = reply.text.splitlines()
+    assert "🧾 Штраф: 100 ₾" in lines and "🧾 Первоначальный штраф: 50 ₾" in lines
+    summary = lines.index("🧾 Первоначальный штраф: 50 ₾", lines.index("🧾 Штраф: 100 ₾"))
+    assert lines[summary + 1:summary + 3] == ["💰 К оплате: требуется уточнение", _OVERDUE_TITLE]
