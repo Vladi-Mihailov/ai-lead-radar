@@ -1629,6 +1629,10 @@ def format_client_link_released(plate: str) -> str:
 CLIENT_LINK_CARD_LINE = "🔗 Привязан менеджером"
 CLIENT_LINK_CARD_LINE_ANCHOR_OFF = "🔗 Привязан менеджером — мониторинг сейчас выключен у менеджера"
 CLIENT_LINK_MENU_HINT = "Ваши автомобили — в «📋 Мои авто» в меню ниже."
+CLIENT_LINK_TOGGLE_REFUSED_TEXT = (
+    "ℹ️ Эта машина привязана к клиенту — её проверяет мониторинг машины менеджера. "
+    "Включайте и выключайте мониторинг на машине менеджера."
+)
 CLIENT_LINK_IS_OWNER_TEXT = "ℹ️ Этот пользователь — владелец автомобиля, привязка не нужна."
 CLIENT_LINK_ALREADY_LINKED_TEXT = "ℹ️ Этот клиент уже привязан к автомобилю."
 

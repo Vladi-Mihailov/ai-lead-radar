@@ -266,6 +266,12 @@ class TurkeyClientLinkRepository:
             )
         return cursor.rowcount == 1
 
+    def mark_client_car_created(self, link_id: int) -> None:
+        with self._conn:
+            self._conn.execute(
+                "UPDATE turkey_client_links SET client_car_created = 1 WHERE id = ? AND status = 'active'", (link_id,),
+            )
+
     def set_muted(self, link_id: int, muted: bool) -> None:
         with self._conn:
             self._conn.execute("UPDATE turkey_client_links SET client_muted = ? WHERE id = ?", (int(muted), link_id))
@@ -465,20 +471,34 @@ class TurkeyClientLinkService:
     def client_removed_car(self, *, telegram_user_id: int, plate: str) -> None:
         """Клиент сам удалил машину из «Мои автомобили» — привязка закрыта,
         уведомления через менеджера ему больше не идут."""
-        active = self._links.active_for_client(telegram_user_id, plate)
-        if active is not None:
+        for active in self._links.active_links_for_client(telegram_user_id, plate):
             self._links.close(active.id, status=STATUS_REMOVED, closed_by=telegram_user_id, now=self.now(),
                               from_status=STATUS_ACTIVE)
+
+    def set_client_muted(self, *, telegram_user_id: int, plate: str, muted: bool) -> None:
+        """⏹/▶️ клиента — для ВСЕХ его привязок к этому номеру."""
+        for active in self._links.active_links_for_client(telegram_user_id, plate):
+            if active.owner_telegram_user_id != telegram_user_id:
+                self._links.set_muted(active.id, muted)
 
     def client_view(self, *, telegram_user_id: int, plate: str) -> tuple[TurkeyClientLink | None, bool]:
         """(активная привязка клиента к этому номеру, приходят ли ему
         уведомления через менеджера: привязка не заглушена и мониторинг
         якоря включён)."""
-        link = self._links.active_for_client(telegram_user_id, plate)
-        if link is None or link.owner_telegram_user_id == telegram_user_id:
+        links = [
+            link for link in self._links.active_links_for_client(telegram_user_id, plate)
+            if link.owner_telegram_user_id != telegram_user_id
+        ]
+        if not links:
             return None, False
-        anchor = self._subscriptions.get(telegram_user_id=link.owner_telegram_user_id, plate=plate)
-        return link, (not link.client_muted) and anchor is not None and anchor.active
+        receiving = any(not link.client_muted and self.anchor_monitoring_active(link) for link in links)
+        return links[-1], receiving
+
+    def any_anchor_monitoring_active(self, *, telegram_user_id: int, plate: str) -> bool:
+        return any(
+            self.anchor_monitoring_active(link) for link in self._links.active_links_for_client(telegram_user_id, plate)
+            if link.owner_telegram_user_id != telegram_user_id
+        )
 
     def anchor_monitoring_active(self, link: TurkeyClientLink) -> bool:
         anchor = self._subscriptions.get(telegram_user_id=link.owner_telegram_user_id, plate=link.plate)
@@ -490,6 +510,13 @@ class TurkeyClientLinkService:
         проверок (turkey_check_runs) не трогается."""
         client = link.client_telegram_user_id
         if client is None or not link.client_car_created:
+            return
+        remaining = self._links.active_links_for_client(client, link.plate)
+        if remaining:
+            # Номер у клиента ещё через другую привязку — машина остаётся, а
+            # отметка «машину создала привязка» переходит к оставшейся: её
+            # отвязка потом уберёт машину.
+            self._links.mark_client_car_created(remaining[0].id)
             return
         own = self._subscriptions.get(telegram_user_id=client, plate=link.plate)
         if own is not None and own.active:

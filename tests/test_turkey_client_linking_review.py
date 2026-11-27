@@ -175,3 +175,73 @@ async def test_confirmation_shows_the_last_reliable_state_and_the_menu(fx):
     confirmed = await fx.link_client(car)
     assert "500" in confirmed.text and "ошибк" not in confirmed.text.lower()
     assert confirmed.extra_texts == (texts.CLIENT_LINK_MENU_HINT,) and confirmed.show_main_menu is True
+
+
+# ---- Второй раунд review ----
+
+def _full(gib_total, at):
+    return _result(ProviderStatus.HAS_DEBT, Decimal(gib_total), at=at)
+
+
+async def test_confirmation_ignores_a_retry_run_with_a_provider_subset(fx):
+    car, _ = await fx.manager_car()
+    full_at = _T0 - timedelta(hours=2)
+    fx.runs.save(_full(900, full_at), telegram_user_id=_MANAGER, telegram_chat_id=_MANAGER,
+                 initiator="monitoring_21:00")
+    retry_at = _T0 - timedelta(hours=1)
+    fx.runs.save(_multi(_provider("kgm", Decimal(0), retry_at, ProviderStatus.NO_DEBT), at=retry_at),
+                 telegram_user_id=_MANAGER, telegram_chat_id=_MANAGER, initiator="monitoring_21:00_retry")
+    confirmed = await fx.link_client(car)
+    assert "900" in confirmed.text and "Итого: 0" not in confirmed.text
+
+
+async def _linked_to_two_owners(fx):
+    car, _ = await fx.manager_car()
+    first = await fx.link_client(car)
+    second_car = fx.garage.add_car(telegram_user_id=_SECOND_OWNER, car_number=_PLATE)
+    fx.subscriptions.enable(telegram_user_id=_SECOND_OWNER, telegram_chat_id=_SECOND_OWNER, plate=_PLATE,
+                            next_check_at=_T0)
+    link = fx.service.request_user(second_car, created_by=_MANAGER, client_telegram_user_id=_CLIENT, method="pick")
+    assert fx.service.confirm(link.id, telegram_user_id=_CLIENT).status == "ok"
+    return car, second_car, first.car_card
+
+
+async def _batch_two_owners(fx, total):
+    for _ in range(2):
+        fx.check.results.append(_full(total, _T0 + timedelta(hours=1)))
+    await fx.monitoring.run_scheduled_batch("21:00")
+    return [text for chat, text in fx.notifier.sent if chat == _CLIENT]
+
+
+async def test_client_delete_closes_every_link_for_the_plate(fx):
+    _car, _second, client_car = await _linked_to_two_owners(fx)
+    await fx.controller.handle_car_action("delete_confirm", client_car.id, chat_id=_CLIENT, telegram_user_id=_CLIENT)
+    assert fx.links.active_links_for_client(_CLIENT, _PLATE) == []
+    assert await _batch_two_owners(fx, 800) == []
+
+
+async def test_client_stop_mutes_every_link_for_the_plate(fx):
+    _car, _second, client_car = await _linked_to_two_owners(fx)
+    card = await fx.controller.handle_car_action("monitor_off", client_car.id, chat_id=_CLIENT,
+                                                 telegram_user_id=_CLIENT)
+    assert card.car_card_monitoring_active is False
+    assert all(link.client_muted for link in fx.links.active_links_for_client(_CLIENT, _PLATE))
+    assert await _batch_two_owners(fx, 800) == []
+
+
+async def test_unlinking_one_owner_keeps_the_car_while_another_link_is_active(fx):
+    car, second_car, _client_car = await _linked_to_two_owners(fx)
+    fx.action("unlink_yes", car)
+    assert fx.garage.get_owned_car_by_number(_CLIENT, _PLATE) is not None
+    assert len(fx.links.active_links_for_client(_CLIENT, _PLATE)) == 1
+    fx.service.unlink(second_car, closed_by=_MANAGER)
+    assert fx.garage.get_owned_car_by_number(_CLIENT, _PLATE) is None
+
+
+async def test_manager_toggle_on_a_linked_client_row_creates_no_subscription(fx):
+    car, _ = await fx.manager_car()
+    confirmed = await fx.link_client(car)
+    reply = fx.controller.handle_manager_car_toggle(confirmed.car_card.id, 0, telegram_user_id=_MANAGER)
+    assert reply.text.startswith(texts.CLIENT_LINK_TOGGLE_REFUSED_TEXT)
+    assert fx.subscriptions.get(telegram_user_id=_CLIENT, plate=_PLATE) is None
+    assert fx.subscriptions.get(telegram_user_id=_MANAGER, plate=_PLATE).active

@@ -550,6 +550,13 @@ class ConversationController:
         if car is None:
             return None
 
+        if self._client_links is not None and self._client_links.links.active_links_for_client(
+            car.telegram_user_id, car.car_number,
+        ):
+            # Машина клиента пришла привязкой: её проверяет мониторинг машины
+            # менеджера. Своя подписка клиенту дала бы вторую проверку номера.
+            reply = self._format_manager_cars_page_reply(page)
+            return replace(reply, text=f"{texts.CLIENT_LINK_TOGGLE_REFUSED_TEXT}\n\n{reply.text}")
         subscription = self._subscriptions.get(
             telegram_user_id=car.telegram_user_id, plate=car.car_number,
         )
@@ -588,8 +595,9 @@ class ConversationController:
         monitoring_active, linked = self._car_monitoring_state(car, telegram_user_id=telegram_user_id)
         text = texts.format_car_card_text(car, monitoring_active=monitoring_active)
         if linked:
-            link = self._client_link_of(car, telegram_user_id=telegram_user_id)
-            anchor_on = link is not None and self._client_links.anchor_monitoring_active(link)
+            anchor_on = self._client_links.any_anchor_monitoring_active(
+                telegram_user_id=telegram_user_id, plate=car.car_number,
+            )
             text = f"{text}\n{texts.CLIENT_LINK_CARD_LINE if anchor_on else texts.CLIENT_LINK_CARD_LINE_ANCHOR_OFF}"
         return BotReply(text=text, car_card=car, car_card_monitoring_active=monitoring_active)
 
@@ -675,7 +683,7 @@ class ConversationController:
             # Привязанному клиенту — только его копия уведомлений из проверки
             # машины менеджера. Своя подписка (вторая проверка того же номера)
             # не создаётся, даже если мониторинг менеджера сейчас выключен.
-            self._client_links.links.set_muted(link.id, False)
+            self._client_links.set_client_muted(telegram_user_id=telegram_user_id, plate=car.car_number, muted=False)
             return self._render_car_card(car, telegram_user_id=telegram_user_id)
         next_check_at = next_monitoring_slot(datetime.now(timezone.utc))
         self._subscriptions.enable(
@@ -693,7 +701,7 @@ class ConversationController:
         link = self._client_link_of(car, telegram_user_id=telegram_user_id)
         if link is not None:
             # Только уведомления ЭТОМУ клиенту — мониторинг менеджера не трогаем.
-            self._client_links.links.set_muted(link.id, True)
+            self._client_links.set_client_muted(telegram_user_id=telegram_user_id, plate=car.car_number, muted=True)
         return self._render_car_card(car, telegram_user_id=telegram_user_id)
 
     def _show_history(self, car: TurkeyUserCar) -> BotReply:

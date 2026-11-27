@@ -47,11 +47,19 @@ _T0 = datetime(2026, 11, 20, 18, 0, tzinfo=timezone.utc)
 
 
 def _result(gib_status, gib_total=Decimal(0), *, at):
+    """Полная проверка: GİB с заданным статусом, Avrasya и KGM — без долга."""
     providers = (
         ProviderCheckResult(
             provider="gib", status=gib_status, debt_count=1 if gib_status == ProviderStatus.HAS_DEBT else 0,
             principal_amount=gib_total, penalty_amount=Decimal(0), total_amount=gib_total,
             items=(), error_type=None, checked_at=at,
+        ),
+        *(
+            ProviderCheckResult(
+                provider=name, status=ProviderStatus.NO_DEBT, debt_count=0, principal_amount=Decimal(0),
+                penalty_amount=Decimal(0), total_amount=Decimal(0), items=(), error_type=None, checked_at=at,
+            )
+            for name in ("avrasya", "kgm")
         ),
     )
     return UnifiedCheckResult(
