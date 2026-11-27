@@ -2964,7 +2964,27 @@ class ConversationController:
         менеджера, как раньше. Только чтение БД — без запросов к Georgian Card."""
         return replace(self._format_check_now_outcome_reply(outcome), show_main_menu=True)
 
+    def _with_fresh_term_flags(self, car_number: str, fines: list) -> list:
+        """Признак окончательного срока (подпись «⏳ Предварительный срок
+        оплаты» в "🔎") — по последней полной проверке номера
+        (georgia_fine_terms, тот же источник, что у сумм и просрочки), а не
+        по сохранённой строке штрафа: та пишется при обнаружении и после
+        вручения не обновляется. Квитанции без данных о сроке — как пришли."""
+        if self._payable_amount is None or not fines:
+            return fines
+        dates = self._payable_amount.repository.term_dates_for_cars([car_number])
+        result = []
+        for fine in fines:
+            key = (car_number, fine.external_fine_id or "")
+            if key in dates:
+                last_date, active_date = dates[key]
+                final = True if active_date is not None else (False if last_date is not None else None)
+                fine = replace(fine, payment_term_final=final)
+            result.append(fine)
+        return result
+
     def _format_check_now_outcome_reply(self, outcome) -> BotReply:
+        outcome = replace(outcome, fines=self._with_fresh_term_flags(outcome.car_number, outcome.fines))
         # CTA — ТОЛЬКО реальному владельцу и только когда есть хотя бы один
         # штраф, НЕ подтверждённый оплаченным (см. design report: "CTA —
         # только owner", не trusted-оператору, управляющему чужой

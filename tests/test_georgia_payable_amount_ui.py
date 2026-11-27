@@ -1511,13 +1511,29 @@ async def test_manager_check_now_uses_the_same_term_label(fx):
     assert _due_line(reply.text.splitlines()) == "⏳ Предварительный срок оплаты: 26.01.2099"
 
 
-async def test_term_without_lastdate_keeps_the_old_label(fx):
+async def test_date_without_confirmed_delivery_is_provisional(fx):
+    # Парсер берёт due_date из lastDate; без activeDate вручение не подтверждено
+    # (то же правило, что у term_end_of для сумм).
     task, subscription = _plain_car(fx, _CAR, [("GE1", 50)], due_date=date(2099, 1, 26))
     await fx.check(task)
 
     reply = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=_OWNER)
 
-    assert _due_line(reply.text.splitlines()) == "⏳ Оплатить до: 26.01.2099"
+    assert _due_line(reply.text.splitlines()) == "⏳ Предварительный срок оплаты: 26.01.2099"
+
+
+async def test_without_term_data_the_old_label_stays(tmp_path):
+    # Без сумм к оплате данных о сроке у "🔎" нет; в ответе police.ge нет lastDate.
+    fixture = _Fixture(tmp_path, with_amounts=False)
+    try:
+        task, subscription = _plain_car(fixture, _CAR, [("GE1", 50)], due_date=date(2099, 1, 26))
+        await fixture.check(task)
+
+        reply = await fixture.controller.handle_check_now_choice(subscription.id, telegram_user_id=_OWNER)
+
+        assert _due_line(reply.text.splitlines()) == "⏳ Оплатить до: 26.01.2099"
+    finally:
+        fixture.close()
 
 
 async def test_new_fine_notification_text_is_unchanged_for_a_provisional_term(fx):
@@ -1548,6 +1564,8 @@ def test_cached_and_one_off_results_use_the_flag_from_the_police_answer():
     ({"lastDate": "2099-01-26"}, False),
     ({"lastDate": "2099-01-26", "activeDate": None}, False),
     ({"lastDate": "2099-01-26", "activeDate": "  "}, False),
+    ({"lastDate": "2099-01-26", "activeDate": "не дата"}, False),  # не разбирается — нет вручения
+    ({"lastDate": "26.01.2099", "activeDate": "27.12.2098"}, True),
     ({"protocolNo": "GE1"}, None),
     ('{"lastDate": "2099-01-26"}', False),
     ('{"lastDate": "2099-01-26", "activeDate": "2098-12-27"}', True),
@@ -1556,3 +1574,46 @@ def test_cached_and_one_off_results_use_the_flag_from_the_police_answer():
 ])
 def test_payment_term_final_of(raw, expected):
     assert payment_term_final_of(raw) is expected
+
+
+async def test_last_known_state_after_delivery_uses_the_fresh_term(fx):
+    """police.ge недоступен: "🔎" показывает сохранённые штрафы. Строка штрафа
+    записана до вручения (без activeDate), а последняя полная проверка уже
+    видела вручение — подпись по свежему сроку."""
+    from reader.public_bot.subscription_service import CheckNowOutcome
+
+    task, subscription = _dated_car(fx, _CAR, [("GE1", 50)], last_date=date(2099, 1, 25), active=False)
+    await fx.check(task)
+    _dated_car_records = fx.provider.records[_CAR]
+    fx.provider.records[_CAR] = [
+        ParsedFineRecord(
+            car_number=_CAR, external_fine_id="GE1", penalty_date=date(2026, 8, 21), due_date=date(2099, 1, 26),
+            delivered_status="Вручено", fingerprint=f"fp-{_CAR}-GE1",
+            raw_data={"protocolNo": "GE1", "lastDate": "2099-01-26", "activeDate": "2098-12-27"}, amount=50,
+        )
+    ]
+    assert _dated_car_records  # первая проверка была до вручения
+    await fx.check(task)
+
+    cached = fx.check_service._read_last_known_state(fx.tasks.get(task.id))
+    outcome = CheckNowOutcome(
+        car_number=_CAR, check_ok=True, fines=cached.current_fines, is_owner=True,
+        provider_unavailable=False, subscription_id=subscription.id,
+    )
+    reply = fx.controller._format_check_now_outcome_reply(outcome)
+
+    assert _due_line(reply.text.splitlines()).startswith("⏳ Оплатить до: ")
+    assert "Предварительный" not in reply.text
+
+
+async def test_manager_one_off_check_marks_a_provisional_term(fx):
+    # Номер без задачи мониторинга — разовая проверка без сохранения.
+    fx.provider.records["BB222CC"] = [ParsedFineRecord(
+        car_number="BB222CC", external_fine_id="GE9", penalty_date=date(2026, 11, 27), due_date=date(2099, 1, 26),
+        delivered_status="Не вручено", fingerprint="fp-BB222CC-GE9",
+        raw_data={"protocolNo": "GE9", "lastDate": "2099-01-26"}, amount=50,
+    )]
+
+    reply = await fx.controller.handle_trusted_one_off_check("BB222CC", telegram_user_id=_TRUSTED)
+
+    assert _due_line(reply.text.splitlines()) == "⏳ Предварительный срок оплаты: 26.01.2099"

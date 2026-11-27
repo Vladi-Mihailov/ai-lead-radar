@@ -260,7 +260,10 @@ class NewFineEvent:
             place_ru=fine.place_ru,
             violation_description_ru=fine.violation_description_ru,
             car_owner_display=car_owner_display,
-            payment_term_final=payment_term_final_of(fine.raw_data),
+            # payment_term_final не выводится: raw_data пишется один раз при
+            # обнаружении и после вручения не обновляется (см.
+            # DetectedFineRepository.mark_seen) — для "🔎" срок берётся из
+            # georgia_fine_terms (ConversationController._with_fresh_term_flags).
         )
 
     @classmethod
@@ -310,10 +313,11 @@ class NewFineEvent:
 
 def payment_term_final_of(raw_data) -> bool | None:
     """Окончательный ли срок оплаты в ответе police.ge (raw_data — dict или
-    JSON-строка detected_fines.raw_data): activeDate есть — True (вручение
+    JSON-строка): activeDate — корректная дата — True (вручение
     подтверждено, lastDate окончательный); lastDate без activeDate — False
     (предварительный); lastDate нет — None. Тот же признак, что и у
-    reader.fines.payable_amount.term_end_of."""
+    reader.fines.payable_amount.term_end_of (даты, которые не разбираются,
+    считаются отсутствующими)."""
     if isinstance(raw_data, str):
         try:
             raw_data = json.loads(raw_data) if raw_data else None
@@ -324,7 +328,16 @@ def payment_term_final_of(raw_data) -> bool | None:
 
     def _present(key: str) -> bool:
         value = raw_data.get(key)
-        return isinstance(value, str) and bool(value.strip())
+        if not isinstance(value, str) or not value.strip():
+            return False
+        text = value.strip()[:10]
+        for parse in (date.fromisoformat, lambda t: datetime.strptime(t, "%d.%m.%Y").date()):
+            try:
+                parse(text)
+                return True
+            except ValueError:
+                pass
+        return False
 
     if _present("activeDate"):
         return True
