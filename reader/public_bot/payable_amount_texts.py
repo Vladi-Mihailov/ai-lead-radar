@@ -72,6 +72,9 @@ class AmountSummary:
     # Окончательный срок оплаты истёк; из них — с подтверждённым увеличением.
     overdue_count: int = 0
     overdue_increased_count: int = 0
+    # Сумма известна без уточнения Georgian Card (исходная сумма, пока срок
+    # оплаты идёт): дату «🕒 Сумма уточнена» тогда не показываем.
+    unrefreshed_count: int = 0
 
     @property
     def all_known(self) -> bool:
@@ -96,6 +99,7 @@ class AmountSummary:
             oldest_observed_at=min(oldest) if oldest else None,
             overdue_count=self.overdue_count + other.overdue_count,
             overdue_increased_count=self.overdue_increased_count + other.overdue_increased_count,
+            unrefreshed_count=self.unrefreshed_count + other.unrefreshed_count,
         )
 
 
@@ -110,7 +114,7 @@ def summarize(receipts: Iterable[ReceiptAmount]) -> AmountSummary:
         if receipt.payable is not None:
             part = AmountSummary(
                 count=1, base_total=base, known_count=1, known_total=receipt.payable,
-                oldest_observed_at=receipt.observed_at, **overdue,
+                oldest_observed_at=receipt.observed_at, unrefreshed_count=int(receipt.observed_at is None), **overdue,
             )
         else:
             part = AmountSummary(count=1, base_total=base, unknown_count=1, unknown_base_total=base, **overdue)
@@ -181,7 +185,8 @@ def format_payable_lines(
 ) -> list[str]:
     """«💰 К оплате» по набору квитанций:
     - все суммы актуальны — сумма и (with_date) одна дата: самая ранняя из
-      уточнений, то есть все суммы уточнены не раньше неё;
+      уточнений, то есть все суммы уточнены не раньше неё; даты нет, если
+      часть сумм — исходные (срок оплаты идёт, Georgian Card их не уточнял);
     - ни одной — «требуется уточнение»;
     - часть — «Предварительно к оплате» (известные суммы плюс исходные суммы
       остальных, нижняя граница) и сколько квитанций требуют уточнения.
@@ -191,7 +196,7 @@ def format_payable_lines(
         return []
     if summary.all_known:
         lines = [f"💰 К оплате: {format_money(summary.known_total)}"]
-        if with_date and summary.oldest_observed_at is not None:
+        if with_date and summary.oldest_observed_at is not None and summary.unrefreshed_count == 0:
             lines.append(format_refreshed_at(summary.oldest_observed_at, tz=tz, plural=summary.count > 1))
     elif summary.known_count == 0:
         lines = [f"💰 К оплате: {NEEDS_REFRESH_TEXT}"]

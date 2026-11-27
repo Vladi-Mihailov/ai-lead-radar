@@ -1249,7 +1249,10 @@ def format_debt_status_summary_block(
         f"🔴 Неоплачено: {count_text}",
         f"💰 Сумма к оплате: {_format_search_amount(total)}",
     ]
-    if amounts is not None and tz is not None and amounts.all_known and amounts.oldest_observed_at is not None:
+    if (
+        amounts is not None and tz is not None and amounts.all_known and amounts.oldest_observed_at is not None
+        and amounts.unrefreshed_count == 0
+    ):
         lines.append(format_refreshed_at(amounts.oldest_observed_at, tz=tz, plural=amounts.count > 1))
     if totals.needs_review_count:
         review_count = totals.needs_review_count
