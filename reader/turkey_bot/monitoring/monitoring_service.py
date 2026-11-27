@@ -186,11 +186,15 @@ class TurkeyMonitoringService:
         next_check_at = next_monitoring_slot(now)
         self._subscriptions.mark_checked(subscription.id, checked_at=now, next_check_at=next_check_at)
 
-        await self._notify_changes(
-            plate=subscription.plate, telegram_chat_id=subscription.telegram_chat_id,
-            previous_by_provider=previous_by_provider, result=result,
-        )
-        await self._notify_linked_clients(subscription.telegram_user_id, subscription.plate, result, run_id)
+        try:
+            await self._notify_changes(
+                plate=subscription.plate, telegram_chat_id=subscription.telegram_chat_id,
+                previous_by_provider=previous_by_provider, result=result,
+            )
+        finally:
+            # Привязанный клиент получает своё и тогда, когда отправка владельцу
+            # подписки не удалась (например, бывший менеджер заблокировал бота).
+            await self._notify_linked_clients(subscription.telegram_user_id, subscription.plate, result, run_id)
         self._maybe_enqueue_retry(subscription, result, slot_label=slot_label, now=now)
 
         return result
@@ -225,11 +229,13 @@ class TurkeyMonitoringService:
             telegram_chat_id=retry.telegram_chat_id, initiator=f"monitoring_{retry.slot_label}_retry",
         )
 
-        await self._notify_changes(
-            plate=retry.plate, telegram_chat_id=retry.telegram_chat_id,
-            previous_by_provider=previous_by_provider, result=result,
-        )
-        await self._notify_linked_clients(retry.telegram_user_id, retry.plate, result, run_id)
+        try:
+            await self._notify_changes(
+                plate=retry.plate, telegram_chat_id=retry.telegram_chat_id,
+                previous_by_provider=previous_by_provider, result=result,
+            )
+        finally:
+            await self._notify_linked_clients(retry.telegram_user_id, retry.plate, result, run_id)
         logger.info(
             "Turkey monitoring retry finished: plate=%s providers=%s slot=%s",
             retry.plate, retry.providers, retry.slot_label,

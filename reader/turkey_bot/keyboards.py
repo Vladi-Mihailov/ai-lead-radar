@@ -133,7 +133,10 @@ def main_menu_keyboard(*, is_trusted: bool = False, is_admin: bool = False) -> l
         rows.append([Button.text(STATISTICS_LABEL, resize=True), Button.text(OSAGO_TR_LABEL, resize=True)])
         rows.append([Button.text(HELP_LABEL, resize=True), Button.text(GEORGIAN_BOT_LINK_LABEL, resize=True)])
         if is_admin:
-            rows.append([Button.text(texts.ORPHAN_LINKS_LABEL, resize=True)])
+            rows.append([
+                Button.text(texts.ORPHAN_LINKS_LABEL, resize=True),
+                Button.text(texts.ADMIN_LINK_SEARCH_LABEL, resize=True),
+            ])
         return rows
     # Пользователь: «👨‍💼 Оператор» — на месте «ℹ️ Справка» (сразу под
     # «🔎 Проверить сейчас»), «ℹ️ Справка» — отдельной последней строкой.
@@ -142,7 +145,10 @@ def main_menu_keyboard(*, is_trusted: bool = False, is_admin: bool = False) -> l
     rows.append([Button.text(HELP_LABEL, resize=True)])
     if is_admin:
         # Администратор (не менеджер) — «🔗 Привязки без менеджера».
-        rows.append([Button.text(texts.ORPHAN_LINKS_LABEL, resize=True)])
+        rows.append([
+            Button.text(texts.ORPHAN_LINKS_LABEL, resize=True),
+            Button.text(texts.ADMIN_LINK_SEARCH_LABEL, resize=True),
+        ])
     return rows
 
 
@@ -656,7 +662,12 @@ def debt_refresh_confirm_keyboard(car_count: int) -> list[list[Button]]:
 _ORPHAN_PREFIXES = {
     "list": (b"trolst:", 1), "disable": (b"trodis:", 1), "disable_yes": (b"trodisy:", 2),
     "transfer": (b"trotr:", 1), "transfer_to": (b"trotrm:", 2), "transfer_yes": (b"trotry:", 3),
+    # Те же действия из «🔎 Найти привязку по номеру» (s_ — после действия
+    # возвращаемся к результатам поиска; любая привязка, не только без менеджера).
+    "s_disable": (b"trosd:", 1), "s_disable_yes": (b"trosdy:", 2),
+    "s_transfer": (b"trost:", 1), "s_transfer_to": (b"trostm:", 2), "s_transfer_yes": (b"trosty:", 3),
 }
+_ADMIN_SEARCH_RESULTS_PREFIX = b"trosr:"
 _ORPHAN_TOKEN_RE = re.compile(r"[0-9a-f]{8}")
 
 
@@ -676,7 +687,7 @@ def decode_orphan_callback(data: bytes | None) -> tuple[str, int, int | None, st
         parts = data[len(prefix):].decode("ascii", errors="replace").split(":")
         if len(parts) != count:
             return None
-        has_token = action in ("disable_yes", "transfer_yes")
+        has_token = action.endswith("_yes")
         numbers, token = (parts[:-1], parts[-1]) if has_token else (parts, None)
         if not all(part.isdigit() for part in numbers) or (has_token and not _ORPHAN_TOKEN_RE.fullmatch(token)):
             return None
@@ -703,18 +714,44 @@ def orphan_list_keyboard(page: int, total_pages: int, options: list[tuple[int, s
     return rows
 
 
-def orphan_confirm_keyboard(link_id: int, action: str, extra: int | None, token: str) -> list[list[Button]]:
-    label = texts.ORPHAN_DISABLE_YES_LABEL if action == "disable_yes" else texts.ORPHAN_TRANSFER_YES_LABEL
+def encode_admin_search_results_callback(plate: str) -> bytes:
+    return _ADMIN_SEARCH_RESULTS_PREFIX + plate.encode("ascii")
+
+
+def decode_admin_search_results_callback(data: bytes | None) -> str | None:
+    if not data or not data.startswith(_ADMIN_SEARCH_RESULTS_PREFIX):
+        return None
+    plate = data[len(_ADMIN_SEARCH_RESULTS_PREFIX):].decode("ascii", errors="replace")
+    return plate if plate.isalnum() and plate.isascii() and 0 < len(plate) <= 16 else None
+
+
+def orphan_confirm_keyboard(
+    link_id: int, action: str, extra: int | None, token: str, back: bytes,
+) -> list[list[Button]]:
+    label = texts.ORPHAN_DISABLE_YES_LABEL if action.endswith("disable_yes") else texts.ORPHAN_TRANSFER_YES_LABEL
     return [[
         Button.inline(label, encode_orphan_callback(action, link_id, extra, token)),
-        Button.inline(DELETE_CANCEL_LABEL, encode_orphan_callback("list", 0)),
+        Button.inline(DELETE_CANCEL_LABEL, back),
     ]]
 
 
-def orphan_picker_keyboard(link_id: int, options: list[tuple[int, str]]) -> list[list[Button]]:
+def orphan_picker_keyboard(
+    link_id: int, options: list[tuple[int, str]], *, action: str = "transfer_to", back: bytes | None = None,
+) -> list[list[Button]]:
     rows = [
-        [Button.inline(label, encode_orphan_callback("transfer_to", link_id, manager_id))]
+        [Button.inline(label, encode_orphan_callback(action, link_id, manager_id))]
         for manager_id, label in options
     ]
-    rows.append([Button.inline(BACK_LABEL, encode_orphan_callback("list", 0))])
+    rows.append([Button.inline(BACK_LABEL, back or encode_orphan_callback("list", 0))])
     return rows
+
+
+def admin_link_search_keyboard(options: list[tuple[int, str]]) -> list[list[Button]]:
+    """Кнопки под результатами поиска — только для активных привязок."""
+    return [
+        [
+            Button.inline(f"{texts.ADMIN_LINK_UNLINK_LABEL} {plate}", encode_orphan_callback("s_disable", link_id)),
+            Button.inline(f"{texts.ORPHAN_TRANSFER_LABEL} {plate}", encode_orphan_callback("s_transfer", link_id)),
+        ]
+        for link_id, plate in options
+    ]

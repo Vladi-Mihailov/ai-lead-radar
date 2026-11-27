@@ -25,6 +25,7 @@ from reader.turkey_bot.keyboards import (
     client_link_pick_keyboard,
     client_link_screen_keyboard,
     client_link_unlink_confirm_keyboard,
+    admin_link_search_keyboard,
     orphan_confirm_keyboard,
     orphan_list_keyboard,
     orphan_picker_keyboard,
@@ -36,6 +37,7 @@ from reader.turkey_bot.keyboards import (
     decode_car_open_callback,
     decode_client_link_answer_callback,
     decode_client_link_callback,
+    decode_admin_search_results_callback,
     decode_orphan_callback,
     decode_debt_refresh_cancel_callback,
     decode_debt_refresh_confirm_callback,
@@ -285,6 +287,16 @@ def register(
             await _deliver_outgoing(event, reply)
             return
 
+        search_plate = decode_admin_search_results_callback(event.data)
+        if search_plate is not None:
+            reply = controller.handle_admin_link_search_results(search_plate, telegram_user_id=event.sender_id)
+            if reply is None:
+                await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
+                return
+            await event.answer()
+            await _send_reply(event, reply, is_trusted=is_trusted, is_admin=is_admin, prefer_edit=True)
+            return
+
         orphan = decode_orphan_callback(event.data)
         if orphan is not None:
             action, first, extra, token = orphan
@@ -420,8 +432,10 @@ def _first_message_buttons(reply: BotReply, *, is_trusted: bool, has_extra: bool
     if reply.orphan_confirm is not None:
         return orphan_confirm_keyboard(*reply.orphan_confirm)
     if reply.orphan_picker is not None:
-        link_id, options = reply.orphan_picker
-        return orphan_picker_keyboard(link_id, list(options))
+        link_id, options, action, back = reply.orphan_picker
+        return orphan_picker_keyboard(link_id, list(options), action=action, back=back)
+    if reply.admin_link_search:
+        return admin_link_search_keyboard(list(reply.admin_link_search))
     if reply.orphan_list is not None:
         page, total_pages, options = reply.orphan_list
         return orphan_list_keyboard(page, total_pages, list(options))

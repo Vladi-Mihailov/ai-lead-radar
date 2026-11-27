@@ -266,6 +266,16 @@ class TurkeyClientLinkRepository:
             )
         return cursor.rowcount == 1
 
+    def links_for_plate(self, plate: str) -> list[TurkeyClientLink]:
+        """Все действующие привязки номера — активные и ждущие подтверждения,
+        у любых владельцев (поиск администратора)."""
+        rows = self._conn.execute(
+            f"SELECT {_COLUMNS} FROM turkey_client_links WHERE plate = ? AND status IN ('active', 'pending') "
+            "ORDER BY status, id",
+            (plate,),
+        ).fetchall()
+        return [_row_to_link(row) for row in rows]
+
     def active_links(self) -> list[TurkeyClientLink]:
         rows = self._conn.execute(
             f"SELECT {_COLUMNS} FROM turkey_client_links WHERE status = 'active' ORDER BY id",
@@ -511,19 +521,25 @@ class TurkeyClientLinkService:
         """Активные привязки, у машины которых владелец больше не менеджер."""
         return [link for link in self._links.active_links() if not self._is_manager(link.owner_telegram_user_id)]
 
-    def _orphan(self, link_id: int) -> tuple[TurkeyClientLink | None, AdminOutcome | None]:
+    def is_manager(self, telegram_user_id: int) -> bool:
+        return self._is_manager(telegram_user_id)
+
+    def _orphan(self, link_id: int, *, require_orphan: bool = True) -> tuple[TurkeyClientLink | None, AdminOutcome | None]:
+        """require_orphan=False — администратор из поиска по номеру работает с
+        ЛЮБОЙ активной привязкой (в т.ч. действующего менеджера)."""
         link = self._links.get(link_id)
         if link is None or link.status != STATUS_ACTIVE:
             return None, AdminOutcome(status="gone", link=link)
-        if self._is_manager(link.owner_telegram_user_id):
+        if require_orphan and self._is_manager(link.owner_telegram_user_id):
             return None, AdminOutcome(status="not_orphan", link=link)
         return link, None
 
-    def disable_orphan(self, link_id: int, *, closed_by: int) -> AdminOutcome:
-        """Закрыть привязку без менеджера так же, как отвязку: история
-        проверок остаётся, машина клиента убирается, только если её создала
-        привязка. Машины и мониторинг бывшего менеджера не трогаются."""
-        link, refused = self._orphan(link_id)
+    def disable_orphan(self, link_id: int, *, closed_by: int, require_orphan: bool = True) -> AdminOutcome:
+        """Закрыть привязку так же, как отвязку: история проверок остаётся,
+        машина клиента убирается, только если её создала привязка и у клиента
+        нет другой привязки к номеру или своей подписки. Машины и мониторинг
+        владельца машины-якоря не трогаются."""
+        link, refused = self._orphan(link_id, require_orphan=require_orphan)
         if refused is not None:
             return refused
         if not self._links.close(link.id, status=STATUS_REVOKED, closed_by=closed_by, now=self.now(),
@@ -532,17 +548,19 @@ class TurkeyClientLinkService:
         self._release_client_car(link)
         return AdminOutcome(status="disabled", link=link)
 
-    def transfer_plan(self, link_id: int, *, new_owner: int) -> AdminOutcome:
+    def transfer_plan(self, link_id: int, *, new_owner: int, require_orphan: bool = True) -> AdminOutcome:
         """Что сделает передача (без изменений): reanchored — у менеджера уже
-        есть эта машина; moved — к нему перейдут машина бывшего менеджера и
+        есть эта машина; moved — к нему перейдут машина прежнего владельца и
         её мониторинг; иначе причина отказа."""
-        link, refused = self._orphan(link_id)
+        link, refused = self._orphan(link_id, require_orphan=require_orphan)
         if refused is not None:
             return refused
         if not self._is_manager(new_owner):
             return AdminOutcome(status="not_manager", link=link)
         if link.client_telegram_user_id == new_owner:
             return AdminOutcome(status="own_client", link=link)
+        if link.owner_telegram_user_id == new_owner:
+            return AdminOutcome(status="same_owner", link=link)
         if self._links.active_for_anchor(new_owner, link.plate) is not None:
             return AdminOutcome(status="conflict", link=link)
         if self._garage.get_owned_car_by_number(new_owner, link.plate) is not None:
@@ -551,7 +569,7 @@ class TurkeyClientLinkService:
             return AdminOutcome(status="no_car", link=link)
         return AdminOutcome(status="moved", link=link)
 
-    def transfer_orphan(self, link_id: int, *, new_owner: int) -> AdminOutcome:
+    def transfer_orphan(self, link_id: int, *, new_owner: int, require_orphan: bool = True) -> AdminOutcome:
         """Передать привязку без менеджера действующему менеджеру — без
         второй проверки номера:
         - у менеджера уже есть эта машина -> привязка переходит на неё
@@ -562,12 +580,15 @@ class TurkeyClientLinkService:
           мониторинг остаётся ОДИН.
         Точка отсчёта клиента хранится в самой привязке и не меняется: ни
         повторов старых штрафов, ни пропусков."""
-        plan = self.transfer_plan(link_id, new_owner=new_owner)
+        plan = self.transfer_plan(link_id, new_owner=new_owner, require_orphan=require_orphan)
         if plan.status not in ("reanchored", "moved"):
             return plan
         link = plan.link
         old_owner = link.owner_telegram_user_id
         if plan.status == "moved":
+            # Машина уходит от прежнего владельца — его неподтверждённое
+            # приглашение к ней больше некуда привязать.
+            self._links_cancel_pending(old_owner, link.plate, closed_by=new_owner)
             old_car = self._garage.get_owned_car_by_number(old_owner, link.plate)
             self._garage.transfer_car(old_car.id, new_owner_telegram_user_id=new_owner)
             self._subscriptions.transfer(
@@ -587,6 +608,12 @@ class TurkeyClientLinkService:
         return AdminOutcome(
             status=plan.status, link=moved, monitoring_active=subscription is not None and subscription.active,
         )
+
+    def _links_cancel_pending(self, owner: int, plate: str, *, closed_by: int) -> None:
+        pending = self._links.pending_for_anchor(owner, plate)
+        if pending is not None:
+            self._links.close(pending.id, status=STATUS_CANCELLED, closed_by=closed_by, now=self.now(),
+                              from_status=STATUS_PENDING)
 
     def client_removed_car(self, *, telegram_user_id: int, plate: str) -> None:
         """Клиент сам удалил машину из «Мои автомобили» — привязка закрыта,

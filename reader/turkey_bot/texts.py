@@ -1695,6 +1695,7 @@ ORPHAN_REFUSAL_TEXTS = {
     "conflict": "⚠️ У этого менеджера к этой машине уже привязан клиент.",
     "own_client": "⚠️ Этот менеджер и есть клиент привязки.",
     "no_car": "⚠️ Машины бывшего менеджера уже нет — передать нечего. Отключите привязку.",
+    "same_owner": "ℹ️ Привязка уже у этого менеджера.",
 }
 
 
@@ -1756,3 +1757,39 @@ def format_orphan_transfer_notice(plate: str, *, client: str) -> str:
         f"👤 Вам передана привязка клиента {client} к {format_plate_for_telegram(plate)}. "
         "Управление — в «📋 Мои авто» → машина → «👤 Данные клиента»."
     )
+
+
+# ---- 🔎 Найти привязку по номеру (администратор) ----
+
+ADMIN_LINK_SEARCH_LABEL = "🔎 Найти привязку по номеру"
+ADMIN_LINK_SEARCH_PROMPT = "🔎 Введите госномер машины — покажу все привязки клиентов к нему."
+ADMIN_LINK_UNLINK_LABEL = "❌ Отвязать"
+
+
+def format_admin_link_search_empty(plate: str) -> str:
+    return f"По номеру {format_plate_for_telegram(plate)} привязок клиентов нет."
+
+
+def format_admin_link_block(
+    *, plate: str, status: str, moment: datetime | None, client: str | None, invited: str | None,
+    manager: str, manager_active: bool, monitoring_active: bool,
+) -> str:
+    """Одна привязка номера для администратора: статус, клиент, ответственный
+    менеджер и действует ли он, мониторинг его машины."""
+    if status == "active":
+        status_line = "✅ Привязка активна"
+        client_line = f"👤 Клиент: {client} · привязан {moment.astimezone(_DISPLAY_TZ).strftime('%d.%m.%Y')}"
+    else:
+        expired = status == "expired"
+        status_line = f"{'⌛ Приглашение истекло' if expired else '⏳ Ждёт подтверждения до'} {_link_moment(moment)}"
+        client_line = f"👤 Приглашён: {invited}" if invited else "👤 Приглашение по ссылке — ещё не открыто"
+    return "\n".join([
+        f"🚗 {format_plate_for_telegram(plate)} · {status_line}",
+        client_line,
+        f"👔 Менеджер: {manager} — {'действующий' if manager_active else 'права сняты'}",
+        f"📡 Мониторинг: {'🟢 включён' if monitoring_active else '⚪ выключен'}",
+    ])
+
+
+def format_admin_link_search(plate: str, blocks: list[str]) -> str:
+    return "\n\n".join([f"🔎 Привязки по номеру {format_plate_for_telegram(plate)}: {len(blocks)}", *blocks])

@@ -205,7 +205,7 @@ async def test_disable_needs_a_fresh_one_time_token(fx):
     fx.demote()
     runs_before = fx.runs.count_total()
     prompt = fx.admin("disable", link.id)
-    _link_id, action, _extra, token = prompt.orphan_confirm
+    _link_id, action, _extra, token, _back = prompt.orphan_confirm
     assert action == "disable_yes"
     assert fx.admin("disable_yes", link.id, token="00000000").text.startswith(texts.ORPHAN_STALE_TEXT)
     assert fx.links.active_for_anchor(_FORMER, _PLATE) is not None  # неверный токен сжёг и верный
