@@ -1474,3 +1474,85 @@ async def test_last_day_of_the_term_is_still_within_the_term(fx):
 
     assert lines[lines.index("🧾 Штраф: 50 ₾") + 1] == "💰 К оплате: 50 ₾"
     assert _OVERDUE_TITLE not in lines
+
+
+# ---- Подпись срока оплаты: предварительный (без вручения) и окончательный ----
+
+
+from reader.fines.models import NewFineEvent, payment_term_final_of  # noqa: E402
+from reader.public_bot.delivery_texts import format_check_now_fines_message, format_owner_fine_message  # noqa: E402
+
+
+def _due_line(lines):
+    return next(line for line in lines if line.startswith("⏳"))
+
+
+@pytest.mark.parametrize("active, expected", [
+    (False, "⏳ Предварительный срок оплаты: 26.01.2099"),
+    (True, "⏳ Оплатить до: 26.01.2099"),
+])
+async def test_check_now_marks_a_term_without_confirmed_delivery_as_provisional(fx, active, expected):
+    task, subscription = _dated_car(fx, _CAR, [("GE1", 50)], last_date=date(2099, 1, 26), active=active)
+    await fx.check(task)
+
+    reply = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=_OWNER)
+
+    lines = reply.text.splitlines()
+    assert _due_line(lines) == expected
+    assert lines[lines.index("🧾 Штраф: 50 ₾") + 1] == "💰 К оплате: 50 ₾"  # суммы и подпись штрафа как были
+
+
+async def test_manager_check_now_uses_the_same_term_label(fx):
+    task, _ = _dated_car(fx, _CAR, [("GE1", 50)], last_date=date(2099, 1, 26), active=False)
+    await fx.check(task)
+
+    reply = await _manager_check_now_by_plate(fx, _CAR)
+
+    assert _due_line(reply.text.splitlines()) == "⏳ Предварительный срок оплаты: 26.01.2099"
+
+
+async def test_term_without_lastdate_keeps_the_old_label(fx):
+    task, subscription = _plain_car(fx, _CAR, [("GE1", 50)], due_date=date(2099, 1, 26))
+    await fx.check(task)
+
+    reply = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=_OWNER)
+
+    assert _due_line(reply.text.splitlines()) == "⏳ Оплатить до: 26.01.2099"
+
+
+async def test_new_fine_notification_text_is_unchanged_for_a_provisional_term(fx):
+    task, _ = _dated_car(fx, _CAR, [("GE1", 50)], last_date=date(2099, 1, 26), active=False)
+    await fx.check(task)
+    fine = fx.fines.list_current_for_task(task.id, since=fx.tasks.get(task.id).last_successful_checked_at)[0]
+
+    text = format_owner_fine_message(car_number=_CAR, fine=fine)
+
+    assert "⏳ Оплатить до: 26.01.2099" in text and "Предварительный" not in text
+
+
+def test_cached_and_one_off_results_use_the_flag_from_the_police_answer():
+    base = dict(detected_fine_id=1, task_id=1, car_number=_CAR, label=None, external_fine_id="GE1",
+                penalty_date=None, due_date=date(2099, 1, 26), delivered_status=None)
+    provisional = NewFineEvent(**base, payment_term_final=False)
+    unknown = NewFineEvent(**base)
+
+    text = format_check_now_fines_message(car_number=_CAR, fines=[provisional, unknown])
+
+    assert [line for line in text.splitlines() if line.startswith("⏳")] == [
+        "⏳ Предварительный срок оплаты: 26.01.2099", "⏳ Оплатить до: 26.01.2099",
+    ]
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ({"lastDate": "2099-01-26", "activeDate": "2098-12-27"}, True),
+    ({"lastDate": "2099-01-26"}, False),
+    ({"lastDate": "2099-01-26", "activeDate": None}, False),
+    ({"lastDate": "2099-01-26", "activeDate": "  "}, False),
+    ({"protocolNo": "GE1"}, None),
+    ('{"lastDate": "2099-01-26"}', False),
+    ('{"lastDate": "2099-01-26", "activeDate": "2098-12-27"}', True),
+    ("not json", None),
+    (None, None),
+])
+def test_payment_term_final_of(raw, expected):
+    assert payment_term_final_of(raw) is expected
