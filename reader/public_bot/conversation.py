@@ -99,7 +99,7 @@ from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 from reader.fines.models import OneOffCheckResult
-from reader.fines.payable_amount import amount_is_current, display_payable
+from reader.fines.payable_amount import amount_is_current, display_payable, term_end_of, term_not_expired
 from reader.fines.payment_status import (
     DISPLAY_GONE,
     DISPLAY_UNVERIFIED,
@@ -3007,14 +3007,16 @@ class ConversationController:
     ) -> dict[str, dict[str, ReceiptAmount]]:
         """{car: {protocolNo: ReceiptAmount}} — сохранённая сумма Georgian
         Card, если она актуальна для текущего контрольного периода (см.
-        amount_is_current), иначе «нужно уточнить»; overdue — окончательный
-        срок оплаты (term_ends_for_cars) истёк. Только чтение БД — никаких
-        запросов к Georgian Card."""
+        amount_is_current); без неё, пока срок оплаты точно идёт (см.
+        term_not_expired), — исходная сумма police.ge без даты уточнения (до
+        конца срока сумма не растёт); иначе «нужно уточнить». overdue —
+        окончательный срок оплаты истёк. Только чтение БД — никаких запросов
+        к Georgian Card, сохранённые значения не меняются."""
         assert self._payable_amount is not None
         car_numbers = list(statuses_by_car)
         repository = self._payable_amount.repository
         stored = repository.amounts_for_cars(car_numbers)
-        term_ends = repository.term_ends_for_cars(car_numbers)
+        term_dates = repository.term_dates_for_cars(car_numbers)
         today = self._today()
         result: dict[str, dict[str, ReceiptAmount]] = {}
         for car_number, statuses in statuses_by_car.items():
@@ -3022,13 +3024,20 @@ class ConversationController:
             for status in statuses:
                 key = (car_number, status.protocol_no)
                 amount = stored.get(key)
-                term_end = term_ends.get(key)
+                last_date, active_date = term_dates.get(key, (None, None))
+                term_end = term_end_of(last_date, active_date)
                 current = amount_is_current(amount, term_end, today=today, tz=self._tz)
+                if current:
+                    payable, observed_at = display_payable(amount.amount, status.amount), amount.observed_at
+                elif term_not_expired(last_date, today=today):
+                    payable, observed_at = status.amount, None
+                else:
+                    payable, observed_at = None, None
                 by_protocol[status.protocol_no] = ReceiptAmount(
                     protocol_no=status.protocol_no,
                     base_amount=status.amount,
-                    payable=display_payable(amount.amount, status.amount) if current else None,
-                    observed_at=amount.observed_at if current else None,
+                    payable=payable,
+                    observed_at=observed_at,
                     overdue=term_end is not None and today > term_end,
                 )
             result[car_number] = by_protocol

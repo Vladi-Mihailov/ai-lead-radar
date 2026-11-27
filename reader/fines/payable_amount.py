@@ -311,6 +311,18 @@ def _parse_source_date(value) -> date | None:
         return None
 
 
+def term_not_expired(last_date: date | None, *, today: date) -> bool:
+    """Срок оплаты точно ещё идёт: lastDate police.ge есть и не прошёл.
+    Окончательный (с activeDate) — как есть. Предварительный (квитанция ещё
+    не вручена) тоже годится: окончательный срок отсчитывается от вручения,
+    а police.ge пересчитывает lastDate при каждой проверке номера, поэтому
+    невручённая на последней проверке квитанция не может быть просрочена,
+    пока предварительный срок не прошёл. Нет lastDate или предварительный
+    прошёл без вручения — срок неизвестен (False): такой штраф не считается
+    непросроченным. Только для отображения суммы, не для проверок."""
+    return last_date is not None and today <= last_date
+
+
 def term_end_of(last_date: date | None, active_date: date | None) -> date | None:
     """Последний день первоначального срока оплаты — lastDate police.ge, но
     только окончательный: пока квитанция не считается врученной (activeDate
@@ -934,8 +946,13 @@ class PayableAmountRepository:
         по последнему ответу police.ge (georgia_fine_terms, пишется при каждой
         полной проверке номера), а если его ещё нет — по самой свежей строке
         detected_fines (данные первого обнаружения)."""
+        return {key: term_end_of(*dates) for key, dates in self.term_dates_for_cars(car_numbers).items()}
+
+    def term_dates_for_cars(self, car_numbers: list[str]) -> dict[tuple[str, str], tuple[date | None, date | None]]:
+        """(lastDate, activeDate) каждой квитанции как их отдал police.ge —
+        те же источники, что и у term_ends_for_cars. Только чтение."""
         tables = {row[0] for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        result: dict[tuple[str, str], date | None] = {}
+        result: dict[tuple[str, str], tuple[date | None, date | None]] = {}
         for start in range(0, len(car_numbers), 500):
             chunk = car_numbers[start:start + 500]
             placeholders = ",".join("?" * len(chunk))
@@ -952,18 +969,14 @@ class PayableAmountRepository:
                         raw = None
                     raw = raw if isinstance(raw, dict) else {}
                     last_date = _parse_source_date(raw.get("lastDate")) or _parse_source_date(due_date)
-                    result[(car_number, protocol_no)] = term_end_of(
-                        last_date, _parse_source_date(raw.get("activeDate")),
-                    )
+                    result[(car_number, protocol_no)] = (last_date, _parse_source_date(raw.get("activeDate")))
             if "georgia_fine_terms" in tables:
                 for car_number, protocol_no, last_date, active_date in self._conn.execute(
                     f"SELECT car_number, protocol_no, last_date, active_date FROM georgia_fine_terms "
                     f"WHERE car_number IN ({placeholders})",
                     chunk,
                 ):
-                    result[(car_number, protocol_no)] = term_end_of(
-                        _parse_source_date(last_date), _parse_source_date(active_date),
-                    )
+                    result[(car_number, protocol_no)] = (_parse_source_date(last_date), _parse_source_date(active_date))
         return result
 
     # ---- Уведомления об увеличении: граница включения ----
