@@ -18,6 +18,12 @@ CLIENT_NAME_MAX_LENGTH = 64
 # Кроме букв любых алфавитов (с диакритикой), цифр и пробела — только
 # обычная пунктуация имён: "Александр-2", "O'Brien", "Ivan Jr.".
 _ALLOWED_PUNCTUATION = frozenset("-'.")
+# Буквы, которые на экране пустые (Hangul fillers): с ними имя выглядело бы
+# пустым — удаляются как невидимые символы.
+_INVISIBLE_LETTERS = frozenset("\u115f\u1160\u3164\uffa0")
+# Не больше стольких комбинируемых знаков (ударения, огласовки) на одну
+# букву: длиннее стопки — уже не имя, а «zalgo»-мусор поверх соседних строк.
+_MAX_MARKS_PER_CHAR = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS georgia_car_client_names (
@@ -55,11 +61,22 @@ def normalize_client_name(raw: str) -> str:
     text = "".join(
         " " if char in "\t\n\r\v\f" else char
         for char in text
-        if char in "\t\n\r\v\f" or not unicodedata.category(char).startswith("C")
+        if char in "\t\n\r\v\f"
+        or (not unicodedata.category(char).startswith("C") and char not in _INVISIBLE_LETTERS)
     )
     text = " ".join(text.split())
     if not text or len(text) > CLIENT_NAME_MAX_LENGTH:
         raise ClientNameValidationError(_INVALID_NAME_TEXT)
+    # Знаки считаются по разложенной форме: «á» после NFC — один символ, но
+    # стопка поверх него — те же комбинируемые знаки.
+    marks_in_a_row = 0
+    for char in unicodedata.normalize("NFD", text):
+        if unicodedata.category(char)[0] == "M":
+            marks_in_a_row += 1
+            if marks_in_a_row > _MAX_MARKS_PER_CHAR:
+                raise ClientNameValidationError(_INVALID_NAME_TEXT)
+        else:
+            marks_in_a_row = 0
     for char in text:
         category = unicodedata.category(char)
         if category[0] in ("L", "M", "N") or char == " " or char in _ALLOWED_PUNCTUATION:

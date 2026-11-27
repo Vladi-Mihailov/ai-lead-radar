@@ -88,6 +88,16 @@ class DelegatedAddCarOutcome:
     claim_link: str | None
 
 
+class ClientLinkRefusedError(Exception):
+    """Поздняя привязка Telegram клиента невозможна (см. link_client_to_task):
+    reason — "task_not_active" (мониторинг машины выключен) или
+    "already_has_car" (у этого пользователя уже есть эта машина)."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
 @dataclass(frozen=True)
 class ClientLinkOutcome:
     """Привязка Telegram клиента к задаче (см. SubscriptionService.
@@ -278,8 +288,13 @@ class SubscriptionService:
         # восстанавливаются вовсе (прежнее поведение): без исключения
         # восстановленный клиент получил бы старые штрафы как новые.
         restored_history_excluder: Callable[[FineMonitoringSubscription], int] | None = None,
+        late_link_history_excluder: Callable[[FineMonitoringSubscription], int] | None = None,
     ):
         self._restored_history_excluder = restored_history_excluder
+        # Поздняя привязка клиента к уже добавленной машине (см.
+        # link_client_to_task): уже известные штрафы исключаются из рассылки
+        # новой привязке — и клиенту, и менеджеру, — новыми они не считаются.
+        self._late_link_history_excluder = late_link_history_excluder
         self._task_repository = task_repository
         self._subscription_repository = subscription_repository
         self._user_repository = user_repository
@@ -494,21 +509,42 @@ class SubscriptionService:
         иначе pending_claim с одноразовой ссылкой, клиент подтверждает сам),
         но на СУЩЕСТВУЮЩУЮ задачу — без второй задачи мониторинга и без
         внеочередной проверки police.ge. None — задачи нет.
-        OwnerResolutionError пробрасывается как у add_delegated_car."""
+        OwnerResolutionError пробрасывается как у add_delegated_car.
+
+        ClientLinkRefusedError: мониторинг машины выключен (подписка на
+        выключенную задачу показала бы клиенту машину включённой без
+        проверок) или у этого пользователя уже есть эта машина (вторая строка
+        отменила бы его собственное «выключено» и задвоила «Мои авто»).
+
+        Уже известные штрафы номера сразу исключаются из рассылки этой
+        привязке (late_link_history_excluder) — ни клиент, ни менеджер не
+        получают их как новые; текущее состояние клиент видит в «🔎»."""
         task = self._task_repository.get(task_id)
         if task is None:
             return None
+        if task.status != "active":
+            raise ClientLinkRefusedError("task_not_active")
         resolved = await resolve_owner_username(
             owner_username,
             user_repository=self._user_repository,
             telegram_client=self._owner_resolver_client,
         )
-        return self._attach_client(
+        if resolved is not None and any(
+            subscription.telegram_user_id == resolved.telegram_user_id and subscription.status != "archived"
+            for subscription in self._subscription_repository.list_by_car_number(task.car_number)
+        ):
+            raise ClientLinkRefusedError("already_has_car")
+        # Между созданием подписки и исключением известных штрафов нет await:
+        # поллер доставки в этом же event loop не увидит её раньше исключения.
+        link = self._attach_client(
             task, resolved=resolved, owner_username=owner_username,
             created_by_telegram_user_id=created_by_telegram_user_id,
             created_by_telegram_chat_id=created_by_telegram_chat_id,
             start_date=today, end_date=UNLIMITED_END_DATE,
         )
+        if self._late_link_history_excluder is not None:
+            self._late_link_history_excluder(link.subscription)
+        return link
 
     def subscriptions_for_task(self, task_id: int) -> list[FineMonitoringSubscription]:
         """Все подписки этой задачи (любого статуса и владельца) — для
@@ -534,15 +570,18 @@ class SubscriptionService:
             and subscription.status in ("active", "stopped", "expired", "pending_claim")
         ]
 
-    def unlink_manager_client_links(self, task_id: int) -> int:
+    def unlink_manager_client_links(self, task_id: int, *, only_ids: set[int] | None = None) -> int:
         """«❌ Отвязать Telegram»: архивирует привязки из manager_client_links
         (клиент больше не видит машину и не получает уведомлений, ссылка-
-        приглашение гаснет). История штрафов и доставок, сама задача
-        мониторинга и подписки, оформленные клиентами самостоятельно, не
-        меняются. Возвращает число отвязанных."""
+        приглашение гаснет). only_ids — только те, что менеджер видел на
+        экране подтверждения (привязка, сделанная после него, не трогается).
+        История штрафов и доставок, сама задача мониторинга и подписки,
+        оформленные клиентами самостоятельно, не меняются. Возвращает число
+        отвязанных."""
         return sum(
             1 for subscription in self.manager_client_links(task_id)
-            if self._subscription_repository.archive(subscription.id)
+            if (only_ids is None or subscription.id in only_ids)
+            and self._subscription_repository.archive(subscription.id)
         )
 
     def _attach_client(

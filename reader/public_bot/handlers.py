@@ -96,7 +96,8 @@ from reader.public_bot.keyboards import (
     search_result_keyboard,
     trusted_stop_confirm_keyboard,
     trusted_stop_options_keyboard,
-    task_client_unlink_confirm_keyboard,
+    task_client_cancel_keyboard,
+    task_client_confirm_keyboard,
     trusted_task_detail_keyboard,
     trusted_task_off_keyboard,
     trusted_tasks_page_keyboard,
@@ -303,6 +304,13 @@ def register(
             await _notify_manager_new_user(event, username, first_name, last_name)
         is_trusted = controller.is_trusted(event.sender_id)
 
+        # Любая другая кнопка закрывает ввод/подтверждение «Данных клиента»
+        # (см. ConversationController.drop_task_client_step): ответ, набранный
+        # потом, не попадёт к машине, которую менеджер уже покинул.
+        task_client = decode_task_client_callback(data)
+        if task_client is None:
+            controller.drop_task_client_step(event.chat_id)
+
         wants_client = decode_add_client_decision_callback(data)
         if wants_client is not None:
             # bool, а не truthy-проверка: False (Отмена) — тоже валидный,
@@ -471,11 +479,20 @@ def register(
             return
 
         # «👤 Данные клиента» на карточке машины менеджера.
-        task_client = decode_task_client_callback(data)
         if task_client is not None:
-            action, task_id, page = task_client
+            action, task_id, page, token = task_client
+            if action == "linkyes":
+                # Привязка может резолвить @username через Telegram — ack сразу.
+                await _ack_then_await_slow_check(
+                    event,
+                    controller.handle_task_client_link_confirm(
+                        task_id, page, chat_id=event.chat_id, telegram_user_id=event.sender_id, token=token,
+                    ),
+                    is_trusted=is_trusted,
+                )
+                return
             reply = controller.handle_task_client_action(
-                action, task_id, page, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+                action, task_id, page, chat_id=event.chat_id, telegram_user_id=event.sender_id, token=token,
             )
             await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
@@ -1068,9 +1085,12 @@ async def _send_reply(
             reply.trusted_tasks_page_options or [],
             page=reply.trusted_tasks_page, total_pages=reply.trusted_tasks_total_pages,
         )
-    elif getattr(reply, "task_client_unlink_confirm", None) is not None:
-        task_id, page = reply.task_client_unlink_confirm
-        buttons = task_client_unlink_confirm_keyboard(task_id, page=page)
+    elif getattr(reply, "task_client_confirm", None) is not None:
+        action, task_id, page, token = reply.task_client_confirm
+        buttons = task_client_confirm_keyboard(action, task_id, page=page, token=token)
+    elif getattr(reply, "task_client_cancel", None) is not None:
+        task_id, page = reply.task_client_cancel
+        buttons = task_client_cancel_keyboard(task_id, page=page)
     elif reply.trusted_task_detail_id is not None:
         client_buttons = getattr(reply, "trusted_task_client_buttons", False)
         buttons = trusted_task_detail_keyboard(

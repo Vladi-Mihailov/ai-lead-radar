@@ -34,6 +34,9 @@ from pathlib import Path
 EXCLUSION_NOTIFICATION_BOUNDARY = "notification_boundary"
 EXCLUSION_KNOWN_BEFORE_BOUNDARY = "known_before_boundary"
 EXCLUSION_SUBSCRIPTION_RESTORED = "subscription_restored"
+# Поздняя привязка клиента к уже добавленной машине (см.
+# SubscriptionService.link_client_to_task): известные штрафы новыми не считаются.
+EXCLUSION_LATE_CLIENT_LINK = "late_client_link"
 
 _SCHEMA = (
     """

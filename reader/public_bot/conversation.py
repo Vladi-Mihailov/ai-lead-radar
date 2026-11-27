@@ -95,7 +95,7 @@ import logging
 import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from reader.fines.models import OneOffCheckResult
@@ -168,6 +168,7 @@ from reader.public_bot.protocol_check_models import ProtocolCheckStatus
 from reader.public_bot.protocol_check_provider import ProtocolCheckProvider
 from reader.public_bot.statistics_service import BotStatisticsService
 from reader.public_bot.subscription_service import (
+    ClientLinkRefusedError,
     CHECK_ALREADY_IN_PROGRESS,
     SubscriptionService,
 )
@@ -188,6 +189,17 @@ STEP_AWAITING_ADD_CLIENT_NAME = "awaiting_add_client_name"
 # «Данные клиента» на карточке уже добавленной машины: payload {task_id, page}.
 STEP_AWAITING_TASK_CLIENT_NAME = "awaiting_task_client_name"
 STEP_AWAITING_TASK_CLIENT_USERNAME = "awaiting_task_client_username"
+# Экраны подтверждения привязки/отвязки Telegram: payload — task_id, page,
+# одноразовый код экрана и то, что менеджер на нём видел.
+STEP_AWAITING_TASK_CLIENT_LINK_CONFIRM = "awaiting_task_client_link_confirm"
+STEP_AWAITING_TASK_CLIENT_UNLINK_CONFIRM = "awaiting_task_client_unlink_confirm"
+_TASK_CLIENT_STEPS = (
+    STEP_AWAITING_TASK_CLIENT_NAME, STEP_AWAITING_TASK_CLIENT_USERNAME,
+    STEP_AWAITING_TASK_CLIENT_LINK_CONFIRM, STEP_AWAITING_TASK_CLIENT_UNLINK_CONFIRM,
+)
+# Шаг «Данных клиента», оставленный дольше, — устаревший: ответ на него не
+# применяется (менеджер мог давно уйти к другой машине).
+_TASK_CLIENT_STEP_TTL = timedelta(minutes=15)
 # Последний шаг Add Car — подтверждение (см. texts.
 # format_add_car_confirm_prompt), срок больше не выбирается. Шаг выбора
 # срока ("awaiting_period") заменён им целиком; это значение по-прежнему
@@ -577,8 +589,11 @@ class BotReply:
     trusted_task_client_buttons: bool = False
     trusted_task_client_has_name: bool = False
     trusted_task_client_can_unlink: bool = False
-    # (task_id, page) — подтверждение «❌ Отвязать Telegram».
-    task_client_unlink_confirm: tuple[int, int] | None = None
+    # (действие linkyes/unlinkyes, task_id, page, одноразовый код) — экран
+    # подтверждения привязки/отвязки Telegram клиента.
+    task_client_confirm: tuple[str, int, int, str] | None = None
+    # (task_id, page) — «❌ Отмена» под вводом имени/Telegram клиента.
+    task_client_cancel: tuple[int, int] | None = None
     # «👤 Имя клиента» под подтверждением Add Car (только менеджеру).
     add_car_client_name_button: bool = False
     trusted_task_off_id: int | None = None
@@ -3504,57 +3519,163 @@ class ConversationController:
         )
 
     # ---- «👤 Данные клиента» на карточке машины менеджера. is_trusted()
-    # перепроверяется на каждом шаге; task_id из callback_data публичен. ----
+    # перепроверяется на каждом шаге; task_id из callback_data публичен и
+    # ничего не доказывает — шаг ввода/подтверждения сверяется с
+    # conversation_state (тот же менеджер, та же машина, код экрана, срок). ----
+
+    def drop_task_client_step(self, chat_id: int) -> None:
+        """Любой другой переход (кнопка другой машины, страницы и т.п.)
+        закрывает ввод/подтверждение «Данных клиента»: ответ, набранный
+        потом, не должен попасть к машине, которую менеджер уже покинул.
+        Другие диалоги не трогаются."""
+        state = self._states.get(chat_id)
+        if state is not None and state.step in _TASK_CLIENT_STEPS:
+            self._clear_state(chat_id)
+
+    def _task_client_card_or_none(self, task_id: int, telegram_user_id: int):
+        if not self._is_trusted(telegram_user_id) or self._client_names is None:
+            return None
+        return self._subscriptions.get_task_for_trusted_admin(task_id)
 
     def handle_task_client_action(
         self, action: str, task_id: int, page: int, *, chat_id: int, telegram_user_id: int,
+        token: str | None = None,
     ) -> BotReply | None:
-        """name/tg — следующий текст: имя клиента / @username; delname —
-        удалить имя; unlink — подтверждение «❌ Отвязать Telegram»;
-        unlinkyes — отвязать. None — не менеджер, функция выключена или
-        задачи нет."""
-        if not self._is_trusted(telegram_user_id) or self._client_names is None:
-            return None
-        task = self._subscriptions.get_task_for_trusted_admin(task_id)
+        """name/tg — следующий текст: имя клиента / @username (с номером
+        машины и «❌ Отмена»); delname — удалить имя; unlink — экран
+        подтверждения отвязки; linkyes/unlinkyes — подтверждение с
+        одноразовым кодом экрана; cancel — назад к карточке. None — не
+        менеджер, функция выключена или задачи нет."""
+        task = self._task_client_card_or_none(task_id, telegram_user_id)
         if task is None:
             return None
+        if action == "cancel":
+            self.drop_task_client_step(chat_id)
+            return self._trusted_task_detail_reply(task, page)
         if action == "name":
             self._states.set(
                 chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_TASK_CLIENT_NAME,
                 payload={"task_id": task.id, "page": page},
             )
-            return BotReply(text=texts.CLIENT_NAME_PROMPT)
+            return BotReply(
+                text=texts.format_task_client_input_prompt(task.car_number, texts.CLIENT_NAME_PROMPT),
+                task_client_cancel=(task.id, page),
+            )
         if action == "tg":
+            if task.status != "active":
+                self.drop_task_client_step(chat_id)
+                return self._trusted_task_detail_reply(task, page, note=texts.TASK_CLIENT_TASK_NOT_ACTIVE_TEXT)
             self._states.set(
                 chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_TASK_CLIENT_USERNAME,
                 payload={"task_id": task.id, "page": page},
             )
-            return BotReply(text=texts.OWNER_USERNAME_PROMPT)
+            return BotReply(
+                text=texts.format_task_client_input_prompt(task.car_number, texts.OWNER_USERNAME_PROMPT),
+                task_client_cancel=(task.id, page),
+            )
         if action == "delname":
+            self.drop_task_client_step(chat_id)
             self._client_names.delete(task.car_number)
             return self._trusted_task_detail_reply(task, page, note=texts.TASK_CLIENT_NAME_DELETED_TEXT)
-        links = self._subscriptions.manager_client_links(task.id)
         if action == "unlink":
+            links = self._subscriptions.manager_client_links(task.id)
             if not links:
+                self.drop_task_client_step(chat_id)
                 return self._trusted_task_detail_reply(task, page, note=texts.format_task_client_unlinked(0))
+            confirm_token = secrets.token_hex(4)
+            self._states.set(
+                chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_TASK_CLIENT_UNLINK_CONFIRM,
+                payload={"task_id": task.id, "page": page, "token": confirm_token, "ids": [link.id for link in links]},
+            )
             usernames = [link.telegram_username or link.owner_username_hint or "" for link in links]
             return BotReply(
                 text=texts.format_task_client_unlink_prompt(task.car_number, usernames),
-                task_client_unlink_confirm=(task.id, page),
+                task_client_confirm=("unlinkyes", task.id, page, confirm_token),
             )
         if action == "unlinkyes":
-            count = self._subscriptions.unlink_manager_client_links(task.id)
+            payload = self._take_task_client_confirm(
+                chat_id, telegram_user_id, task.id, token, step=STEP_AWAITING_TASK_CLIENT_UNLINK_CONFIRM,
+            )
+            if payload is None:
+                return self._trusted_task_detail_reply(task, page, note=texts.TASK_CLIENT_STALE_TEXT)
+            # Только привязки, показанные на экране подтверждения.
+            count = self._subscriptions.unlink_manager_client_links(task.id, only_ids=set(payload.get("ids") or []))
             return self._trusted_task_detail_reply(task, page, note=texts.format_task_client_unlinked(count))
+        # linkyes — асинхронный, см. handle_task_client_link_confirm.
         return None
 
-    def _task_client_state_task(self, chat_id: int, telegram_user_id: int, state_payload: dict | None):
+    async def handle_task_client_link_confirm(
+        self, task_id: int, page: int, *, chat_id: int, telegram_user_id: int, token: str | None,
+    ) -> BotReply | None:
+        """«✅ Привязать @x к машине?» — только с кодом этого экрана, только
+        тем же менеджером и только к той машине, что была на экране; код
+        одноразовый (диалог закрывается до привязки). Ничего не создаётся
+        до этого нажатия."""
+        task = self._task_client_card_or_none(task_id, telegram_user_id)
+        if task is None:
+            return None
+        payload = self._take_task_client_confirm(
+            chat_id, telegram_user_id, task.id, token, step=STEP_AWAITING_TASK_CLIENT_LINK_CONFIRM,
+        )
+        if payload is None or not payload.get("username"):
+            return self._trusted_task_detail_reply(task, page, note=texts.TASK_CLIENT_STALE_TEXT)
+        owner_username = payload["username"]
+        try:
+            outcome = await self._subscriptions.link_client_to_task(
+                task.id, created_by_telegram_user_id=telegram_user_id, created_by_telegram_chat_id=chat_id,
+                owner_username=owner_username, today=self._today(),
+            )
+        except OwnerResolutionError:
+            return self._trusted_task_detail_reply(task, page, note=texts.OWNER_RESOLUTION_ERROR_TEXT)
+        except ClientLinkRefusedError as exc:
+            note = (
+                texts.TASK_CLIENT_TASK_NOT_ACTIVE_TEXT if exc.reason == "task_not_active"
+                else texts.format_task_client_already_has_car(owner_username)
+            )
+            return self._trusted_task_detail_reply(self._subscriptions.get_task_for_trusted_admin(task.id) or task, page, note=note)
+        if outcome is None:
+            return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
+        note = (
+            texts.format_task_client_claim_note(owner_username, outcome.claim_link)
+            if outcome.pending_claim and outcome.claim_link
+            else texts.format_task_client_linked_note(owner_username)
+        )
+        return self._trusted_task_detail_reply(task, page, note=note)
+
+    def _fresh_task_client_state(self, chat_id: int, telegram_user_id: int, step: str):
+        """Состояние шага «Данных клиента» этого менеджера, если оно не
+        устарело (см. _TASK_CLIENT_STEP_TTL); устаревшее сбрасывается."""
+        state = self._states.get(chat_id)
+        if state is None or state.step != step or state.telegram_user_id != telegram_user_id:
+            return None
+        updated_at = state.updated_at.replace(tzinfo=timezone.utc) if state.updated_at.tzinfo is None else state.updated_at
+        if datetime.now(timezone.utc) - updated_at > _TASK_CLIENT_STEP_TTL:
+            self._clear_state(chat_id)
+            return None
+        return state
+
+    def _take_task_client_confirm(
+        self, chat_id: int, telegram_user_id: int, task_id: int, token: str | None, *, step: str,
+    ) -> dict | None:
+        """Payload экрана подтверждения, если кнопка — с этого экрана (тот же
+        менеджер, та же машина, тот же одноразовый код, не устарел); диалог
+        при этом закрывается — второе нажатие уже ничего не делает."""
+        state = self._fresh_task_client_state(chat_id, telegram_user_id, step)
+        payload = (state.payload or {}) if state is not None else {}
+        if state is None or not token or payload.get("token") != token or payload.get("task_id") != task_id:
+            return None
+        self._clear_state(chat_id)
+        return payload
+
+    def _task_client_state_task(self, chat_id: int, telegram_user_id: int, step: str):
         """(task, page) шага ввода «Данных клиента» или None (не менеджер,
-        функция выключена, задачи больше нет) — тогда диалог сбрасывается."""
-        payload = state_payload or {}
+        функция выключена, шаг устарел, задачи больше нет) — тогда диалог
+        сбрасывается."""
+        state = self._fresh_task_client_state(chat_id, telegram_user_id, step)
+        payload = (state.payload or {}) if state is not None else {}
         task = (
-            self._subscriptions.get_task_for_trusted_admin(int(payload["task_id"]))
-            if self._is_trusted(telegram_user_id) and self._client_names is not None and payload.get("task_id")
-            else None
+            self._task_client_card_or_none(int(payload["task_id"]), telegram_user_id)
+            if payload.get("task_id") else None
         )
         if task is None:
             self._clear_state(chat_id)
@@ -3564,14 +3685,17 @@ class ConversationController:
     def _handle_task_client_name_input(
         self, raw_text: str, *, chat_id: int, telegram_user_id: int, state_payload: dict | None,
     ) -> BotReply:
-        found = self._task_client_state_task(chat_id, telegram_user_id, state_payload)
+        found = self._task_client_state_task(chat_id, telegram_user_id, STEP_AWAITING_TASK_CLIENT_NAME)
         if found is None:
             return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
         task, page = found
         try:
             name = normalize_client_name(raw_text)
         except ClientNameValidationError as exc:
-            return BotReply(text=f"❌ {exc.message}\n\n{texts.CLIENT_NAME_PROMPT}")
+            return BotReply(
+                text=texts.format_task_client_input_prompt(task.car_number, f"❌ {exc.message}\n\n{texts.CLIENT_NAME_PROMPT}"),
+                task_client_cancel=(task.id, page),
+            )
         self._clear_state(chat_id)
         self._client_names.set(task.car_number, name, updated_by=telegram_user_id)
         return self._trusted_task_detail_reply(task, page, note=texts.TASK_CLIENT_NAME_SAVED_TEXT)
@@ -3579,30 +3703,31 @@ class ConversationController:
     async def _handle_task_client_username_input(
         self, raw_text: str, *, chat_id: int, telegram_user_id: int, state_payload: dict | None,
     ) -> BotReply:
-        found = self._task_client_state_task(chat_id, telegram_user_id, state_payload)
+        """Логин клиента ничего не создаёт: дальше — экран «✅ Привязать @x к
+        машине?» с одноразовым кодом (см. handle_task_client_link_confirm)."""
+        found = self._task_client_state_task(chat_id, telegram_user_id, STEP_AWAITING_TASK_CLIENT_USERNAME)
         if found is None:
             return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
         task, page = found
         try:
             owner_username = normalize_telegram_username(raw_text)
         except UsernameValidationError as exc:
-            return BotReply(text=f"❌ {exc.message}\n\n{texts.OWNER_USERNAME_PROMPT}")
-        self._clear_state(chat_id)
-        try:
-            outcome = await self._subscriptions.link_client_to_task(
-                task.id, created_by_telegram_user_id=telegram_user_id, created_by_telegram_chat_id=chat_id,
-                owner_username=owner_username, today=self._today(),
+            return BotReply(
+                text=texts.format_task_client_input_prompt(task.car_number, f"❌ {exc.message}\n\n{texts.OWNER_USERNAME_PROMPT}"),
+                task_client_cancel=(task.id, page),
             )
-        except OwnerResolutionError:
-            return self._trusted_task_detail_reply(task, page, note=texts.OWNER_RESOLUTION_ERROR_TEXT)
-        if outcome is None:
-            return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
-        note = (
-            texts.format_task_client_claim_note(owner_username, outcome.claim_link)
-            if outcome.pending_claim and outcome.claim_link
-            else texts.format_task_client_linked_note(owner_username)
+        if task.status != "active":
+            self._clear_state(chat_id)
+            return self._trusted_task_detail_reply(task, page, note=texts.TASK_CLIENT_TASK_NOT_ACTIVE_TEXT)
+        confirm_token = secrets.token_hex(4)
+        self._states.set(
+            chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_TASK_CLIENT_LINK_CONFIRM,
+            payload={"task_id": task.id, "page": page, "token": confirm_token, "username": owner_username},
         )
-        return self._trusted_task_detail_reply(task, page, note=note)
+        return BotReply(
+            text=texts.format_task_client_link_confirm_prompt(task.car_number, owner_username),
+            task_client_confirm=("linkyes", task.id, page, confirm_token),
+        )
 
     def handle_trusted_task_toggle(
         self, task_id: int, page: int, *, telegram_user_id: int,

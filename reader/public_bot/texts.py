@@ -206,12 +206,16 @@ def format_client_lines(
     return lines
 
 
-def _add_car_client_lines(*, owner_username: str | None, client_name: str | None) -> list[str]:
+def _add_car_client_lines(*, owner_username: str | None, client_name: str | None, linked: bool) -> list[str]:
     """Клиент на подтверждении и в итоге Add Car: без имени — прежняя строка
-    «👤 Владелец: @логин» (или ничего); с именем — «👤 Клиент» и «🔗 Telegram»."""
+    «👤 Владелец: @логин» (или ничего); с именем — «👤 Клиент» и «🔗 Telegram»,
+    как на карточке машины: логин — привязанным, только когда привязка уже
+    есть (linked), иначе «не привязан» и «⏳ Ждёт подтверждения: @логин»."""
     if not client_name:
         return [f"👤 Владелец: @{owner_username}"] if owner_username else []
-    return format_client_lines(client_name, [owner_username] if owner_username else [])
+    if owner_username and linked:
+        return format_client_lines(client_name, [owner_username])
+    return format_client_lines(client_name, [], pending_hints=[owner_username] if owner_username else [])
 
 # Бессрочный мониторинг (см. задачу "убрать выбор срока мониторинга") —
 # вместо выбора срока Add Car заканчивается одним подтверждением (см.
@@ -236,7 +240,8 @@ def format_add_car_confirm_prompt(
     чтобы опечатка в номере не включала мониторинг молча. client_name — имя
     клиента, которое указал менеджер (см. CLIENT_NAME_PROMPT)."""
     lines = [f"🚗 {format_plate_for_telegram(car_number)}"]
-    lines += _add_car_client_lines(owner_username=owner_username, client_name=client_name)
+    # До добавления ничего ещё не привязано.
+    lines += _add_car_client_lines(owner_username=owner_username, client_name=client_name, linked=False)
     lines += ["", "Добавить автомобиль и включить проверку штрафов?"]
     return "\n".join(lines)
 
@@ -610,7 +615,9 @@ def format_delegated_add_car_summary(
     показывает, пока он не claimed, см. design report). Срока нет — та же
     первая строка, что и у self-service (см. format_add_car_summary)."""
     formatted_car_number = format_plate_for_telegram(car_number)
-    client_lines = _add_car_client_lines(owner_username=owner_username, client_name=client_name)
+    client_lines = _add_car_client_lines(
+        owner_username=owner_username, client_name=client_name, linked=not pending_claim,
+    )
 
     if not check_ok:
         lines = [
@@ -659,7 +666,7 @@ def format_delegated_add_car_without_client_summary(
     никогда (см. design report: username клиента не обязателен)."""
     formatted_car_number = format_plate_for_telegram(car_number)
     # Без клиента имя всё равно можно указать (Telegram — «не привязан»).
-    client_lines = _add_car_client_lines(owner_username=None, client_name=client_name)
+    client_lines = _add_car_client_lines(owner_username=None, client_name=client_name, linked=False)
 
     if not check_ok:
         return "\n".join([
@@ -948,6 +955,33 @@ TASK_CLIENT_NAME_DELETE_BUTTON_LABEL = "🗑 Удалить имя"
 TASK_CLIENT_UNLINK_BUTTON_LABEL = "❌ Отвязать Telegram"
 TASK_CLIENT_UNLINK_CONFIRM_BUTTON_LABEL = "❌ Отвязать"
 TASK_CLIENT_NAME_SAVED_TEXT = "✅ Имя клиента сохранено."
+TASK_CLIENT_CANCEL_BUTTON_LABEL = "❌ Отмена"
+TASK_CLIENT_LINK_CONFIRM_BUTTON_LABEL = "✅ Привязать"
+TASK_CLIENT_TASK_NOT_ACTIVE_TEXT = (
+    "⚠️ Мониторинг этого автомобиля выключен. Сначала включите мониторинг ▶️, затем привяжите Telegram клиента."
+)
+TASK_CLIENT_STALE_TEXT = "⚠️ Этот экран устарел — откройте автомобиль заново."
+
+
+def format_task_client_input_prompt(car_number: str, prompt: str) -> str:
+    """Ввод имени или Telegram клиента — с номером, чтобы было видно, к какой
+    машине относится ответ."""
+    return f"🚗 {format_plate_for_telegram(car_number)}\n\n{prompt}"
+
+
+def format_task_client_link_confirm_prompt(car_number: str, owner_username: str) -> str:
+    username = safe_telegram_username(owner_username) or owner_username
+    return (
+        f"🔗 Привязать @{username} к {format_plate_for_telegram(car_number)}?\n\n"
+        "Если клиент уже писал боту, автомобиль сразу появится у него в «Мои авто», "
+        "иначе будет создана одноразовая ссылка-приглашение. Уже известные штрафы "
+        "новыми уведомлениями не придут."
+    )
+
+
+def format_task_client_already_has_car(owner_username: str) -> str:
+    username = safe_telegram_username(owner_username) or owner_username
+    return f"ℹ️ У @{username} этот автомобиль уже есть в «Мои авто» — повторная привязка не нужна."
 TASK_CLIENT_NAME_DELETED_TEXT = "🗑 Имя клиента удалено."
 
 

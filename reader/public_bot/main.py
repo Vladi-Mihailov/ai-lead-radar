@@ -33,7 +33,11 @@ from reader.fines.batch_gate import BatchCheckGate
 from reader.fines.check_service import FineCheckService
 from reader.fines.detected_fine_repository import DetectedFineRepository
 from reader.fines.georgian_card_client import GeorgianCardAmountClient, GeorgianCardConfig
-from reader.fines.notification_control import EXCLUSION_SUBSCRIPTION_RESTORED, GeorgiaNotificationControl
+from reader.fines.notification_control import (
+    EXCLUSION_LATE_CLIENT_LINK,
+    EXCLUSION_SUBSCRIPTION_RESTORED,
+    GeorgiaNotificationControl,
+)
 from reader.fines.payable_amount import PayableAmountRepository
 from reader.fines.payment_status import FineStatusRepository, FineStatusTracker, PaymentPageMarkers
 from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository
@@ -591,6 +595,13 @@ async def run() -> None:
                 exclude_known_fines_for_subscription,
                 detected_fine_repository=detected_fine_repository, delivery_repository=delivery_repository,
                 reason=EXCLUSION_SUBSCRIPTION_RESTORED,
+            ),
+            # «🔗 Telegram клиента» на уже добавленной машине — без повторной
+            # рассылки уже известных штрафов клиенту и менеджеру.
+            late_link_history_excluder=functools.partial(
+                exclude_known_fines_for_subscription,
+                detected_fine_repository=detected_fine_repository, delivery_repository=delivery_repository,
+                reason=EXCLUSION_LATE_CLIENT_LINK,
             ),
         )
         # "📊 Статистика" (trusted-operator-only) — поверх уже открытых
