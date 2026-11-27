@@ -1463,3 +1463,14 @@ async def test_statistics_use_the_same_rule_as_the_check(fx):
     assert lines.count("💰 Сумма к оплате: 400 ₾") == 2  # шапка и машина
     assert "Предварительно" not in text and "уточнения" not in text
     assert not any(line.startswith("🕒 Сумм") for line in lines)
+
+
+async def test_last_day_of_the_term_is_still_within_the_term(fx):
+    task, subscription = _dated_car(fx, _CAR, [("GE1", 50)], last_date=_today_tbilisi())
+    await fx.check(task)
+    fx.controller._today = _today_tbilisi  # тот же день, что и lastDate
+
+    lines = (await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=_OWNER)).text.splitlines()
+
+    assert lines[lines.index("🧾 Штраф: 50 ₾") + 1] == "💰 К оплате: 50 ₾"
+    assert _OVERDUE_TITLE not in lines
