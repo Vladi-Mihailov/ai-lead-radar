@@ -293,7 +293,7 @@ def manager_car_detail_keyboard(page: int, *, car_id: int | None = None) -> list
     car_id — кнопка «👤 Клиент» (привязка клиента, см. client_link_screen_keyboard)."""
     rows = []
     if car_id is not None:
-        rows.append([Button.inline(texts.CLIENT_LINK_MANAGE_LABEL, encode_client_link_callback("screen", car_id, page))])
+        rows.append([Button.inline(texts.CLIENT_DATA_LABEL, encode_client_link_callback("screen", car_id, page))])
     rows.append([Button.inline(BACK_LABEL, encode_manager_cars_page_callback(page))])
     return rows
 
@@ -380,7 +380,7 @@ def add_car_confirmation_keyboard(car_id: int, *, offer_client_link: bool = Fals
 _CLIENT_LINK_PREFIXES = {
     "screen": b"trlscr:", "username": b"trlusr:", "pick": b"trlpick:", "pick_user": b"trlpk:",
     "invite": b"trlinv:", "cancel": b"trlcan:", "replace": b"trlrep:", "unlink": b"trlun:",
-    "unlink_yes": b"trluny:",
+    "unlink_yes": b"trluny:", "name": b"trlnm:", "name_clear": b"trlnc:",
 }
 _CLIENT_LINK_CONFIRM_PREFIX = b"trlok:"
 _CLIENT_LINK_DECLINE_PREFIX = b"trlno:"
@@ -431,10 +431,20 @@ def client_link_confirm_keyboard(link_id: int) -> list[list[Button]]:
     ]]
 
 
-def client_link_screen_keyboard(car_id: int, page: int, *, state: str, choosing: bool) -> list[list[Button]]:
+def client_link_screen_keyboard(
+    car_id: int, page: int, *, state: str, choosing: bool, has_name: bool = False, show_name: bool = True,
+) -> list[list[Button]]:
     """state: none/expired/pending_user/pending_invite/active. choosing —
-    показаны способы привязки (нет клиента, приглашение ждёт/истекло, замена)."""
+    показаны способы привязки (нет клиента, приглашение ждёт/истекло, замена).
+    show_name — кнопки имени клиента (✏️, а при имени ещё 🗑)."""
     rows = []
+    if show_name:
+        name_row = [Button.inline(texts.CLIENT_NAME_EDIT_LABEL, encode_client_link_callback("name", car_id, page))]
+        if has_name:
+            name_row.append(Button.inline(
+                texts.CLIENT_NAME_CLEAR_LABEL, encode_client_link_callback("name_clear", car_id, page),
+            ))
+        rows.append(name_row)
     if choosing:
         invite_label = (
             texts.CLIENT_LINK_NEW_INVITE_LABEL if state in ("pending_user", "pending_invite", "expired")

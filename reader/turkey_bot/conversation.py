@@ -54,7 +54,7 @@ from reader.turkey_bot.unified.check_service import UnifiedTurkeyCheckService
 from reader.turkey_bot.unified.models import OverallStatus
 from reader.turkey_bot.unified.run_repository import TurkeyCheckRunRepository
 from reader.turkey_bot.user_cars_repository import TurkeyUserCarsRepository
-from reader.turkey_bot.validation import normalize_plate
+from reader.turkey_bot.validation import normalize_client_name, normalize_plate
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,8 @@ _STEP_AWAITING_NEW_CAR_PLATE = "awaiting_new_car_plate"
 _STEP_AWAITING_SEARCH_QUERY = "awaiting_search_query"
 # 👤 Привязка клиента — ввод @username клиента (payload: car_id, page).
 _STEP_AWAITING_LINK_USERNAME = "awaiting_link_username"
+# 👤 Данные клиента — ввод имени клиента (payload: car_id, page).
+_STEP_AWAITING_CLIENT_NAME = "awaiting_client_name"
 
 # Выбор клиента из пользователей бота — столько кнопок на странице.
 _LINK_PICK_PAGE_SIZE = 8
@@ -212,7 +214,7 @@ class BotReply:
     # (клиенту/менеджеру), отправляет handlers.py.
     offer_client_link: bool = False
     manager_car_detail_car_id: int | None = None
-    client_link_screen: tuple[int, int, str, bool] | None = None
+    client_link_screen: tuple[int, int, str, bool, bool] | None = None
     client_link_pick: tuple[int, int, tuple[tuple[int, str], ...], int, int] | None = None
     client_link_unlink_confirm: tuple[int, int] | None = None
     client_link_confirm_id: int | None = None
@@ -340,6 +342,11 @@ class ConversationController:
         if state is not None and state.step == _STEP_AWAITING_SEARCH_QUERY:
             return self._handle_search_query_input(
                 stripped, chat_id=chat_id, telegram_user_id=telegram_user_id,
+            )
+
+        if state is not None and state.step == _STEP_AWAITING_CLIENT_NAME:
+            return self._handle_client_name_input(
+                stripped, state.payload or {}, chat_id=chat_id, telegram_user_id=telegram_user_id,
             )
 
         if state is not None and state.step == _STEP_AWAITING_LINK_USERNAME:
@@ -747,18 +754,24 @@ class ConversationController:
         return active, ("pending_user" if pending.invited_user_id is not None else "pending_invite"), pending
 
     def _client_link_status_lines(self, car: TurkeyUserCar) -> list[str]:
+        """«👤 Клиент: имя» (имя вводит менеджер, может не быть) и
+        «🔗 Telegram: …» (только подтверждённая привязка), плюс строка
+        приглашения, если оно ждёт или истекло."""
         active, pending_state, pending = self._client_link_state(car)
-        lines = []
+        telegram = None
         if active is not None:
-            lines.append(texts.format_client_link_status_line(
-                state="active", person=self._person(active.client_telegram_user_id), moment=active.confirmed_at,
-            ))
+            profile = self._client_links.profile(active.client_telegram_user_id)
+            username, first_name, last_name = profile if profile is not None else (None, None, None)
+            telegram = texts.format_linked_telegram(
+                username=username, first_name=first_name, last_name=last_name, linked_on=active.confirmed_at,
+            )
+        lines = texts.format_client_card_lines(
+            display_name=self._garage.get_client_display_name(car.id), telegram=telegram,
+        )
         if pending is not None:
             lines.append(texts.format_client_link_status_line(
                 state=pending_state, person=self._person(pending.invited_user_id), moment=pending.expires_at,
             ))
-        if not lines:
-            lines.append(texts.format_client_link_status_line(state="none"))
         return lines
 
     def _client_link_screen(
@@ -774,7 +787,10 @@ class ConversationController:
         )
         if notice:
             text = f"{notice}\n\n{text}"
-        return BotReply(text=text, client_link_screen=(car.id, page, state, choosing), outgoing_messages=outgoing)
+        has_name = self._garage.get_client_display_name(car.id) is not None
+        return BotReply(
+            text=text, client_link_screen=(car.id, page, state, choosing, has_name), outgoing_messages=outgoing,
+        )
 
     def handle_client_link_action(
         self, action: str, car_id: int, page: int, extra: int | None, *, chat_id: int, telegram_user_id: int,
@@ -791,6 +807,15 @@ class ConversationController:
             return self._client_link_screen(car, page)
         if action == "replace":
             return self._client_link_screen(car, page, replacing=True)
+        if action == "name":
+            self._states.set(
+                chat_id, telegram_user_id=telegram_user_id, step=_STEP_AWAITING_CLIENT_NAME,
+                payload={"car_id": car.id, "page": page},
+            )
+            return BotReply(text=texts.CLIENT_NAME_ASK_TEXT, show_cancel_button=True)
+        if action == "name_clear":
+            self._garage.set_client_display_name(car.id, None)
+            return self._client_link_screen(car, page, notice=texts.CLIENT_NAME_CLEARED_TEXT)
         if action == "username":
             self._states.set(
                 chat_id, telegram_user_id=telegram_user_id, step=_STEP_AWAITING_LINK_USERNAME,
@@ -807,7 +832,7 @@ class ConversationController:
             link, url = self._client_links.create_invite(car, created_by=telegram_user_id)
             return BotReply(
                 text=texts.format_client_link_invite(car.car_number, url=url, expires_at=link.expires_at),
-                client_link_screen=(car.id, page, "pending_invite", False),
+                client_link_screen=(car.id, page, "pending_invite", False, False),
             )
         if action == "cancel":
             self._client_links.cancel_pending(car, closed_by=telegram_user_id)
@@ -858,7 +883,7 @@ class ConversationController:
         person = self._person(client_id)
         return BotReply(
             text=texts.format_client_link_request_sent(car.car_number, person=person, expires_at=link.expires_at),
-            client_link_screen=(car.id, page, "pending_user", False),
+            client_link_screen=(car.id, page, "pending_user", False, False),
             outgoing_messages=(OutgoingMessage(
                 chat_id=client_id, text=texts.format_client_link_request(car.car_number), confirm_link_id=link.id,
                 on_failure_text=texts.format_client_link_request_failed(car.car_number, person=person),
@@ -878,6 +903,22 @@ class ConversationController:
         if client_id is None:
             return self._client_link_screen(car, page, notice=texts.format_client_link_unknown_username(username))
         return self._request_client(car, page, client_id, method=METHOD_USERNAME, telegram_user_id=telegram_user_id)
+
+    def _handle_client_name_input(
+        self, raw_text: str, payload: dict, *, chat_id: int, telegram_user_id: int,
+    ) -> BotReply:
+        """Имя клиента от менеджера — только показ: не user_id, не доступ,
+        уведомлений не создаёт. Ошибка — подсказка и снова ввод."""
+        car = self._garage.get_any_car(int(payload.get("car_id", 0)))
+        if self._client_links is None or not self._is_trusted(telegram_user_id) or car is None:
+            self._states.clear(chat_id)
+            return BotReply(text=texts.UNKNOWN_BUTTON_TEXT, show_main_menu=True)
+        name, error = normalize_client_name(raw_text)
+        if error is not None:
+            return BotReply(text=texts.CLIENT_NAME_ERROR_TEXTS[error], show_cancel_button=True)
+        self._states.clear(chat_id)
+        self._garage.set_client_display_name(car.id, name)
+        return self._client_link_screen(car, int(payload.get("page", 0)), notice=texts.CLIENT_NAME_SAVED_TEXT)
 
     _LINK_ERROR_TEXTS = {
         "invalid": texts.CLIENT_LINK_INVALID_TEXT,

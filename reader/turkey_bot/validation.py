@@ -63,3 +63,46 @@ def normalize_plate(raw: str) -> str | None:
     if not _NORMALIZED_RE.fullmatch(candidate):
         return None
     return candidate
+
+
+# ---- Имя клиента, которое вводит менеджер (без Telegram-логина) ----
+# Только для показа менеджеру: не идентификатор, не доступ, не уведомления.
+
+import unicodedata  # noqa: E402
+
+CLIENT_NAME_MAX_LENGTH = 64
+# Кроме букв любого алфавита, цифр и пробелов — обычная пунктуация имён.
+_CLIENT_NAME_PUNCTUATION = frozenset("-'’.,()#№/&_")
+
+
+def normalize_client_name(raw: str | None) -> tuple[str | None, str | None]:
+    """(имя, None) или (None, код ошибки: empty | too_long | bad_chars).
+
+    Управляющие и форматирующие символы (в т.ч. невидимые) удаляются,
+    любые пробельные — схлопываются в один обычный пробел, края обрезаются.
+    Остальное хранится как есть: буквы и знаки любых алфавитов (кириллица,
+    грузинский, латиница…), цифры, пробел и обычная пунктуация имён."""
+    if raw is None:
+        return None, "empty"
+    kept = []
+    for char in raw:
+        category = unicodedata.category(char)
+        if char.isspace() or category in ("Zs", "Zl", "Zp"):
+            kept.append(" ")
+        elif category.startswith("C"):
+            continue  # Cc/Cf/Co/Cs/Cn — управляющие, форматирующие, невидимые
+        else:
+            kept.append(char)
+    name = " ".join("".join(kept).split())
+    if not name:
+        return None, "empty"
+    if len(name) > CLIENT_NAME_MAX_LENGTH:
+        return None, "too_long"
+    for char in name:
+        category = unicodedata.category(char)
+        if char == " " or category[0] in ("L", "M", "N") or char in _CLIENT_NAME_PUNCTUATION:
+            continue
+        return None, "bad_chars"
+    if not any(unicodedata.category(char)[0] in ("L", "N") for char in name):
+        return None, "bad_chars"
+    return name, None

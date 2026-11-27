@@ -1550,7 +1550,7 @@ def format_client_link_status_line(
 
 
 def format_client_link_screen(plate: str, *, status_line: str, choosing: bool, replacing: bool = False) -> str:
-    lines = [f"🚗 {format_plate_for_telegram(plate)}", status_line]
+    lines = [f"🚗 Автомобиль: {format_plate_for_telegram(plate)}", status_line]
     if replacing:
         lines += ["", "Текущий клиент остаётся привязанным, пока новый не подтвердит привязку."]
     if choosing:
@@ -1629,3 +1629,43 @@ def format_client_link_released(plate: str) -> str:
 CLIENT_LINK_CARD_LINE = "🔗 Привязан менеджером"
 CLIENT_LINK_IS_OWNER_TEXT = "ℹ️ Этот пользователь — владелец автомобиля, привязка не нужна."
 CLIENT_LINK_ALREADY_LINKED_TEXT = "ℹ️ Этот клиент уже привязан к автомобилю."
+
+
+# ---- 👤 Данные клиента: имя без Telegram-логина (только для менеджера) ----
+
+CLIENT_DATA_LABEL = "👤 Данные клиента"
+CLIENT_NAME_EDIT_LABEL = "✏️ Имя клиента"
+CLIENT_NAME_CLEAR_LABEL = "🗑 Удалить имя"
+CLIENT_NAME_ASK_TEXT = (
+    "✏️ Введите имя клиента (до 64 символов): буквы любого алфавита, цифры, пробелы, «-».\n"
+    "Например: Иван Иванов, Ahmet 007, Клиент 12345."
+)
+CLIENT_NAME_SAVED_TEXT = "✅ Имя клиента сохранено."
+CLIENT_NAME_CLEARED_TEXT = "🗑 Имя клиента удалено."
+CLIENT_NAME_ERROR_TEXTS = {
+    "empty": "⚠️ Имя пустое — введите хотя бы одну букву или цифру.",
+    "too_long": "⚠️ Имя длиннее 64 символов — сократите его.",
+    "bad_chars": "⚠️ В имени можно использовать буквы, цифры, пробелы и «-».",
+}
+
+
+def format_client_card_lines(*, display_name: str | None, telegram: str | None) -> list[str]:
+    """Блок клиента в карточке машины у менеджера:
+        👤 Клиент: Иван Иванов
+        🔗 Telegram: @ivan123   (или «не привязан» без подтверждённой привязки)
+    Имя экранируется для Telegram markdown; telegram — уже готовая строка."""
+    name = escape_telethon_markdown(display_name) if display_name else "не указан"
+    return [f"👤 Клиент: {name}", f"🔗 Telegram: {telegram or 'не привязан'}"]
+
+
+def format_linked_telegram(
+    *, username: str | None, first_name: str | None, last_name: str | None, linked_on: datetime,
+) -> str:
+    """Подтверждённый Telegram клиента: @username, а без него — имя из Telegram."""
+    safe_username = safe_telegram_username(username)
+    if safe_username:
+        who = f"@{safe_username}"
+    else:
+        name = _full_name(first_name, last_name)
+        who = escape_telethon_markdown(name) if name else "аккаунт без @username"
+    return f"{who} · привязан {linked_on.astimezone(_DISPLAY_TZ).strftime('%d.%m.%Y')}"

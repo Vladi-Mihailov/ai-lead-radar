@@ -172,7 +172,8 @@ async def test_link_actions_are_manager_only_and_check_the_car(fx):
     assert fx.controller.handle_client_link_action("screen", 999999, 0, None, chat_id=_MANAGER,
                                                    telegram_user_id=_MANAGER) is None
     screen = fx.action("screen", car)
-    assert "Клиент не привязан" in screen.text and screen.client_link_screen == (car.id, 0, "none", True)
+    assert "🔗 Telegram: не привязан" in screen.text
+    assert screen.client_link_screen == (car.id, 0, "none", True, False)
 
 
 # ---- Ссылка-приглашение ----
@@ -299,10 +300,10 @@ async def test_manager_detail_shows_the_linked_client(fx):
     car, _ = await fx.manager_car()
     await fx.link_client(car)
     detail = fx.controller.handle_manager_car_open(car.id, 0, telegram_user_id=_MANAGER)
-    assert "👤 Клиент: Client (@client_one) · привязан 20.11.2026" in detail.text
+    assert "🔗 Telegram: @client_one · привязан 20.11.2026" in detail.text
     assert detail.manager_car_detail_car_id == car.id
     screen = fx.action("screen", car)
-    assert screen.client_link_screen == (car.id, 0, "active", False)
+    assert screen.client_link_screen == (car.id, 0, "active", False, False)
 
 
 async def test_replace_moves_the_link_and_keeps_monitoring(fx):

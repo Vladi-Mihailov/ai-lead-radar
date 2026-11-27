@@ -397,8 +397,12 @@ def _first_message_buttons(reply: BotReply, *, is_trusted: bool, has_extra: bool
         car_id, page, options, pick_page, total_pages = reply.client_link_pick
         return client_link_pick_keyboard(car_id, page, list(options), pick_page=pick_page, total_pages=total_pages)
     if reply.client_link_screen is not None:
-        car_id, page, state, choosing = reply.client_link_screen
-        return client_link_screen_keyboard(car_id, page, state=state, choosing=choosing)
+        car_id, page, state, choosing, has_name = reply.client_link_screen
+        # Под ссылкой-приглашением и «запрос отправлен» — только «⬅️ Назад».
+        show_name = choosing or state == "active"
+        return client_link_screen_keyboard(
+            car_id, page, state=state, choosing=choosing, has_name=has_name, show_name=show_name,
+        )
     if reply.car_delete_confirm_car_id is not None:
         return car_delete_confirm_keyboard(reply.car_delete_confirm_car_id)
     if reply.car_card is not None:
