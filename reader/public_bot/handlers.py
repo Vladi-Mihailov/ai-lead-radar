@@ -28,6 +28,7 @@ from reader.public_bot.keyboards import (
     check_now_options_keyboard,
     debt_refresh_confirm_keyboard,
     debt_statistics_keyboard,
+    decode_add_car_client_name_callback,
     decode_add_car_confirm_callback,
     decode_add_client_decision_callback,
     decode_check_now_callback,
@@ -37,6 +38,7 @@ from reader.public_bot.keyboards import (
     decode_debt_refresh_confirm_callback,
     decode_debt_refresh_pick_callback,
     decode_debt_report_page_callback,
+    decode_task_client_callback,
     decode_fine_status_action_callback,
     decode_fine_status_back_callback,
     decode_fine_status_cancel_callback,
@@ -94,6 +96,7 @@ from reader.public_bot.keyboards import (
     search_result_keyboard,
     trusted_stop_confirm_keyboard,
     trusted_stop_options_keyboard,
+    task_client_unlink_confirm_keyboard,
     trusted_task_detail_keyboard,
     trusted_task_off_keyboard,
     trusted_tasks_page_keyboard,
@@ -311,6 +314,16 @@ def register(
             await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
+        # «👤 Имя клиента» под подтверждением Add Car менеджера — следующий
+        # текст станет именем клиента (необязательно).
+        add_car_client_name_plate = decode_add_car_client_name_callback(data)
+        if add_car_client_name_plate is not None:
+            reply = controller.handle_add_car_client_name_prompt(
+                chat_id=event.chat_id, telegram_user_id=event.sender_id, car_number=add_car_client_name_plate,
+            )
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
         # "✅ Добавить" — и старые кнопки выбора срока из истории чата
         # (срока больше нет, см. задачу "убрать выбор срока мониторинга":
         # такое нажатие подтверждает тот же шаг; номера в них нет).
@@ -454,6 +467,16 @@ def register(
         if trusted_task_open is not None:
             task_id, page = trusted_task_open
             reply = controller.handle_trusted_task_open(task_id, page, telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        # «👤 Данные клиента» на карточке машины менеджера.
+        task_client = decode_task_client_callback(data)
+        if task_client is not None:
+            action, task_id, page = task_client
+            reply = controller.handle_task_client_action(
+                action, task_id, page, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
             await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
@@ -1019,7 +1042,9 @@ async def _send_reply(
     if reply.show_main_menu:
         buttons = main_menu_keyboard(is_trusted=is_trusted)
     elif reply.add_car_confirm_plate is not None:
-        buttons = add_car_confirm_keyboard(reply.add_car_confirm_plate)
+        buttons = add_car_confirm_keyboard(
+            reply.add_car_confirm_plate, client_name_button=getattr(reply, "add_car_client_name_button", False),
+        )
     elif reply.show_add_client_decision_buttons:
         buttons = add_client_decision_keyboard()
     elif reply.check_now_options:
@@ -1043,8 +1068,17 @@ async def _send_reply(
             reply.trusted_tasks_page_options or [],
             page=reply.trusted_tasks_page, total_pages=reply.trusted_tasks_total_pages,
         )
+    elif getattr(reply, "task_client_unlink_confirm", None) is not None:
+        task_id, page = reply.task_client_unlink_confirm
+        buttons = task_client_unlink_confirm_keyboard(task_id, page=page)
     elif reply.trusted_task_detail_id is not None:
-        buttons = trusted_task_detail_keyboard(page=reply.trusted_task_detail_page)
+        client_buttons = getattr(reply, "trusted_task_client_buttons", False)
+        buttons = trusted_task_detail_keyboard(
+            page=reply.trusted_task_detail_page,
+            task_id=reply.trusted_task_detail_id if client_buttons else None,
+            has_client_name=getattr(reply, "trusted_task_client_has_name", False),
+            can_unlink=getattr(reply, "trusted_task_client_can_unlink", False),
+        )
     elif reply.trusted_task_off_id is not None:
         buttons = trusted_task_off_keyboard(reply.trusted_task_off_id, page=reply.trusted_task_off_page)
     elif reply.my_cars_page_options is not None:

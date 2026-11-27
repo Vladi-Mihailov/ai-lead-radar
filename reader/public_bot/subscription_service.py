@@ -89,6 +89,17 @@ class DelegatedAddCarOutcome:
 
 
 @dataclass(frozen=True)
+class ClientLinkOutcome:
+    """Привязка Telegram клиента к задаче (см. SubscriptionService.
+    link_client_to_task и add_delegated_car): подписка либо pending_claim с
+    одноразовой ссылкой, которую клиент подтверждает сам."""
+
+    subscription: FineMonitoringSubscription
+    pending_claim: bool
+    claim_link: str | None
+
+
+@dataclass(frozen=True)
 class ClaimOutcome:
     subscription: FineMonitoringSubscription
 
@@ -451,6 +462,101 @@ class SubscriptionService:
             end_date=end_date,
         )
 
+        link = self._attach_client(
+            task, resolved=resolved, owner_username=owner_username,
+            created_by_telegram_user_id=created_by_telegram_user_id,
+            created_by_telegram_chat_id=created_by_telegram_chat_id,
+            start_date=start_date, end_date=end_date,
+        )
+
+        check_result = await self._check_service.check_task(task)
+
+        return DelegatedAddCarOutcome(
+            task=task,
+            subscription=link.subscription,
+            pending_claim=link.pending_claim,
+            check_ok=check_result.shows_as_ok,
+            new_fines_count=len(check_result.new_fines) if check_result.shows_as_ok else 0,
+            claim_link=link.claim_link,
+        )
+
+    async def link_client_to_task(
+        self,
+        task_id: int,
+        *,
+        created_by_telegram_user_id: int,
+        created_by_telegram_chat_id: int,
+        owner_username: str,
+        today: date,
+    ) -> ClientLinkOutcome | None:
+        """«🔗 Telegram клиента» на карточке уже добавленной машины: тот же
+        механизм, что и у add_delegated_car (резолв @username → подписка,
+        иначе pending_claim с одноразовой ссылкой, клиент подтверждает сам),
+        но на СУЩЕСТВУЮЩУЮ задачу — без второй задачи мониторинга и без
+        внеочередной проверки police.ge. None — задачи нет.
+        OwnerResolutionError пробрасывается как у add_delegated_car."""
+        task = self._task_repository.get(task_id)
+        if task is None:
+            return None
+        resolved = await resolve_owner_username(
+            owner_username,
+            user_repository=self._user_repository,
+            telegram_client=self._owner_resolver_client,
+        )
+        return self._attach_client(
+            task, resolved=resolved, owner_username=owner_username,
+            created_by_telegram_user_id=created_by_telegram_user_id,
+            created_by_telegram_chat_id=created_by_telegram_chat_id,
+            start_date=today, end_date=UNLIMITED_END_DATE,
+        )
+
+    def subscriptions_for_task(self, task_id: int) -> list[FineMonitoringSubscription]:
+        """Все подписки этой задачи (любого статуса и владельца) — для
+        карточки машины менеджера. Только чтение."""
+        task = self._task_repository.get(task_id)
+        if task is None:
+            return []
+        return [
+            subscription
+            for subscription in self._subscription_repository.list_by_car_number(task.car_number)
+            if subscription.monitoring_task_id == task_id
+        ]
+
+    def manager_client_links(self, task_id: int) -> list[FineMonitoringSubscription]:
+        """Привязки клиентов, которые сделал менеджер (created_by_telegram_
+        user_id задан): действующие, выключенные и ещё не подтверждённые
+        приглашения этой задачи. Подписки, которые клиент оформил сам, сюда
+        не входят — менеджер их не отвязывает."""
+        return [
+            subscription
+            for subscription in self.subscriptions_for_task(task_id)
+            if subscription.created_by_telegram_user_id is not None
+            and subscription.status in ("active", "stopped", "expired", "pending_claim")
+        ]
+
+    def unlink_manager_client_links(self, task_id: int) -> int:
+        """«❌ Отвязать Telegram»: архивирует привязки из manager_client_links
+        (клиент больше не видит машину и не получает уведомлений, ссылка-
+        приглашение гаснет). История штрафов и доставок, сама задача
+        мониторинга и подписки, оформленные клиентами самостоятельно, не
+        меняются. Возвращает число отвязанных."""
+        return sum(
+            1 for subscription in self.manager_client_links(task_id)
+            if self._subscription_repository.archive(subscription.id)
+        )
+
+    def _attach_client(
+        self,
+        task: FineMonitoringTask,
+        *,
+        resolved,
+        owner_username: str,
+        created_by_telegram_user_id: int,
+        created_by_telegram_chat_id: int,
+        start_date: date,
+        end_date: date,
+    ) -> ClientLinkOutcome:
+        car_number = task.car_number
         if resolved is not None:
             subscription = self._create_or_update_subscription(
                 task_id=task.id,
@@ -476,30 +582,20 @@ class SubscriptionService:
                 last_name=resolved.last_name,
                 car_number=car_number,
             )
-            claim_link = None
-            pending = False
-        else:
-            subscription = self._create_or_refresh_pending_claim(
-                task_id=task.id,
-                car_number=car_number,
-                owner_username_hint=owner_username,
-                created_by_telegram_user_id=created_by_telegram_user_id,
-                created_by_telegram_chat_id=created_by_telegram_chat_id,
-                start_date=start_date,
-                end_date=end_date,
-            )
-            claim_link = self._build_claim_link(subscription.claim_token)
-            pending = True
+            return ClientLinkOutcome(subscription=subscription, pending_claim=False, claim_link=None)
 
-        check_result = await self._check_service.check_task(task)
-
-        return DelegatedAddCarOutcome(
-            task=task,
-            subscription=subscription,
-            pending_claim=pending,
-            check_ok=check_result.shows_as_ok,
-            new_fines_count=len(check_result.new_fines) if check_result.shows_as_ok else 0,
-            claim_link=claim_link,
+        subscription = self._create_or_refresh_pending_claim(
+            task_id=task.id,
+            car_number=car_number,
+            owner_username_hint=owner_username,
+            created_by_telegram_user_id=created_by_telegram_user_id,
+            created_by_telegram_chat_id=created_by_telegram_chat_id,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        return ClientLinkOutcome(
+            subscription=subscription, pending_claim=True,
+            claim_link=self._build_claim_link(subscription.claim_token),
         )
 
     async def add_delegated_car_without_client(

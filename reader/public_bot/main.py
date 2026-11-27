@@ -56,6 +56,7 @@ from reader.protocol_support.telethon_gateway import (
 )
 from reader.public_bot.collector_api import run_collector_api_forever
 from reader.public_bot.collector_ingest_service import CollectorIngestService
+from reader.public_bot.client_names import CarClientNameRepository
 from reader.public_bot.conversation import ConversationController
 from reader.public_bot.daily_recheck import (
     DailyRecheckRepository,
@@ -744,6 +745,7 @@ async def run() -> None:
             daily_recheck_service=daily_recheck_service,
             payable_amount_service=payable_amount_service,
             amount_delivery_service=amount_delivery_service,
+            client_name_repository=CarClientNameRepository(settings.app.users_db_file),
         )
 
         # «👨‍💼 Оператор»: живой диалог через группу менеджеров (общая

@@ -122,6 +122,11 @@ from reader.fines.suppression import is_fine_output_suppressed
 from reader.fines.validation import FineValidationError, looks_like_car_number, normalize_car_number
 from reader.plate_display import format_plate_for_telegram
 from reader.public_bot import manager_alerts, texts
+from reader.public_bot.client_names import (
+    CarClientNameRepository,
+    ClientNameValidationError,
+    normalize_client_name,
+)
 from reader.public_bot.daily_recheck import DailyRecheckService
 from reader.public_bot.conversation_state_repository import (
     BotConversationStateRepository,
@@ -177,6 +182,12 @@ logger = logging.getLogger(__name__)
 STEP_AWAITING_CAR_NUMBER = "awaiting_car_number"
 STEP_AWAITING_CLIENT_DECISION = "awaiting_client_decision"
 STEP_AWAITING_OWNER_USERNAME = "awaiting_owner_username"
+# «👤 Имя клиента» на подтверждении Add Car менеджера (payload — тот же, что
+# у STEP_AWAITING_ADD_CONFIRM; ✅/Отмена на этом шаге работают как там).
+STEP_AWAITING_ADD_CLIENT_NAME = "awaiting_add_client_name"
+# «Данные клиента» на карточке уже добавленной машины: payload {task_id, page}.
+STEP_AWAITING_TASK_CLIENT_NAME = "awaiting_task_client_name"
+STEP_AWAITING_TASK_CLIENT_USERNAME = "awaiting_task_client_username"
 # Последний шаг Add Car — подтверждение (см. texts.
 # format_add_car_confirm_prompt), срок больше не выбирается. Шаг выбора
 # срока ("awaiting_period") заменён им целиком; это значение по-прежнему
@@ -561,6 +572,15 @@ class BotReply:
     trusted_tasks_page_options: list[tuple[int, str, str, bool]] | None = None
     trusted_task_detail_id: int | None = None
     trusted_task_detail_page: int | None = None
+    # Кнопки «Данных клиента» на карточке машины (см. handle_task_client_action):
+    # есть ли имя (🗑 Удалить имя) и привязки менеджера (❌ Отвязать Telegram).
+    trusted_task_client_buttons: bool = False
+    trusted_task_client_has_name: bool = False
+    trusted_task_client_can_unlink: bool = False
+    # (task_id, page) — подтверждение «❌ Отвязать Telegram».
+    task_client_unlink_confirm: tuple[int, int] | None = None
+    # «👤 Имя клиента» под подтверждением Add Car (только менеджеру).
+    add_car_client_name_button: bool = False
     trusted_task_off_id: int | None = None
     trusted_task_off_page: int | None = None
     trusted_one_off_plate: str | None = None
@@ -696,7 +716,11 @@ class ConversationController:
         daily_recheck_service: DailyRecheckService | None = None,
         payable_amount_service: PayableAmountService | None = None,
         amount_delivery_service=None,
+        client_name_repository: CarClientNameRepository | None = None,
     ):
+        # None — «👤 Данные клиента» (имя клиента без Telegram) выключены:
+        # экраны менеджера как раньше.
+        self._client_names = client_name_repository
         # None — сумма к оплате выключена (fine_monitor.payable_amount_enabled):
         # карточки и статистика без «💰 К оплате», кнопки «🔄 Уточнить сумму» нет.
         # Работает только вместе со статусами оплаты.
@@ -1528,6 +1552,10 @@ class ConversationController:
             # Заголовок со статусами длиннее прежнего — страница меньше, чтобы
             # всё сообщение осталось одним сообщением Telegram.
             budget = _DEBT_LIST_PAGE_CHAR_BUDGET if self._fine_status is None else _DEBT_LIST_PAGE_CHAR_BUDGET_WITH_STATUSES
+            client_names = (
+                self._client_names.get_many([car_number for car_number, _, _ in rows])
+                if self._client_names is not None else {}
+            )
             pages = _paginate_debt_blocks([
                 texts.format_debt_row(
                     car_number=car_number,
@@ -1535,6 +1563,7 @@ class ConversationController:
                     total_amount=total_amount,
                     breakdown=breakdown,
                     amounts=amounts_by_car.get(car_number) if amounts_by_car is not None else None,
+                    client_name=client_names.get(car_number),
                 )
                 for car_number, total_amount, breakdown in rows
             ], char_budget=budget)
@@ -2232,6 +2261,21 @@ class ConversationController:
                 stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, state_payload=state.payload,
             )
 
+        if state.step == STEP_AWAITING_ADD_CLIENT_NAME:
+            return self._handle_add_client_name_input(
+                stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, state_payload=state.payload,
+            )
+
+        if state.step == STEP_AWAITING_TASK_CLIENT_NAME:
+            return self._handle_task_client_name_input(
+                stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, state_payload=state.payload,
+            )
+
+        if state.step == STEP_AWAITING_TASK_CLIENT_USERNAME:
+            return await self._handle_task_client_username_input(
+                stripped, chat_id=chat_id, telegram_user_id=telegram_user_id, state_payload=state.payload,
+            )
+
         if state.step == STEP_AWAITING_TRUSTED_CHECK_NOW_CAR_NUMBER:
             return await self._handle_trusted_check_now_car_number_input(
                 stripped, chat_id=chat_id, telegram_user_id=telegram_user_id,
@@ -2412,14 +2456,20 @@ class ConversationController:
         )
         return self._add_car_confirm_reply(payload)
 
-    @staticmethod
-    def _add_car_confirm_reply(payload: dict) -> BotReply:
+    def _add_car_confirm_reply(self, payload: dict) -> BotReply:
         return BotReply(
             text=texts.format_add_car_confirm_prompt(
                 payload["car_number"], owner_username=payload.get("owner_username"),
+                client_name=payload.get("client_name"),
             ),
             add_car_confirm_plate=payload["car_number"],
+            add_car_client_name_button=self._client_name_allowed_for(payload),
         )
+
+    def _client_name_allowed_for(self, payload: dict) -> bool:
+        """Имя клиента — только в Add Car менеджера (payload delegated-flow:
+        owner_username или no_client), не в self-service."""
+        return self._client_names is not None and bool(payload.get("owner_username") or payload.get("no_client"))
 
     def _handle_owner_username_input(
         self, raw_text: str, *, chat_id: int, telegram_user_id: int, state_payload: dict | None,
@@ -2431,6 +2481,36 @@ class ConversationController:
 
         payload = dict(state_payload or {})
         payload["owner_username"] = owner_username
+        return self._ask_add_car_confirm(payload, chat_id=chat_id, telegram_user_id=telegram_user_id)
+
+    def handle_add_car_client_name_prompt(
+        self, *, chat_id: int, telegram_user_id: int, car_number: str | None,
+    ) -> BotReply | None:
+        """«👤 Имя клиента» под подтверждением Add Car менеджера: следующий
+        текст — имя клиента (необязательно). ✅ Добавить / Отмена остаются
+        под вопросом. None — не тот диалог/не менеджер/функция выключена."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+        state = self._owned_add_car_confirm_state(chat_id, telegram_user_id, car_number)
+        if state is None or not self._client_name_allowed_for(state.payload or {}):
+            return None
+        payload = dict(state.payload or {})
+        self._states.set(chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_ADD_CLIENT_NAME, payload=payload)
+        return BotReply(text=texts.CLIENT_NAME_PROMPT, add_car_confirm_plate=payload["car_number"])
+
+    def _handle_add_client_name_input(
+        self, raw_text: str, *, chat_id: int, telegram_user_id: int, state_payload: dict | None,
+    ) -> BotReply:
+        payload = dict(state_payload or {})
+        if not payload.get("car_number") or not self._client_name_allowed_for(payload) or not self._is_trusted(telegram_user_id):
+            self._clear_state(chat_id)
+            return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
+        try:
+            payload["client_name"] = normalize_client_name(raw_text)
+        except ClientNameValidationError as exc:
+            return BotReply(
+                text=f"❌ {exc.message}\n\n{texts.CLIENT_NAME_PROMPT}", add_car_confirm_plate=payload["car_number"],
+            )
         return self._ask_add_car_confirm(payload, chat_id=chat_id, telegram_user_id=telegram_user_id)
 
     async def _handle_trusted_check_now_car_number_input(
@@ -2708,7 +2788,7 @@ class ConversationController:
         state = self._states.get(chat_id)
         if (
             state is None
-            or state.step not in _ADD_CONFIRM_STEPS
+            or state.step not in (*_ADD_CONFIRM_STEPS, STEP_AWAITING_ADD_CLIENT_NAME)
             or state.telegram_user_id != telegram_user_id
         ):
             return None
@@ -2780,16 +2860,19 @@ class ConversationController:
         self._clear_state(chat_id)
         today = self._today()
 
+        # Имя клиента — только в delegated-flow (см. _client_name_allowed_for).
+        client_name = payload.get("client_name") if self._client_name_allowed_for(payload) else None
+
         if no_client:
             return await self._complete_delegated_add_car_without_client(
                 car_number=car_number, today=today,
-                chat_id=chat_id, telegram_user_id=telegram_user_id,
+                chat_id=chat_id, telegram_user_id=telegram_user_id, client_name=client_name,
             )
 
         if owner_username:
             return await self._complete_delegated_add_car(
                 car_number=car_number, owner_username=owner_username, today=today,
-                chat_id=chat_id, telegram_user_id=telegram_user_id,
+                chat_id=chat_id, telegram_user_id=telegram_user_id, client_name=client_name,
             )
 
         return await self._complete_self_add_car(
@@ -2883,7 +2966,7 @@ class ConversationController:
         ]]
 
     async def _complete_delegated_add_car(
-        self, *, car_number, owner_username, today, chat_id, telegram_user_id,
+        self, *, car_number, owner_username, today, chat_id, telegram_user_id, client_name=None,
     ) -> BotReply:
         try:
             outcome = await self._subscriptions.add_delegated_car(
@@ -2895,6 +2978,7 @@ class ConversationController:
             )
         except OwnerResolutionError:
             return BotReply(text=texts.OWNER_RESOLUTION_ERROR_TEXT, show_main_menu=True)
+        self._save_client_name(car_number, client_name, updated_by=telegram_user_id)
 
         return BotReply(
             text=texts.format_delegated_add_car_summary(
@@ -2904,12 +2988,13 @@ class ConversationController:
                 new_fines_count=outcome.new_fines_count,
                 pending_claim=outcome.pending_claim,
                 claim_link=outcome.claim_link,
+                client_name=client_name,
                 **(self._unverified_totals(car_number) if outcome.check_ok else {}),
             )
         )
 
     async def _complete_delegated_add_car_without_client(
-        self, *, car_number, today, chat_id, telegram_user_id,
+        self, *, car_number, today, chat_id, telegram_user_id, client_name=None,
     ) -> BotReply:
         outcome = await self._subscriptions.add_delegated_car_without_client(
             created_by_telegram_user_id=telegram_user_id,
@@ -2917,15 +3002,23 @@ class ConversationController:
             car_number=car_number,
             today=today,
         )
+        self._save_client_name(car_number, client_name, updated_by=telegram_user_id)
 
         return BotReply(
             text=texts.format_delegated_add_car_without_client_summary(
                 car_number=car_number,
                 check_ok=outcome.check_ok,
                 new_fines_count=outcome.new_fines_count,
+                client_name=client_name,
                 **(self._unverified_totals(car_number) if outcome.check_ok else {}),
             )
         )
+
+    def _save_client_name(self, car_number: str, client_name: str | None, *, updated_by: int) -> None:
+        """Имя из Add Car менеджера; без имени ранее сохранённое не трогаем
+        (повторное добавление той же машины не стирает подпись)."""
+        if client_name and self._client_names is not None:
+            self._client_names.set(car_number, client_name, updated_by=updated_by)
 
     # ---- 🔎 Проверить сейчас (inline-кнопки, без conversation_state) ----
 
@@ -3379,10 +3472,137 @@ class ConversationController:
         if task is None:
             return None
 
-        return BotReply(
-            text=texts.format_trusted_task_detail(task),
-            trusted_task_detail_id=task.id, trusted_task_detail_page=page,
+        return self._trusted_task_detail_reply(task, page)
+
+    def _trusted_task_detail_reply(self, task, page: int, *, note: str | None = None) -> BotReply:
+        """Карточка машины менеджера; с «Данными клиента» (если включены):
+        👤 Клиент / 🔗 Telegram и кнопки имени и привязки. note — строка-итог
+        действия над ней (сохранено/удалено/отвязано)."""
+        if self._client_names is None:
+            text = texts.format_trusted_task_detail(task)
+            return BotReply(
+                text=f"{note}\n\n{text}" if note else text,
+                trusted_task_detail_id=task.id, trusted_task_detail_page=page,
+            )
+        client_name = self._client_names.get(task.car_number)
+        links = self._subscriptions.manager_client_links(task.id)
+        confirmed = [
+            subscription for subscription in self._subscriptions.subscriptions_for_task(task.id)
+            if subscription.telegram_user_id is not None and subscription.status in ("active", "stopped", "expired")
+        ]
+        pending = [link.owner_username_hint for link in links if link.status == "pending_claim" and link.owner_username_hint]
+        client_lines = texts.format_client_lines(
+            client_name, [subscription.telegram_username for subscription in confirmed], pending_hints=pending,
         )
+        text = texts.format_trusted_task_detail(task, client_lines=client_lines)
+        return BotReply(
+            text=f"{note}\n\n{text}" if note else text,
+            trusted_task_detail_id=task.id, trusted_task_detail_page=page,
+            trusted_task_client_buttons=True,
+            trusted_task_client_has_name=client_name is not None,
+            trusted_task_client_can_unlink=bool(links),
+        )
+
+    # ---- «👤 Данные клиента» на карточке машины менеджера. is_trusted()
+    # перепроверяется на каждом шаге; task_id из callback_data публичен. ----
+
+    def handle_task_client_action(
+        self, action: str, task_id: int, page: int, *, chat_id: int, telegram_user_id: int,
+    ) -> BotReply | None:
+        """name/tg — следующий текст: имя клиента / @username; delname —
+        удалить имя; unlink — подтверждение «❌ Отвязать Telegram»;
+        unlinkyes — отвязать. None — не менеджер, функция выключена или
+        задачи нет."""
+        if not self._is_trusted(telegram_user_id) or self._client_names is None:
+            return None
+        task = self._subscriptions.get_task_for_trusted_admin(task_id)
+        if task is None:
+            return None
+        if action == "name":
+            self._states.set(
+                chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_TASK_CLIENT_NAME,
+                payload={"task_id": task.id, "page": page},
+            )
+            return BotReply(text=texts.CLIENT_NAME_PROMPT)
+        if action == "tg":
+            self._states.set(
+                chat_id, telegram_user_id=telegram_user_id, step=STEP_AWAITING_TASK_CLIENT_USERNAME,
+                payload={"task_id": task.id, "page": page},
+            )
+            return BotReply(text=texts.OWNER_USERNAME_PROMPT)
+        if action == "delname":
+            self._client_names.delete(task.car_number)
+            return self._trusted_task_detail_reply(task, page, note=texts.TASK_CLIENT_NAME_DELETED_TEXT)
+        links = self._subscriptions.manager_client_links(task.id)
+        if action == "unlink":
+            if not links:
+                return self._trusted_task_detail_reply(task, page, note=texts.format_task_client_unlinked(0))
+            usernames = [link.telegram_username or link.owner_username_hint or "" for link in links]
+            return BotReply(
+                text=texts.format_task_client_unlink_prompt(task.car_number, usernames),
+                task_client_unlink_confirm=(task.id, page),
+            )
+        if action == "unlinkyes":
+            count = self._subscriptions.unlink_manager_client_links(task.id)
+            return self._trusted_task_detail_reply(task, page, note=texts.format_task_client_unlinked(count))
+        return None
+
+    def _task_client_state_task(self, chat_id: int, telegram_user_id: int, state_payload: dict | None):
+        """(task, page) шага ввода «Данных клиента» или None (не менеджер,
+        функция выключена, задачи больше нет) — тогда диалог сбрасывается."""
+        payload = state_payload or {}
+        task = (
+            self._subscriptions.get_task_for_trusted_admin(int(payload["task_id"]))
+            if self._is_trusted(telegram_user_id) and self._client_names is not None and payload.get("task_id")
+            else None
+        )
+        if task is None:
+            self._clear_state(chat_id)
+            return None
+        return task, int(payload.get("page") or 0)
+
+    def _handle_task_client_name_input(
+        self, raw_text: str, *, chat_id: int, telegram_user_id: int, state_payload: dict | None,
+    ) -> BotReply:
+        found = self._task_client_state_task(chat_id, telegram_user_id, state_payload)
+        if found is None:
+            return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
+        task, page = found
+        try:
+            name = normalize_client_name(raw_text)
+        except ClientNameValidationError as exc:
+            return BotReply(text=f"❌ {exc.message}\n\n{texts.CLIENT_NAME_PROMPT}")
+        self._clear_state(chat_id)
+        self._client_names.set(task.car_number, name, updated_by=telegram_user_id)
+        return self._trusted_task_detail_reply(task, page, note=texts.TASK_CLIENT_NAME_SAVED_TEXT)
+
+    async def _handle_task_client_username_input(
+        self, raw_text: str, *, chat_id: int, telegram_user_id: int, state_payload: dict | None,
+    ) -> BotReply:
+        found = self._task_client_state_task(chat_id, telegram_user_id, state_payload)
+        if found is None:
+            return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
+        task, page = found
+        try:
+            owner_username = normalize_telegram_username(raw_text)
+        except UsernameValidationError as exc:
+            return BotReply(text=f"❌ {exc.message}\n\n{texts.OWNER_USERNAME_PROMPT}")
+        self._clear_state(chat_id)
+        try:
+            outcome = await self._subscriptions.link_client_to_task(
+                task.id, created_by_telegram_user_id=telegram_user_id, created_by_telegram_chat_id=chat_id,
+                owner_username=owner_username, today=self._today(),
+            )
+        except OwnerResolutionError:
+            return self._trusted_task_detail_reply(task, page, note=texts.OWNER_RESOLUTION_ERROR_TEXT)
+        if outcome is None:
+            return BotReply(text=texts.STALE_DIALOG_TEXT, show_main_menu=True)
+        note = (
+            texts.format_task_client_claim_note(owner_username, outcome.claim_link)
+            if outcome.pending_claim and outcome.claim_link
+            else texts.format_task_client_linked_note(owner_username)
+        )
+        return self._trusted_task_detail_reply(task, page, note=note)
 
     def handle_trusted_task_toggle(
         self, task_id: int, page: int, *, telegram_user_id: int,
@@ -3703,8 +3923,11 @@ class ConversationController:
         )
 
         statuses = self._manager_statuses(hit.car_number) if check_ok and fines else None
-        lines = [
-            f"👤 {owner_display}",
+        lines = [f"👤 {owner_display}"]
+        client_name = self._client_names.get(hit.car_number) if self._client_names is not None else None
+        if client_name:
+            lines.append(f"👤 Клиент: {escape_telethon_markdown(client_name)}")
+        lines += [
             f"🚗 {format_plate_for_telegram(hit.car_number)}",
             texts.format_search_money_line(check_ok=check_ok, fines=fines, statuses=statuses),
         ]

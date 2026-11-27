@@ -39,6 +39,11 @@ from reader.protocol_support.texts import OPERATOR_LABEL
 from reader.public_bot.payable_amount_texts import REFRESH_BUTTON_LABEL as PAYABLE_AMOUNT_REFRESH_LABEL
 from reader.public_bot.texts import (
     ADD_CAR_CONFIRM_LABEL,
+    CLIENT_NAME_BUTTON_LABEL,
+    TASK_CLIENT_NAME_DELETE_BUTTON_LABEL,
+    TASK_CLIENT_TELEGRAM_BUTTON_LABEL,
+    TASK_CLIENT_UNLINK_BUTTON_LABEL,
+    TASK_CLIENT_UNLINK_CONFIRM_BUTTON_LABEL,
     ADD_CAR_LABEL,
     BACK_BUTTON_LABEL,
     CANCEL_BUTTON_LABEL,
@@ -75,6 +80,12 @@ _ADD_CLIENT_NO = b"addclient:no"
 # номер из вопроса (ascii, через _encode_plate) лишь должен с ним совпасть.
 _ADD_CAR_CONFIRM_YES_PREFIX = b"addcar:yes:"
 _ADD_CAR_CONFIRM_NO_PREFIX = b"addcar:no:"
+# «👤 Имя клиента» на подтверждении Add Car менеджера (номер — та же сверка
+# с conversation_state, что и у ✅/Отмена).
+_ADD_CAR_CLIENT_NAME_PREFIX = b"addcar:name:"
+# «Данные клиента» на карточке машины менеджера: tcl:<действие>:<task_id>:<page>.
+_TASK_CLIENT_PREFIX = b"tcl:"
+TASK_CLIENT_ACTIONS = ("name", "tg", "delname", "unlink", "unlinkyes")
 # Кнопки выбора срока, которые бот больше не показывает, но которые
 # остались в истории чатов (см. is_legacy_period_callback/
 # decode_legacy_trusted_task_period_callback) — принимаются ТОЛЬКО с теми
@@ -219,11 +230,37 @@ def decode_add_client_decision_callback(data: bytes | None) -> bool | None:
     return None
 
 
-def add_car_confirm_keyboard(car_number: str) -> list[list[Button]]:
-    return [[
+def add_car_confirm_keyboard(car_number: str, *, client_name_button: bool = False) -> list[list[Button]]:
+    """client_name_button — менеджер добавляет машину: можно указать имя
+    клиента (необязательно, см. texts.CLIENT_NAME_PROMPT)."""
+    rows = [[
         Button.inline(ADD_CAR_CONFIRM_LABEL, _encode_plate(_ADD_CAR_CONFIRM_YES_PREFIX, car_number)),
         Button.inline(CANCEL_BUTTON_LABEL, _encode_plate(_ADD_CAR_CONFIRM_NO_PREFIX, car_number)),
     ]]
+    if client_name_button:
+        rows.append([Button.inline(CLIENT_NAME_BUTTON_LABEL, _encode_plate(_ADD_CAR_CLIENT_NAME_PREFIX, car_number))])
+    return rows
+
+
+def decode_add_car_client_name_callback(data: bytes | None) -> str | None:
+    return _decode_plate(data, _ADD_CAR_CLIENT_NAME_PREFIX)
+
+
+def encode_task_client_callback(action: str, task_id: int, page: int) -> bytes:
+    return _TASK_CLIENT_PREFIX + f"{action}:{task_id}:{page}".encode("ascii")
+
+
+def decode_task_client_callback(data: bytes | None) -> tuple[str, int, int] | None:
+    """(действие, task_id, page) — task_id публичен и НЕ доказывает
+    авторизацию: is_trusted() перепроверяется в handle_task_client_action."""
+    if not data or not data.startswith(_TASK_CLIENT_PREFIX):
+        return None
+    parts = data[len(_TASK_CLIENT_PREFIX):].decode("ascii", "replace").split(":")
+    if len(parts) != 3 or parts[0] not in TASK_CLIENT_ACTIONS:
+        return None
+    if not (parts[1].isdigit() and parts[2].isdigit()):
+        return None
+    return parts[0], int(parts[1]), int(parts[2])
 
 
 def decode_add_car_confirm_callback(data: bytes | None) -> tuple[bool, str] | None:
@@ -564,10 +601,35 @@ def trusted_tasks_page_keyboard(
     return rows
 
 
-def trusted_task_detail_keyboard(*, page: int) -> list[list[Button]]:
-    """Карточка одной машины (см. design report) — read-only, единственное
-    действие — "⬅️ Назад" на "📋 Мои авто" (ту же page)."""
-    return [[Button.inline(BACK_BUTTON_LABEL, encode_trusted_tasks_page_callback(page))]]
+def trusted_task_detail_keyboard(
+    *, page: int, task_id: int | None = None, has_client_name: bool = False, can_unlink: bool = False,
+) -> list[list[Button]]:
+    """Карточка одной машины (см. design report) — "⬅️ Назад" на "📋 Мои
+    авто" (ту же page). task_id — кнопки «Данных клиента»: имя, Telegram,
+    удалить имя (has_client_name), отвязать Telegram (can_unlink —
+    есть привязки, сделанные менеджером)."""
+    rows: list[list[Button]] = []
+    if task_id is not None:
+        rows.append([
+            Button.inline(CLIENT_NAME_BUTTON_LABEL, encode_task_client_callback("name", task_id, page)),
+            Button.inline(TASK_CLIENT_TELEGRAM_BUTTON_LABEL, encode_task_client_callback("tg", task_id, page)),
+        ])
+        extra = []
+        if has_client_name:
+            extra.append(Button.inline(TASK_CLIENT_NAME_DELETE_BUTTON_LABEL, encode_task_client_callback("delname", task_id, page)))
+        if can_unlink:
+            extra.append(Button.inline(TASK_CLIENT_UNLINK_BUTTON_LABEL, encode_task_client_callback("unlink", task_id, page)))
+        if extra:
+            rows.append(extra)
+    rows.append([Button.inline(BACK_BUTTON_LABEL, encode_trusted_tasks_page_callback(page))])
+    return rows
+
+
+def task_client_unlink_confirm_keyboard(task_id: int, *, page: int) -> list[list[Button]]:
+    return [[
+        Button.inline(TASK_CLIENT_UNLINK_CONFIRM_BUTTON_LABEL, encode_task_client_callback("unlinkyes", task_id, page)),
+        Button.inline(BACK_BUTTON_LABEL, encode_trusted_task_open_callback(task_id, page)),
+    ]]
 
 
 def trusted_task_off_keyboard(task_id: int, *, page: int) -> list[list[Button]]:
