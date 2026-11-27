@@ -1272,3 +1272,85 @@ async def test_paid_fine_with_an_expired_term_keeps_the_plain_fine_label(fx):
     assert "🧾 Штраф: 100 ₾" in lines and "🧾 Первоначальный штраф: 50 ₾" in lines
     summary = lines.index("🧾 Первоначальный штраф: 50 ₾", lines.index("🧾 Штраф: 100 ₾"))
     assert lines[summary + 1:summary + 3] == ["💰 К оплате: требуется уточнение", _OVERDUE_TITLE]
+
+
+# ---- «🔎 Проверить сейчас» менеджера: та же логика суммы, что у клиента ----
+
+
+async def _manager_check_now_by_plate(fx, car):
+    await fx.controller.handle_text(texts.CHECK_NOW_LABEL, chat_id=_TRUSTED, telegram_user_id=_TRUSTED, username=None)
+    return await fx.controller.handle_text(car, chat_id=_TRUSTED, telegram_user_id=_TRUSTED, username=None)
+
+
+async def _overdue_car_with_increase(fx):
+    """Две квитанции с истёкшим окончательным сроком: по одной Georgian Card
+    подтвердил увеличение, по другой — нет; третья (новая) — в сроке."""
+    task, subscription = _dated_car(fx, _CAR, [("GE1", 100), ("GE2", 50)], last_date=_today_tbilisi() - timedelta(days=5))
+    fx.provider.records[_CAR].append(ParsedFineRecord(
+        car_number=_CAR, external_fine_id="GE3", penalty_date=date(2026, 11, 27), due_date=date(2027, 1, 26),
+        delivered_status="Не вручено", fingerprint=f"fp-{_CAR}-GE3",
+        raw_data={"protocolNo": "GE3", "lastDate": "2027-01-26"}, amount=50,
+    ))
+    await fx.check(task)
+    observed = _now_utc() - timedelta(hours=1)
+    fx.store(_CAR, "GE1", 300, at=observed)
+    fx.store(_CAR, "GE2", 50, at=observed)
+    return task, subscription, observed
+
+
+async def test_manager_check_now_by_plate_shows_the_gateway_amount_like_the_client(fx):
+    _, subscription, observed = await _overdue_car_with_increase(fx)
+    client = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=_OWNER)
+
+    reply = await _manager_check_now_by_plate(fx, _CAR)
+
+    lines = reply.text.splitlines()
+    first = lines.index("🧾 Первоначальный штраф: 100 ₾")
+    assert lines[first + 1:first + 3] == ["💰 К оплате: 300 ₾", _INCREASED_ONE]
+    second = lines.index("🧾 Первоначальный штраф: 50 ₾")
+    assert lines[second + 1:second + 3] == ["💰 К оплате: 50 ₾", _OVERDUE_TITLE]
+    assert "🧾 Штраф: 50 ₾" in lines  # новая квитанция в сроке — без «Первоначальный»
+    assert "💰 Сумма: 100 GEL" not in reply.text
+    assert "Статус: 🔴 Не оплачен" in lines
+    summary = lines.index("🧾 Первоначальные штрафы: 3 шт. — 200 ₾")
+    assert lines[summary + 1:summary + 3] == [
+        "💰 Предварительно к оплате: 400 ₾",
+        "⚠️ Срок оплаты истёк по 2 из 3 штрафов. Сумма увеличилась по 1 из 3 штрафов.",
+    ]
+    # Тот же текст, что у клиента; без кнопок оплаты и «🔄 Уточнить сумму»,
+    # под ответом — меню менеджера.
+    assert reply.text == client.text
+    assert reply.show_main_menu is True
+    assert not reply.cta_buttons
+    # Только чтение: ни сессий Georgian Card, ни событий, ни сообщений.
+    assert fx.gc.calls == [] and fx.amounts.count_events() == 0
+    await fx.delivery.run_once(now=_now_utc() + timedelta(minutes=3))
+    assert fx.sender.sent == []
+
+
+async def test_manager_check_now_from_a_button_uses_the_same_reply(fx):
+    task, _, _ = await _overdue_car_with_increase(fx)
+    by_plate = await _manager_check_now_by_plate(fx, _CAR)
+
+    reply = await fx.controller.handle_trusted_check_now_once(task.id, telegram_user_id=_TRUSTED)
+
+    assert reply.text == by_plate.text
+    assert "💰 К оплате: 300 ₾" in reply.text
+    assert reply.show_main_menu is True and not reply.cta_buttons
+
+
+async def test_manager_check_now_without_the_amount_feature_shows_statuses_not_gateway_amounts(tmp_path):
+    fixture = _Fixture(tmp_path, with_amounts=False)
+    try:
+        task, _ = _dated_car(fixture, _CAR, [("GE1", 100)], last_date=_today_tbilisi() - timedelta(days=5))
+        await fixture.check(task)
+
+        reply = await _manager_check_now_by_plate(fixture, _CAR)
+
+        assert "💰 Сумма: 100 GEL" in reply.text
+        assert "Статус: 🔴 Не оплачен" in reply.text
+        assert "💰 К оплате: 100 ₾" in reply.text
+        assert "Первоначальный" not in reply.text and fixture.gc.calls == []
+        assert reply.show_main_menu is True
+    finally:
+        fixture.close()

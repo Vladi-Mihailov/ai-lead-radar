@@ -2384,7 +2384,7 @@ class ConversationController:
             self._clear_state(chat_id)
             outcome = await self._subscriptions.check_now_task_by_car_number(car_number)
             if outcome is not None:
-                return BotReply(text=texts.format_check_now_result(outcome), show_main_menu=True)
+                return self._trusted_check_now_reply(outcome)
             # Задача перестала быть активной между двумя запросами — дальше
             # как у номера без активной задачи.
 
@@ -2477,7 +2477,7 @@ class ConversationController:
         if outcome is CHECK_ALREADY_IN_PROGRESS:
             return CHECK_ALREADY_IN_PROGRESS
         if outcome is not None:
-            return BotReply(text=texts.format_check_now_result(outcome), show_main_menu=True)
+            return self._trusted_check_now_reply(outcome)
 
         return await self.handle_trusted_one_off_check(
             car_number, telegram_user_id=telegram_user_id, on_check_started=_check_started_once,
@@ -2874,6 +2874,15 @@ class ConversationController:
         if outcome is CHECK_ALREADY_IN_PROGRESS:
             return CHECK_ALREADY_IN_PROGRESS
         return self._format_check_now_outcome_reply(outcome)
+
+    def _trusted_check_now_reply(self, outcome) -> BotReply:
+        """«🔎 Проверить сейчас» менеджера по машине с активной задачей — тот
+        же ответ, что и у клиента (статусы оплаты, сумма к оплате Georgian
+        Card, просрочка по окончательному сроку, итог), а не голый список
+        исходных сумм. Кнопок клиента нет: оплата — только владельцу,
+        «🔄 Уточнить сумму» — только по подписке; под ответом — меню
+        менеджера, как раньше. Только чтение БД — без запросов к Georgian Card."""
+        return replace(self._format_check_now_outcome_reply(outcome), show_main_menu=True)
 
     def _format_check_now_outcome_reply(self, outcome) -> BotReply:
         # CTA — ТОЛЬКО реальному владельцу и только когда есть хотя бы один
