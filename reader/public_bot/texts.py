@@ -164,6 +164,66 @@ OWNER_USERNAME_PROMPT = "👤 Укажите Telegram владельца авт�
 # reader/public_bot/subscription_service.py::add_delegated_car_without_client).
 ADD_CLIENT_DECISION_PROMPT = "👤 Добавить Telegram клиента?"
 
+# «👤 Данные клиента» (см. reader/public_bot/client_names.py): имя клиента —
+# необязательная подпись менеджера, Telegram — необязательная привязка.
+# Имя не даёт доступа и не включает уведомления: их даёт только
+# подтверждённая подписка.
+CLIENT_NAME_BUTTON_LABEL = "👤 Имя клиента"
+CLIENT_NAME_PROMPT = (
+    "👤 Имя клиента (необязательно)\n\n"
+    "Напишите имя — буквы любого алфавита, цифры и пробелы, до 64 символов.\n"
+    "Например: Иван Иванов, Giorgi123, გიორგი, Ahmet 007.\n\n"
+    "Имя видно только менеджерам и не даёт клиенту доступа к автомобилю."
+)
+CLIENT_NOT_SET_TEXT = "не указан"
+CLIENT_TELEGRAM_NOT_LINKED_TEXT = "не привязан"
+
+
+def format_client_lines(
+    client_name: str | None, usernames: list[str | None], *, pending_hints: list[str] | None = None,
+) -> list[str]:
+    """Данные клиента на экранах менеджера:
+        👤 Клиент: Иван Иванов            (или «не указан»)
+        🔗 Telegram: @ivan123             (или «не привязан»)
+        ⏳ Ждёт подтверждения: @ivan123   (приглашение ещё не открыто)
+    usernames — подтверждённые привязки (None — логин неизвестен); имя —
+    произвольный текст, обезвреживается для Telethon markdown; логин
+    показывается, только если это настоящий Telegram username."""
+    name_text = escape_telethon_markdown(client_name) if client_name else CLIENT_NOT_SET_TEXT
+    lines = [f"👤 Клиент: {name_text}"]
+    if usernames:
+        shown = []
+        for username in usernames:
+            safe = safe_telegram_username(username)
+            shown.append(f"@{safe}" if safe else "привязан (логин не указан)")
+        lines.append(f"🔗 Telegram: {', '.join(shown)}")
+    else:
+        lines.append(f"🔗 Telegram: {CLIENT_TELEGRAM_NOT_LINKED_TEXT}")
+    for hint in pending_hints or []:
+        safe = safe_telegram_username(hint)
+        if safe:
+            lines.append(f"⏳ Ждёт подтверждения: @{safe}")
+    return lines
+
+
+def _add_car_client_lines(*, owner_username: str | None, client_name: str | None, stage: str) -> list[str]:
+    """Клиент на подтверждении и в итоге Add Car: без имени — прежняя строка
+    «👤 Владелец: @логин» (или ничего); с именем — «👤 Клиент» и «🔗 Telegram»,
+    как на карточке машины. stage: "planned" — подтверждение, ещё ничего не
+    создано («@логин — будет привязан после добавления»); "linked" — привязка
+    есть; "pending" — создано приглашение («не привязан» + «⏳ Ждёт
+    подтверждения: @логин»)."""
+    if not client_name:
+        return [f"👤 Владелец: @{owner_username}"] if owner_username else []
+    if owner_username and stage == "linked":
+        return format_client_lines(client_name, [owner_username])
+    if owner_username and stage == "planned":
+        lines = format_client_lines(client_name, [])
+        username = safe_telegram_username(owner_username) or owner_username
+        lines[1] = f"🔗 Telegram: @{username} — будет привязан после добавления"
+        return lines
+    return format_client_lines(client_name, [], pending_hints=[owner_username] if owner_username else [])
+
 # Бессрочный мониторинг (см. задачу "убрать выбор срока мониторинга") —
 # вместо выбора срока Add Car заканчивается одним подтверждением (см.
 # format_add_car_confirm_prompt), после него мониторинг включается без
@@ -179,13 +239,16 @@ NOTIFICATIONS_ON_LINE = "🟢 Уведомления включены — соо
 NOTIFICATIONS_OFF_LINE = "⚪ Уведомления выключены — включите, чтобы мы сообщали о новых штрафах."
 
 
-def format_add_car_confirm_prompt(car_number: str, *, owner_username: str | None = None) -> str:
+def format_add_car_confirm_prompt(
+    car_number: str, *, owner_username: str | None = None, client_name: str | None = None,
+) -> str:
     """Последний шаг Add Car перед созданием (self-service и trusted) —
     номер (и владелец, если trusted указал клиента) ещё раз перед глазами,
-    чтобы опечатка в номере не включала мониторинг молча."""
+    чтобы опечатка в номере не включала мониторинг молча. client_name — имя
+    клиента, которое указал менеджер (см. CLIENT_NAME_PROMPT)."""
     lines = [f"🚗 {format_plate_for_telegram(car_number)}"]
-    if owner_username:
-        lines.append(f"👤 Владелец: @{owner_username}")
+    # До добавления ничего ещё не привязано.
+    lines += _add_car_client_lines(owner_username=owner_username, client_name=client_name, stage="planned")
     lines += ["", "Добавить автомобиль и включить проверку штрафов?"]
     return "\n".join(lines)
 
@@ -552,12 +615,16 @@ def format_delegated_add_car_summary(
     claim_link: str | None,
     unverified_count: int = 0,
     unverified_amount: float = 0.0,
+    client_name: str | None = None,
 ) -> str:
     """Итог trusted-operator delegated Add Car flow — показывается
     ТОЛЬКО trusted-оператору (владельцу это же событие ничего не
     показывает, пока он не claimed, см. design report). Срока нет — та же
     первая строка, что и у self-service (см. format_add_car_summary)."""
     formatted_car_number = format_plate_for_telegram(car_number)
+    client_lines = _add_car_client_lines(
+        owner_username=owner_username, client_name=client_name, stage="pending" if pending_claim else "linked",
+    )
 
     if not check_ok:
         lines = [
@@ -565,14 +632,14 @@ def format_delegated_add_car_summary(
             "⚠️ Но проверить штрафы сейчас не удалось",
             "",
             f"🚗 {formatted_car_number}",
-            f"👤 Владелец: @{owner_username}",
+            *client_lines,
         ]
     else:
         lines = [
             ADD_CAR_DONE_LINE,
             "",
             f"🚗 {formatted_car_number}",
-            f"👤 Владелец: @{owner_username}",
+            *client_lines,
             _format_add_car_check_line(new_fines_count),
             *_unverified_lines(unverified_count, unverified_amount),
         ]
@@ -598,12 +665,15 @@ def format_delegated_add_car_without_client_summary(
     new_fines_count: int,
     unverified_count: int = 0,
     unverified_amount: float = 0.0,
+    client_name: str | None = None,
 ) -> str:
     """Итог trusted-operator delegated Add Car БЕЗ клиента ("Отмена" на
     ADD_CLIENT_DECISION_PROMPT) — как format_delegated_add_car_summary, но
     без строки "👤 Владелец: ..." — клиента нет и, возможно, не будет
     никогда (см. design report: username клиента не обязателен)."""
     formatted_car_number = format_plate_for_telegram(car_number)
+    # Без клиента имя всё равно можно указать (Telegram — «не привязан»).
+    client_lines = _add_car_client_lines(owner_username=None, client_name=client_name, stage="pending")
 
     if not check_ok:
         return "\n".join([
@@ -611,12 +681,14 @@ def format_delegated_add_car_without_client_summary(
             "⚠️ Но проверить штрафы сейчас не удалось",
             "",
             f"🚗 {formatted_car_number}",
+            *client_lines,
         ])
 
     return "\n".join([
         ADD_CAR_DONE_LINE,
         "",
         f"🚗 {formatted_car_number}",
+        *client_lines,
         _format_add_car_check_line(new_fines_count),
         *_unverified_lines(unverified_count, unverified_amount),
     ])
@@ -759,7 +831,7 @@ def format_delete_confirm_prompt(car_number: str) -> str:
     )
 
 
-def format_trusted_task_detail(task: FineMonitoringTask) -> str:
+def format_trusted_task_detail(task: FineMonitoringTask, *, client_lines: list[str] | None = None) -> str:
     """Карточка одной машины (см. design report про "убрать текстовый
     перечень из списка, показывать в карточке по нажатию на номер") —
     открывается по нажатию на кнопку-номер в списке "📋 Мои авто" (см.
@@ -768,6 +840,8 @@ def format_trusted_task_detail(task: FineMonitoringTask) -> str:
     раньше была видна прямо в списке, теперь ТОЛЬКО здесь. Срока нет (см.
     задачу "убрать выбор срока мониторинга") — вместо периода статус."""
     lines = [f"🚗 {format_plate_for_telegram(task.car_number)}" + (f" ({task.label})" if task.label else "")]
+    # client_lines — «👤 Клиент / 🔗 Telegram» (см. format_client_lines).
+    lines += client_lines or []
     lines.append(MONITORING_ACTIVE_LINE if task.status == "active" else MONITORING_OFF_LINE)
     if task.last_checked_at is not None:
         lines.append(f"🔎 Последняя проверка: {_fmt_date(task.last_checked_at.date())}")
@@ -881,6 +955,70 @@ def format_trusted_task_off_detail(task: FineMonitoringTask) -> str:
 
 def format_trusted_task_turn_off_success(car_number: str) -> str:
     return f"⏸ Мониторинг {format_plate_for_telegram(car_number)} выключен."
+
+
+TASK_CLIENT_TELEGRAM_BUTTON_LABEL = "🔗 Telegram клиента"
+TASK_CLIENT_NAME_DELETE_BUTTON_LABEL = "🗑 Удалить имя"
+TASK_CLIENT_UNLINK_BUTTON_LABEL = "❌ Отвязать Telegram"
+TASK_CLIENT_UNLINK_CONFIRM_BUTTON_LABEL = "❌ Отвязать"
+TASK_CLIENT_NAME_SAVED_TEXT = "✅ Имя клиента сохранено."
+TASK_CLIENT_CANCEL_BUTTON_LABEL = "❌ Отмена"
+TASK_CLIENT_LINK_CONFIRM_BUTTON_LABEL = "✅ Привязать"
+TASK_CLIENT_TASK_NOT_ACTIVE_TEXT = (
+    "⚠️ Мониторинг этого автомобиля выключен. Сначала включите мониторинг ▶️, затем привяжите Telegram клиента."
+)
+TASK_CLIENT_STALE_TEXT = "⚠️ Этот экран устарел — откройте автомобиль заново."
+
+
+def format_task_client_input_prompt(car_number: str, prompt: str) -> str:
+    """Ввод имени или Telegram клиента — с номером, чтобы было видно, к какой
+    машине относится ответ."""
+    return f"🚗 {format_plate_for_telegram(car_number)}\n\n{prompt}"
+
+
+def format_task_client_link_confirm_prompt(car_number: str, owner_username: str) -> str:
+    username = safe_telegram_username(owner_username) or owner_username
+    return (
+        f"🔗 Привязать @{username} к {format_plate_for_telegram(car_number)}?\n\n"
+        "Если клиент уже писал боту, автомобиль сразу появится у него в «Мои авто», "
+        "иначе будет создана одноразовая ссылка-приглашение. Уже известные штрафы "
+        "новыми уведомлениями не придут."
+    )
+
+
+def format_task_client_already_has_car(owner_username: str) -> str:
+    username = safe_telegram_username(owner_username) or owner_username
+    return f"ℹ️ У @{username} этот автомобиль уже есть в «Мои авто» — повторная привязка не нужна."
+TASK_CLIENT_NAME_DELETED_TEXT = "🗑 Имя клиента удалено."
+
+
+def format_task_client_unlink_prompt(car_number: str, usernames: list[str]) -> str:
+    """Подтверждение «❌ Отвязать Telegram» (необратимо для клиента: машина
+    исчезнет из его «Мои авто», уведомления прекратятся)."""
+    shown = ", ".join(f"@{u}" for u in (safe_telegram_username(name) for name in usernames) if u) or "клиента"
+    return (
+        f"❌ Отвязать {shown} от {format_plate_for_telegram(car_number)}?\n\n"
+        "Клиент больше не увидит автомобиль и не будет получать уведомления. "
+        "Мониторинг, история штрафов и имя клиента сохранятся."
+    )
+
+
+def format_task_client_linked_note(owner_username: str) -> str:
+    return f"✅ Telegram клиента привязан: @{safe_telegram_username(owner_username) or owner_username}"
+
+
+def format_task_client_claim_note(owner_username: str, claim_link: str) -> str:
+    """Клиента с этим логином бот ещё не знает: привязка заработает, когда
+    клиент сам откроет ссылку (та же одноразовая ссылка, что и в Add Car)."""
+    return "\n".join([
+        f"⏳ Приглашение для @{safe_telegram_username(owner_username) or owner_username} создано.",
+        "Перешлите клиенту эту ссылку — как только он откроет её, бот сможет присылать штрафы лично ему:",
+        claim_link,
+    ])
+
+
+def format_task_client_unlinked(count: int) -> str:
+    return "✅ Telegram клиента отвязан." if count else "ℹ️ Привязок, сделанных менеджером, не было."
 
 
 def format_trusted_task_resume_success(car_number: str) -> str:
@@ -1100,7 +1238,7 @@ def _format_fine_count_and_amount(count: int, amount: float) -> str:
 
 def format_debt_row(
     *, car_number: str, owners: list[DebtOwner], total_amount: float, breakdown: DebtBreakdown | None = None,
-    amounts: AmountSummary | None = None,
+    amounts: AmountSummary | None = None, client_name: str | None = None,
 ) -> str:
     """Блок одной машины debt-списка (см. задачу "дополнить статистику
     штрафов информацией о пользователях"), без статусов оплаты:
@@ -1170,8 +1308,13 @@ def format_debt_row(
             )
         if breakdown.paid_count:
             lines.append(f"🟢 Оплачено: {_format_fine_count_and_amount(breakdown.paid_count, breakdown.paid_amount)}")
+    # Имя клиента от менеджера (client_name, см. reader/public_bot/
+    # client_names.py) — отдельной строкой «👤 Клиент» над строками
+    # привязанных Telegram-аккаунтов; без привязки — «🔗 Telegram: не привязан».
+    if client_name:
+        lines.append(f"👤 Клиент: {escape_telethon_markdown(client_name)}")
     if not owners:
-        lines.append(DEBT_OWNER_NOT_LINKED_LINE)
+        lines.append(f"🔗 Telegram: {CLIENT_TELEGRAM_NOT_LINKED_TEXT}" if client_name else DEBT_OWNER_NOT_LINKED_LINE)
     for owner in owners:
         lines.extend(_format_debt_owner_lines(owner))
     return "\n".join(lines)

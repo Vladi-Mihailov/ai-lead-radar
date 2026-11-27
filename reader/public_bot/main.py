@@ -33,7 +33,11 @@ from reader.fines.batch_gate import BatchCheckGate
 from reader.fines.check_service import FineCheckService
 from reader.fines.detected_fine_repository import DetectedFineRepository
 from reader.fines.georgian_card_client import GeorgianCardAmountClient, GeorgianCardConfig
-from reader.fines.notification_control import EXCLUSION_SUBSCRIPTION_RESTORED, GeorgiaNotificationControl
+from reader.fines.notification_control import (
+    EXCLUSION_LATE_CLIENT_LINK,
+    EXCLUSION_SUBSCRIPTION_RESTORED,
+    GeorgiaNotificationControl,
+)
 from reader.fines.payable_amount import PayableAmountRepository
 from reader.fines.payment_status import FineStatusRepository, FineStatusTracker, PaymentPageMarkers
 from reader.fines.plate_bootstrap_repository import GeorgiaPlateBootstrapRepository
@@ -56,6 +60,7 @@ from reader.protocol_support.telethon_gateway import (
 )
 from reader.public_bot.collector_api import run_collector_api_forever
 from reader.public_bot.collector_ingest_service import CollectorIngestService
+from reader.public_bot.client_names import CarClientNameRepository
 from reader.public_bot.conversation import ConversationController
 from reader.public_bot.daily_recheck import (
     DailyRecheckRepository,
@@ -591,6 +596,13 @@ async def run() -> None:
                 detected_fine_repository=detected_fine_repository, delivery_repository=delivery_repository,
                 reason=EXCLUSION_SUBSCRIPTION_RESTORED,
             ),
+            # «🔗 Telegram клиента» на уже добавленной машине — без повторной
+            # рассылки уже известных штрафов клиенту и менеджеру.
+            late_link_history_excluder=functools.partial(
+                exclude_known_fines_for_subscription,
+                detected_fine_repository=detected_fine_repository, delivery_repository=delivery_repository,
+                reason=EXCLUSION_LATE_CLIENT_LINK,
+            ),
         )
         # "📊 Статистика" (trusted-operator-only) — поверх уже открытых
         # known_users_repository/subscription_repository/
@@ -744,6 +756,7 @@ async def run() -> None:
             daily_recheck_service=daily_recheck_service,
             payable_amount_service=payable_amount_service,
             amount_delivery_service=amount_delivery_service,
+            client_name_repository=CarClientNameRepository(settings.app.users_db_file),
         )
 
         # «👨‍💼 Оператор»: живой диалог через группу менеджеров (общая
