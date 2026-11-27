@@ -186,10 +186,18 @@ class TurkeyMonitoringService:
         next_check_at = next_monitoring_slot(now)
         self._subscriptions.mark_checked(subscription.id, checked_at=now, next_check_at=next_check_at)
 
-        await self._notify_changes(
-            plate=subscription.plate, telegram_chat_id=subscription.telegram_chat_id,
-            previous_by_provider=previous_by_provider, result=result,
-        )
+        try:
+            await self._notify_changes(
+                plate=subscription.plate, telegram_chat_id=subscription.telegram_chat_id,
+                previous_by_provider=previous_by_provider, result=result,
+            )
+        except Exception:
+            # Отправка владельцу подписки не удалась (например, бывший менеджер
+            # заблокировал бота) — привязанный клиент получает своё, а повтор
+            # провайдеров с CAPTCHA всё равно ставится в очередь.
+            logger.exception(
+                "Turkey monitoring: не удалось отправить уведомление подписчику (plate=%s)", subscription.plate,
+            )
         await self._notify_linked_clients(subscription.telegram_user_id, subscription.plate, result, run_id)
         self._maybe_enqueue_retry(subscription, result, slot_label=slot_label, now=now)
 
@@ -225,10 +233,13 @@ class TurkeyMonitoringService:
             telegram_chat_id=retry.telegram_chat_id, initiator=f"monitoring_{retry.slot_label}_retry",
         )
 
-        await self._notify_changes(
-            plate=retry.plate, telegram_chat_id=retry.telegram_chat_id,
-            previous_by_provider=previous_by_provider, result=result,
-        )
+        try:
+            await self._notify_changes(
+                plate=retry.plate, telegram_chat_id=retry.telegram_chat_id,
+                previous_by_provider=previous_by_provider, result=result,
+            )
+        except Exception:
+            logger.exception("Turkey monitoring retry: не удалось отправить уведомление подписчику (plate=%s)", retry.plate)
         await self._notify_linked_clients(retry.telegram_user_id, retry.plate, result, run_id)
         logger.info(
             "Turkey monitoring retry finished: plate=%s providers=%s slot=%s",

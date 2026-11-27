@@ -196,6 +196,7 @@ async def run() -> None:
     client_link_service = TurkeyClientLinkService(
         client_link_repository, garage_repository, subscription_repository, run_repository,
         known_users_repository, bot_username=_BOT_USERNAME,
+        is_manager=lambda telegram_user_id: telegram_user_id in frozenset(settings.public_bot.trusted_operator_user_ids),
     )
 
     # Тот же общий OPENAI_API_KEY (settings.ocr.openai_api_key) и
@@ -247,6 +248,7 @@ async def run() -> None:
             payment_help_contact_username=settings.public_bot.payment_help_contact_username,
             debt_refresh_service=debt_refresh_service,
             client_link_service=client_link_service,
+            admin_user_ids=frozenset(settings.fine_monitor.allowed_user_ids),
         )
 
         client = TelegramClient(str(_SESSION_PATH), api_id, api_hash)

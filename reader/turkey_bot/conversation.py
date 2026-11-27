@@ -23,6 +23,7 @@ reader/public_bot/conversation.py) — reader/turkey_bot/handlers.py
   Оба используют ОДИН UnifiedTurkeyCheckService (см. design report п.12)."""
 
 import logging
+import secrets
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -44,6 +45,7 @@ from reader.turkey_bot.debt_refresh_service import (
     TurkeyDebtRefreshService,
     TurkeyRefreshAlreadyInProgressError,
 )
+from reader.turkey_bot.keyboards import encode_admin_search_results_callback, encode_orphan_callback
 from reader.turkey_bot.models import TurkeyUserCar
 from reader.turkey_bot.monitoring.scheduler_job import next_monitoring_slot
 from reader.turkey_bot.monitoring.subscription_repository import (
@@ -70,6 +72,8 @@ _STEP_AWAITING_SEARCH_QUERY = "awaiting_search_query"
 _STEP_AWAITING_LINK_USERNAME = "awaiting_link_username"
 # 👤 Данные клиента — ввод имени клиента (payload: car_id, page).
 _STEP_AWAITING_CLIENT_NAME = "awaiting_client_name"
+# 🔎 Найти привязку по номеру — администратор вводит госномер.
+_STEP_AWAITING_ADMIN_LINK_PLATE = "awaiting_admin_link_plate"
 
 # Выбор клиента из пользователей бота — столько кнопок на странице.
 _LINK_PICK_PAGE_SIZE = 8
@@ -220,6 +224,18 @@ class BotReply:
     client_link_confirm_id: int | None = None
     outgoing_messages: tuple[OutgoingMessage, ...] = ()
 
+    # 🔗 Привязки без менеджера (администратор): orphan_list — (page,
+    # total_pages, ((link_id, plate), ...)); orphan_confirm — (link_id,
+    # action, manager_id, token); orphan_picker — (link_id, ((manager_id,
+    # подпись), ...)).
+    orphan_list: tuple[int, int, tuple[tuple[int, str], ...]] | None = None
+    # orphan_confirm — (link_id, action, manager_id, token, back_callback);
+    # orphan_picker — (link_id, ((manager_id, подпись), ...), action, back_callback);
+    # admin_link_search — ((link_id, plate), ...) активные привязки под результатами поиска.
+    orphan_confirm: tuple[int, str, int | None, str, bytes] | None = None
+    orphan_picker: tuple[int, tuple[tuple[int, str], ...], str, bytes] | None = None
+    admin_link_search: tuple[tuple[int, str], ...] | None = None
+
 
 class ConversationController:
     def __init__(
@@ -236,6 +252,7 @@ class ConversationController:
         payment_help_contact_username: str = "tplgee",
         debt_refresh_service: TurkeyDebtRefreshService | None = None,
         client_link_service: TurkeyClientLinkService | None = None,
+        admin_user_ids: frozenset[int] = frozenset(),
     ):
         self._states = conversation_state_repository
         self._garage = garage_repository
@@ -255,6 +272,12 @@ class ConversationController:
         self._debt_refresh = debt_refresh_service
         # None — привязки клиентов в этой сборке нет (кнопки не показываются).
         self._client_links = client_link_service
+        # Администраторы бота (fine_monitor.allowed_user_ids — тот же список,
+        # что и fine-admin у грузинского бота): решают судьбу привязок,
+        # которыми не может управлять ни один менеджер.
+        self._admin_user_ids = frozenset(admin_user_ids)
+        # Одноразовые токены подтверждений: (admin, link_id) -> (action, manager_id, token).
+        self._orphan_tokens: dict[tuple[int, int], tuple[str, int | None, str]] = {}
 
     def _debt_cta_buttons(self) -> tuple[tuple[str, str], ...]:
         """Та же destination (payment_help_contact_username), что и
@@ -269,6 +292,11 @@ class ConversationController:
     def reset_conversation(self, chat_id: int) -> None:
         """Вход в диалог с оператором: незавершённый шаг сбрасывается."""
         self._states.clear(chat_id)
+
+    def is_admin(self, telegram_user_id: int) -> bool:
+        """Администратор бота — «🔗 Привязки без менеджера» (только если
+        привязки клиентов есть в этой сборке)."""
+        return self._client_links is not None and telegram_user_id in self._admin_user_ids
 
     def is_trusted(self, telegram_user_id: int) -> bool:
         """Публичная обёртка — нужна reader/turkey_bot/handlers.py,
@@ -321,6 +349,14 @@ class ConversationController:
         if stripped == texts.STOP_MONITORING_LABEL and self._is_trusted(telegram_user_id):
             return self.handle_stop_monitoring(chat_id=chat_id)
 
+        if stripped == texts.ORPHAN_LINKS_LABEL and self.is_admin(telegram_user_id):
+            self._states.clear(chat_id)
+            return self._orphan_list_reply(0)
+
+        if stripped == texts.ADMIN_LINK_SEARCH_LABEL and self.is_admin(telegram_user_id):
+            self._states.set(chat_id, telegram_user_id=telegram_user_id, step=_STEP_AWAITING_ADMIN_LINK_PLATE)
+            return BotReply(text=texts.ADMIN_LINK_SEARCH_PROMPT, show_cancel_button=True)
+
         if stripped == texts.SEARCH_LABEL and self._is_trusted(telegram_user_id):
             return self.handle_search_start(chat_id=chat_id, telegram_user_id=telegram_user_id)
 
@@ -343,6 +379,16 @@ class ConversationController:
             return self._handle_search_query_input(
                 stripped, chat_id=chat_id, telegram_user_id=telegram_user_id,
             )
+
+        if state is not None and state.step == _STEP_AWAITING_ADMIN_LINK_PLATE:
+            if not self.is_admin(telegram_user_id):
+                self._states.clear(chat_id)
+                return BotReply(text=texts.UNKNOWN_BUTTON_TEXT, show_main_menu=True)
+            plate = normalize_plate(stripped)
+            if plate is None:
+                return BotReply(text=texts.INVALID_PLATE_TEXT, show_cancel_button=True)
+            self._states.clear(chat_id)
+            return self._link_search_reply(plate)
 
         if state is not None and state.step == _STEP_AWAITING_CLIENT_NAME:
             return self._handle_client_name_input(
@@ -615,6 +661,12 @@ class ConversationController:
         if car is None:
             return None
 
+        if action in ("monitor_off", "delete_prompt", "delete_confirm") and self._anchor_locked(
+            car, telegram_user_id=telegram_user_id,
+        ):
+            card = self._render_car_card(car, telegram_user_id=telegram_user_id)
+            return replace(card, text=f"{texts.CLIENT_LINK_ANCHOR_LOCKED_TEXT}\n\n{card.text}")
+
         if action == "check":
             return await self._run_manual_check(car, chat_id=chat_id, telegram_user_id=telegram_user_id)
         if action == "monitor_on":
@@ -747,6 +799,18 @@ class ConversationController:
     # client_links.py). Менеджерские действия — только trusted, car_id из
     # callback_data перепроверяется (get_any_car); ответ клиента — только
     # тот, кому адресовано приглашение. ----
+
+    def _anchor_locked(self, car: TurkeyUserCar, *, telegram_user_id: int) -> bool:
+        """Владелец машины-якоря больше не менеджер (обычный пользователь), а к
+        машине привязан клиент или ждёт приглашение: ⏹ и удаление оставили бы
+        клиента без уведомлений — решает администратор."""
+        if self._client_links is None or self._is_trusted(telegram_user_id):
+            return False
+        links = self._client_links.links
+        pending = links.pending_for_anchor(telegram_user_id, car.car_number)
+        return links.active_for_anchor(telegram_user_id, car.car_number) is not None or (
+            pending is not None and not pending.is_expired(self._client_links.now())
+        )
 
     def _link_anchor(self, car_id: int) -> TurkeyUserCar | None:
         """Машина, к которой можно привязать клиента: своя строка менеджера
@@ -950,6 +1014,186 @@ class ConversationController:
         self._states.clear(chat_id)
         self._garage.set_client_display_name(car.id, name)
         return self._client_link_screen(car, int(payload.get("page", 0)), notice=texts.CLIENT_NAME_SAVED_TEXT)
+
+    # ---- 🔗 Привязки без менеджера (администратор) ----
+
+    _ORPHAN_PAGE_SIZE = 5
+
+    def _orphan_list_reply(
+        self, page: int, *, notice: str | None = None, outgoing: tuple[OutgoingMessage, ...] = (),
+    ) -> BotReply:
+        links = self._client_links.orphan_links()
+        if not links:
+            text = texts.ORPHAN_LINKS_EMPTY_TEXT
+            return BotReply(text=f"{notice}\n\n{text}" if notice else text, outgoing_messages=outgoing)
+        total_pages = -(-len(links) // self._ORPHAN_PAGE_SIZE)
+        page = max(0, min(page, total_pages - 1))
+        shown = links[page * self._ORPHAN_PAGE_SIZE:(page + 1) * self._ORPHAN_PAGE_SIZE]
+        blocks = [
+            texts.format_orphan_block(
+                plate=link.plate, client=self._person(link.client_telegram_user_id),
+                former_manager=self._person(link.owner_telegram_user_id), since=link.confirmed_at,
+                monitoring_active=self._client_links.anchor_monitoring_active(link),
+            )
+            for link in shown
+        ]
+        text = texts.format_orphan_list(blocks, count=len(links), page=page, total_pages=total_pages)
+        return BotReply(
+            text=f"{notice}\n\n{text}" if notice else text, outgoing_messages=outgoing,
+            orphan_list=(page, total_pages, tuple((link.id, link.plate) for link in shown)),
+        )
+
+    def _issue_orphan_token(self, admin: int, link_id: int, action: str, manager_id: int | None) -> str:
+        token = secrets.token_hex(4)
+        self._orphan_tokens[(admin, link_id)] = (action, manager_id, token)
+        return token
+
+    def _take_orphan_token(self, admin: int, link_id: int, action: str, manager_id: int | None, token: str) -> bool:
+        """Одноразово: токен снимается при любой попытке; верен только для
+        того же администратора, привязки, действия и менеджера."""
+        stored = self._orphan_tokens.pop((admin, link_id), None)
+        return stored is not None and secrets.compare_digest(stored[2], token or "") and stored[:2] == (action, manager_id)
+
+    def _link_search_reply(
+        self, plate: str, *, notice: str | None = None, outgoing: tuple[OutgoingMessage, ...] = (),
+    ) -> BotReply:
+        """Все привязки номера (активные и ждущие подтверждения, у любых
+        владельцев): клиент, ответственный менеджер и действует ли он,
+        мониторинг его машины. Действия — только для активных привязок."""
+        links = self._client_links.links.links_for_plate(plate)
+        if not links:
+            text = texts.format_admin_link_search_empty(plate)
+            return BotReply(text=f"{notice}\n\n{text}" if notice else text, outgoing_messages=outgoing)
+        now = self._client_links.now()
+        blocks = []
+        for link in links:
+            subscription = self._subscriptions.get(telegram_user_id=link.owner_telegram_user_id, plate=link.plate)
+            status = "active" if link.status == "active" else ("expired" if link.is_expired(now) else "pending")
+            blocks.append(texts.format_admin_link_block(
+                plate=link.plate, status=status,
+                moment=link.confirmed_at if status == "active" else link.expires_at,
+                client=self._person(link.client_telegram_user_id) if status == "active" else None,
+                invited=self._person(link.invited_user_id) if link.invited_user_id is not None else None,
+                manager=self._person(link.owner_telegram_user_id),
+                manager_active=self._client_links.is_manager(link.owner_telegram_user_id),
+                monitoring_active=subscription is not None and subscription.active,
+            ))
+        text = texts.format_admin_link_search(plate, blocks)
+        return BotReply(
+            text=f"{notice}\n\n{text}" if notice else text, outgoing_messages=outgoing,
+            admin_link_search=tuple((link.id, link.plate) for link in links if link.status == "active"),
+        )
+
+    def handle_admin_link_search_results(self, plate: str, *, telegram_user_id: int) -> BotReply | None:
+        if not self.is_admin(telegram_user_id):
+            return None
+        return self._link_search_reply(plate)
+
+    def handle_orphan_action(
+        self, action: str, first: int, extra: int | None, token: str | None, *, telegram_user_id: int,
+    ) -> BotReply | None:
+        """None — не администратор (права перепроверяются на каждом нажатии).
+        Действия с префиксом s_ — из «🔎 Найти привязку по номеру»: любая
+        активная привязка (в т.ч. действующего менеджера), после действия —
+        снова результаты поиска; без префикса — только привязки без менеджера."""
+        if not self.is_admin(telegram_user_id):
+            return None
+        admin = telegram_user_id
+        if action == "list":
+            return self._orphan_list_reply(first)
+        search = action.startswith("s_")
+        base = action[2:] if search else action
+        prefix = "s_" if search else ""
+        link_id = first
+        link = self._client_links.links.get(link_id)
+        if link is None:
+            return self._orphan_list_reply(0, notice=texts.ORPHAN_REFUSAL_TEXTS["gone"])
+        client = self._person(link.client_telegram_user_id)
+        require_orphan = not search
+
+        def back(notice: str | None = None, outgoing: tuple[OutgoingMessage, ...] = ()) -> BotReply:
+            if search:
+                return self._link_search_reply(link.plate, notice=notice, outgoing=outgoing)
+            return self._orphan_list_reply(0, notice=notice, outgoing=outgoing)
+
+        back_data = encode_admin_search_results_callback(link.plate) if search else encode_orphan_callback("list", 0)
+
+        if base == "disable":
+            refusal = self._client_links.transfer_plan(link_id, new_owner=admin, require_orphan=require_orphan).status
+            if refusal in ("gone", "not_orphan"):
+                return back(texts.ORPHAN_REFUSAL_TEXTS[refusal])
+            action_yes = f"{prefix}disable_yes"
+            return BotReply(
+                text=texts.format_orphan_disable_prompt(plate=link.plate, client=client),
+                orphan_confirm=(link_id, action_yes, None,
+                                self._issue_orphan_token(admin, link_id, action_yes, None), back_data),
+            )
+        if base == "disable_yes":
+            if not self._take_orphan_token(admin, link_id, action, None, token):
+                return back(texts.ORPHAN_STALE_TEXT)
+            owner_was_manager = self._client_links.is_manager(link.owner_telegram_user_id)
+            outcome = self._client_links.disable_orphan(link_id, closed_by=admin, require_orphan=require_orphan)
+            if outcome.status != "disabled":
+                return back(texts.ORPHAN_REFUSAL_TEXTS[outcome.status])
+            outgoing = [OutgoingMessage(chat_id=link.client_telegram_user_id,
+                                        text=texts.format_client_link_released(link.plate))]
+            if owner_was_manager and link.owner_telegram_user_id != admin:
+                outgoing.append(OutgoingMessage(chat_id=link.owner_telegram_user_id, text=texts.format_admin_link_owner_notice(
+                    link.plate, client=client, transferred=False, moved=False,
+                )))
+            return back(texts.format_orphan_disabled(link.plate), tuple(outgoing))
+        if base == "transfer":
+            managers = sorted(
+                self._trusted_operator_user_ids - {link.client_telegram_user_id, link.owner_telegram_user_id}
+            )
+            if not managers:
+                return back(texts.ORPHAN_NO_MANAGERS_TEXT)
+            options = []
+            for manager_id in managers:
+                profile = self._client_links.profile(manager_id)
+                username, first_name, last_name = profile if profile is not None else (None, None, None)
+                label = texts.format_link_person_button(username=username, first_name=first_name, last_name=last_name)
+                options.append((manager_id, label if profile is not None else f"Менеджер {manager_id}"))
+            return BotReply(
+                text=f"👤 Кому передать привязку {texts.format_plate_for_telegram(link.plate)}?",
+                orphan_picker=(link_id, tuple(options), f"{prefix}transfer_to", back_data),
+            )
+        if base == "transfer_to":
+            plan = self._client_links.transfer_plan(link_id, new_owner=extra, require_orphan=require_orphan)
+            if plan.status not in ("reanchored", "moved"):
+                return back(texts.ORPHAN_REFUSAL_TEXTS[plan.status])
+            action_yes = f"{prefix}transfer_yes"
+            current_owner = (
+                self._person(link.owner_telegram_user_id)
+                if self._client_links.is_manager(link.owner_telegram_user_id) else None
+            )
+            return BotReply(
+                text=texts.format_orphan_transfer_prompt(
+                    plate=link.plate, client=client, manager=self._person(extra), moved=plan.status == "moved",
+                    current_owner=current_owner,
+                ),
+                orphan_confirm=(link_id, action_yes, extra,
+                                self._issue_orphan_token(admin, link_id, action_yes, extra), back_data),
+            )
+        if base == "transfer_yes":
+            if not self._take_orphan_token(admin, link_id, action, extra, token):
+                return back(texts.ORPHAN_STALE_TEXT)
+            owner_was_manager = self._client_links.is_manager(link.owner_telegram_user_id)
+            outcome = self._client_links.transfer_orphan(link_id, new_owner=extra, require_orphan=require_orphan)
+            if outcome.status not in ("reanchored", "moved"):
+                return back(texts.ORPHAN_REFUSAL_TEXTS[outcome.status])
+            outgoing = [OutgoingMessage(chat_id=extra, text=texts.format_orphan_transfer_notice(link.plate, client=client))]
+            if owner_was_manager and link.owner_telegram_user_id != admin:
+                outgoing.append(OutgoingMessage(chat_id=link.owner_telegram_user_id, text=texts.format_admin_link_owner_notice(
+                    link.plate, client=client, transferred=True, moved=outcome.status == "moved",
+                )))
+            return back(
+                texts.format_orphan_transferred(
+                    link.plate, manager=self._person(extra), monitoring_active=outcome.monitoring_active,
+                ),
+                tuple(outgoing),
+            )
+        return None
 
     _LINK_ERROR_TEXTS = {
         "invalid": texts.CLIENT_LINK_INVALID_TEXT,
