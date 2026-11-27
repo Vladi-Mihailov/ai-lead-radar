@@ -60,7 +60,7 @@ def format_trusted_operator_fine_message(
 
 def format_check_now_fines_message(
     *, car_number: str, fines: list[NewFineEvent], status_labels: dict[str, str] | None = None,
-    payable_lines: dict[str, list[str]] | None = None,
+    payable_lines: dict[str, list[str]] | None = None, original_amount_protocols: set[str] | None = None,
 ) -> str:
     """Manual "🔎 Проверить сейчас" (см. design report про UX manual
     check) — показывает ВСЕ штрафы, которые police.ge вернул на этой
@@ -81,7 +81,10 @@ def format_check_now_fines_message(
 
     payable_lines — {protocolNo: ["💰 К оплате: ..."]} (сумма к оплате,
     см. reader/public_bot/payable_amount_texts.py): строка суммы блока
-    становится «🧾 Штраф», под ней — «💰 К оплате». None — формат прежний."""
+    становится «🧾 Штраф», под ней — «💰 К оплате». None — формат прежний.
+
+    original_amount_protocols — штрафы с истёкшим окончательным сроком
+    оплаты: их исходная сумма — «🧾 Первоначальный штраф»."""
     formatted_car_number = format_plate_for_telegram(car_number)
     blocks = []
     for fine in fines:
@@ -90,7 +93,10 @@ def format_check_now_fines_message(
             "🚨 Обнаружен штраф",
             "",
             f"🚗 Автомобиль: {formatted_car_number}",
-            format_fine_block(fine, payable_lines=extra),
+            format_fine_block(
+                fine, payable_lines=extra,
+                original_amount=(fine.external_fine_id or "") in (original_amount_protocols or set()),
+            ),
         ]
         if status_labels is not None:
             label = status_labels.get(fine.external_fine_id or "")

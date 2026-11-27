@@ -35,7 +35,9 @@ from reader.public_bot.payable_amount_texts import (
     ReceiptAmount,
     format_fine_payable_line,
     format_fines_line,
+    format_overdue_line,
     format_payable_lines,
+    format_receipt_overdue_line,
     format_refreshed_at,
     summarize,
 )
@@ -278,21 +280,30 @@ def format_check_now_result(
     }
     if payable is not None and tz is not None:
         # Штрафы не «к оплате» (🟢 и т.п.) — тоже «🧾 Штраф», но без «💰 К оплате».
+        # Просроченный по окончательному сроку — «🧾 Первоначальный штраф» и
+        # строка просрочки под суммой к оплате.
         payable_lines = {
             fine.external_fine_id: (
-                [format_fine_payable_line(payable[fine.external_fine_id])]
+                _receipt_payable_lines(payable[fine.external_fine_id])
                 if fine.external_fine_id in payable else []
             )
             for fine in outcome.fines
             if fine.external_fine_id
         }
+        overdue_protocols = {protocol_no for protocol_no, receipt in payable.items() if receipt.overdue}
         blocks = format_check_now_fines_message(
             car_number=outcome.car_number, fines=outcome.fines, status_labels=labels, payable_lines=payable_lines,
+            original_amount_protocols=overdue_protocols,
         )
         summary = format_check_now_payable_summary(outcome.fines, statuses, payable, tz=tz)
         return f"{blocks}\n\n{summary}{unverified_line}"
     blocks = format_check_now_fines_message(car_number=outcome.car_number, fines=outcome.fines, status_labels=labels)
     return f"{blocks}\n\n{format_check_now_status_summary(outcome.fines, statuses)}{unverified_line}"
+
+
+def _receipt_payable_lines(receipt: ReceiptAmount) -> list[str]:
+    overdue = format_receipt_overdue_line(receipt)
+    return [format_fine_payable_line(receipt)] + ([overdue] if overdue else [])
 
 
 # ==== Статусы оплаты (см. reader/fines/payment_status.py) ====
@@ -381,7 +392,7 @@ def format_check_now_payable_summary(
     summary = summarize(receipts)
     lines = []
     if summary.count:
-        lines.append(format_fines_line(summary.count, summary.base_total))
+        lines.append(format_fines_line(summary.count, summary.base_total, original=summary.overdue_count > 0))
         lines.extend(format_payable_lines(summary, tz=tz))
     else:
         lines.append(f"💰 К оплате: {_format_search_amount(0.0)}")
@@ -412,14 +423,17 @@ def format_payable_amount_card(
         🚗 Автомобиль: AB123CD
         🧾 Штраф: 50 ₾
         💰 К оплате: 150 ₾
-        🕒 Сумма уточнена 21.11 в 15:20
+        🕒 Сумма уточнена: 21.11 в 15:20
+    Окончательный срок оплаты истёк — «🧾 Первоначальный штраф» и под суммой
+    «⚠️ Срок оплаты истёк.» (с «Сумма штрафа увеличилась.», только если
+    Georgian Card подтвердил сумму больше исходной).
     notes — что произошло при уточнении (увеличение, недоступность, лимит)."""
     if not receipts:
         return PAYABLE_AMOUNT_NOTHING_TO_REFRESH_TEXT.format(car_number=format_plate_for_telegram(car_number))
     summary = summarize(receipts)
     lines = [
         f"🚗 Автомобиль: {format_plate_for_telegram(car_number)}",
-        format_fines_line(summary.count, summary.base_total),
+        format_fines_line(summary.count, summary.base_total, original=summary.overdue_count > 0),
         *format_payable_lines(summary, tz=tz),
     ]
     if notes:
@@ -1116,6 +1130,11 @@ def format_debt_row(
             lines.append(f"🔴 Неоплачено: {_format_fine_count_and_amount(debt_count, debt_amount)}")
         if debt_count or isinstance(breakdown, SnapshotDebt):
             lines.append(f"💰 Сумма к оплате: {_format_search_amount(payable)}")
+            # Просрочка по окончательному сроку (без строки о неуточнённых
+            # суммах — решение владельца 2026-11-21).
+            overdue = format_overdue_line(amounts) if amounts is not None else None
+            if overdue is not None:
+                lines.append(overdue)
         if breakdown.needs_review_count:
             lines.append(
                 "🟡 Из них требуют проверки: "

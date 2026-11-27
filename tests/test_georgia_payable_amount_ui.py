@@ -209,7 +209,7 @@ def test_one_date_only_when_every_amount_is_known_and_it_is_the_earliest():
     later = _REFRESHED_AT + timedelta(hours=3)
     summary = summarize([_receipt(50, 150, _REFRESHED_AT), _receipt(100, 400, later)])
     assert format_header_payable_lines(summary, tz=_TBILISI) == [
-        "💰 К оплате: 550 ₾", "🕒 Суммы уточнены 21.11 в 15:20",
+        "💰 К оплате: 550 ₾", "🕒 Суммы уточнены: 21.11 в 15:20",
     ]
 
 
@@ -270,7 +270,7 @@ async def test_check_now_card_shows_fine_and_amount_to_pay_with_refresh_button(f
 
     lines = reply.text.splitlines()
     assert "🧾 Штраф: 50 ₾" in lines and "💰 К оплате: 150 ₾" in lines
-    assert "🕒 Сумма уточнена 21.11 в 15:20" in lines
+    assert "🕒 Сумма уточнена: 21.11 в 15:20" in lines
     assert "💰 Сумма: 50 GEL" not in reply.text
     assert reply.cta_buttons[0] == [("🔄 Уточнить сумму", f"amtref:{subscription.id}".encode())]
     assert [label for label, _ in reply.cta_buttons[1]] == ["💳 Оплатить в рублях", "🚗 ОСАГО Грузии"]
@@ -318,7 +318,7 @@ async def test_refresh_button_returns_the_agreed_card(fx):
         f"🚗 Автомобиль: {format_plate_for_telegram(_CAR)}",
         "🧾 Штраф: 50 ₾",
         "💰 К оплате: 150 ₾",
-        "🕒 Сумма уточнена 21.11 в 15:20",
+        "🕒 Сумма уточнена: 21.11 в 15:20",
     ]
     assert [label for label, _ in reply.cta_buttons[0]] == ["🔄 Уточнить сумму"]
     assert [label for label, _ in reply.cta_buttons[1]] == ["💳 Оплатить в рублях", "🚗 ОСАГО Грузии"]
@@ -381,10 +381,10 @@ async def test_statistics_shows_amounts_to_pay_and_creates_no_gateway_requests(f
         "Автомобили со штрафами: 2",
         "🔴 Неоплачено: 3 штрафа",
         "💰 Сумма к оплате: 550 ₾",
-        "🕒 Суммы уточнены 21.11 в 15:20",
+        "🕒 Суммы уточнены: 21.11 в 15:20",
         "🟢 Оплачено: 0 ₾ (0 шт.)",
     ]
-    assert lines.count("🕒 Суммы уточнены 21.11 в 15:20") == 1 and not any("Сумма уточнена" in line for line in lines)
+    assert lines.count("🕒 Суммы уточнены: 21.11 в 15:20") == 1 and not any("Сумма уточнена" in line for line in lines)
     text = "\n".join(lines)
     assert (f"🚗 Госномер: {format_plate_for_telegram('AA111BB')}\n"
             "🔴 Неоплачено: 2 штрафа — 150 ₾\n💰 Сумма к оплате: 450 ₾\n") in text
@@ -1023,3 +1023,213 @@ async def test_operator_skips_a_receipt_paid_before_sending(fx):
     assert fx.amounts.get_delivery(event_id, OPERATOR_SUBSCRIPTION_ID, OPERATOR_ROLE).exclusion_reason == (
         EXCLUSION_RECEIPT_NOT_PAYABLE
     )
+
+
+# ---- Просрочка по окончательному сроку оплаты ----
+#
+# Даты считаются от реальных часов: контроллер берёт «сегодня» из них, а
+# сумма Georgian Card актуальна только в текущем контрольном периоде.
+
+from reader.public_bot.conversation import _SearchHit  # noqa: E402
+from reader.public_bot.payable_amount_texts import format_overdue_line, format_refreshed_at  # noqa: E402
+
+_OVERDUE_TITLE = "⚠️ Срок оплаты истёк."
+_INCREASED_ONE = "⚠️ Срок оплаты истёк. Сумма штрафа увеличилась."
+
+
+def _today_tbilisi() -> date:
+    return datetime.now(timezone.utc).astimezone(_TBILISI).date()
+
+
+def _dated_car(fx, car, fines, *, last_date: date, active: bool = True, owner=_OWNER):
+    """Машина, у квитанций которой police.ge отдаёт lastDate и (active) activeDate:
+    срок окончательный только с activeDate."""
+    task, subscription = fx.car(car, fines, owner=owner)
+    raw_extra = {"lastDate": last_date.isoformat()}
+    if active:
+        raw_extra["activeDate"] = (last_date - timedelta(days=30)).isoformat()
+    fx.provider.records[car] = [
+        ParsedFineRecord(
+            car_number=car, external_fine_id=protocol, penalty_date=date(2026, 8, 21), due_date=last_date,
+            delivered_status="Вручено", fingerprint=f"fp-{car}-{protocol}",
+            raw_data={"protocolNo": protocol, **raw_extra}, amount=amount,
+        )
+        for protocol, amount in fines
+    ]
+    return task, subscription
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def _overdue_receipt(base, payable=None, *, overdue=True):
+    return ReceiptAmount(protocol_no="X", base_amount=base, payable=payable, observed_at=None, overdue=overdue)
+
+
+@pytest.mark.parametrize("receipts, expected", [
+    ([_overdue_receipt(50, 150)], _INCREASED_ONE),
+    ([_overdue_receipt(50, 50)], _OVERDUE_TITLE),
+    ([_overdue_receipt(50)], _OVERDUE_TITLE),
+    ([_overdue_receipt(50, 150, overdue=False)], None),
+    ([_overdue_receipt(50, 150), _overdue_receipt(100, 300)], "⚠️ Срок оплаты истёк. Сумма штрафов увеличилась."),
+    ([_overdue_receipt(50, 150), _overdue_receipt(100)], "⚠️ Срок оплаты истёк. Сумма увеличилась по 1 из 2 штрафов."),
+    ([_overdue_receipt(50, 150), _overdue_receipt(100, overdue=False)],
+     "⚠️ Срок оплаты истёк по 1 из 2 штрафов. Сумма увеличилась по 1 из 2 штрафов."),
+    ([_overdue_receipt(50), _overdue_receipt(100, overdue=False)], "⚠️ Срок оплаты истёк по 1 из 2 штрафов."),
+    # Увеличение по штрафу, срок которого не истёк, в строку просрочки не входит.
+    ([_overdue_receipt(50), _overdue_receipt(100, 300, overdue=False)], "⚠️ Срок оплаты истёк по 1 из 2 штрафов."),
+])
+def test_overdue_line_claims_an_increase_only_where_the_gateway_confirmed_it(receipts, expected):
+    assert format_overdue_line(summarize(receipts)) == expected
+
+
+async def test_overdue_refresh_card_with_a_confirmed_increase_matches_the_agreed_layout(fx):
+    fx.clock_now = _now_utc()
+    task, subscription = _dated_car(fx, _CAR, [("GE1", 50)], last_date=_today_tbilisi() - timedelta(days=5))
+    await fx.check(task)
+    fx.gc.amounts["GE1"] = 150.0
+
+    reply = await fx.controller.handle_payable_amount_refresh(subscription.id, telegram_user_id=_OWNER, chat_id=_OWNER)
+
+    assert reply.text.splitlines() == [
+        f"🚗 Автомобиль: {format_plate_for_telegram(_CAR)}",
+        "🧾 Первоначальный штраф: 50 ₾",
+        "💰 К оплате: 150 ₾",
+        _INCREASED_ONE,
+        format_refreshed_at(fx.clock_now, tz=_TBILISI),
+    ]
+    assert format_refreshed_at(fx.clock_now, tz=_TBILISI).startswith("🕒 Сумма уточнена: ")
+    # Первое значение Georgian Card сохраняется молча: событий и уведомлений нет.
+    assert fx.amounts.count_events() == 0
+    await fx.delivery.run_once(now=fx.clock_now + timedelta(minutes=3))
+    assert fx.sender.sent == []
+
+
+@pytest.mark.parametrize("gc_amount", [40.0, 50.0])
+async def test_overdue_without_a_confirmed_increase_never_says_the_amount_grew(fx, gc_amount):
+    fx.clock_now = _now_utc()
+    task, subscription = _dated_car(fx, _CAR, [("GE1", 50)], last_date=_today_tbilisi() - timedelta(days=5))
+    await fx.check(task)
+    fx.gc.amounts["GE1"] = gc_amount
+
+    reply = await fx.controller.handle_payable_amount_refresh(subscription.id, telegram_user_id=_OWNER, chat_id=_OWNER)
+
+    lines = reply.text.splitlines()
+    assert lines[1:4] == ["🧾 Первоначальный штраф: 50 ₾", "💰 К оплате: 50 ₾", _OVERDUE_TITLE]  # максимум сохранён
+    assert "увеличилась" not in reply.text
+
+
+async def test_overdue_with_an_unknown_amount_warns_and_offers_a_refresh(fx):
+    task, subscription = _dated_car(fx, _CAR, [("GE1", 50), ("GE2", 100)], last_date=_today_tbilisi() - timedelta(days=5))
+    await fx.check(task)
+
+    reply = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=_OWNER)
+
+    lines = reply.text.splitlines()
+    first = lines.index("🧾 Первоначальный штраф: 50 ₾")
+    assert lines[first + 1:first + 3] == ["💰 К оплате: требуется уточнение", _OVERDUE_TITLE]
+    summary = lines.index("🧾 Первоначальные штрафы: 2 шт. — 150 ₾")
+    assert lines[summary + 1:summary + 3] == ["💰 К оплате: требуется уточнение", _OVERDUE_TITLE]
+    assert "увеличилась" not in reply.text
+    assert reply.cta_buttons[0] == [("🔄 Уточнить сумму", f"amtref:{subscription.id}".encode())]
+    assert fx.gc.calls == [] and fx.amounts.count_events() == 0
+
+
+async def test_check_now_shows_the_increase_under_each_overdue_fine(fx):
+    task, subscription = _dated_car(fx, _CAR, [("GE1", 50), ("GE2", 100)], last_date=_today_tbilisi() - timedelta(days=5))
+    await fx.check(task)
+    observed = _now_utc() - timedelta(hours=1)
+    fx.store(_CAR, "GE1", 150, at=observed)
+    fx.store(_CAR, "GE2", 100, at=observed)
+
+    reply = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=_OWNER)
+
+    lines = reply.text.splitlines()
+    first = lines.index("🧾 Первоначальный штраф: 50 ₾")
+    assert lines[first + 1:first + 3] == ["💰 К оплате: 150 ₾", _INCREASED_ONE]
+    second = lines.index("🧾 Первоначальный штраф: 100 ₾")
+    assert lines[second + 1:second + 3] == ["💰 К оплате: 100 ₾", _OVERDUE_TITLE]
+    summary = lines.index("🧾 Первоначальные штрафы: 2 шт. — 150 ₾")
+    assert lines[summary + 1:summary + 4] == [
+        "💰 К оплате: 250 ₾",
+        "⚠️ Срок оплаты истёк. Сумма увеличилась по 1 из 2 штрафов.",
+        format_refreshed_at(observed, tz=_TBILISI, plural=True),
+    ]
+    assert fx.gc.calls == []
+
+
+async def test_amount_from_an_earlier_control_period_is_not_a_confirmed_increase(fx):
+    # Срок истёк 40 дней назад: идёт второй период, сумма получена в первом.
+    task, subscription = _dated_car(fx, _CAR, [("GE1", 50)], last_date=_today_tbilisi() - timedelta(days=40))
+    await fx.check(task)
+    fx.store(_CAR, "GE1", 150, at=_now_utc() - timedelta(days=20))
+
+    reply = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=_OWNER)
+
+    lines = reply.text.splitlines()
+    first = lines.index("🧾 Первоначальный штраф: 50 ₾")
+    assert lines[first + 1:first + 3] == ["💰 К оплате: требуется уточнение", _OVERDUE_TITLE]
+    assert "увеличилась" not in reply.text
+
+
+@pytest.mark.parametrize("last_date_offset, active", [
+    (-5, False),  # предварительный срок (без activeDate) просрочкой не считается
+    (10, True),   # окончательный срок ещё идёт
+    (0, True),    # последний день срока — ещё не просрочка
+])
+async def test_no_overdue_warning_without_a_final_expired_term(fx, last_date_offset, active):
+    task, subscription = _dated_car(
+        fx, _CAR, [("GE1", 50)], last_date=_today_tbilisi() + timedelta(days=last_date_offset), active=active,
+    )
+    await fx.check(task)
+    fx.store(_CAR, "GE1", 150, at=_now_utc() - timedelta(hours=1))
+
+    reply = await fx.controller.handle_check_now_choice(subscription.id, telegram_user_id=_OWNER)
+
+    assert "Срок оплаты истёк" not in reply.text and "Первоначальн" not in reply.text
+    assert "🧾 Штраф: 50 ₾" in reply.text.splitlines()
+
+
+async def test_statistics_rows_show_overdue_without_a_line_about_unrefined_amounts(fx):
+    overdue_day = _today_tbilisi() - timedelta(days=5)
+    first, _ = _dated_car(fx, "AA111BB", [("GE1", 50), ("GE2", 100)], last_date=overdue_day)
+    second, _ = _dated_car(fx, "CD456EF", [("GE3", 50), ("GE4", 50)], last_date=overdue_day, owner=None)
+    third, _ = fx.car("EE777KK", [("GE5", 100)])  # срок не окончательный — без строки
+    for task in (first, second, third):
+        await fx.check(task)
+    observed = _now_utc() - timedelta(hours=1)
+    fx.store("AA111BB", "GE1", 150, at=observed)
+    fx.store("AA111BB", "GE2", 300, at=observed)
+    fx.store("CD456EF", "GE3", 150, at=observed)  # GE4 — сумма неизвестна
+
+    lines = fx.controller._format_statistics_reply().text.splitlines()
+    text = "\n".join(lines)
+
+    assert (f"🚗 Госномер: {format_plate_for_telegram('AA111BB')}\n🔴 Неоплачено: 2 штрафа — 150 ₾\n"
+            "💰 Сумма к оплате: 450 ₾\n⚠️ Срок оплаты истёк. Сумма штрафов увеличилась.\n") in text
+    assert (f"🚗 Госномер: {format_plate_for_telegram('CD456EF')}\n🔴 Неоплачено: 2 штрафа — 100 ₾\n"
+            "💰 Сумма к оплате: 200 ₾\n⚠️ Срок оплаты истёк. Сумма увеличилась по 1 из 2 штрафов.\n") in text
+    assert (f"🚗 Госномер: {format_plate_for_telegram('EE777KK')}\n🔴 Неоплачено: 1 штраф — 100 ₾\n"
+            "💰 Сумма к оплате: 100 ₾\n") in text
+    header = lines[lines.index("🚨 Штрафы по последней проверке"):]
+    assert not any("⚠️" in line for line in header[:5])  # шапка не меняется
+    assert not any("требует уточнения" in line or "Предварительно" in line for line in lines)
+    assert fx.gc.calls == [] and fx.amounts.count_events() == 0
+
+
+async def test_manager_search_block_shows_overdue_after_the_fines_line(fx):
+    task, _ = _dated_car(fx, _CAR, [("GE1", 50)], last_date=_today_tbilisi() - timedelta(days=5))
+    await fx.check(task)
+    fx.store(_CAR, "GE1", 150, at=_now_utc() - timedelta(hours=1))
+    fines = (await fx.check_service.check_task(fx.tasks.get(task.id))).current_fines
+
+    block = fx.controller._format_search_block(
+        _SearchHit(task_id=task.id, owner_telegram_user_id=_OWNER, car_number=_CAR),
+        monitoring_active=True, check_ok=True, fines=fines, checked_at=_now_utc(),
+    )
+
+    lines = block.splitlines()
+    money = lines.index("💰 Штрафы: 50 ₾")
+    assert lines[money + 1] == _INCREASED_ONE
+    assert fx.gc.calls == []
