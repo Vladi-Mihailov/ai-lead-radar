@@ -23,7 +23,7 @@ reader/public_bot/conversation.py) — reader/turkey_bot/handlers.py
   Оба используют ОДИН UnifiedTurkeyCheckService (см. design report п.12)."""
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -523,12 +523,13 @@ class ConversationController:
         text = texts.format_manager_car_detail(
             car, owner_username=username, monitoring_active=monitoring_active,
         )
-        if self._client_links is not None:
-            text = "\n".join([text, *self._client_link_status_lines(car)])
+        anchor = self._link_anchor(car.id)
+        if anchor is not None:
+            text = "\n".join([text, *self._client_link_status_lines(anchor)])
         return BotReply(
             text=text,
             manager_car_detail_page=page,
-            manager_car_detail_car_id=car.id if self._client_links is not None else None,
+            manager_car_detail_car_id=anchor.id if anchor is not None else None,
         )
 
     def handle_manager_car_toggle(self, car_id: int, page: int, *, telegram_user_id: int) -> BotReply | None:
@@ -587,7 +588,9 @@ class ConversationController:
         monitoring_active, linked = self._car_monitoring_state(car, telegram_user_id=telegram_user_id)
         text = texts.format_car_card_text(car, monitoring_active=monitoring_active)
         if linked:
-            text = f"{text}\n{texts.CLIENT_LINK_CARD_LINE}"
+            link = self._client_link_of(car, telegram_user_id=telegram_user_id)
+            anchor_on = link is not None and self._client_links.anchor_monitoring_active(link)
+            text = f"{text}\n{texts.CLIENT_LINK_CARD_LINE if anchor_on else texts.CLIENT_LINK_CARD_LINE_ANCHOR_OFF}"
         return BotReply(text=text, car_card=car, car_card_monitoring_active=monitoring_active)
 
     async def handle_car_action(
@@ -669,12 +672,11 @@ class ConversationController:
         pattern [Georgian bot edit-in-place]")."""
         link = self._client_link_of(car, telegram_user_id=telegram_user_id)
         if link is not None:
-            # Привязанному клиенту — снова уведомления из проверки машины
-            # менеджера; своя подписка (вторая проверка номера) не нужна,
-            # пока мониторинг менеджера включён.
+            # Привязанному клиенту — только его копия уведомлений из проверки
+            # машины менеджера. Своя подписка (вторая проверка того же номера)
+            # не создаётся, даже если мониторинг менеджера сейчас выключен.
             self._client_links.links.set_muted(link.id, False)
-            if self._client_links.anchor_monitoring_active(link):
-                return self._render_car_card(car, telegram_user_id=telegram_user_id)
+            return self._render_car_card(car, telegram_user_id=telegram_user_id)
         next_check_at = next_monitoring_slot(datetime.now(timezone.utc))
         self._subscriptions.enable(
             telegram_user_id=telegram_user_id, telegram_chat_id=chat_id,
@@ -720,15 +722,36 @@ class ConversationController:
         reader/public_bot/conversation.py::handle_my_car_delete_confirm —
         "не отдельное сообщение-квитанция, а сразу актуальный список")."""
         self._subscriptions.disable(telegram_user_id=telegram_user_id, plate=car.car_number)
+        outgoing: tuple[OutgoingMessage, ...] = ()
         if self._client_links is not None:
             self._client_links.client_removed_car(telegram_user_id=telegram_user_id, plate=car.car_number)
+            # Удалили машину-якорь — привязка закрывается как при отвязке.
+            released = self._client_links.anchor_removed(car, closed_by=telegram_user_id)
+            if released is not None:
+                outgoing = (OutgoingMessage(
+                    chat_id=released.client_telegram_user_id, text=texts.format_client_link_released(car.car_number),
+                ),)
         self._garage.delete_car(car.id, telegram_user_id=telegram_user_id)
-        return self.handle_my_cars(chat_id=chat_id, telegram_user_id=telegram_user_id)
+        reply = self.handle_my_cars(chat_id=chat_id, telegram_user_id=telegram_user_id)
+        return replace(reply, outgoing_messages=outgoing) if outgoing else reply
 
     # ---- 👤 Привязка клиента к автомобилю (см. reader/turkey_bot/
     # client_links.py). Менеджерские действия — только trusted, car_id из
     # callback_data перепроверяется (get_any_car); ответ клиента — только
     # тот, кому адресовано приглашение. ----
+
+    def _link_anchor(self, car_id: int) -> TurkeyUserCar | None:
+        """Машина, к которой можно привязать клиента: своя строка менеджера
+        (владелец — trusted), но не машина, которая сама пришла привязкой.
+        Чужой мониторинг привязка не трогает, второй задачи не создаёт."""
+        if self._client_links is None:
+            return None
+        car = self._garage.get_any_car(car_id)
+        if car is None or not self._is_trusted(car.telegram_user_id):
+            return None
+        if self._client_links.links.active_for_client(car.telegram_user_id, car.car_number) is not None:
+            return None
+        return car
 
     def _client_link_of(self, car: TurkeyUserCar, *, telegram_user_id: int):
         if self._client_links is None:
@@ -798,7 +821,7 @@ class ConversationController:
         """None — фичи нет, НЕ trusted или car_id не существует."""
         if self._client_links is None or not self._is_trusted(telegram_user_id):
             return None
-        car = self._garage.get_any_car(car_id)
+        car = self._link_anchor(car_id)
         if car is None:
             return None
 
@@ -894,7 +917,7 @@ class ConversationController:
         self, raw_text: str, payload: dict, *, chat_id: int, telegram_user_id: int,
     ) -> BotReply:
         self._states.clear(chat_id)
-        car = self._garage.get_any_car(int(payload.get("car_id", 0)))
+        car = self._link_anchor(int(payload.get("car_id", 0)))
         if self._client_links is None or not self._is_trusted(telegram_user_id) or car is None:
             return BotReply(text=texts.UNKNOWN_BUTTON_TEXT, show_main_menu=True)
         page = int(payload.get("page", 0))
@@ -909,7 +932,7 @@ class ConversationController:
     ) -> BotReply:
         """Имя клиента от менеджера — только показ: не user_id, не доступ,
         уведомлений не создаёт. Ошибка — подсказка и снова ввод."""
-        car = self._garage.get_any_car(int(payload.get("car_id", 0)))
+        car = self._link_anchor(int(payload.get("car_id", 0)))
         if self._client_links is None or not self._is_trusted(telegram_user_id) or car is None:
             self._states.clear(chat_id)
             return BotReply(text=texts.UNKNOWN_BUTTON_TEXT, show_main_menu=True)
@@ -962,7 +985,7 @@ class ConversationController:
         if car is None:
             return BotReply(text=texts.CLIENT_LINK_INVALID_TEXT, show_main_menu=True)
         monitoring_active, _ = self._car_monitoring_state(car, telegram_user_id=telegram_user_id)
-        latest = self._runs.list_by_plate(link.plate, limit=1)
+        latest = self._runs.get_latest_reliable_run_for_plate(link.plate)
         outgoing: list[OutgoingMessage] = []
         if outcome.status == "ok":
             outgoing.append(OutgoingMessage(
@@ -975,11 +998,14 @@ class ConversationController:
                 outgoing.append(OutgoingMessage(
                     chat_id=replaced.client_telegram_user_id, text=texts.format_client_link_released(link.plate),
                 ))
+        # Клиент мог прийти по ссылке и ещё не видеть меню — второе сообщение
+        # с главным меню («📋 Мои авто»).
         return BotReply(
             text=texts.format_client_link_confirmed(
-                link.plate, latest=latest[0] if latest else None, monitoring_active=monitoring_active,
+                link.plate, latest=latest, monitoring_active=monitoring_active,
             ),
             car_card=car, car_card_monitoring_active=monitoring_active, outgoing_messages=tuple(outgoing),
+            extra_texts=(texts.CLIENT_LINK_MENU_HINT,), show_main_menu=True,
         )
 
     # ---- 📊 Статистика / ⛔ Остановить мониторинг (manager, см. design

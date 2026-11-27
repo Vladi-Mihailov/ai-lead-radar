@@ -35,7 +35,6 @@ from typing import Callable
 from reader.turkey_bot.models import TurkeyUserCar
 from reader.turkey_bot.monitoring.change_detector import detect_changes
 from reader.turkey_bot.monitoring.notification_texts import format_change_notification
-from reader.turkey_bot.monitoring.scheduler_job import next_monitoring_slot
 from reader.turkey_bot.unified.models import ProviderStatus, UnifiedCheckResult
 
 logger = logging.getLogger(__name__)
@@ -182,6 +181,16 @@ class TurkeyClientLinkRepository:
         return self._one(
             "client_telegram_user_id = ? AND plate = ? AND status = 'active'", (client_telegram_user_id, plate),
         )
+
+    def active_links_for_client(self, client_telegram_user_id: int, plate: str) -> list[TurkeyClientLink]:
+        """Все активные привязки клиента к этому номеру (номер мог быть у
+        нескольких владельцев) — общая точка отсчёта, без дублей."""
+        rows = self._conn.execute(
+            f"SELECT {_COLUMNS} FROM turkey_client_links "
+            "WHERE client_telegram_user_id = ? AND plate = ? AND status = 'active' ORDER BY id",
+            (client_telegram_user_id, plate),
+        ).fetchall()
+        return [_row_to_link(row) for row in rows]
 
     def create_pending(
         self, *, owner_telegram_user_id: int, plate: str, method: str, created_by: int,
@@ -395,21 +404,27 @@ class TurkeyClientLinkService:
         if link.owner_telegram_user_id == telegram_user_id:
             return ConfirmOutcome(status="own_car", link=link)
 
+        # Тот же клиент подтверждает новое приглашение той же машины (замена
+        # привязки на него же): машина и точка отсчёта переходят из прежней
+        # привязки, его строку «Мои автомобили» не удаляем.
+        current = self._links.active_for_anchor(link.owner_telegram_user_id, link.plate)
+        same_client = current if current is not None and current.client_telegram_user_id == telegram_user_id else None
         existed = self._garage.get_owned_car_by_number(telegram_user_id, link.plate) is not None
         car = self._garage.add_car(telegram_user_id=telegram_user_id, car_number=link.plate)
-        now = self.now()
         activated = self._links.activate(
-            link.id, client_telegram_user_id=telegram_user_id, now=now,
-            baseline=self._current_baseline(link.plate), client_car_created=not existed,
+            link.id, client_telegram_user_id=telegram_user_id, now=self.now(),
+            baseline=same_client.baseline if same_client is not None else self._current_baseline(link.plate),
+            client_car_created=same_client.client_car_created if same_client is not None else not existed,
         )
         if activated is None:
             if not existed:
                 self._garage.delete_car(car.id, telegram_user_id=telegram_user_id)
             return ConfirmOutcome(status="invalid", link=self._links.get(link.id))
         active, replaced = activated
-        if replaced is not None:
+        if replaced is not None and replaced.client_telegram_user_id != telegram_user_id:
             self._release_client_car(replaced)
-        self._ensure_anchor_monitoring(active)
+        # Мониторинг якоря при подтверждении НЕ включается: чужое состояние
+        # мониторинга (в т.ч. осознанная остановка или общий ⛔) не меняется.
         return ConfirmOutcome(status="ok", link=active, client_car=car, replaced=replaced)
 
     def decline(self, link_id: int, *, telegram_user_id: int) -> ConfirmOutcome:
@@ -439,6 +454,14 @@ class TurkeyClientLinkService:
         self._release_client_car(active)
         return active
 
+    def anchor_removed(self, car: TurkeyUserCar, *, closed_by: int) -> TurkeyClientLink | None:
+        """Владелец удалил машину-якорь: приглашение отменяется, активная
+        привязка закрывается так же, как при отвязке (история проверок
+        остаётся, машина клиента убирается, только если её создала привязка).
+        Возвращает закрытую активную привязку (клиенту — короткое уведомление)."""
+        self.cancel_pending(car, closed_by=closed_by)
+        return self.unlink(car, closed_by=closed_by)
+
     def client_removed_car(self, *, telegram_user_id: int, plate: str) -> None:
         """Клиент сам удалил машину из «Мои автомобили» — привязка закрыта,
         уведомления через менеджера ему больше не идут."""
@@ -460,16 +483,6 @@ class TurkeyClientLinkService:
     def anchor_monitoring_active(self, link: TurkeyClientLink) -> bool:
         anchor = self._subscriptions.get(telegram_user_id=link.owner_telegram_user_id, plate=link.plate)
         return anchor is not None and anchor.active
-
-    def _ensure_anchor_monitoring(self, link: TurkeyClientLink) -> None:
-        """Клиенту нужны уведомления — мониторинг машины менеджера включается,
-        если был выключен (тот же enable, что и у кнопки менеджера)."""
-        if self.anchor_monitoring_active(link):
-            return
-        self._subscriptions.enable(
-            telegram_user_id=link.owner_telegram_user_id, telegram_chat_id=link.owner_telegram_user_id,
-            plate=link.plate, next_check_at=next_monitoring_slot(self.now()),
-        )
 
     def _release_client_car(self, link: TurkeyClientLink) -> None:
         """Отвязка/замена: строку «Мои автомобили», созданную привязкой,
@@ -518,29 +531,39 @@ class TurkeyLinkedClientNotifier:
         if own is not None and own.active:
             return
 
-        previous = {p.provider: self._baseline_result(link, plate, p.provider) for p in result.providers}
-        delivered = True
+        # Точка отсчёта — общая для ВСЕХ привязок клиента к этому номеру (номер
+        # мог быть у нескольких владельцев): то же изменение из проверки
+        # второго якоря уже не придёт повторно.
+        family = self._links.active_links_for_client(client, plate) or [link]
+        previous = {p.provider: self._baseline_result(family, plate, p.provider, client) for p in result.providers}
+        failed: set[str] = set()
         for change in detect_changes(previous, result):
             try:
                 await notifier.send(telegram_chat_id=client, text=format_change_notification(plate, change))
             except Exception:
-                delivered = False
+                failed.add(change.provider)
                 logger.exception("Turkey linked client: не удалось отправить уведомление (link_id=%s)", link.id)
-        if not delivered:
-            return  # точка отсчёта не двигается — изменение придёт со следующей проверкой
+        # Двигаем точку отсчёта по каждому провайдеру отдельно: недоставленное
+        # изменение придёт со следующей проверкой, доставленное — не повторится.
         ids = self._runs.provider_result_ids_for_run(run_id)
-        baseline = dict(link.baseline)
-        for provider_result in result.providers:
-            if provider_result.status != ProviderStatus.ERROR and provider_result.provider in ids:
-                baseline[provider_result.provider] = ids[provider_result.provider]
-        self._links.update_baseline(link.id, baseline)
+        for member in family:
+            baseline = dict(member.baseline)
+            for provider_result in result.providers:
+                provider = provider_result.provider
+                if provider_result.status != ProviderStatus.ERROR and provider in ids and provider not in failed:
+                    baseline[provider] = ids[provider]
+            if baseline != member.baseline:
+                self._links.update_baseline(member.id, baseline)
 
-    def _baseline_result(self, link: TurkeyClientLink, plate: str, provider: str):
-        """Новее из двух: что клиенту уже отправлено/было состоянием при
-        привязке (baseline) и его собственная ручная проверка."""
-        pointed = self._runs.get_provider_result(link.baseline[provider]) if provider in link.baseline else None
-        own = self._runs.get_last_successful_provider_result_for_subscriber(
-            plate, provider, telegram_user_id=link.client_telegram_user_id,
-        )
-        candidates = [result for result in (pointed, own) if result is not None]
+    def _baseline_result(self, family: list[TurkeyClientLink], plate: str, provider: str, client: int):
+        """Самое новое из: что клиенту уже отправлено/было состоянием при
+        привязке (по всем его привязкам к номеру) и его ручная проверка."""
+        candidates = [
+            self._runs.get_provider_result(member.baseline[provider])
+            for member in family if provider in member.baseline
+        ]
+        candidates.append(self._runs.get_last_successful_provider_result_for_subscriber(
+            plate, provider, telegram_user_id=client,
+        ))
+        candidates = [result for result in candidates if result is not None]
         return max(candidates, key=lambda result: result.checked_at) if candidates else None

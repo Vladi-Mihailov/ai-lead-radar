@@ -1607,7 +1607,7 @@ def format_client_link_confirmed(plate: str, *, latest: UnifiedCheckResult | Non
         "",
     ]
     if latest is None:
-        lines.append("Проверок ещё не было — нажмите «🔎 Проверить сейчас».")
+        lines.append("Надёжных результатов проверки ещё нет — нажмите «🔎 Проверить сейчас».")
     else:
         lines += ["Текущее состояние:", "", format_unified_check_result(latest)]
     return "\n".join(lines)
@@ -1627,6 +1627,8 @@ def format_client_link_released(plate: str) -> str:
 
 
 CLIENT_LINK_CARD_LINE = "🔗 Привязан менеджером"
+CLIENT_LINK_CARD_LINE_ANCHOR_OFF = "🔗 Привязан менеджером — мониторинг сейчас выключен у менеджера"
+CLIENT_LINK_MENU_HINT = "Ваши автомобили — в «📋 Мои авто» в меню ниже."
 CLIENT_LINK_IS_OWNER_TEXT = "ℹ️ Этот пользователь — владелец автомобиля, привязка не нужна."
 CLIENT_LINK_ALREADY_LINKED_TEXT = "ℹ️ Этот клиент уже привязан к автомобилю."
 

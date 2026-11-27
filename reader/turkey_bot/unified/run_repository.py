@@ -351,6 +351,16 @@ class TurkeyCheckRunRepository:
         ).fetchone()
         return row[0] if row else None
 
+    def get_latest_reliable_run_for_plate(self, plate: str) -> UnifiedCheckResult | None:
+        """Последняя полная проверка номера без ошибок (has_debt/no_debt) —
+        «последнее надёжное состояние»; ERROR/PARTIAL не выдаются за состояние."""
+        row = self._conn.execute(
+            "SELECT id FROM turkey_check_runs WHERE plate = ? AND overall_status IN ('has_debt', 'no_debt') "
+            "ORDER BY finished_at DESC, id DESC LIMIT 1",
+            (plate,),
+        ).fetchone()
+        return self.get_run(row[0]) if row else None
+
     def provider_result_ids_for_run(self, run_id: int) -> dict[str, int]:
         rows = self._conn.execute(
             "SELECT provider, id FROM turkey_provider_results WHERE run_id = ? ORDER BY id", (run_id,),

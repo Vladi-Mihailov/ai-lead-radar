@@ -219,6 +219,7 @@ def register(
             # — back_to_car_id всё равно даёт путь назад к карточке (см.
             # _first_message_buttons).
             await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=action != "history")
+            await _deliver_outgoing(event, reply)  # удаление машины-якоря — уведомление клиенту
             return
 
         # manager/trusted-operator "🚗 Мои автомобили" (см. задачу

@@ -342,12 +342,14 @@ async def test_client_who_already_had_the_car_keeps_it_after_unlink(fx):
     assert fx.garage.get_owned_car_by_number(_CLIENT, _PLATE) is not None
 
 
-async def test_linking_enables_manager_monitoring_if_it_was_off(fx):
+async def test_linking_never_changes_the_managers_monitoring(fx):
     car, _ = await fx.manager_car()
-    fx.subscriptions.disable(telegram_user_id=_MANAGER, plate=_PLATE)
-    await fx.link_client(car)
-    assert fx.subscriptions.get(telegram_user_id=_MANAGER, plate=_PLATE).active
+    fx.subscriptions.disable(telegram_user_id=_MANAGER, plate=_PLATE)  # осознанная остановка / общий ⛔
+    confirmed = await fx.link_client(car)
+    assert not fx.subscriptions.get(telegram_user_id=_MANAGER, plate=_PLATE).active
     assert fx.subscriptions.get(telegram_user_id=_CLIENT, plate=_PLATE) is None  # своей подписки клиенту не создаём
+    assert confirmed.car_card_monitoring_active is False
+    assert "Уведомления включатся вместе с мониторингом" in confirmed.text
 
 
 # ---- Уведомления: одна проверка, оба получателя, без старых штрафов ----
