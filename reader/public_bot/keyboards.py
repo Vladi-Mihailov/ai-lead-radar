@@ -31,6 +31,8 @@ page в my-car-* callback'ах — ТОЛЬКО для навигации (ку�
 идентификатор ресурса и не доказательство чего-либо.
 """
 
+import re
+
 from telethon import Button
 
 from reader.protocol_support.texts import OPERATOR_LABEL
@@ -626,8 +628,30 @@ def decode_debt_list_page_callback(data: bytes | None) -> int | None:
     return _decode_id(data, _DEBT_LIST_PAGE_PREFIX)
 
 
+# Листание ОДНОГО отчёта статистики (см. ConversationController.
+# handle_debt_report_page): report_id — случайный код отчёта, страницы
+# которого бот запомнил при формировании, поэтому старый отчёт листается
+# своими данными, а не текущими. Кнопки старого формата (_DEBT_LIST_PAGE_
+# PREFIX, сообщения до этого изменения) продолжают работать как раньше.
+_DEBT_REPORT_PAGE_PREFIX = b"debtpg:"
+_DEBT_REPORT_ID_RE = re.compile(r"[0-9a-f]{8,16}")
+
+
+def encode_debt_report_page_callback(report_id: str, page: int) -> bytes:
+    return _DEBT_REPORT_PAGE_PREFIX + f"{report_id}:{page}".encode("ascii")
+
+
+def decode_debt_report_page_callback(data: bytes | None) -> tuple[str, int] | None:
+    if not data or not data.startswith(_DEBT_REPORT_PAGE_PREFIX):
+        return None
+    report_id, _, raw_page = data[len(_DEBT_REPORT_PAGE_PREFIX):].decode("ascii", "replace").partition(":")
+    if not _DEBT_REPORT_ID_RE.fullmatch(report_id) or not raw_page.isdigit():
+        return None
+    return report_id, int(raw_page)
+
+
 def debt_statistics_keyboard(
-    *, page: int | None, total_pages: int | None, fine_status_button: bool = False,
+    *, page: int | None, total_pages: int | None, fine_status_button: bool = False, report_id: str | None = None,
 ) -> list[list[Button]]:
     """Клавиатура ПОД сообщением 📊 Статистика, когда debt_refresh
     доступен (см. BotReply.debt_refresh_available) — пагинация itemized-
@@ -635,15 +659,23 @@ def debt_statistics_keyboard(
     total_pages) ПЛЮС кнопка проверки, одно сообщение, несколько строк
     кнопок (Telegram допускает несколько рядов в одной inline-клавиатуре,
     в отличие от одновременного reply+inline на одном сообщении, см.
-    ConversationController._format_statistics_reply)."""
+    ConversationController._format_statistics_reply). report_id — кнопки
+    листания этого отчёта (encode_debt_report_page_callback); без него —
+    прежний формат."""
     rows: list[list[Button]] = []
     if total_pages is not None and total_pages > 1 and page is not None:
         back_page = max(0, page - 1)
         next_page = min(total_pages - 1, page + 1)
+
+        def _page_data(target: int) -> bytes:
+            if report_id is not None:
+                return encode_debt_report_page_callback(report_id, target)
+            return encode_debt_list_page_callback(target)
+
         rows.append([
-            Button.inline("◀️ Назад", encode_debt_list_page_callback(back_page)),
-            Button.inline(f"{page + 1} / {total_pages}", encode_debt_list_page_callback(page)),
-            Button.inline("Вперёд ▶️", encode_debt_list_page_callback(next_page)),
+            Button.inline("◀️ Назад", _page_data(back_page)),
+            Button.inline(f"{page + 1} / {total_pages}", _page_data(page)),
+            Button.inline("Вперёд ▶️", _page_data(next_page)),
         ])
     rows.append([Button.inline(DEBT_REFRESH_BUTTON_LABEL, _DEBT_REFRESH_PICK)])
     if fine_status_button:

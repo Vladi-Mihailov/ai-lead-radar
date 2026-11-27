@@ -405,7 +405,7 @@ async def test_statistics_with_unknown_amounts_is_preliminary(fx):
 
     assert lines.count("💰 Сумма к оплате: 250 ₾") == 2  # шапка и машина: 150 известно + 100 исходная
     assert not any("требует уточнения" in line or "Предварительно" in line for line in lines)
-    assert not any(line.startswith("🕒") for line in lines)
+    assert not any(line.startswith("🕒 Сумм") for line in lines)  # «🕒 Сформировано» — время отчёта, не сумм
     assert fx.gc.calls == []
 
 

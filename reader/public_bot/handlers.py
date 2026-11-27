@@ -13,12 +13,12 @@ import logging
 from collections.abc import Callable
 
 from telethon import Button, TelegramClient, events
-from telethon.errors.rpcerrorlist import QueryIdInvalidError
+from telethon.errors.rpcerrorlist import MessageNotModifiedError, QueryIdInvalidError
 
 from reader.protocol_support.service import ProtocolSupportService
 from reader.protocol_support.telethon_gateway import handle_private_support
 from reader.public_bot import manager_alerts
-from reader.public_bot.conversation import ConversationController
+from reader.public_bot.conversation import DEBT_REPORT_EXPIRED, ConversationController
 from reader.public_bot.keyboards import (
     STOP_NO,
     add_car_confirm_keyboard,
@@ -36,6 +36,7 @@ from reader.public_bot.keyboards import (
     decode_debt_refresh_cancel_callback,
     decode_debt_refresh_confirm_callback,
     decode_debt_refresh_pick_callback,
+    decode_debt_report_page_callback,
     decode_fine_status_action_callback,
     decode_fine_status_back_callback,
     decode_fine_status_cancel_callback,
@@ -102,6 +103,7 @@ from reader.public_bot.known_users_repository import BotKnownUsersRepository
 from reader.public_bot.subscription_service import CHECK_ALREADY_IN_PROGRESS
 from reader.public_bot.texts import (
     CALLBACK_NOT_AUTHORIZED_TEXT,
+    DEBT_REPORT_EXPIRED_TEXT,
     ONE_OFF_CHECK_IN_PROGRESS_TEXT,
     START_GREETING_TEXT,
 )
@@ -546,8 +548,11 @@ def register(
             return
 
         if decode_debt_refresh_pick_callback(data):
+            # Экран подтверждения — новым сообщением: кнопка висит под
+            # отчётом статистики, его нельзя затирать (менеджер сравнивает
+            # отчёт до проверки с отчётом после неё).
             reply = controller.handle_debt_refresh_pick(telegram_user_id=event.sender_id)
-            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            await _answer_and_send(event, reply, is_trusted=is_trusted, prefer_edit=False)
             return
 
         if decode_debt_refresh_confirm_callback(data):
@@ -564,6 +569,17 @@ def register(
 
         if decode_debt_refresh_cancel_callback(data):
             reply = controller.handle_debt_refresh_cancel(telegram_user_id=event.sender_id)
+            await _answer_and_send(event, reply, is_trusted=is_trusted)
+            return
+
+        debt_report_page = decode_debt_report_page_callback(data)
+        if debt_report_page is not None:
+            report_id, page = debt_report_page
+            reply = controller.handle_debt_report_page(report_id, page, telegram_user_id=event.sender_id)
+            if reply is DEBT_REPORT_EXPIRED:
+                # Отчёт уже не листается — сообщение остаётся как есть.
+                await event.answer(DEBT_REPORT_EXPIRED_TEXT, alert=True)
+                return
             await _answer_and_send(event, reply, is_trusted=is_trusted)
             return
 
@@ -1020,6 +1036,7 @@ async def _send_reply(
         buttons = debt_statistics_keyboard(
             page=reply.debt_list_page, total_pages=reply.debt_list_total_pages,
             fine_status_button=reply.fine_status_available,
+            report_id=getattr(reply, "debt_report_id", None),
         )
     elif reply.trusted_tasks_page is not None:
         buttons = trusted_tasks_page_keyboard(
@@ -1109,6 +1126,11 @@ async def _send_reply(
     if prefer_edit:
         try:
             await event.edit(chunks[0], buttons=buttons if last_index == 0 else None)
+            send_from = 1
+        except MessageNotModifiedError:
+            # Сообщение уже показывает ровно этот текст и кнопки (например,
+            # кнопка текущей страницы «2 / 5») — копия новым сообщением не
+            # нужна.
             send_from = 1
         except Exception:
             # Сообщение с кнопками могло стать недоступным для редактирования

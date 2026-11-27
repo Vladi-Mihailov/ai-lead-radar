@@ -304,6 +304,59 @@ _DEBT_LIST_PAGE_CHAR_BUDGET = 3000
 # (три категории, дата обновления базы, строка вечерней перепроверки).
 _DEBT_LIST_PAGE_CHAR_BUDGET_WITH_STATUSES = 2600
 
+# Сколько последних отчётов статистики бот помнит для листания (см.
+# _DebtReportStore): отчёт создаётся открытием 📊 Статистика, итогом "🔄
+# Проверить авто со штрафами" и кнопкой листания старого формата (сообщения
+# до этого изменения); листание отчёта по его коду новых отчётов не создаёт.
+_DEBT_REPORTS_KEPT = 50
+
+# Ответ handle_debt_report_page, когда отчёта уже нет в памяти (перезапуск
+# бота или вытеснен более новыми): handlers отвечает алертом и сообщение не
+# меняет.
+DEBT_REPORT_EXPIRED = object()
+
+
+@dataclass(frozen=True)
+class _DebtReport:
+    """Отчёт статистики, как он был сформирован: заголовок (📊 Статистика
+    или итог проверки), debt-блок и готовые страницы списка машин."""
+
+    header: str
+    summary: str
+    pages: tuple[str, ...]
+
+    def render(self, page: int) -> tuple[str, int | None, int | None]:
+        text = f"{self.header}\n\n{self.summary}"
+        if not self.pages:
+            return text, None, None
+        total_pages = len(self.pages)
+        page = max(0, min(page, total_pages - 1))
+        return f"{text}\n\n{self.pages[page]}", page, total_pages
+
+
+class _DebtReportStore:
+    """Последние отчёты статистики в памяти процесса: листание старого
+    отчёта показывает его собственные страницы, а не текущие данные, —
+    менеджер сравнивает отчёт до проверки с отчётом после неё. Код отчёта
+    случайный, поэтому кнопки отчёта из прошлого запуска бота не откроют
+    чужой отчёт нового запуска."""
+
+    def __init__(self, *, limit: int = _DEBT_REPORTS_KEPT):
+        self._limit = limit
+        self._reports: dict[str, _DebtReport] = {}
+
+    def add(self, report: _DebtReport) -> str:
+        report_id = secrets.token_hex(4)
+        while report_id in self._reports:
+            report_id = secrets.token_hex(4)
+        self._reports[report_id] = report
+        while len(self._reports) > self._limit:
+            del self._reports[next(iter(self._reports))]
+        return report_id
+
+    def get(self, report_id: str) -> _DebtReport | None:
+        return self._reports.get(report_id)
+
 
 def _naive_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
@@ -542,6 +595,9 @@ class BotReply:
     debt_refresh_confirm: bool = False
     debt_list_page: int | None = None
     debt_list_total_pages: int | None = None
+    # Код отчёта статистики для кнопок листания (см. _DebtReportStore);
+    # None — кнопки прежнего формата.
+    debt_report_id: str | None = None
 
     # Manager/trusted Search (см. задачу "manager/trusted Search") —
     # ТОЛЬКО trusted_operator_user_ids, self-service вообще не видит эти
@@ -667,6 +723,7 @@ class ConversationController:
         # см. задачу "минимальные изменения") продолжают работать бит в
         # бит как раньше.
         self._debt_refresh = debt_refresh_service
+        self._debt_reports = _DebtReportStore()
         # "📸 Проверить протокол" (см. задачу) — None означает "фичи в этой
         # сборке нет" (тот же приём, что и у debt_refresh_service выше) —
         # существующие вызовы ConversationController(...) без этих
@@ -1386,7 +1443,8 @@ class ConversationController:
         return None
 
     def _format_statistics_reply(self, *, debt_page: int = 0) -> BotReply:
-        stats = self._statistics.get_statistics(now=datetime.now(timezone.utc), tz=self._tz)
+        now = datetime.now(timezone.utc)
+        stats = self._statistics.get_statistics(now=now, tz=self._tz)
         if self._debt_refresh is None:
             # Фичи нет в этой сборке (см. конструктор) — прежнее поведение
             # бит в бит: обычная reply-клавиатура главного меню.
@@ -1402,23 +1460,36 @@ class ConversationController:
         # сообщение — она не пропадает от того, что ЭТО сообщение её не
         # переотправляет (см. handle_debt_refresh_cancel/confirm ниже —
         # они возвращают show_main_menu=True отдельным сообщением).
-        debt_text, page, total_pages = self._build_debt_section(debt_page=debt_page)
-        text = f"{texts.format_statistics_header(stats)}\n\n{debt_text}"
+        header = texts.format_statistics_header(stats, generated_at=now, tz=self._tz)
+        return self._new_debt_report_reply(header, debt_page=debt_page)
 
+    def _new_debt_report_reply(self, header: str, *, debt_page: int = 0) -> BotReply:
+        """Новый отчёт статистики (📊 Статистика или итог проверки): debt-
+        блок строится заново из БД, все страницы запоминаются (см.
+        _DebtReportStore) — листание этого сообщения потом показывает их же,
+        даже если после него прошла проверка и данные изменились."""
+        summary, pages = self._build_debt_section()
+        report = _DebtReport(header=header, summary=summary, pages=tuple(pages))
+        return self._debt_report_reply(self._debt_reports.add(report), report, debt_page)
+
+    def _debt_report_reply(self, report_id: str, report: _DebtReport, debt_page: int) -> BotReply:
+        text, page, total_pages = report.render(debt_page)
         return BotReply(
             text=text, debt_refresh_available=True, debt_list_page=page, debt_list_total_pages=total_pages,
-            fine_status_available=self._fine_status is not None,
+            fine_status_available=self._fine_status is not None, debt_report_id=report_id,
         )
 
-    def _build_debt_section(self, *, debt_page: int = 0) -> tuple[str, int | None, int | None]:
-        """ВСЕГДА заново перечитывает persisted state из БД (см. задачу
-        п.8: "Statistics после refresh: заново query из DB, НЕ показывать
-        старый cached UI") — переиспользуется И обычным открытием 📊
-        Статистика (_format_statistics_reply), И результатом "🔄 Проверить
-        авто со штрафами" (см. handle_debt_refresh_confirm), поэтому обе
-        точки ВСЕГДА показывают один и тот же, только что построенный
-        список — self._debt_refresh НЕ None здесь гарантируется вызывающим
-        кодом (оба caller'а уже проверили это заранее)."""
+    def _build_debt_section(self) -> tuple[str, list[str]]:
+        """(debt-блок, страницы списка машин) — ВСЕГДА заново перечитывает
+        persisted state из БД (см. задачу п.8: "Statistics после refresh:
+        заново query из DB, НЕ показывать старый cached UI") —
+        переиспользуется И обычным открытием 📊 Статистика
+        (_format_statistics_reply), И результатом "🔄 Проверить авто со
+        штрафами" (см. handle_debt_refresh_confirm), поэтому обе точки
+        ВСЕГДА показывают один и тот же, только что построенный список —
+        self._debt_refresh НЕ None здесь гарантируется вызывающим кодом (оба
+        caller'а уже проверили это заранее). Пустой список страниц — машин
+        со штрафами нет, пагинация не нужна."""
         assert self._debt_refresh is not None
         debt_groups = self._debt_refresh.list_debt_car_groups()
         rows: list[tuple[str, float, DebtBreakdown | None]]
@@ -1448,8 +1519,7 @@ class ConversationController:
                 tz=self._tz,
             )
 
-        page: int | None = None
-        total_pages: int | None = None
+        sections: list[str] = []
         if rows:
             # Страницы режутся по числу машин И по длине (см.
             # _paginate_debt_blocks), поэтому блоки строятся для всего списка
@@ -1468,12 +1538,12 @@ class ConversationController:
                 )
                 for car_number, total_amount, breakdown in rows
             ], char_budget=budget)
-            total_pages = len(pages)
-            page = max(0, min(debt_page, total_pages - 1))
-            section = texts.format_debt_list_section(pages[page], page=page, total_pages=total_pages)
-            text = f"{text}\n\n{section}"
+            sections = [
+                texts.format_debt_list_section(blocks, page=index, total_pages=len(pages))
+                for index, blocks in enumerate(pages)
+            ]
 
-        return text, page, total_pages
+        return text, sections
 
     def _debt_rows_with_statuses(
         self, debt_groups: list,
@@ -1633,6 +1703,18 @@ class ConversationController:
             return None
         return self._format_statistics_reply(debt_page=page)
 
+    def handle_debt_report_page(self, report_id: str, page: int, *, telegram_user_id: int) -> BotReply | object | None:
+        """Листание отчёта статистики его же страницами (см. _DebtReportStore)
+        — ни запроса к БД, ни к police.ge. None — не trusted;
+        DEBT_REPORT_EXPIRED — отчёта уже нет в памяти: сообщение не меняется,
+        его данные остаются такими, какими были при формировании."""
+        if not self._is_trusted(telegram_user_id):
+            return None
+        report = self._debt_reports.get(report_id)
+        if report is None:
+            return DEBT_REPORT_EXPIRED
+        return self._debt_report_reply(report_id, report, page)
+
     def handle_debt_refresh_pick(self, *, telegram_user_id: int) -> BotReply:
         """Первый шаг — ТОЛЬКО чтение (list_debt_car_groups(), см.
         DebtRefreshService), ни одного police.ge-запроса (см. задачу п.11:
@@ -1681,13 +1763,11 @@ class ConversationController:
         # persisted state ЗАНОВО (provider checks уже завершились и
         # персистентны к этому моменту, см. DebtRefreshService.refresh()/
         # FineCheckService.check_task()), поэтому здесь виден РОВНО тот
-        # же список, что покажет следующее открытие 📊 Статистика.
-        debt_text, page, total_pages = self._build_debt_section()
-        text = f"{texts.format_debt_refresh_summary(outcome)}\n\n{debt_text}"
-        return BotReply(
-            text=text, debt_refresh_available=True, debt_list_page=page, debt_list_total_pages=total_pages,
-            fine_status_available=self._fine_status is not None,
-        )
+        # же список, что покажет следующее открытие 📊 Статистика. Это новый
+        # отчёт отдельным сообщением (см. handlers.py) — отчёт до проверки
+        # остаётся в чате со своими данными.
+        header = texts.format_debt_refresh_summary(outcome, generated_at=datetime.now(timezone.utc), tz=self._tz)
+        return self._new_debt_report_reply(header)
 
     # ---- "🧾 Статусы оплаты" (см. reader/fines/payment_status.py) —
     # trusted-manager-only, is_trusted() перепроверяется на КАЖДОМ шаге по
