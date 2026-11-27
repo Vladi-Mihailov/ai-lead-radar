@@ -17,6 +17,7 @@ event.sender_id), тот же принцип, что и раньше."""
 
 from telethon import Button
 
+from reader.turkey_bot import texts
 from reader.turkey_bot.models import TurkeyUserCar
 from reader.protocol_support.texts import OPERATOR_LABEL
 from reader.turkey_bot.texts import (
@@ -286,10 +287,15 @@ def manager_cars_page_keyboard(
     return rows
 
 
-def manager_car_detail_keyboard(page: int) -> list[list[Button]]:
+def manager_car_detail_keyboard(page: int, *, car_id: int | None = None) -> list[list[Button]]:
     """"⬅️ Назад" из read-only деталей строки -> та же страница
-    manager-списка (см. handle_manager_car_open/_format_manager_cars_page_reply)."""
-    return [[Button.inline(BACK_LABEL, encode_manager_cars_page_callback(page))]]
+    manager-списка (см. handle_manager_car_open/_format_manager_cars_page_reply).
+    car_id — кнопка «👤 Клиент» (привязка клиента, см. client_link_screen_keyboard)."""
+    rows = []
+    if car_id is not None:
+        rows.append([Button.inline(texts.CLIENT_DATA_LABEL, encode_client_link_callback("screen", car_id, page))])
+    rows.append([Button.inline(BACK_LABEL, encode_manager_cars_page_callback(page))])
+    return rows
 
 
 def my_cars_list_keyboard(
@@ -355,13 +361,135 @@ def car_delete_confirm_keyboard(car_id: int) -> list[list[Button]]:
     ]]
 
 
-def add_car_confirmation_keyboard(car_id: int) -> list[list[Button]]:
+def add_car_confirmation_keyboard(car_id: int, *, offer_client_link: bool = False) -> list[list[Button]]:
     """После добавления автомобиля (см. design report п.2, пример
     "[🔎 Проверить сейчас] [🏠 Главное меню]") — "Главное меню" отдельной
     inline-кнопкой не нужен: персистентная reply-клавиатура (см.
     main_menu_keyboard) остаётся видна пользователю и без повторной
-    отправки."""
-    return [[Button.inline(CHECK_NOW_LABEL, encode_car_action_callback("check", car_id))]]
+    отправки. offer_client_link — менеджеру ещё «👤 Привязать клиента»."""
+    rows = [[Button.inline(CHECK_NOW_LABEL, encode_car_action_callback("check", car_id))]]
+    if offer_client_link:
+        rows.append([Button.inline(texts.CLIENT_LINK_BUTTON_LABEL, encode_client_link_callback("screen", car_id, 0))])
+    return rows
+
+
+# ---- 👤 Привязка клиента (см. reader/turkey_bot/client_links.py) — car_id/
+# link_id/user_id в callback_data публичны: is_trusted() и владение
+# приглашением перепроверяются в ConversationController на КАЖДОМ нажатии ----
+
+_CLIENT_LINK_PREFIXES = {
+    "screen": b"trlscr:", "username": b"trlusr:", "pick": b"trlpick:", "pick_user": b"trlpk:",
+    "invite": b"trlinv:", "cancel": b"trlcan:", "replace": b"trlrep:", "unlink": b"trlun:",
+    "unlink_yes": b"trluny:", "name": b"trlnm:", "name_clear": b"trlnc:",
+}
+_CLIENT_LINK_CONFIRM_PREFIX = b"trlok:"
+_CLIENT_LINK_DECLINE_PREFIX = b"trlno:"
+
+
+def _decode_ints(data: bytes | None, prefix: bytes, count: int) -> tuple[int, ...] | None:
+    if not data or not data.startswith(prefix):
+        return None
+    parts = data[len(prefix):].decode("ascii", errors="replace").split(":")
+    if len(parts) != count or not all(part.isdigit() for part in parts):
+        return None
+    return tuple(int(part) for part in parts)
+
+
+def encode_client_link_callback(action: str, car_id: int, page: int, extra: int | None = None) -> bytes:
+    """action: screen/username/invite/cancel/replace/unlink/unlink_yes —
+    car_id:page; pick — car_id:page:pick_page; pick_user — car_id:page:user_id."""
+    values = [car_id, page] + ([extra] if extra is not None else [])
+    return _CLIENT_LINK_PREFIXES[action] + ":".join(str(value) for value in values).encode("ascii")
+
+
+def decode_client_link_callback(data: bytes | None) -> tuple[str, int, int, int | None] | None:
+    for action, prefix in _CLIENT_LINK_PREFIXES.items():
+        count = 3 if action in ("pick", "pick_user") else 2
+        values = _decode_ints(data, prefix, count)
+        if values is not None:
+            return action, values[0], values[1], values[2] if count == 3 else None
+    return None
+
+
+def encode_client_link_answer_callback(link_id: int, *, confirm: bool) -> bytes:
+    prefix = _CLIENT_LINK_CONFIRM_PREFIX if confirm else _CLIENT_LINK_DECLINE_PREFIX
+    return prefix + str(link_id).encode("ascii")
+
+
+def decode_client_link_answer_callback(data: bytes | None) -> tuple[int, bool] | None:
+    for prefix, confirm in ((_CLIENT_LINK_CONFIRM_PREFIX, True), (_CLIENT_LINK_DECLINE_PREFIX, False)):
+        values = _decode_ints(data, prefix, 1)
+        if values is not None:
+            return values[0], confirm
+    return None
+
+
+def client_link_confirm_keyboard(link_id: int) -> list[list[Button]]:
+    return [[
+        Button.inline(texts.CLIENT_LINK_CONFIRM_LABEL, encode_client_link_answer_callback(link_id, confirm=True)),
+        Button.inline(texts.CLIENT_LINK_DECLINE_LABEL, encode_client_link_answer_callback(link_id, confirm=False)),
+    ]]
+
+
+def client_link_screen_keyboard(
+    car_id: int, page: int, *, state: str, choosing: bool, has_name: bool = False, show_name: bool = True,
+) -> list[list[Button]]:
+    """state: none/expired/pending_user/pending_invite/active. choosing —
+    показаны способы привязки (нет клиента, приглашение ждёт/истекло, замена).
+    show_name — кнопки имени клиента (✏️, а при имени ещё 🗑)."""
+    rows = []
+    if show_name:
+        name_row = [Button.inline(texts.CLIENT_NAME_EDIT_LABEL, encode_client_link_callback("name", car_id, page))]
+        if has_name:
+            name_row.append(Button.inline(
+                texts.CLIENT_NAME_CLEAR_LABEL, encode_client_link_callback("name_clear", car_id, page),
+            ))
+        rows.append(name_row)
+    if choosing:
+        invite_label = (
+            texts.CLIENT_LINK_NEW_INVITE_LABEL if state in ("pending_user", "pending_invite", "expired")
+            else texts.CLIENT_LINK_INVITE_LABEL
+        )
+        rows += [
+            [Button.inline(texts.CLIENT_LINK_USERNAME_LABEL, encode_client_link_callback("username", car_id, page))],
+            [Button.inline(texts.CLIENT_LINK_PICK_LABEL, encode_client_link_callback("pick", car_id, page, 0))],
+            [Button.inline(invite_label, encode_client_link_callback("invite", car_id, page))],
+        ]
+        if state in ("pending_user", "pending_invite"):
+            rows.append([Button.inline(
+                texts.CLIENT_LINK_CANCEL_INVITE_LABEL, encode_client_link_callback("cancel", car_id, page),
+            )])
+    if state == "active" and not choosing:
+        rows += [
+            [Button.inline(texts.CLIENT_LINK_REPLACE_LABEL, encode_client_link_callback("replace", car_id, page))],
+            [Button.inline(texts.CLIENT_LINK_UNLINK_LABEL, encode_client_link_callback("unlink", car_id, page))],
+        ]
+    rows.append([Button.inline(BACK_LABEL, encode_manager_car_open_callback(car_id, page))])
+    return rows
+
+
+def client_link_pick_keyboard(
+    car_id: int, page: int, options: list[tuple[int, str]], *, pick_page: int, total_pages: int,
+) -> list[list[Button]]:
+    rows = [
+        [Button.inline(label, encode_client_link_callback("pick_user", car_id, page, user_id))]
+        for user_id, label in options
+    ]
+    if total_pages > 1:
+        rows.append([
+            Button.inline("◀️", encode_client_link_callback("pick", car_id, page, max(0, pick_page - 1))),
+            Button.inline(f"{pick_page + 1}/{total_pages}", encode_client_link_callback("pick", car_id, page, pick_page)),
+            Button.inline("▶️", encode_client_link_callback("pick", car_id, page, min(total_pages - 1, pick_page + 1))),
+        ])
+    rows.append([Button.inline(BACK_LABEL, encode_client_link_callback("screen", car_id, page))])
+    return rows
+
+
+def client_link_unlink_confirm_keyboard(car_id: int, page: int) -> list[list[Button]]:
+    return [[
+        Button.inline(texts.CLIENT_LINK_UNLINK_YES_LABEL, encode_client_link_callback("unlink_yes", car_id, page)),
+        Button.inline(DELETE_CANCEL_LABEL, encode_client_link_callback("screen", car_id, page)),
+    ]]
 
 
 def encode_help_callback(section: str) -> bytes:

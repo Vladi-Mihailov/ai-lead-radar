@@ -21,12 +21,18 @@ from reader.turkey_bot.keyboards import (
     cancel_keyboard,
     car_card_keyboard,
     car_delete_confirm_keyboard,
+    client_link_confirm_keyboard,
+    client_link_pick_keyboard,
+    client_link_screen_keyboard,
+    client_link_unlink_confirm_keyboard,
     check_now_picker_keyboard,
     debt_refresh_button_keyboard,
     debt_refresh_confirm_keyboard,
     decode_car_action_callback,
     decode_car_open_by_plate_callback,
     decode_car_open_callback,
+    decode_client_link_answer_callback,
+    decode_client_link_callback,
     decode_debt_refresh_cancel_callback,
     decode_debt_refresh_confirm_callback,
     decode_debt_refresh_pick_callback,
@@ -105,6 +111,7 @@ def register(
             text, chat_id=event.chat_id, telegram_user_id=event.sender_id,
         )
         await _send_reply(event, reply, is_trusted=is_trusted)
+        await _deliver_outgoing(event, reply)
 
     @client.on(events.CallbackQuery(func=lambda e: e.is_private))
     async def _on_callback(event: events.CallbackQuery.Event) -> None:
@@ -212,6 +219,7 @@ def register(
             # — back_to_car_id всё равно даёт путь назад к карточке (см.
             # _first_message_buttons).
             await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=action != "history")
+            await _deliver_outgoing(event, reply)  # удаление машины-якоря — уведомление клиенту
             return
 
         # manager/trusted-operator "🚗 Мои автомобили" (см. задачу
@@ -251,6 +259,36 @@ def register(
                 return
             await event.answer()
             await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            return
+
+        # 👤 Привязка клиента — менеджерские действия (is_trusted и car_id
+        # перепроверяются в controller) и ответ клиента ✅/❌.
+        client_link = decode_client_link_callback(event.data)
+        if client_link is not None:
+            action, car_id, page, extra = client_link
+            reply = controller.handle_client_link_action(
+                action, car_id, page, extra, chat_id=event.chat_id, telegram_user_id=event.sender_id,
+            )
+            if reply is None:
+                await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
+                return
+            await event.answer()
+            # Ссылку-приглашение и запрос — новым сообщением (менеджер её
+            # пересылает), остальное — правкой экрана.
+            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=action not in ("invite", "username"))
+            await _deliver_outgoing(event, reply)
+            return
+
+        client_link_answer = decode_client_link_answer_callback(event.data)
+        if client_link_answer is not None:
+            link_id, confirm = client_link_answer
+            reply = controller.handle_client_link_answer(link_id, confirm, telegram_user_id=event.sender_id)
+            if reply is None:
+                await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
+                return
+            await event.answer()
+            await _send_reply(event, reply, is_trusted=is_trusted, prefer_edit=True)
+            await _deliver_outgoing(event, reply)
             return
 
         search_page = decode_search_page_callback(event.data)
@@ -309,6 +347,19 @@ def register(
 
         await event.answer(UNKNOWN_BUTTON_TEXT, alert=True)
 
+    async def _deliver_outgoing(event, reply: BotReply) -> None:
+        """Сообщения в ДРУГИЕ приватные чаты (запрос клиенту, уведомление
+        менеджеру) — после ответа текущему чату. Не дошло — короткая
+        подсказка в текущий чат, если она задана."""
+        for message in reply.outgoing_messages:
+            buttons = client_link_confirm_keyboard(message.confirm_link_id) if message.confirm_link_id else None
+            try:
+                await client.send_message(message.chat_id, message.text, buttons=buttons)
+            except Exception:
+                logger.warning("Turkey client link: сообщение в другой чат не отправлено", exc_info=True)
+                if message.on_failure_text:
+                    await event.respond(message.on_failure_text)
+
     logger.info("✔ Turkey bot handlers зарегистрированы")
 
 
@@ -338,13 +389,29 @@ def _first_message_buttons(reply: BotReply, *, is_trusted: bool, has_extra: bool
             total_pages=reply.manager_cars_total_pages or 1,
         )
     if reply.manager_car_detail_page is not None:
-        return manager_car_detail_keyboard(reply.manager_car_detail_page)
+        return manager_car_detail_keyboard(reply.manager_car_detail_page, car_id=reply.manager_car_detail_car_id)
+    if reply.client_link_confirm_id is not None:
+        return client_link_confirm_keyboard(reply.client_link_confirm_id)
+    if reply.client_link_unlink_confirm is not None:
+        return client_link_unlink_confirm_keyboard(*reply.client_link_unlink_confirm)
+    if reply.client_link_pick is not None:
+        car_id, page, options, pick_page, total_pages = reply.client_link_pick
+        return client_link_pick_keyboard(car_id, page, list(options), pick_page=pick_page, total_pages=total_pages)
+    if reply.client_link_screen is not None:
+        car_id, page, state, choosing, has_name = reply.client_link_screen
+        # Под ссылкой-приглашением и «запрос отправлен» — только «⬅️ Назад».
+        show_name = choosing or state == "active"
+        return client_link_screen_keyboard(
+            car_id, page, state=state, choosing=choosing, has_name=has_name, show_name=show_name,
+        )
     if reply.car_delete_confirm_car_id is not None:
         return car_delete_confirm_keyboard(reply.car_delete_confirm_car_id)
     if reply.car_card is not None:
         return car_card_keyboard(reply.car_card, monitoring_active=reply.car_card_monitoring_active)
     if reply.check_now_confirmation_car_id is not None:
-        return add_car_confirmation_keyboard(reply.check_now_confirmation_car_id)
+        return add_car_confirmation_keyboard(
+            reply.check_now_confirmation_car_id, offer_client_link=reply.offer_client_link,
+        )
     if reply.cta_buttons and not has_extra:
         rows = [[Button.url(label, url) for label, url in reply.cta_buttons]]
         if reply.back_to_car_id is not None:

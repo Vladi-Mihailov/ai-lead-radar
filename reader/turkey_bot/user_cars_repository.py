@@ -40,6 +40,9 @@ CREATE TABLE IF NOT EXISTS turkey_bot_user_cars (
 _COLUMN_MIGRATIONS = (
     ("last_overall_status", "ALTER TABLE turkey_bot_user_cars ADD COLUMN last_overall_status TEXT"),
     ("last_total_amount", "ALTER TABLE turkey_bot_user_cars ADD COLUMN last_total_amount TEXT"),
+    # Имя клиента, которое вводит менеджер (см. validation.normalize_client_name)
+    # — только для показа, не идентификатор и не доступ.
+    ("client_display_name", "ALTER TABLE turkey_bot_user_cars ADD COLUMN client_display_name TEXT"),
 )
 
 _INSERT_NEW_CAR = """
@@ -236,6 +239,21 @@ class TurkeyUserCarsRepository:
         self-service путях — там всегда get_owned_car."""
         row = self._conn.execute(_SELECT_ANY, (car_id,)).fetchone()
         return _row_to_car(row) if row else None
+
+    def get_client_display_name(self, car_id: int) -> str | None:
+        row = self._conn.execute(
+            "SELECT client_display_name FROM turkey_bot_user_cars WHERE id = ?", (car_id,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def set_client_display_name(self, car_id: int, name: str | None) -> bool:
+        """name — уже нормализованное имя или None (удалить). Только эта
+        колонка; остальные данные машины и история не меняются."""
+        cursor = self._conn.execute(
+            "UPDATE turkey_bot_user_cars SET client_display_name = ? WHERE id = ?", (name, car_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
 
     def close(self) -> None:
         self._conn.close()

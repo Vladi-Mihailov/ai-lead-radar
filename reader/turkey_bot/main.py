@@ -61,6 +61,11 @@ from telethon import TelegramClient
 from reader.jobs.scheduler import Scheduler
 from reader.logging_setup import setup_logging
 from reader.settings import ConfigError, load_settings
+from reader.turkey_bot.client_links import (
+    TurkeyClientLinkRepository,
+    TurkeyClientLinkService,
+    TurkeyLinkedClientNotifier,
+)
 from reader.turkey_bot.conversation import ConversationController
 from reader.turkey_bot.conversation_state_repository import (
     TurkeyConversationStateRepository,
@@ -187,6 +192,11 @@ async def run() -> None:
     statistics_service = TurkeyStatisticsService(
         known_users_repository, run_repository, subscription_repository,
     )
+    client_link_repository = TurkeyClientLinkRepository(db_path)
+    client_link_service = TurkeyClientLinkService(
+        client_link_repository, garage_repository, subscription_repository, run_repository,
+        known_users_repository, bot_username=_BOT_USERNAME,
+    )
 
     # Тот же общий OPENAI_API_KEY (settings.ocr.openai_api_key) и
     # translation_model, что и у Георгии/у старого reader/turkey_bot/
@@ -236,6 +246,7 @@ async def run() -> None:
             tz=ZoneInfo(settings.fine_monitor.timezone),
             payment_help_contact_username=settings.public_bot.payment_help_contact_username,
             debt_refresh_service=debt_refresh_service,
+            client_link_service=client_link_service,
         )
 
         client = TelegramClient(str(_SESSION_PATH), api_id, api_hash)
@@ -253,6 +264,7 @@ async def run() -> None:
         notifier = _TelethonNotifier(client)
         monitoring_service = TurkeyMonitoringService(
             check_service, run_repository, subscription_repository, notifier,
+            linked_clients=TurkeyLinkedClientNotifier(client_link_repository, run_repository, subscription_repository),
         )
         monitoring_job = TurkeyMonitoringJob(monitoring_service)
         # См. задачу "Retry orchestration Unified Turkey checks" п.3 —
@@ -282,6 +294,7 @@ async def run() -> None:
         garage_repository.close()
         run_repository.close()
         subscription_repository.close()
+        client_link_repository.close_db()
 
 
 def main() -> None:

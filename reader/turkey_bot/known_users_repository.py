@@ -243,6 +243,29 @@ class TurkeyBotKnownUsersRepository:
         rows = self._conn.execute(_SELECT_ALL_ORDERED).fetchall()
         return [(telegram_user_id, telegram_username) for telegram_user_id, telegram_username in rows]
 
+    def list_recent_page(
+        self, *, offset: int, limit: int, exclude_ids: frozenset[int] = frozenset(),
+    ) -> list[tuple[int, str | None, str | None, str | None]]:
+        """(telegram_user_id, telegram_username, first_name, last_name) —
+        страница пользователей бота, недавно писавшие сверху (выбор клиента
+        для привязки к автомобилю, см. reader/turkey_bot/client_links.py).
+        exclude_ids — кого не предлагать (владелец машины). Без chat_id."""
+        placeholders = ",".join("?" for _ in exclude_ids)
+        where = f"WHERE telegram_user_id NOT IN ({placeholders}) " if exclude_ids else ""
+        rows = self._conn.execute(
+            "SELECT telegram_user_id, telegram_username, first_name, last_name FROM turkey_bot_known_users "
+            f"{where}ORDER BY last_seen_at DESC, telegram_user_id DESC LIMIT ? OFFSET ?",
+            [*exclude_ids, limit, offset],
+        ).fetchall()
+        return [(user_id, username, first_name, last_name) for user_id, username, first_name, last_name in rows]
+
+    def count_excluding(self, exclude_ids: frozenset[int] = frozenset()) -> int:
+        placeholders = ",".join("?" for _ in exclude_ids)
+        where = f" WHERE telegram_user_id NOT IN ({placeholders})" if exclude_ids else ""
+        return self._conn.execute(
+            f"SELECT COUNT(*) FROM turkey_bot_known_users{where}", list(exclude_ids),
+        ).fetchone()[0]
+
     def list_all_with_chat_id(self) -> list[tuple[int, int]]:
         """(telegram_user_id, telegram_chat_id) для КАЖДОГО известного
         пользователя — ОТДЕЛЬНЫЙ метод от list_all() выше: тот инвариант
