@@ -661,6 +661,12 @@ class ConversationController:
         if car is None:
             return None
 
+        if action in ("monitor_off", "delete_prompt", "delete_confirm") and self._anchor_locked(
+            car, telegram_user_id=telegram_user_id,
+        ):
+            card = self._render_car_card(car, telegram_user_id=telegram_user_id)
+            return replace(card, text=f"{texts.CLIENT_LINK_ANCHOR_LOCKED_TEXT}\n\n{card.text}")
+
         if action == "check":
             return await self._run_manual_check(car, chat_id=chat_id, telegram_user_id=telegram_user_id)
         if action == "monitor_on":
@@ -793,6 +799,18 @@ class ConversationController:
     # client_links.py). Менеджерские действия — только trusted, car_id из
     # callback_data перепроверяется (get_any_car); ответ клиента — только
     # тот, кому адресовано приглашение. ----
+
+    def _anchor_locked(self, car: TurkeyUserCar, *, telegram_user_id: int) -> bool:
+        """Владелец машины-якоря больше не менеджер (обычный пользователь), а к
+        машине привязан клиент или ждёт приглашение: ⏹ и удаление оставили бы
+        клиента без уведомлений — решает администратор."""
+        if self._client_links is None or self._is_trusted(telegram_user_id):
+            return False
+        links = self._client_links.links
+        pending = links.pending_for_anchor(telegram_user_id, car.car_number)
+        return links.active_for_anchor(telegram_user_id, car.car_number) is not None or (
+            pending is not None and not pending.is_expired(self._client_links.now())
+        )
 
     def _link_anchor(self, car_id: int) -> TurkeyUserCar | None:
         """Машина, к которой можно привязать клиента: своя строка менеджера
@@ -1015,6 +1033,7 @@ class ConversationController:
             texts.format_orphan_block(
                 plate=link.plate, client=self._person(link.client_telegram_user_id),
                 former_manager=self._person(link.owner_telegram_user_id), since=link.confirmed_at,
+                monitoring_active=self._client_links.anchor_monitoring_active(link),
             )
             for link in shown
         ]

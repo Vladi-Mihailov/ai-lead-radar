@@ -282,6 +282,82 @@ class TurkeyClientLinkRepository:
         ).fetchall()
         return [_row_to_link(row) for row in rows]
 
+    def move_anchor(
+        self, link_id: int, *, old_owner: int, new_owner: int, plate: str, move_car: bool, now: datetime,
+    ) -> bool:
+        """Передача привязки администратором — ОДНОЙ транзакцией (все таблицы
+        Turkey-бота в одном файле SQLite): либо всё, либо ничего.
+        - неподтверждённые приглашения старой машины отменяются;
+        - move_car: строка машины, её подписка мониторинга (со слиянием, если у
+          нового менеджера осталась выключенная строка этого номера) и история
+          проверок номера прежнего владельца переходят новому — его точка
+          отсчёта та же, старый долг не придёт ему как новый, проверка одна;
+        - иначе — только имя клиента на его машину, если там пусто;
+        - владелец привязки меняется, точка отсчёта клиента — нет.
+        False — что-то не сошлось (ничего не изменено)."""
+        try:
+            with self._conn:
+                cur = self._conn.cursor()
+                cur.execute(
+                    "UPDATE turkey_client_links SET status = 'cancelled', closed_at = ?, closed_by = ?, "
+                    "token_hash = NULL WHERE owner_telegram_user_id = ? AND plate = ? AND status = 'pending'",
+                    (_iso(now), new_owner, old_owner, plate),
+                )
+                if move_car:
+                    moved = cur.execute(
+                        "UPDATE turkey_bot_user_cars SET telegram_user_id = ? WHERE telegram_user_id = ? AND car_number = ?",
+                        (new_owner, old_owner, plate),
+                    )
+                    if moved.rowcount != 1:
+                        raise _MoveFailed()
+                    source = cur.execute(
+                        "SELECT id, active, next_check_at FROM turkey_monitoring_subscriptions "
+                        "WHERE telegram_user_id = ? AND plate = ?",
+                        (old_owner, plate),
+                    ).fetchone()
+                    target = cur.execute(
+                        "SELECT id FROM turkey_monitoring_subscriptions WHERE telegram_user_id = ? AND plate = ?",
+                        (new_owner, plate),
+                    ).fetchone()
+                    if source is not None and target is None:
+                        cur.execute(
+                            "UPDATE turkey_monitoring_subscriptions SET telegram_user_id = ?, telegram_chat_id = ?, "
+                            "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (new_owner, new_owner, source[0]),
+                        )
+                    elif source is not None:
+                        cur.execute(
+                            "UPDATE turkey_monitoring_subscriptions SET active = ?, next_check_at = ?, telegram_chat_id = ?, "
+                            "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (source[1], source[2], new_owner, target[0]),
+                        )
+                        cur.execute(
+                            "UPDATE turkey_monitoring_subscriptions SET active = 0, updated_at = CURRENT_TIMESTAMP "
+                            "WHERE id = ?",
+                            (source[0],),
+                        )
+                    cur.execute(
+                        "UPDATE turkey_check_runs SET telegram_user_id = ?, telegram_chat_id = ? "
+                        "WHERE telegram_user_id = ? AND plate = ?",
+                        (new_owner, new_owner, old_owner, plate),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE turkey_bot_user_cars SET client_display_name = ("
+                        "  SELECT client_display_name FROM turkey_bot_user_cars WHERE telegram_user_id = ? AND car_number = ?"
+                        ") WHERE telegram_user_id = ? AND car_number = ? AND client_display_name IS NULL",
+                        (old_owner, plate, new_owner, plate),
+                    )
+                relinked = cur.execute(
+                    "UPDATE turkey_client_links SET owner_telegram_user_id = ? WHERE id = ? AND status = 'active'",
+                    (new_owner, link_id),
+                )
+                if relinked.rowcount != 1:
+                    raise _MoveFailed()
+        except (sqlite3.IntegrityError, _MoveFailed):
+            return False
+        return True
+
     def reanchor(self, link_id: int, *, new_owner_telegram_user_id: int) -> bool:
         """Активная привязка переходит к машине другого владельца того же
         номера; точка отсчёта и всё остальное в строке не меняются. False —
@@ -315,6 +391,10 @@ class TurkeyClientLinkRepository:
 
     def close_db(self) -> None:
         self._conn.close()
+
+
+class _MoveFailed(Exception):
+    """Шаг передачи не сошёлся — транзакция откатывается."""
 
 
 @dataclass(frozen=True)
@@ -420,7 +500,7 @@ class TurkeyClientLinkService:
         """Переход по ссылке: только проверка и закрепление за открывшим —
         ни машины, ни уведомлений до подтверждения."""
         link = self._links.get_by_token(token) if token else None
-        if link is None or link.status != STATUS_PENDING or not self._is_manager(link.owner_telegram_user_id):
+        if link is None or link.status != STATUS_PENDING or not self._anchor_usable(link):
             return ConfirmOutcome(status="invalid")
         if link.is_expired(self.now()):
             return ConfirmOutcome(status="expired", link=link)
@@ -438,7 +518,7 @@ class TurkeyClientLinkService:
             return ConfirmOutcome(status="invalid")
         if link.status == STATUS_ACTIVE and link.client_telegram_user_id == telegram_user_id:
             return ConfirmOutcome(status="already", link=link)
-        if link.status != STATUS_PENDING or not self._is_manager(link.owner_telegram_user_id):
+        if link.status != STATUS_PENDING or not self._anchor_usable(link):
             return ConfirmOutcome(status="invalid", link=link)
         if link.invited_user_id != telegram_user_id:
             return ConfirmOutcome(status="not_for_you", link=link)
@@ -524,6 +604,14 @@ class TurkeyClientLinkService:
     def is_manager(self, telegram_user_id: int) -> bool:
         return self._is_manager(telegram_user_id)
 
+    def _anchor_usable(self, link: TurkeyClientLink) -> bool:
+        """К приглашению можно привязаться, только пока его владелец —
+        менеджер и машина-якорь у него ещё есть (её не передали и не удалили)."""
+        return (
+            self._is_manager(link.owner_telegram_user_id)
+            and self._garage.get_owned_car_by_number(link.owner_telegram_user_id, link.plate) is not None
+        )
+
     def _orphan(self, link_id: int, *, require_orphan: bool = True) -> tuple[TurkeyClientLink | None, AdminOutcome | None]:
         """require_orphan=False — администратор из поиска по номеру работает с
         ЛЮБОЙ активной привязкой (в т.ч. действующего менеджера)."""
@@ -545,6 +633,7 @@ class TurkeyClientLinkService:
         if not self._links.close(link.id, status=STATUS_REVOKED, closed_by=closed_by, now=self.now(),
                                  from_status=STATUS_ACTIVE):
             return AdminOutcome(status="gone", link=link)
+        self._links_cancel_pending(link.owner_telegram_user_id, link.plate, closed_by=closed_by)
         self._release_client_car(link)
         return AdminOutcome(status="disabled", link=link)
 
@@ -563,6 +652,8 @@ class TurkeyClientLinkService:
             return AdminOutcome(status="same_owner", link=link)
         if self._links.active_for_anchor(new_owner, link.plate) is not None:
             return AdminOutcome(status="conflict", link=link)
+        if self._links.active_links_for_client(new_owner, link.plate):
+            return AdminOutcome(status="linked_car", link=link)  # его машина сама пришла привязкой
         if self._garage.get_owned_car_by_number(new_owner, link.plate) is not None:
             return AdminOutcome(status="reanchored", link=link)
         if self._garage.get_owned_car_by_number(link.owner_telegram_user_id, link.plate) is None:
@@ -584,25 +675,11 @@ class TurkeyClientLinkService:
         if plan.status not in ("reanchored", "moved"):
             return plan
         link = plan.link
-        old_owner = link.owner_telegram_user_id
-        if plan.status == "moved":
-            # Машина уходит от прежнего владельца — его неподтверждённое
-            # приглашение к ней больше некуда привязать.
-            self._links_cancel_pending(old_owner, link.plate, closed_by=new_owner)
-            old_car = self._garage.get_owned_car_by_number(old_owner, link.plate)
-            self._garage.transfer_car(old_car.id, new_owner_telegram_user_id=new_owner)
-            self._subscriptions.transfer(
-                from_telegram_user_id=old_owner, plate=link.plate, to_telegram_user_id=new_owner,
-            )
-        else:
-            target = self._garage.get_owned_car_by_number(new_owner, link.plate)
-            old_car = self._garage.get_owned_car_by_number(old_owner, link.plate)
-            if old_car is not None and self._garage.get_client_display_name(target.id) is None:
-                name = self._garage.get_client_display_name(old_car.id)
-                if name is not None:
-                    self._garage.set_client_display_name(target.id, name)
-        if not self._links.reanchor(link.id, new_owner_telegram_user_id=new_owner):
-            return AdminOutcome(status="conflict", link=link)
+        if not self._links.move_anchor(
+            link.id, old_owner=link.owner_telegram_user_id, new_owner=new_owner, plate=link.plate,
+            move_car=plan.status == "moved", now=self.now(),
+        ):
+            return AdminOutcome(status="failed", link=link)
         moved = self._links.get(link.id)
         subscription = self._subscriptions.get(telegram_user_id=new_owner, plate=link.plate)
         return AdminOutcome(

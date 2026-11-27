@@ -269,8 +269,9 @@ async def test_next_new_event_reaches_manager_and_client_exactly_once_before_and
     _due(fx, _MANAGER2)
     fx.check.results.append(_result(ProviderStatus.HAS_DEBT, Decimal(800), at=_T0 + timedelta(days=2)))
     await fx.monitoring.run_scheduled_batch("21:00")
-    assert [chat for chat, _ in fx.notifier.sent] == [_MANAGER2]  # клиенту 800 уже приходило — не повторяется
-    # (новому менеджеру — один раз как первое знакомство с машиной: его своя точка отсчёта пуста)
+    # Тот же долг после передачи — никому: клиенту 800 уже приходило, а
+    # история машины перешла новому менеджеру вместе с ней.
+    assert fx.notifier.sent == []
 
     fx.notifier.sent.clear()
     _due(fx, _MANAGER2)

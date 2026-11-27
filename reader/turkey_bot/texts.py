@@ -1696,15 +1696,24 @@ ORPHAN_REFUSAL_TEXTS = {
     "own_client": "⚠️ Этот менеджер и есть клиент привязки.",
     "no_car": "⚠️ Машины бывшего менеджера уже нет — передать нечего. Отключите привязку.",
     "same_owner": "ℹ️ Привязка уже у этого менеджера.",
+    "linked_car": "⚠️ Машина этого менеджера сама пришла привязкой клиента — передать на неё нельзя.",
+    "failed": "⚠️ Передача не выполнена — ничего не изменено. Попробуйте ещё раз.",
 }
 
+CLIENT_LINK_ANCHOR_LOCKED_TEXT = (
+    "ℹ️ Машина привязана к клиенту — выключить мониторинг или удалить её нельзя. Обратитесь к администратору."
+)
 
-def format_orphan_block(*, plate: str, client: str, former_manager: str, since: datetime) -> str:
+
+def format_orphan_block(
+    *, plate: str, client: str, former_manager: str, since: datetime, monitoring_active: bool = True,
+) -> str:
     return "\n".join([
         f"🚗 {format_plate_for_telegram(plate)}",
         f"👤 Клиент: {client}",
         f"👔 Бывший менеджер: {former_manager}",
         f"📅 Привязана: {since.astimezone(_DISPLAY_TZ).strftime('%d.%m.%Y')}",
+        f"📡 Мониторинг: {'🟢 включён' if monitoring_active else '⚪ выключен'}",
     ])
 
 
