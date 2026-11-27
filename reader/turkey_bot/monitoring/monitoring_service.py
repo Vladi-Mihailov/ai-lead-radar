@@ -93,12 +93,18 @@ class TurkeyMonitoringService:
         run_repository: TurkeyCheckRunRepository,
         subscription_repository: TurkeyMonitoringSubscriptionRepository,
         notifier: NotifierLike,
+        *,
+        linked_clients=None,
     ):
         self._check_service = check_service
         self._runs = run_repository
         self._subscriptions = subscription_repository
         self._notifier = notifier
         self._pending_retries: list[_PendingRetry] = []
+        # Привязанные клиенты (см. reader/turkey_bot/client_links.py::
+        # TurkeyLinkedClientNotifier) — получают изменения из ЭТОЙ ЖЕ
+        # проверки подписки якоря, без второй проверки номера. None — фичи нет.
+        self._linked_clients = linked_clients
 
     async def run_scheduled_batch(self, slot_label: str) -> None:
         now = datetime.now(timezone.utc)
@@ -172,7 +178,7 @@ class TurkeyMonitoringService:
             subscription.plate, max_attempts=_SCHEDULED_MAX_ATTEMPTS, mode="scheduled",
         )
 
-        self._runs.save(
+        run_id = self._runs.save(
             result, telegram_user_id=subscription.telegram_user_id,
             telegram_chat_id=subscription.telegram_chat_id, initiator=f"monitoring_{slot_label}",
         )
@@ -184,6 +190,7 @@ class TurkeyMonitoringService:
             plate=subscription.plate, telegram_chat_id=subscription.telegram_chat_id,
             previous_by_provider=previous_by_provider, result=result,
         )
+        await self._notify_linked_clients(subscription.telegram_user_id, subscription.plate, result, run_id)
         self._maybe_enqueue_retry(subscription, result, slot_label=slot_label, now=now)
 
         return result
@@ -213,7 +220,7 @@ class TurkeyMonitoringService:
             providers=retry.providers,
         )
 
-        self._runs.save(
+        run_id = self._runs.save(
             result, telegram_user_id=retry.telegram_user_id,
             telegram_chat_id=retry.telegram_chat_id, initiator=f"monitoring_{retry.slot_label}_retry",
         )
@@ -222,6 +229,7 @@ class TurkeyMonitoringService:
             plate=retry.plate, telegram_chat_id=retry.telegram_chat_id,
             previous_by_provider=previous_by_provider, result=result,
         )
+        await self._notify_linked_clients(retry.telegram_user_id, retry.plate, result, run_id)
         logger.info(
             "Turkey monitoring retry finished: plate=%s providers=%s slot=%s",
             retry.plate, retry.providers, retry.slot_label,
@@ -246,6 +254,21 @@ class TurkeyMonitoringService:
         for change in changes:
             text = format_change_notification(plate, change)
             await self._notifier.send(telegram_chat_id=telegram_chat_id, text=text)
+
+    async def _notify_linked_clients(
+        self, owner_telegram_user_id: int, plate: str, result: UnifiedCheckResult, run_id: int,
+    ) -> None:
+        """Сбой рассылки привязанным клиентам не должен ломать проверку
+        подписки и батч."""
+        if self._linked_clients is None:
+            return
+        try:
+            await self._linked_clients.notify(
+                owner_telegram_user_id=owner_telegram_user_id, plate=plate, result=result, run_id=run_id,
+                notifier=self._notifier,
+            )
+        except Exception:
+            logger.exception("Turkey monitoring: ошибка рассылки привязанному клиенту (plate=%s)", plate)
 
     def _maybe_enqueue_retry(
         self, subscription: TurkeyMonitoringSubscription, result: UnifiedCheckResult,

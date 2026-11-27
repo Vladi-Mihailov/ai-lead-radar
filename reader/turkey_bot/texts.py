@@ -1465,3 +1465,167 @@ def format_search_results(*, blocks: list[str]) -> str:
 
 def format_search_pagination_footer(*, page: int, total_pages: int) -> str:
     return f"Страница {page + 1} из {total_pages}"
+
+
+# ---- 👤 Привязка клиента к автомобилю менеджера (см. reader/turkey_bot/
+# client_links.py) — до подтверждения клиент видит только номер ----
+
+CLIENT_LINK_BUTTON_LABEL = "👤 Привязать клиента"
+CLIENT_LINK_MANAGE_LABEL = "👤 Клиент"
+CLIENT_LINK_USERNAME_LABEL = "✍️ Ввести @username"
+CLIENT_LINK_PICK_LABEL = "📋 Выбрать из пользователей бота"
+CLIENT_LINK_INVITE_LABEL = "🔗 Ссылка-приглашение"
+CLIENT_LINK_NEW_INVITE_LABEL = "🔗 Новая ссылка-приглашение"
+CLIENT_LINK_CANCEL_INVITE_LABEL = "❌ Отменить приглашение"
+CLIENT_LINK_REPLACE_LABEL = "🔄 Заменить привязку"
+CLIENT_LINK_UNLINK_LABEL = "❌ Отвязать клиента"
+CLIENT_LINK_UNLINK_YES_LABEL = "Да, отвязать"
+CLIENT_LINK_CONFIRM_LABEL = "✅ Подтвердить"
+CLIENT_LINK_DECLINE_LABEL = "❌ Отклонить"
+
+CLIENT_LINK_ASK_USERNAME_TEXT = (
+    "✍️ Введите @username клиента.\n"
+    "Клиент должен хотя бы раз написать этому боту — иначе отправьте ему ссылку-приглашение."
+)
+CLIENT_LINK_UNLINK_PROMPT_TEMPLATE = (
+    "❌ Отвязать клиента от {plate}?\n"
+    "Машина исчезнет из его «Мои автомобили», уведомления ему больше не придут. "
+    "Мониторинг и история проверок сохраняются."
+)
+CLIENT_LINK_INVALID_TEXT = "⚠️ Приглашение недействительно или уже использовано."
+CLIENT_LINK_EXPIRED_TEXT = "⌛ Срок приглашения истёк. Попросите менеджера прислать новое."
+CLIENT_LINK_NOT_FOR_YOU_TEXT = "⚠️ Это приглашение адресовано другому пользователю."
+CLIENT_LINK_OWN_CAR_TEXT = "ℹ️ Это ваш собственный автомобиль — привязка не нужна."
+CLIENT_LINK_DECLINED_TEXT = "Привязка отклонена. Автомобиль не добавлен."
+CLIENT_LINK_PICK_EMPTY_TEXT = "Пользователей бота пока нет. Отправьте клиенту ссылку-приглашение."
+
+
+def _link_moment(moment: datetime) -> str:
+    return moment.astimezone(_DISPLAY_TZ).strftime("%d.%m %H:%M")
+
+
+def format_link_person(
+    *, username: str | None, first_name: str | None, last_name: str | None, telegram_user_id: int | None = None,
+) -> str:
+    """Клиент для менеджера: "Имя (@username)" / "Имя" / "@username" /
+    "пользователь без имени" — имя экранировано, username только настоящий."""
+    name = _full_name(first_name, last_name)
+    name = escape_telethon_markdown(name) if name else None
+    safe_username = safe_telegram_username(username)
+    if name and safe_username:
+        return f"{name} (@{safe_username})"
+    if name:
+        return name
+    if safe_username:
+        return f"@{safe_username}"
+    return "пользователь без имени"
+
+
+def format_link_person_button(
+    *, username: str | None, first_name: str | None, last_name: str | None,
+) -> str:
+    """Подпись кнопки выбора клиента (без markdown — это кнопка)."""
+    name = _full_name(first_name, last_name)
+    safe_username = safe_telegram_username(username)
+    if name and safe_username:
+        label = f"{name} (@{safe_username})"
+    else:
+        label = name or (f"@{safe_username}" if safe_username else "Пользователь без имени")
+    return label[:60]
+
+
+def format_client_link_status_line(
+    *, state: str, person: str | None = None, moment: datetime | None = None,
+) -> str:
+    """state: none | active | pending_user | pending_invite | expired."""
+    if state == "active":
+        return f"👤 Клиент: {person} · привязан {moment.astimezone(_DISPLAY_TZ).strftime('%d.%m.%Y')}"
+    if state == "pending_user":
+        return f"⏳ Ждёт подтверждения: {person} · до {_link_moment(moment)}"
+    if state == "pending_invite":
+        return f"⏳ Ссылка-приглашение действует до {_link_moment(moment)}"
+    if state == "expired":
+        return f"⌛ Приглашение истекло {_link_moment(moment)}"
+    return "👤 Клиент не привязан"
+
+
+def format_client_link_screen(plate: str, *, status_line: str, choosing: bool, replacing: bool = False) -> str:
+    lines = [f"🚗 {format_plate_for_telegram(plate)}", status_line]
+    if replacing:
+        lines += ["", "Текущий клиент остаётся привязанным, пока новый не подтвердит привязку."]
+    if choosing:
+        lines += ["", "Как привязать клиента?"]
+    return "\n".join(lines)
+
+
+def format_client_link_invite(plate: str, *, url: str, expires_at: datetime) -> str:
+    return "\n".join([
+        f"🔗 Ссылка-приглашение для {format_plate_for_telegram(plate)}",
+        f"Одноразовая, действует до {_link_moment(expires_at)}:",
+        "",
+        url,
+        "",
+        "Перешлите её клиенту. До подтверждения он увидит только номер автомобиля.",
+    ])
+
+
+def format_client_link_request_sent(plate: str, *, person: str, expires_at: datetime) -> str:
+    return (
+        f"📨 Запрос на привязку {format_plate_for_telegram(plate)} отправлен: {person}.\n"
+        f"Клиент должен подтвердить его в боте до {_link_moment(expires_at)}."
+    )
+
+
+def format_client_link_request_failed(plate: str, *, person: str) -> str:
+    return (
+        f"⚠️ Не удалось отправить запрос {person} (возможно, бот заблокирован). "
+        f"Отправьте ссылку-приглашение для {format_plate_for_telegram(plate)}."
+    )
+
+
+def format_client_link_unknown_username(username: str) -> str:
+    safe = safe_telegram_username(username)
+    who = f"@{safe}" if safe else "Этот пользователь"
+    return f"⚠️ {who} ещё не писал этому боту. Отправьте клиенту ссылку-приглашение."
+
+
+def format_client_link_request(plate: str) -> str:
+    """Что видит клиент ДО подтверждения — только номер."""
+    return "\n".join([
+        f"🚗 Вам предлагают добавить автомобиль {format_plate_for_telegram(plate)} в «🚗 Мои автомобили».",
+        "",
+        "После подтверждения вы сможете проверять штрафы по нему и будете получать уведомления "
+        "о новых штрафах GİB, Avrasya и KGM.",
+    ])
+
+
+def format_client_link_confirmed(plate: str, *, latest: UnifiedCheckResult | None, monitoring_active: bool) -> str:
+    lines = [
+        f"✅ Автомобиль {format_plate_for_telegram(plate)} добавлен в «🚗 Мои автомобили».",
+        "Новые штрафы GİB, Avrasya и KGM будут приходить сюда." if monitoring_active
+        else "Уведомления включатся вместе с мониторингом автомобиля.",
+        "",
+    ]
+    if latest is None:
+        lines.append("Проверок ещё не было — нажмите «🔎 Проверить сейчас».")
+    else:
+        lines += ["Текущее состояние:", "", format_unified_check_result(latest)]
+    return "\n".join(lines)
+
+
+def format_client_link_manager_notice(plate: str, *, person: str, confirmed: bool) -> str:
+    if confirmed:
+        return f"✅ {person} подтвердил(а) привязку {format_plate_for_telegram(plate)}."
+    return f"❌ {person} отклонил(а) привязку {format_plate_for_telegram(plate)}."
+
+
+def format_client_link_released(plate: str) -> str:
+    return (
+        f"ℹ️ Автомобиль {format_plate_for_telegram(plate)} больше не привязан к вашему аккаунту — "
+        "уведомления по нему через менеджера не приходят."
+    )
+
+
+CLIENT_LINK_CARD_LINE = "🔗 Привязан менеджером"
+CLIENT_LINK_IS_OWNER_TEXT = "ℹ️ Этот пользователь — владелец автомобиля, привязка не нужна."
+CLIENT_LINK_ALREADY_LINKED_TEXT = "ℹ️ Этот клиент уже привязан к автомобилю."

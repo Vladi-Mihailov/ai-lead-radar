@@ -336,6 +336,35 @@ class TurkeyCheckRunRepository:
         ).fetchone()
         return self._row_to_provider_result(row) if row is not None else None
 
+    # ---- Точка отсчёта привязанного клиента (см. reader/turkey_bot/
+    # client_links.py) — только чтение, по id строк turkey_provider_results ----
+
+    def latest_successful_provider_result_id(self, plate: str, provider: str) -> int | None:
+        """id последнего НЕ-ERROR результата провайдера по номеру (любой
+        владелец/initiator — состояние машины), тот же порядок, что и у
+        get_latest_provider_results_for_plate."""
+        row = self._conn.execute(
+            "SELECT pr.id FROM turkey_check_runs r CROSS JOIN turkey_provider_results pr ON pr.run_id = r.id "
+            "WHERE r.plate = ? AND pr.provider = ? AND pr.status != 'error' "
+            "ORDER BY r.finished_at DESC, r.id DESC, pr.id DESC LIMIT 1",
+            (plate, provider),
+        ).fetchone()
+        return row[0] if row else None
+
+    def provider_result_ids_for_run(self, run_id: int) -> dict[str, int]:
+        rows = self._conn.execute(
+            "SELECT provider, id FROM turkey_provider_results WHERE run_id = ? ORDER BY id", (run_id,),
+        ).fetchall()
+        return {provider: result_id for provider, result_id in rows}
+
+    def get_provider_result(self, result_id: int) -> ProviderCheckResult | None:
+        row = self._conn.execute(
+            "SELECT provider, status, debt_count, principal_amount, penalty_amount, total_amount, "
+            "error_type, items_snapshot, checked_at FROM turkey_provider_results WHERE id = ?",
+            (result_id,),
+        ).fetchone()
+        return self._row_to_provider_result(row) if row is not None else None
+
     def get_latest_provider_results_for_plate(
         self, plate: str, provider: str,
     ) -> tuple[ProviderResultAt | None, ProviderResultAt | None]:
