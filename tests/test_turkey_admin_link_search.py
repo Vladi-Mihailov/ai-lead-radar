@@ -72,6 +72,8 @@ async def test_admin_finds_every_link_of_a_plate_with_manager_rights_and_monitor
 
 async def test_search_is_admin_only_and_handles_bad_or_empty_input(fx):
     await fx.linked_car()
+    prompt = await fx.controller.handle_text(texts.ADMIN_LINK_SEARCH_LABEL, chat_id=_MANAGER2, telegram_user_id=_MANAGER2)
+    assert prompt.text != texts.ADMIN_LINK_SEARCH_PROMPT and fx.states.get(_MANAGER2) is None
     not_admin = await _search(fx, _PLATE, user=_MANAGER2)
     assert not_admin.admin_link_search is None
     assert fx.controller.handle_admin_link_search_results(_PLATE, telegram_user_id=_MANAGER2) is None
