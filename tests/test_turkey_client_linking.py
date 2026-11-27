@@ -474,3 +474,59 @@ async def test_concurrent_confirms_link_once(fx):
     results = await asyncio.gather(confirm(), confirm())
     assert sum(bool(r.outgoing_messages) for r in results) == 1
     assert len(fx.garage.list_cars(_CLIENT)) == 1
+
+
+# ---- Защиты на уровне репозитория (второй слой, на случай гонки) ----
+
+def _pending(repo, *, invited=None, token="tok-1", now=_T0):
+    return repo.create_pending(
+        owner_telegram_user_id=_MANAGER, plate=_PLATE, method="invite", created_by=_MANAGER,
+        invited_user_id=invited, token=token, now=now,
+    )
+
+
+def test_activate_is_single_use_and_erases_the_token(tmp_path):
+    repo = TurkeyClientLinkRepository(tmp_path / "users.db")
+    try:
+        link = _pending(repo, invited=_CLIENT)
+        assert repo.activate(link.id, client_telegram_user_id=_CLIENT, now=_T0, baseline={}, client_car_created=True)
+        assert repo.get_by_token("tok-1") is None
+        assert repo.activate(link.id, client_telegram_user_id=_CLIENT, now=_T0, baseline={},
+                             client_car_created=True) is None
+    finally:
+        repo.close_db()
+
+
+def test_activate_refuses_an_expired_or_foreign_invite(tmp_path):
+    repo = TurkeyClientLinkRepository(tmp_path / "users.db")
+    try:
+        link = _pending(repo, invited=_CLIENT)
+        assert repo.activate(link.id, client_telegram_user_id=_OTHER, now=_T0, baseline={},
+                             client_car_created=True) is None
+        late = _T0 + timedelta(hours=72)
+        assert repo.activate(link.id, client_telegram_user_id=_CLIENT, now=late, baseline={},
+                             client_car_created=True) is None
+        assert repo.get(link.id).status == "pending"
+    finally:
+        repo.close_db()
+
+
+def test_bind_invite_cannot_be_taken_over(tmp_path):
+    repo = TurkeyClientLinkRepository(tmp_path / "users.db")
+    try:
+        link = _pending(repo)
+        assert repo.bind_invite(link.id, _CLIENT) is True
+        assert repo.bind_invite(link.id, _OTHER) is False
+        assert repo.get(link.id).invited_user_id == _CLIENT
+    finally:
+        repo.close_db()
+
+
+async def test_open_invite_refuses_a_link_that_is_no_longer_pending_even_with_a_token(fx):
+    car, _ = await fx.manager_car()
+    token, _ = await fx.invite_token(car)
+    link = fx.links.get_by_token(token)
+    fx.links._conn.execute("UPDATE turkey_client_links SET status = 'declined' WHERE id = ?", (link.id,))
+    fx.links._conn.commit()
+    opened = await fx.controller.handle_text(f"/start trlink_{token}", chat_id=_CLIENT, telegram_user_id=_CLIENT)
+    assert opened.text == texts.CLIENT_LINK_INVALID_TEXT
