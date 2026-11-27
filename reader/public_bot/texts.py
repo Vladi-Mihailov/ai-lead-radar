@@ -912,7 +912,26 @@ def trusted_stop_confirm_button_label(subscriber_count: int) -> str:
     )
 
 
-def format_statistics_header(stats: BotStatistics) -> str:
+def format_generated_at(moment: datetime, *, tz: ZoneInfo) -> str:
+    """Когда сформирован отчёт статистики (📊 Статистика и итог "🔄
+    Проверить авто со штрафами"): по этой строке менеджер отличает отчёт
+    до проверки от отчёта после неё."""
+    local = moment.astimezone(tz)
+    return f"🕒 Сформировано: {local:%d.%m} в {local:%H:%M}"
+
+
+# Ответ на листание отчёта статистики, которого бот уже не помнит (после
+# перезапуска бота или когда отчёт вытеснен более новыми): сообщение не
+# меняется — его данные остаются такими, какими были при формировании.
+DEBT_REPORT_EXPIRED_TEXT = (
+    "Этот отчёт больше нельзя листать — его данные остаются как есть. "
+    "Откройте «📊 Статистика» заново."
+)
+
+
+def format_statistics_header(
+    stats: BotStatistics, *, generated_at: datetime | None = None, tz: ZoneInfo | None = None,
+) -> str:
     """Часть "📊 Статистика", НЕ относящаяся к штрафам (см.
     format_debt_summary_block ниже) — вынесена отдельно, чтобы
     ConversationController мог переиспользовать ТОЛЬКО debt-блок в
@@ -921,9 +940,13 @@ def format_statistics_header(stats: BotStatistics) -> str:
     Пользователи/🚗 Подписки, только сам факт проверки + актуальный
     debt-блок). Числа активных и остановленных подписок здесь не
     показываются (решение владельца), хотя BotStatisticsService
-    по-прежнему их считает."""
+    по-прежнему их считает. generated_at — строка «🕒 Сформировано» под
+    заголовком (см. format_generated_at)."""
+    lines = ["📊 Статистика бота"]
+    if generated_at is not None and tz is not None:
+        lines.append(format_generated_at(generated_at, tz=tz))
     return "\n".join([
-        "📊 Статистика бота",
+        *lines,
         "",
         f"👥 Всего пользователей: {stats.total_users}",
         f"🆕 Новых сегодня: {stats.new_users_today}",
@@ -980,15 +1003,20 @@ def format_debt_refresh_prompt(car_count: int) -> str:
 _DEBT_REFRESH_FAILED_PLATES_SHOWN = 20
 
 
-def format_debt_refresh_summary(outcome: RefreshOutcome) -> str:
+def format_debt_refresh_summary(
+    outcome: RefreshOutcome, *, generated_at: datetime | None = None, tz: ZoneInfo | None = None,
+) -> str:
     """См. задачу п.7 "RESULT" — БЕЗ "Найдены новые штрафы"/"Без новых
     штрафов"-аналитики: только факт проверки, актуальный список — заново
     построенный "🚨 Штрафы по последней проверке" блок (см.
     ConversationController._build_debt_section), склеиваемый вызывающим
     кодом ПОСЛЕ этого текста, а не здесь. Непроверенные номера —
-    не больше _DEBT_REFRESH_FAILED_PLATES_SHOWN, остальные — "и ещё N"."""
-    lines = [
-        "🔄 Проверка завершена",
+    не больше _DEBT_REFRESH_FAILED_PLATES_SHOWN, остальные — "и ещё N".
+    generated_at — строка «🕒 Сформировано» под заголовком."""
+    lines = ["🔄 Проверка завершена"]
+    if generated_at is not None and tz is not None:
+        lines.append(format_generated_at(generated_at, tz=tz))
+    lines += [
         "",
         f"Проверено: {outcome.checked}",
         f"⚠️ Не удалось проверить: {outcome.failed}",
