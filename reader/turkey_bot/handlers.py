@@ -110,7 +110,7 @@ def register(
         last_name = getattr(sender, "last_name", None) if sender is not None else None
         _record_known_user(event.sender_id, event.chat_id, username, first_name, last_name)
         is_trusted = controller.is_trusted(event.sender_id)
-        is_admin = controller.is_admin(event.sender_id)
+        is_admin = _is_admin(controller, event.sender_id)
 
         reply = await controller.handle_text(
             text, chat_id=event.chat_id, telegram_user_id=event.sender_id,
@@ -126,7 +126,7 @@ def register(
         last_name = getattr(sender, "last_name", None) if sender is not None else None
         _record_known_user(event.sender_id, event.chat_id, username, first_name, last_name)
         is_trusted = controller.is_trusted(event.sender_id)
-        is_admin = controller.is_admin(event.sender_id)
+        is_admin = _is_admin(controller, event.sender_id)
 
         if event.data == CANCEL_CALLBACK_DATA:
             reply = await controller.handle_cancel(chat_id=event.chat_id)
@@ -379,6 +379,13 @@ def register(
                     await event.respond(message.on_failure_text)
 
     logger.info("✔ Turkey bot handlers зарегистрированы")
+
+
+def _is_admin(controller, telegram_user_id: int) -> bool:
+    """Администратор бота (см. ConversationController.is_admin); контроллер
+    без этого метода — администраторов нет."""
+    check = getattr(controller, "is_admin", None)
+    return bool(check(telegram_user_id)) if check is not None else False
 
 
 def _first_message_buttons(reply: BotReply, *, is_trusted: bool, has_extra: bool, is_admin: bool = False):
