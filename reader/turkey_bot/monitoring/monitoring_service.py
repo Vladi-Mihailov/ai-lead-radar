@@ -191,10 +191,14 @@ class TurkeyMonitoringService:
                 plate=subscription.plate, telegram_chat_id=subscription.telegram_chat_id,
                 previous_by_provider=previous_by_provider, result=result,
             )
-        finally:
-            # Привязанный клиент получает своё и тогда, когда отправка владельцу
-            # подписки не удалась (например, бывший менеджер заблокировал бота).
-            await self._notify_linked_clients(subscription.telegram_user_id, subscription.plate, result, run_id)
+        except Exception:
+            # Отправка владельцу подписки не удалась (например, бывший менеджер
+            # заблокировал бота) — привязанный клиент получает своё, а повтор
+            # провайдеров с CAPTCHA всё равно ставится в очередь.
+            logger.exception(
+                "Turkey monitoring: не удалось отправить уведомление подписчику (plate=%s)", subscription.plate,
+            )
+        await self._notify_linked_clients(subscription.telegram_user_id, subscription.plate, result, run_id)
         self._maybe_enqueue_retry(subscription, result, slot_label=slot_label, now=now)
 
         return result
@@ -234,8 +238,9 @@ class TurkeyMonitoringService:
                 plate=retry.plate, telegram_chat_id=retry.telegram_chat_id,
                 previous_by_provider=previous_by_provider, result=result,
             )
-        finally:
-            await self._notify_linked_clients(retry.telegram_user_id, retry.plate, result, run_id)
+        except Exception:
+            logger.exception("Turkey monitoring retry: не удалось отправить уведомление подписчику (plate=%s)", retry.plate)
+        await self._notify_linked_clients(retry.telegram_user_id, retry.plate, result, run_id)
         logger.info(
             "Turkey monitoring retry finished: plate=%s providers=%s slot=%s",
             retry.plate, retry.providers, retry.slot_label,

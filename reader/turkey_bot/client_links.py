@@ -354,7 +354,7 @@ class TurkeyClientLinkRepository:
                 )
                 if relinked.rowcount != 1:
                     raise _MoveFailed()
-        except (sqlite3.IntegrityError, _MoveFailed):
+        except (sqlite3.Error, _MoveFailed):  # в т.ч. «database is locked» — транзакция откатилась
             return False
         return True
 
@@ -654,6 +654,10 @@ class TurkeyClientLinkService:
             return AdminOutcome(status="conflict", link=link)
         if self._links.active_links_for_client(new_owner, link.plate):
             return AdminOutcome(status="linked_car", link=link)  # его машина сама пришла привязкой
+        target_invite = self._links.pending_for_anchor(new_owner, link.plate)
+        if target_invite is not None and not target_invite.is_expired(self.now()):
+            # Подтверждение этого приглашения заменило бы переданного клиента.
+            return AdminOutcome(status="target_pending", link=link)
         if self._garage.get_owned_car_by_number(new_owner, link.plate) is not None:
             return AdminOutcome(status="reanchored", link=link)
         if self._garage.get_owned_car_by_number(link.owner_telegram_user_id, link.plate) is None:
@@ -671,6 +675,9 @@ class TurkeyClientLinkService:
           мониторинг остаётся ОДИН.
         Точка отсчёта клиента хранится в самой привязке и не меняется: ни
         повторов старых штрафов, ни пропусков."""
+        # Передача во время планового прохода (21:00) или 5-минутного повтора:
+        # подписки этого прохода уже выбраны, клиент получит изменение на один
+        # слот позже — ничего не теряется (точка отсчёта в привязке).
         plan = self.transfer_plan(link_id, new_owner=new_owner, require_orphan=require_orphan)
         if plan.status not in ("reanchored", "moved"):
             return plan

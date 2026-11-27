@@ -1698,6 +1698,7 @@ ORPHAN_REFUSAL_TEXTS = {
     "same_owner": "ℹ️ Привязка уже у этого менеджера.",
     "linked_car": "⚠️ Машина этого менеджера сама пришла привязкой клиента — передать на неё нельзя.",
     "failed": "⚠️ Передача не выполнена — ничего не изменено. Попробуйте ещё раз.",
+    "target_pending": "⚠️ У менеджера по этой машине открыто приглашение — отмените его или выберите другого.",
 }
 
 CLIENT_LINK_ANCHOR_LOCKED_TEXT = (
@@ -1735,9 +1736,14 @@ def format_orphan_disable_prompt(*, plate: str, client: str) -> str:
     ])
 
 
-def format_orphan_transfer_prompt(*, plate: str, client: str, manager: str, moved: bool) -> str:
+def format_orphan_transfer_prompt(
+    *, plate: str, client: str, manager: str, moved: bool, current_owner: str | None = None,
+) -> str:
+    """current_owner — владелец машины ещё действующий менеджер (передача из
+    поиска по номеру); None — бывший менеджер."""
+    whose = f"текущего менеджера {current_owner}" if current_owner else "бывшего менеджера"
     detail = (
-        "Машина бывшего менеджера и её мониторинг перейдут этому менеджеру — проверка номера останется одна."
+        f"Машина {whose} и её мониторинг перейдут этому менеджеру — проверка номера останется одна."
         if moved else
         "У менеджера уже есть эта машина — клиент будет получать уведомления из её проверки."
     )
@@ -1748,6 +1754,17 @@ def format_orphan_transfer_prompt(*, plate: str, client: str, manager: str, move
         detail,
         "Уже отправленное клиенту не повторится.",
     ])
+
+
+def format_admin_link_owner_notice(plate: str, *, client: str, transferred: bool, moved: bool) -> str:
+    """Действующему менеджеру — администратор забрал его привязку."""
+    if not transferred:
+        return f"ℹ️ Администратор отвязал клиента {client} от {format_plate_for_telegram(plate)}."
+    tail = " Машина и её мониторинг переданы вместе с ней." if moved else ""
+    return (
+        f"ℹ️ Администратор передал привязку клиента {client} к {format_plate_for_telegram(plate)} "
+        f"другому менеджеру.{tail}"
+    )
 
 
 def format_orphan_disabled(plate: str) -> str:

@@ -1131,14 +1131,17 @@ class ConversationController:
         if base == "disable_yes":
             if not self._take_orphan_token(admin, link_id, action, None, token):
                 return back(texts.ORPHAN_STALE_TEXT)
+            owner_was_manager = self._client_links.is_manager(link.owner_telegram_user_id)
             outcome = self._client_links.disable_orphan(link_id, closed_by=admin, require_orphan=require_orphan)
             if outcome.status != "disabled":
                 return back(texts.ORPHAN_REFUSAL_TEXTS[outcome.status])
-            return back(
-                texts.format_orphan_disabled(link.plate),
-                (OutgoingMessage(chat_id=link.client_telegram_user_id,
-                                 text=texts.format_client_link_released(link.plate)),),
-            )
+            outgoing = [OutgoingMessage(chat_id=link.client_telegram_user_id,
+                                        text=texts.format_client_link_released(link.plate))]
+            if owner_was_manager and link.owner_telegram_user_id != admin:
+                outgoing.append(OutgoingMessage(chat_id=link.owner_telegram_user_id, text=texts.format_admin_link_owner_notice(
+                    link.plate, client=client, transferred=False, moved=False,
+                )))
+            return back(texts.format_orphan_disabled(link.plate), tuple(outgoing))
         if base == "transfer":
             managers = sorted(
                 self._trusted_operator_user_ids - {link.client_telegram_user_id, link.owner_telegram_user_id}
@@ -1160,9 +1163,14 @@ class ConversationController:
             if plan.status not in ("reanchored", "moved"):
                 return back(texts.ORPHAN_REFUSAL_TEXTS[plan.status])
             action_yes = f"{prefix}transfer_yes"
+            current_owner = (
+                self._person(link.owner_telegram_user_id)
+                if self._client_links.is_manager(link.owner_telegram_user_id) else None
+            )
             return BotReply(
                 text=texts.format_orphan_transfer_prompt(
                     plate=link.plate, client=client, manager=self._person(extra), moved=plan.status == "moved",
+                    current_owner=current_owner,
                 ),
                 orphan_confirm=(link_id, action_yes, extra,
                                 self._issue_orphan_token(admin, link_id, action_yes, extra), back_data),
@@ -1170,14 +1178,20 @@ class ConversationController:
         if base == "transfer_yes":
             if not self._take_orphan_token(admin, link_id, action, extra, token):
                 return back(texts.ORPHAN_STALE_TEXT)
+            owner_was_manager = self._client_links.is_manager(link.owner_telegram_user_id)
             outcome = self._client_links.transfer_orphan(link_id, new_owner=extra, require_orphan=require_orphan)
             if outcome.status not in ("reanchored", "moved"):
                 return back(texts.ORPHAN_REFUSAL_TEXTS[outcome.status])
+            outgoing = [OutgoingMessage(chat_id=extra, text=texts.format_orphan_transfer_notice(link.plate, client=client))]
+            if owner_was_manager and link.owner_telegram_user_id != admin:
+                outgoing.append(OutgoingMessage(chat_id=link.owner_telegram_user_id, text=texts.format_admin_link_owner_notice(
+                    link.plate, client=client, transferred=True, moved=outcome.status == "moved",
+                )))
             return back(
                 texts.format_orphan_transferred(
                     link.plate, manager=self._person(extra), monitoring_active=outcome.monitoring_active,
                 ),
-                (OutgoingMessage(chat_id=extra, text=texts.format_orphan_transfer_notice(link.plate, client=client)),),
+                tuple(outgoing),
             )
         return None
 

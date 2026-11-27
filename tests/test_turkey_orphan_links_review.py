@@ -212,3 +212,90 @@ def test_move_anchor_is_one_transaction_on_the_shared_file(tmp_path):
                 "turkey_check_runs"} <= tables
     finally:
         fx.close()
+
+
+# ---- Второй раунд review ----
+
+async def test_transfer_refused_when_the_target_car_has_an_open_invite(fx):
+    _car, _client_car, link = await fx.linked_car()
+    car2 = fx.garage.add_car(telegram_user_id=_MANAGER2, car_number=_PLATE)
+    fx.controller.handle_client_link_action("invite", car2.id, 0, None, chat_id=_MANAGER2, telegram_user_id=_MANAGER2)
+    fx.demote()
+    refused = fx.admin("transfer_to", link.id, _MANAGER2)
+    assert refused.text.startswith(texts.ORPHAN_REFUSAL_TEXTS["target_pending"])
+    assert fx.links.get(link.id).owner_telegram_user_id == _FORMER
+
+
+async def test_captcha_retry_is_queued_even_if_the_owner_send_fails(fx):
+    from reader.turkey_bot.unified.models import (
+        ProviderCheckResult, UnifiedCheckResult, derive_overall_status, total_amount_for,
+    )
+    _car, _client_car, _link = await fx.linked_car()
+    fx.demote()
+    at = _T0 + timedelta(hours=1)
+    providers = (
+        ProviderCheckResult(provider="gib", status=ProviderStatus.HAS_DEBT, debt_count=1, principal_amount=Decimal(800),
+                            penalty_amount=Decimal(0), total_amount=Decimal(800), items=(), error_type=None, checked_at=at),
+        ProviderCheckResult(provider="kgm", status=ProviderStatus.ERROR, debt_count=0, principal_amount=None,
+                            penalty_amount=None, total_amount=Decimal(0), items=(), error_type="captcha_unavailable",
+                            checked_at=at),
+    )
+    fx.check.results.append(UnifiedCheckResult(
+        plate=_PLATE, started_at=at, finished_at=at, overall_status=derive_overall_status(providers),
+        total_amount=total_amount_for(providers), providers=providers,
+    ))
+
+    class _Blocked:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, *, telegram_chat_id, text):
+            if telegram_chat_id == _FORMER:
+                raise RuntimeError("bot blocked by user")
+            self.sent.append((telegram_chat_id, text))
+
+    fx.monitoring._notifier = _Blocked()
+    await fx.monitoring.run_scheduled_batch("21:00")
+    assert [chat for chat, _ in fx.monitoring._notifier.sent] == [_CLIENT]
+    assert fx.monitoring.has_due_retries(_T0 + timedelta(days=30))  # повтор KGM поставлен
+
+
+async def test_current_managers_link_wording_and_notices(fx):
+    _car, _client_car, link = await fx.linked_car()   # владелец — действующий менеджер
+    prompt = fx.admin("s_transfer_to", link.id, _MANAGER2)
+    assert "текущего менеджера Former (@former_mgr)" in prompt.text and "бывшего" not in prompt.text
+    done = fx.admin("s_transfer_yes", link.id, _MANAGER2, prompt.orphan_confirm[3])
+    notices = {m.chat_id: m.text for m in done.outgoing_messages}
+    assert set(notices) == {_MANAGER2, _FORMER}
+    assert notices[_FORMER].startswith("ℹ️ Администратор передал привязку") and "Машина и её мониторинг" in notices[_FORMER]
+    # Отвязка администратором — тоже с уведомлением действующему менеджеру.
+    unlinked = fx.admin("s_disable_yes", link.id, token=fx.admin("s_disable", link.id).orphan_confirm[3])
+    assert {m.chat_id for m in unlinked.outgoing_messages} == {_CLIENT, _MANAGER2}
+
+
+async def test_locked_database_reports_a_failed_transfer(fx, monkeypatch):
+    _car, _client_car, link = await fx.linked_car()
+    fx.demote()
+
+    class _LockedConn:
+        def __init__(self, real):
+            self._real = real
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._real.rollback()
+            return False
+
+        def cursor(self):
+            raise sqlite3.OperationalError("database is locked")
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    prompt = fx.admin("transfer_to", link.id, _MANAGER2)
+    monkeypatch.setattr(fx.links, "_conn", _LockedConn(fx.links._conn))
+    done = fx.admin("transfer_yes", link.id, _MANAGER2, prompt.orphan_confirm[3])
+    assert done.text.startswith(texts.ORPHAN_REFUSAL_TEXTS["failed"])
+    assert fx.links.get(link.id).owner_telegram_user_id == _FORMER
