@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Literal
@@ -233,6 +234,11 @@ class NewFineEvent:
     # существующих вызовов (например, FineCheckService.check_task(),
     # которому эта информация не нужна).
     car_owner_display: str | None = None
+    # Срок оплаты окончательный (police.ge отдал activeDate — вручение
+    # подтверждено) — True; только предварительный lastDate без вручения —
+    # False; срока в ответе нет — None. Только для подписи срока в "🔎
+    # Проверить сейчас" (см. format_fine_block(mark_provisional_due=True)).
+    payment_term_final: bool | None = None
 
     @classmethod
     def from_detected_fine(
@@ -254,6 +260,10 @@ class NewFineEvent:
             place_ru=fine.place_ru,
             violation_description_ru=fine.violation_description_ru,
             car_owner_display=car_owner_display,
+            # payment_term_final не выводится: raw_data пишется один раз при
+            # обнаружении и после вручения не обновляется (см.
+            # DetectedFineRepository.mark_seen) — для "🔎" срок берётся из
+            # georgia_fine_terms (ConversationController._with_fresh_term_flags).
         )
 
     @classmethod
@@ -297,7 +307,43 @@ class NewFineEvent:
             place_ru=place_ru,
             violation_description_ru=violation_description_ru,
             car_owner_display=car_owner_display,
+            payment_term_final=payment_term_final_of(record.raw_data),
         )
+
+
+def payment_term_final_of(raw_data) -> bool | None:
+    """Окончательный ли срок оплаты в ответе police.ge (raw_data — dict или
+    JSON-строка): activeDate — корректная дата — True (вручение
+    подтверждено, lastDate окончательный); lastDate без activeDate — False
+    (предварительный); lastDate нет — None. Тот же признак, что и у
+    reader.fines.payable_amount.term_end_of (даты, которые не разбираются,
+    считаются отсутствующими)."""
+    if isinstance(raw_data, str):
+        try:
+            raw_data = json.loads(raw_data) if raw_data else None
+        except ValueError:
+            return None
+    if not isinstance(raw_data, dict):
+        return None
+
+    def _present(key: str) -> bool:
+        value = raw_data.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return False
+        text = value.strip()[:10]
+        for parse in (date.fromisoformat, lambda t: datetime.strptime(t, "%d.%m.%Y").date()):
+            try:
+                parse(text)
+                return True
+            except ValueError:
+                pass
+        return False
+
+    if _present("activeDate"):
+        return True
+    if _present("lastDate"):
+        return False
+    return None
 
 
 # "suppressed" (см. reader/fines/suppression.py) — car_number в жёстком

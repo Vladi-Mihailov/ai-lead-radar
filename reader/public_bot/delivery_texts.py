@@ -84,7 +84,10 @@ def format_check_now_fines_message(
     становится «🧾 Штраф», под ней — «💰 К оплате». None — формат прежний.
 
     original_amount_protocols — штрафы с истёкшим окончательным сроком
-    оплаты: их исходная сумма — «🧾 Первоначальный штраф»."""
+    оплаты: их исходная сумма — «🧾 Первоначальный штраф».
+
+    Срок без подтверждённого вручения — «⏳ Предварительный срок оплаты»
+    (см. format_fine_block(mark_provisional_due=True))."""
     formatted_car_number = format_plate_for_telegram(car_number)
     blocks = []
     for fine in fines:
@@ -96,6 +99,7 @@ def format_check_now_fines_message(
             format_fine_block(
                 fine, payable_lines=extra,
                 original_amount=(fine.external_fine_id or "") in (original_amount_protocols or set()),
+                mark_provisional_due=True,
             ),
         ]
         if status_labels is not None:

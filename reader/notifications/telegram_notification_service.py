@@ -43,6 +43,7 @@ def _format_amount(value: float | None) -> str | None:
 
 def format_fine_block(
     event: NewFineEvent, *, payable_lines: list[str] | None = None, original_amount: bool = False,
+    mark_provisional_due: bool = False,
 ) -> str:
     """Публичная (без ведущего "_") — переиспользуется
     reader/public_bot/delivery_texts.py для клиентских уведомлений (см.
@@ -56,7 +57,13 @@ def format_fine_block(
     payable_lines — сумма к оплате (клиентская карточка "🔎 Проверить
     сейчас", см. reader/public_bot/payable_amount_texts.py): строка суммы
     становится "🧾 Штраф: N ₾" (original_amount — "🧾 Первоначальный штраф",
-    срок оплаты истёк), под ней — эти строки. None — как раньше."""
+    срок оплаты истёк), под ней — эти строки. None — как раньше.
+
+    mark_provisional_due — "🔎 Проверить сейчас": предварительный срок
+    (вручение не подтверждено, event.payment_term_final is False) —
+    «⏳ Предварительный срок оплаты», окончательный и неизвестный — «⏳
+    Оплатить до». Уведомления о новых штрафах этот параметр не передают —
+    их текст не меняется."""
     lines = []
 
     if event.external_fine_id:
@@ -100,7 +107,8 @@ def format_fine_block(
 
     due_date = _format_date(event.due_date)
     if due_date:
-        lines.append(f"⏳ Оплатить до: {due_date}")
+        provisional = mark_provisional_due and event.payment_term_final is False
+        lines.append(f"⏳ Предварительный срок оплаты: {due_date}" if provisional else f"⏳ Оплатить до: {due_date}")
 
     if event.delivered_status:
         lines.append(f"📬 Статус вручения: {event.delivered_status}")
