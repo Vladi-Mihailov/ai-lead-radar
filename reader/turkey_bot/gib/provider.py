@@ -6,6 +6,7 @@
 никогда не обращается к GibSession напрямую.
 """
 
+from reader.turkey_bot.gib.diagnostics import log_unexpected_response
 from reader.turkey_bot.gib.models import CaptchaChallenge, GibSubmitOutcome
 from reader.turkey_bot.gib.parser import parse_submit_response
 from reader.turkey_bot.gib.session import GibSession
@@ -31,4 +32,11 @@ class GibProvider:
         raw = await self._session.submit(
             plate=plate, image_id=image_id, captcha_code=captcha_code,
         )
-        return parse_submit_response(raw)
+        outcome = parse_submit_response(raw)
+        if outcome.kind == "unexpected":
+            # Только лог (см. diagnostics.py): исход и дальнейшая логика не меняются.
+            log_unexpected_response(
+                raw, meta=getattr(self._session, "last_submit_meta", None), plate=plate,
+                captcha_code=captcha_code, image_id=image_id,
+            )
+        return outcome

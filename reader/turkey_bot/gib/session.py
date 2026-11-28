@@ -24,9 +24,11 @@ Stage 1): базовый путь апигейта вычитан из реал�
 
 import base64
 import logging
+import time
 
 import httpx
 
+from reader.turkey_bot.gib.diagnostics import GibResponseMeta, describe_non_json, response_meta
 from reader.turkey_bot.gib.models import CaptchaChallenge
 
 logger = logging.getLogger(__name__)
@@ -79,6 +81,9 @@ class GibSession:
     def __init__(self, client: httpx.AsyncClient, *, request_timeout: float = 30.0):
         self._client = client
         self._timeout = request_timeout
+        # Метаданные последнего submit (статус, длительность, Retry-After) —
+        # только для диагностического лога "unexpected" (см. diagnostics.py).
+        self.last_submit_meta: GibResponseMeta | None = None
 
     async def start(self) -> CaptchaChallenge:
         """Полный цикл установки сессии: сначала GET самой страницы (те же
@@ -149,18 +154,38 @@ class GibSession:
                 "securityCode": captcha_code,
             },
         }
+        self.last_submit_meta = None
+        started = time.monotonic()
         try:
             response = await self._client.post(
                 _SUBMIT_URL, json=body, headers=_API_HEADERS, timeout=self._timeout,
             )
         except httpx.HTTPError as exc:
-            logger.warning("GIB submit: transport error (%s)", type(exc).__name__)
+            logger.warning(
+                "GIB submit: transport error (%s) duration_ms=%s",
+                type(exc).__name__, _elapsed_ms(started),
+            )
             raise GibTransportError("failed to submit GIB check") from exc
+        try:
+            self.last_submit_meta = response_meta(response, duration_ms=_elapsed_ms(started))
+        except Exception:  # noqa: BLE001 - диагностика не должна влиять на проверку
+            self.last_submit_meta = None
 
         try:
             return response.json()
         except ValueError as exc:
+            try:
+                details = describe_non_json(
+                    response, meta=self.last_submit_meta, plate=plate,
+                    captcha_code=captcha_code, image_id=image_id,
+                )
+            except Exception as diag_exc:  # noqa: BLE001 - диагностика не должна влиять на проверку
+                details = f"diagnostics failed ({type(diag_exc).__name__})"
             logger.warning(
-                "GIB submit: response is not valid JSON (status=%s)", response.status_code,
+                "GIB submit: response is not valid JSON (status=%s) %s", response.status_code, details,
             )
             raise GibTransportError("GIB submit response is not valid JSON") from exc
+
+
+def _elapsed_ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)
