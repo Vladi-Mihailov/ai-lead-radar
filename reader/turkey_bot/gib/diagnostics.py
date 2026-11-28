@@ -17,12 +17,13 @@
 токены, CAPTCHA (код и image id), полное тело ответа, сведения о штрафах
 (поля "data"/"BORCLAR" не читаются вовсе). Из тела берутся только:
   - имена ключей верхнего уровня (схема, не данные; без цифр);
-  - тип и код сообщения (строгий формат);
+  - тип и код сообщения (код — только число или префикс + число);
   - текст сообщения из известного поля messages[].text — по БЕЛОМУ
     списку: текст пишется, только если в нём нет слов с заглавной буквы
-    (кроме первого слова предложения и известных аббревиатур), нет чисел
-    (кроме "5 dakika"-подобных интервалов), нет токенов из букв и цифр и
-    нет e-mail. Иначе пишется только причина: text=<omitted:...>.
+    (кроме первого слова предложения — после . ! ? — и известных
+    аббревиатур), нет букв не латиницы, нет чисел (кроме "5 dakika"-подобных
+    интервалов), нет токенов из букв и цифр и нет e-mail. Иначе пишется
+    только причина: text=<omitted:...>.
 Запрошенный номер, код CAPTCHA и image id дополнительно маскируются как
 точные значения (в любом написании с разделителями).
 
@@ -89,7 +90,10 @@ _ALLOWED_UPPER_WORDS = frozenset({"GİB", "GIB", "HTTP", "API", "URL", "TC", "IP
 _TIME_UNIT_RE = re.compile(
     r"\s*(?:saniye|sn|dakika|dk|saat|gün|seconds?|secs?|minutes?|mins?|hours?|days?)\b", re.IGNORECASE,
 )
-_SENTENCE_END_CHARS = ".!?:;…"
+_SENTENCE_END_CHARS = ".!?…"
+# Латиница с турецкими буквами: текст с другими буквами (грузинскими,
+# арабскими и т.п.) не проверить по регистру — он не логируется.
+_ALLOWED_LETTERS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZçğıöşüâîûÇĞİÖŞÜÂÎÛ")
 _OPENING_PUNCT = " \"'(«[“‘"
 
 _MESSAGE_CODE_KEYS = ("code", "messageCode", "errorCode", "kod", "hataKodu")
@@ -97,7 +101,9 @@ _TOP_LEVEL_CODE_KEYS = ("code", "errorCode", "hataKodu", "status")
 _CONTENT_MAIN_TYPES = frozenset({"application", "text", "image", "multipart", "message", "audio", "video", "font"})
 
 _SAFE_KEY_RE = re.compile(r"[A-Za-z_]{1,40}")
-_SAFE_CODE_RE = re.compile(r"[A-Za-z0-9_.\-]{1,40}")
+# Код ошибки — только число или короткий префикс + число ("GW-503", "E1001"):
+# слова и составные значения могут оказаться данными (имя, номер).
+_SAFE_CODE_RE = re.compile(r"\d{1,5}|[A-Za-z]{1,6}[-_.]?\d{1,5}")
 _SAFE_TYPE_RE = re.compile(r"[A-Za-z_]{1,20}")
 _RETRY_AFTER_SECONDS_RE = re.compile(r"\d{1,7}")
 _RETRY_AFTER_DATE_RE = re.compile(
@@ -180,6 +186,8 @@ def _unsafe_reason(cleaned: str) -> str | None:
     """Причина, по которой текст нельзя писать в лог, или None (белый список)."""
     if _EMAIL_RE.search(cleaned):
         return "email"
+    if any(ch.isalpha() and ch not in _ALLOWED_LETTERS for ch in cleaned):
+        return "non_latin"
     if _MIXED_TOKEN_RE.search(cleaned):
         return "id_like"
     for match in _NUMBER_RE.finditer(cleaned):
@@ -273,9 +281,6 @@ def _safe_code(value: object, secrets: dict[str, str | None]) -> str | None:
     value = value.strip()
     if not _SAFE_CODE_RE.fullmatch(value) or _is_secret(value, secrets):
         return None
-    for group in re.split(r"[_.\-]", value):
-        if group and not (group.isalpha() or (group.isdigit() and len(group) <= 5)):
-            return None
     return value
 
 

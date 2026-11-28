@@ -254,6 +254,10 @@ async def test_http_403_is_blocked(caplog):
     ("Protokol MC03475903 bulunamadı.", "id_like", ("MC03475903",)),
     ("Plaka 34 ABC 123 kayıtlı değil.", "number", ("ABC", "34 ABC")),
     ("Plaka AB.1234.CD kayıtlı değil.", "number", ("AB.1234", "1234.CD")),
+    ("Ad: Ahmet; Soyad: Yılmaz", "capitalised_word", ("Ahmet", "Yılmaz")),
+    ("Araç sahibi: Ahmet; soyadı: Yılmaz.", "capitalised_word", ("Ahmet", "Yılmaz")),
+    ("Araç sahibi ვლადიმერ ბერიძე olarak kayıtlı.", "non_latin", ("ვლადიმერ", "ბერიძე")),
+    ("Araç sahibi محمد رضایی olarak kayıtlı.", "non_latin", ("محمد", "رضایی")),
 ])
 async def test_text_with_possible_personal_data_is_omitted(caplog, text, reason, leaked):
     line = await _single_line(caplog, _json_response(200, _message(text)))
@@ -288,13 +292,40 @@ async def test_requested_plate_and_captcha_are_masked_in_otherwise_safe_text(cap
     assert 'text="Sorgulanan araç <plate> için kod <captcha> geçersiz."' in line
 
 
-@pytest.mark.parametrize("code", [_PLATE, "AB1234CD", _CAPTCHA, "ZZ-9999-TST", "123456789"])
+@pytest.mark.parametrize("code", [
+    _PLATE, "AB1234CD", _CAPTCHA, "ZZ-9999-TST", "123456789", "AHMET_YILMAZ", "XY-9876-ZW", "AHMET",
+])
 async def test_codes_that_could_be_data_are_not_logged(caplog, code):
     line = await _single_line(caplog, _json_response(
         200, {"messages": [{"type": "ERROR", "text": "Hata.", "code": code}], "status": code},
     ))
     assert "codes=-" in line
-    assert "AB1234CD" not in line and "123456789" not in line
+    for value in ("AB1234CD", "123456789", "AHMET", "XY-9876-ZW"):
+        assert value not in line
+
+
+@pytest.mark.parametrize("code, logged", [("GW-503", "GW-503"), ("E1001", "E1001"), (429, "429")])
+async def test_short_error_codes_are_logged(caplog, code, logged):
+    line = await _single_line(caplog, _json_response(
+        200, {"messages": [{"type": "ERROR", "text": "Hata.", "code": code}]},
+    ))
+    assert f"codes={logged}" in line
+
+
+async def test_turkish_letters_pass_the_allowlist(caplog):
+    line = await _single_line(caplog, _json_response(
+        200, _message("İşleminiz şu an gerçekleştirilemiyor; lütfen daha sonra tekrar deneyiniz. Çağrı ömrü üç gün."),
+    ))
+    assert 'text="İşleminiz şu an gerçekleştirilemiyor; lütfen daha sonra tekrar deneyiniz. Çağrı ömrü üç gün."' in line
+
+
+async def test_unknown_html_title_after_colon_is_omitted(caplog):
+    caplog.set_level(logging.INFO)
+    recorder = _Recorder(httpx.Response(200, text="<html><title>Hata: Ahmet</title></html>"))
+    with pytest.raises(GibTransportError):
+        await _submit(_provider(recorder))
+    [line] = _gib_lines(caplog)
+    assert "title=<omitted:capitalised_word>" in line and "Ahmet" not in line
 
 
 async def test_text_that_cannot_be_checked_safely_is_omitted(caplog):
