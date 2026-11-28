@@ -97,9 +97,25 @@ def _extract_messages(payload: dict) -> tuple[GibMessage, ...]:
     )
 
 
+def _has_malformed_message(payload: dict) -> bool:
+    """Элемент "messages" нестандартной формы: не объект, либо "type"/"text"
+    не строка (null, число, массив, объект, поле отсутствует). Во всех
+    сохранённых реальных ответах GİB оба поля — строки; другой тип —
+    ответ, который мы не понимаем, а не "штрафов нет"."""
+    raw_messages = payload.get("messages")
+    if not isinstance(raw_messages, list):
+        return False
+    return any(
+        not isinstance(item, dict)
+        or not isinstance(item.get("type"), str)
+        or not isinstance(item.get("text"), str)
+        for item in raw_messages
+    )
+
+
 def _has_message_text(messages: tuple[GibMessage, ...], known_text: str) -> bool:
     return any(
-        message.text is not None and message.text.strip() == known_text
+        isinstance(message.text, str) and message.text.strip() == known_text
         for message in messages
     )
 
@@ -117,6 +133,13 @@ def _is_empty(data: object) -> bool:
 
 def parse_submit_response(payload: object) -> GibSubmitOutcome:
     if not isinstance(payload, dict):
+        return GibSubmitOutcome(kind="unexpected", messages=(), raw_data=payload)
+
+    if _has_malformed_message(payload):
+        # Раньше такой ответ ронял разбор (AttributeError на text.strip(),
+        # TypeError на нехешируемом type) или молча становился "no_debt".
+        # Теперь — "unexpected": проверка GİB = ошибка, без сравнения и
+        # без уведомлений; GibProvider пишет безопасную диагностику.
         return GibSubmitOutcome(kind="unexpected", messages=(), raw_data=payload)
 
     messages = _extract_messages(payload)
