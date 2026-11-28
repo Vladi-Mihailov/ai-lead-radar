@@ -251,7 +251,7 @@ async def test_http_403_is_blocked(caplog):
     ("Adres Atatürk Caddesi Kadıköy İstanbul olarak kayıtlı.", "capitalised_word", ("Atatürk", "Kadıköy")),
     ("Borç tutarı 3000 TL.", "number", ("3000",)),
     ("Bilgi için ahmet.yilmaz@example.com adresine yazınız.", "email", ("ahmet.yilmaz", "example.com")),
-    ("Protokol MC03475903 bulunamadı.", "id_like", ("MC03475903",)),
+    ("Protokol MC00000017 bulunamadı.", "id_like", ("MC00000017",)),
     ("Plaka 34 ABC 123 kayıtlı değil.", "number", ("ABC", "34 ABC")),
     ("Plaka AB.1234.CD kayıtlı değil.", "number", ("AB.1234", "1234.CD")),
     ("Ad: Ahmet; Soyad: Yılmaz", "capitalised_word", ("Ahmet", "Yılmaz")),
@@ -269,17 +269,17 @@ async def test_text_with_possible_personal_data_is_omitted(caplog, text, reason,
 async def test_response_with_personal_data_and_fine_data_logs_metadata_only(caplog):
     text = (
         "Sayın AHMET YILMAZ, ZZ 9999 TST plakalı araç için 12345678901 TC kimlik no, "
-        "ahmet.yilmaz@example.com, tutar 3000.00 TL, protokol MC03475903, "
+        "ahmet.yilmaz@example.com, tutar 3000.00 TL, protokol MC00000017, "
         "bkz. https://dijital.gib.gov.tr/x?id=42"
     )
     line = await _single_line(caplog, _json_response(
         200,
         {"messages": [{"type": "ERROR", "text": text}],
          "data": {"KK_HASH": "secret-hash-abc", "KK_KIMLIK": "kimlik-token-xyz",
-                  "KK_TUTANAKNO": "MC03475903", "KK_BORC": "3000.00"}},
+                  "KK_TUTANAKNO": "MC00000017", "KK_BORC": "3000.00"}},
     ))
     for leaked in ("AHMET", "YILMAZ", "9999", "TST", "12345678901", "ahmet.yilmaz", "example.com",
-                   "3000", "MC03475903", "secret-hash", "kimlik-token", "id=42", "dijital.gib.gov.tr"):
+                   "3000", "MC00000017", "secret-hash", "kimlik-token", "id=42", "dijital.gib.gov.tr"):
         assert leaked not in line, leaked
     assert "text=<omitted:email>" in line
     assert "category=undetermined" in line and "keys=messages,data" in line
