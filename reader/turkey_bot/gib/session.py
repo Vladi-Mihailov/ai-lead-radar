@@ -166,13 +166,19 @@ class GibSession:
                 type(exc).__name__, _elapsed_ms(started),
             )
             raise GibTransportError("failed to submit GIB check") from exc
-        self.last_submit_meta = response_meta(response, duration_ms=_elapsed_ms(started))
+        try:
+            self.last_submit_meta = response_meta(response, duration_ms=_elapsed_ms(started))
+        except Exception:  # noqa: BLE001 - диагностика не должна влиять на проверку
+            self.last_submit_meta = None
 
         try:
             return response.json()
         except ValueError as exc:
             try:
-                details = describe_non_json(response, meta=self.last_submit_meta, plate=plate)
+                details = describe_non_json(
+                    response, meta=self.last_submit_meta, plate=plate,
+                    captcha_code=captcha_code, image_id=image_id,
+                )
             except Exception as diag_exc:  # noqa: BLE001 - диагностика не должна влиять на проверку
                 details = f"diagnostics failed ({type(diag_exc).__name__})"
             logger.warning(

@@ -37,5 +37,6 @@ class GibProvider:
             # Только лог (см. diagnostics.py): исход и дальнейшая логика не меняются.
             log_unexpected_response(
                 raw, meta=getattr(self._session, "last_submit_meta", None), plate=plate,
+                captcha_code=captcha_code, image_id=image_id,
             )
         return outcome

@@ -14,22 +14,25 @@
   - не пишет в БД и не влияет на уведомления.
 
 Что НИКОГДА не попадает в лог: госномер, персональные данные, cookies,
-токены, CAPTCHA (код и image id), полное тело ответа, сведения о
-штрафах (поля "data"/"BORCLAR" не читаются вовсе). Из тела берутся
-только имена ключей верхнего уровня (схема, не данные), тип и код
-сообщения и текст сообщения из известного поля messages[].text — и
-этот текст проходит маскирование ниже. Если текст нельзя безопасно
-проверить (не строка или слишком длинный), он не логируется вовсе:
-остаются только категория и метаданные.
+токены, CAPTCHA (код и image id), полное тело ответа, сведения о штрафах
+(поля "data"/"BORCLAR" не читаются вовсе). Из тела берутся только:
+  - имена ключей верхнего уровня (схема, не данные; без цифр);
+  - тип и код сообщения (строгий формат);
+  - текст сообщения из известного поля messages[].text — по БЕЛОМУ
+    списку: текст пишется, только если в нём нет слов с заглавной буквы
+    (кроме первого слова предложения и известных аббревиатур), нет чисел
+    (кроме "5 dakika"-подобных интервалов), нет токенов из букв и цифр и
+    нет e-mail. Иначе пишется только причина: text=<omitted:...>.
+Запрошенный номер, код CAPTCHA и image id дополнительно маскируются как
+точные значения (в любом написании с разделителями).
 
-Категория — подсказка по наблюдаемым признакам (HTTP-статус, Retry-After,
-ключевые слова сообщения, форма ответа), а не доказанная причина:
+Категория — подсказка по наблюдаемым признакам, а не доказанная причина;
+рядом пишется signal — какой именно признак сработал:
   - rate_limit     — лимит частоты запросов;
   - blocked        — блокировка/отказ в доступе;
   - service_error  — техническая ошибка или недоступность сервиса;
   - unknown_format — ответ незнакомой формы (не объект, нет известных полей);
-  - undetermined   — не определено (например, незнакомый текст ERROR/WARNING
-    при HTTP 200 без других признаков).
+  - undetermined   — не определено.
 """
 
 from __future__ import annotations
@@ -49,52 +52,68 @@ SERVICE_ERROR = "service_error"
 UNKNOWN_FORMAT = "unknown_format"
 UNDETERMINED = "undetermined"
 
-# Текст длиннее этого не проверяется и не логируется: длинный текст —
-# уже не короткое системное сообщение, и маскированию в нём доверять нельзя.
-_MAX_TEXT_SOURCE_CHARS = 500
+_MAX_TEXT_SOURCE_CHARS = 300
 _MAX_TEXT_LOG_CHARS = 200
 _MAX_TITLE_LOG_CHARS = 80
 _MAX_MESSAGES_LOGGED = 3
 _MAX_KEYS_LOGGED = 12
-_HTML_SCAN_CHARS = 4096
+_HTML_SCAN_BYTES = 4096
+_MIN_SECRET_CHARS = 4
 
-# Ключевые слова — в "турецком" нижнем регистре (см. _turkish_lower).
-_RATE_LIMIT_WORDS = (
-    "çok fazla", "fazla sayıda", "sorgu limit", "limit", "sınır", "kota",
-    "too many", "rate limit", "throttl",
-)
-_BLOCKED_WORDS = (
-    "engellen", "erişiminiz", "erişim engel", "yasaklan", "access denied",
-    "forbidden", "blocked", "request rejected", "url was rejected",
-)
-_SERVICE_WORDS = (
-    "bakım", "geçici olarak", "hizmet ver", "sistem hata", "beklenmeyen",
-    "hata oluştu", "zaman aşımı", "maintenance", "unavailable",
-    "internal server error", "bad gateway", "timeout", "timed out",
+# Фразы, а не отдельные слова: "sınır" (граница) и "limit" (лимит карты)
+# встречаются и в обычных текстах.
+_KEYWORDS = (
+    (RATE_LIMIT, (
+        "çok fazla", "fazla sayıda", "sorgu limit", "sorgu sınır", "sınırını aş", "sınırı aş",
+        "limitini aş", "limiti aş", "limit aşıl", "kota", "too many", "rate limit", "throttl",
+    )),
+    (BLOCKED, (
+        "engellen", "erişiminiz", "erişim engel", "yasaklan", "access denied", "forbidden",
+        "blocked", "request rejected", "url was rejected",
+    )),
+    (SERVICE_ERROR, (
+        "bakım", "geçici olarak", "hizmet verem", "hizmet verilem", "sistem hata", "beklenmeyen",
+        "hata oluştu", "zaman aşımı", "maintenance", "unavailable", "internal server error",
+        "bad gateway", "timeout", "timed out",
+    )),
 )
 
-# Аббревиатуры в верхнем регистре, которые не маскируются (не имена).
-_ALLOWED_UPPER_WORDS = frozenset({"GİB", "GIB", "HTTP", "API", "URL", "TC", "IP", "SSL", "TL", "ERROR", "WARNING"})
+# Типовые заголовки страниц шлюзов/WAF — пишутся как есть (наш список).
+_KNOWN_TITLES = frozenset({
+    "request rejected", "service unavailable", "service temporarily unavailable", "bad gateway",
+    "gateway timeout", "gateway time-out", "too many requests", "access denied", "forbidden",
+    "internal server error", "maintenance", "error", "bakım", "hata", "erişim engellendi",
+})
 
-# Известные поля с кодом ошибки: в элементе messages[] и на верхнем уровне.
+_ALLOWED_UPPER_WORDS = frozenset({"GİB", "GIB", "HTTP", "API", "URL", "TC", "IP", "SSL", "TL"})
+_TIME_UNIT_RE = re.compile(
+    r"\s*(?:saniye|sn|dakika|dk|saat|gün|seconds?|secs?|minutes?|mins?|hours?|days?)\b", re.IGNORECASE,
+)
+_SENTENCE_END_CHARS = ".!?:;…"
+_OPENING_PUNCT = " \"'(«[“‘"
+
 _MESSAGE_CODE_KEYS = ("code", "messageCode", "errorCode", "kod", "hataKodu")
 _TOP_LEVEL_CODE_KEYS = ("code", "errorCode", "hataKodu", "status")
+_CONTENT_MAIN_TYPES = frozenset({"application", "text", "image", "multipart", "message", "audio", "video", "font"})
 
-_SAFE_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,39}")
+_SAFE_KEY_RE = re.compile(r"[A-Za-z_]{1,40}")
 _SAFE_CODE_RE = re.compile(r"[A-Za-z0-9_.\-]{1,40}")
 _SAFE_TYPE_RE = re.compile(r"[A-Za-z_]{1,20}")
 _RETRY_AFTER_SECONDS_RE = re.compile(r"\d{1,7}")
-_RETRY_AFTER_DATE_RE = re.compile(r"[A-Za-z0-9 ,:\-]{1,40}")
-_CONTENT_TYPE_RE = re.compile(r"[a-z0-9.+\-]{1,40}/[a-z0-9.+\-]{1,40}")
+_RETRY_AFTER_DATE_RE = re.compile(
+    r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"\d{4} \d{2}:\d{2}:\d{2} GMT"
+)
+_CONTENT_SUBTYPE_RE = re.compile(r"[a-z.+\-]{1,40}")
 
 _TAG_RE = re.compile(r"<[^>]{0,200}>")
 _EMAIL_RE = re.compile(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+")
 _URL_RE = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
 _MIXED_TOKEN_RE = re.compile(r"\b(?=\w*\d)(?=\w*[^\W\d_])\w+\b")
-_DECIMAL_RE = re.compile(r"\d+(?:[.,]\d+)+")
-_LONG_DIGITS_RE = re.compile(r"\d{5,}")
-_WORD_RE = re.compile(r"[^\W\d_]{2,}")
+_NUMBER_RE = re.compile(r"\d+(?:[.,:/\-]\d+)*")
+_WORD_RE = re.compile(r"[^\W\d_]+")
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_STATUS_PREFIX_RE = re.compile(r"^\d{3}\s+")
 
 
 @dataclass(frozen=True)
@@ -128,80 +147,100 @@ def _safe_retry_after(value: str | None) -> str | None:
 def _safe_content_type(value: str | None) -> str | None:
     if not value:
         return None
-    main = value.split(";", 1)[0].strip().lower()
-    return main if _CONTENT_TYPE_RE.fullmatch(main) else "<invalid>"
+    main, _, subtype = value.split(";", 1)[0].strip().lower().partition("/")
+    if main in _CONTENT_MAIN_TYPES and _CONTENT_SUBTYPE_RE.fullmatch(subtype):
+        return f"{main}/{subtype}"
+    return "<other>"
 
 
 def _turkish_lower(text: str) -> str:
     return text.replace("İ", "i").replace("I", "ı").lower()
 
 
-def _plate_pattern(plate: str | None) -> re.Pattern[str] | None:
-    if not plate:
-        return None
-    compact = re.sub(r"[\s\-]", "", plate)
-    if not compact:
-        return None
-    return re.compile(r"[\s\-]*".join(re.escape(ch) for ch in compact), re.IGNORECASE)
+def _compact(value: str) -> str:
+    return re.sub(r"[\W_]", "", value).casefold()
 
 
-def _mask_upper_word(match: re.Match[str]) -> str:
-    word = match.group(0)
-    if word.isupper() and word not in _ALLOWED_UPPER_WORDS:
-        return "<caps>"
-    return word
+def _secret_patterns(secrets: dict[str, str | None]) -> list[tuple[re.Pattern[str], str]]:
+    patterns = []
+    for label, value in secrets.items():
+        compact = re.sub(r"[\W_]", "", value or "")
+        if len(compact) < _MIN_SECRET_CHARS:
+            continue
+        patterns.append((re.compile(r"[\W_]*".join(re.escape(ch) for ch in compact), re.IGNORECASE), f"<{label}>"))
+    return patterns
 
 
-def safe_text(text: object, *, plate: str | None, max_chars: int = _MAX_TEXT_LOG_CHARS) -> str | None:
-    """Маскированный короткий текст или None, если безопасно нельзя.
+def _is_secret(value: str, secrets: dict[str, str | None]) -> bool:
+    compact = _compact(value)
+    return any(compact and compact == _compact(s or "") for s in secrets.values())
 
-    Маскируются: запрошенный госномер (в любом написании с пробелами/
-    дефисами), e-mail, ссылки, токены из букв и цифр (номера, id, хеши),
-    десятичные числа (суммы), числа из 5+ цифр (документы, телефоны,
-    номера протоколов), слова целиком в верхнем регистре (имена в данных
-    GİB пишутся заглавными) кроме известных аббревиатур. Короткие числа
-    (до 4 цифр, например "5 dakika") остаются — они нужны для диагностики.
-    """
-    if not isinstance(text, str) or len(text) > _MAX_TEXT_SOURCE_CHARS:
-        return None
+
+def _unsafe_reason(cleaned: str) -> str | None:
+    """Причина, по которой текст нельзя писать в лог, или None (белый список)."""
+    if _EMAIL_RE.search(cleaned):
+        return "email"
+    if _MIXED_TOKEN_RE.search(cleaned):
+        return "id_like"
+    for match in _NUMBER_RE.finditer(cleaned):
+        number = match.group(0)
+        if not (number.isdigit() and len(number) <= 4 and _TIME_UNIT_RE.match(cleaned, match.end())):
+            return "number"
+    for match in _WORD_RE.finditer(cleaned):
+        word = match.group(0)
+        if not any(ch.isupper() for ch in word) or word in _ALLOWED_UPPER_WORDS:
+            continue
+        prefix = cleaned[:match.start()].rstrip(_OPENING_PUNCT)
+        at_sentence_start = not prefix or prefix[-1] in _SENTENCE_END_CHARS
+        if at_sentence_start and not any(ch.isupper() for ch in word[1:]):
+            continue
+        return "capitalised_word"
+    return None
+
+
+def safe_text(
+    text: object, *, secrets: dict[str, str | None], max_chars: int = _MAX_TEXT_LOG_CHARS,
+) -> tuple[str | None, str | None]:
+    """(текст, None), если его можно писать в лог, иначе (None, причина)."""
+    if not isinstance(text, str):
+        return None, "not_text"
+    if len(text) > _MAX_TEXT_SOURCE_CHARS:
+        return None, "too_long"
     cleaned = unicodedata.normalize("NFC", text)
     cleaned = "".join(" " if unicodedata.category(ch).startswith("C") else ch for ch in cleaned)
     cleaned = _TAG_RE.sub(" ", cleaned)
-    pattern = _plate_pattern(plate)
-    if pattern is not None:
-        cleaned = pattern.sub("<plate>", cleaned)
-    cleaned = _EMAIL_RE.sub("<email>", cleaned)
+    for pattern, replacement in _secret_patterns(secrets):
+        cleaned = pattern.sub(replacement, cleaned)
     cleaned = _URL_RE.sub("<url>", cleaned)
-    cleaned = _MIXED_TOKEN_RE.sub("<id>", cleaned)
-    cleaned = _DECIMAL_RE.sub("<num>", cleaned)
-    cleaned = _LONG_DIGITS_RE.sub("<num>", cleaned)
-    cleaned = _WORD_RE.sub(_mask_upper_word, cleaned)
     cleaned = " ".join(cleaned.split())
+    reason = _unsafe_reason(cleaned)
+    if reason is not None:
+        return None, reason
     if len(cleaned) > max_chars:
         cleaned = cleaned[:max_chars].rstrip() + "…"
-    return cleaned
+    return cleaned, None
 
 
-def classify(*, status_code: int | None, retry_after: str | None, texts: list[str], known_shape: bool) -> str:
-    """Категория по признакам — подсказка, не доказательство (см. докстрок модуля)."""
+def classify(
+    *, status_code: int | None, retry_after: str | None, texts: list[str], known_shape: bool,
+) -> tuple[str, str]:
+    """(категория, сработавший признак) — подсказка, не доказательство."""
     if status_code == 429:
-        return RATE_LIMIT
+        return RATE_LIMIT, "http_429"
     if status_code in (401, 403):
-        return BLOCKED
+        return BLOCKED, f"http_{status_code}"
     if status_code is not None and status_code >= 500:
-        return SERVICE_ERROR
-    lowered = " ".join(_turkish_lower(t) for t in texts)
-    if any(word in lowered for word in _RATE_LIMIT_WORDS):
-        return RATE_LIMIT
-    if any(word in lowered for word in _BLOCKED_WORDS):
-        return BLOCKED
-    if any(word in lowered for word in _SERVICE_WORDS):
-        return SERVICE_ERROR
+        return SERVICE_ERROR, f"http_{status_code}"
+    haystacks = [_turkish_lower(t) for t in texts] + [t.casefold() for t in texts]
+    for category, words in _KEYWORDS:
+        for word in words:
+            if any(word in haystack for haystack in haystacks):
+                return category, "keyword:" + word.replace(" ", "_")
     if retry_after is not None:
-        return RATE_LIMIT
+        return RATE_LIMIT, "retry_after"
     if not known_shape:
-        return UNKNOWN_FORMAT
-    return UNDETERMINED
+        return UNKNOWN_FORMAT, "shape"
+    return UNDETERMINED, "-"
 
 
 def _shape_of(payload: object) -> str:
@@ -218,18 +257,34 @@ def _shape_of(payload: object) -> str:
     return "other"
 
 
-def _safe_code(value: object) -> str | None:
+def _safe_key(key: object, secrets: dict[str, str | None]) -> str:
+    if isinstance(key, str) and _SAFE_KEY_RE.fullmatch(key) and not _is_secret(key, secrets):
+        return key
+    return "?"
+
+
+def _safe_code(value: object, secrets: dict[str, str | None]) -> str | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
         return str(value) if 0 <= value < 100000 else None
-    if isinstance(value, str) and _SAFE_CODE_RE.fullmatch(value.strip()) and not _LONG_DIGITS_RE.search(value):
-        return value.strip()
-    return None
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not _SAFE_CODE_RE.fullmatch(value) or _is_secret(value, secrets):
+        return None
+    for group in re.split(r"[_.\-]", value):
+        if group and not (group.isalpha() or (group.isdigit() and len(group) <= 5)):
+            return None
+    return value
 
 
-def describe_unexpected(payload: object, *, meta: GibResponseMeta | None, plate: str | None) -> str:
+def describe_unexpected(
+    payload: object, *, meta: GibResponseMeta | None, plate: str | None,
+    captcha_code: str | None = None, image_id: str | None = None,
+) -> str:
     """Одна строка для лога по "unexpected"-ответу submit."""
+    secrets = {"plate": plate, "captcha": captcha_code, "cid": image_id}
     keys = "-"
     messages_info = "absent"
     types: list[str] = []
@@ -239,12 +294,12 @@ def describe_unexpected(payload: object, *, meta: GibResponseMeta | None, plate:
     known_shape = False
 
     if isinstance(payload, dict):
-        key_names = [k if isinstance(k, str) and _SAFE_KEY_RE.fullmatch(k) else "?" for k in list(payload)[:_MAX_KEYS_LOGGED]]
+        key_names = [_safe_key(k, secrets) for k in list(payload)[:_MAX_KEYS_LOGGED]]
         keys = ",".join(key_names) if key_names else "-"
         if len(payload) > _MAX_KEYS_LOGGED:
             keys += ",…"
         for key in _TOP_LEVEL_CODE_KEYS:
-            code = _safe_code(payload.get(key))
+            code = _safe_code(payload.get(key), secrets)
             if code is not None:
                 codes.append(f"{key}:{code}")
         raw_messages = payload.get("messages")
@@ -262,26 +317,26 @@ def describe_unexpected(payload: object, *, meta: GibResponseMeta | None, plate:
                 else:
                     types.append("?")
                 for key in _MESSAGE_CODE_KEYS:
-                    code = _safe_code(item.get(key))
+                    code = _safe_code(item.get(key), secrets)
                     if code is not None:
                         codes.append(code)
                 text = item.get("text")
-                if isinstance(text, str):
-                    raw_texts.append(text[:_MAX_TEXT_SOURCE_CHARS])
                 if text is None:
                     continue
-                masked = safe_text(text, plate=plate)
-                safe_texts.append(f'"{masked}"' if masked is not None else "<omitted>")
-        elif raw_messages is None and "messages" in payload:
-            messages_info = "null"
+                if isinstance(text, str):
+                    raw_texts.append(text[:_MAX_TEXT_SOURCE_CHARS])
+                masked, reason = safe_text(text, secrets=secrets)
+                safe_texts.append(f'"{masked}"' if masked is not None else f"<omitted:{reason}>")
         elif "messages" in payload:
-            messages_info = "invalid"
+            messages_info = "null" if raw_messages is None else "invalid"
 
     status_code = meta.status_code if meta else None
     retry_after = meta.retry_after if meta else None
-    category = classify(status_code=status_code, retry_after=retry_after, texts=raw_texts, known_shape=known_shape)
+    category, signal = classify(
+        status_code=status_code, retry_after=retry_after, texts=raw_texts, known_shape=known_shape,
+    )
     return (
-        f"GIB unexpected response: category={category}"
+        f"GIB unexpected response: category={category} signal={signal}"
         f" http_status={status_code if status_code is not None else '-'}"
         f" retry_after={retry_after or '-'}"
         f" duration_ms={meta.duration_ms if meta else '-'}"
@@ -292,32 +347,50 @@ def describe_unexpected(payload: object, *, meta: GibResponseMeta | None, plate:
     )
 
 
-def log_unexpected_response(payload: object, *, meta: GibResponseMeta | None, plate: str | None) -> None:
+def log_unexpected_response(
+    payload: object, *, meta: GibResponseMeta | None, plate: str | None,
+    captcha_code: str | None = None, image_id: str | None = None,
+) -> None:
     """Пишет строку WARNING; сама диагностика никогда не ломает проверку."""
     try:
-        line = describe_unexpected(payload, meta=meta, plate=plate)
+        line = describe_unexpected(
+            payload, meta=meta, plate=plate, captcha_code=captcha_code, image_id=image_id,
+        )
     except Exception as exc:  # noqa: BLE001 - диагностика не должна влиять на проверку
         logger.warning("GIB unexpected response: diagnostics failed (%s)", type(exc).__name__)
         return
     logger.warning("%s", line)
 
 
-def describe_non_json(response: httpx.Response, *, meta: GibResponseMeta, plate: str | None) -> str:
-    """Поля для строки "response is not valid JSON": без тела, только <title>."""
-    title = None
-    try:
-        match = _TITLE_RE.search(response.text[:_HTML_SCAN_CHARS])
-    except Exception:  # noqa: BLE001 - кодировка тела не должна ломать лог
-        match = None
-    if match:
-        title = safe_text(match.group(1), plate=plate, max_chars=_MAX_TITLE_LOG_CHARS)
-    category = classify(
-        status_code=meta.status_code, retry_after=meta.retry_after,
-        texts=[match.group(1)[:_MAX_TEXT_SOURCE_CHARS]] if match else [], known_shape=False,
+def _safe_title(raw: str, secrets: dict[str, str | None]) -> str:
+    normalized = " ".join(raw.split())
+    if _STATUS_PREFIX_RE.sub("", normalized).casefold() in _KNOWN_TITLES:
+        return f'"{normalized}"'
+    title, reason = safe_text(raw, secrets=secrets, max_chars=_MAX_TITLE_LOG_CHARS)
+    return f'"{title}"' if title is not None else f"<omitted:{reason}>"
+
+
+def describe_non_json(
+    response: httpx.Response, *, meta: GibResponseMeta | None, plate: str | None,
+    captcha_code: str | None = None, image_id: str | None = None,
+) -> str:
+    """Поля для строки "response is not valid JSON": без тела, только <title>.
+
+    Читаются только первые 4 КБ тела (без полного декодирования).
+    """
+    secrets = {"plate": plate, "captcha": captcha_code, "cid": image_id}
+    head = response.content[:_HTML_SCAN_BYTES].decode("utf-8", "replace")
+    match = _TITLE_RE.search(head)
+    raw_title = match.group(1)[:_MAX_TEXT_SOURCE_CHARS] if match else None
+    status_code = meta.status_code if meta else response.status_code
+    retry_after = meta.retry_after if meta else None
+    category, signal = classify(
+        status_code=status_code, retry_after=retry_after,
+        texts=[raw_title] if raw_title else [], known_shape=False,
     )
-    title_field = f'"{title}"' if title else "-"
     return (
-        f"category={category} retry_after={meta.retry_after or '-'}"
-        f" duration_ms={meta.duration_ms} content_type={meta.content_type or '-'}"
-        f" length={len(response.content)} title={title_field}"
+        f"category={category} signal={signal} retry_after={retry_after or '-'}"
+        f" duration_ms={meta.duration_ms if meta else '-'}"
+        f" content_type={(meta.content_type if meta else None) or '-'}"
+        f" length={len(response.content)} title={_safe_title(raw_title, secrets) if raw_title else '-'}"
     )
