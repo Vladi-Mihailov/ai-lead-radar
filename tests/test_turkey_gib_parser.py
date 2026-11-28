@@ -190,11 +190,14 @@ def test_non_dict_payload_is_unexpected():
     assert outcome.raw_data == ["not", "a", "dict"]
 
 
-def test_non_dict_items_inside_messages_are_ignored_defensively():
+def test_non_dict_items_inside_messages_are_unexpected_not_no_debt():
+    # Раньше такие элементы молча игнорировались и ответ давал "no_debt".
+    # Нестандартный ответ — ошибка разбора, а не "штрафов нет" (см.
+    # tests/test_turkey_gib_parser_types.py).
     outcome = parse_submit_response({"messages": ["not-a-dict", 123], "data": []})
 
     assert outcome.messages == ()
-    assert outcome.kind == "no_debt"
+    assert outcome.kind == "unexpected"
 
 
 def _sanitized_borclar_response(*, borclar: list) -> dict:

@@ -327,6 +327,7 @@ def describe_unexpected(
                         codes.append(code)
                 text = item.get("text")
                 if text is None:
+                    safe_texts.append("<omitted:no_text>")
                     continue
                 if isinstance(text, str):
                     raw_texts.append(text[:_MAX_TEXT_SOURCE_CHARS])
