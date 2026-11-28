@@ -7,6 +7,7 @@
 результатом и не даёт уведомлений. Реальная сеть не используется.
 """
 
+import base64
 import logging
 import sys
 from datetime import datetime, timezone
@@ -23,7 +24,10 @@ from reader.turkey_bot.gib.parser import parse_submit_response  # noqa: E402
 from reader.turkey_bot.gib.provider import GibProvider  # noqa: E402
 from reader.turkey_bot.gib.session import GibSession  # noqa: E402
 from reader.turkey_bot.monitoring.change_detector import detect_changes  # noqa: E402
-from reader.turkey_bot.unified.check_service import _gib_outcome_to_result  # noqa: E402
+from reader.turkey_bot.unified.check_service import (  # noqa: E402
+    UnifiedTurkeyCheckService,
+    _gib_outcome_to_result,
+)
 from reader.turkey_bot.unified.models import (  # noqa: E402
     ProviderCheckResult,
     ProviderStatus,
@@ -76,6 +80,23 @@ def test_non_object_message_item_is_unexpected(item):
     assert parse_submit_response(_with_messages({"BORCLAR": []}, item)).kind == "unexpected"
 
 
+@pytest.mark.parametrize("shape", [{"data": None}, {"data": []}, {"BORCLAR": []}, {"BORCLAR": [{"KK_BORC": "1"}]}])
+@pytest.mark.parametrize("messages", [
+    {"type": "ERROR", "text": "Çok fazla sorgu"}, "Hata oluştu", 5, True,
+], ids=["dict", "str", "int", "bool"])
+def test_messages_field_that_is_not_a_list_is_unexpected(shape, messages):
+    assert parse_submit_response({**shape, "messages": messages}).kind == "unexpected"
+
+
+@pytest.mark.parametrize("payload, kind", [
+    ({"BORCLAR": [], "messages": None}, "no_debt"),
+    ({"BORCLAR": []}, "no_debt"),
+    ({"data": []}, "no_debt"),
+])
+def test_null_or_missing_messages_field_is_standard(payload, kind):
+    assert parse_submit_response(payload).kind == kind
+
+
 def test_one_bad_item_wins_over_a_known_no_debt_message():
     payload = _with_messages(
         {"data": None},
@@ -119,6 +140,49 @@ async def test_provider_logs_safe_diagnostics_for_bad_types(caplog):
     assert "messages=2 types=?,ERROR" in line
     assert "text=<omitted:not_text> | <omitted:no_text>" in line
     assert _PLATE not in line
+
+
+class _FixedCaptcha:
+    async def resolve(self, *, provider, image_png):
+        return "ABCDE"
+
+
+class _NeverCalled:
+    def __call__(self):
+        raise AssertionError("only GİB is checked in this test")
+
+
+@pytest.mark.parametrize("payload", [
+    {"messages": [{"type": ["ERROR"], "text": "x"}], "BORCLAR": []},
+    {"messages": [{"type": "ERROR", "text": 0}], "data": []},
+    {"messages": "Hata oluştu", "data": None},
+])
+async def test_full_gib_check_makes_one_submit_and_returns_error(payload):
+    submits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/captcha/getnewcaptcha"):
+            return httpx.Response(200, json={
+                "captchaImgBase64": base64.b64encode(b"PNG-BYTES").decode(), "cid": "cid-1", "messages": None,
+            })
+        if request.method == "POST":
+            submits.append(url)
+            return httpx.Response(200, json=payload)
+        return httpx.Response(200, text="<html></html>")
+
+    def gib_factory():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        return client, GibProvider(GibSession(client))
+
+    service = UnifiedTurkeyCheckService(
+        gib_factory, _NeverCalled(), _NeverCalled(), captcha_resolver=_FixedCaptcha(),
+    )
+    result = await service.check(_PLATE, max_attempts=25, mode="scheduled", providers=("gib",))
+
+    gib = result.provider_result("gib")
+    assert gib.status == ProviderStatus.ERROR and gib.error_type == "unexpected"
+    assert len(submits) == 1
 
 
 def _provider_result(provider: str, status: ProviderStatus, total: Decimal) -> ProviderCheckResult:

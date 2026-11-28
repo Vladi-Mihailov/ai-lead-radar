@@ -98,13 +98,17 @@ def _extract_messages(payload: dict) -> tuple[GibMessage, ...]:
 
 
 def _has_malformed_message(payload: dict) -> bool:
-    """Элемент "messages" нестандартной формы: не объект, либо "type"/"text"
-    не строка (null, число, массив, объект, поле отсутствует). Во всех
-    сохранённых реальных ответах GİB оба поля — строки; другой тип —
-    ответ, который мы не понимаем, а не "штрафов нет"."""
+    """Нестандартное поле "messages": само поле есть, но это не список и
+    не null (реальный успешный ответ с "BORCLAR" присылает null), либо
+    элемент списка не объект, либо его "type"/"text" не строка (null, число,
+    массив, объект, поле отсутствует). Во всех сохранённых реальных ответах
+    GİB оба поля — строки; другой тип — ответ, который мы не понимаем, а не
+    "штрафов нет"."""
     raw_messages = payload.get("messages")
-    if not isinstance(raw_messages, list):
+    if raw_messages is None:
         return False
+    if not isinstance(raw_messages, list):
+        return True
     return any(
         not isinstance(item, dict)
         or not isinstance(item.get("type"), str)
